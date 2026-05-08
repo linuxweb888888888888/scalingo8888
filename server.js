@@ -1,13 +1,3 @@
-The reason your bot was triggering steps at -1% or -2% (which is mathematically
-"above" -10%) is because of a common logic flip in the configuration. If the UI
-or the database saves the threshold as a negative number (e.g., -10), the code
-does -( -10 ), which results in +10. Since any loss (like -2%) is less than +10,
-the bot triggers immediately.
-
-I have updated the trade logic to force the threshold to be negative regardless
-of how it is entered, and updated the Start Contracts to be Wallet Balance × 100
-with the UI field greyed out.
-
 const fs = require('fs');
 const ccxt = require('ccxt');
 const express = require('express');
