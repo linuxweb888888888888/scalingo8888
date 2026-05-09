@@ -511,7 +511,7 @@ app.get('/api/data', authMiddleware, (req, res) => { const worker = activeWorker
 app.get('/api/chart-history', (req, res) => res.json(memoryChartHistory.slice(-800))); 
 app.get('/api/close-all', authMiddleware, async (req, res) => { const worker = activeWorkers.get(req.user._id.toString()); if(worker) await worker.forceClosePosition("MANUAL_FORCE_CLOSE").catch(()=>{}); res.json({status: 'ok'}); });
 
-// ==================== FRONTEND (ANDROID MOBILE DESIGN) ====================
+// ==================== FRONTEND ====================
 app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -540,10 +540,10 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         .m3-input:focus { border-color: var(--primary); border-width: 2px; }
         .m3-label { position: absolute; left: 10px; top: -10px; background: white; padding: 0 4px; font-size: 11px; color: #444; font-weight: 500; }
         .m3-select { width: 100%; border: 1px solid #8e9199; border-radius: 4px; padding: 10px; background: white; font-size: 14px; appearance: none; }
-        .btn-fab { position: fixed; bottom: 96px; right: 20px; width: 56px; height: 56px; background: var(--error); border-radius: 50%; display: flex; items: center; justify-content: center; color: white; box-shadow: 0 4px 12px rgba(0,0,0,0.25); z-index: 150; border: none; cursor: pointer; }
         .metric-label { font-size: 10px; font-weight: 700; color: #74777f; text-transform: uppercase; letter-spacing: 0.5px; }
         .metric-value { font-family: 'Roboto Mono', monospace; font-size: 16px; font-weight: 700; }
         #chartWrapper { height: 180px; width: 100%; }
+        .auth-only { display: none; } /* Used to hide nav items when logged out */
     </style>
 </head>
 <body>
@@ -594,11 +594,12 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                     <div class="text-right"><span class="metric-label block">Contracts</span><span id="activeQty" class="text-lg font-bold font-mono">0</span></div>
                 </div>
                 <div class="flex items-center gap-2"><span class="material-symbols-outlined text-[16px] text-gray-400">history</span><span class="text-[10px] font-bold text-gray-400 uppercase">Uptime: <span id="uptime" class="text-black">0s</span></span></div>
+                <button onclick="closePositionManual()" class="w-full py-3 mt-4 bg-red-50 text-red-600 rounded-xl font-bold text-[10px] uppercase border border-red-100">Close Position</button>
             </div>
             <div class="m3-card"><h3 class="text-[10px] font-bold uppercase text-gray-400 mb-3">Recent Executions (Last 10)</h3><div id="tradeHistoryBody" class="space-y-3"><p class="text-center py-4 text-xs text-gray-400">No trades found.</p></div></div>
         </section>
 
-        <!-- SETUP MENU (EVERY SETTING RESTORED) -->
+        <!-- SETUP -->
         <section id="view-settings" class="view-section">
             <h2 class="text-xl font-bold mb-4">Strategy Setup</h2>
             <div class="m3-card">
@@ -675,19 +676,17 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- AUTH -->
+        <!-- LOGIN / REGISTER -->
         <section id="view-login" class="view-section"><h2 class="text-2xl font-bold mb-6">Sign In</h2><div class="m3-card"><div class="m3-input-group"><label class="m3-label">Email</label><input type="email" id="login-email" class="m3-input"></div><div class="m3-input-group"><label class="m3-label">Password</label><input type="password" id="login-pass" class="m3-input"></div><button onclick="doLogin()" class="w-full py-4 bg-black text-white rounded-2xl font-bold">Login</button><p id="login-err" class="text-red-500 text-xs mt-3 text-center"></p></div></section>
         <section id="view-register" class="view-section"><h2 class="text-2xl font-bold mb-6">Register</h2><div class="m3-card"><div class="m3-input-group"><label class="m3-label">Name</label><input type="text" id="reg-name" class="m3-input"></div><div class="m3-input-group"><label class="m3-label">Email</label><input type="email" id="reg-email" class="m3-input"></div><div class="m3-input-group"><label class="m3-label">Password</label><input type="password" id="reg-pass" class="m3-input"></div><button onclick="doRegister()" class="w-full py-4 bg-black text-white rounded-2xl font-bold">Sign Up</button><p id="reg-err" class="text-red-500 text-xs mt-3 text-center"></p></div></section>
 
     </main>
 
-    <button id="fabClose" class="btn-fab hidden" onclick="closeAll()" title="Close All"><span class="material-symbols-outlined">close</span></button>
-
     <nav class="bottom-nav">
         <button onclick="nav('home')" id="nav-home" class="nav-item active"><span class="material-symbols-outlined">home</span><span>Home</span></button>
-        <button onclick="nav('dashboard')" id="nav-dashboard" class="nav-item"><span class="material-symbols-outlined">show_chart</span><span>Trade</span></button>
-        <button onclick="nav('backtest')" id="nav-backtest" class="nav-item"><span class="material-symbols-outlined">science</span><span>Test</span></button>
-        <button onclick="nav('settings')" id="nav-settings" class="nav-item"><span class="material-symbols-outlined">settings</span><span>Setup</span></button>
+        <button onclick="nav('dashboard')" id="nav-dashboard" class="nav-item auth-only"><span class="material-symbols-outlined">show_chart</span><span>Trade</span></button>
+        <button onclick="nav('backtest')" id="nav-backtest" class="nav-item auth-only"><span class="material-symbols-outlined">science</span><span>Test</span></button>
+        <button onclick="nav('settings')" id="nav-settings" class="nav-item auth-only"><span class="material-symbols-outlined">settings</span><span>Setup</span></button>
     </nav>
 
     <script>
@@ -696,19 +695,50 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         let dashLoop = null;
         let settingsLoaded = false;
 
+        // AUTH UI SYNC
+        function updateAuthUI() {
+            const profile = document.getElementById('userProfile');
+            const homeBtns = document.getElementById('home-auth-btns');
+            const authNavs = document.querySelectorAll('.auth-only');
+
+            if (authToken) {
+                profile.classList.remove('hidden');
+                homeBtns.classList.add('hidden');
+                authNavs.forEach(el => el.style.display = 'flex');
+            } else {
+                profile.classList.add('hidden');
+                homeBtns.classList.remove('hidden');
+                authNavs.forEach(el => el.style.display = 'none');
+            }
+        }
+
         function nav(v) {
+            // View Protection
+            const protectedViews = ['dashboard', 'backtest', 'settings'];
+            if (!authToken && protectedViews.includes(v)) {
+                nav('home');
+                return;
+            }
+
             document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active-view'));
             document.getElementById('view-' + v).classList.add('active-view');
             document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
-            const activeNav = document.getElementById('nav-' + (['login','register'].includes(v) ? 'home' : v));
+            
+            const targetNavId = ['login','register'].includes(v) ? 'nav-home' : 'nav-' + v;
+            const activeNav = document.getElementById(targetNavId);
             if(activeNav) activeNav.classList.add('active');
+            
             if(v === 'dashboard' && authToken) initDashboard();
-            const fab = document.getElementById('fabClose');
-            if(v === 'dashboard' && authToken) fab.classList.remove('hidden'); else fab.classList.add('hidden');
             window.scrollTo(0,0);
         }
 
-        function logout() { localStorage.removeItem('bot_token'); location.reload(); }
+        function logout() { 
+            localStorage.removeItem('bot_token'); 
+            authToken = null;
+            if(dashLoop) clearInterval(dashLoop);
+            updateAuthUI();
+            nav('home');
+        }
 
         async function doAPI(endpoint, method, body) {
             const h = { 'Content-Type': 'application/json' };
@@ -719,8 +749,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         }
 
         async function initDashboard() {
-            document.getElementById('userProfile').classList.remove('hidden');
-            document.getElementById('home-auth-btns').classList.add('hidden');
+            updateAuthUI();
             if(dashLoop) clearInterval(dashLoop);
             dashLoop = setInterval(fetchMetrics, 1000);
             fetchMetrics();
@@ -771,11 +800,8 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             if (data.mlSignal) {
                 document.getElementById('mlValue').innerText = data.mlSignal.confidence.toFixed(1) + "%";
                 const stat = document.getElementById('mlStatus');
-                
-                // Convert to LONG/SHORT for better UI clarity
                 const signalDirection = data.mlSignal.type === 'bull' ? 'LONG' : 'SHORT';
                 stat.innerText = "SIGNAL: " + signalDirection;
-                
                 stat.className = "text-[10px] font-bold px-3 py-1 rounded-full uppercase " + 
                     (data.mlSignal.type === 'bull' ? "bg-green-500 text-white" : "bg-red-500 text-white");
             }
@@ -783,15 +809,11 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             const hist = document.getElementById("tradeHistoryBody");
             if(data.metrics.trades && data.metrics.trades.length > 0) {
                 hist.innerHTML = "";
-                // Show last 10 executions
                 data.metrics.trades.slice(-10).reverse().forEach(t => {
-                    const isLong = t.side.toLowerCase() === 'long';
-                    const sideColor = isLong ? 'text-green-600' : 'text-red-600';
+                    const sideColor = t.side === 'long' ? 'text-green-600' : 'text-red-600';
                     const pnlColor = t.netPnl >= 0 ? 'text-green-600' : 'text-red-600';
-
                     hist.innerHTML += \`
                     <div class="flex flex-col border-b border-gray-100 pb-3 mb-2">
-                        <!-- Top Row: Signal and Net Profit -->
                         <div class="flex justify-between items-center">
                             <div class="flex items-center gap-2">
                                 <span class="text-[9px] font-bold bg-gray-100 px-1.5 py-0.5 rounded text-gray-500 uppercase">Signal</span>
@@ -799,14 +821,10 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                             </div>
                             <span class="text-xs font-mono font-bold \${pnlColor}">\${t.netPnl >= 0 ? '+' : ''}$\${t.netPnl.toFixed(2)}</span>
                         </div>
-                        
-                        <!-- Middle Row: Reason and Quantity -->
                         <div class="flex justify-between items-center mt-1.5">
                             <span class="text-[10px] text-gray-400">Reason: <span class="text-gray-700 font-medium">\${t.exitReason}</span></span>
                             <span class="text-[10px] text-gray-400">Qty: <span class="text-gray-700 font-mono">\${t.contracts.toLocaleString()}</span></span>
                         </div>
-
-                        <!-- Bottom Row: ROI -->
                         <div class="flex items-center gap-1 mt-1">
                              <span class="text-[9px] font-bold uppercase text-gray-400">ROI:</span>
                              <span class="text-[10px] font-bold \${t.roiPct >= 0 ? 'text-green-500' : 'text-red-500'}">\${t.roiPct.toFixed(2)}%</span>
@@ -837,15 +855,27 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 
         async function doLogin() {
             const res = await doAPI('/api/auth/login', 'POST', { email: document.getElementById('login-email').value, password: document.getElementById('login-pass').value });
-            if (res.error) document.getElementById('login-err').innerText = res.error; else { authToken = res.token; localStorage.setItem('bot_token', authToken); nav('dashboard'); }
+            if (res.error) document.getElementById('login-err').innerText = res.error; 
+            else { 
+                authToken = res.token; 
+                localStorage.setItem('bot_token', authToken); 
+                updateAuthUI();
+                nav('dashboard'); 
+            }
         }
 
         async function doRegister() {
             const res = await doAPI('/api/auth/register', 'POST', { name: document.getElementById('reg-name').value, email: document.getElementById('reg-email').value, password: document.getElementById('reg-pass').value });
-            if (res.error) document.getElementById('reg-err').innerText = res.error; else { authToken = res.token; localStorage.setItem('bot_token', authToken); nav('dashboard'); }
+            if (res.error) document.getElementById('reg-err').innerText = res.error; 
+            else { 
+                authToken = res.token; 
+                localStorage.setItem('bot_token', authToken); 
+                updateAuthUI();
+                nav('dashboard'); 
+            }
         }
 
-        async function closeAll() { if(confirm("Close Position?")) await doAPI('/api/close-all', 'GET'); }
+        async function closePositionManual() { if(confirm("Close Position?")) await doAPI('/api/close-all', 'GET'); }
 
         async function runBacktest() {
             const res = await doAPI('/api/backtest', 'POST', { ticks: document.getElementById('btTicks').value, tpPct: document.getElementById('btTp').value, slPct: document.getElementById('btSl').value, mlLookback: document.getElementById('btMlLookback').value });
@@ -853,7 +883,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             document.getElementById('btResWinrate').innerText = res.winRate + "%";
             document.getElementById('btResPnl').innerText = "$" + res.netPnl.toFixed(2);
             const container = document.getElementById('btTableBody'); container.innerHTML = "";
-            res.trades.slice(-10).forEach(t => { container.innerHTML += \`<div>\${t.side.toUpperCase()} | ROI: \${t.roiPct.toFixed(2)}% | Net: \${t.netPnl.toFixed(2)}</div>\`; });
+            res.trades.slice(-10).forEach(t => { container.innerHTML += `<div>${t.side.toUpperCase()} | ROI: ${t.roiPct.toFixed(2)}% | Net: ${t.netPnl.toFixed(2)}</div>`; });
         }
 
         const ctx = document.getElementById("mlChart").getContext("2d");
@@ -871,6 +901,8 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             mlChart.update();
         }
 
+        // Initialize UI
+        updateAuthUI();
         if(authToken) nav('dashboard'); else nav('home');
     </script>
 </body>
