@@ -1,17 +1,20 @@
 {
-  "name": "shib-ai-bot",
+  "name": "htx-trading-bot",
   "version": "1.0.0",
-  "description": "SHIB ML Trading Bot",
-  "main": "server.js",
-  "engines": {
-    "node": "20.x"
-  },
+  "description": "Dual-mode HTX Futures Trading Bot with Smart Offset and DCA logic",
+  "main": "index.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
   "dependencies": {
-    "ccxt": "^4.2.0",
+    "bcryptjs": "^2.4.3",
+    "ccxt": "^4.2.10",
     "express": "^4.18.2",
-    "mongoose": "^8.0.0"
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.1.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
