@@ -543,7 +543,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         .metric-label { font-size: 10px; font-weight: 700; color: #74777f; text-transform: uppercase; letter-spacing: 0.5px; }
         .metric-value { font-family: 'Roboto Mono', monospace; font-size: 16px; font-weight: 700; }
         #chartWrapper { height: 180px; width: 100%; }
-        .auth-only { display: none; } /* Used to hide nav items when logged out */
+        .auth-only { display: none; } 
     </style>
 </head>
 <body>
@@ -695,12 +695,10 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         let dashLoop = null;
         let settingsLoaded = false;
 
-        // AUTH UI SYNC
         function updateAuthUI() {
             const profile = document.getElementById('userProfile');
             const homeBtns = document.getElementById('home-auth-btns');
             const authNavs = document.querySelectorAll('.auth-only');
-
             if (authToken) {
                 profile.classList.remove('hidden');
                 homeBtns.classList.add('hidden');
@@ -713,21 +711,14 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         }
 
         function nav(v) {
-            // View Protection
             const protectedViews = ['dashboard', 'backtest', 'settings'];
-            if (!authToken && protectedViews.includes(v)) {
-                nav('home');
-                return;
-            }
-
+            if (!authToken && protectedViews.includes(v)) { nav('home'); return; }
             document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active-view'));
             document.getElementById('view-' + v).classList.add('active-view');
             document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
-            
             const targetNavId = ['login','register'].includes(v) ? 'nav-home' : 'nav-' + v;
             const activeNav = document.getElementById(targetNavId);
             if(activeNav) activeNav.classList.add('active');
-            
             if(v === 'dashboard' && authToken) initDashboard();
             window.scrollTo(0,0);
         }
@@ -758,7 +749,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         async function fetchMetrics() {
             const data = await doAPI('/api/data', 'GET');
             if(data.error) return;
-
             if(!settingsLoaded) {
                 document.getElementById("tpPctSens").value = data.config.takeProfitPct;
                 document.getElementById("slPctSens").value = data.config.stopLossPct; 
@@ -778,12 +768,10 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 document.getElementById("liveTrade").checked = data.liveTradingEnabled;
                 settingsLoaded = true;
             }
-
             document.getElementById("uptime").innerText = data.uptime + "s";
             document.getElementById("netPnl").innerText = "$" + data.metrics.totalNetPnl.toFixed(2);
             document.getElementById("netPnl").className = "metric-value " + (data.metrics.totalNetPnl >= 0 ? "text-green-600" : "text-red-600");
             document.getElementById("marginUsed").innerText = "$" + Number(data.walletBalance || 0).toFixed(2);
-
             const badge = document.getElementById("statusBadge");
             if(data.activePositions.length > 0) {
                 const p = data.activePositions[0];
@@ -796,7 +784,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 document.getElementById("activeRoi").innerText = "N/A";
                 document.getElementById("activeQty").innerText = "0";
             }
-
             if (data.mlSignal) {
                 document.getElementById('mlValue').innerText = data.mlSignal.confidence.toFixed(1) + "%";
                 const stat = document.getElementById('mlStatus');
@@ -805,7 +792,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 stat.className = "text-[10px] font-bold px-3 py-1 rounded-full uppercase " + 
                     (data.mlSignal.type === 'bull' ? "bg-green-500 text-white" : "bg-red-500 text-white");
             }
-
             const hist = document.getElementById("tradeHistoryBody");
             if(data.metrics.trades && data.metrics.trades.length > 0) {
                 hist.innerHTML = "";
@@ -844,8 +830,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 dcaRoiThresholdSens: document.getElementById("dcaRoiThresholdSens").value, dcaMultiplierSens: document.getElementById("dcaMultiplierSens").value,
                 profitRoiThresholdSens: document.getElementById("profitRoiThresholdSens").value
             };
-            await doAPI('/api/user/config', 'POST', p);
-            alert("Strategy Updated");
+            await doAPI('/api/user/config', 'POST', p); alert("Strategy Updated");
         }
 
         async function saveApiKeys() {
@@ -856,23 +841,13 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         async function doLogin() {
             const res = await doAPI('/api/auth/login', 'POST', { email: document.getElementById('login-email').value, password: document.getElementById('login-pass').value });
             if (res.error) document.getElementById('login-err').innerText = res.error; 
-            else { 
-                authToken = res.token; 
-                localStorage.setItem('bot_token', authToken); 
-                updateAuthUI();
-                nav('dashboard'); 
-            }
+            else { authToken = res.token; localStorage.setItem('bot_token', authToken); updateAuthUI(); nav('dashboard'); }
         }
 
         async function doRegister() {
             const res = await doAPI('/api/auth/register', 'POST', { name: document.getElementById('reg-name').value, email: document.getElementById('reg-email').value, password: document.getElementById('reg-pass').value });
             if (res.error) document.getElementById('reg-err').innerText = res.error; 
-            else { 
-                authToken = res.token; 
-                localStorage.setItem('bot_token', authToken); 
-                updateAuthUI();
-                nav('dashboard'); 
-            }
+            else { authToken = res.token; localStorage.setItem('bot_token', authToken); updateAuthUI(); nav('dashboard'); }
         }
 
         async function closePositionManual() { if(confirm("Close Position?")) await doAPI('/api/close-all', 'GET'); }
@@ -883,7 +858,9 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             document.getElementById('btResWinrate').innerText = res.winRate + "%";
             document.getElementById('btResPnl').innerText = "$" + res.netPnl.toFixed(2);
             const container = document.getElementById('btTableBody'); container.innerHTML = "";
-            res.trades.slice(-10).forEach(t => { container.innerHTML += `<div>${t.side.toUpperCase()} | ROI: ${t.roiPct.toFixed(2)}% | Net: ${t.netPnl.toFixed(2)}</div>`; });
+            res.trades.slice(-10).forEach(t => { 
+                container.innerHTML += \`<div>\${t.side.toUpperCase()} | ROI: \${t.roiPct.toFixed(2)}% | Net: \${t.netPnl.toFixed(2)}</div>\`; 
+            });
         }
 
         const ctx = document.getElementById("mlChart").getContext("2d");
@@ -901,12 +878,10 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             mlChart.update();
         }
 
-        // Initialize UI
         updateAuthUI();
         if(authToken) nav('dashboard'); else nav('home');
     </script>
 </body>
-</html>`);
-});
+</html>\`); });
 
-app.listen(CUSTOM_PORT, async () => { console.log(`✅ Server running on port ${CUSTOM_PORT}`); await loadAllUsers(); startMasterStreams(); });
+app.listen(CUSTOM_PORT, async () => { console.log(\`✅ Server running on port \${CUSTOM_PORT}\`); await loadAllUsers(); startMasterStreams(); });
