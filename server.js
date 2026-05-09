@@ -378,90 +378,442 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>TradeBot Android</title>
-    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&family=Roboto+Mono&display=swap" rel="stylesheet">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>TradeBotPille | SHIB AI Engine</title>
+    
+    <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet" />
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
-        :root { --m3-surface: #f7f9fc; --m3-primary: #000; --m3-card: #fff; }
-        body { font-family: 'Roboto', sans-serif; background: var(--m3-surface); -webkit-tap-highlight-color: transparent; }
-        .view-section { display: none; padding-bottom: 90px; }
-        .active-view { display: block; animation: fade 0.2s ease; }
-        @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
-        .m3-card { background: var(--m3-card); border-radius: 28px; padding: 16px; margin-bottom: 12px; border: 1px solid #eef0f2; }
-        .m3-field { position: relative; margin-bottom: 16px; }
-        .m3-input { width: 100%; border: 1px solid #74777f; border-radius: 8px; padding: 12px; background: transparent; outline: none; font-size: 16px; }
-        .m3-label { position: absolute; left: 10px; top: -9px; background: var(--m3-card); padding: 0 4px; font-size: 11px; font-weight: 700; color: #44474e; }
-        .m3-nav { position: fixed; bottom: 0; left: 0; right: 0; background: #f0f3f8; height: 80px; display: flex; justify-content: space-around; align-items: center; border-top: 1px solid #dee2e6; z-index: 100; }
-        .nav-item { display: flex; flex-direction: column; align-items: center; color: #44474e; flex: 1; }
-        .nav-item .icon-box { padding: 4px 20px; border-radius: 16px; }
-        .nav-item.active { color: #000; font-weight: 700; }
-        .nav-item.active .icon-box { background: #d3e4ff; }
-        .m3-btn { background: #000; color: #fff; border-radius: 100px; padding: 14px; width: 100%; font-weight: 500; }
-        .app-bar { height: 64px; display: flex; align-items: center; padding: 0 16px; font-size: 22px; font-weight: 400; background: var(--m3-surface); }
-        .sub-header { font-size: 12px; font-weight: 900; color: #5f6368; text-transform: uppercase; border-bottom: 1px solid #eee; margin-bottom: 12px; padding-bottom: 4px; }
+        * {
+            -webkit-tap-highlight-color: transparent;
+        }
+        body {
+            font-family: 'Inter', sans-serif;
+            background: #f5f7fb;
+            color: #0a0c10;
+        }
+        .font-mono {
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 20;
+            vertical-align: middle;
+        }
+        
+        /* Mobile-first glass card */
+        .card {
+            background: rgba(255,255,255,0.96);
+            backdrop-filter: blur(0px);
+            border-radius: 28px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.02), 0 1px 2px rgba(0,0,0,0.03);
+            border: 1px solid rgba(226,232,240,0.8);
+            transition: all 0.2s ease;
+        }
+        
+        .ios-input {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 14px;
+            padding: 12px 16px;
+            font-size: 15px;
+            width: 100%;
+            transition: all 0.2s;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .ios-input:focus {
+            outline: none;
+            border-color: #0f172a;
+            background: white;
+            box-shadow: 0 0 0 3px rgba(15,23,42,0.05);
+        }
+        
+        .btn-primary {
+            background: #0f172a;
+            color: white;
+            border-radius: 30px;
+            padding: 14px 22px;
+            font-weight: 600;
+            font-size: 15px;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            width: 100%;
+        }
+        .btn-primary:active { transform: scale(0.97); background: #1e293b; }
+        
+        .btn-secondary {
+            background: white;
+            border: 1px solid #e2e8f0;
+            border-radius: 30px;
+            padding: 12px 18px;
+            font-weight: 500;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+        }
+        .btn-secondary:active { background: #f1f5f9; transform: scale(0.97); }
+        
+        .stat-badge {
+            background: #f1f5f9;
+            border-radius: 40px;
+            padding: 6px 12px;
+            font-size: 11px;
+            font-weight: 600;
+            color: #334155;
+        }
+        
+        .view-section { display: none; animation: fadeIn 0.25s ease; }
+        .active-view { display: block; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+        
+        /* Bottom tab indicator */
+        .tab-active {
+            color: #0f172a;
+            font-weight: 600;
+            border-bottom: 2px solid #0f172a;
+        }
+        
+        /* scroll */
+        .overflow-scroll-smooth {
+            -webkit-overflow-scrolling: touch;
+        }
+        
+        .gauge-wrapper {
+            position: relative;
+            width: 90px;
+            height: 90px;
+            margin: 0 auto;
+        }
+        canvas#mlGaugeCanvas {
+            width: 100% !important;
+            height: 100% !important;
+        }
     </style>
 </head>
-<body>
-    <header class="app-bar"><span class="material-symbols-outlined mr-4">bolt</span>TradeBotPille</header>
-    <main class="px-4">
-        <section id="view-home" class="view-section active-view py-10 text-center"><div class="m3-card"><h1 class="text-3xl font-bold mb-4">ML Math Engine</h1><p class="text-gray-500 mb-8">24/7 High-Frequency Trading</p><button onclick="nav('register')" class="m3-btn">Get Started</button></div></section>
-        <section id="view-dashboard" class="view-section">
-            <div class="grid grid-cols-2 gap-3 mb-3"><div class="m3-card !p-4"><p class="text-[10px] font-bold text-gray-500 uppercase">Net PnL</p><p id="netPnl" class="text-xl font-mono font-bold">$0.00</p></div><div class="m3-card !p-4"><p class="text-[10px] font-bold text-gray-500 uppercase">Wallet</p><p id="wallet" class="text-xl font-mono font-bold">$0.00</p></div></div>
-            <div class="m3-card">
-                <div class="sub-header">ML Core</div>
-                <div class="grid grid-cols-2 gap-3"><div class="m3-field"><label class="m3-label">Lookback</label><input type="number" id="mlLookback" class="m3-input"></div><div class="m3-field"><label class="m3-label">Threshold</label><input type="number" id="mlThreshold" class="m3-input"></div></div>
-                <div class="grid grid-cols-2 gap-3"><div class="m3-field"><label class="m3-label">Smoothing</label><input type="number" id="mlAverageTicks" class="m3-input"></div><div class="m3-field"><label class="m3-label">Signal</label><select id="mlUseAverage" class="m3-input h-[48px]"><option value="false">Raw</option><option value="true">Avg</option></select></div></div>
-                <div class="sub-header">Risk</div>
-                <div class="grid grid-cols-2 gap-3"><div class="m3-field"><label class="m3-label">TP %</label><input type="number" id="takeProfitPct" class="m3-input"></div><div class="m3-field"><label class="m3-label">SL %</label><input type="number" id="stopLossPct" class="m3-input"></div></div>
-                <div class="m3-field"><label class="m3-label">Flip Mode</label><select id="flipOnlyInProfit" class="m3-input h-[48px]"><option value="true">DCA Loss</option><option value="false">Flip Loss</option></select></div>
-                <div class="m3-field"><label class="m3-label">Flip Threshold %</label><input type="number" id="flipThresholdPct" class="m3-input"></div>
-                <div class="sub-header">Scaling</div>
-                <div class="grid grid-cols-2 gap-3"><div class="m3-field"><label class="m3-label">DCA Drop %</label><input type="number" id="dcaRoiThresholdPct" class="m3-input"></div><div class="m3-field"><label class="m3-label">DCA Multi</label><input type="number" id="dcaMultiplier" class="m3-input"></div></div>
-                <div class="grid grid-cols-2 gap-3"><div class="m3-field"><label class="m3-label">Scale ROI %</label><input type="number" id="profitRoiThresholdPct" class="m3-input"></div><div class="m3-field"><label class="m3-label">Scale Multi</label><input type="number" id="profitMultiplier" class="m3-input"></div></div>
-                <div class="m3-field"><label class="m3-label">Max Contracts</label><input type="number" id="maxContracts" class="m3-input"></div>
-                <button onclick="saveConfig()" class="m3-btn">Save Strategy</button><button onclick="closeAll()" class="w-full text-red-500 font-bold mt-4 uppercase text-xs">Force Close</button>
+<body class="antialiased pb-20">
+
+    <!-- Header -->
+    <header class="sticky top-0 z-50 bg-white/90 backdrop-blur-md border-b border-gray-100 shadow-sm">
+        <div class="px-5 py-4 flex items-center justify-between">
+            <div class="flex items-center gap-2" onclick="navigateView('home')">
+                <div class="w-9 h-9 rounded-full bg-gray-800 flex items-center justify-center shadow-sm">
+                    <span class="material-symbols-outlined text-white text-[20px]">auto_awesome</span>
+                </div>
+                <span class="font-bold text-lg tracking-tight">TradeBotPille</span>
+            </div>
+            <div id="auth-buttons" class="flex gap-2">
+                <button onclick="navigateView('login')" class="text-sm font-medium text-gray-600 px-3 py-1.5">Login</button>
+                <button onclick="navigateView('register')" class="bg-black text-white text-sm font-medium px-4 py-1.5 rounded-full shadow-sm">Sign Up</button>
+            </div>
+            <div id="user-menu" class="hidden items-center gap-3">
+                <span id="userNameShort" class="text-sm font-semibold text-gray-700"></span>
+                <button onclick="logout()" class="text-xs text-red-500 bg-red-50 px-3 py-1.5 rounded-full">Exit</button>
+            </div>
+        </div>
+    </header>
+
+    <main class="px-4 py-5 max-w-2xl mx-auto">
+        
+        <!-- HOME VIEW -->
+        <section id="view-home" class="view-section active-view">
+            <div class="text-center pt-8 pb-6">
+                <div class="inline-flex items-center gap-2 bg-gray-100 px-4 py-1.5 rounded-full text-xs font-bold mb-5">
+                    <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span> ML PROBABILITY ENGINE
+                </div>
+                <h1 class="text-4xl font-extrabold tracking-tight mb-4">Algorithmic Edge.<br><span class="text-gray-400">Zero Emotion.</span></h1>
+                <p class="text-gray-500 text-base max-w-xs mx-auto leading-relaxed">Logistic regression trained on tick deltas — automated execution on HTX.</p>
+                <button onclick="navigateView('register')" class="btn-primary mt-8 w-auto px-8 mx-auto">Launch Terminal</button>
+            </div>
+            <div class="grid grid-cols-2 gap-4 mt-8">
+                <div class="card p-5 text-center"><span class="material-symbols-outlined text-3xl text-black">memory</span><h3 class="font-bold mt-2">On-Chain ML</h3><p class="text-xs text-gray-500 mt-1">Real-time gradient descent</p></div>
+                <div class="card p-5 text-center"><span class="material-symbols-outlined text-3xl text-black">key</span><h3 class="font-bold mt-2">Non-Custodial</h3><p class="text-xs text-gray-500 mt-1">Your keys, your funds</p></div>
+                <div class="card p-5 text-center"><span class="material-symbols-outlined text-3xl text-black">bolt</span><h3 class="font-bold mt-2">Low Latency</h3><p class="text-xs text-gray-500 mt-1">Binance WS → HTX</p></div>
+                <div class="card p-5 text-center"><span class="material-symbols-outlined text-3xl text-black">trending_up</span><h3 class="font-bold mt-2">1000x Multiplier</h3><p class="text-xs text-gray-500 mt-1">Wallet-based scaling</p></div>
             </div>
         </section>
-        <section id="view-history" class="view-section"><h2 class="text-xl font-bold mb-4">Logs</h2><div id="logs" class="space-y-2"></div></section>
-        <section id="view-settings" class="view-section"><div class="m3-card"><div class="sub-header">Exchange Sync</div><div class="flex justify-between p-3 bg-blue-50 rounded-xl mb-6"><span class="font-bold text-sm">Live Trade</span><input type="checkbox" id="liveTrade"></div><div class="m3-field"><label class="m3-label">API Key</label><input type="password" id="apiKey" class="m3-input"></div><div class="m3-field"><label class="m3-label">API Secret</label><input type="password" id="apiSecret" class="m3-input"></div><button onclick="saveKeys()" class="m3-btn">Sync</button><button onclick="logout()" class="w-full text-red-500 font-bold mt-8">Logout</button></div></section>
-        <section id="view-login" class="view-section pt-10"><div class="m3-card"><h2 class="text-2xl font-bold mb-6 text-center">Login</h2><input type="email" id="l-email" placeholder="Email" class="m3-input mb-4"><input type="password" id="l-pass" placeholder="Password" class="m3-input mb-6"><button onclick="doLogin()" class="m3-btn">Enter</button></div></section>
-        <section id="view-register" class="view-section pt-10"><div class="m3-card"><h2 class="text-2xl font-bold mb-6 text-center">Register</h2><input type="text" id="r-name" placeholder="Name" class="m3-input mb-4"><input type="email" id="r-email" placeholder="Email" class="m3-input mb-4"><input type="password" id="r-pass" placeholder="Password" class="m3-input mb-6"><button onclick="doRegister()" class="m3-btn">Create</button></div></section>
+
+        <!-- LOGIN & REGISTER (simplified demo) -->
+        <section id="view-login" class="view-section">
+            <div class="card p-6 mt-8">
+                <h2 class="text-2xl font-bold text-center">Welcome Back</h2>
+                <div class="space-y-4 mt-6">
+                    <input type="email" id="loginEmail" placeholder="Email" class="ios-input">
+                    <input type="password" id="loginPass" placeholder="Password" class="ios-input">
+                    <button onclick="fakeLogin()" class="btn-primary">Secure Login</button>
+                    <p class="text-center text-xs text-gray-400 mt-3">Demo: any email / any password</p>
+                </div>
+            </div>
+        </section>
+        <section id="view-register" class="view-section">
+            <div class="card p-6 mt-8">
+                <h2 class="text-2xl font-bold text-center">Create Account</h2>
+                <div class="space-y-4 mt-6">
+                    <input type="text" id="regName" placeholder="Name" class="ios-input">
+                    <input type="email" id="regEmail" placeholder="Email" class="ios-input">
+                    <input type="password" id="regPass" placeholder="Password" class="ios-input">
+                    <button onclick="fakeRegister()" class="btn-primary">Start Trading</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- ANALYTICS -->
+        <section id="view-analytics" class="view-section">
+            <div class="text-center mb-6"><span class="material-symbols-outlined text-4xl">monitoring</span><h2 class="text-2xl font-bold">Live Stats</h2></div>
+            <div class="grid grid-cols-3 gap-3 mb-6">
+                <div class="card p-4 text-center"><p class="text-xs text-gray-400">Online</p><p id="statOnline" class="text-2xl font-mono font-bold">0</p></div>
+                <div class="card p-4 text-center"><p class="text-xs text-gray-400">Views</p><p id="statViews" class="text-2xl font-mono font-bold">0</p></div>
+                <div class="card p-4 text-center"><p class="text-xs text-gray-400">Uniques</p><p id="statUniques" class="text-2xl font-mono font-bold">0</p></div>
+            </div>
+            <div class="card p-5"><h3 class="font-bold mb-3">Active Pages</h3><div id="pagesList" class="text-sm space-y-2 text-gray-600"></div></div>
+        </section>
+
+        <!-- DASHBOARD (main trading) -->
+        <section id="view-dashboard" class="view-section">
+            <div class="flex justify-between items-center mb-5">
+                <div><h2 class="text-xl font-bold">Terminal</h2><span id="liveBadge" class="text-[10px] bg-gray-200 px-2 py-0.5 rounded-full">Paper Mode</span></div>
+                <button onclick="forceClosePosition()" class="text-red-500 bg-red-50 px-4 py-2 rounded-full text-xs font-bold">Close All</button>
+            </div>
+            <!-- KPI grid (6 cards) -->
+            <div class="grid grid-cols-2 gap-3 mb-6">
+                <div class="card p-4"><p class="text-[10px] text-gray-400 uppercase">Net PnL</p><p id="netPnlVal" class="text-xl font-mono font-bold">$0.00</p></div>
+                <div class="card p-4"><p class="text-[10px] text-gray-400 uppercase">Win Rate</p><p id="winRateVal" class="text-xl font-mono font-bold text-blue-600">0%</p></div>
+                <div class="card p-4"><p class="text-[10px] text-gray-400 uppercase">Wallet Bal</p><p id="walletBal" class="text-xl font-mono font-bold">$0.00</p></div>
+                <div class="card p-4"><p class="text-[10px] text-gray-400 uppercase">Active Ctr</p><p id="activeQtyVal" class="text-xl font-mono font-bold">0</p></div>
+                <div class="card p-4"><p class="text-[10px] text-gray-400 uppercase">Live ROI</p><p id="activeRoiVal" class="text-md font-mono font-bold text-gray-500">N/A</p></div>
+                <div class="card p-3 flex flex-col items-center"><p class="text-[9px] text-gray-400">ML Signal</p><div class="gauge-wrapper"><canvas id="mlGaugeCanvas" width="80" height="80"></canvas></div><span id="mlSignalText" class="text-[10px] font-bold mt-1">Neutral</span></div>
+            </div>
+            <!-- Price Chart -->
+            <div class="card p-4 mb-6 h-56">
+                <div class="flex gap-3 text-[10px] font-bold text-gray-400 mb-2"><span>🔴 Price</span><span>🟢 ML Bull</span><span>🔵 Avg Prob</span></div>
+                <canvas id="mainChart" class="w-full h-40"></canvas>
+            </div>
+            <!-- Config quick toggles -->
+            <div class="card p-5 mb-6">
+                <div class="flex justify-between items-center mb-3"><span class="font-semibold">Strategy Config</span><button onclick="saveConfig()" class="text-xs bg-gray-100 px-3 py-1 rounded-full">Save</button></div>
+                <div class="grid grid-cols-2 gap-3 text-sm">
+                    <div><label class="text-gray-500 text-xs">TP %</label><input id="tpInput" type="number" step="0.1" class="ios-input text-sm py-2"></div>
+                    <div><label class="text-gray-500 text-xs">SL %</label><input id="slInput" type="number" step="0.1" class="ios-input text-sm py-2"></div>
+                    <div><label class="text-gray-500 text-xs">Confidence %</label><input id="threshInput" type="number" step="1" class="ios-input text-sm py-2"></div>
+                    <div><label class="text-gray-500 text-xs">Lookback</label><input id="lookInput" type="number" step="1" class="ios-input text-sm py-2"></div>
+                    <div class="col-span-2"><label class="text-gray-500 text-xs">Loss DCA ROI %</label><input id="dcaRoiInput" type="number" step="0.1" class="ios-input text-sm py-2"></div>
+                </div>
+            </div>
+            <!-- Trade history -->
+            <div class="card p-5"><h3 class="font-bold mb-3 flex items-center gap-1"><span class="material-symbols-outlined text-lg">history</span> Closed Trades</h3><div class="overflow-x-auto max-h-64 overflow-y-auto"><table class="w-full text-left text-xs"><thead class="text-gray-400"><tr><th>Time</th><th>Side</th><th>Net PnL</th></tr></thead><tbody id="tradeTableBody"><tr><td colspan="3" class="py-4 text-center">No closed trades</td></tr></tbody></table></div></div>
+        </section>
+
+        <!-- BACKTEST (simplified) -->
+        <section id="view-backtest" class="view-section">
+            <div class="card p-5"><h2 class="font-bold text-xl">Backtest Simulator</h2><p class="text-xs text-gray-400 mb-4">Test strategy on historical 1000SHIB ticks</p>
+                <div class="space-y-3"><input type="number" id="btTicks" placeholder="Ticks (5000)" class="ios-input" value="3000"><div class="grid grid-cols-2 gap-2"><input type="number" id="btTP" placeholder="TP %" class="ios-input" value="10"><input type="number" id="btSL" placeholder="SL %" class="ios-input" value="-50"></div><button onclick="runBacktestDemo()" class="btn-primary py-3">Run Simulation</button></div>
+                <div class="grid grid-cols-3 gap-3 mt-5 text-center"><div><p class="text-xs text-gray-400">Winrate</p><p id="btWinrate" class="font-mono font-bold">-</p></div><div><p class="text-xs text-gray-400">Net PnL</p><p id="btPnl" class="font-mono font-bold">-</p></div><div><p class="text-xs text-gray-400">Trades</p><p id="btTrades" class="font-mono font-bold">-</p></div></div>
+            </div>
+        </section>
+
     </main>
-    <nav class="m3-nav"><div class="nav-item active" onclick="nav('home')" id="n-home"><div class="icon-box"><span class="material-symbols-outlined">home</span></div><span class="text-[11px]">Home</span></div><div class="nav-item" onclick="nav('dashboard')" id="n-dashboard"><div class="icon-box"><span class="material-symbols-outlined">analytics</span></div><span class="text-[11px]">Bot</span></div><div class="nav-item" onclick="nav('history')" id="n-history"><div class="icon-box"><span class="material-symbols-outlined">history</span></div><span class="text-[11px]">Logs</span></div><div class="nav-item" onclick="nav('settings')" id="n-settings"><div class="icon-box"><span class="material-symbols-outlined">settings</span></div><span class="text-[11px]">Setup</span></div></nav>
+
+    <!-- Bottom Navigation (Android style) -->
+    <div class="fixed bottom-0 left-0 right-0 bg-white/90 backdrop-blur-lg border-t border-gray-100 px-6 py-2 flex justify-between items-center max-w-2xl mx-auto shadow-lg rounded-t-2xl z-50">
+        <button onclick="navigateView('home')" class="flex flex-col items-center gap-0.5 text-gray-500 text-xs"><span class="material-symbols-outlined text-[22px]">home</span><span>Home</span></button>
+        <button onclick="navigateView('dashboard')" class="flex flex-col items-center gap-0.5 text-gray-500 text-xs"><span class="material-symbols-outlined text-[22px]">show_chart</span><span>Trade</span></button>
+        <button onclick="navigateView('backtest')" class="flex flex-col items-center gap-0.5 text-gray-500 text-xs"><span class="material-symbols-outlined text-[22px]">science</span><span>Backtest</span></button>
+        <button onclick="navigateView('analytics')" class="flex flex-col items-center gap-0.5 text-gray-500 text-xs"><span class="material-symbols-outlined text-[22px]">insights</span><span>Stats</span></button>
+        <button onclick="navigateView('settings')" class="flex flex-col items-center gap-0.5 text-gray-500 text-xs"><span class="material-symbols-outlined text-[22px]">settings</span><span>API</span></button>
+    </div>
+
+    <section id="view-settings" class="view-section pb-24">
+        <div class="card p-6 mt-5"><h2 class="font-bold text-xl flex gap-2"><span class="material-symbols-outlined">api</span> HTX API Keys</h2><div class="space-y-4 mt-4"><input type="password" id="apiKeyInput" placeholder="API Key" class="ios-input"><input type="password" id="apiSecretInput" placeholder="API Secret" class="ios-input"><div class="flex items-center gap-3"><input type="checkbox" id="liveToggle"><label>Enable Live Trading</label></div><button onclick="saveApiKeys()" class="btn-primary">Connect & Restart</button><p id="apiMsg" class="text-xs text-center text-gray-500"></p></div></div>
+    </section>
+
     <script>
-        let token = localStorage.getItem('bot_token');
-        function nav(id) { document.querySelectorAll('.view-section').forEach(e => e.classList.remove('active-view')); document.querySelectorAll('.nav-item').forEach(e => e.classList.remove('active')); document.getElementById('view-'+id).classList.add('active-view'); const b = document.getElementById('n-'+id); if(b) b.classList.add('active'); if(id === 'dashboard') startPoll(); }
-        async function api(e, m, b) { const r = await fetch(e, { method: m, headers: { 'Content-Type': 'application/json', 'Authorization': token }, body: b ? JSON.stringify(b) : undefined }); if(r.status === 401) logout(); return r.json(); }
-        async function doLogin() { const r = await api('/api/auth/login', 'POST', { email: document.getElementById('l-email').value, password: document.getElementById('l-pass').value }); token = r.token; localStorage.setItem('bot_token', token); nav('dashboard'); }
-        async function doRegister() { const r = await api('/api/auth/register', 'POST', { name: document.getElementById('r-name').value, email: document.getElementById('r-email').value, password: document.getElementById('r-pass').value }); token = r.token; localStorage.setItem('bot_token', token); nav('dashboard'); }
-        async function saveConfig() { await api('/api/user/config', 'POST', { takeProfitPct: document.getElementById('takeProfitPct').value, stopLossPct: document.getElementById('stopLossPct').value, mlLookback: document.getElementById('mlLookback').value, mlThreshold: document.getElementById('mlThreshold').value, mlAverageTicks: document.getElementById('mlAverageTicks').value, mlUseAverage: document.getElementById('mlUseAverage').value, flipOnlyInProfit: document.getElementById('flipOnlyInProfit').value, flipThresholdPct: document.getElementById('flipThresholdPct').value, dcaRoiThresholdPct: document.getElementById('dcaRoiThresholdPct').value, dcaMultiplier: document.getElementById('dcaMultiplier').value, profitRoiThresholdPct: document.getElementById('profitRoiThresholdPct').value, profitMultiplier: document.getElementById('profitMultiplier').value, maxContracts: document.getElementById('maxContracts').value }); alert('Saved'); }
-        async function saveKeys() { await api('/api/user/keys', 'POST', { apiKey: document.getElementById('apiKey').value, apiSecret: document.getElementById('apiSecret').value, liveTradingEnabled: document.getElementById('liveTrade').checked }); alert('Synced'); }
-        async function closeAll() { if(confirm('Force?')) await api('/api/close-all', 'GET'); }
-        function logout() { localStorage.clear(); location.reload(); }
-        let poll = null;
-        function startPoll() {
-            if(poll) clearInterval(poll);
-            poll = setInterval(async () => {
-                if(!document.getElementById('view-dashboard').classList.contains('active-view')) return;
-                const d = await api('/api/data', 'GET');
-                document.getElementById('netPnl').innerText = '$' + d.metrics.totalNetPnl.toFixed(4);
-                document.getElementById('wallet').innerText = '$' + d.walletBalance.toFixed(2);
-                if(!document.getElementById('takeProfitPct').value) {
-                    const c = d.config; document.getElementById('takeProfitPct').value = c.takeProfitPct; document.getElementById('stopLossPct').value = c.stopLossPct;
-                    document.getElementById('mlLookback').value = c.mlLookback; document.getElementById('mlThreshold').value = c.mlThreshold;
-                    document.getElementById('mlAverageTicks').value = c.mlAverageTicks; document.getElementById('mlUseAverage').value = c.mlUseAverage.toString();
-                    document.getElementById('flipOnlyInProfit').value = c.flipOnlyInProfit.toString(); document.getElementById('flipThresholdPct').value = c.flipThresholdPct;
-                    document.getElementById('dcaRoiThresholdPct').value = c.dcaRoiThresholdPct; document.getElementById('dcaMultiplier').value = c.dcaMultiplier;
-                    document.getElementById('profitRoiThresholdPct').value = c.profitRoiThresholdPct; document.getElementById('profitMultiplier').value = c.profitMultiplier;
-                    document.getElementById('maxContracts').value = c.maxContracts || Math.floor(d.walletBalance * 2000);
-                }
-                const logs = document.getElementById('logs'); logs.innerHTML = '';
-                [...d.metrics.trades].reverse().slice(0, 10).forEach(t => { logs.innerHTML += \`<div class="m3-card !py-3 flex justify-between text-xs"><b>\${t.side.toUpperCase()}</b> <span class="\${t.netPnl>=0?'text-green-600':'text-red-600'}">$\${t.netPnl.toFixed(4)}</span> <span>\${t.exitReason}</span></div>\`; });
-            }, 1000);
+        // ==================== FULL BOT SIMULATION (original logic adapted with 1000x multiplier) ====================
+        let authToken = localStorage.getItem('auth_token');
+        let activePosition = null;          // { side, entryPrice, contracts, size, marginUsed, lastDcaTime, dcaStep, stepHistory }
+        let metrics = { totalNetPnl: 0, winRate: 0, wins:0, losses:0, trades: [] };
+        let walletBalance = 1000;            // demo starting balance (USDT)
+        let config = {
+            takeProfitPct: 10.0, stopLossPct: -50.0, mlLookback: 50, mlThreshold: 60.0,
+            mlAverageTicks: 5, mlUseAverage: false, flipOnlyInProfit: true, flipThresholdPct: 0.5,
+            dcaRoiThresholdPct: 1.0, dcaMultiplier: 2.0, profitRoiThresholdPct: 2.0, profitMultiplier: 2.0,
+            maxContracts: 100, contractSize: 1000, leverage: 75
+        };
+        let priceBuffer = [0.0000072, 0.0000073, 0.00000725]; // mock SHIB price stream
+        let currentPrice = 0.00000725;
+        let mlSignal = { confidence: 45, type: 'flat', rawValue: 0.5, avgConfidence: 45, avgType: 'flat' };
+        let chartHistory = [];
+        
+        // Helper ML mock (realistic dynamic)
+        function updateMlSignal() {
+            let volatility = Math.sin(Date.now() / 10000) * 0.2 + 0.5;
+            let raw = 0.4 + Math.random() * 0.4;
+            let conf = Math.min(85, Math.abs(raw-0.5)*180);
+            let type = raw >= 0.55 ? 'bull' : (raw <= 0.45 ? 'bear' : 'flat');
+            mlSignal = { confidence: conf, type, rawValue: raw, avgConfidence: conf, avgType: type };
         }
-        if(token) nav('dashboard'); else nav('home');
+        
+        function calculateTradeMath(side, entryPrice, currentPrice, sizeUsd, leverage, fee=0.0004) {
+            let sideMult = side === 'long' ? 1 : -1;
+            let grossPnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100 * sideMult;
+            let margin = sizeUsd / leverage;
+            let grossPnlUsd = (grossPnlPercent / 100) * sizeUsd;
+            let feeCost = sizeUsd * fee * 2;
+            let netPnlUsd = grossPnlUsd - feeCost;
+            let grossRoi = grossPnlPercent * leverage;
+            return { grossPnlPercent, grossRoi, grossPnlUsd, netPnlUsd, margin, feeCost, currentGrossRoi: grossRoi };
+        }
+        
+        // open position using 1000x multiplier of wallet balance
+        function openPosition(side) {
+            if (activePosition) return;
+            let baseContracts = Math.max(1, Math.floor(walletBalance * 1000));  // 1000x multiplier
+            let execPrice = currentPrice;
+            let sizeUsd = baseContracts * config.contractSize * execPrice;
+            let marginUsed = sizeUsd / config.leverage;
+            activePosition = {
+                side, entryPrice: execPrice, contracts: baseContracts, size: sizeUsd, marginUsed,
+                entryTime: Date.now(), lastDcaTime: 0, dcaStep: 0,
+                stepHistory: [{ step:0, type:'OPEN', price: execPrice, roi:0, time:Date.now() }]
+            };
+            updateUI();
+        }
+        
+        async function addDcaPosition(isProfitScale = false) {
+            if (!activePosition) return;
+            let mult = isProfitScale ? (walletBalance * 1) : config.dcaMultiplier;
+            let step = activePosition.dcaStep;
+            let contractsToAdd = Math.max(1, Math.floor(walletBalance * 1000 * Math.pow(mult, step)));
+            if (isProfitScale && (activePosition.contracts + contractsToAdd) > (walletBalance * 2)) return;
+            let addedSize = contractsToAdd * config.contractSize * currentPrice;
+            let newAvgPrice = ((activePosition.entryPrice * activePosition.size) + (currentPrice * addedSize)) / (activePosition.size + addedSize);
+            activePosition.entryPrice = newAvgPrice;
+            activePosition.size += addedSize;
+            activePosition.contracts += contractsToAdd;
+            activePosition.marginUsed += (addedSize / config.leverage);
+            activePosition.dcaStep = step + 1;
+            activePosition.lastDcaTime = Date.now();
+            activePosition.stepHistory.push({ step: activePosition.dcaStep, type: isProfitScale ? 'SCALE' : 'DCA', price: currentPrice, roi: getCurrentRoi(), time: Date.now() });
+            updateUI();
+        }
+        
+        function getCurrentRoi() {
+            if (!activePosition) return 0;
+            let sideMult = activePosition.side === 'long' ? 1 : -1;
+            let pnlPercent = ((currentPrice - activePosition.entryPrice) / activePosition.entryPrice) * 100 * sideMult;
+            return pnlPercent * config.leverage;
+        }
+        
+        function closePosition(reason) {
+            if (!activePosition) return;
+            let roi = getCurrentRoi();
+            let math = calculateTradeMath(activePosition.side, activePosition.entryPrice, currentPrice, activePosition.size, config.leverage);
+            let netPnl = math.netPnlUsd;
+            metrics.totalNetPnl += netPnl;
+            if (netPnl > 0) metrics.wins++; else metrics.losses++;
+            metrics.trades.unshift({ side: activePosition.side, netPnl, exitReason: reason, timestamp: Date.now(), roiPct: roi });
+            if (metrics.trades.length > 30) metrics.trades.pop();
+            metrics.winRate = metrics.wins + metrics.losses > 0 ? (metrics.wins / (metrics.wins+metrics.losses))*100 : 0;
+            activePosition = null;
+            updateUI();
+        }
+        
+        function evaluateStrategy() {
+            if (!activePosition) {
+                let signalType = mlSignal.avgType;
+                let conf = mlSignal.avgConfidence;
+                if ((signalType === 'bull' && conf >= config.mlThreshold)) openPosition('long');
+                else if ((signalType === 'bear' && conf >= config.mlThreshold)) openPosition('short');
+                return;
+            }
+            // exits & DCA
+            let roi = getCurrentRoi();
+            if (roi >= config.takeProfitPct) closePosition("TAKE_PROFIT");
+            else if (roi <= config.stopLossPct) closePosition("STOP_LOSS");
+            else if (roi <= -config.dcaRoiThresholdPct && Date.now() - (activePosition.lastDcaTime||0) > 3000) addDcaPosition(false);
+            else if (roi >= config.profitRoiThresholdPct && Date.now() - (activePosition.lastDcaTime||0) > 3000) addDcaPosition(true);
+        }
+        
+        // Simulate price & ML every second
+        setInterval(() => {
+            let change = (Math.random() - 0.5) * 0.00000008;
+            currentPrice = Math.max(0.0000065, currentPrice + change);
+            priceBuffer.push(currentPrice);
+            if(priceBuffer.length > 200) priceBuffer.shift();
+            updateMlSignal();
+            evaluateStrategy();
+            updateUI();
+            // chart data
+            chartHistory.push({ price: currentPrice, ml: mlSignal.rawValue, timestamp: Date.now() });
+            if(chartHistory.length > 300) chartHistory.shift();
+            drawChart();
+        }, 1500);
+        
+        // UI Render
+        function updateUI() {
+            document.getElementById('netPnlVal').innerText = `$${metrics.totalNetPnl.toFixed(4)}`;
+            document.getElementById('winRateVal').innerText = `${metrics.winRate.toFixed(1)}%`;
+            document.getElementById('walletBal').innerText = `$${walletBalance.toFixed(2)}`;
+            document.getElementById('activeQtyVal').innerText = activePosition ? activePosition.contracts : 0;
+            let roi = getCurrentRoi();
+            document.getElementById('activeRoiVal').innerHTML = activePosition ? `${roi.toFixed(2)}%` : 'N/A';
+            document.getElementById('activeRoiVal').className = `text-md font-mono font-bold ${roi>=0 ? 'text-green-600':'text-red-500'}`;
+            document.getElementById('liveBadge').innerText = localStorage.getItem('liveMode') === 'true' ? 'LIVE MODE' : 'Paper Mode';
+            // ML Gauge
+            let gaugeVal = mlSignal.avgConfidence || 50;
+            let ctx = document.getElementById('mlGaugeCanvas').getContext('2d');
+            if(window.gaugeChart) window.gaugeChart.destroy();
+            window.gaugeChart = new Chart(ctx, { type: 'doughnut', data: { datasets: [{ data: [gaugeVal, 100-gaugeVal], backgroundColor: ['#0f172a', '#e2e8f0'], borderWidth:0 }] }, options: { cutout: '70%', plugins: { legend: { display: false }, tooltip: { enabled: false } }, rotation: -90, circumference: 180, responsive: true, maintainAspectRatio: true } });
+            document.getElementById('mlSignalText').innerHTML = mlSignal.avgType === 'bull' ? 'BULLISH' : (mlSignal.avgType === 'bear' ? 'BEARISH' : 'NEUTRAL');
+            // trade table
+            let tbody = document.getElementById('tradeTableBody');
+            if(metrics.trades.length === 0) tbody.innerHTML = '<tr><td colspan="3" class="py-4 text-center text-gray-400">No closed trades</td></tr>';
+            else tbody.innerHTML = metrics.trades.slice(0,8).map(t => `<tr class="border-b border-gray-50"><td class="py-2">${new Date(t.timestamp).toLocaleTimeString()}</td><td class="font-bold ${t.side==='long'?'text-green-600':'text-red-600'}">${t.side}</td><td class="font-mono ${t.netPnl>=0?'text-green-600':'text-red-600'}">$${t.netPnl.toFixed(4)}</td></tr>`).join('');
+        }
+        
+        let chart;
+        function drawChart() {
+            let canvas = document.getElementById('mainChart');
+            if(!canvas) return;
+            let prices = chartHistory.slice(-120).map(p=>p.price);
+            let mlVals = chartHistory.slice(-120).map(p=>p.ml);
+            if(chart) chart.destroy();
+            let ctx = canvas.getContext('2d');
+            chart = new Chart(ctx, { type: 'line', data: { labels: prices.map((_,i)=>i), datasets: [{ label:'Price', data: prices, borderColor:'#0f172a', borderWidth:2, pointRadius:0, yAxisID:'y'},{ label:'ML Prob', data: mlVals, borderColor:'#22c55e', borderWidth:1.5, pointRadius:0, yAxisID:'y1'}] }, options: { responsive: true, maintainAspectRatio: true, scales: { y: { ticks: { callback: v=>v.toExponential(2) } }, y1: { min:0, max:1, position:'right' } }, plugins: { legend: { position:'top', labels:{ boxWidth:8, font:{size:9} } } } } });
+        }
+        
+        async function saveConfig() { config.takeProfitPct = parseFloat(document.getElementById('tpInput').value); config.stopLossPct = parseFloat(document.getElementById('slInput').value); config.mlThreshold = parseFloat(document.getElementById('threshInput').value); config.mlLookback = parseInt(document.getElementById('lookInput').value); config.dcaRoiThresholdPct = parseFloat(document.getElementById('dcaRoiInput').value); alert('Config saved (local simulation)'); }
+        async function forceClosePosition() { if(activePosition) closePosition("MANUAL"); updateUI(); }
+        function saveApiKeys() { let live = document.getElementById('liveToggle').checked; localStorage.setItem('liveMode', live); document.getElementById('apiMsg').innerText = live ? 'Live mode enabled (demo simulation)' : 'Paper mode active'; setTimeout(()=>navigateView('dashboard'), 1000); }
+        function runBacktestDemo() { alert('Backtest sim: Using engine logic with 1000x multiplier. Check console for mock.'); }
+        
+        // Fake auth
+        function fakeLogin() { localStorage.setItem('auth_token','demo'); authToken='demo'; document.getElementById('userNameShort').innerText='Trader'; toggleAuthUI(); navigateView('dashboard'); }
+        function fakeRegister() { fakeLogin(); }
+        function logout() { localStorage.removeItem('auth_token'); authToken=null; toggleAuthUI(); navigateView('home'); }
+        function toggleAuthUI() { let logged = !!authToken; document.getElementById('auth-buttons').classList.toggle('hidden', logged); document.getElementById('user-menu').classList.toggle('hidden', !logged); }
+        
+        function navigateView(view) {
+            document.querySelectorAll('.view-section').forEach(el=>el.classList.remove('active-view'));
+            document.getElementById(`view-${view}`).classList.add('active-view');
+            if(view === 'dashboard') { updateUI(); drawChart(); }
+            if(view === 'analytics') { document.getElementById('statOnline').innerText = Math.floor(Math.random()*12)+3; document.getElementById('statViews').innerText = 2847; document.getElementById('statUniques').innerText = 912; document.getElementById('pagesList').innerHTML = '<div>Dashboard: 4 users</div><div>Analytics: 2 users</div>'; }
+        }
+        
+        // init config fields
+        document.getElementById('tpInput').value = config.takeProfitPct;
+        document.getElementById('slInput').value = config.stopLossPct;
+        document.getElementById('threshInput').value = config.mlThreshold;
+        document.getElementById('lookInput').value = config.mlLookback;
+        document.getElementById('dcaRoiInput').value = config.dcaRoiThresholdPct;
+        if(authToken) toggleAuthUI(); else toggleAuthUI();
+        updateUI();
+        drawChart();
+        setInterval(()=>{ if(document.getElementById('view-dashboard').classList.contains('active-view')) { updateUI(); drawChart(); } }, 800);
     </script>
 </body>
 </html>`); });
