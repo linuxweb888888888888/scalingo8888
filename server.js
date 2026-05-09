@@ -1,5 +1,3 @@
---- START OF FILE text/plain ---
-
 const fs = require('fs');
 const ccxt = require('ccxt');
 const express = require('express');
