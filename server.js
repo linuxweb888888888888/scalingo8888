@@ -181,7 +181,7 @@ class PerformanceMetrics {
 }
 
 async function runBacktestSimulation(config, tickCount, symbol) {
-    try { await publicBinance.loadMarkets(); } catch (e) { return { error: `Market error: ${e.message}` }; }
+    try { await publicBinance.loadMarkets(); } catch (e) { return { error: `Market error: \${e.message}` }; }
     let allCandles = [], since = Date.now() - (tickCount * 60 * 1000); 
     try {
         while (allCandles.length < tickCount) {
@@ -265,7 +265,7 @@ async function runBacktestSimulation(config, tickCount, symbol) {
     const formatTime = (ms) => {
         if (ms < 1000) return "< 1s";
         let s = Math.floor(ms / 1000), m = Math.floor(s / 60), h = Math.floor(m / 60), d = Math.floor(h / 24);
-        if (d > 0) return `${d}d ${h%24}h`; if (h > 0) return `${h}h ${m%60}m`; if (m > 0) return `${m}m ${s%60}s`; return `${s}s`;
+        if (d > 0) return `\${d}d \${h%24}h`; if (h > 0) return `\${h}h \${m%60}m`; if (m > 0) return `\${m}m \${s%60}s`; return `\${s}s`;
     };
     return { 
         ticksAnalyzed: ticks.length, totalTradesCount, wins, losses, winRate: totalTradesCount > 0 ? ((wins / totalTradesCount) * 100).toFixed(2) : 0, 
@@ -375,7 +375,7 @@ class UserTradeInstance {
             pos.size = Number(pos.size) + addedSizeUsd; pos.contracts = Number(pos.contracts) + contractsToAdd; 
             pos.marginUsed = Number(pos.marginUsed) + (addedSizeUsd / FORCED_LEVERAGE); pos.dcaStep = step + 1;
             this.metrics.updateMaxMargin(pos.marginUsed); await this.saveState();
-        } catch (err)) {} finally { this.isTrading = false; }
+        } catch (err) { } finally { this.isTrading = false; }
     }
     async syncState(targetSide) {
         if (this.isTrading || this.activePositions.length > 0) return;
@@ -408,7 +408,7 @@ class UserTradeInstance {
             const math = calculateTradeMath(snapPos.side, snapPos.entryPrice, realExitPrice, snapPos.size, FORCED_LEVERAGE, this.config.fees.taker);
             this.metrics.recordTrade({ side: snapPos.side, contracts: snapPos.contracts, entryPrice: snapPos.entryPrice, exitPrice: realExitPrice, marginUsed: math.margin, grossPnl: math.grossPnlUsd, grossRoiPct: math.grossRoiPct, netPnl: math.netPnlUsd, roiPct: math.netRoiPct, feeCost: math.feeCost, exitReason: reason });
             this.lastCloseTime = Date.now(); await this.saveState();
-        } catch (err) {} finally { this.isTrading = false; }
+        } catch (err) { } finally { this.isTrading = false; }
     }
     startExchangeROISync() {
         setInterval(async () => {
