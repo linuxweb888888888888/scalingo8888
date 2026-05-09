@@ -96,7 +96,7 @@ async function authMiddleware(req, res, next) {
     next();
 }
 
-// ==================== CORE MATH & ML (ORIGINAL) ====================
+// ==================== CORE MATH & ML ====================
 function calculateTradeMath(side, entryPrice, currentPrice, sizeUsd, leverage, takerFee) {
     const sideMult = side === 'long' ? 1 : -1;
     const grossPnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100 * sideMult;
@@ -156,7 +156,7 @@ function calculateMLSignal(prices, lookback) {
     return { confidence: Math.min(confidence, 100), type: finalPred >= 0.5 ? 'bull' : 'bear', rawValue: finalPred };
 }
 
-// ==================== METRICS & WORKER (ORIGINAL) ====================
+// ==================== METRICS & BACKTEST ====================
 class PerformanceMetrics {
     constructor(userId) {
         this.userId = userId; this.trades = []; 
@@ -181,7 +181,7 @@ class PerformanceMetrics {
 }
 
 async function runBacktestSimulation(config, tickCount, symbol) {
-    try { await publicBinance.loadMarkets(); } catch (e) { return { error: \`Market error: \${e.message}\` }; }
+    try { await publicBinance.loadMarkets(); } catch (e) { return { error: `Market error: ${e.message}` }; }
     let allCandles = [], since = Date.now() - (tickCount * 60 * 1000); 
     try {
         while (allCandles.length < tickCount) {
@@ -194,7 +194,7 @@ async function runBacktestSimulation(config, tickCount, symbol) {
         }
     } catch (e) { if (allCandles.length === 0) allCandles = await publicBinance.fetchOHLCV(symbol, '1m', undefined, Math.min(tickCount, 1000)).catch(()=>[]) || []; }
     const ticks = allCandles.map(c => ({ timestamp: c[0], priceMid: c[4] }));
-    if (!ticks || ticks.length === 0) return { error: \`No historical tick data fetched.\` };
+    if (!ticks || ticks.length === 0) return { error: `No historical tick data fetched.` };
     let activePos = null, closedTrades = [], netPnl = 0, wins = 0, losses = 0, totalTradeDurationMs = 0, maxMarginUsed = 0;
     const { mlLookback=50, mlThreshold=60.0, mlAverageTicks=5, mlUseAverage=false, flipOnlyInProfit=true, flipThresholdPct=0.5 } = config;
     let priceBuffer = [], mlRawBuffer = [];
@@ -265,7 +265,7 @@ async function runBacktestSimulation(config, tickCount, symbol) {
     const formatTime = (ms) => {
         if (ms < 1000) return "< 1s";
         let s = Math.floor(ms / 1000), m = Math.floor(s / 60), h = Math.floor(m / 60), d = Math.floor(h / 24);
-        if (d > 0) return \`\${d}d \${h%24}h\`; if (h > 0) return \`\${h}h \${m%60}m\`; if (m > 0) return \`\${m}m \${s%60}s\`; return \`\${s}s\`;
+        if (d > 0) return `${d}d ${h%24}h`; if (h > 0) return `${h}h ${m%60}m`; if (m > 0) return `${m}m ${s%60}s`; return `${s}s`;
     };
     return { 
         ticksAnalyzed: ticks.length, totalTradesCount, wins, losses, winRate: totalTradesCount > 0 ? ((wins / totalTradesCount) * 100).toFixed(2) : 0, 
@@ -456,7 +456,7 @@ async function startMasterStreams() {
 
 async function loadAllUsers() { try { const users = await UserModel.find({}); for(const u of users) { try { const worker = new UserTradeInstance(u); await worker.initialize(); activeWorkers.set(u._id.toString(), worker); if (u.token) tokenCache.set(u.token, { user: u, lastAccessed: Date.now() }); } catch(we) {} } } catch(e) {} }
 
-// ==================== EXPRESS & API (ORIGINAL) ====================
+// ==================== EXPRESS & API ====================
 const app = express(); app.use(express.json());
 
 app.post('/api/analytics/track', async (req, res) => {
@@ -512,7 +512,7 @@ app.get('/api/chart-history', (req, res) => res.json(memoryChartHistory.slice(-8
 app.get('/api/close-all', authMiddleware, async (req, res) => { const worker = activeWorkers.get(req.user._id.toString()); if(worker) await worker.forceClosePosition("MANUAL_FORCE_CLOSE").catch(()=>{}); res.json({status: 'ok'}); });
 
 // ==================== FRONTEND (ANDROID MOBILE DESIGN) ====================
-app.get('/', (req, res) => { res.send(\`<!DOCTYPE html>
+app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -523,27 +523,24 @@ app.get('/', (req, res) => { res.send(\`<!DOCTYPE html>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        :root { --surface: #f7f9fc; --on-surface: #1a1c1e; --primary: #0061a4; --secondary-container: #d1e4ff; }
+        :root { --surface: #f7f9fc; --on-surface: #1a1c1e; --primary: #0061a4; --secondary-container: #d1e4ff; --error: #ba1a1a; }
         body { font-family: 'Roboto', sans-serif; background-color: var(--surface); color: var(--on-surface); -webkit-tap-highlight-color: transparent; overflow-x: hidden; }
         .app-bar { position: fixed; top: 0; left: 0; right: 0; height: 64px; background: white; display: flex; align-items: center; padding: 0 16px; z-index: 100; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
         .bottom-nav { position: fixed; bottom: 0; left: 0; right: 0; height: 80px; background: white; border-top: 1px solid #eee; display: flex; justify-content: space-around; align-items: center; z-index: 100; padding-bottom: env(safe-area-inset-bottom); }
         .nav-item { display: flex; flex-direction: column; align-items: center; color: #444; font-size: 11px; font-weight: 500; gap: 4px; flex: 1; }
         .nav-item.active { color: var(--primary); }
         .nav-item.active .material-symbols-outlined { background: var(--secondary-container); border-radius: 16px; padding: 2px 16px; font-variation-settings: 'FILL' 1; }
-        
         .main-container { margin-top: 64px; margin-bottom: 90px; padding: 16px; min-height: calc(100vh - 154px); }
         .view-section { display: none; animation: slideUp 0.3s cubic-bezier(0.2, 0.8, 0.2, 1); }
         .active-view { display: block; }
         @keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
-
         .m3-card { background: white; border-radius: 12px; padding: 16px; margin-bottom: 12px; border: 1px solid #eef2f6; }
         .m3-input-group { position: relative; margin-bottom: 16px; }
         .m3-input { width: 100%; border: 1px solid #8e9199; border-radius: 4px; padding: 10px; background: transparent; font-size: 14px; outline: none; transition: border-color 0.2s; }
         .m3-input:focus { border-color: var(--primary); border-width: 2px; }
         .m3-label { position: absolute; left: 10px; top: -10px; background: white; padding: 0 4px; font-size: 11px; color: #444; font-weight: 500; }
         .m3-select { width: 100%; border: 1px solid #8e9199; border-radius: 4px; padding: 10px; background: white; font-size: 14px; appearance: none; }
-
-        .btn-fab { position: fixed; bottom: 100px; right: 16px; width: 56px; height: 56px; background: var(--primary); border-radius: 16px; display: flex; items: center; justify-content: center; color: white; box-shadow: 0 4px 12px rgba(0,0,0,0.2); z-index: 90; }
+        .btn-fab { position: fixed; bottom: 96px; right: 20px; width: 56px; height: 56px; background: var(--error); border-radius: 50%; display: flex; items: center; justify-content: center; color: white; box-shadow: 0 4px 12px rgba(0,0,0,0.25); z-index: 150; border: none; cursor: pointer; }
         .metric-label { font-size: 10px; font-weight: 700; color: #74777f; text-transform: uppercase; letter-spacing: 0.5px; }
         .metric-value { font-family: 'Roboto Mono', monospace; font-size: 16px; font-weight: 700; }
         #chartWrapper { height: 180px; width: 100%; }
@@ -567,14 +564,12 @@ app.get('/', (req, res) => { res.send(\`<!DOCTYPE html>
 
     <main class="main-container">
 
-        <!-- HOME VIEW -->
+        <!-- HOME -->
         <section id="view-home" class="view-section active-view">
             <div class="py-8 text-center">
-                <div class="w-20 h-20 bg-blue-50 rounded-3xl flex items-center justify-center mx-auto mb-6">
-                    <span class="material-symbols-outlined text-4xl text-blue-600">bolt</span>
-                </div>
+                <div class="w-20 h-20 bg-blue-50 rounded-3xl flex items-center justify-center mx-auto mb-6"><span class="material-symbols-outlined text-4xl text-blue-600">bolt</span></div>
                 <h2 class="text-3xl font-bold tracking-tight mb-2">Automated SHIB<br>AI Trading</h2>
-                <p class="text-gray-500 text-sm px-4 mb-8">Deploy powerful machine learning strategies directly from your mobile device.</p>
+                <p class="text-gray-500 text-sm px-4 mb-8">Deploy machine learning strategies directly from your mobile device.</p>
                 <div class="space-y-3 px-4" id="home-auth-btns">
                     <button onclick="nav('login')" class="w-full py-4 bg-black text-white rounded-2xl font-bold text-sm">Sign In</button>
                     <button onclick="nav('register')" class="w-full py-4 bg-white border border-gray-200 text-black rounded-2xl font-bold text-sm">Create Account</button>
@@ -582,7 +577,7 @@ app.get('/', (req, res) => { res.send(\`<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- DASHBOARD VIEW -->
+        <!-- DASHBOARD -->
         <section id="view-dashboard" class="view-section">
             <div class="grid grid-cols-2 gap-3 mb-3">
                 <div class="m3-card !mb-0 flex flex-col justify-between"><span class="metric-label">Net PnL</span><span id="netPnl" class="metric-value">$0.00</span></div>
@@ -603,7 +598,61 @@ app.get('/', (req, res) => { res.send(\`<!DOCTYPE html>
             <div class="m3-card"><h3 class="text-[10px] font-bold uppercase text-gray-400 mb-3">Recent Executions</h3><div id="tradeHistoryBody" class="space-y-3"><p class="text-center py-4 text-xs text-gray-400">No trades found.</p></div></div>
         </section>
 
-        <!-- BACKTEST VIEW -->
+        <!-- SETUP MENU (EVERY SETTING RESTORED) -->
+        <section id="view-settings" class="view-section">
+            <h2 class="text-xl font-bold mb-4">Strategy Setup</h2>
+            <div class="m3-card">
+                <h3 class="text-xs font-bold uppercase text-gray-400 mb-4">HTX API Connection</h3>
+                <div class="m3-input-group"><label class="m3-label">API Key</label><input type="password" id="apiKey" class="m3-input"></div>
+                <div class="m3-input-group"><label class="m3-label">API Secret</label><input type="password" id="apiSecret" class="m3-input"></div>
+                <div class="flex items-center justify-between py-2 px-1"><span class="text-xs font-bold">Enable Live Trading</span><input type="checkbox" id="liveTrade" class="w-6 h-6 accent-blue-600"></div>
+                <button onclick="saveApiKeys()" class="w-full py-3 mt-3 bg-black text-white rounded-xl font-bold text-xs">Update Connection</button>
+                <p id="key-msg" class="text-[9px] text-center mt-2"></p>
+            </div>
+            <div class="m3-card">
+                <h3 class="text-xs font-bold uppercase text-gray-400 mb-4">ML Engine Logic</h3>
+                <div class="grid grid-cols-2 gap-3">
+                    <div class="m3-input-group"><label class="m3-label">Lookback</label><input type="number" id="mlLookbackSens" class="m3-input"></div>
+                    <div class="m3-input-group"><label class="m3-label">Threshold %</label><input type="number" id="mlThresholdSens" class="m3-input"></div>
+                </div>
+                <div class="m3-input-group"><label class="m3-label">Smoothing (Ticks)</label><input type="number" id="mlAverageTicksSens" class="m3-input"></div>
+                <div class="m3-input-group">
+                    <label class="m3-label">Signal Trigger</label>
+                    <select id="mlUseAverageSens" class="m3-select"><option value="false">Raw Signal</option><option value="true">Averaged</option></select>
+                </div>
+            </div>
+            <div class="m3-card">
+                <h3 class="text-xs font-bold uppercase text-gray-400 mb-4">Risk & Exit</h3>
+                <div class="grid grid-cols-2 gap-3">
+                    <div class="m3-input-group"><label class="m3-label">Take Profit %</label><input type="number" id="tpPctSens" class="m3-input" step="0.1"></div>
+                    <div class="m3-input-group"><label class="m3-label">Stop Loss %</label><input type="number" id="slPctSens" class="m3-input" step="0.1"></div>
+                </div>
+                <div class="m3-input-group">
+                    <label class="m3-label">Loss Behavior</label>
+                    <select id="flipOnlyInProfitSens" class="m3-select"><option value="true">DCA in Loss</option><option value="false">Force Flip</option></select>
+                </div>
+                <div class="m3-input-group"><label class="m3-label">Flip ROI Threshold %</label><input type="number" id="flipThresholdSens" class="m3-input" step="0.1"></div>
+            </div>
+            <div class="m3-card">
+                <h3 class="text-xs font-bold uppercase text-gray-400 mb-4">DCA & Profit Scaling</h3>
+                <div class="grid grid-cols-2 gap-3">
+                    <div class="m3-input-group"><label class="m3-label">Loss DCA ROI</label><input type="number" id="dcaRoiThresholdSens" class="m3-input" step="0.1"></div>
+                    <div class="m3-input-group"><label class="m3-label">Loss Mult</label><input type="number" id="dcaMultiplierSens" class="m3-input" step="0.1"></div>
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                    <div class="m3-input-group"><label class="m3-label">Profit Scale ROI</label><input type="number" id="profitRoiThresholdSens" class="m3-input" step="0.1"></div>
+                    <div class="m3-input-group"><label class="m3-label">Profit Mult</label><input type="number" id="profitMultiplierSens" class="m3-input" disabled></div>
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                    <div class="m3-input-group"><label class="m3-label">Start Contracts</label><input type="number" id="baseContracts" class="m3-input" disabled></div>
+                    <div class="m3-input-group"><label class="m3-label">Max Scaling</label><input type="number" id="maxContractsSens" class="m3-input" disabled></div>
+                </div>
+            </div>
+            <button onclick="saveConfig()" class="w-full py-4 bg-blue-600 text-white rounded-2xl font-bold text-sm shadow-lg mb-4">Save Strategy Config</button>
+            <button onclick="logout()" class="w-full py-4 text-red-500 font-bold text-sm">Logout</button>
+        </section>
+
+        <!-- BACKTEST -->
         <section id="view-backtest" class="view-section">
             <h2 class="text-xl font-bold mb-4">Backtest Engine</h2>
             <div class="m3-card">
@@ -626,76 +675,13 @@ app.get('/', (req, res) => { res.send(\`<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- SETUP / SETTINGS VIEW (ALL ORIGINAL SETTINGS RESTORED) -->
-        <section id="view-settings" class="view-section">
-            <h2 class="text-xl font-bold mb-4">Strategy Setup</h2>
-            
-            <!-- Exchange API -->
-            <div class="m3-card">
-                <h3 class="text-xs font-bold uppercase text-gray-400 mb-4">HTX API Connection</h3>
-                <div class="m3-input-group"><label class="m3-label">API Key</label><input type="password" id="apiKey" class="m3-input"></div>
-                <div class="m3-input-group"><label class="m3-label">API Secret</label><input type="password" id="apiSecret" class="m3-input"></div>
-                <div class="flex items-center justify-between py-2 px-1"><span class="text-xs font-bold">Enable Live Trading</span><input type="checkbox" id="liveTrade" class="w-6 h-6 accent-blue-600"></div>
-                <button onclick="saveApiKeys()" class="w-full py-3 mt-3 bg-black text-white rounded-xl font-bold text-xs">Update Connection</button>
-                <p id="key-msg" class="text-[9px] text-center mt-2"></p>
-            </div>
-
-            <!-- ML Logic -->
-            <div class="m3-card">
-                <h3 class="text-xs font-bold uppercase text-gray-400 mb-4">ML Engine Logic</h3>
-                <div class="grid grid-cols-2 gap-3">
-                    <div class="m3-input-group"><label class="m3-label">Lookback</label><input type="number" id="mlLookbackSens" class="m3-input"></div>
-                    <div class="m3-input-group"><label class="m3-label">Threshold %</label><input type="number" id="mlThresholdSens" class="m3-input"></div>
-                </div>
-                <div class="m3-input-group"><label class="m3-label">Smoothing (Ticks)</label><input type="number" id="mlAverageTicksSens" class="m3-input"></div>
-                <div class="m3-input-group">
-                    <label class="m3-label">Signal Trigger</label>
-                    <select id="mlUseAverageSens" class="m3-select"><option value="false">Raw Signal</option><option value="true">Averaged</option></select>
-                </div>
-            </div>
-
-            <!-- Risk & Exit -->
-            <div class="m3-card">
-                <h3 class="text-xs font-bold uppercase text-gray-400 mb-4">Risk & Exit</h3>
-                <div class="grid grid-cols-2 gap-3">
-                    <div class="m3-input-group"><label class="m3-label">Take Profit %</label><input type="number" id="tpPctSens" class="m3-input" step="0.1"></div>
-                    <div class="m3-input-group"><label class="m3-label">Stop Loss %</label><input type="number" id="slPctSens" class="m3-input" step="0.1"></div>
-                </div>
-                <div class="m3-input-group">
-                    <label class="m3-label">Loss Behavior</label>
-                    <select id="flipOnlyInProfitSens" class="m3-select"><option value="true">DCA in Loss</option><option value="false">Force Flip</option></select>
-                </div>
-                <div class="m3-input-group"><label class="m3-label">Flip ROI Threshold %</label><input type="number" id="flipThresholdSens" class="m3-input" step="0.1"></div>
-            </div>
-
-            <!-- Scaling & Multipliers -->
-            <div class="m3-card">
-                <h3 class="text-xs font-bold uppercase text-gray-400 mb-4">DCA & Profit Scaling</h3>
-                <div class="grid grid-cols-2 gap-3">
-                    <div class="m3-input-group"><label class="m3-label">Loss DCA ROI</label><input type="number" id="dcaRoiThresholdSens" class="m3-input" step="0.1"></div>
-                    <div class="m3-input-group"><label class="m3-label">Loss Mult</label><input type="number" id="dcaMultiplierSens" class="m3-input" step="0.1"></div>
-                </div>
-                <div class="grid grid-cols-2 gap-3">
-                    <div class="m3-input-group"><label class="m3-label">Profit Scale ROI</label><input type="number" id="profitRoiThresholdSens" class="m3-input" step="0.1"></div>
-                    <div class="m3-input-group"><label class="m3-label">Profit Mult</label><input type="number" id="profitMultiplierSens" class="m3-input" disabled></div>
-                </div>
-                <div class="grid grid-cols-2 gap-3">
-                    <div class="m3-input-group"><label class="m3-label">Start Contracts</label><input type="number" id="baseContracts" class="m3-input" disabled></div>
-                    <div class="m3-input-group"><label class="m3-label">Max Scaling</label><input type="number" id="maxContractsSens" class="m3-input" disabled></div>
-                </div>
-            </div>
-
-            <button onclick="saveConfig()" class="w-full py-4 bg-blue-600 text-white rounded-2xl font-bold text-sm shadow-lg mb-4">Save Strategy Config</button>
-            <button onclick="logout()" class="w-full py-4 text-red-500 font-bold text-sm">Log out of Terminal</button>
-        </section>
-
-        <!-- LOGIN / REGISTER (HIDDEN BY DEFAULT) -->
+        <!-- AUTH -->
         <section id="view-login" class="view-section"><h2 class="text-2xl font-bold mb-6">Sign In</h2><div class="m3-card"><div class="m3-input-group"><label class="m3-label">Email</label><input type="email" id="login-email" class="m3-input"></div><div class="m3-input-group"><label class="m3-label">Password</label><input type="password" id="login-pass" class="m3-input"></div><button onclick="doLogin()" class="w-full py-4 bg-black text-white rounded-2xl font-bold">Login</button><p id="login-err" class="text-red-500 text-xs mt-3 text-center"></p></div></section>
         <section id="view-register" class="view-section"><h2 class="text-2xl font-bold mb-6">Register</h2><div class="m3-card"><div class="m3-input-group"><label class="m3-label">Name</label><input type="text" id="reg-name" class="m3-input"></div><div class="m3-input-group"><label class="m3-label">Email</label><input type="email" id="reg-email" class="m3-input"></div><div class="m3-input-group"><label class="m3-label">Password</label><input type="password" id="reg-pass" class="m3-input"></div><button onclick="doRegister()" class="w-full py-4 bg-black text-white rounded-2xl font-bold">Sign Up</button><p id="reg-err" class="text-red-500 text-xs mt-3 text-center"></p></div></section>
 
     </main>
 
-    <button id="fabClose" class="btn-fab hidden" onclick="closeAll()"><span class="material-symbols-outlined">close</span></button>
+    <button id="fabClose" class="btn-fab hidden" onclick="closeAll()" title="Close All"><span class="material-symbols-outlined">close</span></button>
 
     <nav class="bottom-nav">
         <button onclick="nav('home')" id="nav-home" class="nav-item active"><span class="material-symbols-outlined">home</span><span>Home</span></button>
@@ -710,24 +696,24 @@ app.get('/', (req, res) => { res.send(\`<!DOCTYPE html>
         let dashLoop = null;
         let settingsLoaded = false;
 
-        function nav(viewId) {
+        function nav(v) {
             document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active-view'));
-            document.getElementById('view-' + viewId).classList.add('active-view');
+            document.getElementById('view-' + v).classList.add('active-view');
             document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
-            const activeNav = document.getElementById('nav-' + (['login','register'].includes(viewId) ? 'home' : viewId));
+            const activeNav = document.getElementById('nav-' + (['login','register'].includes(v) ? 'home' : v));
             if(activeNav) activeNav.classList.add('active');
-            if(viewId === 'dashboard' && authToken) initDashboard();
+            if(v === 'dashboard' && authToken) initDashboard();
             const fab = document.getElementById('fabClose');
-            if(viewId === 'dashboard' && authToken) fab.classList.remove('hidden'); else fab.classList.add('hidden');
+            if(v === 'dashboard' && authToken) fab.classList.remove('hidden'); else fab.classList.add('hidden');
             window.scrollTo(0,0);
         }
 
         function logout() { localStorage.removeItem('bot_token'); location.reload(); }
 
         async function doAPI(endpoint, method, body) {
-            const headers = { 'Content-Type': 'application/json' };
-            if (authToken) headers['Authorization'] = authToken;
-            const res = await fetch(endpoint, { method, headers, body: body ? JSON.stringify(body) : undefined });
+            const h = { 'Content-Type': 'application/json' };
+            if (authToken) h['Authorization'] = authToken;
+            const res = await fetch(endpoint, { method, headers: h, body: body ? JSON.stringify(body) : undefined });
             if (res.status === 401) { logout(); return { error: "Expired" }; }
             return await res.json();
         }
@@ -745,7 +731,6 @@ app.get('/', (req, res) => { res.send(\`<!DOCTYPE html>
             if(data.error) return;
 
             if(!settingsLoaded) {
-                // Populate all Setup fields
                 document.getElementById("tpPctSens").value = data.config.takeProfitPct;
                 document.getElementById("slPctSens").value = data.config.stopLossPct; 
                 document.getElementById("mlLookbackSens").value = data.config.mlLookback || 50;
@@ -805,7 +790,7 @@ app.get('/', (req, res) => { res.send(\`<!DOCTYPE html>
         }
 
         async function saveConfig() {
-            const payload = {
+            const p = {
                 tpPct: document.getElementById("tpPctSens").value, slPct: document.getElementById("slPctSens").value,
                 mlLookbackSens: document.getElementById("mlLookbackSens").value, mlThresholdSens: document.getElementById("mlThresholdSens").value,
                 mlAverageTicksSens: document.getElementById("mlAverageTicksSens").value, mlUseAverageSens: document.getElementById("mlUseAverageSens").value,
@@ -813,8 +798,8 @@ app.get('/', (req, res) => { res.send(\`<!DOCTYPE html>
                 dcaRoiThresholdSens: document.getElementById("dcaRoiThresholdSens").value, dcaMultiplierSens: document.getElementById("dcaMultiplierSens").value,
                 profitRoiThresholdSens: document.getElementById("profitRoiThresholdSens").value
             };
-            await doAPI('/api/user/config', 'POST', payload);
-            alert("Strategy Updated Successfully");
+            await doAPI('/api/user/config', 'POST', p);
+            alert("Strategy Updated");
         }
 
         async function saveApiKeys() {
@@ -861,7 +846,7 @@ app.get('/', (req, res) => { res.send(\`<!DOCTYPE html>
         if(authToken) nav('dashboard'); else nav('home');
     </script>
 </body>
-</html>\`);
+</html>`);
 });
 
-app.listen(CUSTOM_PORT, async () => { console.log(\`✅ Server running on port \${CUSTOM_PORT}\`); await loadAllUsers(); startMasterStreams(); });
+app.listen(CUSTOM_PORT, async () => { console.log(`✅ Server running on port ${CUSTOM_PORT}`); await loadAllUsers(); startMasterStreams(); });
