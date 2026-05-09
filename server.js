@@ -554,7 +554,10 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             <div class="w-8 h-8 rounded-lg bg-black flex items-center justify-center text-white text-xs font-bold">TB</div>
             <div class="flex-1">
                 <h1 class="text-sm font-bold leading-none">TradeBot Engine</h1>
-                <span id="statusBadge" class="text-[10px] text-gray-400 font-bold uppercase">Connecting...</span>
+                <div class="flex items-center gap-1.5">
+                    <span id="statusBadge" class="text-[10px] text-gray-400 font-bold uppercase">Connecting...</span>
+                    <span class="text-[8px] text-gray-300 font-bold uppercase tracking-tight">| developed by Rayner Teo</span>
+                </div>
             </div>
             <div id="userProfile" class="hidden flex items-center gap-2">
                 <span id="nav-user-name" class="text-xs font-bold text-gray-600"></span>
