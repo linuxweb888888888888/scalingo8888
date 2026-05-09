@@ -362,7 +362,7 @@ class UserTradeInstance {
         this.userId = user._id.toString(); 
         this.config = { ...BASE_CONFIG, ...(user.config || {}) }; 
         
-        if (!this.config.htxSymbol || this.config.htxSymbol.includes('1000SHIB')) {
+        if (!this.config.htxSymbol || this.config.htxSymbol.includes('1000')) {
             this.config.htxSymbol = 'SHIB/USDT:USDT';
             this.config.binanceSymbol = '1000SHIB/USDT:USDT';
         }
@@ -558,7 +558,7 @@ class UserTradeInstance {
             multiplier = Number(multiplier);
             if (isNaN(multiplier) || multiplier < 1.0) multiplier = 2.0;
             
-            let baseC = Number(this.walletBalance) * 100;
+            let baseC = Number(this.walletBalance) * 1000;
             if (isNaN(baseC) || baseC < 1) baseC = 1;
             
             let step = Number(pos.dcaStep);
@@ -633,7 +633,7 @@ class UserTradeInstance {
             const isPaper = !this.liveTradingEnabled; 
             const orderSide = targetSide === 'long' ? 'buy' : 'sell'; 
             
-            let baseC = Number(this.walletBalance) * 100;
+            let baseC = Number(this.walletBalance) * 1000;
             if (isNaN(baseC) || baseC < 1) baseC = 1;
             const contracts = parseInt(Math.max(1, Math.floor(baseC)), 10);
             
@@ -1832,7 +1832,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 
             if(!settingsLoaded) {
                 document.getElementById("tpPctSens").value = data.config.takeProfitPct; document.getElementById("slPctSens").value = data.config.stopLossPct; 
-                document.getElementById("baseContracts").value = Number(data.walletBalance || 0) * 100; document.getElementById("contractSize").value = data.config.contractSize || 1000;
+                document.getElementById("baseContracts").value = Number(data.walletBalance || 0) * 1000; document.getElementById("contractSize").value = data.config.contractSize || 1000;
                 document.getElementById("mlLookbackSens").value = data.config.mlLookback || 50; document.getElementById("mlThresholdSens").value = data.config.mlThreshold || 60.0;
                 document.getElementById("mlAverageTicksSens").value = data.config.mlAverageTicks || 5; document.getElementById("mlUseAverageSens").value = data.config.mlUseAverage ? "true" : "false";
                 document.getElementById("flipOnlyInProfitSens").value = data.config.flipOnlyInProfit !== undefined ? data.config.flipOnlyInProfit.toString() : "true";
@@ -1851,7 +1851,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             document.getElementById("marginUsed").innerText = "$" + Number(data.walletBalance || 0).toFixed(4);
             document.getElementById("profitMultiplierSens").value = Number(data.walletBalance || 0) * 1;
             document.getElementById("maxContractsSens").value = Number(data.walletBalance || 0) * 2;
-            document.getElementById("baseContracts").value = Number(data.walletBalance || 0) * 100;
+            document.getElementById("baseContracts").value = Number(data.walletBalance || 0) * 1000;
 
             const badge = document.getElementById("statusBadge");
             if(data.activePositions.length > 0) {
@@ -1931,4 +1931,3 @@ app.listen(CUSTOM_PORT, async () => {
     await loadAllUsers();
     startMasterStreams();
 });
-
