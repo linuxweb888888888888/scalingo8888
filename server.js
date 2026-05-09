@@ -1,12 +1,3 @@
-To update the Start Contracts logic to use a 1000x multiplier of the wallet
-balance (instead of 100x), I have modified the calculations in the syncState
-(opening trades), addDcaPosition (scaling trades), and the frontend display
-logic.
-
-The rest of the code remains identical to your original file.
-
---- START OF FILE text/plain ---
-
 const fs = require('fs');
 const ccxt = require('ccxt');
 const express = require('express');
