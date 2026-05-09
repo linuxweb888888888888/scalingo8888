@@ -515,25 +515,30 @@ class UserTradeInstance {
         try {
             const pos = this.activePositions[0];
             
-            let currentPrice = pos.side === 'long' ? globalMarketData.binance.bid : globalMarketData.binance.ask;
-            if (!currentPrice) currentPrice = globalMarketData.binance.mid;
-            const pnlPercent = pos.side === 'long' ? ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100 : ((pos.entryPrice - currentPrice) / pos.entryPrice) * 100;
-            let instantRoi = pnlPercent * FORCED_LEVERAGE;
+            // PRIORITY: Use Exchange ROI for Live triggers to avoid calculation errors
+            let effectiveRoi = 0;
+            if (this.liveTradingEnabled && !pos.isPaper) {
+                effectiveRoi = pos.exchangeROI || 0;
+            } else {
+                let currentPrice = pos.side === 'long' ? globalMarketData.binance.bid : globalMarketData.binance.ask;
+                if (!currentPrice) currentPrice = globalMarketData.binance.mid;
+                const pnlPercent = pos.side === 'long' ? ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100 : ((pos.entryPrice - currentPrice) / pos.entryPrice) * 100;
+                effectiveRoi = pnlPercent * FORCED_LEVERAGE;
+            }
             
-            if (instantRoi >= this.config.takeProfitPct) {
+            if (effectiveRoi >= this.config.takeProfitPct) {
                 await this.forceClosePosition("TAKE_PROFIT");
-            } else if (instantRoi <= this.config.stopLossPct) {
+            } else if (effectiveRoi <= this.config.stopLossPct) {
                 await this.forceClosePosition("STOP_LOSS");
             } else {
                 const requiredRoiForDca = -(Math.abs(this.config.dcaRoiThresholdPct || 1.0));
                 const profitScaleThreshold = this.config.profitRoiThresholdPct !== undefined ? this.config.profitRoiThresholdPct : 2.0;
                 
-                // LIVE/PAPER: Loss DCA is UNLIMITED
-                if (instantRoi <= requiredRoiForDca && Date.now() - (pos.lastDcaTime || 0) > 10000) {
+                // LIVE/PAPER: Evaluate against exchange ROI
+                if (effectiveRoi <= requiredRoiForDca && Date.now() - (pos.lastDcaTime || 0) > 10000) {
                     await this.addDcaPosition(false);
                 } 
-                // LIVE/PAPER: Profit Scaling triggers eval
-                else if (instantRoi >= profitScaleThreshold && Date.now() - (pos.lastDcaTime || 0) > 10000) {
+                else if (effectiveRoi >= profitScaleThreshold && Date.now() - (pos.lastDcaTime || 0) > 10000) {
                     await this.addDcaPosition(true);
                 }
             }
@@ -595,11 +600,15 @@ class UserTradeInstance {
                 }
             }
 
-            // RECORD THE STEP INTO HISTORY
+            // INJECTED: RECORD THE STEP WITH OFFICIAL EXCHANGE ROI
             if(!pos.stepHistory) pos.stepHistory = [];
-            const curP = pos.side === 'long' ? globalMarketData.binance.bid : globalMarketData.binance.ask;
-            const roiAtTrigger = pos.exchangeROI || 0;
-            pos.stepHistory.push({ step: step + 1, type: isProfitScale ? 'SCALE' : 'DCA', price: realExecPrice, roi: roiAtTrigger, time: Date.now() });
+            pos.stepHistory.push({
+                step: step + 1,
+                type: isProfitScale ? 'SCALE' : 'DCA',
+                price: realExecPrice,
+                roi: pos.exchangeROI || 0,
+                time: Date.now()
+            });
 
             const addedSizeUsd = contractsToAdd * (Number(this.config.contractSize) || 1000) * realExecPrice;
             
@@ -645,6 +654,7 @@ class UserTradeInstance {
             const sizeUsd = contracts * (Number(this.config.contractSize) || 1000) * executionPrice;
             const marginUsed = sizeUsd / FORCED_LEVERAGE;
             
+            // INITIALIZE HISTORY WITH STEP 0
             this.activePositions = [{ id: Date.now(), side: targetSide, entryPrice: Number(executionPrice), contracts: Number(contracts), size: Number(sizeUsd), marginUsed: Number(marginUsed), entryTime: Date.now(), exchangeROI: 0, exchangePnl: 0, isPaper, lastDcaTime: 0, dcaStep: 0, stepHistory: [{ step: 0, type: 'OPEN', price: executionPrice, roi: 0, time: Date.now() }] }];
             
             this.metrics.updateMaxMargin(marginUsed); 
@@ -1091,7 +1101,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 <button onclick="nav('backtest')" class="text-gray-500 hover:text-black transition flex items-center gap-1"><span class="material-symbols-outlined text-[18px]">science</span></button>
                 <button onclick="nav('analytics')" class="text-gray-500 hover:text-black transition flex items-center gap-1"><span class="material-symbols-outlined text-[18px]">monitoring</span></button>
                 <button onclick="nav('dashboard')" class="hover:text-black transition">Dashboard</button>
-                <!-- ADDED MENU ITEM -->
+                <!-- NEW STEP HISTORY TAB -->
                 <button onclick="nav('step-history')" class="hover:text-black transition">Step History</button>
                 <button onclick="logout()" class="text-red-500 hover:text-red-700 transition">Logout</button>
             </nav>
@@ -1520,12 +1530,12 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- ADDED STEP HISTORY SECTION -->
+        <!-- STEP HISTORY VIEW -->
         <section id="view-step-history" class="view-section max-w-5xl mx-auto px-4 py-12">
             <div class="text-center mb-10">
                 <span class="material-symbols-outlined text-4xl text-black">layers</span>
-                <h2 class="text-3xl font-bold mt-2">Position Step Breakdown</h2>
-                <p class="text-gray-500 mt-2">A history of execution points for the current active position.</p>
+                <h2 class="text-3xl font-bold mt-2">Active Position Step Breakdown</h2>
+                <p class="text-gray-500 mt-2">Historical execution triggers for the current active trade.</p>
             </div>
             <div class="ui-card p-6 border border-gray-100">
                 <div class="overflow-x-auto">
@@ -1533,9 +1543,9 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                         <thead class="text-gray-400 uppercase text-[10px] tracking-wider border-b border-gray-100">
                             <tr>
                                 <th class="pb-3 px-2">Step #</th>
-                                <th class="pb-3 px-2">Type</th>
-                                <th class="pb-3 px-2">Price</th>
-                                <th class="pb-3 px-2">ROI at Step</th>
+                                <th class="pb-3 px-2">Action</th>
+                                <th class="pb-3 px-2">Trigger Price</th>
+                                <th class="pb-3 px-2">ROI at Trigger</th>
                                 <th class="pb-3 px-2">Time</th>
                             </tr>
                         </thead>
@@ -1798,25 +1808,25 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         async function fetchMetrics() {
             if(document.getElementById('view-dashboard').classList.contains('active-view') === false && 
                document.getElementById('view-step-history').classList.contains('active-view') === false) return;
-            
+
             const data = await doAPI('/api/data', 'GET'); if(data.error) return;
 
-            // UPDATE STEP HISTORY UI
+            // INJECTED: REFRESH STEP HISTORY TABLE IF VIEW IS ACTIVE
             if (document.getElementById('view-step-history').classList.contains('active-view')) {
-                const stepTbody = document.getElementById("stepHistoryBody");
+                const tbody = document.getElementById("stepHistoryBody");
                 if (data.activePositions.length > 0 && data.activePositions[0].stepHistory) {
-                    stepTbody.innerHTML = "";
+                    tbody.innerHTML = "";
                     data.activePositions[0].stepHistory.forEach(s => {
                         const d = new Date(s.time), tStr = d.getHours().toString().padStart(2,"0")+":"+d.getMinutes().toString().padStart(2,"0")+":"+d.getSeconds().toString().padStart(2,"0");
-                        stepTbody.innerHTML += '<tr class="border-b border-gray-50 hover:bg-gray-50">' +
+                        tbody.innerHTML += '<tr class="border-b border-gray-50 hover:bg-gray-50">' +
                             '<td class="py-3 px-2 font-bold text-gray-800">' + s.step + '</td>' +
                             '<td class="py-3 px-2 font-bold ' + (s.type === 'DCA' ? 'text-red-500' : 'text-blue-500') + '">' + s.type + '</td>' +
-                            '<td class="py-3 px-2">$' + Number(s.price).toFixed(8) + '</td>' +
+                            '<td class="py-3 px-2">$' + s.price.toFixed(8) + '</td>' +
                             '<td class="py-3 px-2 font-bold ' + (s.roi >= 0 ? 'text-green-600' : 'text-red-600') + '">' + s.roi.toFixed(2) + '%</td>' +
                             '<td class="py-3 px-2 text-gray-400">' + tStr + '</td></tr>';
                     });
                 } else {
-                    stepTbody.innerHTML = '<tr><td colspan="5" class="py-10 text-center text-gray-400 font-sans">No active position tracked.</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="5" class="py-10 text-center text-gray-400 font-sans">No active position data found.</td></tr>';
                 }
             }
 
@@ -1921,3 +1931,4 @@ app.listen(CUSTOM_PORT, async () => {
     await loadAllUsers();
     startMasterStreams();
 });
+
