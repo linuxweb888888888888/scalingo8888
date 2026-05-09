@@ -55,34 +55,29 @@ const BASE_CONFIG = {
 };
 
 const globalMarketData = { 
-    binance: { bid: 0, ask: 0, mid: 0, timestamp: 0 },
+    binance: { mid: 0, bid: 0, ask: 0 },
     tickBuffer: [],
     mlSignal: { confidence: 0, type: 'flat', rawValue: 0.5 } 
 };
-const memoryChartHistory = []; 
+const memoryChartHistory = [];
 const publicBinance = new ccxt.pro.binance({ options: { defaultType: 'swap', defaultSubType: 'linear' } });
 const mlSignalCache = new Map();
 const tokenCache = new Map();
 
-// ==================== SECURITY & AUTH ====================
+// ==================== SECURITY ====================
 function hashPassword(password, salt) { return crypto.scryptSync(password, salt, 64).toString('hex'); }
 function generateToken() { return crypto.randomBytes(32).toString('hex'); }
 
 async function authMiddleware(req, res, next) {
     const token = req.headers['authorization'];
     if (!token) return res.status(401).json({ error: 'Unauthorized' });
-    let userEntry = tokenCache.get(token);
-    if (!userEntry) {
-        const user = await UserModel.findOne({ token });
-        if (!user) return res.status(401).json({ error: 'Unauthorized' });
-        userEntry = { user, lastAccessed: Date.now() };
-        tokenCache.set(token, userEntry);
-    }
-    req.user = userEntry.user;
+    let user = await UserModel.findOne({ token });
+    if (!user) return res.status(401).json({ error: 'Unauthorized' });
+    req.user = user;
     next();
 }
 
-// ==================== CORE MATH & ML ENGINE ====================
+// ==================== ENGINE MATH ====================
 function calculateTradeMath(side, entryPrice, currentPrice, sizeUsd, leverage, takerFee) {
     const sideMult = side === 'long' ? 1 : -1;
     const grossPnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100 * sideMult;
@@ -91,131 +86,124 @@ function calculateTradeMath(side, entryPrice, currentPrice, sizeUsd, leverage, t
     const grossRoiPct = (grossPnlUsd / margin) * 100;
     const feeCost = sizeUsd * (takerFee * 2);
     const netPnlUsd = grossPnlUsd - feeCost;
-    return { grossPnlPercent, currentGrossRoi: grossPnlPercent * leverage, grossPnlUsd, grossRoiPct, netPnlUsd, netRoiPct: (netPnlUsd / margin) * 100, feeCost, margin };
+    return { currentGrossRoi: grossPnlPercent * leverage, grossPnlUsd, netPnlUsd, margin };
 }
 
 function calculateMLSignal(prices, lookback) {
-    if (prices.length < lookback + 15 || lookback < 10) return { confidence: 0, type: 'flat', rawValue: 0.5 };
+    if (prices.length < lookback + 10) return { confidence: 0, type: 'flat', rawValue: 0.5 };
     let X = [], y = [];
-    const getFeatures = (idx) => [
-        ((prices[idx] - prices[idx-1]) / prices[idx-1]) * 1000,
-        ((prices[idx] - prices[idx-3]) / prices[idx-3]) * 1000,
-        ((prices[idx] - prices[idx-5]) / prices[idx-5]) * 1000,
-        ((prices[idx] - prices[idx-10]) / prices[idx-10]) * 1000
-    ];
-    for (let i = (prices.length - 2 - lookback); i <= (prices.length - 2); i++) {
-        X.push(getFeatures(i));
-        let diff = prices[i+1] - prices[i];
-        y.push(diff > 0 ? 1 : (diff < 0 ? 0 : 0.5));
+    const getF = (idx) => [((prices[idx]-prices[idx-1])/prices[idx-1])*1000, ((prices[idx]-prices[idx-5])/prices[idx-5])*1000];
+    for (let i = prices.length - 2 - lookback; i <= prices.length - 2; i++) {
+        X.push(getF(i));
+        y.push(prices[i+1] > prices[i] ? 1 : 0);
     }
-    let w = [0, 0, 0, 0], b = 0, lr = 0.05;
-    for (let e = 0; e < 20; e++) {
+    let w = [0, 0], b = 0, lr = 0.05;
+    for (let e = 0; e < 15; e++) {
         for (let i = 0; i < X.length; i++) {
-            let z = w[0]*X[i][0] + w[1]*X[i][1] + w[2]*X[i][2] + w[3]*X[i][3] + b;
-            let pred = 1 / (1 + Math.exp(-Math.max(Math.min(z, 20), -20)));
+            let pred = 1 / (1 + Math.exp(-(w[0]*X[i][0] + w[1]*X[i][1] + b)));
             let err = pred - y[i];
-            for(let j=0; j<4; j++) w[j] -= lr * err * X[i][j];
-            b -= lr * err;
+            w[0] -= lr * err * X[i][0]; w[1] -= lr * err * X[i][1]; b -= lr * err;
         }
     }
-    let currX = getFeatures(prices.length - 1);
-    let zCur = w[0]*currX[0] + w[1]*currX[1] + w[2]*currX[2] + w[3]*currX[3] + b;
-    let finalPred = 1 - (1 / (1 + Math.exp(-Math.max(Math.min(zCur, 20), -20))));
-    return { confidence: Math.abs(finalPred - 0.5) * 200, type: finalPred >= 0.5 ? 'bull' : 'bear', rawValue: finalPred };
+    let cur = getF(prices.length - 1);
+    let final = 1 - (1 / (1 + Math.exp(-(w[0]*cur[0] + w[1]*cur[1] + b))));
+    return { confidence: Math.abs(final-0.5)*200, type: final>=0.5?'bull':'bear', rawValue: final };
 }
 
-// ==================== WORKER INSTANCE ====================
+// ==================== WORKER ====================
+class PerformanceMetrics {
+    constructor(userId) { this.userId = userId; this.trades = []; this.totalNetPnl = 0; this.winRate = 0; }
+    async init() {
+        const db = await TradeModel.find({ userId: this.userId }).sort({ timestamp: -1 }).limit(50).lean();
+        this.trades = db;
+        this.totalNetPnl = db.reduce((a, b) => a + b.netPnl, 0);
+        let wins = db.filter(t => t.netPnl > 0).length;
+        this.winRate = db.length ? ((wins / db.length) * 100).toFixed(1) : 0;
+    }
+}
+
 class UserTradeInstance {
     constructor(user) {
-        this.userId = user._id.toString(); 
+        this.userId = user._id.toString();
         this.config = { ...BASE_CONFIG, ...(user.config || {}) };
         this.activePositions = user.activePosition ? [user.activePosition] : [];
         this.lastCloseTime = user.lastCloseTime || 0;
-        this.walletBalance = 0; this.isTrading = false;
-        this.applyUserKeys(user);
-    }
-    applyUserKeys(user) {
-        this.liveTradingEnabled = user.liveTradingEnabled;
-        this.htx = new ccxt.pro.htx({ apiKey: user.apiKey || "demo", secret: user.apiSecret || "demo", options: { defaultType: 'swap' } });
+        this.walletBalance = 1000;
+        this.metrics = new PerformanceMetrics(this.userId);
     }
     async saveState() {
         await UserModel.updateOne({ _id: this.userId }, { $set: { activePosition: this.activePositions[0] || null, lastCloseTime: this.lastCloseTime, config: this.config } });
     }
-    async syncState(targetSide) {
-        if(this.isTrading) return; this.isTrading = true;
-        try {
-            const contracts = Math.max(1, Math.floor(this.walletBalance * 1000));
-            const price = globalMarketData.binance.mid;
-            const sizeUsd = contracts * 1000 * price;
-            this.activePositions = [{ id: Date.now(), side: targetSide, entryPrice: price, contracts, size: sizeUsd, marginUsed: sizeUsd/FORCED_LEVERAGE, exchangeROI: 0, dcaStep: 0 }];
-            await this.saveState();
-        } finally { this.isTrading = false; }
+    async syncState(side) {
+        const contracts = Math.floor(this.walletBalance * 1000); // REQUESTED: 1000X
+        const price = globalMarketData.binance.mid;
+        const sizeUsd = contracts * 1000 * price;
+        this.activePositions = [{ side, entryPrice: price, contracts, size: sizeUsd, marginUsed: sizeUsd/FORCED_LEVERAGE, exchangeROI: 0, timestamp: Date.now() }];
+        await this.saveState();
     }
-    async forceClosePosition() {
-        this.activePositions = []; this.lastCloseTime = Date.now(); await this.saveState();
-    }
-    async evaluateAI() {
-        let mlSig = mlSignalCache.get(this.config.mlLookback) || calculateMLSignal(globalMarketData.tickBuffer, this.config.mlLookback || 50);
-        if (this.activePositions.length === 0 && mlSig.confidence >= this.config.mlThreshold && (Date.now() - this.lastCloseTime > 5000)) {
-            await this.syncState(mlSig.type === 'bull' ? 'long' : 'short');
-        }
-    }
-    async checkExits() {
-        if (this.activePositions.length === 0) return;
+    async forceClose() {
+        if (!this.activePositions.length) return;
         const pos = this.activePositions[0];
         const math = calculateTradeMath(pos.side, pos.entryPrice, globalMarketData.binance.mid, pos.size, FORCED_LEVERAGE, 0.0004);
-        pos.exchangeROI = math.currentGrossRoi;
-        if (pos.exchangeROI >= this.config.takeProfitPct || pos.exchangeROI <= this.config.stopLossPct) await this.forceClosePosition();
+        await TradeModel.create({ userId: this.userId, side: pos.side, entryPrice: pos.entryPrice, exitPrice: globalMarketData.binance.mid, contracts: pos.contracts, netPnl: math.netPnlUsd, exitReason: "SIGNAL_EXIT" });
+        this.activePositions = []; this.lastCloseTime = Date.now();
+        await this.metrics.init(); await this.saveState();
+    }
+    async runCycle() {
+        const ml = mlSignalCache.get(this.config.mlLookback);
+        if (!ml) return;
+        if (this.activePositions.length) {
+            const pos = this.activePositions[0];
+            const math = calculateTradeMath(pos.side, pos.entryPrice, globalMarketData.binance.mid, pos.size, FORCED_LEVERAGE, 0.0004);
+            pos.exchangeROI = math.currentGrossRoi;
+            if (pos.exchangeROI >= this.config.takeProfitPct || pos.exchangeROI <= this.config.stopLossPct) await this.forceClose();
+        } else if (ml.confidence >= this.config.mlThreshold && Date.now() - this.lastCloseTime > 10000) {
+            await this.syncState(ml.type === 'bull' ? 'long' : 'short');
+        }
     }
 }
 
-// ==================== MANAGER ====================
-const activeWorkers = new Map();
-async function loadAllUsers() {
+// ==================== CORE APP ====================
+const workers = new Map();
+
+async function init() {
     const users = await UserModel.find({});
-    for(const u of users) {
-        const worker = new UserTradeInstance(u);
-        worker.walletBalance = 1000;
-        activeWorkers.set(u._id.toString(), worker);
+    for (const u of users) {
+        const w = new UserTradeInstance(u);
+        await w.metrics.init();
+        workers.set(u._id.toString(), w);
     }
-}
-async function startStreams() {
     setInterval(async () => {
         try {
-            const ticker = await publicBinance.fetchTicker(BASE_CONFIG.binanceSymbol);
-            const mid = (ticker.bid + ticker.ask) / 2;
-            globalMarketData.binance = { mid };
-            globalMarketData.tickBuffer.push(mid); if(globalMarketData.tickBuffer.length > 500) globalMarketData.tickBuffer.shift();
+            const t = await publicBinance.fetchTicker(BASE_CONFIG.binanceSymbol);
+            globalMarketData.binance = { mid: (t.bid + t.ask) / 2, bid: t.bid, ask: t.ask };
+            globalMarketData.tickBuffer.push(globalMarketData.binance.mid);
+            if (globalMarketData.tickBuffer.length > 500) globalMarketData.tickBuffer.shift();
             const ml = calculateMLSignal(globalMarketData.tickBuffer, BASE_CONFIG.mlLookback);
             mlSignalCache.set(BASE_CONFIG.mlLookback, ml);
-            memoryChartHistory.push({ priceMid: mid, mlPlot: ml.rawValue, timestamp: Date.now() });
-            if(memoryChartHistory.length > 800) memoryChartHistory.shift();
-            for(const w of activeWorkers.values()) { w.checkExits(); w.evaluateAI(); }
-        } catch(e){}
-    }, 2000);
+            for (const w of workers.values()) w.runCycle();
+        } catch (e) {}
+    }, 2500);
 }
 
-// ==================== API ====================
 const app = express(); app.use(express.json());
 
 app.post('/api/auth/login', async (req, res) => {
-    const user = await UserModel.findOne({ email: req.body.email });
-    if(!user) return res.status(400).json({error:'User not found'});
-    res.json({ token: user.token });
+    const u = await UserModel.findOne({ email: req.body.email });
+    if (!u) return res.status(400).send();
+    res.json({ token: u.token });
 });
 
 app.get('/api/data', authMiddleware, (req, res) => {
-    const worker = activeWorkers.get(req.user._id.toString());
-    res.json(worker ? { config: worker.config, activePositions: worker.activePositions, walletBalance: worker.walletBalance, mlSignal: mlSignalCache.get(worker.config.mlLookback) } : { error: "Not found" });
+    const w = workers.get(req.user._id.toString());
+    res.json({ metrics: w.metrics, active: w.activePositions[0], ml: mlSignalCache.get(w.config.mlLookback), config: w.config, wallet: w.walletBalance });
 });
 
 app.post('/api/user/config', authMiddleware, async (req, res) => {
-    const worker = activeWorkers.get(req.user._id.toString());
-    if(worker) {
-        worker.config = { ...worker.config, ...req.body };
-        req.user.config = worker.config; await req.user.save();
-    }
-    res.json({status: 'ok'});
+    const w = workers.get(req.user._id.toString());
+    w.config = { ...w.config, ...req.body };
+    req.user.config = w.config; await req.user.save();
+    res.json({status:'ok'});
 });
 
 // ==================== ANDROID UI ====================
@@ -229,197 +217,149 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet" />
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body { font-family: 'Google Sans', sans-serif; background: #F7F9FC; padding-bottom: 90px; padding-top: 65px; }
-        .android-header { background: #FFF; position: fixed; top:0; width: 100%; height: 60px; display: flex; align-items: center; padding: 0 20px; border-bottom: 1px solid #EEE; z-index: 100; font-weight: 700; }
-        .android-card { background: #FFF; border-radius: 28px; padding: 20px; margin: 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+        body { font-family: 'Google Sans', sans-serif; background: #F7F9FC; padding: 70px 0 90px; }
+        .android-bar { background: #FFF; position: fixed; top: 0; width: 100%; height: 60px; display: flex; align-items: center; padding: 0 20px; border-bottom: 1px solid #EEE; z-index: 100; font-weight: 700; }
+        .android-card { background: #FFF; border-radius: 28px; padding: 20px; margin: 12px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
         .bottom-nav { background: #FFF; border-top: 1px solid #EEE; position: fixed; bottom: 0; width: 100%; display: flex; padding: 12px 0 25px; z-index: 100; }
-        .nav-item { flex: 1; display: flex; flex-direction: column; align-items: center; color: #5F6368; transition: 0.2s; }
+        .nav-item { flex: 1; display: flex; flex-direction: column; align-items: center; color: #5F6368; }
         .nav-item.active { color: #1A73E8; font-variation-settings: 'FILL' 1; }
-        .view-section { display: none; }
-        .view-section.active { display: block; animation: fadeIn 0.3s; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .view { display: none; } .view.active { display: block; }
         
-        /* SETTINGS STYLING */
-        .pref-category { color: #1A73E8; font-size: 13px; font-weight: 700; margin: 24px 20px 8px; text-transform: uppercase; letter-spacing: 0.5px; }
-        .pref-item { background: #FFF; padding: 16px 20px; display: flex; align-items: center; border-bottom: 1px solid #F0F0F0; }
-        .pref-info { flex: 1; }
-        .pref-title { font-size: 16px; color: #1C1B1F; font-weight: 500; }
-        .pref-summary { font-size: 13px; color: #5F6368; margin-top: 2px; }
-        .pref-input { width: 80px; text-align: right; border: none; background: #F1F3F4; border-radius: 8px; padding: 6px; font-family: 'Roboto Mono'; font-weight: 700; color: #1A73E8; }
-        .pref-switch { width: 44px; height: 24px; background: #E0E0E0; border-radius: 12px; position: relative; transition: 0.3s; }
-        .pref-switch.on { background: #1A73E8; }
-        .pref-switch::after { content:''; position:absolute; width:18px; height:18px; background:#FFF; border-radius:50%; top:3px; left:3px; transition:0.3s; }
-        .pref-switch.on::after { left:23px; }
+        /* SETTINGS PREFERENCES */
+        .pref-header { color: #1A73E8; font-size: 12px; font-weight: 700; padding: 20px 20px 8px; text-transform: uppercase; }
+        .pref-row { background: #FFF; padding: 16px 20px; display: flex; align-items: center; border-bottom: 1px solid #F8F8F8; }
+        .pref-text { flex: 1; }
+        .pref-title { font-size: 15px; color: #1C1B1F; font-weight: 500; }
+        .pref-sub { font-size: 12px; color: #70757A; }
+        .pref-input { width: 75px; text-align: right; background: #F1F3F4; border-radius: 8px; padding: 5px; font-family: 'Roboto Mono'; font-weight: 700; color: #1A73E8; border: none; }
     </style>
 </head>
 <body>
 
-    <div class="android-header">TradeBot <span class="ml-auto material-symbols-rounded text-green-500">account_balance_wallet</span></div>
+    <div class="android-bar">TradeBot Terminal <span class="ml-auto material-symbols-rounded text-green-500">sensors</span></div>
 
     <!-- TERMINAL VIEW -->
-    <section id="view-terminal" class="view-section active">
+    <section id="terminal" class="view active">
         <div class="grid grid-cols-2 gap-0">
-            <div class="android-card !mr-2 p-4">
-                <p class="text-[11px] font-bold text-gray-400 uppercase">Live ROI</p>
-                <p id="liveRoi" class="text-xl font-mono font-bold text-gray-800">0.00%</p>
+            <div class="android-card !mr-1 p-4">
+                <p class="text-[10px] font-bold text-gray-400 uppercase">Total Net PnL</p>
+                <p id="totalPnl" class="text-lg font-mono font-bold">$0.00</p>
             </div>
-            <div class="android-card !ml-2 p-4">
-                <p class="text-[11px] font-bold text-gray-400 uppercase">Balance</p>
-                <p id="liveBalance" class="text-xl font-mono font-bold text-gray-800">$0.00</p>
+            <div class="android-card !ml-1 p-4">
+                <p class="text-[10px] font-bold text-gray-400 uppercase">Win Rate</p>
+                <p id="winRate" class="text-lg font-mono font-bold">0.0%</p>
             </div>
         </div>
 
         <div class="android-card">
             <div class="flex items-center mb-2">
-                <span class="font-bold text-sm">AI Directional Confidence</span>
+                <span class="font-bold text-sm">AI Prediction</span>
                 <span id="mlPct" class="ml-auto font-mono text-blue-600 font-bold">0%</span>
             </div>
-            <div class="h-3 w-full bg-gray-100 rounded-full overflow-hidden">
-                <div id="mlBar" class="h-full bg-blue-600" style="width: 0%"></div>
-            </div>
-            <p id="mlTrend" class="text-[10px] font-bold mt-2 text-gray-400 uppercase">Searching...</p>
+            <div class="h-2 w-full bg-gray-100 rounded-full overflow-hidden"><div id="mlBar" class="h-full bg-blue-600 w-0"></div></div>
+            <p id="mlType" class="text-[10px] font-bold mt-2 text-gray-400 uppercase">Analyzing Market...</p>
         </div>
 
         <div class="android-card">
-            <h3 class="font-bold text-sm mb-4 uppercase text-gray-400">Position Info</h3>
-            <div id="posBox" class="space-y-2">
-                <p class="text-center py-6 text-gray-400 italic">No active positions</p>
+            <h3 class="font-bold text-xs uppercase text-gray-400 mb-4">Active Position</h3>
+            <div id="activeBox" class="space-y-3">
+                <p class="text-center py-4 text-gray-400 italic">No active trades</p>
             </div>
+        </div>
+
+        <div class="android-card">
+            <h3 class="font-bold text-xs uppercase text-gray-400 mb-4">Recent Executions</h3>
+            <div id="historyBox" class="text-xs space-y-3"></div>
         </div>
     </section>
 
-    <!-- SETTINGS VIEW (MATERIAL PREFERENCES) -->
-    <section id="view-settings" class="view-section">
-        <div class="pref-category">AI Engine Configuration</div>
-        <div class="pref-item">
-            <div class="pref-info">
-                <div class="pref-title">Lookback Ticks</div>
-                <div class="pref-summary">Historical data points for AI training</div>
-            </div>
-            <input type="number" id="set-mlLookback" class="pref-input">
-        </div>
-        <div class="pref-item">
-            <div class="pref-info">
-                <div class="pref-title">Confidence Threshold</div>
-                <div class="pref-summary">Minimum % required to trigger trade</div>
-            </div>
-            <input type="number" id="set-mlThreshold" class="pref-input">
-        </div>
+    <!-- SETTINGS VIEW -->
+    <section id="settings" class="view">
+        <div class="pref-header">Geometric Strategy</div>
+        <div class="pref-row"><div class="pref-text"><div class="pref-title">Take Profit (%)</div></div><input type="number" id="tpPct" class="pref-input"></div>
+        <div class="pref-row"><div class="pref-text"><div class="pref-title">Stop Loss (%)</div></div><input type="number" id="slPct" class="pref-input"></div>
+        
+        <div class="pref-header">ML Logic</div>
+        <div class="pref-row"><div class="pref-text"><div class="pref-title">Lookback Ticks</div><div class="pref-sub">Baseline training size</div></div><input type="number" id="mlLook" class="pref-input"></div>
+        <div class="pref-row"><div class="pref-text"><div class="pref-title">Confidence (%)</div><div class="pref-sub">Minimum entry trigger</div></div><input type="number" id="mlThres" class="pref-input"></div>
+        
+        <div class="pref-header">Risk Management</div>
+        <div class="pref-row"><div class="pref-text"><div class="pref-title">DCA Multiplier</div><div class="pref-sub">Multiplier on loss steps</div></div><input type="number" id="dcaMult" class="pref-input"></div>
+        <div class="pref-row"><div class="pref-text"><div class="pref-title">Max Contracts</div><div class="pref-sub">Hard position limit</div></div><input type="number" id="maxC" class="pref-input"></div>
 
-        <div class="pref-category">Trade Execution</div>
-        <div class="pref-item">
-            <div class="pref-info">
-                <div class="pref-title">Take Profit (%)</div>
-                <div class="pref-summary">Auto-close at target gain</div>
-            </div>
-            <input type="number" id="set-tp" class="pref-input">
-        </div>
-        <div class="pref-item">
-            <div class="pref-info">
-                <div class="pref-title">Stop Loss (%)</div>
-                <div class="pref-summary">Max risk per position</div>
-            </div>
-            <input type="number" id="set-sl" class="pref-input">
-        </div>
-
-        <div class="pref-category">Scaling & Risk</div>
-        <div class="pref-item">
-            <div class="pref-info">
-                <div class="pref-title">DCA Multiplier</div>
-                <div class="pref-summary">Size increase on loss step</div>
-            </div>
-            <input type="number" id="set-dcaMult" class="pref-input">
-        </div>
-        <div class="pref-item">
-            <div class="pref-info">
-                <div class="pref-title">Max Contracts</div>
-                <div class="pref-summary">Hard limit on total position size</div>
-            </div>
-            <input type="number" id="set-maxC" class="pref-input">
-        </div>
-
-        <div class="p-4">
-            <button onclick="saveSettings()" class="w-full bg-black text-white rounded-2xl py-4 font-bold shadow-lg">Save Changes</button>
-        </div>
+        <div class="p-4"><button onclick="save()" class="w-full bg-black text-white rounded-2xl py-4 font-bold">Update Strategy</button></div>
     </section>
 
     <nav class="bottom-nav">
-        <div onclick="nav('terminal')" class="nav-item active" id="nav-terminal">
-            <span class="material-symbols-rounded">monitoring</span>
-            <span class="text-[11px] mt-1">Terminal</span>
-        </div>
-        <div onclick="nav('settings')" class="nav-item" id="nav-settings">
-            <span class="material-symbols-rounded">settings</span>
-            <span class="text-[11px] mt-1">Settings</span>
-        </div>
+        <div onclick="nav('terminal')" class="nav-item active" id="nav-term"><span class="material-symbols-rounded">monitoring</span><span class="text-[10px] mt-1">Terminal</span></div>
+        <div onclick="nav('settings')" class="nav-item" id="nav-set"><span class="material-symbols-rounded">settings</span><span class="text-[10px] mt-1">Settings</span></div>
     </nav>
 
     <script>
         let token = localStorage.getItem('token') || "dummy";
         function nav(id) {
-            document.querySelectorAll('.view-section').forEach(v => v.classList.remove('active'));
+            document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
             document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-            document.getElementById('view-'+id).classList.add('active');
-            document.getElementById('nav-'+id).classList.add('active');
+            document.getElementById(id).classList.add('active');
+            document.getElementById(id === 'terminal' ? 'nav-term' : 'nav-set').classList.add('active');
         }
 
-        async function fetchUI() {
+        async function sync() {
             const res = await fetch('/api/data', { headers: { 'Authorization': token } });
-            const data = await res.json();
-            if(data.error) return;
+            const d = await res.json();
+            if (d.error) return;
 
-            document.getElementById('liveBalance').innerText = '$' + data.walletBalance.toFixed(2);
-            if(data.mlSignal) {
-                document.getElementById('mlPct').innerText = data.mlSignal.confidence.toFixed(1) + '%';
-                document.getElementById('mlBar').style.width = data.mlSignal.confidence + '%';
-                document.getElementById('mlTrend').innerText = data.mlSignal.type + ' Probability';
+            document.getElementById('totalPnl').innerText = '$' + d.metrics.totalNetPnl.toFixed(2);
+            document.getElementById('totalPnl').style.color = d.metrics.totalNetPnl >= 0 ? '#22C55E' : '#EF4444';
+            document.getElementById('winRate').innerText = d.metrics.winRate + '%';
+
+            if (d.ml) {
+                document.getElementById('mlPct').innerText = d.ml.confidence.toFixed(1) + '%';
+                document.getElementById('mlBar').style.width = d.ml.confidence + '%';
+                document.getElementById('mlType').innerText = d.ml.type + ' Trend Identified';
             }
 
-            const pos = data.activePositions[0];
-            const posBox = document.getElementById('posBox');
-            if(pos) {
-                document.getElementById('liveRoi').innerText = pos.exchangeROI.toFixed(2) + '%';
-                document.getElementById('liveRoi').className = "text-xl font-mono font-bold " + (pos.exchangeROI >= 0 ? "text-green-500" : "text-red-500");
-                posBox.innerHTML = \`<div class="flex justify-between border-b pb-2"><span>Side</span><span class="font-bold">\${pos.side.toUpperCase()}</span></div>
-                                     <div class="flex justify-between border-b pb-2"><span>Contracts</span><span class="font-bold">\${pos.contracts}</span></div>
-                                     <div class="flex justify-between"><span>Entry</span><span class="font-bold">$\${pos.entryPrice.toFixed(6)}</span></div>\`;
-            } else {
-                document.getElementById('liveRoi').innerText = "0.00%";
-                document.getElementById('liveRoi').className = "text-xl font-mono font-bold text-gray-400";
-                posBox.innerHTML = '<p class="text-center py-6 text-gray-400 italic">No active positions</p>';
-            }
+            const activeBox = document.getElementById('activeBox');
+            if (d.active) {
+                activeBox.innerHTML = \`<div class="flex justify-between font-bold text-blue-600"><span>\${d.active.side.toUpperCase()}</span><span>\${d.active.exchangeROI.toFixed(2)}%</span></div>
+                                        <div class="flex justify-between text-gray-500"><span>Size</span><span>\${d.active.contracts.toLocaleString()} C</span></div>\`;
+            } else activeBox.innerHTML = '<p class="text-center py-4 text-gray-400 italic">No active trades</p>';
 
-            // Fill settings inputs once
-            if(!window.settingsFilled) {
-                document.getElementById('set-mlLookback').value = data.config.mlLookback;
-                document.getElementById('set-mlThreshold').value = data.config.mlThreshold;
-                document.getElementById('set-tp').value = data.config.takeProfitPct;
-                document.getElementById('set-sl').value = data.config.stopLossPct;
-                document.getElementById('set-dcaMult').value = data.config.dcaMultiplier;
-                document.getElementById('set-maxC').value = data.config.maxContracts;
-                window.settingsFilled = true;
+            const historyBox = document.getElementById('historyBox');
+            historyBox.innerHTML = d.metrics.trades.map(t => \`<div class="flex justify-between border-b pb-2">
+                <span class="\${t.netPnl > 0 ? 'text-green-500' : 'text-red-500'} font-bold">\${t.side.toUpperCase()}</span>
+                <span>$\${t.netPnl.toFixed(2)}</span>
+            </div>\`).join('');
+
+            if (!window.loaded) {
+                document.getElementById('tpPct').value = d.config.takeProfitPct;
+                document.getElementById('slPct').value = d.config.stopLossPct;
+                document.getElementById('mlLook').value = d.config.mlLookback;
+                document.getElementById('mlThres').value = d.config.mlThreshold;
+                document.getElementById('dcaMult').value = d.config.dcaMultiplier;
+                document.getElementById('maxC').value = d.config.maxContracts;
+                window.loaded = true;
             }
         }
 
-        async function saveSettings() {
-            const payload = {
-                mlLookback: parseInt(document.getElementById('set-mlLookback').value),
-                mlThreshold: parseFloat(document.getElementById('set-mlThreshold').value),
-                takeProfitPct: parseFloat(document.getElementById('set-tp').value),
-                stopLossPct: parseFloat(document.getElementById('set-sl').value),
-                dcaMultiplier: parseFloat(document.getElementById('set-dcaMult').value),
-                maxContracts: parseInt(document.getElementById('set-maxC').value)
+        async function save() {
+            const body = {
+                takeProfitPct: parseFloat(document.getElementById('tpPct').value),
+                stopLossPct: parseFloat(document.getElementById('slPct').value),
+                mlLookback: parseInt(document.getElementById('mlLook').value),
+                mlThreshold: parseFloat(document.getElementById('mlThres').value),
+                dcaMultiplier: parseFloat(document.getElementById('dcaMult').value),
+                maxContracts: parseInt(document.getElementById('maxC').value)
             };
-            await fetch('/api/user/config', { method:'POST', headers:{'Content-Type':'application/json','Authorization':token}, body: JSON.stringify(payload) });
-            alert("Settings Updated");
+            await fetch('/api/user/config', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': token }, body: JSON.stringify(body) });
+            alert("Strategy Updated");
         }
-
-        setInterval(fetchUI, 2000);
+        setInterval(sync, 2500); sync();
     </script>
 </body>
 </html>`); });
 
 app.listen(CUSTOM_PORT, async () => {
+    await init();
     console.log(`✅ Android Server running on port ${CUSTOM_PORT}`);
-    await loadAllUsers(); startStreams();
 });
