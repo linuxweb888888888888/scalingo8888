@@ -595,7 +595,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 </div>
                 <div class="flex items-center gap-2"><span class="material-symbols-outlined text-[16px] text-gray-400">history</span><span class="text-[10px] font-bold text-gray-400 uppercase">Uptime: <span id="uptime" class="text-black">0s</span></span></div>
             </div>
-            <div class="m3-card"><h3 class="text-[10px] font-bold uppercase text-gray-400 mb-3">Recent Executions</h3><div id="tradeHistoryBody" class="space-y-3"><p class="text-center py-4 text-xs text-gray-400">No trades found.</p></div></div>
+            <div class="m3-card"><h3 class="text-[10px] font-bold uppercase text-gray-400 mb-3">Recent Executions (Last 10)</h3><div id="tradeHistoryBody" class="space-y-3"><p class="text-center py-4 text-xs text-gray-400">No trades found.</p></div></div>
         </section>
 
         <!-- SETUP MENU (EVERY SETTING RESTORED) -->
@@ -771,18 +771,46 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             if (data.mlSignal) {
                 document.getElementById('mlValue').innerText = data.mlSignal.confidence.toFixed(1) + "%";
                 const stat = document.getElementById('mlStatus');
-                stat.innerText = data.mlSignal.type.toUpperCase();
-                stat.className = "text-[9px] font-bold px-2 py-1 rounded uppercase " + (data.mlSignal.type === 'bull' ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700");
+                
+                // Convert to LONG/SHORT for better UI clarity
+                const signalDirection = data.mlSignal.type === 'bull' ? 'LONG' : 'SHORT';
+                stat.innerText = "SIGNAL: " + signalDirection;
+                
+                stat.className = "text-[10px] font-bold px-3 py-1 rounded-full uppercase " + 
+                    (data.mlSignal.type === 'bull' ? "bg-green-500 text-white" : "bg-red-500 text-white");
             }
 
             const hist = document.getElementById("tradeHistoryBody");
             if(data.metrics.trades && data.metrics.trades.length > 0) {
                 hist.innerHTML = "";
-                data.metrics.trades.slice(-4).reverse().forEach(t => {
-                    hist.innerHTML += \`<div class="flex justify-between items-center text-[10px] border-b border-gray-50 pb-2">
-                        <span class="font-bold \${t.side==='long'?'text-green-600':'text-red-600'}">\${t.side.toUpperCase()}</span>
-                        <span class="text-gray-400">\${t.exitReason}</span>
-                        <span class="font-bold \${t.netPnl>=0?'text-green-600':'text-red-600'}">$\${t.netPnl.toFixed(2)}</span>
+                // Show last 10 executions
+                data.metrics.trades.slice(-10).reverse().forEach(t => {
+                    const isLong = t.side.toLowerCase() === 'long';
+                    const sideColor = isLong ? 'text-green-600' : 'text-red-600';
+                    const pnlColor = t.netPnl >= 0 ? 'text-green-600' : 'text-red-600';
+
+                    hist.innerHTML += \`
+                    <div class="flex flex-col border-b border-gray-100 pb-3 mb-2">
+                        <!-- Top Row: Signal and Net Profit -->
+                        <div class="flex justify-between items-center">
+                            <div class="flex items-center gap-2">
+                                <span class="text-[9px] font-bold bg-gray-100 px-1.5 py-0.5 rounded text-gray-500 uppercase">Signal</span>
+                                <span class="text-xs font-black \${sideColor}">\${t.side.toUpperCase()}</span>
+                            </div>
+                            <span class="text-xs font-mono font-bold \${pnlColor}">\${t.netPnl >= 0 ? '+' : ''}$\${t.netPnl.toFixed(2)}</span>
+                        </div>
+                        
+                        <!-- Middle Row: Reason and Quantity -->
+                        <div class="flex justify-between items-center mt-1.5">
+                            <span class="text-[10px] text-gray-400">Reason: <span class="text-gray-700 font-medium">\${t.exitReason}</span></span>
+                            <span class="text-[10px] text-gray-400">Qty: <span class="text-gray-700 font-mono">\${t.contracts.toLocaleString()}</span></span>
+                        </div>
+
+                        <!-- Bottom Row: ROI -->
+                        <div class="flex items-center gap-1 mt-1">
+                             <span class="text-[9px] font-bold uppercase text-gray-400">ROI:</span>
+                             <span class="text-[10px] font-bold \${t.roiPct >= 0 ? 'text-green-500' : 'text-red-500'}">\${t.roiPct.toFixed(2)}%</span>
+                        </div>
                     </div>\`;
                 });
             }
@@ -825,7 +853,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             document.getElementById('btResWinrate').innerText = res.winRate + "%";
             document.getElementById('btResPnl').innerText = "$" + res.netPnl.toFixed(2);
             const container = document.getElementById('btTableBody'); container.innerHTML = "";
-            res.trades.slice(-8).forEach(t => { container.innerHTML += \`<div>\${t.side.toUpperCase()} | \${t.netPnl.toFixed(2)}</div>\`; });
+            res.trades.slice(-10).forEach(t => { container.innerHTML += \`<div>\${t.side.toUpperCase()} | ROI: \${t.roiPct.toFixed(2)}% | Net: \${t.netPnl.toFixed(2)}</div>\`; });
         }
 
         const ctx = document.getElementById("mlChart").getContext("2d");
