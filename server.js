@@ -435,7 +435,7 @@ class UserTradeInstance {
                     if (this.config.htxSymbol.includes('SHIB') && !this.config.htxSymbol.includes('1000')) entryP = entryP * 1000;
 
                     const sizeUsd = openPos.contracts * this.config.contractSize * entryP;
-                    this.activePositions = [{ id: Date.now(), side: openPos.side, entryPrice: entryP, contracts: openPos.contracts, size: sizeUsd, marginUsed: sizeUsd / FORCED_LEVERAGE, exchangeROI: openPos.percentage || 0, exchangePnl: openPos.unrealizedPnl || 0, entryTime: Date.now(), isPaper: false, lastDcaTime: 0, dcaStep: 0 }];
+                    this.activePositions = [{ id: Date.now(), side: openPos.side, entryPrice: entryP, contracts: openPos.contracts, size: sizeUsd, marginUsed: sizeUsd / FORCED_LEVERAGE, exchangeROI: openPos.percentage || 0, exchangePnl: openPos.unrealizedPnl || 0, entryTime: Date.now(), isPaper: false, lastDcaTime: 0, dcaStep: 0, stepHistory: [] }];
                     this.metrics.updateMaxMargin(this.activePositions[0].marginUsed); await this.saveState();
                 } else {
                     // FIX: If exchange is empty but we have ghost state, clear it
@@ -595,11 +595,11 @@ class UserTradeInstance {
                 }
             }
 
-            // INJECTED: TRACKING STEP
+            // RECORD THE STEP INTO HISTORY
             if(!pos.stepHistory) pos.stepHistory = [];
-            const currentPriceForHistory = pos.side === 'long' ? globalMarketData.binance.bid : globalMarketData.binance.ask;
-            const pnlPercentForHistory = pos.side === 'long' ? ((currentPriceForHistory - pos.entryPrice) / pos.entryPrice) * 100 : ((pos.entryPrice - currentPriceForHistory) / pos.entryPrice) * 100;
-            pos.stepHistory.push({ step: step + 1, type: isProfitScale ? 'SCALE' : 'DCA', price: realExecPrice, roi: pnlPercentForHistory * FORCED_LEVERAGE, time: Date.now() });
+            const curP = pos.side === 'long' ? globalMarketData.binance.bid : globalMarketData.binance.ask;
+            const roiAtTrigger = pos.exchangeROI || 0;
+            pos.stepHistory.push({ step: step + 1, type: isProfitScale ? 'SCALE' : 'DCA', price: realExecPrice, roi: roiAtTrigger, time: Date.now() });
 
             const addedSizeUsd = contractsToAdd * (Number(this.config.contractSize) || 1000) * realExecPrice;
             
@@ -1091,7 +1091,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 <button onclick="nav('backtest')" class="text-gray-500 hover:text-black transition flex items-center gap-1"><span class="material-symbols-outlined text-[18px]">science</span></button>
                 <button onclick="nav('analytics')" class="text-gray-500 hover:text-black transition flex items-center gap-1"><span class="material-symbols-outlined text-[18px]">monitoring</span></button>
                 <button onclick="nav('dashboard')" class="hover:text-black transition">Dashboard</button>
-                <!-- INJECTED: MENU ITEM -->
+                <!-- ADDED MENU ITEM -->
                 <button onclick="nav('step-history')" class="hover:text-black transition">Step History</button>
                 <button onclick="logout()" class="text-red-500 hover:text-red-700 transition">Logout</button>
             </nav>
@@ -1520,12 +1520,12 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- INJECTED: STEP HISTORY VIEW -->
+        <!-- ADDED STEP HISTORY SECTION -->
         <section id="view-step-history" class="view-section max-w-5xl mx-auto px-4 py-12">
-            <div class="text-center mb-8">
-                <span class="material-symbols-outlined text-4xl text-black">list_alt</span>
-                <h2 class="text-3xl font-bold mt-2">Active Position Steps</h2>
-                <p class="text-gray-500 mt-2">Real-time breakdown of current position scaling and ROI triggers.</p>
+            <div class="text-center mb-10">
+                <span class="material-symbols-outlined text-4xl text-black">layers</span>
+                <h2 class="text-3xl font-bold mt-2">Position Step Breakdown</h2>
+                <p class="text-gray-500 mt-2">A history of execution points for the current active position.</p>
             </div>
             <div class="ui-card p-6 border border-gray-100">
                 <div class="overflow-x-auto">
@@ -1533,14 +1533,14 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                         <thead class="text-gray-400 uppercase text-[10px] tracking-wider border-b border-gray-100">
                             <tr>
                                 <th class="pb-3 px-2">Step #</th>
-                                <th class="pb-3 px-2">Action</th>
+                                <th class="pb-3 px-2">Type</th>
                                 <th class="pb-3 px-2">Price</th>
-                                <th class="pb-3 px-2">ROI at Trigger</th>
-                                <th class="pb-3 px-2">Timestamp</th>
+                                <th class="pb-3 px-2">ROI at Step</th>
+                                <th class="pb-3 px-2">Time</th>
                             </tr>
                         </thead>
                         <tbody id="stepHistoryBody" class="font-mono text-xs">
-                            <tr><td colspan="5" class="py-10 text-center text-gray-400 font-sans">No active position tracked.</td></tr>
+                            <tr><td colspan="5" class="py-10 text-center text-gray-400 font-sans">No active position data found.</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -1801,7 +1801,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             
             const data = await doAPI('/api/data', 'GET'); if(data.error) return;
 
-            // INJECTED: UPDATE STEP HISTORY TABLE
+            // UPDATE STEP HISTORY UI
             if (document.getElementById('view-step-history').classList.contains('active-view')) {
                 const stepTbody = document.getElementById("stepHistoryBody");
                 if (data.activePositions.length > 0 && data.activePositions[0].stepHistory) {
@@ -1811,7 +1811,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                         stepTbody.innerHTML += '<tr class="border-b border-gray-50 hover:bg-gray-50">' +
                             '<td class="py-3 px-2 font-bold text-gray-800">' + s.step + '</td>' +
                             '<td class="py-3 px-2 font-bold ' + (s.type === 'DCA' ? 'text-red-500' : 'text-blue-500') + '">' + s.type + '</td>' +
-                            '<td class="py-3 px-2">$' + s.price.toFixed(8) + '</td>' +
+                            '<td class="py-3 px-2">$' + Number(s.price).toFixed(8) + '</td>' +
                             '<td class="py-3 px-2 font-bold ' + (s.roi >= 0 ? 'text-green-600' : 'text-red-600') + '">' + s.roi.toFixed(2) + '%</td>' +
                             '<td class="py-3 px-2 text-gray-400">' + tStr + '</td></tr>';
                     });
