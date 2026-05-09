@@ -540,10 +540,11 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         .m3-input:focus { border-color: var(--primary); border-width: 2px; }
         .m3-label { position: absolute; left: 10px; top: -10px; background: white; padding: 0 4px; font-size: 11px; color: #444; font-weight: 500; }
         .m3-select { width: 100%; border: 1px solid #8e9199; border-radius: 4px; padding: 10px; background: white; font-size: 14px; appearance: none; }
-        .btn-fab { position: fixed; bottom: 96px; right: 20px; width: 56px; height: 56px; background: var(--error); border-radius: 50%; display: flex; items: center; justify-content: center; color: white; box-shadow: 0 4px 12px rgba(0,0,0,0.25); z-index: 150; border: none; cursor: pointer; }
+        .btn-fab { display: none; }
         .metric-label { font-size: 10px; font-weight: 700; color: #74777f; text-transform: uppercase; letter-spacing: 0.5px; }
         .metric-value { font-family: 'Roboto Mono', monospace; font-size: 16px; font-weight: 700; }
         #chartWrapper { height: 180px; width: 100%; }
+        .auth-only { display: none; }
     </style>
 </head>
 <body>
@@ -681,13 +682,11 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 
     </main>
 
-    <button id="fabClose" class="btn-fab hidden" onclick="closeAll()" title="Close All"><span class="material-symbols-outlined">close</span></button>
-
     <nav class="bottom-nav">
         <button onclick="nav('home')" id="nav-home" class="nav-item active"><span class="material-symbols-outlined">home</span><span>Home</span></button>
-        <button onclick="nav('dashboard')" id="nav-dashboard" class="nav-item"><span class="material-symbols-outlined">show_chart</span><span>Trade</span></button>
-        <button onclick="nav('backtest')" id="nav-backtest" class="nav-item"><span class="material-symbols-outlined">science</span><span>Test</span></button>
-        <button onclick="nav('settings')" id="nav-settings" class="nav-item"><span class="material-symbols-outlined">settings</span><span>Setup</span></button>
+        <button onclick="nav('dashboard')" id="nav-dashboard" class="nav-item auth-only"><span class="material-symbols-outlined">show_chart</span><span>Trade</span></button>
+        <button onclick="nav('backtest')" id="nav-backtest" class="nav-item auth-only"><span class="material-symbols-outlined">science</span><span>Test</span></button>
+        <button onclick="nav('settings')" id="nav-settings" class="nav-item auth-only"><span class="material-symbols-outlined">settings</span><span>Setup</span></button>
     </nav>
 
     <script>
@@ -697,14 +696,17 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         let settingsLoaded = false;
 
         function nav(v) {
+            if (['dashboard', 'backtest', 'settings'].includes(v) && !authToken) return;
             document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active-view'));
             document.getElementById('view-' + v).classList.add('active-view');
             document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
             const activeNav = document.getElementById('nav-' + (['login','register'].includes(v) ? 'home' : v));
             if(activeNav) activeNav.classList.add('active');
             if(v === 'dashboard' && authToken) initDashboard();
-            const fab = document.getElementById('fabClose');
-            if(v === 'dashboard' && authToken) fab.classList.remove('hidden'); else fab.classList.add('hidden');
+            
+            document.querySelectorAll('.auth-only').forEach(el => {
+                el.style.display = authToken ? 'flex' : 'none';
+            });
             window.scrollTo(0,0);
         }
 
@@ -771,11 +773,8 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             if (data.mlSignal) {
                 document.getElementById('mlValue').innerText = data.mlSignal.confidence.toFixed(1) + "%";
                 const stat = document.getElementById('mlStatus');
-                
-                // Convert to LONG/SHORT for better UI clarity
                 const signalDirection = data.mlSignal.type === 'bull' ? 'LONG' : 'SHORT';
                 stat.innerText = "SIGNAL: " + signalDirection;
-                
                 stat.className = "text-[10px] font-bold px-3 py-1 rounded-full uppercase " + 
                     (data.mlSignal.type === 'bull' ? "bg-green-500 text-white" : "bg-red-500 text-white");
             }
@@ -783,15 +782,12 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             const hist = document.getElementById("tradeHistoryBody");
             if(data.metrics.trades && data.metrics.trades.length > 0) {
                 hist.innerHTML = "";
-                // Show last 10 executions
                 data.metrics.trades.slice(-10).reverse().forEach(t => {
                     const isLong = t.side.toLowerCase() === 'long';
                     const sideColor = isLong ? 'text-green-600' : 'text-red-600';
                     const pnlColor = t.netPnl >= 0 ? 'text-green-600' : 'text-red-600';
-
                     hist.innerHTML += \`
                     <div class="flex flex-col border-b border-gray-100 pb-3 mb-2">
-                        <!-- Top Row: Signal and Net Profit -->
                         <div class="flex justify-between items-center">
                             <div class="flex items-center gap-2">
                                 <span class="text-[9px] font-bold bg-gray-100 px-1.5 py-0.5 rounded text-gray-500 uppercase">Signal</span>
@@ -799,14 +795,10 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                             </div>
                             <span class="text-xs font-mono font-bold \${pnlColor}">\${t.netPnl >= 0 ? '+' : ''}$\${t.netPnl.toFixed(2)}</span>
                         </div>
-                        
-                        <!-- Middle Row: Reason and Quantity -->
                         <div class="flex justify-between items-center mt-1.5">
                             <span class="text-[10px] text-gray-400">Reason: <span class="text-gray-700 font-medium">\${t.exitReason}</span></span>
                             <span class="text-[10px] text-gray-400">Qty: <span class="text-gray-700 font-mono">\${t.contracts.toLocaleString()}</span></span>
                         </div>
-
-                        <!-- Bottom Row: ROI -->
                         <div class="flex items-center gap-1 mt-1">
                              <span class="text-[9px] font-bold uppercase text-gray-400">ROI:</span>
                              <span class="text-[10px] font-bold \${t.roiPct >= 0 ? 'text-green-500' : 'text-red-500'}">\${t.roiPct.toFixed(2)}%</span>
@@ -844,8 +836,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             const res = await doAPI('/api/auth/register', 'POST', { name: document.getElementById('reg-name').value, email: document.getElementById('reg-email').value, password: document.getElementById('reg-pass').value });
             if (res.error) document.getElementById('reg-err').innerText = res.error; else { authToken = res.token; localStorage.setItem('bot_token', authToken); nav('dashboard'); }
         }
-
-        async function closeAll() { if(confirm("Close Position?")) await doAPI('/api/close-all', 'GET'); }
 
         async function runBacktest() {
             const res = await doAPI('/api/backtest', 'POST', { ticks: document.getElementById('btTicks').value, tpPct: document.getElementById('btTp').value, slPct: document.getElementById('btSl').value, mlLookback: document.getElementById('btMlLookback').value });
