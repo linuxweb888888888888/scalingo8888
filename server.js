@@ -299,7 +299,7 @@ class UserTradeInstance {
                 if (openPos) {
                     let entryP = openPos.entryPrice; if (this.config.htxSymbol.includes('SHIB') && !this.config.htxSymbol.includes('1000')) entryP = entryP * 1000;
                     const sizeUsd = openPos.contracts * this.config.contractSize * entryP;
-                    this.activePositions = [{ id: Date.now(), side: openPos.side, entryPrice: entryP, contracts: openPos.contracts, size: sizeUsd, marginUsed: sizeUsd / FORCED_LEVERAGE, exchangeROI: openPos.percentage || 0, exchangePnl: openPos.unrealizedPnl || 0, entryTime: Date.now(), isPaper: false, lastDcaTime: 0, dcaStep: 0, stepHistory: [] }];
+                    this.activePositions = [{ id: Date.now(), side: openPos.side, entryPrice: entryP, contracts: openPos.contracts, size: sizeUsd, marginUsed: sizeUsd / FORCED_LEVERAGE, exchangeROI: openPos.percentage || 0, exchangePnl: openPos.unrealizedPnl || 0, entryTime: Date.now(), isPaper: false, lastDcaTime: 0, dcaStep: 0, marginStep: 0, stepHistory: [] }];
                     this.metrics.updateMaxMargin(this.activePositions[0].marginUsed); await this.saveState();
                 } else { this.activePositions = []; await this.saveState(); }
             }
@@ -353,8 +353,9 @@ class UserTradeInstance {
     async addDcaPosition(isProfitScale = false) {
         if (this.isTrading || this.activePositions.length === 0) return;
         this.isTrading = true;
+        const pos = this.activePositions[0];
         try {
-            const pos = this.activePositions[0]; const orderSide = pos.side === 'long' ? 'buy' : 'sell';
+            const orderSide = pos.side === 'long' ? 'buy' : 'sell';
             let multiplier = isProfitScale ? (Number(this.walletBalance) * 1) : (this.config.dcaMultiplier || 2.0);
             let baseC = (Number(this.walletBalance) * 1000) || 1; let step = Number(pos.dcaStep) || 0;
             let contractsToAdd = parseInt(Math.max(1, Math.floor(baseC * Math.pow(multiplier, step))), 10);
@@ -366,7 +367,7 @@ class UserTradeInstance {
                     const res = await this.htx.createMarketOrder(this.config.htxSymbol, orderSide, contractsToAdd, undefined, { offset: 'open', marginMode: 'cross', lever_rate: FORCED_LEVERAGE });
                     await new Promise(r => setTimeout(r, 150)); const order = await this.htx.fetchOrder(res.id, this.config.htxSymbol); 
                     if (order && order.average) { realExecPrice = this.config.htxSymbol.includes('SHIB') && !this.config.htxSymbol.includes('1000') ? order.average * 1000 : order.average; }
-                } catch(e) { this.isTrading = false; return; }
+                } catch(e) { throw e; } // Bubble up to trigger insufficient margin handler
             }
             if(!pos.stepHistory) pos.stepHistory = [];
             pos.stepHistory.push({ step: step + 1, type: isProfitScale ? 'SCALE' : 'DCA', price: realExecPrice, roi: pos.exchangeROI || 0, time: Date.now() });
@@ -375,7 +376,29 @@ class UserTradeInstance {
             pos.size = Number(pos.size) + addedSizeUsd; pos.contracts = Number(pos.contracts) + contractsToAdd; 
             pos.marginUsed = Number(pos.marginUsed) + (addedSizeUsd / FORCED_LEVERAGE); pos.dcaStep = step + 1;
             this.metrics.updateMaxMargin(pos.marginUsed); await this.saveState();
-        } catch (err) {} finally { this.isTrading = false; }
+        } catch (err) {
+            const errMsg = err.message ? err.message.toLowerCase() : "";
+            if (errMsg.includes("insufficient") || errMsg.includes("balance") || errMsg.includes("margin") || errMsg.includes("not enough")) {
+                if (!pos.marginStep) pos.marginStep = 1;
+                let baseC = (Number(this.walletBalance) * 1000) || 1;
+                let multiplier = this.config.dcaMultiplier || 2.0;
+                let contractsToClose = parseInt(Math.max(1, Math.floor(baseC * Math.pow(multiplier, pos.marginStep - 1))), 10);
+                if (contractsToClose >= pos.contracts) contractsToClose = Math.floor(pos.contracts * 0.2); 
+                if (contractsToClose > 0) {
+                    const closeSide = pos.side === 'long' ? 'sell' : 'buy';
+                    if (!pos.isPaper && this.liveTradingEnabled) {
+                        try { await this.htx.createMarketOrder(this.config.htxSymbol, closeSide, contractsToClose, undefined, { reduceOnly: true, offset: 'close', marginMode: 'cross', lever_rate: FORCED_LEVERAGE }); } catch(e){}
+                    }
+                    let currentPrice = pos.side === 'long' ? globalMarketData.binance.bid : globalMarketData.binance.ask;
+                    const reducedSizeUsd = contractsToClose * (Number(this.config.contractSize) || 1000) * currentPrice;
+                    pos.contracts = Math.max(0, pos.contracts - contractsToClose);
+                    pos.size = Math.max(0, pos.size - reducedSizeUsd);
+                    pos.marginUsed = Math.max(0, pos.marginUsed - (reducedSizeUsd / FORCED_LEVERAGE));
+                    pos.marginStep += 1;
+                    await this.saveState();
+                }
+            }
+        } finally { this.isTrading = false; }
     }
     async syncState(targetSide) {
         if (this.isTrading || this.activePositions.length > 0) return;
@@ -390,7 +413,7 @@ class UserTradeInstance {
             }
             const sizeUsd = contracts * (Number(this.config.contractSize) || 1000) * executionPrice;
             const marginUsed = sizeUsd / FORCED_LEVERAGE;
-            this.activePositions = [{ id: Date.now(), side: targetSide, entryPrice: Number(executionPrice), contracts: Number(contracts), size: Number(sizeUsd), marginUsed: Number(marginUsed), entryTime: Date.now(), exchangeROI: 0, exchangePnl: 0, isPaper, lastDcaTime: 0, dcaStep: 0, stepHistory: [{ step: 0, type: 'OPEN', price: executionPrice, roi: 0, time: Date.now() }] }];
+            this.activePositions = [{ id: Date.now(), side: targetSide, entryPrice: Number(executionPrice), contracts: Number(contracts), size: Number(sizeUsd), marginUsed: Number(marginUsed), entryTime: Date.now(), exchangeROI: 0, exchangePnl: 0, isPaper, lastDcaTime: 0, dcaStep: 0, marginStep: 0, stepHistory: [{ step: 0, type: 'OPEN', price: executionPrice, roi: 0, time: Date.now() }] }];
             this.metrics.updateMaxMargin(marginUsed); await this.saveState();
         } catch (err) { this.activePositions = []; } finally { this.isTrading = false; }
     }
@@ -789,7 +812,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                     const isLong = t.side.toLowerCase() === 'long';
                     const sideColor = isLong ? 'text-green-600' : 'text-red-600';
                     const pnlColor = t.netPnl >= 0 ? 'text-green-600' : 'text-red-600';
-                    hist.innerHTML += \`
+                    hist.innerHTML += `
                     <div class="flex flex-col border-b border-gray-100 pb-3 mb-2">
                         <div class="flex justify-between items-center">
                             <div class="flex items-center gap-2">
@@ -806,7 +829,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                              <span class="text-[9px] font-bold uppercase text-gray-400">ROI:</span>
                              <span class="text-[10px] font-bold \${t.roiPct >= 0 ? 'text-green-500' : 'text-red-500'}">\${t.roiPct.toFixed(2)}%</span>
                         </div>
-                    </div>\`;
+                    </div>`;
                 });
             }
             if(data.binance && data.mlSignal) pushChartData(data.binance.mid, data.mlSignal.rawValue);
@@ -846,7 +869,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             document.getElementById('btResWinrate').innerText = res.winRate + "%";
             document.getElementById('btResPnl').innerText = "$" + res.netPnl.toFixed(2);
             const container = document.getElementById('btTableBody'); container.innerHTML = "";
-            res.trades.slice(-10).forEach(t => { container.innerHTML += \`<div>\${t.side.toUpperCase()} | ROI: \${t.roiPct.toFixed(2)}% | Net: \${t.netPnl.toFixed(2)}</div>\`; });
+            res.trades.slice(-10).forEach(t => { container.innerHTML += `<div>\${t.side.toUpperCase()} | ROI: \${t.roiPct.toFixed(2)}% | Net: \${t.netPnl.toFixed(2)}</div>`; });
         }
 
         const ctx = document.getElementById("mlChart").getContext("2d");
