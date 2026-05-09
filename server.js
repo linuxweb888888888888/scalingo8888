@@ -77,9 +77,7 @@ function generateToken() { return crypto.randomBytes(32).toString('hex'); }
 const tokenCache = new Map();
 setInterval(() => {
     const now = Date.now();
-    for (const [token, data] of tokenCache.entries()) {
-        if (now - data.lastAccessed > 3600000) tokenCache.delete(token);
-    }
+    for (const [token, data] of tokenCache.entries()) { if (now - data.lastAccessed > 3600000) tokenCache.delete(token); }
 }, 600000);
 
 async function authMiddleware(req, res, next) {
@@ -165,7 +163,6 @@ class PerformanceMetrics {
         const dbTrades = await TradeModel.find({ userId: this.userId }).sort({ timestamp: -1 }).limit(2000).lean(); 
         dbTrades.reverse().forEach(t => this.processTrade(t, false)); 
     }
-    recordTrade(trade) { this.processTrade(trade, true); }
     processTrade(trade, saveToDb = true) {
         this.totalTradesCount++; if (!trade.timestamp) trade.timestamp = Date.now();
         this.trades.push(trade); if (this.trades.length > 2000) this.trades.shift(); 
@@ -178,70 +175,19 @@ class PerformanceMetrics {
     updateMaxMargin(margin) { if (margin > this.maxMarginUsed) this.maxMarginUsed = margin; }
 }
 
-async function runBacktestSimulation(config, tickCount, symbol) {
-    try { await publicBinance.loadMarkets(); } catch (e) { return { error: e.message }; }
-    let allCandles = [], since = Date.now() - (tickCount * 60 * 1000); 
-    try {
-        while (allCandles.length < tickCount) {
-            const limit = Math.min(1000, tickCount - allCandles.length);
-            const ohlcv = await publicBinance.fetchOHLCV(symbol, '1m', since, limit);
-            if (!ohlcv || ohlcv.length === 0) break;
-            allCandles.push(...ohlcv);
-            since = ohlcv[ohlcv.length - 1][0] + 60000;
-        }
-    } catch (e) { allCandles = await publicBinance.fetchOHLCV(symbol, '1m', undefined, Math.min(tickCount, 1000)).catch(()=>[]) || []; }
-    const ticks = allCandles.map(c => ({ timestamp: c[0], priceMid: c[4] }));
-    if (!ticks || ticks.length === 0) return { error: "No data" };
-    let activePos = null, closedTrades = [], netPnl = 0, wins = 0, losses = 0, totalTradeDurationMs = 0, maxMarginUsed = 0;
-    const { mlLookback=50, mlThreshold=60.0, mlAverageTicks=5, mlUseAverage=false, flipOnlyInProfit=true, flipThresholdPct=0.5 } = config;
-    let priceBuffer = [], mlRawBuffer = [];
-    for (const tick of ticks) {
-        const price = tick.priceMid, tickTime = tick.timestamp;
-        if (priceBuffer.length === 0 || price !== priceBuffer[priceBuffer.length - 1]) { priceBuffer.push(price); if (priceBuffer.length > 500) priceBuffer.shift(); }
-        const mlSig = calculateMLSignal(priceBuffer, mlLookback);
-        mlRawBuffer.push(mlSig.rawValue); if (mlRawBuffer.length > mlAverageTicks) mlRawBuffer.shift();
-        let avgRaw = mlRawBuffer.reduce((a,b)=>a+b,0) / mlRawBuffer.length;
-        let avgConf = Math.min(Math.abs(avgRaw - 0.5) * 200, 100);
-        let activeType = mlUseAverage ? (avgRaw >= 0.5 ? 'bull' : 'bear') : mlSig.type;
-        let activeConf = mlUseAverage ? avgConf : mlSig.confidence;
-        let signal = (activeConf >= mlThreshold) ? (activeType === 'bull' ? 'long' : 'short') : null;
-        if (!activePos && signal) {
-            let bC = parseInt(config.baseContracts) || 1;
-            const sizeUsd = bC * config.contractSize * price; 
-            activePos = { side: signal, entryPrice: price, contracts: bC, size: sizeUsd, marginUsed: sizeUsd / FORCED_LEVERAGE, entryTime: tickTime, dcaStep: 0 };
-            if (activePos.marginUsed > maxMarginUsed) maxMarginUsed = activePos.marginUsed;
-            continue;
-        }
-        if (activePos) {
-            const math = calculateTradeMath(activePos.side, activePos.entryPrice, price, activePos.size, FORCED_LEVERAGE, config.fees.taker);
-            let forceExitReason = null;
-            if (signal && activePos.side !== signal) {
-                if (flipOnlyInProfit) { if (math.currentGrossRoi >= flipThresholdPct) forceExitReason = "ML_FLIP"; } else forceExitReason = "ML_FLIP";
-            }
-            if (!forceExitReason && math.currentGrossRoi >= config.takeProfitPct) forceExitReason = "TAKE_PROFIT";
-            else if (!forceExitReason && math.currentGrossRoi <= config.stopLossPct) forceExitReason = "STOP_LOSS";
-            if (forceExitReason) {
-                netPnl += math.netPnlUsd; math.netPnlUsd > 0 ? wins++ : losses++;
-                totalTradeDurationMs += (tickTime - activePos.entryTime);
-                closedTrades.push({ side: activePos.side, contracts: activePos.contracts, netPnl: math.netPnlUsd, exitReason: forceExitReason, timestamp: tickTime });
-                activePos = null;
-            }
-        }
-    }
-    return { winRate: (wins / (wins+losses) * 100).toFixed(2), netPnl, totalTradesCount: closedTrades.length, depositNeeded: maxMarginUsed, trades: closedTrades.slice(-100) };
-}
-
 class UserTradeInstance {
     constructor(user) {
         this.userId = user._id.toString(); 
         this.config = { ...BASE_CONFIG, ...(user.config || {}) }; 
+        if (!this.config.htxSymbol || this.config.htxSymbol.includes('1000')) { this.config.htxSymbol = 'SHIB/USDT:USDT'; this.config.binanceSymbol = '1000SHIB/USDT:USDT'; }
+        if (!this.config.contractSize) this.config.contractSize = 1000;
+        this.config.leverage = FORCED_LEVERAGE;
+        this.config.marginMode = 'cross'; 
         this.startTime = Date.now(); this.metrics = new PerformanceMetrics(this.userId);
         this.activePositions = user.activePosition ? [user.activePosition] : []; 
         this.lastCloseTime = user.lastCloseTime || 0;
-        this.isTrading = false; 
-        this.currentMl = { confidence: 0, type: 'flat', rawValue: 0.5 };
-        this.mlRawBuffer = [];
-        this.walletBalance = 0;
+        this.isTrading = false; this.currentMl = { confidence: 0, type: 'flat', rawValue: 0.5 };
+        this.mlRawBuffer = []; this.walletBalance = 0;
         this.applyUserKeys(user);
     }
     applyUserKeys(user) {
@@ -257,8 +203,7 @@ class UserTradeInstance {
                 const positions = await this.htx.fetchPositions([this.config.htxSymbol]); 
                 const openPos = positions.find(p => p.contracts > 0);
                 if (openPos) {
-                    let entryP = openPos.entryPrice;
-                    if (this.config.htxSymbol.includes('SHIB') && !this.config.htxSymbol.includes('1000')) entryP = entryP * 1000;
+                    let entryP = openPos.entryPrice; if (this.config.htxSymbol.includes('SHIB') && !this.config.htxSymbol.includes('1000')) entryP = entryP * 1000;
                     const sizeUsd = openPos.contracts * this.config.contractSize * entryP;
                     this.activePositions = [{ side: openPos.side, entryPrice: entryP, contracts: openPos.contracts, size: sizeUsd, marginUsed: sizeUsd / FORCED_LEVERAGE, exchangeROI: openPos.percentage || 0, exchangePnl: openPos.unrealizedPnl || 0, isPaper: false, lastDcaTime: 0, dcaStep: 0, stepHistory: [] }];
                 } else this.activePositions = [];
@@ -267,36 +212,40 @@ class UserTradeInstance {
         return { success: true };
     }
     async evaluateAIEntry() {
-        let mlSig = mlSignalCache.get(this.config.mlLookback) || calculateMLSignal(globalMarketData.tickBuffer, this.config.mlLookback);
-        this.mlRawBuffer.push(mlSig.rawValue); if (this.mlRawBuffer.length > this.config.mlAverageTicks) this.mlRawBuffer.shift();
-        let avgRaw = this.mlRawBuffer.reduce((a,b)=>a+b,0) / this.mlRawBuffer.length;
-        this.currentMl = { confidence: mlSig.confidence, type: mlSig.type, rawValue: mlSig.rawValue, avgConfidence: Math.abs(avgRaw - 0.5)*200, avgType: avgRaw >= 0.5 ? 'bull' : 'bear' };
-        if (this.isTrading || (Date.now() - this.lastCloseTime < 3000)) return;
-        let activeType = this.config.mlUseAverage ? this.currentMl.avgType : mlSig.type;
-        let activeConf = this.config.mlUseAverage ? this.currentMl.avgConfidence : mlSig.confidence;
-        let signal = (activeConf >= (this.config.mlThreshold || 60.0)) ? (activeType === 'bull' ? 'long' : 'short') : null;
-        if (this.activePositions.length > 0) {
-            const pos = this.activePositions[0];
-            if (signal && pos.side !== signal) {
-                const roi = pos.exchangeROI || 0;
-                if (!this.config.flipOnlyInProfit || roi >= (this.config.flipThresholdPct || 0)) {
-                    await this.forceClosePosition("ML_FLIP"); setTimeout(() => this.syncState(signal), 100);
+        try {
+            let mlSig = mlSignalCache.get(this.config.mlLookback) || calculateMLSignal(globalMarketData.tickBuffer, this.config.mlLookback);
+            this.mlRawBuffer.push(mlSig.rawValue); if (this.mlRawBuffer.length > (this.config.mlAverageTicks || 5)) this.mlRawBuffer.shift();
+            let avgRaw = this.mlRawBuffer.reduce((a,b)=>a+b,0) / this.mlRawBuffer.length;
+            this.currentMl = { confidence: mlSig.confidence, type: mlSig.type, rawValue: mlSig.rawValue, avgConfidence: Math.abs(avgRaw - 0.5)*200, avgType: avgRaw >= 0.5 ? 'bull' : 'bear' };
+            if (this.isTrading || (Date.now() - this.lastCloseTime < 3000)) return;
+            let activeType = this.config.mlUseAverage ? this.currentMl.avgType : mlSig.type;
+            let activeConf = this.config.mlUseAverage ? this.currentMl.avgConfidence : mlSig.confidence;
+            let signal = (activeConf >= (this.config.mlThreshold || 60.0)) ? (activeType === 'bull' ? 'long' : 'short') : null;
+            if (this.activePositions.length > 0) {
+                const pos = this.activePositions[0];
+                if (signal && pos.side !== signal) {
+                    const roi = pos.exchangeROI || 0;
+                    if (!this.config.flipOnlyInProfit || roi >= (this.config.flipThresholdPct || 0)) {
+                        await this.forceClosePosition("ML_FLIP"); setTimeout(() => this.syncState(signal), 100);
+                    }
                 }
-            }
-        } else if (signal) await this.syncState(signal);
+            } else if (signal) await this.syncState(signal);
+        } catch(e) {}
     }
     async checkExits() {
         if (this.isTrading || this.activePositions.length === 0) return;
-        const pos = this.activePositions[0];
-        const roi = pos.exchangeROI || 0;
-        if (roi >= this.config.takeProfitPct) await this.forceClosePosition("TAKE_PROFIT");
-        else if (roi <= this.config.stopLossPct) await this.forceClosePosition("STOP_LOSS");
-        else {
-            const dcaThreshold = -(Math.abs(this.config.dcaRoiThresholdPct || 1));
-            const scaleThreshold = this.config.profitRoiThresholdPct || 2;
-            if (roi <= dcaThreshold && Date.now() - (pos.lastDcaTime || 0) > 10000) await this.addDcaPosition(false);
-            else if (roi >= scaleThreshold && Date.now() - (pos.lastDcaTime || 0) > 10000) await this.addDcaPosition(true);
-        }
+        try {
+            const pos = this.activePositions[0];
+            const roi = pos.exchangeROI || 0;
+            if (roi >= this.config.takeProfitPct) await this.forceClosePosition("TAKE_PROFIT");
+            else if (roi <= this.config.stopLossPct) await this.forceClosePosition("STOP_LOSS");
+            else {
+                const dcaThreshold = -(Math.abs(this.config.dcaRoiThresholdPct || 1));
+                const scaleThreshold = this.config.profitRoiThresholdPct || 2;
+                if (roi <= dcaThreshold && Date.now() - (pos.lastDcaTime || 0) > 10000) await this.addDcaPosition(false);
+                else if (roi >= scaleThreshold && Date.now() - (pos.lastDcaTime || 0) > 10000) await this.addDcaPosition(true);
+            }
+        } catch(e) {}
     }
     async addDcaPosition(isProfitScale) {
         this.isTrading = true;
@@ -308,6 +257,7 @@ class UserTradeInstance {
             if (isProfitScale && (pos.contracts + contractsToAdd > (this.config.maxContracts || baseC*2))) { this.isTrading = false; return; }
             let price = globalMarketData.binance.mid;
             if (!pos.isPaper && this.liveTradingEnabled) {
+                try { await this.htx.setLeverage(FORCED_LEVERAGE, this.config.htxSymbol); } catch(e){}
                 await this.htx.createMarketOrder(this.config.htxSymbol, pos.side === 'long' ? 'buy' : 'sell', contractsToAdd, undefined, { offset: 'open' });
             }
             pos.stepHistory = pos.stepHistory || [];
@@ -315,31 +265,36 @@ class UserTradeInstance {
             const addedUsd = contractsToAdd * this.config.contractSize * price;
             pos.entryPrice = ((pos.entryPrice * pos.size) + (price * addedUsd)) / (pos.size + addedUsd);
             pos.size += addedUsd; pos.contracts += contractsToAdd; pos.marginUsed += (addedUsd / FORCED_LEVERAGE);
-            pos.dcaStep = (pos.dcaStep || 0) + 1; pos.lastDcaTime = Date.now();
-            await this.saveState();
-        } finally { this.isTrading = false; }
+            pos.dcaStep = (pos.dcaStep || 0) + 1; pos.lastDcaTime = Date.now(); await this.saveState();
+        } catch(e) { console.error("DCA Error:", e.message); } finally { this.isTrading = false; }
     }
     async syncState(targetSide) {
         this.isTrading = true;
         try {
             let contracts = Math.max(1, Math.floor(this.walletBalance * 1000));
             let price = globalMarketData.binance.mid;
-            if (this.liveTradingEnabled) await this.htx.createMarketOrder(this.config.htxSymbol, targetSide === 'long' ? 'buy' : 'sell', contracts, undefined, { offset: 'open' });
+            if (this.liveTradingEnabled) {
+                try { await this.htx.setLeverage(FORCED_LEVERAGE, this.config.htxSymbol); } catch(e){}
+                await this.htx.createMarketOrder(this.config.htxSymbol, targetSide === 'long' ? 'buy' : 'sell', contracts, undefined, { offset: 'open' });
+            }
             const sizeUsd = contracts * this.config.contractSize * price;
             this.activePositions = [{ side: targetSide, entryPrice: price, contracts, size: sizeUsd, marginUsed: sizeUsd / FORCED_LEVERAGE, exchangeROI: 0, exchangePnl: 0, isPaper: !this.liveTradingEnabled, lastDcaTime: 0, dcaStep: 0, stepHistory: [{ step: 0, type: 'OPEN', price, roi: 0, time: Date.now() }] }];
             await this.saveState();
-        } finally { this.isTrading = false; }
+        } catch(e) { console.error("Open Error:", e.message); } finally { this.isTrading = false; }
     }
     async forceClosePosition(reason) {
         this.isTrading = true;
         try {
             const pos = this.activePositions[0];
             let price = globalMarketData.binance.mid;
-            if (!pos.isPaper && this.liveTradingEnabled) await this.htx.createMarketOrder(this.config.htxSymbol, pos.side === 'long' ? 'sell' : 'buy', pos.contracts, undefined, { reduceOnly: true, offset: 'close' });
+            if (!pos.isPaper && this.liveTradingEnabled) {
+                try { await this.htx.setLeverage(FORCED_LEVERAGE, this.config.htxSymbol); } catch(e){}
+                await this.htx.createMarketOrder(this.config.htxSymbol, pos.side === 'long' ? 'sell' : 'buy', pos.contracts, undefined, { reduceOnly: true, offset: 'close' });
+            }
             const math = calculateTradeMath(pos.side, pos.entryPrice, price, pos.size, FORCED_LEVERAGE, 0.0004);
             this.metrics.recordTrade({ side: pos.side, contracts: pos.contracts, netPnl: math.netPnlUsd, exitReason: reason, timestamp: Date.now() });
             this.activePositions = []; this.lastCloseTime = Date.now(); await this.saveState();
-        } finally { this.isTrading = false; }
+        } catch(e) { console.error("Close Error:", e.message); } finally { this.isTrading = false; }
     }
     startExchangeROISync() {
         setInterval(async () => {
@@ -377,29 +332,24 @@ async function startMasterStreams() {
                 globalMarketData.tickBuffer.push(mid); if (globalMarketData.tickBuffer.length > 500) globalMarketData.tickBuffer.shift();
                 const ml = calculateMLSignal(globalMarketData.tickBuffer, BASE_CONFIG.mlLookback);
                 mlSignalCache.set(BASE_CONFIG.mlLookback, ml);
-                for (const w of activeWorkers.values()) { w.checkExits(); w.evaluateAIEntry(); }
+                for (const w of activeWorkers.values()) { try { w.checkExits(); w.evaluateAIEntry(); } catch(e){} }
             } catch(e) { await new Promise(r => setTimeout(r, 2000)); }
         }
     })();
 }
-async function loadAllUsers() {
-    const users = await UserModel.find({});
-    for(const u of users) { const w = new UserTradeInstance(u); await w.initialize(); activeWorkers.set(u._id.toString(), w); }
-}
+async function loadAllUsers() { const users = await UserModel.find({}); for(const u of users) { const w = new UserTradeInstance(u); await w.initialize(); activeWorkers.set(u._id.toString(), w); } }
 
 const app = express(); app.use(express.json());
 app.post('/api/auth/register', async (req, res) => {
     const salt = crypto.randomBytes(16).toString('hex');
     const user = await UserModel.create({ ...req.body, passwordHash: hashPassword(req.body.password, salt), salt, token: generateToken() });
-    const w = new UserTradeInstance(user); await w.initialize(); activeWorkers.set(user._id.toString(), w);
-    res.json({ token: user.token });
+    const w = new UserTradeInstance(user); await w.initialize(); activeWorkers.set(user._id.toString(), w); res.json({ token: user.token });
 });
 app.post('/api/auth/login', async (req, res) => {
     const user = await UserModel.findOne({ email: req.body.email });
     if(user && hashPassword(req.body.password, user.salt) === user.passwordHash) {
         user.token = generateToken(); await user.save();
-        tokenCache.set(user.token, { user, lastAccessed: Date.now() });
-        res.json({ token: user.token });
+        tokenCache.set(user.token, { user, lastAccessed: Date.now() }); res.json({ token: user.token });
     } else res.status(400).json({ error: "Invalid" });
 });
 app.post('/api/user/config', authMiddleware, async (req, res) => {
@@ -416,7 +366,11 @@ app.post('/api/user/keys', authMiddleware, async (req, res) => {
     req.user.apiKey = req.body.apiKey; req.user.apiSecret = req.body.apiSecret; req.user.liveTradingEnabled = req.body.liveTradingEnabled;
     await req.user.save(); res.json({status: 'ok'});
 });
-app.get('/api/data', authMiddleware, (req, res) => res.json(activeWorkers.get(req.user._id.toString()).getExportData()));
+app.get('/api/data', authMiddleware, (req, res) => {
+    const w = activeWorkers.get(req.user._id.toString());
+    if(!w) return res.json({ metrics: { totalNetPnl: 0, trades: [] }, mlSignal: {}, config: BASE_CONFIG, walletBalance: 0, activePositions: [], binance: {} });
+    res.json(w.getExportData());
+});
 app.get('/api/close-all', authMiddleware, async (req, res) => { await activeWorkers.get(req.user._id.toString()).forceClosePosition("MANUAL"); res.json({status: 'ok'}); });
 
 // ==================== ANDROID UI ====================
@@ -453,75 +407,39 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
     <header class="app-bar"><span class="material-symbols-outlined mr-4">bolt</span>TradeBotPille</header>
     <main class="px-4">
         <section id="view-home" class="view-section active-view py-10 text-center"><div class="m3-card"><h1 class="text-3xl font-bold mb-4">ML Math Engine</h1><p class="text-gray-500 mb-8">24/7 High-Frequency Trading</p><button onclick="nav('register')" class="m3-btn">Get Started</button></div></section>
-        
         <section id="view-dashboard" class="view-section">
-            <div class="grid grid-cols-2 gap-3 mb-3">
-                <div class="m3-card !p-4"><p class="text-[10px] font-bold text-gray-500 uppercase">Net PnL</p><p id="netPnl" class="text-xl font-mono font-bold">$0.00</p></div>
-                <div class="m3-card !p-4"><p class="text-[10px] font-bold text-gray-500 uppercase">Wallet</p><p id="wallet" class="text-xl font-mono font-bold">$0.00</p></div>
-            </div>
-            
+            <div class="grid grid-cols-2 gap-3 mb-3"><div class="m3-card !p-4"><p class="text-[10px] font-bold text-gray-500 uppercase">Net PnL</p><p id="netPnl" class="text-xl font-mono font-bold">$0.00</p></div><div class="m3-card !p-4"><p class="text-[10px] font-bold text-gray-500 uppercase">Wallet</p><p id="wallet" class="text-xl font-mono font-bold">$0.00</p></div></div>
             <div class="m3-card">
-                <div class="sub-header">ML Performance</div>
-                <div class="flex justify-between mb-4"><span>Confidence</span><b id="mlValue" class="font-mono">0%</b></div>
-                
-                <div class="sub-header">Strategy Settings</div>
-                <div class="grid grid-cols-2 gap-3">
-                    <div class="m3-field"><label class="m3-label">Lookback</label><input type="number" id="mlLookback" class="m3-input"></div>
-                    <div class="m3-field"><label class="m3-label">Threshold</label><input type="number" id="mlThreshold" class="m3-input"></div>
-                </div>
-                <div class="grid grid-cols-2 gap-3">
-                    <div class="m3-field"><label class="m3-label">TP %</label><input type="number" id="takeProfitPct" class="m3-input"></div>
-                    <div class="m3-field"><label class="m3-label">SL %</label><input type="number" id="stopLossPct" class="m3-input"></div>
-                </div>
-                <div class="m3-field"><label class="m3-label">Profit Multiplier</label><input type="number" id="profitMultiplier" class="m3-input"></div>
-                <div class="m3-field"><label class="m3-label">Loss Multiplier</label><input type="number" id="dcaMultiplier" class="m3-input"></div>
+                <div class="sub-header">ML Core</div>
+                <div class="grid grid-cols-2 gap-3"><div class="m3-field"><label class="m3-label">Lookback</label><input type="number" id="mlLookback" class="m3-input"></div><div class="m3-field"><label class="m3-label">Threshold</label><input type="number" id="mlThreshold" class="m3-input"></div></div>
+                <div class="grid grid-cols-2 gap-3"><div class="m3-field"><label class="m3-label">Smoothing</label><input type="number" id="mlAverageTicks" class="m3-input"></div><div class="m3-field"><label class="m3-label">Signal</label><select id="mlUseAverage" class="m3-input h-[48px]"><option value="false">Raw</option><option value="true">Avg</option></select></div></div>
+                <div class="sub-header">Risk</div>
+                <div class="grid grid-cols-2 gap-3"><div class="m3-field"><label class="m3-label">TP %</label><input type="number" id="takeProfitPct" class="m3-input"></div><div class="m3-field"><label class="m3-label">SL %</label><input type="number" id="stopLossPct" class="m3-input"></div></div>
+                <div class="m3-field"><label class="m3-label">Flip Mode</label><select id="flipOnlyInProfit" class="m3-input h-[48px]"><option value="true">DCA Loss</option><option value="false">Flip Loss</option></select></div>
+                <div class="m3-field"><label class="m3-label">Flip Threshold %</label><input type="number" id="flipThresholdPct" class="m3-input"></div>
+                <div class="sub-header">Scaling</div>
+                <div class="grid grid-cols-2 gap-3"><div class="m3-field"><label class="m3-label">DCA Drop %</label><input type="number" id="dcaRoiThresholdPct" class="m3-input"></div><div class="m3-field"><label class="m3-label">DCA Multi</label><input type="number" id="dcaMultiplier" class="m3-input"></div></div>
+                <div class="grid grid-cols-2 gap-3"><div class="m3-field"><label class="m3-label">Scale ROI %</label><input type="number" id="profitRoiThresholdPct" class="m3-input"></div><div class="m3-field"><label class="m3-label">Scale Multi</label><input type="number" id="profitMultiplier" class="m3-input"></div></div>
                 <div class="m3-field"><label class="m3-label">Max Contracts</label><input type="number" id="maxContracts" class="m3-input"></div>
-                <button onclick="saveConfig()" class="m3-btn">Save Strategy</button>
-                <button onclick="closeAll()" class="w-full text-red-500 font-bold mt-4">Force Close All</button>
+                <button onclick="saveConfig()" class="m3-btn">Save Strategy</button><button onclick="closeAll()" class="w-full text-red-500 font-bold mt-4 uppercase text-xs">Force Close</button>
             </div>
         </section>
-
-        <section id="view-history" class="view-section"><h2 class="text-xl font-bold mb-4">Trade Logs</h2><div id="logs" class="space-y-2"></div></section>
-        
-        <section id="view-settings" class="view-section">
-            <div class="m3-card">
-                <div class="sub-header">Exchange Sync</div>
-                <div class="flex justify-between p-3 bg-blue-50 rounded-xl mb-6"><span class="font-bold text-sm">Live Trading</span><input type="checkbox" id="liveTrade"></div>
-                <div class="m3-field"><label class="m3-label">API Key</label><input type="password" id="apiKey" class="m3-input"></div>
-                <div class="m3-field"><label class="m3-label">API Secret</label><input type="password" id="apiSecret" class="m3-input"></div>
-                <button onclick="saveKeys()" class="m3-btn">Connect HTX</button>
-                <button onclick="logout()" class="w-full text-red-500 font-bold mt-8">Logout</button>
-            </div>
-        </section>
-
-        <section id="view-login" class="view-section pt-10"><div class="m3-card"><h2 class="text-2xl font-bold mb-6">Login</h2><input type="email" id="l-email" placeholder="Email" class="m3-input mb-4"><input type="password" id="l-pass" placeholder="Password" class="m3-input mb-6"><button onclick="doLogin()" class="m3-btn">Enter</button></div></section>
-        <section id="view-register" class="view-section pt-10"><div class="m3-card"><h2 class="text-2xl font-bold mb-6">Register</h2><input type="text" id="r-name" placeholder="Name" class="m3-input mb-4"><input type="email" id="r-email" placeholder="Email" class="m3-input mb-4"><input type="password" id="r-pass" placeholder="Password" class="m3-input mb-6"><button onclick="doRegister()" class="m3-btn">Create</button></div></section>
+        <section id="view-history" class="view-section"><h2 class="text-xl font-bold mb-4">Logs</h2><div id="logs" class="space-y-2"></div></section>
+        <section id="view-settings" class="view-section"><div class="m3-card"><div class="sub-header">Exchange Sync</div><div class="flex justify-between p-3 bg-blue-50 rounded-xl mb-6"><span class="font-bold text-sm">Live Trade</span><input type="checkbox" id="liveTrade"></div><div class="m3-field"><label class="m3-label">API Key</label><input type="password" id="apiKey" class="m3-input"></div><div class="m3-field"><label class="m3-label">API Secret</label><input type="password" id="apiSecret" class="m3-input"></div><button onclick="saveKeys()" class="m3-btn">Sync</button><button onclick="logout()" class="w-full text-red-500 font-bold mt-8">Logout</button></div></section>
+        <section id="view-login" class="view-section pt-10"><div class="m3-card"><h2 class="text-2xl font-bold mb-6 text-center">Login</h2><input type="email" id="l-email" placeholder="Email" class="m3-input mb-4"><input type="password" id="l-pass" placeholder="Password" class="m3-input mb-6"><button onclick="doLogin()" class="m3-btn">Enter</button></div></section>
+        <section id="view-register" class="view-section pt-10"><div class="m3-card"><h2 class="text-2xl font-bold mb-6 text-center">Register</h2><input type="text" id="r-name" placeholder="Name" class="m3-input mb-4"><input type="email" id="r-email" placeholder="Email" class="m3-input mb-4"><input type="password" id="r-pass" placeholder="Password" class="m3-input mb-6"><button onclick="doRegister()" class="m3-btn">Create</button></div></section>
     </main>
-
-    <nav class="m3-nav" id="main-nav">
-        <div class="nav-item active" onclick="nav('home')" id="n-home"><div class="icon-box"><span class="material-symbols-outlined">home</span></div><span class="text-[11px]">Home</span></div>
-        <div class="nav-item" onclick="nav('dashboard')" id="n-dashboard"><div class="icon-box"><span class="material-symbols-outlined">analytics</span></div><span class="text-[11px]">Terminal</span></div>
-        <div class="nav-item" onclick="nav('history')" id="n-history"><div class="icon-box"><span class="material-symbols-outlined">history</span></div><span class="text-[11px]">Logs</span></div>
-        <div class="nav-item" onclick="nav('settings')" id="n-settings"><div class="icon-box"><span class="material-symbols-outlined">settings</span></div><span class="text-[11px]">Setup</span></div>
-    </nav>
-
+    <nav class="m3-nav"><div class="nav-item active" onclick="nav('home')" id="n-home"><div class="icon-box"><span class="material-symbols-outlined">home</span></div><span class="text-[11px]">Home</span></div><div class="nav-item" onclick="nav('dashboard')" id="n-dashboard"><div class="icon-box"><span class="material-symbols-outlined">analytics</span></div><span class="text-[11px]">Bot</span></div><div class="nav-item" onclick="nav('history')" id="n-history"><div class="icon-box"><span class="material-symbols-outlined">history</span></div><span class="text-[11px]">Logs</span></div><div class="nav-item" onclick="nav('settings')" id="n-settings"><div class="icon-box"><span class="material-symbols-outlined">settings</span></div><span class="text-[11px]">Setup</span></div></nav>
     <script>
         let token = localStorage.getItem('bot_token');
-        function nav(id) {
-            document.querySelectorAll('.view-section').forEach(e => e.classList.remove('active-view'));
-            document.querySelectorAll('.nav-item').forEach(e => e.classList.remove('active'));
-            document.getElementById('view-' + id).classList.add('active-view');
-            const navBtn = document.getElementById('n-' + id); if(navBtn) navBtn.classList.add('active');
-            if(id === 'dashboard') startPoll();
-        }
-        async function api(e, m, b) { const r = await fetch(e, { method: m, headers: { 'Content-Type': 'application/json', 'Authorization': token }, body: b ? JSON.stringify(b) : undefined }); return r.json(); }
+        function nav(id) { document.querySelectorAll('.view-section').forEach(e => e.classList.remove('active-view')); document.querySelectorAll('.nav-item').forEach(e => e.classList.remove('active')); document.getElementById('view-'+id).classList.add('active-view'); const b = document.getElementById('n-'+id); if(b) b.classList.add('active'); if(id === 'dashboard') startPoll(); }
+        async function api(e, m, b) { const r = await fetch(e, { method: m, headers: { 'Content-Type': 'application/json', 'Authorization': token }, body: b ? JSON.stringify(b) : undefined }); if(r.status === 401) logout(); return r.json(); }
         async function doLogin() { const r = await api('/api/auth/login', 'POST', { email: document.getElementById('l-email').value, password: document.getElementById('l-pass').value }); token = r.token; localStorage.setItem('bot_token', token); nav('dashboard'); }
         async function doRegister() { const r = await api('/api/auth/register', 'POST', { name: document.getElementById('r-name').value, email: document.getElementById('r-email').value, password: document.getElementById('r-pass').value }); token = r.token; localStorage.setItem('bot_token', token); nav('dashboard'); }
-        async function saveConfig() { await api('/api/user/config', 'POST', { takeProfitPct: document.getElementById('takeProfitPct').value, stopLossPct: document.getElementById('stopLossPct').value, mlLookback: document.getElementById('mlLookback').value, mlThreshold: document.getElementById('mlThreshold').value, profitMultiplier: document.getElementById('profitMultiplier').value, dcaMultiplier: document.getElementById('dcaMultiplier').value, maxContracts: document.getElementById('maxContracts').value }); alert('Saved'); }
+        async function saveConfig() { await api('/api/user/config', 'POST', { takeProfitPct: document.getElementById('takeProfitPct').value, stopLossPct: document.getElementById('stopLossPct').value, mlLookback: document.getElementById('mlLookback').value, mlThreshold: document.getElementById('mlThreshold').value, mlAverageTicks: document.getElementById('mlAverageTicks').value, mlUseAverage: document.getElementById('mlUseAverage').value, flipOnlyInProfit: document.getElementById('flipOnlyInProfit').value, flipThresholdPct: document.getElementById('flipThresholdPct').value, dcaRoiThresholdPct: document.getElementById('dcaRoiThresholdPct').value, dcaMultiplier: document.getElementById('dcaMultiplier').value, profitRoiThresholdPct: document.getElementById('profitRoiThresholdPct').value, profitMultiplier: document.getElementById('profitMultiplier').value, maxContracts: document.getElementById('maxContracts').value }); alert('Saved'); }
         async function saveKeys() { await api('/api/user/keys', 'POST', { apiKey: document.getElementById('apiKey').value, apiSecret: document.getElementById('apiSecret').value, liveTradingEnabled: document.getElementById('liveTrade').checked }); alert('Synced'); }
-        async function closeAll() { if(confirm('Force Close?')) await api('/api/close-all', 'GET'); }
+        async function closeAll() { if(confirm('Force?')) await api('/api/close-all', 'GET'); }
         function logout() { localStorage.clear(); location.reload(); }
-
         let poll = null;
         function startPoll() {
             if(poll) clearInterval(poll);
@@ -530,18 +448,17 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 const d = await api('/api/data', 'GET');
                 document.getElementById('netPnl').innerText = '$' + d.metrics.totalNetPnl.toFixed(4);
                 document.getElementById('wallet').innerText = '$' + d.walletBalance.toFixed(2);
-                document.getElementById('mlValue').innerText = d.mlSignal.confidence.toFixed(1) + '%';
                 if(!document.getElementById('takeProfitPct').value) {
-                    const c = d.config;
-                    document.getElementById('takeProfitPct').value = c.takeProfitPct; document.getElementById('stopLossPct').value = c.stopLossPct;
+                    const c = d.config; document.getElementById('takeProfitPct').value = c.takeProfitPct; document.getElementById('stopLossPct').value = c.stopLossPct;
                     document.getElementById('mlLookback').value = c.mlLookback; document.getElementById('mlThreshold').value = c.mlThreshold;
-                    document.getElementById('profitMultiplier').value = c.profitMultiplier; document.getElementById('dcaMultiplier').value = c.dcaMultiplier;
+                    document.getElementById('mlAverageTicks').value = c.mlAverageTicks; document.getElementById('mlUseAverage').value = c.mlUseAverage.toString();
+                    document.getElementById('flipOnlyInProfit').value = c.flipOnlyInProfit.toString(); document.getElementById('flipThresholdPct').value = c.flipThresholdPct;
+                    document.getElementById('dcaRoiThresholdPct').value = c.dcaRoiThresholdPct; document.getElementById('dcaMultiplier').value = c.dcaMultiplier;
+                    document.getElementById('profitRoiThresholdPct').value = c.profitRoiThresholdPct; document.getElementById('profitMultiplier').value = c.profitMultiplier;
                     document.getElementById('maxContracts').value = c.maxContracts || Math.floor(d.walletBalance * 2000);
                 }
                 const logs = document.getElementById('logs'); logs.innerHTML = '';
-                [...d.metrics.trades].reverse().slice(0, 10).forEach(t => {
-                    logs.innerHTML += \`<div class="m3-card !py-3 flex justify-between text-xs"><b>\${t.side.toUpperCase()}</b> <span class="\${t.netPnl>=0?'text-green-600':'text-red-600'}">$\${t.netPnl.toFixed(4)}</span> <span>\${t.exitReason}</span></div>\`;
-                });
+                [...d.metrics.trades].reverse().slice(0, 10).forEach(t => { logs.innerHTML += \`<div class="m3-card !py-3 flex justify-between text-xs"><b>\${t.side.toUpperCase()}</b> <span class="\${t.netPnl>=0?'text-green-600':'text-red-600'}">$\${t.netPnl.toFixed(4)}</span> <span>\${t.exitReason}</span></div>\`; });
             }, 1000);
         }
         if(token) nav('dashboard'); else nav('home');
