@@ -367,7 +367,7 @@ class UserTradeInstance {
                     const res = await this.htx.createMarketOrder(this.config.htxSymbol, orderSide, contractsToAdd, undefined, { offset: 'open', marginMode: 'cross', lever_rate: FORCED_LEVERAGE });
                     await new Promise(r => setTimeout(r, 150)); const order = await this.htx.fetchOrder(res.id, this.config.htxSymbol); 
                     if (order && order.average) { realExecPrice = this.config.htxSymbol.includes('SHIB') && !this.config.htxSymbol.includes('1000') ? order.average * 1000 : order.average; }
-                } catch(e) { throw e; } // Bubble up to trigger insufficient margin handler
+                } catch(e) { throw e; } 
             }
             if(!pos.stepHistory) pos.stepHistory = [];
             pos.stepHistory.push({ step: step + 1, type: isProfitScale ? 'SCALE' : 'DCA', price: realExecPrice, roi: pos.exchangeROI || 0, time: Date.now() });
@@ -390,7 +390,7 @@ class UserTradeInstance {
                         try { await this.htx.createMarketOrder(this.config.htxSymbol, closeSide, contractsToClose, undefined, { reduceOnly: true, offset: 'close', marginMode: 'cross', lever_rate: FORCED_LEVERAGE }); } catch(e){}
                     }
                     let currentPrice = pos.side === 'long' ? globalMarketData.binance.bid : globalMarketData.binance.ask;
-                    const reducedSizeUsd = contractsToClose * (Number(this.config.contractSize) || 1000) * currentPrice;
+                    const reducedSizeUsd = contractsToClose * (Number(this.config.contractSize) || 1000) * (currentPrice || pos.entryPrice);
                     pos.contracts = Math.max(0, pos.contracts - contractsToClose);
                     pos.size = Math.max(0, pos.size - reducedSizeUsd);
                     pos.marginUsed = Math.max(0, pos.marginUsed - (reducedSizeUsd / FORCED_LEVERAGE));
@@ -534,7 +534,7 @@ app.get('/api/data', authMiddleware, (req, res) => { const worker = activeWorker
 app.get('/api/chart-history', (req, res) => res.json(memoryChartHistory.slice(-800))); 
 app.get('/api/close-all', authMiddleware, async (req, res) => { const worker = activeWorkers.get(req.user._id.toString()); if(worker) await worker.forceClosePosition("MANUAL_FORCE_CLOSE").catch(()=>{}); res.json({status: 'ok'}); });
 
-// ==================== FRONTEND (ANDROID MOBILE DESIGN) ====================
+// ==================== FRONTEND ====================
 app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -563,7 +563,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         .m3-input:focus { border-color: var(--primary); border-width: 2px; }
         .m3-label { position: absolute; left: 10px; top: -10px; background: white; padding: 0 4px; font-size: 11px; color: #444; font-weight: 500; }
         .m3-select { width: 100%; border: 1px solid #8e9199; border-radius: 4px; padding: 10px; background: white; font-size: 14px; appearance: none; }
-        .btn-fab { display: none; }
         .metric-label { font-size: 10px; font-weight: 700; color: #74777f; text-transform: uppercase; letter-spacing: 0.5px; }
         .metric-value { font-family: 'Roboto Mono', monospace; font-size: 16px; font-weight: 700; }
         #chartWrapper { height: 180px; width: 100%; }
@@ -571,7 +570,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
     </style>
 </head>
 <body>
-
     <header class="app-bar">
         <div class="flex items-center gap-3 w-full">
             <div class="w-8 h-8 rounded-lg bg-black flex items-center justify-center text-white text-xs font-bold">TB</div>
@@ -590,8 +588,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
     </header>
 
     <main class="main-container">
-
-        <!-- HOME -->
         <section id="view-home" class="view-section active-view">
             <div class="py-8 text-center">
                 <div class="w-20 h-20 bg-blue-50 rounded-3xl flex items-center justify-center mx-auto mb-6"><span class="material-symbols-outlined text-4xl text-blue-600">bolt</span></div>
@@ -604,7 +600,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- DASHBOARD -->
         <section id="view-dashboard" class="view-section">
             <div class="grid grid-cols-2 gap-3 mb-3">
                 <div class="m3-card !mb-0 flex flex-col justify-between"><span class="metric-label">Net PnL</span><span id="netPnl" class="metric-value">$0.00</span></div>
@@ -622,10 +617,9 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 </div>
                 <div class="flex items-center gap-2"><span class="material-symbols-outlined text-[16px] text-gray-400">history</span><span class="text-[10px] font-bold text-gray-400 uppercase">Uptime: <span id="uptime" class="text-black">0s</span></span></div>
             </div>
-            <div class="m3-card"><h3 class="text-[10px] font-bold uppercase text-gray-400 mb-3">Recent Executions (Last 10)</h3><div id="tradeHistoryBody" class="space-y-3"><p class="text-center py-4 text-xs text-gray-400">No trades found.</p></div></div>
+            <div class="m3-card"><h3 class="text-[10px] font-bold uppercase text-gray-400 mb-3">Recent Executions (Last 10)</h3><div id="tradeHistoryBody" class="space-y-3"></div></div>
         </section>
 
-        <!-- SETUP MENU (EVERY SETTING RESTORED) -->
         <section id="view-settings" class="view-section">
             <h2 class="text-xl font-bold mb-4">Strategy Setup</h2>
             <div class="m3-card">
@@ -670,16 +664,11 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                     <div class="m3-input-group"><label class="m3-label">Profit Scale ROI</label><input type="number" id="profitRoiThresholdSens" class="m3-input" step="0.1"></div>
                     <div class="m3-input-group"><label class="m3-label">Profit Mult</label><input type="number" id="profitMultiplierSens" class="m3-input" disabled></div>
                 </div>
-                <div class="grid grid-cols-2 gap-3">
-                    <div class="m3-input-group"><label class="m3-label">Start Contracts</label><input type="number" id="baseContracts" class="m3-input" disabled></div>
-                    <div class="m3-input-group"><label class="m3-label">Max Scaling</label><input type="number" id="maxContractsSens" class="m3-input" disabled></div>
-                </div>
             </div>
             <button onclick="saveConfig()" class="w-full py-4 bg-blue-600 text-white rounded-2xl font-bold text-sm shadow-lg mb-4">Save Strategy Config</button>
             <button onclick="logout()" class="w-full py-4 text-red-500 font-bold text-sm">Logout</button>
         </section>
 
-        <!-- BACKTEST -->
         <section id="view-backtest" class="view-section">
             <h2 class="text-xl font-bold mb-4">Backtest Engine</h2>
             <div class="m3-card">
@@ -702,10 +691,8 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- AUTH -->
         <section id="view-login" class="view-section"><h2 class="text-2xl font-bold mb-6">Sign In</h2><div class="m3-card"><div class="m3-input-group"><label class="m3-label">Email</label><input type="email" id="login-email" class="m3-input"></div><div class="m3-input-group"><label class="m3-label">Password</label><input type="password" id="login-pass" class="m3-input"></div><button onclick="doLogin()" class="w-full py-4 bg-black text-white rounded-2xl font-bold">Login</button><p id="login-err" class="text-red-500 text-xs mt-3 text-center"></p></div></section>
         <section id="view-register" class="view-section"><h2 class="text-2xl font-bold mb-6">Register</h2><div class="m3-card"><div class="m3-input-group"><label class="m3-label">Name</label><input type="text" id="reg-name" class="m3-input"></div><div class="m3-input-group"><label class="m3-label">Email</label><input type="email" id="reg-email" class="m3-input"></div><div class="m3-input-group"><label class="m3-label">Password</label><input type="password" id="reg-pass" class="m3-input"></div><button onclick="doRegister()" class="w-full py-4 bg-black text-white rounded-2xl font-bold">Sign Up</button><p id="reg-err" class="text-red-500 text-xs mt-3 text-center"></p></div></section>
-
     </main>
 
     <nav class="bottom-nav">
@@ -729,10 +716,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             const activeNav = document.getElementById('nav-' + (['login','register'].includes(v) ? 'home' : v));
             if(activeNav) activeNav.classList.add('active');
             if(v === 'dashboard' && authToken) initDashboard();
-            
-            document.querySelectorAll('.auth-only').forEach(el => {
-                el.style.display = authToken ? 'flex' : 'none';
-            });
+            document.querySelectorAll('.auth-only').forEach(el => { el.style.display = authToken ? 'flex' : 'none'; });
             window.scrollTo(0,0);
         }
 
@@ -757,7 +741,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         async function fetchMetrics() {
             const data = await doAPI('/api/data', 'GET');
             if(data.error) return;
-
             if(!settingsLoaded) {
                 document.getElementById("tpPctSens").value = data.config.takeProfitPct;
                 document.getElementById("slPctSens").value = data.config.stopLossPct; 
@@ -770,19 +753,14 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 document.getElementById("dcaRoiThresholdSens").value = data.config.dcaRoiThresholdPct || 1.0;
                 document.getElementById("dcaMultiplierSens").value = data.config.dcaMultiplier || 2.0;
                 document.getElementById("profitRoiThresholdSens").value = data.config.profitRoiThresholdPct || 2.0;
-                document.getElementById("profitMultiplierSens").value = (data.walletBalance * 1) || 0;
-                document.getElementById("baseContracts").value = (data.walletBalance * 1000) || 1;
-                document.getElementById("maxContractsSens").value = (data.walletBalance * 2) || 100;
                 document.getElementById("apiKey").value = data.apiKey || "";
                 document.getElementById("liveTrade").checked = data.liveTradingEnabled;
                 settingsLoaded = true;
             }
-
             document.getElementById("uptime").innerText = data.uptime + "s";
             document.getElementById("netPnl").innerText = "$" + data.metrics.totalNetPnl.toFixed(2);
             document.getElementById("netPnl").className = "metric-value " + (data.metrics.totalNetPnl >= 0 ? "text-green-600" : "text-red-600");
             document.getElementById("marginUsed").innerText = "$" + Number(data.walletBalance || 0).toFixed(2);
-
             const badge = document.getElementById("statusBadge");
             if(data.activePositions.length > 0) {
                 const p = data.activePositions[0];
@@ -795,24 +773,19 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 document.getElementById("activeRoi").innerText = "N/A";
                 document.getElementById("activeQty").innerText = "0";
             }
-
             if (data.mlSignal) {
                 document.getElementById('mlValue').innerText = data.mlSignal.confidence.toFixed(1) + "%";
                 const stat = document.getElementById('mlStatus');
-                const signalDirection = data.mlSignal.type === 'bull' ? 'LONG' : 'SHORT';
-                stat.innerText = "SIGNAL: " + signalDirection;
-                stat.className = "text-[10px] font-bold px-3 py-1 rounded-full uppercase " + 
-                    (data.mlSignal.type === 'bull' ? "bg-green-500 text-white" : "bg-red-500 text-white");
+                stat.innerText = "SIGNAL: " + (data.mlSignal.type === 'bull' ? 'LONG' : 'SHORT');
+                stat.className = "text-[10px] font-bold px-3 py-1 rounded-full uppercase " + (data.mlSignal.type === 'bull' ? "bg-green-500 text-white" : "bg-red-500 text-white");
             }
-
             const hist = document.getElementById("tradeHistoryBody");
             if(data.metrics.trades && data.metrics.trades.length > 0) {
                 hist.innerHTML = "";
                 data.metrics.trades.slice(-10).reverse().forEach(t => {
-                    const isLong = t.side.toLowerCase() === 'long';
-                    const sideColor = isLong ? 'text-green-600' : 'text-red-600';
+                    const sideColor = t.side.toLowerCase() === 'long' ? 'text-green-600' : 'text-red-600';
                     const pnlColor = t.netPnl >= 0 ? 'text-green-600' : 'text-red-600';
-                    hist.innerHTML += `
+                    hist.innerHTML += \`
                     <div class="flex flex-col border-b border-gray-100 pb-3 mb-2">
                         <div class="flex justify-between items-center">
                             <div class="flex items-center gap-2">
@@ -825,25 +798,14 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                             <span class="text-[10px] text-gray-400">Reason: <span class="text-gray-700 font-medium">\${t.exitReason}</span></span>
                             <span class="text-[10px] text-gray-400">Qty: <span class="text-gray-700 font-mono">\${t.contracts.toLocaleString()}</span></span>
                         </div>
-                        <div class="flex items-center gap-1 mt-1">
-                             <span class="text-[9px] font-bold uppercase text-gray-400">ROI:</span>
-                             <span class="text-[10px] font-bold \${t.roiPct >= 0 ? 'text-green-500' : 'text-red-500'}">\${t.roiPct.toFixed(2)}%</span>
-                        </div>
-                    </div>`;
+                    </div>\`;
                 });
             }
             if(data.binance && data.mlSignal) pushChartData(data.binance.mid, data.mlSignal.rawValue);
         }
 
         async function saveConfig() {
-            const p = {
-                tpPct: document.getElementById("tpPctSens").value, slPct: document.getElementById("slPctSens").value,
-                mlLookbackSens: document.getElementById("mlLookbackSens").value, mlThresholdSens: document.getElementById("mlThresholdSens").value,
-                mlAverageTicksSens: document.getElementById("mlAverageTicksSens").value, mlUseAverageSens: document.getElementById("mlUseAverageSens").value,
-                flipOnlyInProfitSens: document.getElementById("flipOnlyInProfitSens").value, flipThresholdSens: document.getElementById("flipThresholdSens").value,
-                dcaRoiThresholdSens: document.getElementById("dcaRoiThresholdSens").value, dcaMultiplierSens: document.getElementById("dcaMultiplierSens").value,
-                profitRoiThresholdSens: document.getElementById("profitRoiThresholdSens").value
-            };
+            const p = { tpPct: document.getElementById("tpPctSens").value, slPct: document.getElementById("slPctSens").value, mlLookbackSens: document.getElementById("mlLookbackSens").value, mlThresholdSens: document.getElementById("mlThresholdSens").value, mlAverageTicksSens: document.getElementById("mlAverageTicksSens").value, mlUseAverageSens: document.getElementById("mlUseAverageSens").value, flipOnlyInProfitSens: document.getElementById("flipOnlyInProfitSens").value, flipThresholdSens: document.getElementById("flipThresholdSens").value, dcaRoiThresholdSens: document.getElementById("dcaRoiThresholdSens").value, dcaMultiplierSens: document.getElementById("dcaMultiplierSens").value, profitRoiThresholdSens: document.getElementById("profitRoiThresholdSens").value };
             await doAPI('/api/user/config', 'POST', p);
             alert("Strategy Updated");
         }
@@ -869,17 +831,11 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             document.getElementById('btResWinrate').innerText = res.winRate + "%";
             document.getElementById('btResPnl').innerText = "$" + res.netPnl.toFixed(2);
             const container = document.getElementById('btTableBody'); container.innerHTML = "";
-            res.trades.slice(-10).forEach(t => { container.innerHTML += `<div>\${t.side.toUpperCase()} | ROI: \${t.roiPct.toFixed(2)}% | Net: \${t.netPnl.toFixed(2)}</div>`; });
+            res.trades.slice(-10).forEach(t => { container.innerHTML += \`<div>\${t.side.toUpperCase()} | ROI: \${t.roiPct.toFixed(2)}% | Net: \${t.netPnl.toFixed(2)}</div>\`; });
         }
 
         const ctx = document.getElementById("mlChart").getContext("2d");
-        const mlChart = new Chart(ctx, {
-            type: "line", data: { labels: [], datasets: [
-                { data: [], borderColor: "#000", borderWidth: 1, pointRadius: 0, yAxisID: 'y' },
-                { data: [], borderColor: "#3b82f6", borderWidth: 1, pointRadius: 0, yAxisID: 'y1', fill: true, backgroundColor: 'rgba(59,130,246,0.03)' }
-            ]},
-            options: { responsive: true, maintainAspectRatio: false, animation: false, scales: { x: { display: false }, y: { display: false }, y1: { display: false, min: 0, max: 1 } }, plugins: { legend: { display: false } } }
-        });
+        const mlChart = new Chart(ctx, { type: "line", data: { labels: [], datasets: [{ data: [], borderColor: "#000", borderWidth: 1, pointRadius: 0, yAxisID: 'y' }, { data: [], borderColor: "#3b82f6", borderWidth: 1, pointRadius: 0, yAxisID: 'y1', fill: true, backgroundColor: 'rgba(59,130,246,0.03)' }] }, options: { responsive: true, maintainAspectRatio: false, animation: false, scales: { x: { display: false }, y: { display: false }, y1: { display: false, min: 0, max: 1 } }, plugins: { legend: { display: false } } } });
 
         function pushChartData(p, m) {
             mlChart.data.labels.push(""); mlChart.data.datasets[0].data.push(p); mlChart.data.datasets[1].data.push(m);
@@ -890,7 +846,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         if(authToken) nav('dashboard'); else nav('home');
     </script>
 </body>
-</html>`);
-});
+</html>`); });
 
 app.listen(CUSTOM_PORT, async () => { console.log(`✅ Server running on port ${CUSTOM_PORT}`); await loadAllUsers(); startMasterStreams(); });
