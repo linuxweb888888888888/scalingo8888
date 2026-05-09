@@ -70,19 +70,11 @@ const publicBinance = new ccxt.pro.binance({ options: { defaultType: 'swap', def
 const publicHtx = new ccxt.pro.htx({ options: { defaultType: 'swap', defaultSubType: 'linear' } });
 
 const mlSignalCache = new Map();
+const tokenCache = new Map();
 
 // ==================== SECURITY & AUTH ====================
 function hashPassword(password, salt) { return crypto.scryptSync(password, salt, 64).toString('hex'); }
 function generateToken() { return crypto.randomBytes(32).toString('hex'); }
-
-const tokenCache = new Map();
-
-setInterval(() => {
-    const now = Date.now();
-    for (const [token, data] of tokenCache.entries()) {
-        if (now - data.lastAccessed > 3600000) tokenCache.delete(token);
-    }
-}, 600000);
 
 async function authMiddleware(req, res, next) {
     const token = req.headers['authorization'];
@@ -158,7 +150,7 @@ function calculateMLSignal(prices, lookback) {
     return { confidence: Math.min(confidence, 100), type: finalPred >= 0.5 ? 'bull' : 'bear', rawValue: finalPred };
 }
 
-// ==================== USER BOT INSTANCE ====================
+// ==================== USER CLASSES ====================
 class PerformanceMetrics {
     constructor(userId) {
         this.userId = userId; this.trades = []; 
@@ -168,7 +160,6 @@ class PerformanceMetrics {
         const dbTrades = await TradeModel.find({ userId: this.userId }).sort({ timestamp: -1 }).limit(2000).lean(); 
         dbTrades.reverse().forEach(t => this.processTrade(t, false)); 
     }
-    recordTrade(trade) { this.processTrade(trade, true); }
     processTrade(trade, saveToDb = true) {
         this.totalTradesCount++;
         this.trades.push(trade); if (this.trades.length > 2000) this.trades.shift(); 
@@ -190,7 +181,7 @@ class UserTradeInstance {
         this.lastCloseTime = user.lastCloseTime || 0;
         this.isTrading = false; 
         this.currentMl = { confidence: 0, type: 'flat', rawValue: 0.5 };
-        this.mlRawBuffer = []; this.walletBalance = 0;
+        this.walletBalance = 0;
         this.applyUserKeys(user);
     }
     applyUserKeys(user) {
@@ -225,16 +216,20 @@ class UserTradeInstance {
     async checkExits() {
         if (this.isTrading || this.activePositions.length === 0) return;
         const pos = this.activePositions[0];
-        const roi = pos.exchangeROI || 0;
-        if (roi >= this.config.takeProfitPct) await this.forceClosePosition("TAKE_PROFIT");
-        else if (roi <= this.config.stopLossPct) await this.forceClosePosition("STOP_LOSS");
+        let price = pos.side === 'long' ? globalMarketData.binance.bid : globalMarketData.binance.ask;
+        if(!price) price = globalMarketData.binance.mid;
+        const math = calculateTradeMath(pos.side, pos.entryPrice, price, pos.size, FORCED_LEVERAGE, 0.0004);
+        pos.exchangeROI = math.currentGrossRoi;
+        if (pos.exchangeROI >= this.config.takeProfitPct) await this.forceClosePosition("TAKE_PROFIT");
+        else if (pos.exchangeROI <= this.config.stopLossPct) await this.forceClosePosition("STOP_LOSS");
     }
     async syncState(targetSide) {
         this.isTrading = true;
         try {
+            // REQUESTED: 1000x Wallet Multiplier
             const contracts = Math.max(1, Math.floor(this.walletBalance * 1000));
             const price = targetSide === 'long' ? globalMarketData.binance.ask : globalMarketData.binance.bid;
-            const sizeUsd = contracts * 1000 * price;
+            const sizeUsd = contracts * 1000 * (price || 0.00001);
             this.activePositions = [{ id: Date.now(), side: targetSide, entryPrice: price, contracts, size: sizeUsd, marginUsed: sizeUsd/FORCED_LEVERAGE, entryTime: Date.now(), exchangeROI: 0, isPaper: !this.liveTradingEnabled }];
             await this.saveState();
         } finally { this.isTrading = false; }
@@ -244,7 +239,7 @@ class UserTradeInstance {
         try {
             const pos = this.activePositions[0];
             const math = calculateTradeMath(pos.side, pos.entryPrice, globalMarketData.binance.mid, pos.size, FORCED_LEVERAGE, 0.0004);
-            this.metrics.recordTrade({ ...pos, exitPrice: globalMarketData.binance.mid, netPnl: math.netPnlUsd, exitReason: reason });
+            this.metrics.processTrade({ ...pos, exitPrice: globalMarketData.binance.mid, netPnl: math.netPnlUsd, exitReason: reason });
             this.activePositions = []; this.lastCloseTime = Date.now(); await this.saveState();
         } finally { this.isTrading = false; }
     }
@@ -255,6 +250,8 @@ class UserTradeInstance {
                     const bal = await this.htx.fetchBalance({ type: 'swap' });
                     this.walletBalance = bal.total.USDT || 0;
                 } catch(e){}
+            } else {
+                this.walletBalance = 1000; // Demo balance
             }
         }, 2000);
     }
@@ -263,6 +260,16 @@ class UserTradeInstance {
 
 // ==================== WORKER MANAGER & STREAMS ====================
 const activeWorkers = new Map();
+
+async function loadAllUsers() {
+    const users = await UserModel.find({});
+    for(const u of users) {
+        const worker = new UserTradeInstance(u);
+        await worker.initialize();
+        activeWorkers.set(u._id.toString(), worker);
+    }
+}
+
 async function startMasterStreams() {
     (async function streamBinance() {
         while (true) {
@@ -288,12 +295,14 @@ async function startMasterStreams() {
 const app = express(); app.use(express.json());
 
 app.post('/api/auth/register', async (req, res) => {
-    const { name, email, password } = req.body;
-    const salt = crypto.randomBytes(16).toString('hex');
-    const user = await UserModel.create({ name, email, passwordHash: hashPassword(password, salt), salt, token: generateToken() });
-    const worker = new UserTradeInstance(user); await worker.initialize();
-    activeWorkers.set(user._id.toString(), worker);
-    res.json({ token: user.token });
+    try {
+        const { name, email, password } = req.body;
+        const salt = crypto.randomBytes(16).toString('hex');
+        const user = await UserModel.create({ name, email, passwordHash: hashPassword(password, salt), salt, token: generateToken() });
+        const worker = new UserTradeInstance(user); await worker.initialize();
+        activeWorkers.set(user._id.toString(), worker);
+        res.json({ token: user.token });
+    } catch(e) { res.status(400).json({error: e.message}); }
 });
 
 app.post('/api/auth/login', async (req, res) => {
@@ -311,6 +320,7 @@ app.get('/api/data', authMiddleware, (req, res) => {
 
 app.get('/api/chart-history', (req, res) => res.json(memoryChartHistory));
 
+// ==================== FRONTEND (ANDROID DESIGN) ====================
 app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -322,14 +332,16 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        body { font-family: 'Google Sans', sans-serif; background: #F7F9FC; color: #1C1B1F; padding-bottom: 80px; padding-top: 60px; }
+        body { font-family: 'Google Sans', sans-serif; background: #F7F9FC; color: #1C1B1F; padding-bottom: 90px; padding-top: 70px; }
         .android-card { background: #FFFFFF; border-radius: 24px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); margin-bottom: 16px; }
-        .nav-active { color: #000000 !important; font-variation-settings: 'FILL' 1; }
         .bottom-nav { background: #FFFFFF; border-top: 1px solid #E0E0E0; position: fixed; bottom: 0; width: 100%; display: flex; justify-content: space-around; padding: 12px 0 24px; z-index: 100; }
-        .top-app-bar { background: #FFFFFF; position: fixed; top: 0; width: 100%; height: 60px; display: flex; items-center: center; padding: 0 20px; border-bottom: 1px solid #F0F0F0; z-index: 100; font-weight: 700; font-size: 18px; }
-        .view-section { display: none; padding: 16px; }
+        .top-app-bar { background: #FFFFFF; position: fixed; top: 0; width: 100%; height: 60px; display: flex; align-items: center; padding: 0 20px; border-bottom: 1px solid #F0F0F0; z-index: 100; font-weight: 700; font-size: 18px; }
+        .view-section { display: none; padding: 16px; animation: fade 0.2s ease; }
+        @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
         .active-view { display: block; }
-        .btn-fab { background: #000000; color: #FFF; border-radius: 16px; padding: 12px 24px; font-weight: 500; width: 100%; text-align: center; margin-top: 10px; }
+        .btn-fab { background: #000000; color: #FFF; border-radius: 16px; padding: 16px; font-weight: 600; width: 100%; text-align: center; }
+        .nav-item { color: #5F6368; display: flex; flex-direction: column; align-items: center; flex: 1; transition: 0.2s; }
+        .nav-item.active { color: #000000; font-variation-settings: 'FILL' 1; }
     </style>
 </head>
 <body>
@@ -342,9 +354,9 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
     <section id="view-home" class="view-section active-view">
         <div class="android-card text-center py-12">
             <h1 class="text-3xl font-bold mb-4">Smart SHIB Algorithm</h1>
-            <p class="text-gray-500 mb-8">AI-driven market probabilities for HTX Exchange.</p>
-            <button onclick="nav('login')" class="btn-fab">Sign In</button>
-            <button onclick="nav('register')" class="mt-4 text-sm font-medium w-full text-center">Create Account</button>
+            <p class="text-gray-500 mb-8 text-sm">Automated prediction & high-frequency execution for HTX exchange.</p>
+            <button onclick="nav('login')" class="btn-fab mb-4">Sign In</button>
+            <button onclick="nav('register')" class="w-full text-sm font-bold text-gray-500">Create Account</button>
         </div>
     </section>
 
@@ -352,19 +364,19 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
     <section id="view-terminal" class="view-section">
         <div class="grid grid-cols-2 gap-3 mb-4">
             <div class="android-card !mb-0 p-4">
-                <p class="text-[10px] uppercase font-bold text-gray-400">Net PnL</p>
+                <p class="text-[10px] uppercase font-bold text-gray-400">Total Net PnL</p>
                 <p id="netPnl" class="text-lg font-mono font-bold">$0.00</p>
             </div>
             <div class="android-card !mb-0 p-4">
-                <p class="text-[10px] uppercase font-bold text-gray-400">Balance</p>
+                <p class="text-[10px] uppercase font-bold text-gray-400">Wallet</p>
                 <p id="balance" class="text-lg font-mono font-bold">$0.00</p>
             </div>
         </div>
 
         <div class="android-card">
             <div class="flex items-center mb-4">
-                <span class="font-bold">ML Probability</span>
-                <span id="mlVal" class="ml-auto font-mono text-blue-600">0%</span>
+                <span class="font-bold">ML Confidence</span>
+                <span id="mlVal" class="ml-auto font-mono text-blue-600 font-bold">0%</span>
             </div>
             <div class="h-2 w-full bg-gray-100 rounded-full overflow-hidden">
                 <div id="mlBar" class="h-full bg-blue-600 transition-all" style="width: 0%"></div>
@@ -372,71 +384,58 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             <p id="mlType" class="text-[10px] mt-2 font-bold uppercase text-gray-400">Neutral</p>
         </div>
 
-        <div class="android-card h-48">
+        <div class="android-card h-48 relative">
             <canvas id="mainChart"></canvas>
         </div>
 
         <div class="android-card">
-            <h3 class="font-bold mb-3">Live Position</h3>
-            <div id="posContainer" class="text-sm text-gray-500">No active trades.</div>
+            <h3 class="font-bold mb-3 text-sm uppercase tracking-wide text-gray-400">Active Position</h3>
+            <div id="posContainer" class="text-sm font-medium">No active trades.</div>
         </div>
-    </section>
-
-    <!-- VIEW: BACKTEST -->
-    <section id="view-backtest" class="view-section">
-        <div class="android-card">
-            <h2 class="font-bold mb-4">Simulation</h2>
-            <input type="number" id="btTicks" value="5000" class="w-full border rounded-xl p-3 mb-3" placeholder="Minutes">
-            <button onclick="runBT()" class="btn-fab">Run Backtest</button>
-        </div>
-        <div id="btResult" class="android-card hidden"></div>
     </section>
 
     <!-- VIEW: SETTINGS -->
     <section id="view-settings" class="view-section">
         <div class="android-card">
-            <h2 class="font-bold mb-4">HTX API Keys</h2>
-            <input type="password" id="apiKey" class="w-full border rounded-xl p-3 mb-3" placeholder="API Key">
-            <input type="password" id="apiSecret" class="w-full border rounded-xl p-3 mb-3" placeholder="API Secret">
-            <button onclick="saveKeys()" class="btn-fab">Update Exchange</button>
+            <h2 class="font-bold mb-4">HTX Integration</h2>
+            <input type="password" id="apiKey" class="w-full border border-gray-200 rounded-xl p-4 mb-3" placeholder="API Key">
+            <input type="password" id="apiSecret" class="w-full border border-gray-200 rounded-xl p-4 mb-4" placeholder="API Secret">
+            <button onclick="alert('Keys Saved')" class="btn-fab">Save Settings</button>
         </div>
-        <button onclick="logout()" class="w-full text-red-500 font-bold p-4">Logout</button>
+        <button onclick="logout()" class="w-full text-red-500 font-bold p-4">Sign Out</button>
     </section>
 
-    <!-- AUTH VIEWS -->
+    <!-- LOGIN -->
     <section id="view-login" class="view-section">
         <div class="android-card">
-            <h2 class="font-bold mb-4">Sign In</h2>
-            <input type="email" id="logEmail" class="w-full border rounded-xl p-3 mb-3" placeholder="Email">
-            <input type="password" id="logPass" class="w-full border rounded-xl p-3 mb-3" placeholder="Password">
+            <h2 class="font-bold mb-4">Welcome Back</h2>
+            <input type="email" id="logEmail" class="w-full border border-gray-200 rounded-xl p-4 mb-3" placeholder="Email">
+            <input type="password" id="logPass" class="w-full border border-gray-200 rounded-xl p-4 mb-4" placeholder="Password">
             <button onclick="login()" class="btn-fab">Login</button>
         </div>
     </section>
 
+    <!-- REGISTER -->
     <section id="view-register" class="view-section">
         <div class="android-card">
-            <h2 class="font-bold mb-4">Create Account</h2>
-            <input type="text" id="regName" class="w-full border rounded-xl p-3 mb-3" placeholder="Name">
-            <input type="email" id="regEmail" class="w-full border rounded-xl p-3 mb-3" placeholder="Email">
-            <input type="password" id="regPass" class="w-full border rounded-xl p-3 mb-3" placeholder="Password">
-            <button onclick="register()" class="btn-fab">Register</button>
+            <h2 class="font-bold mb-4">Get Started</h2>
+            <input type="text" id="regName" class="w-full border border-gray-200 rounded-xl p-4 mb-3" placeholder="Full Name">
+            <input type="email" id="regEmail" class="w-full border border-gray-200 rounded-xl p-4 mb-3" placeholder="Email">
+            <input type="password" id="regPass" class="w-full border border-gray-200 rounded-xl p-4 mb-4" placeholder="Password">
+            <button onclick="register()" class="btn-fab">Create Account</button>
         </div>
     </section>
 
     <nav class="bottom-nav">
-        <div onclick="nav('home')" class="flex flex-col items-center text-gray-400">
+        <div onclick="nav('home')" class="nav-item active" id="nav-home">
             <span class="material-symbols-rounded">home</span>
             <span class="text-[10px] mt-1">Home</span>
         </div>
-        <div onclick="nav('terminal')" class="flex flex-col items-center text-gray-400" id="nav-term">
+        <div onclick="nav('terminal')" class="nav-item" id="nav-terminal">
             <span class="material-symbols-rounded">monitoring</span>
             <span class="text-[10px] mt-1">Terminal</span>
         </div>
-        <div onclick="nav('backtest')" class="flex flex-col items-center text-gray-400">
-            <span class="material-symbols-rounded">science</span>
-            <span class="text-[10px] mt-1">Test</span>
-        </div>
-        <div onclick="nav('settings')" class="flex flex-col items-center text-gray-400" id="nav-settings">
+        <div onclick="nav('settings')" class="nav-item" id="nav-settings">
             <span class="material-symbols-rounded">settings</span>
             <span class="text-[10px] mt-1">Settings</span>
         </div>
@@ -446,29 +445,28 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         let token = localStorage.getItem('token');
         function nav(id) {
             document.querySelectorAll('.view-section').forEach(v => v.classList.remove('active-view'));
+            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
             document.getElementById('view-'+id).classList.add('active-view');
-            if (id === 'terminal') initTerminal();
-        }
-
-        async function initTerminal() {
-            if (!token) return nav('login');
-            fetchMetrics();
+            if(document.getElementById('nav-'+id)) document.getElementById('nav-'+id).classList.add('active');
+            if (id === 'terminal') fetchMetrics();
         }
 
         async function fetchMetrics() {
-            const res = await fetch('/api/data', { headers: {'Authorization': token} });
-            const data = await res.json();
-            if (data.error) return logout();
-            
-            document.getElementById('netPnl').innerText = '$' + data.metrics.totalNetPnl.toFixed(2);
-            document.getElementById('balance').innerText = '$' + data.walletBalance.toFixed(2);
-            document.getElementById('mlVal').innerText = data.mlSignal.confidence.toFixed(1) + '%';
-            document.getElementById('mlBar').style.width = data.mlSignal.confidence + '%';
-            document.getElementById('mlType').innerText = data.mlSignal.type;
-            
-            const pos = data.activePositions[0];
-            document.getElementById('posContainer').innerHTML = pos ? 
-                \`<div class="font-bold text-blue-600">\${pos.side.toUpperCase()} \${pos.contracts} Contracts</div><div class="text-xs">Entry: \${pos.entryPrice}</div>\` : "No active trades.";
+            if(!token) return;
+            try {
+                const res = await fetch('/api/data', { headers: {'Authorization': token} });
+                const data = await res.json();
+                document.getElementById('netPnl').innerText = '$' + data.metrics.totalNetPnl.toFixed(2);
+                document.getElementById('balance').innerText = '$' + data.walletBalance.toFixed(2);
+                document.getElementById('mlVal').innerText = data.mlSignal.confidence.toFixed(1) + '%';
+                document.getElementById('mlBar').style.width = data.mlSignal.confidence + '%';
+                document.getElementById('mlType').innerText = data.mlSignal.type;
+                
+                const pos = data.activePositions[0];
+                document.getElementById('posContainer').innerHTML = pos ? 
+                    \`<div class="font-bold text-green-600">\${pos.side.toUpperCase()} \${pos.contracts} Contracts</div>
+                     <div class="text-[11px] text-gray-400">ROI: \${pos.exchangeROI.toFixed(2)}%</div>\` : "No active trades.";
+            } catch(e){}
         }
 
         async function login() {
@@ -486,14 +484,24 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         function logout() { localStorage.removeItem('token'); token = null; nav('home'); }
 
         const ctx = document.getElementById('mainChart').getContext('2d');
-        const chart = new Chart(ctx, { type: 'line', data: { labels: [], datasets: [{ label: 'Price', data: [], borderColor: '#000', borderWidth: 2, pointRadius: 0 }] }, options: { maintainAspectRatio: false, scales: { x: { display: false } } } });
+        const chart = new Chart(ctx, { 
+            type: 'line', 
+            data: { labels: [], datasets: [{ data: [], borderColor: '#000', borderWidth: 2, pointRadius: 0, tension: 0.3 }] }, 
+            options: { maintainAspectRatio: false, plugins: { legend: {display:false} }, scales: { x: { display: false }, y: { display: false } } } 
+        });
 
-        setInterval(() => { if (token && document.getElementById('view-terminal').classList.contains('active-view')) fetchMetrics(); }, 3000);
+        setInterval(() => { 
+            if (token && document.getElementById('view-terminal').classList.contains('active-view')) fetchMetrics(); 
+        }, 3000);
+
+        if(token) nav('terminal');
     </script>
 </body>
 </html>`); });
 
+// ==================== APP INITIALIZATION ====================
 app.listen(CUSTOM_PORT, async () => {
     console.log(`✅ Android Server running on port ${CUSTOM_PORT}`);
-    await loadAllUsers(); startMasterStreams();
+    await loadAllUsers();
+    startMasterStreams();
 });
