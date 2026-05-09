@@ -375,7 +375,7 @@ class UserTradeInstance {
             pos.size = Number(pos.size) + addedSizeUsd; pos.contracts = Number(pos.contracts) + contractsToAdd; 
             pos.marginUsed = Number(pos.marginUsed) + (addedSizeUsd / FORCED_LEVERAGE); pos.dcaStep = step + 1;
             this.metrics.updateMaxMargin(pos.marginUsed); await this.saveState();
-        } catch (err) {} finally { this.isTrading = false; }
+        } catch (err)) {} finally { this.isTrading = false; }
     }
     async syncState(targetSide) {
         if (this.isTrading || this.activePositions.length > 0) return;
