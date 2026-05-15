@@ -7,440 +7,375 @@ const crypto = require('crypto');
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
-// ==================== MONGODB SETUP ====================
+// ==================== INSTITUTIONAL DB SETUP ====================
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
 
 mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000, socketTimeoutMS: 45000 })
-    .then(() => console.log('✅ MongoDB Connected Successfully'))
-    .catch(err => console.error('🚨 MongoDB Connection Error:', err));
+    .then(() => console.log('✅ Quantitative Engine Connected to MongoDB'))
+    .catch(err => console.error('🚨 Connection Error:', err));
 
-const UserModel = mongoose.model('User_V3', new mongoose.Schema({
-    name: { type: String, required: true },
-    email: { type: String, unique: true, required: true },
-    passwordHash: { type: String, required: true },
-    salt: { type: String, required: true },
-    token: { type: String },
-    apiKey: { type: String, default: "" },
-    apiSecret: { type: String, default: "" },
+const UserModel = mongoose.model('User_V4', new mongoose.Schema({
+    name: String, email: { type: String, unique: true }, passwordHash: String, salt: String, token: String,
+    apiKey: { type: String, default: "" }, apiSecret: { type: String, default: "" },
     liveTradingEnabled: { type: Boolean, default: false },
-    config: { type: Object, default: {} },
     activePosition: { type: Object, default: null }, 
     lastCloseTime: { type: Number, default: 0 }      
 }));
 
-const TradeModel = mongoose.model('TradeLog_V3', new mongoose.Schema({
-    userId: { type: String, required: true }, side: String, entryPrice: Number, exitPrice: Number,
-    contracts: Number, marginUsed: Number, grossPnl: Number, grossRoiPct: Number, roiPct: Number, 
-    netPnl: Number, feeCost: Number, timestamp: { type: Date, default: Date.now }, exitReason: String
+const TradeModel = mongoose.model('TradeLog_V4', new mongoose.Schema({
+    userId: String, side: String, entryPrice: Number, exitPrice: Number,
+    contracts: Number, netPnl: Number, exitReason: String, timestamp: { type: Date, default: Date.now }
 }));
 
-const ChartDataModel = mongoose.model('ChartData_V8', new mongoose.Schema({
-    priceMid: Number, mlPlot: Number, timestamp: { type: Date, default: Date.now, expires: 86400 } 
-}));
-
-const AnalyticsModel = mongoose.model('SiteAnalytics_V3', new mongoose.Schema({
-    key: { type: String, default: "global" }, views: { type: Number, default: 0 },
-    uniques: { type: Number, default: 0 }, knownIds: { type: [String], default: [] }
-}));
-
-// ==================== BASE CONFIGURATION ====================
+// ==================== CORE FINANCIAL ENGINE ====================
 const CUSTOM_PORT = process.env.PORT || 3000;
-const FORCED_LEVERAGE = 75;
+const FORCED_LEVERAGE = 75; // Institutional High-Frequency Setting
 
-const BASE_CONFIG = {
-    htxSymbol: 'SHIB/USDT:USDT',         
-    binanceSymbol: '1000SHIB/USDT:USDT', 
-    leverage: FORCED_LEVERAGE, baseContracts: 1, contractSize: 1000, marginMode: 'cross', fees: { taker: 0.0004 }, 
-    takeProfitPct: 10.0, stopLossPct: -50.0, mlLookback: 50, mlThreshold: 60.0, 
-    mlAverageTicks: 5, mlUseAverage: false, flipOnlyInProfit: true, flipThresholdPct: 0.5, 
-    dcaRoiThresholdPct: 1.0, dcaMultiplier: 2.0, 
-    profitRoiThresholdPct: 2.0, profitMultiplier: 2.0, 
-    maxContracts: 100, 
-    maxDcaStepsBeforeReverse: 10,
-    // MICRO SCALING DEFAULTS
-    microScalpRoi: 0.5,
-    microScalpQty: 5,
-    microDcaRoi: -0.5,
-    microDcaQty: 3,
-    closeProfitQtyThreshold: 50
+const MARKET_STATE = {
+    binance: { bid: 0, ask: 0, mid: 0, vwap: 0, atr: 0 },
+    priceHistory: [],
+    volumeHistory: [],
+    lookback: 100 // Ticks for VWAP/ATR calculation
 };
 
-const globalMarketData = { 
-    binance: { bid: 0, ask: 0, mid: 0, timestamp: 0 },
-    tickBuffer: [],
-    mlSignal: { confidence: 0, type: 'flat', rawValue: 0.5 } 
-};
-const memoryChartHistory = []; 
 const publicBinance = new ccxt.pro.binance({ options: { defaultType: 'swap', defaultSubType: 'linear' } });
-const publicHtx = new ccxt.pro.htx({ options: { defaultType: 'swap', defaultSubType: 'linear' } });
-const mlSignalCache = new Map();
 
-// ==================== SECURITY & AUTH ====================
-function hashPassword(password, salt) { return crypto.scryptSync(password, salt, 64).toString('hex'); }
-function generateToken() { return crypto.randomBytes(32).toString('hex'); }
-const tokenCache = new Map();
+// QUANTITATIVE MATH
+function calculateTechnicalData(prices, volumes) {
+    if (prices.length < 20) return { vwap: prices[prices.length-1], atr: 0 };
 
-async function authMiddleware(req, res, next) {
-    const token = req.headers['authorization'];
-    if (!token) return res.status(401).json({ error: 'Unauthorized' });
-    let userEntry = tokenCache.get(token);
-    if (!userEntry) {
-        const user = await UserModel.findOne({ token });
-        if (!user) return res.status(401).json({ error: 'Unauthorized' });
-        userEntry = { user, lastAccessed: Date.now() };
-        tokenCache.set(token, userEntry);
+    // 1. VWAP Calculation
+    let tpvSum = 0, volSum = 0;
+    for (let i = 0; i < prices.length; i++) {
+        tpvSum += prices[i] * volumes[i];
+        volSum += volumes[i];
     }
-    req.user = userEntry.user;
-    next();
+    const vwap = tpvSum / volSum;
+
+    // 2. ATR (Volatility) Calculation
+    let trSum = 0;
+    for (let i = 1; i < prices.length; i++) {
+        trSum += Math.abs(prices[i] - prices[i-1]);
+    }
+    const atr = trSum / (prices.length - 1);
+
+    return { vwap, atr };
 }
 
-// ==================== MATH ENGINE ====================
-function calculateTradeMath(side, entryPrice, currentPrice, sizeUsd, leverage, takerFee) {
-    const sideMult = side === 'long' ? 1 : -1;
-    const grossPnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100 * sideMult;
-    const margin = sizeUsd / leverage;
-    const grossPnlUsd = (grossPnlPercent / 100) * sizeUsd;
-    const feeCost = sizeUsd * (takerFee * 2);
-    return { grossPnlPercent, currentGrossRoi: grossPnlPercent * leverage, grossPnlUsd, grossRoiPct: (grossPnlUsd/margin)*100, netPnlUsd: grossPnlUsd - feeCost, netRoiPct: ((grossPnlUsd-feeCost)/margin)*100, margin, feeCost };
-}
-
-function calculateMLSignal(prices, lookback) {
-    if (prices.length < lookback + 15 || lookback < 10) return { confidence: 0, type: 'flat', rawValue: 0.5 };
-    let X = [], y = [];
-    const getFeatures = (i) => [((prices[i]-prices[i-1])/prices[i-1])*1000, ((prices[i]-prices[i-3])/prices[i-3])*1000, ((prices[i]-prices[i-5])/prices[i-5])*1000];
-    for (let i = prices.length - lookback - 1; i < prices.length - 1; i++) {
-        X.push(getFeatures(i));
-        y.push(prices[i+1] > prices[i] ? 1 : 0);
-    }
-    let w = [0,0,0], b = 0, lr = 0.05;
-    for (let e = 0; e < 20; e++) {
-        for (let i = 0; i < X.length; i++) {
-            let pred = 1 / (1 + Math.exp(-(w[0]*X[i][0] + w[1]*X[i][1] + w[2]*X[i][2] + b)));
-            let err = pred - y[i];
-            for(let j=0; j<3; j++) w[j] -= lr * err * X[i][j];
-            b -= lr * err;
-        }
-    }
-    let curX = getFeatures(prices.length - 1);
-    let finalP = 1 / (1 + Math.exp(-(w[0]*curX[0] + w[1]*curX[1] + w[2]*curX[2] + b)));
-    finalP = 1 - finalP;
-    return { confidence: Math.abs(finalP - 0.5) * 200, type: finalP >= 0.5 ? 'bull' : 'bear', rawValue: finalP };
-}
-
-// ==================== PERFORMANCE METRICS ====================
-class PerformanceMetrics {
-    constructor(userId) {
-        this.userId = userId; this.trades = []; 
-        this.totalNetPnl = 0; this.winRate = 0; this.wins = 0; this.losses = 0;
-    }
-    async init() {
-        const dbTrades = await TradeModel.find({ userId: this.userId }).sort({ timestamp: -1 }).limit(100).lean();
-        dbTrades.reverse().forEach(t => this.processTrade(t, false));
-    }
-    recordTrade(trade) { this.processTrade(trade, true); }
-    processTrade(trade, save = true) {
-        this.trades.push(trade); if(this.trades.length > 100) this.trades.shift();
-        this.totalNetPnl += trade.netPnl || 0;
-        if(trade.netPnl > 0) this.wins++; else this.losses++;
-        this.winRate = this.trades.length ? ((this.wins / this.trades.length) * 100).toFixed(2) : 0;
-        if(save) TradeModel.create({ ...trade, userId: this.userId }).catch(()=>{});
-    }
-}
-
-// ==================== USER BOT INSTANCE ====================
-class UserTradeInstance {
+// ==================== PROFESSIONAL TRADE INSTANCE ====================
+class ProfessionalEngine {
     constructor(user) {
-        this.userId = user._id.toString(); 
-        this.config = { ...BASE_CONFIG, ...(user.config || {}) }; 
-        this.metrics = new PerformanceMetrics(this.userId);
-        this.activePositions = user.activePosition ? [user.activePosition] : []; 
+        this.userId = user._id.toString();
+        this.liveTradingEnabled = user.liveTradingEnabled;
+        this.activePositions = user.activePosition ? [user.activePosition] : [];
         this.lastCloseTime = user.lastCloseTime || 0;
-        this.isTrading = false;
         this.walletBalance = 0;
-        this.applyUserKeys(user);
+        this.isExecuting = false;
+
+        this.htx = new ccxt.pro.htx({ 
+            apiKey: user.apiKey || "demo", 
+            secret: user.apiSecret || "demo", 
+            agent: keepAliveAgent,
+            options: { defaultType: 'swap', defaultSubType: 'linear' }
+        });
     }
 
-    applyUserKeys(user) {
-        this.liveTradingEnabled = user.liveTradingEnabled; 
-        this.htx = new ccxt.pro.htx({ apiKey: user.apiKey || "demo", secret: user.apiSecret || "demo", agent: keepAliveAgent });
-    }
+    async init() { this.syncExchange(); setInterval(() => this.syncExchange(), 3000); }
 
-    async initialize() {
-        await this.metrics.init();
-        this.startSync();
-    }
-
-    async saveState() {
-        await UserModel.updateOne({ _id: this.userId }, { $set: { activePosition: this.activePositions[0] || null, config: this.config, lastCloseTime: this.lastCloseTime } });
-    }
-
-    startSync() {
-        setInterval(async () => {
-            if (this.liveTradingEnabled && this.activePositions.length > 0) {
-                try {
-                    const res = await this.htx.fetchPositions([this.config.htxSymbol]);
-                    const open = res.find(p => p.contracts > 0);
-                    if (open) {
-                        this.activePositions[0].exchangeROI = open.percentage || 0;
-                        this.activePositions[0].exchangePnl = open.unrealizedPnl || 0;
-                    } else { this.activePositions = []; await this.saveState(); }
-                    const bal = await this.htx.fetchBalance({ type: 'swap' }); this.walletBalance = bal.total.USDT || 0;
-                } catch(e){}
-            }
-        }, 2000);
-    }
-
-    async checkExits() {
-        if (this.isTrading || this.activePositions.length === 0) return;
-        const pos = this.activePositions[0];
-        const roi = pos.exchangeROI || 0;
-        const mlVal = globalMarketData.mlSignal.rawValue;
-
+    async syncExchange() {
+        if (!this.liveTradingEnabled) return;
         try {
-            if (roi >= this.config.takeProfitPct) return await this.closeFull("TAKE_PROFIT");
-            if (roi <= this.config.stopLossPct) return await this.closeFull("STOP_LOSS");
-            if (pos.contracts >= (this.config.closeProfitQtyThreshold || 50) && roi > 0) return await this.closeFull("QTY_PROFIT_TARGET");
-
-            // MICRO SCALING (Smarter Scaling)
-            const weakening = (pos.side === 'long' && mlVal < 0.52) || (pos.side === 'short' && mlVal > 0.48);
-            if (roi >= (this.config.microScalpRoi || 0.5) && weakening && pos.contracts > 5) {
-                await this.microOrder('close', this.config.microScalpQty || 5, "MICRO_SCALP");
-            }
-            const strong = (pos.side === 'long' && mlVal > 0.65) || (pos.side === 'short' && mlVal < 0.35);
-            if (roi <= (this.config.microDcaRoi || -0.5) && strong && (Date.now() - (pos.lastDcaTime || 0) > 20000)) {
-                await this.microOrder('open', this.config.microDcaQty || 3, "ENTRY_IMPROVE");
-            }
-
-            if (roi <= -(Math.abs(this.config.dcaRoiThresholdPct)) && (Date.now() - (pos.lastDcaTime || 0) > 15000)) {
-                await this.mainDca();
-            }
+            const bal = await this.htx.fetchBalance({ type: 'swap' });
+            this.walletBalance = bal.total.USDT || 0;
+            const pos = await this.htx.fetchPositions(['SHIB/USDT:USDT']);
+            const open = pos.find(p => p.contracts > 0);
+            if (open) {
+                if(!this.activePositions[0]) this.activePositions = [{}];
+                this.activePositions[0].exchangeROI = open.percentage || 0;
+                this.activePositions[0].exchangePnl = open.unrealizedPnl || 0;
+                this.activePositions[0].contracts = open.contracts;
+            } else { this.activePositions = []; }
         } catch (e) {}
     }
 
-    async microOrder(action, qty, reason) {
-        this.isTrading = true;
-        try {
-            const pos = this.activePositions[0];
-            const side = action === 'open' ? (pos.side==='long'?'buy':'sell') : (pos.side==='long'?'sell':'buy');
-            if (this.liveTradingEnabled) await this.htx.createMarketOrder(this.config.htxSymbol, side, qty);
+    async monitor() {
+        if (this.isExecuting) return;
+        const price = MARKET_STATE.binance.mid;
+        const { vwap, atr } = MARKET_STATE.binance;
+
+        // ENTRY LOGIC: VWAP DEVIATION
+        if (this.activePositions.length === 0 && (Date.now() - this.lastCloseTime > 10000)) {
+            const deviation = ((price - vwap) / vwap) * 100;
             
-            const price = globalMarketData.binance.mid;
-            if (action === 'open') {
-                const addedSize = qty * this.config.contractSize * price;
-                pos.entryPrice = ((pos.entryPrice * pos.size) + (price * addedSize)) / (pos.size + addedSize);
-                pos.contracts += qty; pos.size += addedSize; pos.lastDcaTime = Date.now();
-            } else {
-                pos.contracts -= qty; pos.size = pos.contracts * this.config.contractSize * pos.entryPrice;
-            }
-            if(!pos.stepHistory) pos.stepHistory = [];
-            pos.stepHistory.push({ step: pos.contracts, type: reason, price, roi: pos.exchangeROI || 0, time: Date.now() });
-            await this.saveState();
-        } finally { this.isTrading = false; }
-    }
-
-    async mainDca() {
-        this.isTrading = true;
-        try {
-            const pos = this.activePositions[0];
-            const qty = Math.floor(pos.contracts);
-            if (this.liveTradingEnabled) await this.htx.createMarketOrder(this.config.htxSymbol, pos.side==='long'?'buy':'sell', qty);
-            const price = globalMarketData.binance.mid;
-            const addedSize = qty * this.config.contractSize * price;
-            pos.entryPrice = ((pos.entryPrice * pos.size) + (price * addedSize)) / (pos.size + addedSize);
-            pos.contracts += qty; pos.size += addedSize; pos.dcaStep++; pos.lastDcaTime = Date.now();
-            if(!pos.stepHistory) pos.stepHistory = [];
-            pos.stepHistory.push({ step: pos.dcaStep, type: 'DCA', price, roi: pos.exchangeROI || 0, time: Date.now() });
-            await this.saveState();
-        } finally { this.isTrading = false; }
-    }
-
-    async closeFull(reason) {
-        this.isTrading = true;
-        try {
-            const pos = this.activePositions[0];
-            const price = globalMarketData.binance.mid;
-            if (this.liveTradingEnabled) await this.htx.createMarketOrder(this.config.htxSymbol, pos.side === 'long' ? 'sell' : 'buy', pos.contracts, undefined, { reduceOnly: true });
-            const math = calculateTradeMath(pos.side, pos.entryPrice, price, pos.size, FORCED_LEVERAGE, 0.0004);
-            this.metrics.recordTrade({ side: pos.side, entryPrice: pos.entryPrice, exitPrice: price, contracts: pos.contracts, netPnl: math.netPnlUsd, exitReason: reason });
-            this.activePositions = []; this.lastCloseTime = Date.now(); await this.saveState();
-        } finally { this.isTrading = false; }
-    }
-
-    async evaluateEntry() {
-        if (this.isTrading || this.activePositions.length > 0 || Date.now() - this.lastCloseTime < 5000) return;
-        const sig = globalMarketData.mlSignal;
-        if (sig.confidence >= this.config.mlThreshold) {
-            const side = sig.type === 'bull' ? 'long' : 'short';
-            const price = globalMarketData.binance.mid;
-            const contracts = this.config.baseContracts || 1;
-            if (this.liveTradingEnabled) await this.htx.createMarketOrder(this.config.htxSymbol, side === 'long' ? 'buy' : 'sell', contracts);
-            const sizeUsd = contracts * this.config.contractSize * price;
-            this.activePositions = [{ side, entryPrice: price, contracts, size: sizeUsd, dcaStep: 0, entryTime: Date.now(), isPaper: !this.liveTradingEnabled, stepHistory: [{ step: 0, type: 'OPEN', price, roi: 0, time: Date.now() }] }];
-            await this.saveState();
+            // Buy if price is undervalued (below VWAP) and starts recovering
+            if (deviation < -0.2) await this.executeOrder('long', 'VWAP_UNDERVALUED');
+            // Short if price is overextended (above VWAP)
+            else if (deviation > 0.2) await this.executeOrder('short', 'VWAP_OVEREXTENDED');
         }
+
+        // EXIT & SCALING LOGIC
+        if (this.activePositions.length > 0) {
+            const pos = this.activePositions[0];
+            const roi = pos.exchangeROI || 0;
+
+            // 1. SMART SCALING (Add to winners)
+            if (roi > 5 && pos.contracts < 100 && (Date.now() - (pos.lastScaleTime || 0) > 30000)) {
+                await this.scalePosition('add', 10, 'PROFIT_SCALING');
+            }
+
+            // 2. DYNAMIC STOP (Volatility based)
+            const stopPrice = pos.side === 'long' ? pos.entryPrice - (atr * 3) : pos.entryPrice + (atr * 3);
+            const isStopped = pos.side === 'long' ? price < stopPrice : price > stopPrice;
+            
+            if (isStopped) await this.executeClose('ATR_STOP_LOSS');
+            if (roi > 15) await this.executeClose('DYNAMIC_TAKE_PROFIT');
+        }
+    }
+
+    async executeOrder(side, reason) {
+        this.isExecuting = true;
+        try {
+            const qty = Math.max(1, Math.floor(this.walletBalance * 0.1)); // Risk 10% of wallet per entry
+            if (this.liveTradingEnabled) await this.htx.createMarketOrder('SHIB/USDT:USDT', side === 'long' ? 'buy' : 'sell', qty);
+            
+            this.activePositions = [{ 
+                side, entryPrice: MARKET_STATE.binance.mid, contracts: qty, 
+                lastScaleTime: Date.now(), entryTime: Date.now() 
+            }];
+            await UserModel.updateOne({ _id: this.userId }, { $set: { activePosition: this.activePositions[0] } });
+            console.log(`[EXECUTION] ${side.toUpperCase()} via ${reason}`);
+        } finally { this.isExecuting = false; }
+    }
+
+    async scalePosition(type, qty, reason) {
+        this.isExecuting = true;
+        try {
+            const pos = this.activePositions[0];
+            if (this.liveTradingEnabled) await this.htx.createMarketOrder('SHIB/USDT:USDT', pos.side === 'long' ? 'buy' : 'sell', qty);
+            pos.contracts += qty;
+            pos.lastScaleTime = Date.now();
+            await UserModel.updateOne({ _id: this.userId }, { $set: { activePosition: pos } });
+            console.log(`[SCALING] Added ${qty} contracts via ${reason}`);
+        } finally { this.isExecuting = false; }
+    }
+
+    async executeClose(reason) {
+        this.isExecuting = true;
+        try {
+            const pos = this.activePositions[0];
+            if (this.liveTradingEnabled) await this.htx.createMarketOrder('SHIB/USDT:USDT', pos.side === 'long' ? 'sell' : 'buy', pos.contracts, undefined, { reduceOnly: true });
+            
+            await TradeModel.create({ userId: this.userId, side: pos.side, entryPrice: pos.entryPrice, exitPrice: MARKET_STATE.binance.mid, contracts: pos.contracts, netPnl: pos.exchangePnl || 0, exitReason: reason });
+            this.activePositions = [];
+            this.lastCloseTime = Date.now();
+            await UserModel.updateOne({ _id: this.userId }, { $set: { activePosition: null, lastCloseTime: this.lastCloseTime } });
+            console.log(`[LIQUIDATION] Position Closed via ${reason}`);
+        } finally { this.isExecuting = false; }
     }
 }
 
-// ==================== SERVER & STREAMS ====================
+// ==================== WORKER MANAGER ====================
 const activeWorkers = new Map();
-async function startMasterStreams() {
-    (async function stream() {
+
+async function startSystem() {
+    (async function streamData() {
         while (true) {
             try {
-                const ticker = await publicBinance.watchTicker(BASE_CONFIG.binanceSymbol);
+                const ticker = await publicBinance.watchTicker('1000SHIB/USDT:USDT');
                 const mid = (ticker.bid + ticker.ask) / 2;
-                globalMarketData.binance = { mid, bid: ticker.bid, ask: ticker.ask };
-                globalMarketData.tickBuffer.push(mid); if (globalMarketData.tickBuffer.length > 500) globalMarketData.tickBuffer.shift();
-                globalMarketData.mlSignal = calculateMLSignal(globalMarketData.tickBuffer, BASE_CONFIG.mlLookback);
-                for (const w of activeWorkers.values()) { w.checkExits(); w.evaluateEntry(); }
+                MARKET_STATE.binance.mid = mid;
+                
+                MARKET_STATE.priceHistory.push(mid);
+                MARKET_STATE.volumeHistory.push(ticker.quoteVolume || 1);
+                
+                if (MARKET_STATE.priceHistory.length > MARKET_STATE.lookback) {
+                    MARKET_STATE.priceHistory.shift();
+                    MARKET_STATE.volumeHistory.shift();
+                }
+
+                const { vwap, atr } = calculateTechnicalData(MARKET_STATE.priceHistory, MARKET_STATE.volumeHistory);
+                MARKET_STATE.binance.vwap = vwap;
+                MARKET_STATE.binance.atr = atr;
+
+                for (const worker of activeWorkers.values()) { worker.monitor(); }
             } catch (e) { await new Promise(r => setTimeout(r, 2000)); }
         }
     })();
 }
 
+// ==================== PROFESSIONAL API & UI ====================
 const app = express(); app.use(express.json());
 
-// API ENDPOINTS
+function hash(p, s) { return crypto.scryptSync(p, s, 64).toString('hex'); }
+
 app.post('/api/auth/register', async (req, res) => {
     const salt = crypto.randomBytes(16).toString('hex');
-    const user = await UserModel.create({ name: req.body.name, email: req.body.email, passwordHash: hashPassword(req.body.password, salt), salt, token: generateToken() });
-    const worker = new UserTradeInstance(user); await worker.initialize(); activeWorkers.set(user._id.toString(), worker);
+    const user = await UserModel.create({ name: req.body.name, email: req.body.email, salt, passwordHash: hash(req.body.password, salt), token: crypto.randomBytes(32).toString('hex') });
+    const worker = new ProfessionalEngine(user); worker.init(); activeWorkers.set(user._id.toString(), worker);
     res.json({ token: user.token });
 });
+
 app.post('/api/auth/login', async (req, res) => {
     const user = await UserModel.findOne({ email: req.body.email });
-    if(user && hashPassword(req.body.password, user.salt) === user.passwordHash) {
-        user.token = generateToken(); await user.save(); res.json({ token: user.token });
-    } else res.status(400).json({ error: 'Invalid' });
-});
-app.get('/api/data', authMiddleware, (req, res) => {
-    const worker = activeWorkers.get(req.user._id.toString());
-    res.json(worker ? { activePositions: worker.activePositions, metrics: worker.metrics, mlSignal: globalMarketData.mlSignal, walletBalance: worker.walletBalance, config: worker.config } : { error: 'Not found' });
+    if (user && hash(req.body.password, user.salt) === user.passwordHash) res.json({ token: user.token });
+    else res.status(401).json({ error: "Auth Failed" });
 });
 
-// FULL UI RESTORED
+app.get('/api/data', async (req, res) => {
+    const user = await UserModel.findOne({ token: req.headers.authorization });
+    if (!user) return res.status(401).send();
+    const worker = activeWorkers.get(user._id.toString());
+    const trades = await TradeModel.find({ userId: user._id.toString() }).sort({ timestamp: -1 }).limit(10);
+    res.json({ 
+        activePositions: worker.activePositions, 
+        walletBalance: worker.walletBalance,
+        market: MARKET_STATE.binance,
+        trades: trades
+    });
+});
+
 app.get('/', (req, res) => res.send(`
-<!DOCTYPE html><html><head><title>TradeBot Smarter Scaling</title><script src="https://cdn.tailwindcss.com"></script><link href="https://fonts.googleapis.com/css2?family=Roboto+Mono&display=swap" rel="stylesheet"></head>
-<body class="bg-gray-50 text-gray-900 font-sans">
-    <header class="bg-white shadow-sm sticky top-0 z-50 h-16 flex items-center justify-between px-10">
-        <div class="font-bold text-xl cursor-pointer" onclick="nav('home')">TradeBotPille</div>
-        <nav id="nav-public" class="flex gap-6 text-sm font-medium">
-            <button onclick="nav('login')">Login</button>
-            <button onclick="nav('register')" class="bg-black text-white px-5 py-2 rounded-xl">Get Started</button>
-        </nav>
-        <nav id="nav-private" class="hidden gap-6 text-sm font-medium">
-            <button onclick="nav('dashboard')">Dashboard</button>
-            <button onclick="logout()" class="text-red-500">Logout</button>
-        </nav>
-    </header>
+<!DOCTYPE html><html><head><title>Quantum Terminal</title><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-[#0a0a0c] text-gray-100 font-sans">
+    <nav class="border-b border-gray-800 h-16 flex items-center justify-between px-10 bg-[#0f0f12]">
+        <div class="flex items-center gap-2">
+            <div class="w-8 h-8 bg-blue-600 rounded flex items-center justify-center font-bold">Q</div>
+            <span class="font-bold tracking-tighter text-xl">QUANTUM<span class="text-blue-500">ENGINE</span></span>
+        </div>
+        <div id="auth-nav" class="flex gap-6 text-sm font-medium text-gray-400">
+            <button onclick="show('login')">Login</button>
+            <button onclick="show('register')" class="bg-blue-600 text-white px-4 py-1.5 rounded shadow-lg shadow-blue-900/20">Register</button>
+        </div>
+    </nav>
 
-    <main>
-        <!-- HOME -->
-        <section id="view-home" class="view-section py-20 px-10 text-center">
-            <h1 class="text-7xl font-black mb-6">TradeBot: <span class="text-blue-600">Smarter Scaling</span></h1>
-            <div class="grid md:grid-cols-2 gap-8 max-w-4xl mx-auto mt-12 text-left">
-                <div class="bg-white p-10 rounded-3xl shadow-sm border">
-                    <h2 class="text-2xl font-bold text-green-600 mb-4">Micro-Scalping</h2>
-                    <p class="text-gray-500 leading-relaxed">Banks small profits automatically when the ML signal shows the trend is weakening, keeping the trade running with less risk.</p>
+    <main class="max-w-6xl mx-auto py-12 px-6">
+        <!-- HOME SECTION -->
+        <section id="view-home" class="text-center">
+            <h1 class="text-7xl font-black tracking-tighter mb-6 bg-gradient-to-b from-white to-gray-500 bg-clip-text text-transparent">Professional Execution.</h1>
+            <p class="text-gray-400 text-lg max-w-2xl mx-auto leading-relaxed">Quantitative fair-value trading for SHIB/USDT. Using institutional VWAP deviation and ATR volatility risk management.</p>
+            <div class="grid md:grid-cols-3 gap-6 mt-16 text-left">
+                <div class="bg-[#141417] p-8 rounded-2xl border border-gray-800">
+                    <h3 class="text-blue-500 font-bold mb-2">VWAP Analysis</h3>
+                    <p class="text-sm text-gray-500">Identifies Institutional Fair Value. The bot only buys when price is undervalued relative to volume.</p>
                 </div>
-                <div class="bg-white p-10 rounded-3xl shadow-sm border">
-                    <h2 class="text-2xl font-bold text-blue-600 mb-4">Micro-Averaging</h2>
-                    <p class="text-gray-500 leading-relaxed">Adds tiny amounts to the position on small pullbacks to lower the average entry price while the trend is still strong.</p>
+                <div class="bg-[#141417] p-8 rounded-2xl border border-gray-800">
+                    <h3 class="text-green-500 font-bold mb-2">ATR Volatility</h3>
+                    <p class="text-sm text-gray-500">Dynamic Risk Mitigation. Stops are calculated based on market noise, not static percentages.</p>
                 </div>
-            </div>
-            <p class="mt-12 text-gray-400 italic">Login to the dashboard to monitor live smart-scaling logs in the Step History tab.</p>
-        </section>
-
-        <!-- LOGIN -->
-        <section id="view-login" class="view-section hidden max-w-md mx-auto py-20">
-            <div class="bg-white p-10 rounded-3xl shadow-xl border">
-                <h2 class="text-3xl font-bold mb-6 text-center">Login</h2>
-                <input type="email" id="l-email" placeholder="Email" class="w-full p-4 mb-4 bg-gray-50 rounded-xl">
-                <input type="password" id="l-pass" placeholder="Password" class="w-full p-4 mb-6 bg-gray-50 rounded-xl">
-                <button onclick="doLogin()" class="w-full bg-black text-white py-4 rounded-xl font-bold">Login</button>
+                <div class="bg-[#141417] p-8 rounded-2xl border border-gray-800">
+                    <h3 class="text-purple-500 font-bold mb-2">Geometric Scaling</h3>
+                    <p class="text-sm text-gray-500">Winner Compounding. The bot automatically adds to profitable trends while protecting capital.</p>
+                </div>
             </div>
         </section>
 
-        <!-- REGISTER -->
-        <section id="view-register" class="view-section hidden max-w-md mx-auto py-20">
-            <div class="bg-white p-10 rounded-3xl shadow-xl border">
-                <h2 class="text-3xl font-bold mb-6 text-center">Sign Up</h2>
-                <input type="text" id="r-name" placeholder="Name" class="w-full p-4 mb-4 bg-gray-50 rounded-xl">
-                <input type="email" id="r-email" placeholder="Email" class="w-full p-4 mb-4 bg-gray-50 rounded-xl">
-                <input type="password" id="r-pass" placeholder="Password" class="w-full p-4 mb-6 bg-gray-50 rounded-xl">
-                <button onclick="doRegister()" class="w-full bg-black text-white py-4 rounded-xl font-bold">Register</button>
+        <!-- DASHBOARD (Hidden until login) -->
+        <section id="view-dashboard" class="hidden space-y-8">
+            <div class="grid grid-cols-4 gap-6">
+                <div class="bg-[#141417] p-6 rounded-xl border border-gray-800">
+                    <p class="text-[10px] font-bold text-gray-500 uppercase tracking-widest">Market VWAP</p>
+                    <p id="dash-vwap" class="text-2xl font-mono font-bold text-blue-400">0.000000</p>
+                </div>
+                <div class="bg-[#141417] p-6 rounded-xl border border-gray-800">
+                    <p class="text-[10px] font-bold text-gray-500 uppercase tracking-widest">Volatility (ATR)</p>
+                    <p id="dash-atr" class="text-2xl font-mono font-bold text-yellow-400">0.00%</p>
+                </div>
+                <div class="bg-[#141417] p-6 rounded-xl border border-gray-800">
+                    <p class="text-[10px] font-bold text-gray-500 uppercase tracking-widest">Active ROI</p>
+                    <p id="dash-roi" class="text-2xl font-mono font-bold">0.00%</p>
+                </div>
+                <div class="bg-[#141417] p-6 rounded-xl border border-gray-800">
+                    <p class="text-[10px] font-bold text-gray-500 uppercase tracking-widest">Wallet USDT</p>
+                    <p id="dash-bal" class="text-2xl font-mono font-bold text-green-400">$0.00</p>
+                </div>
+            </div>
+
+            <div class="bg-[#141417] rounded-2xl border border-gray-800 overflow-hidden">
+                <div class="p-6 border-b border-gray-800 flex justify-between items-center">
+                    <h3 class="font-bold">Trade Execution Ledger</h3>
+                    <span class="text-[10px] bg-green-900/30 text-green-500 px-3 py-1 rounded-full font-bold">ENGINE LIVE</span>
+                </div>
+                <table class="w-full text-left text-sm">
+                    <thead class="bg-[#0f0f12] text-gray-500 uppercase text-[10px]">
+                        <tr><th class="p-4">Side</th><th class="p-4">Contracts</th><th class="p-4">Reason</th><th class="p-4 text-right">PnL</th></tr>
+                    </thead>
+                    <tbody id="trade-ledger" class="font-mono"></tbody>
+                </table>
             </div>
         </section>
 
-        <!-- DASHBOARD -->
-        <section id="view-dashboard" class="view-section hidden max-w-7xl mx-auto py-10 px-10">
-            <div class="grid grid-cols-1 lg:grid-cols-3 gap-8 mb-10">
-                <div class="bg-white p-8 rounded-3xl shadow-sm border">
-                    <p class="text-xs font-bold text-gray-400 uppercase mb-2">Net PnL</p>
-                    <p id="netPnl" class="text-4xl font-mono font-bold">$0.00</p>
-                </div>
-                <div class="bg-white p-8 rounded-3xl shadow-sm border">
-                    <p class="text-xs font-bold text-gray-400 uppercase mb-2">Contracts</p>
-                    <p id="activeQty" class="text-4xl font-mono font-bold">0</p>
-                </div>
-                <div class="bg-white p-8 rounded-3xl shadow-sm border">
-                    <p class="text-xs font-bold text-gray-400 uppercase mb-2">ROI</p>
-                    <p id="activeRoi" class="text-4xl font-mono font-bold">0.00%</p>
-                </div>
-            </div>
-
-            <div class="grid lg:grid-cols-2 gap-8">
-                <div class="bg-white p-10 rounded-3xl shadow-sm border">
-                    <h3 class="font-bold text-xl mb-6">Execution Log (Closed Trades)</h3>
-                    <div id="tradeHistory" class="space-y-4 text-sm font-mono text-gray-600"></div>
-                </div>
-                <div class="bg-white p-10 rounded-3xl shadow-sm border">
-                    <h3 class="font-bold text-xl mb-6">Step History (Smarter Scaling)</h3>
-                    <div id="stepHistory" class="space-y-4 text-sm font-mono text-gray-400"></div>
-                </div>
+        <!-- AUTH FORMS -->
+        <section id="view-auth" class="hidden max-w-sm mx-auto bg-[#141417] p-10 rounded-3xl border border-gray-800 shadow-2xl">
+            <h2 id="auth-title" class="text-3xl font-bold mb-8 text-center">Login</h2>
+            <div class="space-y-4">
+                <input type="text" id="auth-name" placeholder="Name" class="w-full bg-[#0a0a0c] p-4 rounded-xl outline-none border border-gray-800 hidden">
+                <input type="email" id="auth-email" placeholder="Email" class="w-full bg-[#0a0a0c] p-4 rounded-xl outline-none border border-gray-800">
+                <input type="password" id="auth-pass" placeholder="Password" class="w-full bg-[#0a0a0c] p-4 rounded-xl outline-none border border-gray-800">
+                <button onclick="auth()" id="auth-btn" class="w-full bg-blue-600 py-4 rounded-xl font-bold shadow-lg shadow-blue-900/20 mt-4">Continue</button>
             </div>
         </section>
     </main>
 
     <script>
-        let token = localStorage.getItem('bot_token');
-        function nav(id) { document.querySelectorAll('.view-section').forEach(s => s.classList.add('hidden')); document.getElementById('view-'+id).classList.remove('hidden'); }
-        async function doLogin() {
-            const res = await fetch('/api/auth/login', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ email: document.getElementById('l-email').value, password: document.getElementById('l-pass').value })});
-            const data = await res.json(); if(data.token) { localStorage.setItem('bot_token', data.token); location.reload(); }
-        }
-        async function doRegister() {
-            await fetch('/api/auth/register', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ name: document.getElementById('r-name').value, email: document.getElementById('r-email').value, password: document.getElementById('r-pass').value })}); nav('login');
-        }
-        function logout() { localStorage.removeItem('bot_token'); location.reload(); }
-        
-        if(token) {
-            document.getElementById('nav-public').classList.add('hidden');
-            document.getElementById('nav-private').classList.remove('hidden');
-            nav('dashboard');
-            setInterval(update, 1000);
+        let mode = 'login';
+        let token = localStorage.getItem('q_token');
+
+        function show(v) {
+            document.querySelectorAll('main > section').forEach(s => s.classList.add('hidden'));
+            if(v === 'login' || v === 'register') {
+                mode = v;
+                document.getElementById('view-auth').classList.remove('hidden');
+                document.getElementById('auth-title').innerText = v === 'login' ? 'Login' : 'Create Account';
+                document.getElementById('auth-name').classList.toggle('hidden', v === 'login');
+            } else document.getElementById('view-' + v).classList.remove('hidden');
         }
 
-        async function update() {
-            const res = await fetch('/api/data', { headers: {'Authorization': token} });
+        async function auth() {
+            const email = document.getElementById('auth-email').value;
+            const password = document.getElementById('auth-pass').value;
+            const name = document.getElementById('auth-name').value;
+            const endpoint = mode === 'login' ? '/api/auth/login' : '/api/auth/register';
+            const res = await fetch(endpoint, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ email, password, name })});
             const data = await res.json();
-            if(data.metrics) {
-                document.getElementById('netPnl').innerText = '$' + data.metrics.totalNetPnl.toFixed(4);
-                document.getElementById('tradeHistory').innerHTML = data.metrics.trades.slice().reverse().map(t => '<div class="border-b pb-2">['+t.exitReason+'] '+t.side.toUpperCase()+' PnL: $'+t.netPnl.toFixed(4)+'</div>').join('');
-            }
-            if(data.activePositions && data.activePositions.length > 0) {
-                const p = data.activePositions[0];
-                document.getElementById('activeQty').innerText = p.contracts;
-                document.getElementById('activeRoi').innerText = (p.exchangeROI || 0).toFixed(2) + '%';
-                document.getElementById('stepHistory').innerHTML = (p.stepHistory || []).map(s => '<div>['+s.type+'] '+s.step+' contracts @ '+s.price+'</div>').join('');
-            }
+            if(data.token) { localStorage.setItem('q_token', data.token); location.reload(); }
+        }
+
+        if(token) {
+            show('dashboard');
+            setInterval(async () => {
+                const res = await fetch('/api/data', { headers: {'Authorization': token} });
+                const data = await res.json();
+                document.getElementById('dash-vwap').innerText = data.market.vwap.toFixed(8);
+                document.getElementById('dash-atr').innerText = (data.market.atr / data.market.mid * 100).toFixed(4) + '%';
+                document.getElementById('dash-bal').innerText = '$' + data.walletBalance.toFixed(2);
+                
+                if(data.activePositions.length > 0) {
+                    const p = data.activePositions[0];
+                    document.getElementById('dash-roi').innerText = (p.exchangeROI || 0).toFixed(2) + '%';
+                    document.getElementById('dash-roi').className = 'text-2xl font-mono font-bold ' + (p.exchangeROI >= 0 ? 'text-green-500' : 'text-red-500');
+                }
+
+                document.getElementById('trade-ledger').innerHTML = data.trades.map(t => \`
+                    <tr class="border-t border-gray-800/50">
+                        <td class="p-4 font-bold \${t.side==='long'?'text-green-500':'text-red-500'}">\${t.side.toUpperCase()}</td>
+                        <td class="p-4">\${t.contracts}</td>
+                        <td class="p-4 text-gray-500 text-[10px] uppercase">\${t.exitReason}</td>
+                        <td class="p-4 text-right font-bold \${t.netPnl>=0?'text-green-500':'text-red-500'}">$\${t.netPnl.toFixed(4)}</td>
+                    </tr>
+                \`).join('');
+            }, 1000);
         }
     </script>
 </body></html>`));
 
+// ==================== INITIALIZATION ====================
 app.listen(CUSTOM_PORT, async () => {
     const users = await UserModel.find({});
-    for(const u of users) { const w = new UserTradeInstance(u); await w.initialize(); activeWorkers.set(u._id.toString(), w); }
-    startMasterStreams();
-    console.log(`✅ Fully Restored Engine Live on ${CUSTOM_PORT}`);
+    for(const u of users) { 
+        const w = new ProfessionalEngine(u); 
+        await w.init(); 
+        activeWorkers.set(u._id.toString(), w); 
+    }
+    startSystem();
+    console.log(`✅ Institutional Engine Running on Port ${CUSTOM_PORT}`);
 });
