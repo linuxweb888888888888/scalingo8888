@@ -3,17 +3,20 @@ const mongoose = require('mongoose');
 const ccxt = require('ccxt');
 
 // ==================== CONFIGURATION ====================
-const PAPER_TRADING = true; // <--- SET TO FALSE TO USE REAL MONEY
+const PAPER_TRADING = false; // <--- SET TO FALSE TO USE REAL MONEY
 const API_KEY = 'a961bee8-b730aff5-qv2d5ctgbn-990d3';
 const API_SECRET = 'caab0880-9a1832ee-738173d7-c923b';
 const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/ton_trading_bot?retryWrites=true&w=majority&appName=Clusterweb8888";
 
 const PORT = process.env.PORT || 3000;
-const SYMBOL = 'TON/USDT:USDT';
+const SYMBOL = 'SHIB/USDT:USDT'; // <--- CHANGED TO SHIB
 const LEVERAGE = 75;
 const MULTIPLIER = 1; 
 const TAKE_PROFIT = 10.0; 
 const STOP_LOSS = -30.0; 
+
+// For SHIB, 1 contract is usually 1,000,000 tokens on HTX
+const SHIB_CONTRACT_SIZE = 1000; 
 
 // ==================== DATABASE ====================
 mongoose.connect(MONGO_URI).then(() => console.log(`✅ MongoDB Connected (${PAPER_TRADING ? 'PAPER' : 'REAL'} MODE)`));
@@ -27,7 +30,6 @@ const BotState = mongoose.model('Bot_State', new mongoose.Schema({
     key: String, value: Number, startDate: { type: Date, default: Date.now }
 }));
 
-// Collection to store paper positions
 const PaperPosition = mongoose.model('Paper_Position', new mongoose.Schema({
     symbol: String, side: String, entryPrice: Number, contracts: Number, timestamp: { type: Date, default: Date.now }
 }));
@@ -58,21 +60,18 @@ let botStatus = {
 async function syncAccount() {
     try {
         if (PAPER_TRADING) {
-            // Paper Mode: Get balance from Database
             let balanceDoc = await BotState.findOne({ key: "paper_balance" });
             if (!balanceDoc) {
-                balanceDoc = await BotState.create({ key: "paper_balance", value: 1000.00 }); // Start with $1000 Paper Money
+                balanceDoc = await BotState.create({ key: "paper_balance", value: 1000.00 }); 
             }
             botStatus.currentBalance = balanceDoc.value;
             botStatus.availableBalance = balanceDoc.value;
         } else {
-            // Real Mode: Get balance from HTX
             const bal = await htx.fetchBalance({ type: 'swap' });
             botStatus.currentBalance = (bal.total && bal.total.USDT) ? bal.total.USDT : 0;
             botStatus.availableBalance = (bal.free && bal.free.USDT) ? bal.free.USDT : 0;
         }
 
-        // Global Stats
         const history = await Trade.find();
         botStatus.totalClosedRoi = history.reduce((sum, trade) => sum + (trade.roi || 0), 0);
 
@@ -109,25 +108,22 @@ async function tradingLoop() {
             }
 
             if (activePos) {
-                // --- POSITION TRACKING ---
                 botStatus.active = true;
                 botStatus.side = activePos.side.toUpperCase();
                 botStatus.lastQty = activePos.contracts;
 
-                // Calculate ROI manually for Paper or use exchange value for Real
                 if (PAPER_TRADING) {
                     const priceDiff = activePos.side === 'buy' ? (currentPrice - activePos.entryPrice) : (activePos.entryPrice - currentPrice);
                     botStatus.currentRoi = (priceDiff / activePos.entryPrice) * LEVERAGE * 100;
-                    botStatus.currentPnl = (priceDiff * activePos.contracts * 0.1); // 1 contract = 0.1 TON
+                    // UPDATED PNL MATH FOR SHIB: PriceDiff * Number of Contracts * 1,000,000
+                    botStatus.currentPnl = (priceDiff * activePos.contracts * SHIB_CONTRACT_SIZE); 
                 } else {
                     botStatus.currentRoi = parseFloat(activePos.percentage) || 0;
                     botStatus.currentPnl = parseFloat(activePos.unrealizedPnl) || 0;
                 }
 
-                // --- EXIT LOGIC ---
                 if (botStatus.currentRoi >= TAKE_PROFIT || botStatus.currentRoi <= STOP_LOSS) {
                     if (PAPER_TRADING) {
-                        // Update Paper Balance
                         await BotState.updateOne({ key: "paper_balance" }, { $inc: { value: botStatus.currentPnl } });
                         await PaperPosition.deleteOne({ _id: activePos._id });
                     } else {
@@ -141,12 +137,12 @@ async function tradingLoop() {
                     await new Promise(r => setTimeout(r, 10000));
                 }
             } else {
-                // --- ENTRY LOGIC ---
                 botStatus.active = false;
                 botStatus.side = "IDLE";
                 botStatus.currentRoi = 0;
 
-                const unitValue = currentPrice * 0.1;
+                // UPDATED ENTRY QTY MATH FOR SHIB
+                const unitValue = currentPrice * SHIB_CONTRACT_SIZE;
                 const baseDiv = botStatus.availableBalance / unitValue;
                 const maxQty = Math.floor(baseDiv * LEVERAGE * MULTIPLIER);
 
@@ -194,11 +190,11 @@ app.post('/api/reset-baseline', async (req, res) => {
 
 app.get('/', (req, res) => {
     res.send(`
-    <!DOCTYPE html><html><head><title>TON Paper Extreme</title><script src="https://cdn.tailwindcss.com"></script>
+    <!DOCTYPE html><html><head><title>SHIB Paper Extreme</title><script src="https://cdn.tailwindcss.com"></script>
     <style>@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
     body{background:#020617;color:#f8fafc;font-family:'JetBrains+Mono',monospace;}.card{background:#0f172a;border:1px solid #1e293b;border-radius:12px;}</style></head>
     <body class="p-6 md:p-12"><div class="max-w-6xl mx-auto"><header class="flex justify-between items-center mb-10"><div>
-    <h1 class="text-2xl font-bold tracking-tighter text-blue-500 uppercase font-black italic">TON.EXTREME.V4</h1>
+    <h1 class="text-2xl font-bold tracking-tighter text-blue-500 uppercase font-black italic">SHIB.EXTREME.V4</h1>
     <p class="text-[10px] text-rose-500 font-bold uppercase tracking-widest">${PAPER_TRADING ? '⚠️ PAPER TRADING MODE ENABLED' : 'LIVE TRADING ACTIVE'}</p></div>
     <button onclick="resetBaseline()" class="text-[10px] bg-slate-800 hover:bg-rose-900 px-4 py-2 rounded-lg font-bold border border-slate-700 transition-colors">RESET PORTFOLIO</button>
     </header>
@@ -260,4 +256,4 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.listen(PORT, () => console.log(`🌐 ${PAPER_TRADING ? 'Paper' : 'Live'} Engine active on port ${PORT}`));
+app.listen(PORT, () => console.log(`🌐 SHIB ${PAPER_TRADING ? 'Paper' : 'Live'} Engine active on port ${PORT}`));
