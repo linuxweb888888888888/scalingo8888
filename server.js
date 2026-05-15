@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const ccxt = require('ccxt');
 
 // ==================== CONFIGURATION ====================
-const PAPER_TRADING = true; // Set to false to use real money
+const PAPER_TRADING = false; // Set to false to use real money
 const API_KEY = 'a961bee8-b730aff5-qv2d5ctgbn-990d3';
 const API_SECRET = 'caab0880-9a1832ee-738173d7-c923b';
 const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/ton_trading_bot?retryWrites=true&w=majority";
