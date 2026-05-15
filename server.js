@@ -12,8 +12,8 @@ const PORT = process.env.PORT || 3000;
 const SYMBOL = 'SHIB/USDT:USDT';
 const LEVERAGE = 75;
 const CONTRACT_SIZE = 1000; // 1 HTX contract = 1000 SHIB tokens
-const TAKE_PROFIT = 5.0; 
-const STOP_LOSS = -20.0; 
+const TAKE_PROFIT = 10.0; 
+const STOP_LOSS = -30.0; 
 const RISK_PERCENT = 0.10; // Use 10% of available margin per trade
 
 // ==================== DATABASE ====================
