@@ -14,7 +14,7 @@ const LEVERAGE = 75;
 const CONTRACT_SIZE = 1000; // 1 HTX contract = 1000 SHIB tokens
 const TAKE_PROFIT = 10.0; 
 const STOP_LOSS = -30.0; 
-const RISK_PERCENT = 0.50; // Use 10% of available margin per trade
+const RISK_PERCENT = 0.10; // Use 10% of available margin per trade
 
 // ==================== DATABASE ====================
 mongoose.connect(MONGO_URI).then(() => console.log(`✅ MongoDB Connected | SHIB ${PAPER_TRADING ? 'PAPER' : 'REAL'} MODE`));
