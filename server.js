@@ -14,7 +14,7 @@ const TAKE_PROFIT = 5.0;
 const STOP_LOSS = -30.0; 
 
 // ==================== DATABASE ====================
-mongoose.connect(MONGO_URI).then(() => console.log('✅ Atlas Connected'));
+mongoose.connect(MONGO_URI).then(() => console.log('✅ MongoDB Connected'));
 
 const Trade = mongoose.model('Trade_History', new mongoose.Schema({
     side: String, entryPrice: Number, exitPrice: Number,
@@ -40,8 +40,7 @@ let botStatus = {
     currentPnl: 0,
     initialBalance: 0,
     currentBalance: 0,
-    availableBalance: 0, // This is your 0.4347
-    buyingPower: 0,      // availableBalance * 75
+    availableBalance: 0,
     growthPnl: 0,
     growthPct: 0,
     lastQty: 0,
@@ -57,7 +56,6 @@ async function syncAccount() {
 
         botStatus.currentBalance = totalEquity;
         botStatus.availableBalance = freeCash;
-        botStatus.buyingPower = freeCash * LEVERAGE;
 
         if (totalEquity > 0) {
             let startDoc = await BotState.findOne({ key: "initial_balance" });
@@ -68,7 +66,7 @@ async function syncAccount() {
             botStatus.growthPnl = totalEquity - startDoc.value;
             botStatus.growthPct = (botStatus.growthPnl / (startDoc.value || 1)) * 100;
         }
-    } catch (e) { botStatus.errorMsg = "Sync Error"; }
+    } catch (e) { botStatus.errorMsg = "Balance Sync Error"; }
 }
 
 async function tradingLoop() {
@@ -90,45 +88,56 @@ async function tradingLoop() {
                 botStatus.currentPnl = parseFloat(pos.unrealizedPnl) || 0;
                 botStatus.lastQty = pos.contracts;
 
+                // 1. EXIT LOGIC
                 if (botStatus.currentRoi >= TAKE_PROFIT || botStatus.currentRoi <= STOP_LOSS) {
                     await htx.createMarketOrder(SYMBOL, (pos.side === 'long' ? 'sell' : 'buy'), pos.contracts, undefined, {
                         'lever_rate': LEVERAGE, 'offset': 'close', 'reduceOnly': true
                     });
-                    
                     await Trade.create({
                         side: pos.side, entryPrice: pos.entryPrice, exitPrice: pos.markPrice,
                         roi: botStatus.currentRoi, pnl: botStatus.currentPnl, reason: "SYSTEM_EXIT"
                     });
                     await new Promise(r => setTimeout(r, 10000));
+                    continue;
                 }
+
+                // 2. COMPOUNDING LOGIC (The Squeeze)
+                // If there is still more than 0.05 USDT available while in a trade, use it!
+                if (botStatus.availableBalance > 0.05) {
+                    const ticker = await htx.fetchTicker(SYMBOL);
+                    const price = pos.side === 'long' ? ticker.ask : ticker.bid;
+                    const addPower = botStatus.availableBalance * 0.98 * LEVERAGE;
+                    let addQty = htx.amountToPrecision(SYMBOL, addPower / price);
+
+                    if (parseFloat(addQty) > 0) {
+                        console.log(`COMPOUNDING: Adding ${addQty} more TON to ${pos.side}`);
+                        await htx.createMarketOrder(SYMBOL, pos.side === 'long' ? 'buy' : 'sell', addQty, undefined, {
+                            'lever_rate': LEVERAGE, 'offset': 'open'
+                        });
+                        await new Promise(r => setTimeout(r, 2000));
+                    }
+                }
+
             } else {
+                // 3. INITIAL ENTRY LOGIC
                 botStatus.active = false;
                 const ticker = await htx.fetchTicker(SYMBOL);
-                const randomSide = Math.random() > 0.5 ? 'buy' : 'sell';
-                const price = randomSide === 'buy' ? ticker.ask : ticker.bid;
+                const side = Math.random() > 0.5 ? 'buy' : 'sell';
+                const price = side === 'buy' ? ticker.ask : ticker.bid;
 
-                // --- 100% UTILIZATION CALCULATION ---
-                // We use 99.9% of the 0.4347 USDT you have.
-                const power = botStatus.availableBalance * 0.999 * LEVERAGE;
-                let maxQty = power / price;
+                const power = botStatus.availableBalance * 0.99 * LEVERAGE;
+                let maxQty = htx.amountToPrecision(SYMBOL, power / price);
 
-                // Apply exchange rounding rules
-                maxQty = htx.amountToPrecision(SYMBOL, maxQty);
-
-                if (parseFloat(maxQty) > 0 && botStatus.availableBalance > 0.001) {
-                    console.log(`SQUEEZING: Buying ${maxQty} TON...`);
-                    await htx.createMarketOrder(SYMBOL, randomSide, maxQty, undefined, {
-                        'lever_rate': LEVERAGE, 
-                        'offset': 'open'
+                if (parseFloat(maxQty) > 0 && botStatus.availableBalance > 0.01) {
+                    await htx.createMarketOrder(SYMBOL, side, maxQty, undefined, {
+                        'lever_rate': LEVERAGE, 'offset': 'open'
                     });
-                    botStatus.lastQty = maxQty;
-                    botStatus.errorMsg = null;
-                    await new Promise(r => setTimeout(r, 5000));
+                    await new Promise(r => setTimeout(r, 4000));
                 }
             }
         } catch (e) { 
             botStatus.errorMsg = e.message.substring(0, 50);
-            await new Promise(r => setTimeout(r, 4000)); 
+            await new Promise(r => setTimeout(r, 3000)); 
         }
         await new Promise(r => setTimeout(r, 1000));
     }
@@ -151,24 +160,24 @@ app.get('/api/history', async (req, res) => {
 
 app.get('/', (req, res) => {
     res.send(`
-    <!DOCTYPE html><html><head><title>TON Alpha V6</title><script src="https://cdn.tailwindcss.com"></script>
+    <!DOCTYPE html><html><head><title>TON Alpha Compounder</title><script src="https://cdn.tailwindcss.com"></script>
     <style>@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
     body{background:#020617;color:#f8fafc;font-family:'JetBrains+Mono',monospace;}.card{background:#0f172a;border:1px solid #1e293b;border-radius:12px;}</style></head>
     <body class="p-6 md:p-12"><div class="max-w-6xl mx-auto"><header class="flex justify-between items-center mb-10"><div>
-    <h1 class="text-2xl font-bold tracking-tighter text-blue-500 uppercase font-black">TON.V6.SQUEEZE</h1>
-    <p class="text-[10px] text-slate-500 font-bold uppercase tracking-widest text-emerald-500">Wallet Usage: 99.9% Full Send</p></div>
+    <h1 class="text-2xl font-bold tracking-tighter text-blue-500 uppercase font-black italic">TON.COMPOUNDER.V7</h1>
+    <p class="text-[10px] text-slate-500 font-bold uppercase tracking-widest text-emerald-500">Continuous 99% Margin Squeeze Active</p></div>
     <button onclick="resetBaseline()" class="text-[10px] bg-slate-800 hover:bg-rose-900 px-4 py-2 rounded-lg font-bold border border-slate-700 transition-colors">RESET BASELINE</button>
     </header>
-    <div id="err" class="hidden mb-6 p-3 bg-rose-500/10 border border-rose-500/40 text-rose-500 text-[10px] font-bold rounded-lg text-center uppercase"></div>
+    <div id="err" class="hidden mb-6 p-3 bg-rose-500/10 border border-rose-500/40 text-rose-500 text-[10px] font-bold rounded-lg text-center"></div>
     <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-    <div class="card p-8 border-t-2 border-emerald-500"><div class="text-slate-500 text-[10px] uppercase font-bold mb-2">Growth Percentage</div><div id="g-pct" class="text-4xl font-bold text-emerald-400">0.00%</div></div>
-    <div class="card p-8 border-t-2 border-blue-500"><div class="text-slate-500 text-[10px] uppercase font-bold mb-2">Net USDT Session</div><div id="g-pnl" class="text-4xl font-bold text-blue-400">+0.0000</div></div>
+    <div class="card p-8 border-t-2 border-emerald-500"><div class="text-slate-500 text-[10px] uppercase font-bold mb-2">Total Growth</div><div id="g-pct" class="text-4xl font-bold text-emerald-400">0.00%</div></div>
+    <div class="card p-8 border-t-2 border-blue-500"><div class="text-slate-500 text-[10px] uppercase font-bold mb-2">Net Session USDT</div><div id="g-pnl" class="text-4xl font-bold text-blue-400">+0.0000</div></div>
     <div class="card p-8 border-t-2 border-slate-600"><div class="text-slate-500 text-[10px] uppercase font-bold mb-2">Starting Equity</div><div id="s-bal" class="text-4xl font-bold text-slate-400">0.0000</div></div></div>
     <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
-    <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Live Trade ROI</div><div id="roi" class="text-xl font-bold">0%</div></div>
-    <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Buying Power (75x)</div><div id="power" class="text-xl font-bold text-white">$0.00</div></div>
-    <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Available USDT</div><div id="wallet" class="text-xl font-bold text-emerald-400">0</div></div>
-    <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Active Contracts</div><div id="qty" class="text-xl font-bold text-blue-500">0</div></div></div>
+    <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Live ROI</div><div id="roi" class="text-xl font-bold">0%</div></div>
+    <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Current TON</div><div id="qty" class="text-xl font-bold text-white">0</div></div>
+    <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Unused USDT</div><div id="wallet" class="text-xl font-bold text-emerald-400">0</div></div>
+    <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Buying Power</div><div id="power" class="text-xl font-bold text-blue-500">$0.00</div></div></div>
     <div class="card overflow-hidden"><table class="w-full text-left"><thead class="bg-slate-900/50 text-[10px] text-slate-500 font-bold uppercase tracking-widest"><tr><th class="px-6 py-4">Side</th><th class="px-6 py-4 text-right">ROI %</th><th class="px-6 py-4 text-right">PnL</th><th class="px-6 py-4 text-right">Time</th></tr></thead>
     <tbody id="history" class="text-xs"></tbody></table></div></div>
     <script>
@@ -180,10 +189,10 @@ app.get('/', (req, res) => {
     document.getElementById('roi').innerText=s.currentRoi.toFixed(2)+'%';
     document.getElementById('roi').className='text-xl font-bold '+(s.currentRoi>=0?'text-emerald-400':'text-rose-500');
     document.getElementById('wallet').innerText=s.availableBalance.toFixed(4);
-    document.getElementById('power').innerText='$'+s.buyingPower.toFixed(2);
+    document.getElementById('power').innerText='$'+(s.availableBalance * 75).toFixed(2);
     document.getElementById('qty').innerText=s.lastQty;
     const e=document.getElementById('err');if(s.errorMsg){e.innerText=s.errorMsg;e.classList.remove('hidden');}else{e.classList.add('hidden');}
-    const b=document.getElementById('badge');b.innerText=s.active?s.side+' ACTIVE':'LIQUIDITY SEARCH';
+    const b=document.getElementById('badge');b.innerText=s.active?s.side+' ACTIVE':'MARKET SEARCH';
     b.className=s.active?'px-4 py-1 rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-400 text-[10px] font-bold':'px-4 py-1 rounded-full border border-slate-700 text-slate-500 text-[10px] font-bold';
     const hRes=await fetch('/api/history');const h=await hRes.json();
     document.getElementById('history').innerHTML=h.map(t=>\`<tr class="border-b border-slate-800/50">
@@ -195,4 +204,4 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.listen(PORT, () => console.log(`🚀 Squeeze Engine V6 Active`));
+app.listen(PORT, () => console.log(`🌐 Gorilla Compounder Engine Active`));
