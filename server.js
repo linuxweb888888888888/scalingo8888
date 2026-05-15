@@ -4,8 +4,8 @@ const ccxt = require('ccxt');
 
 // ==================== CONFIGURATION ====================
 const API_KEY = 'a961bee8-b730aff5-qv2d5ctgbn-990d3';
-const API_SECRET = 'caab0880-9a1832ee-738173d7-c923b';
-const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/ton_trading_bot?retryWrites=true&w=majority&appName=Clusterweb8888";
+const API_SECRET = 'caab0880-9a1832ee-738173d7-c923_your_secret'; // Ensure secret is correct
+const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/ton_trading_bot?retryWrites=true&w=majority";
 
 const PORT = process.env.PORT || 3000;
 const SYMBOL = 'TON/USDT:USDT';
@@ -50,9 +50,9 @@ let botStatus = {
 
 async function syncAccount() {
     try {
-        const bal = await htx.fetchBalance({ type: 'swap' });
-        const totalEquity = (bal.total && bal.total.USDT) ? bal.total.USDT : 0;
-        const freeCash = (bal.free && bal.free.USDT) ? bal.free.USDT : 0;
+        const bal = await htx.fetchBalance();
+        const totalEquity = bal.total.USDT || 0;
+        const freeCash = bal.free.USDT || 0;
 
         botStatus.currentBalance = totalEquity;
         botStatus.availableBalance = freeCash;
@@ -71,7 +71,7 @@ async function syncAccount() {
 
 async function tradingLoop() {
     await htx.loadMarkets();
-    try { await htx.setLeverage(LEVERAGE, SYMBOL, { 'lever_rate': LEVERAGE }); } catch (e) {}
+    try { await htx.setLeverage(LEVERAGE, SYMBOL); } catch (e) {}
 
     while (true) {
         botStatus.lastUpdate = new Date().toLocaleTimeString();
@@ -79,7 +79,7 @@ async function tradingLoop() {
             await syncAccount();
 
             const positions = await htx.fetchPositions([SYMBOL]);
-            const pos = positions.find(p => p.symbol === SYMBOL && p.contracts > 0);
+            const pos = positions.find(p => p.symbol === SYMBOL && parseFloat(p.contracts) > 0);
 
             if (pos) {
                 botStatus.active = true;
@@ -88,9 +88,10 @@ async function tradingLoop() {
                 botStatus.currentPnl = parseFloat(pos.unrealizedPnl) || 0;
                 botStatus.lastQty = pos.contracts;
 
+                // EXIT LOGIC
                 if (botStatus.currentRoi >= TAKE_PROFIT || botStatus.currentRoi <= STOP_LOSS) {
                     await htx.createMarketOrder(SYMBOL, (pos.side === 'long' ? 'sell' : 'buy'), pos.contracts, undefined, {
-                        'lever_rate': LEVERAGE, 'offset': 'close', 'reduceOnly': true
+                        'reduceOnly': true
                     });
                     
                     await Trade.create({
@@ -100,19 +101,31 @@ async function tradingLoop() {
                     await new Promise(r => setTimeout(r, 10000));
                 }
             } else {
+                // ENTRY LOGIC
                 botStatus.active = false;
                 const ticker = await htx.fetchTicker(SYMBOL);
                 const price = ticker.last;
 
-                const buyingPower = botStatus.availableBalance * 0.995 * LEVERAGE;
-                const maxQty = Math.floor(buyingPower / price);
+                // --- YOUR SPECIFIC FORMULA ---
+                // 1. Get the USDT value for 0.1 TON
+                const unitValue = price * 0.1;
+                // 2. Take wallet balance and divide by this value
+                const baseDivision = botStatus.availableBalance / unitValue;
+                // 3. Use result with 75 leverage
+                const leveragedResult = baseDivision * 75;
+                // 4. Multiply end result units with 4
+                const finalQty = Math.floor(leveragedResult * 4);
 
-                if (maxQty >= 1 && botStatus.availableBalance > 0.01) {
+                if (finalQty >= 1 && botStatus.availableBalance > 0.01) {
                     const side = Math.random() > 0.5 ? 'buy' : 'sell';
-                    await htx.createMarketOrder(SYMBOL, side, maxQty, undefined, {
-                        'lever_rate': LEVERAGE, 'offset': 'open'
+                    
+                    console.log(`Attempting Order: ${side} ${finalQty} units`);
+
+                    await htx.createMarketOrder(SYMBOL, side, finalQty, undefined, {
+                        'lever_rate': LEVERAGE
                     });
-                    botStatus.lastQty = maxQty;
+
+                    botStatus.lastQty = finalQty;
                     botStatus.errorMsg = null;
                     await new Promise(r => setTimeout(r, 5000));
                 }
@@ -132,12 +145,10 @@ const app = express();
 
 app.get('/api/status', (req, res) => res.json(botStatus));
 
-// --- RESET BASELINE ENDPOINT ---
 app.post('/api/reset-baseline', async (req, res) => {
     try {
         await BotState.deleteOne({ key: "initial_balance" });
         await syncAccount();
-        console.log("♻️ Baseline reset by user.");
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -154,7 +165,7 @@ app.get('/', (req, res) => {
     body{background:#020617;color:#f8fafc;font-family:'JetBrains+Mono',monospace;}.card{background:#0f172a;border:1px solid #1e293b;border-radius:12px;}</style></head>
     <body class="p-6 md:p-12"><div class="max-w-6xl mx-auto"><header class="flex justify-between items-center mb-10"><div>
     <h1 class="text-2xl font-bold tracking-tighter text-blue-500 uppercase font-black italic">TON.EXTREME.V4</h1>
-    <p class="text-[10px] text-slate-500 font-bold uppercase tracking-widest">99.5% Margin Utilization | 75X</p></div>
+    <p class="text-[10px] text-slate-500 font-bold uppercase tracking-widest">75X | 300% AGGRESSION FORMULA</p></div>
     <button onclick="resetBaseline()" class="text-[10px] bg-slate-800 hover:bg-rose-900 px-4 py-2 rounded-lg font-bold border border-slate-700 transition-colors">RESET BASELINE</button>
     </header>
 
@@ -188,7 +199,7 @@ app.get('/', (req, res) => {
 
     <script>
     async function resetBaseline() {
-        if(confirm("Are you sure you want to set your current balance as the new Starting Equity?")) {
+        if(confirm("Reset baseline?")) {
             await fetch('/api/reset-baseline', { method: 'POST' });
             location.reload();
         }
@@ -214,4 +225,4 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.listen(PORT, () => console.log(`🌐 Reset-capable engine online at port ${PORT}`));
+app.listen(PORT, () => console.log(`🌐 Server active on port ${PORT}`));
