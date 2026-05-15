@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const ccxt = require('ccxt');
 
 // ==================== CONFIGURATION ====================
-const PAPER_TRADING = false; // SET TO FALSE TO USE REAL MONEY (Ensure funds are in USDT-M Futures)
+const PAPER_TRADING = false; // <--- SET TO FALSE TO USE REAL MONEY
 const API_KEY = 'a961bee8-b730aff5-qv2d5ctgbn-990d3';
 const API_SECRET = 'caab0880-9a1832ee-738173d7-c923b';
 const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/shib_trading_bot?retryWrites=true&w=majority";
@@ -81,7 +81,20 @@ async function syncAccount() {
 
 async function tradingLoop() {
     if (!PAPER_TRADING) {
-        try { await htx.loadMarkets(); await htx.setLeverage(LEVERAGE, SYMBOL); } catch (e) {}
+        console.log("🔧 Initializing Live Leverage...");
+        try {
+            await htx.loadMarkets();
+            // Critical: Set leverage before starting any logic
+            await htx.setLeverage(LEVERAGE, SYMBOL);
+            console.log(`✅ Leverage successfully synced to ${LEVERAGE}x`);
+        } catch (e) {
+            console.log(`⚠️ Leverage Error: ${e.message}`);
+            if (e.message.includes('1349') || e.message.includes('match')) {
+                botStatus.errorMsg = "LEVERAGE MISMATCH: Close all SHIB trades on HTX first!";
+                console.log("🚨 STOPPING: You must close existing SHIB positions/orders manually.");
+                return; // Stop the bot to prevent liquidations
+            }
+        }
     }
 
     while (true) {
@@ -118,6 +131,7 @@ async function tradingLoop() {
 
                 // --- EXIT LOGIC ---
                 if (botStatus.currentRoi >= TAKE_PROFIT || botStatus.currentRoi <= STOP_LOSS) {
+                    const reason = botStatus.currentRoi >= TAKE_PROFIT ? "TAKE_PROFIT" : "STOP_LOSS";
                     if (PAPER_TRADING) {
                         await BotState.updateOne({ key: "paper_balance" }, { $inc: { value: botStatus.currentPnl } });
                         await PaperPosition.deleteOne({ _id: activePos._id });
@@ -128,54 +142,55 @@ async function tradingLoop() {
                     
                     await Trade.create({
                         side: activePos.side, entryPrice: activePos.entryPrice, exitPrice: currentPrice,
-                        roi: botStatus.currentRoi, pnl: botStatus.currentPnl, reason: "AUTO_EXIT"
+                        roi: botStatus.currentRoi, pnl: botStatus.currentPnl, reason: reason
                     });
+                    console.log(`🚩 Position Closed: ${reason}`);
                     await new Promise(r => setTimeout(r, 10000));
                 }
             } else {
-                // --- ENTRY LOGIC (SHIB CONTRACT METHOD) ---
+                // --- ENTRY LOGIC (SHIB MINIMUM 1000 CONTRACTS) ---
                 botStatus.active = false;
                 botStatus.side = "IDLE";
                 botStatus.currentRoi = 0;
 
-                // Method: Calculate based on available balance and contract size
-                // 1 contract value = currentPrice * 1000
                 const contractValueUsd = currentPrice * CONTRACT_SIZE;
                 const buyingPower = botStatus.availableBalance * LEVERAGE * RISK_PERCENT;
                 let contractsToBuy = Math.floor(buyingPower / contractValueUsd);
 
-                // Force minimum 1000 contracts (API Requirement)
+                // HTX API Minimum for SHIB is 1,000 contracts
                 if (contractsToBuy < 1000) contractsToBuy = 1000;
 
-                // Final check: Do we have enough margin for the minimum 1000 contracts?
-                const requiredMargin = (contractsToBuy * contractValueUsd) / LEVERAGE;
+                // Total trade value must be at least ~$5.00 for most APIs
+                const totalTradeValue = contractsToBuy * contractValueUsd;
+                const requiredMargin = totalTradeValue / LEVERAGE;
 
-                if (botStatus.availableBalance >= requiredMargin) {
+                if (botStatus.availableBalance >= requiredMargin && totalTradeValue >= 5.0) {
                     const side = Math.random() > 0.5 ? 'buy' : 'sell';
                     
                     if (PAPER_TRADING) {
                         await PaperPosition.create({ symbol: SYMBOL, side: side, entryPrice: currentPrice, contracts: contractsToBuy });
                     } else {
+                        console.log(`🚀 Opening Live ${side.toUpperCase()} for ${contractsToBuy} contracts...`);
                         await htx.createMarketOrder(SYMBOL, side, contractsToBuy);
                     }
                     botStatus.lastQty = contractsToBuy;
                     botStatus.errorMsg = null;
                     await new Promise(r => setTimeout(r, 5000));
-                } else if (botStatus.availableBalance > 0) {
-                    botStatus.errorMsg = `Balance too low. Need ~$${requiredMargin.toFixed(4)} for min SHIB trade.`;
+                } else if (botStatus.availableBalance > 0 && !PAPER_TRADING) {
+                    botStatus.errorMsg = `Need min ~$${requiredMargin.toFixed(2)} USDT to trade SHIB.`;
                 }
             }
         } catch (e) { 
-            botStatus.errorMsg = e.message.substring(0, 100);
+            botStatus.errorMsg = e.message.substring(0, 80);
             await new Promise(r => setTimeout(r, 4000)); 
         }
-        await new Promise(r => setTimeout(r, 1000));
+        await new Promise(r => setTimeout(r, 1500));
     }
 }
 
 tradingLoop();
 
-// ==================== WEB APP ====================
+// ==================== WEB APP (UI) ====================
 const app = express();
 app.get('/api/status', (req, res) => res.json(botStatus));
 app.get('/api/history', async (req, res) => {
@@ -221,16 +236,16 @@ app.get('/', (req, res) => {
             <div id="g-pnl" class="text-4xl font-bold text-blue-400">+0.0000</div>
         </div>
         <div class="card p-8 border-t-2 border-slate-600">
-            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Balance</div>
+            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Wallet USDT</div>
             <div id="s-bal" class="text-4xl font-bold text-slate-400">0.0000</div>
         </div>
     </div>
 
     <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
-        <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Live Position ROI</div><div id="roi" class="text-xl font-bold">0%</div></div>
+        <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Live ROI</div><div id="roi" class="text-xl font-bold">0%</div></div>
         <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Contracts (1k/ea)</div><div id="qty" class="text-xl font-bold text-white">0</div></div>
-        <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Avail. Margin</div><div id="wallet" class="text-xl font-bold text-emerald-400">0</div></div>
-        <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Heartbeat</div><div id="sync" class="text-xl font-bold text-blue-500">...</div></div>
+        <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Available</div><div id="wallet" class="text-xl font-bold text-emerald-400">0</div></div>
+        <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Sync</div><div id="sync" class="text-xl font-bold text-blue-500">...</div></div>
     </div>
 
     <div class="card overflow-hidden"><table class="w-full text-left">
@@ -239,7 +254,7 @@ app.get('/', (req, res) => {
 
     <script>
     async function resetBaseline() {
-        if(confirm("Reset portfolio?")) { await fetch('/api/reset-baseline', { method: 'POST' }); location.reload(); }
+        if(confirm("Reset all portfolio stats?")) { await fetch('/api/reset-baseline', { method: 'POST' }); location.reload(); }
     }
     async function update(){try{const res=await fetch('/api/status');const s=await res.json();
     document.getElementById('total-roi').innerText=s.totalClosedRoi.toFixed(2)+'%';
