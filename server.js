@@ -10,8 +10,9 @@ const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clus
 const PORT = process.env.PORT || 3000;
 const SYMBOL = 'TON/USDT:USDT';
 const LEVERAGE = 75;
-const TAKE_PROFIT = 5.0; 
-const STOP_LOSS = -20.0; 
+const MULTIPLIER = 2; // <--- NEW SETTING FOR THE MULTIPLY WITH 4
+const TAKE_PROFIT = 10.0; 
+const STOP_LOSS = -30.0; 
 
 // ==================== DATABASE ====================
 mongoose.connect(MONGO_URI).then(() => console.log('✅ MongoDB Atlas Connected'));
@@ -43,7 +44,7 @@ let botStatus = {
     availableBalance: 0,
     growthPnl: 0,
     growthPct: 0,
-    totalClosedRoi: 0, // <--- Added for tracking
+    totalClosedRoi: 0, 
     lastQty: 0,
     errorMsg: null,
     lastUpdate: 'INIT'
@@ -58,7 +59,7 @@ async function syncAccount() {
         botStatus.currentBalance = totalEquity;
         botStatus.availableBalance = freeCash;
 
-        // --- Calculate Sum of Closed ROI ---
+        // Calculate Sum of Closed ROI
         const history = await Trade.find();
         botStatus.totalClosedRoi = history.reduce((sum, trade) => sum + (trade.roi || 0), 0);
 
@@ -109,13 +110,10 @@ async function tradingLoop() {
                 const ticker = await htx.fetchTicker(SYMBOL);
                 const price = ticker.last;
 
-                // --- NEW CALCULATION LOGIC ---
-                // 1. Get USDT value for 0.1 TON
+                // --- FORMULA: (Balance / (Price * 0.1)) * 75 * Multiplier ---
                 const unitValue = price * 0.1;
-                // 2. Wallet balance divided by unit value
                 const baseDiv = botStatus.availableBalance / unitValue;
-                // 3 & 4. Multiply by Leverage(75) then by 4
-                const maxQty = Math.floor(baseDiv * 75 * 4);
+                const maxQty = Math.floor(baseDiv * LEVERAGE * MULTIPLIER);
 
                 if (maxQty >= 1 && botStatus.availableBalance > 0.01) {
                     const side = Math.random() > 0.5 ? 'buy' : 'sell';
@@ -139,21 +137,17 @@ tradingLoop();
 
 // ==================== WEB APP ====================
 const app = express();
-
 app.get('/api/status', (req, res) => res.json(botStatus));
-
+app.get('/api/history', async (req, res) => {
+    const history = await Trade.find().sort({ timestamp: -1 }).limit(10);
+    res.json(history);
+});
 app.post('/api/reset-baseline', async (req, res) => {
     try {
         await BotState.deleteOne({ key: "initial_balance" });
         await syncAccount();
-        console.log("♻️ Baseline reset by user.");
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/api/history', async (req, res) => {
-    const history = await Trade.find().sort({ timestamp: -1 }).limit(10);
-    res.json(history);
 });
 
 app.get('/', (req, res) => {
@@ -163,11 +157,11 @@ app.get('/', (req, res) => {
     body{background:#020617;color:#f8fafc;font-family:'JetBrains+Mono',monospace;}.card{background:#0f172a;border:1px solid #1e293b;border-radius:12px;}</style></head>
     <body class="p-6 md:p-12"><div class="max-w-6xl mx-auto"><header class="flex justify-between items-center mb-10"><div>
     <h1 class="text-2xl font-bold tracking-tighter text-blue-500 uppercase font-black italic">TON.EXTREME.V4</h1>
-    <p class="text-[10px] text-slate-500 font-bold uppercase tracking-widest">Calculated Logic: (Bal / (Price*0.1)) * 75 * 4</p></div>
+    <p class="text-[10px] text-slate-500 font-bold uppercase tracking-widest">Multiplier: ${MULTIPLIER}x | Leverage: ${LEVERAGE}x</p></div>
     <button onclick="resetBaseline()" class="text-[10px] bg-slate-800 hover:bg-rose-900 px-4 py-2 rounded-lg font-bold border border-slate-700 transition-colors">RESET BASELINE</button>
     </header>
 
-    <div id="err" class="hidden mb-6 p-3 bg-rose-500/10 border border-rose-500/40 text-rose-500 text-[10px] font-bold rounded-lg text-center uppercase"></div>
+    <div id="err" class="mb-6 p-3 bg-rose-500/10 border border-rose-500/40 text-rose-500 text-[10px] font-bold rounded-lg text-center uppercase hidden"></div>
     
     <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
         <div class="card p-8 border-t-2 border-yellow-500">
@@ -201,12 +195,8 @@ app.get('/', (req, res) => {
 
     <script>
     async function resetBaseline() {
-        if(confirm("Are you sure you want to set your current balance as the new Starting Equity?")) {
-            await fetch('/api/reset-baseline', { method: 'POST' });
-            location.reload();
-        }
+        if(confirm("Are you sure?")) { await fetch('/api/reset-baseline', { method: 'POST' }); location.reload(); }
     }
-
     async function update(){try{const res=await fetch('/api/status');const s=await res.json();
     document.getElementById('total-roi').innerText=s.totalClosedRoi.toFixed(2)+'%';
     document.getElementById('g-pct').innerText=s.growthPct.toFixed(2)+'%';
@@ -228,4 +218,4 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.listen(PORT, () => console.log(`🌐 Engine online at port ${PORT}`));
+app.listen(PORT, () => console.log(`🌐 Server running on port ${PORT}`));
