@@ -10,7 +10,7 @@ const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clus
 
 const PORT = process.env.PORT || 3000;
 const SYMBOL = 'SHIB/USDT:USDT'; 
-const CONTRACT_SIZE = 1; // 1 Contract = 1000 SHIB
+const CONTRACT_SIZE = 1000; // 1 Contract = 1000 SHIB
 const LEVERAGE = 75;
 const MULTIPLIER = 1; 
 const TAKE_PROFIT = 10.0; 
