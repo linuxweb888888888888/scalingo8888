@@ -59,6 +59,7 @@ const BASE_CONFIG = {
     dcaRoiThresholdPct: 1.0, dcaMultiplier: 2.0, 
     profitRoiThresholdPct: 2.0, profitMultiplier: 2.0, 
     maxContracts: 100, 
+    maxDcaStepsBeforeReverse: 10,
     chartTicks: 800
 };
 
@@ -227,6 +228,7 @@ async function runBacktestSimulation(config, tickCount, symbol) {
     const dcaRoiThresholdPct = config.dcaRoiThresholdPct || 1.0;
     const profitRoiThresholdPct = config.profitRoiThresholdPct !== undefined ? config.profitRoiThresholdPct : 2.0;
     const maxContracts = config.maxContracts !== undefined ? Number(config.maxContracts) : 100;
+    const maxDcaStepsBeforeReverse = config.maxDcaStepsBeforeReverse !== undefined ? Number(config.maxDcaStepsBeforeReverse) : 10;
     
     let priceBuffer = [], mlRawBuffer = [];
     const totalSpanMs = ticks[ticks.length - 1].timestamp - ticks[0].timestamp;
@@ -291,35 +293,41 @@ async function runBacktestSimulation(config, tickCount, symbol) {
             } else {
                 const requiredRoiForDca = -(Math.abs(dcaRoiThresholdPct || 1.0));
                 
-                // BACKTEST: Loss DCA is UNLIMITED
+                // BACKTEST: Loss DCA
                 if (math.currentGrossRoi <= requiredRoiForDca && tickTime - (activePos.lastDcaTime || 0) >= 3000) {
-                    let bC = Number(config.baseContracts) || 1;
-                    let mult = Number(config.dcaMultiplier) || 2.0;
-                    let step = Number(activePos.dcaStep) || 0;
                     
-                    let contractsToAdd = parseInt(Math.max(1, Math.floor(bC * Math.pow(mult, step))), 10);
-                    
-                    const addedSizeUsd = contractsToAdd * Number(config.contractSize) * price;
-                    
-                    activePos.entryPrice = ((Number(activePos.entryPrice) * Number(activePos.size)) + (price * addedSizeUsd)) / (Number(activePos.size) + addedSizeUsd);
-                    activePos.size = Number(activePos.size) + addedSizeUsd; 
-                    activePos.contracts = Number(activePos.contracts) + contractsToAdd;
-                    activePos.marginUsed = Number(activePos.marginUsed) + (addedSizeUsd / FORCED_LEVERAGE);
-                    activePos.lastDcaTime = tickTime; activePos.dcaStep = step + 1;
+                    // REVERSE DIRECTION IF MAX STEPS REACHED
+                    if (maxDcaStepsBeforeReverse > 0 && activePos.dcaStep >= maxDcaStepsBeforeReverse) {
+                        netPnl += math.netPnlUsd; losses++;
+                        totalTradeDurationMs += (tickTime - activePos.entryTime);
+                        closedTrades.push({ side: activePos.side, entryPrice: activePos.entryPrice, exitPrice: price, contracts: activePos.contracts, grossPnl: math.grossPnlUsd, grossRoiPct: math.grossRoiPct, netPnl: math.netPnlUsd, roiPct: math.netRoiPct, exitReason: "MAX_DCA_REVERSE", time: tick.timestamp });
+                        
+                        const reverseSignal = activePos.side === 'long' ? 'short' : 'long';
+                        let bC = parseInt(config.baseContracts) || 1;
+                        const sizeUsd = bC * config.contractSize * price; 
+                        activePos = { side: reverseSignal, entryPrice: price, contracts: bC, size: sizeUsd, marginUsed: sizeUsd / FORCED_LEVERAGE, entryTime: tickTime, lastDcaTime: 0, dcaStep: 0 };
+                    } else {
+                        let bC = Number(config.baseContracts) || 1;
+                        let mult = Number(config.dcaMultiplier) || 2.0;
+                        let step = Number(activePos.dcaStep) || 0;
+                        let contractsToAdd = parseInt(Math.max(1, Math.floor(bC * Math.pow(mult, step))), 10);
+                        const addedSizeUsd = contractsToAdd * Number(config.contractSize) * price;
+                        activePos.entryPrice = ((Number(activePos.entryPrice) * Number(activePos.size)) + (price * addedSizeUsd)) / (Number(activePos.size) + addedSizeUsd);
+                        activePos.size = Number(activePos.size) + addedSizeUsd; 
+                        activePos.contracts = Number(activePos.contracts) + contractsToAdd;
+                        activePos.marginUsed = Number(activePos.marginUsed) + (addedSizeUsd / FORCED_LEVERAGE);
+                        activePos.lastDcaTime = tickTime; activePos.dcaStep = step + 1;
+                    }
                     if (activePos.marginUsed > maxMarginUsed) maxMarginUsed = activePos.marginUsed;
                     
-                } // BACKTEST: Profit Scaling evaluates exact contracts to add
+                } // BACKTEST: Profit Scaling
                 else if (math.currentGrossRoi >= profitRoiThresholdPct && tickTime - (activePos.lastDcaTime || 0) >= 3000) {
                     let bC = Number(config.baseContracts) || 1;
                     let mult = Number(config.profitMultiplier) || 2.0;
                     let step = Number(activePos.dcaStep) || 0;
-                    
                     let contractsToAdd = parseInt(Math.max(1, Math.floor(bC * Math.pow(mult, step))), 10);
-                    
-                    // Proceed ONLY if adding the required amount doesn't breach Max Contracts
                     if (Number(activePos.contracts) + contractsToAdd <= maxContracts) {
                         const addedSizeUsd = contractsToAdd * Number(config.contractSize) * price;
-                        
                         activePos.entryPrice = ((Number(activePos.entryPrice) * Number(activePos.size)) + (price * addedSizeUsd)) / (Number(activePos.size) + addedSizeUsd);
                         activePos.size = Number(activePos.size) + addedSizeUsd; 
                         activePos.contracts = Number(activePos.contracts) + contractsToAdd;
@@ -374,10 +382,7 @@ class UserTradeInstance {
         this.activePositions = user.activePosition ? [user.activePosition] : []; 
         this.lastCloseTime = user.lastCloseTime || 0;
         
-        // Removed `this.isEvaluating` to prevent ML execution deadlock
         this.isTrading = false; 
-        
-        // This decouples the UI gauge state from the execution logic so it never freezes
         this.currentMl = { confidence: 0, type: 'flat', rawValue: 0.5 };
         this.mlRawBuffer = [];
         this.lastEvalPrice = 0;
@@ -438,7 +443,6 @@ class UserTradeInstance {
                     this.activePositions = [{ id: Date.now(), side: openPos.side, entryPrice: entryP, contracts: openPos.contracts, size: sizeUsd, marginUsed: sizeUsd / FORCED_LEVERAGE, exchangeROI: openPos.percentage || 0, exchangePnl: openPos.unrealizedPnl || 0, entryTime: Date.now(), isPaper: false, lastDcaTime: 0, dcaStep: 0, stepHistory: [] }];
                     this.metrics.updateMaxMargin(this.activePositions[0].marginUsed); await this.saveState();
                 } else {
-                    // FIX: If exchange is empty but we have ghost state, clear it
                     this.activePositions = []; await this.saveState();
                 }
             }
@@ -450,14 +454,12 @@ class UserTradeInstance {
     }
 
     async evaluateAIEntry() {
-        // ALWAYS update ML state asynchronously so UI never gets stuck
         let mlSig = mlSignalCache.get(this.config.mlLookback);
         if (!mlSig) {
             mlSig = calculateMLSignal(globalMarketData.tickBuffer, this.config.mlLookback || 50);
             mlSignalCache.set(this.config.mlLookback, mlSig);
         }
         
-        // Push only when the global tick actually moves
         if (this.lastEvalPrice !== globalMarketData.binance.mid) {
             this.mlRawBuffer.push(mlSig.rawValue);
             if (this.mlRawBuffer.length > (this.config.mlAverageTicks || 5)) this.mlRawBuffer.shift();
@@ -472,7 +474,6 @@ class UserTradeInstance {
             avgRaw: avgRaw, avgConfidence: avgConf, avgType: avgRaw >= 0.5 ? 'bull' : 'bear' 
         };
 
-        // Execution Check (Only locked if an actual trade is actively executing to HTX)
         if (this.isTrading || (Date.now() - this.lastCloseTime < 3000)) return;
 
         try {
@@ -484,8 +485,6 @@ class UserTradeInstance {
             
             if (this.activePositions.length > 0) {
                 const pos = this.activePositions[0];
-                
-                // INSTANT FLIP LOGIC
                 if (signal && pos.side !== signal) {
                     let currentPrice = pos.side === 'long' ? globalMarketData.binance.bid : globalMarketData.binance.ask;
                     if (!currentPrice) currentPrice = globalMarketData.binance.mid;
@@ -514,8 +513,6 @@ class UserTradeInstance {
         
         try {
             const pos = this.activePositions[0];
-            
-            // PRIORITY: Use Exchange ROI for Live triggers to avoid calculation errors
             let effectiveRoi = 0;
             if (this.liveTradingEnabled && !pos.isPaper) {
                 effectiveRoi = pos.exchangeROI || 0;
@@ -534,9 +531,15 @@ class UserTradeInstance {
                 const requiredRoiForDca = -(Math.abs(this.config.dcaRoiThresholdPct || 1.0));
                 const profitScaleThreshold = this.config.profitRoiThresholdPct !== undefined ? this.config.profitRoiThresholdPct : 2.0;
                 
-                // LIVE/PAPER: Evaluate against exchange ROI
                 if (effectiveRoi <= requiredRoiForDca && Date.now() - (pos.lastDcaTime || 0) > 10000) {
-                    await this.addDcaPosition(false);
+                    const maxSteps = parseInt(this.config.maxDcaStepsBeforeReverse) || 0;
+                    if (maxSteps > 0 && pos.dcaStep >= maxSteps) {
+                        const reverseSide = pos.side === 'long' ? 'short' : 'long';
+                        await this.forceClosePosition("MAX_DCA_REVERSE");
+                        setTimeout(() => this.syncState(reverseSide), 200);
+                    } else {
+                        await this.addDcaPosition(false);
+                    }
                 } 
                 else if (effectiveRoi >= profitScaleThreshold && Date.now() - (pos.lastDcaTime || 0) > 10000) {
                     await this.addDcaPosition(true);
@@ -566,11 +569,9 @@ class UserTradeInstance {
 
             let contractsToAdd = parseInt(Math.max(1, Math.floor(baseC * Math.pow(multiplier, step))), 10);
             
-            // EXACT PROFIT SCALING LIMIT: Evaluates required addition BEFORE executing
             if (isProfitScale) {
                 const maxC = (Number(this.walletBalance) * 2);
                 if (Number(pos.contracts) + contractsToAdd > maxC) {
-                    // Update Lockout timer to completely prevent infinite CPU evaluation loop
                     pos.lastDcaTime = Date.now();
                     await this.saveState();
                     this.isTrading = false;
@@ -578,7 +579,6 @@ class UserTradeInstance {
                 }
             }
 
-            // Lockout timer to prevent loop spamming if api fails
             pos.lastDcaTime = Date.now();
             await this.saveState();
             
@@ -600,7 +600,6 @@ class UserTradeInstance {
                 }
             }
 
-            // INJECTED: RECORD THE STEP WITH OFFICIAL EXCHANGE ROI
             if(!pos.stepHistory) pos.stepHistory = [];
             pos.stepHistory.push({
                 step: step + 1,
@@ -654,7 +653,6 @@ class UserTradeInstance {
             const sizeUsd = contracts * (Number(this.config.contractSize) || 1000) * executionPrice;
             const marginUsed = sizeUsd / FORCED_LEVERAGE;
             
-            // INITIALIZE HISTORY WITH STEP 0
             this.activePositions = [{ id: Date.now(), side: targetSide, entryPrice: Number(executionPrice), contracts: Number(contracts), size: Number(sizeUsd), marginUsed: Number(marginUsed), entryTime: Date.now(), exchangeROI: 0, exchangePnl: 0, isPaper, lastDcaTime: 0, dcaStep: 0, stepHistory: [{ step: 0, type: 'OPEN', price: executionPrice, roi: 0, time: Date.now() }] }];
             
             this.metrics.updateMaxMargin(marginUsed); 
@@ -712,8 +710,6 @@ class UserTradeInstance {
                 return;
             }
             const pos = this.activePositions[0];
-            
-            // PRIORITY: If LIVE, fetch ROI and PNL directly from HTX
             if (this.liveTradingEnabled && !pos.isPaper) {
                 try {
                     const bal = await this.htx.fetchBalance({ type: 'swap' });
@@ -725,13 +721,10 @@ class UserTradeInstance {
                         let entryP = openPos.entryPrice;
                         if (this.config.htxSymbol.includes('SHIB') && !this.config.htxSymbol.includes('1000')) entryP = entryP * 1000;
                         pos.entryPrice = entryP;
-                        
-                        // SET DATA DIRECTLY FROM EXCHANGE
                         pos.exchangeROI = openPos.percentage || 0; 
                         pos.exchangePnl = openPos.unrealizedPnl || 0;
-                        return; // Exit here to avoid local math overwriting
+                        return;
                     } else {
-                        // FIX: If exchange has 0 contracts, wipe our local ghost state immediately
                         this.activePositions = [];
                         await this.saveState();
                         return;
@@ -739,14 +732,12 @@ class UserTradeInstance {
                 } catch(e) {}
             }
             
-            // FALLBACK: Local Math for Paper Trading or if API fails
             let currentPrice = pos.side === 'long' ? globalMarketData.binance.bid : globalMarketData.binance.ask;
             if (!currentPrice) currentPrice = globalMarketData.binance.mid;
             
             if (currentPrice && pos.entryPrice > 0) { 
                 const sideMult = pos.side === 'long' ? 1 : -1;
                 const pnlPercent = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100 * sideMult;
-                
                 pos.exchangeROI = pnlPercent * FORCED_LEVERAGE;
                 pos.exchangePnl = (pos.exchangeROI / 100) * pos.marginUsed; 
             }
@@ -862,7 +853,6 @@ async function loadAllUsers() {
     } catch(e) {}
 }
 
-// ==================== ANALYTICS ENGINE ====================
 const activeSessions = new Map();
 setInterval(() => {
     const now = Date.now();
@@ -871,7 +861,6 @@ setInterval(() => {
     }
 }, 5000);
 
-// ==================== EXPRESS SERVER & API ====================
 const app = express(); app.use(express.json());
 
 app.post('/api/analytics/track', async (req, res) => {
@@ -911,7 +900,8 @@ app.post('/api/backtest', async (req, res) => {
         dcaMultiplier: parseFloat(req.body.dcaMultiplier) || 2.0,
         profitRoiThresholdPct: parseFloat(req.body.profitRoiThresholdPct) || 2.0,
         profitMultiplier: parseFloat(req.body.profitMultiplier) || 2.0,
-        maxContracts: parseInt(req.body.maxContracts) || 100
+        maxContracts: parseInt(req.body.maxContracts) || 100,
+        maxDcaStepsBeforeReverse: parseInt(req.body.maxDcaStepsBeforeReverse) || 10
     };
     try {
         const results = await runBacktestSimulation(bConfig, parseInt(req.body.ticks) || 5000, BASE_CONFIG.binanceSymbol);
@@ -955,7 +945,6 @@ app.get('/api/user/me', authMiddleware, (req, res) => {
 app.post('/api/user/keys', authMiddleware, async (req, res) => {
     try {
         const { apiKey, apiSecret, liveTradingEnabled } = req.body;
-        
         let worker = activeWorkers.get(req.user._id.toString());
         if(worker) {
             if (Boolean(liveTradingEnabled) && worker.activePositions.length > 0 && worker.activePositions[0].isPaper) {
@@ -964,10 +953,8 @@ app.post('/api/user/keys', authMiddleware, async (req, res) => {
             if (!Boolean(liveTradingEnabled) && worker.activePositions.length > 0 && !worker.activePositions[0].isPaper) {
                 worker.activePositions = [];
             }
-            
             worker.applyUserKeys({ apiKey, apiSecret, liveTradingEnabled });
             const connectionResult = await worker.connectExchange();
-            
             if (liveTradingEnabled && !connectionResult.success) {
                 worker.liveTradingEnabled = false; 
                 return res.json({ error: 'Exchange Error: ' + connectionResult.message });
@@ -976,7 +963,6 @@ app.post('/api/user/keys', authMiddleware, async (req, res) => {
         } else {
             req.user.liveTradingEnabled = Boolean(liveTradingEnabled);
         }
-
         req.user.apiKey = apiKey; req.user.apiSecret = apiSecret; 
         await req.user.save();
         res.json({ status: 'ok' });
@@ -987,7 +973,7 @@ app.post('/api/user/config', authMiddleware, async (req, res) => {
     const worker = activeWorkers.get(req.user._id.toString());
     if(!worker) return res.status(400).json({ error: 'Worker not active' });
     
-    const { tpPct, slPct, baseContracts, contractSize, mlLookbackSens, mlThresholdSens, mlAverageTicksSens, mlUseAverageSens, flipOnlyInProfitSens, flipThresholdSens, dcaRoiThresholdSens, dcaMultiplierSens, profitRoiThresholdSens, profitMultiplierSens, maxContractsSens } = req.body;
+    const { tpPct, slPct, baseContracts, contractSize, mlLookbackSens, mlThresholdSens, mlAverageTicksSens, mlUseAverageSens, flipOnlyInProfitSens, flipThresholdSens, dcaRoiThresholdSens, dcaMultiplierSens, profitRoiThresholdSens, profitMultiplierSens, maxContractsSens, maxDcaStepsBeforeReverseSens } = req.body;
     const pSet = (v, f, k) => { if (v !== undefined && v !== "") { const p = f(v); if (!isNaN(p)) worker.config[k] = p; } };
 
     pSet(tpPct, parseFloat, 'takeProfitPct'); pSet(slPct, parseFloat, 'stopLossPct');
@@ -1000,6 +986,7 @@ app.post('/api/user/config', authMiddleware, async (req, res) => {
     pSet(profitMultiplierSens, parseFloat, 'profitMultiplier');
     pSet(flipThresholdSens, parseFloat, 'flipThresholdPct');
     pSet(maxContractsSens, parseInt, 'maxContracts'); 
+    pSet(maxDcaStepsBeforeReverseSens, parseInt, 'maxDcaStepsBeforeReverse'); 
     
     if (mlUseAverageSens !== undefined) worker.config.mlUseAverage = (mlUseAverageSens === 'true');
     if (flipOnlyInProfitSens !== undefined) worker.config.flipOnlyInProfit = (flipOnlyInProfitSens === 'true');
@@ -1070,20 +1057,14 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
     <header class="bg-white/80 backdrop-blur-md shadow-[0_2px_10px_-4px_rgba(0,0,0,0.05)] sticky top-0 z-50">
         <div class="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
             <div class="flex items-center gap-2 cursor-pointer" onclick="nav('home')">
-                <!-- Dark Grey Circle -->
                 <div class="w-9 h-9 rounded-full bg-gray-700 flex items-center justify-center shrink-0 shadow-md border border-gray-600 relative overflow-hidden">
-                    
-                    <!-- 4-Color Corners Grid -->
                     <div class="absolute inset-0 m-[5px] grid grid-cols-2 grid-rows-2 gap-[2px]">
-                        <div class="bg-white rounded-tl-[3px]"></div> <!-- Top Left: White -->
-                        <div class="bg-white rounded-tr-[3px]"></div> <!-- Top Right: White -->
-                        <div class="bg-black rounded-bl-[3px]"></div> <!-- Bottom Left: Black -->
-                        <div class="bg-[#E1AD01] rounded-br-[3px]"></div> <!-- Bottom Right: Mustard -->
+                        <div class="bg-white rounded-tl-[3px]"></div> 
+                        <div class="bg-white rounded-tr-[3px]"></div> 
+                        <div class="bg-black rounded-bl-[3px]"></div> 
+                        <div class="bg-[#E1AD01] rounded-br-[3px]"></div> 
                     </div>
-
-                    <!-- Current API Logo (Layered on top) -->
                     <span class="material-symbols-outlined text-[20px] font-bold text-white z-10 relative drop-shadow-[0_1px_2px_rgba(0,0,0,0.8)]">api</span>
-                    
                 </div>
                 <span class="font-bold tracking-tight text-lg ml-1">TradeBotPille</span><div>taking it to the next level</div>
             </div>
@@ -1101,7 +1082,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 <button onclick="nav('backtest')" class="text-gray-500 hover:text-black transition flex items-center gap-1"><span class="material-symbols-outlined text-[18px]">science</span></button>
                 <button onclick="nav('analytics')" class="text-gray-500 hover:text-black transition flex items-center gap-1"><span class="material-symbols-outlined text-[18px]">monitoring</span></button>
                 <button onclick="nav('dashboard')" class="hover:text-black transition">Dashboard</button>
-                <!-- NEW STEP HISTORY TAB -->
                 <button onclick="nav('step-history')" class="hover:text-black transition">Step History</button>
                 <button onclick="logout()" class="text-red-500 hover:text-red-700 transition">Logout</button>
             </nav>
@@ -1117,42 +1097,10 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                     <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span> SHIB ML Probability Strategy
                 </div>
                 <h1 class="text-5xl sm:text-6xl md:text-7xl font-extrabold tracking-tight mb-6 leading-tight">Algorithmic Math.<br><span class="text-gray-400">Zero Emotion.</span></h1>
-                <p class="text-lg md:text-xl text-gray-500 mb-10 max-w-2xl mx-auto leading-relaxed">TradeBot utilizes a dynamically trained logistic regression model, analyzing the rolling tick buffer to predict directional probabilities and executing automatically via HTX 24/7.</p>
+                <p class="text-lg md:text-xl text-gray-500 mb-10 max-w-2xl mx-auto leading-relaxed">TradeBot utilizes a dynamically trained logistic regression model, predicting probabilities and executing automatically via HTX 24/7.</p>
                 <button onclick="nav('register')" class="btn-primary text-base px-10 py-4 shadow-lg shadow-black/20 flex items-center gap-2 mx-auto">
                     Launch Web Terminal <span class="material-symbols-outlined text-[20px]">arrow_forward</span>
                 </button>
-            </div>
-
-            <div class="bg-white border-y border-gray-100 py-20">
-                <div class="max-w-6xl mx-auto px-4">
-                    <div class="text-center mb-16">
-                        <h2 class="text-3xl font-bold mb-3">Engineered for Precision</h2>
-                        <p class="text-gray-500">Stop relying on subjective chart patterns. Trade with algorithmic certainty.</p>
-                    </div>
-                    <div class="grid md:grid-cols-3 gap-8 text-left">
-                        <div class="ui-card p-8 ui-card-hover border border-gray-50">
-                            <div class="w-12 h-12 bg-gray-100 rounded-lg flex items-center justify-center mb-6">
-                                <span class="material-symbols-outlined text-2xl text-black">memory</span>
-                            </div>
-                            <h3 class="font-bold text-xl mb-3">Machine Learning</h3>
-                            <p class="text-sm text-gray-500 leading-relaxed">The engine recalculates weights for a logistic regression perceptron on the fly using a rapid gradient descent algorithm against recent tick price deltas.</p>
-                        </div>
-                        <div class="ui-card p-8 ui-card-hover border border-gray-50">
-                            <div class="w-12 h-12 bg-gray-100 rounded-lg flex items-center justify-center mb-6">
-                                <span class="material-symbols-outlined text-2xl text-black">key</span>
-                            </div>
-                            <h3 class="font-bold text-xl mb-3">Non-Custodial execution</h3>
-                            <p class="text-sm text-gray-500 leading-relaxed">We never hold your funds. You connect your HTX API keys strictly for trading permissions. Withdrawals are physically impossible for our engine to execute.</p>
-                        </div>
-                        <div class="ui-card p-8 ui-card-hover border border-gray-50">
-                            <div class="w-12 h-12 bg-gray-100 rounded-lg flex items-center justify-center mb-6">
-                                <span class="material-symbols-outlined text-2xl text-black">bolt</span>
-                            </div>
-                            <h3 class="font-bold text-xl mb-3">High-Frequency Node</h3>
-                            <p class="text-sm text-gray-500 leading-relaxed">Hosted on dedicated infrastructure, the bot evaluates Binance websocket ticks multiple times a second to ensure entries are executed with absolute minimum latency on HTX.</p>
-                        </div>
-                    </div>
-                </div>
             </div>
         </section>
 
@@ -1161,28 +1109,19 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             <div class="text-center mb-10">
                 <span class="material-symbols-outlined text-4xl text-black">monitoring</span>
                 <h2 class="text-3xl font-bold mt-2">Platform Analytics</h2>
-                <p class="text-gray-500 mt-2">Real-time statistics of user activity across the TradeBot Engine ecosystem.</p>
             </div>
-
             <div class="grid sm:grid-cols-3 gap-6 mb-8">
-                <div class="ui-card p-6 border border-gray-100 text-center">
-                    <p class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-2 flex items-center justify-center gap-1"><span class="material-symbols-outlined text-[16px] text-green-500">wifi</span> Users Online Now</p>
+                <div class="ui-card p-6 text-center border border-gray-100">
+                    <p class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-2 flex items-center justify-center gap-1">Users Online Now</p>
                     <p id="stat-online" class="text-4xl font-mono font-bold text-black">0</p>
                 </div>
-                <div class="ui-card p-6 border border-gray-100 text-center">
-                    <p class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-2 flex items-center justify-center gap-1"><span class="material-symbols-outlined text-[16px]">visibility</span> Total Page Views</p>
+                <div class="ui-card p-6 text-center border border-gray-100">
+                    <p class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-2 flex items-center justify-center gap-1">Total Page Views</p>
                     <p id="stat-views" class="text-4xl font-mono font-bold text-black">0</p>
                 </div>
-                <div class="ui-card p-6 border border-gray-100 text-center">
-                    <p class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-2 flex items-center justify-center gap-1"><span class="material-symbols-outlined text-[16px]">group</span> Unique Visitors</p>
+                <div class="ui-card p-6 text-center border border-gray-100">
+                    <p class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-2 flex items-center justify-center gap-1">Unique Visitors</p>
                     <p id="stat-uniques" class="text-4xl font-mono font-bold text-black">0</p>
-                </div>
-            </div>
-
-            <div class="ui-card p-6 border border-gray-100">
-                <h3 class="text-lg font-bold mb-4 flex items-center gap-2"><span class="material-symbols-outlined text-[20px] text-gray-500">find_in_page</span> Live Page Distribution</h3>
-                <div id="stat-pages" class="space-y-2 text-sm text-gray-700 font-mono">
-                    <div class="p-4 text-center text-gray-400 font-sans">Loading active pages...</div>
                 </div>
             </div>
         </section>
@@ -1192,125 +1131,30 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             <div class="text-center mb-10">
                 <span class="material-symbols-outlined text-4xl text-black">science</span>
                 <h2 class="text-3xl font-bold mt-2">Strategy Backtesting</h2>
-                <p class="text-gray-500 mt-2">Test your geometric configuration against historical 1000SHIB tick data stored in the engine database.</p>
             </div>
-
             <div class="grid lg:grid-cols-4 gap-8">
                 <div class="lg:col-span-1 space-y-4 ui-card p-6 border border-gray-100 h-fit">
-                    <h3 class="font-bold mb-4 border-b border-gray-50 pb-2 flex items-center gap-2"><span class="material-symbols-outlined text-[20px]">tune</span> Parameters</h3>
-                    
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Asset Market</label>
-                    <select id="btSymbol" class="input-minimal w-full font-mono font-bold text-gray-700 bg-gray-50 pointer-events-none" disabled>
-                        <option value="1000SHIB/USDT:USDT" selected>1000SHIB/USDT</option>
-                    </select></div>
-
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Test Span (Minutes)</label>
-                    <input type="number" id="btTicks" class="input-minimal w-full font-mono font-bold text-gray-700" value="5000" step="1000"></div>
-
-                    <hr class="border-gray-100 my-2">
-
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Training Lookback (Ticks)</label>
-                    <input type="number" id="btMlLookback" class="input-minimal w-full font-mono text-gray-700" value="50" step="1"></div>
-
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Confidence Threshold (%)</label>
-                    <input type="number" id="btMlThreshold" class="input-minimal w-full font-mono text-blue-600" value="60" step="1"></div>
-
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Signal Smoothing (Ticks)</label>
-                    <input type="number" id="btMlAvgTicks" class="input-minimal w-full font-mono text-gray-700" value="5" step="1"></div>
-
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Signal Trigger</label>
-                    <select id="btMlUseAvg" class="input-minimal w-full font-mono font-bold text-gray-700">
-                        <option value="false" selected>Raw Signal</option>
-                        <option value="true">Averaged Signal</option>
-                    </select></div>
-                    
-                    <hr class="border-gray-100 my-2">
-
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Loss Behavior</label>
-                    <select id="btFlipOnlyInProfit" class="input-minimal w-full font-mono font-bold text-gray-700">
-                        <option value="true" selected>DCA in Loss</option>
-                        <option value="false">Force Flip</option>
-                    </select></div>
-
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block" title="Minimum ROI % to allow ML flip execution">Flip Profit Threshold (%)</label>
-                    <input type="number" id="btFlipThreshold" class="input-minimal w-full font-mono text-gray-700 text-xs" value="0.5" step="0.1"></div>
-
-                    <div class="flex gap-2">
-                        <div class="flex-1"><label class="text-[10px] font-semibold text-gray-500 mb-1 block">Loss ROI Drop</label>
-                        <input type="number" id="btDcaRoiThreshold" class="input-minimal w-full font-mono text-gray-700 text-xs" value="1.0" step="0.1"></div>
-                        <div class="flex-1"><label class="text-[10px] font-semibold text-gray-500 mb-1 block">Loss Mult</label>
-                        <input type="number" id="btDcaMultiplier" class="input-minimal w-full font-mono text-gray-700 text-xs" value="2.0" step="0.1"></div>
-                    </div>
-                    
-                    <div class="flex gap-2 mt-2">
-                        <div class="flex-1"><label class="text-[10px] font-semibold text-gray-500 mb-1 block">Profit Scale ROI</label>
-                        <input type="number" id="btProfitRoiThreshold" class="input-minimal w-full font-mono text-gray-700 text-xs" value="2.0" step="0.1"></div>
-                        <div class="flex-1"><label class="text-[10px] font-semibold text-gray-500 mb-1 block">Profit Mult</label>
-                        <input type="number" id="btProfitMultiplier" class="input-minimal w-full font-mono text-gray-700 text-xs" value="2.0" step="0.1"></div>
-                    </div>
-
-                    <hr class="border-gray-100 my-2">
-
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Take Profit (%)</label>
-                    <input type="number" id="btTp" class="input-minimal w-full font-mono text-green-600" value="10.0" step="0.1"></div>
-                    
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Stop Loss (%)</label>
-                    <input type="number" id="btSl" class="input-minimal w-full font-mono text-red-600" value="-50.0" step="1"></div>
-                    
-                    <div class="flex gap-2">
-                        <div class="flex-1"><label class="text-[10px] font-semibold text-gray-500 mb-1 block">Base Contracts</label>
-                        <input type="number" id="btBase" class="input-minimal w-full font-mono text-xs" value="1"></div>
-                        <div class="flex-1"><label class="text-[10px] font-semibold text-gray-500 mb-1 block" title="Maximum contracts allowed for profit scaling. Loss DCA is unlimited.">Max Profit Contracts</label>
-                        <input type="number" id="btMaxContracts" class="input-minimal w-full font-mono text-gray-700 text-xs" value="100" step="1"></div>
-                    </div>
-                    
-                    <button onclick="runBacktest()" class="btn-primary w-full py-3 mt-4 flex justify-center items-center gap-2 shadow-sm"><span class="material-symbols-outlined text-[18px]">play_arrow</span> Run Simulation</button>
+                    <h3 class="font-bold mb-4 border-b border-gray-50 pb-2">Parameters</h3>
+                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Test Span (Minutes)</label><input type="number" id="btTicks" class="input-minimal w-full font-mono font-bold text-gray-700" value="5000" step="1000"></div>
+                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Training Lookback</label><input type="number" id="btMlLookback" class="input-minimal w-full font-mono text-gray-700" value="50" step="1"></div>
+                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Confidence Threshold (%)</label><input type="number" id="btMlThreshold" class="input-minimal w-full font-mono text-blue-600" value="60" step="1"></div>
+                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Max DCA Steps (Reverse)</label><input type="number" id="btMaxDcaStepsBeforeReverse" class="input-minimal w-full font-mono text-gray-700" value="10" step="1"></div>
+                    <button onclick="runBacktest()" class="btn-primary w-full py-3 mt-4">Run Simulation</button>
                 </div>
-
                 <div class="lg:col-span-3 space-y-6">
                     <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-4">
-                        <div class="ui-card p-4 text-center border border-gray-100">
-                            <p class="text-[10px] text-gray-400 font-bold uppercase tracking-wider mb-1">Win Rate</p>
-                            <p id="btResWinrate" class="text-lg font-mono font-bold text-blue-600">-</p>
-                        </div>
-                        <div class="ui-card p-4 text-center border border-gray-100">
-                            <p class="text-[10px] text-gray-400 font-bold uppercase tracking-wider mb-1">Net PnL</p>
-                            <p id="btResPnl" class="text-lg font-mono font-bold text-gray-800">-</p>
-                        </div>
-                        <div class="ui-card p-4 text-center border border-gray-100">
-                            <p class="text-[10px] text-gray-400 font-bold uppercase tracking-wider mb-1">Total Trades</p>
-                            <p id="btResTrades" class="text-lg font-mono font-bold text-gray-800">-</p>
-                        </div>
-                        <div class="ui-card p-4 text-center border border-gray-100">
-                            <p class="text-[10px] text-gray-400 font-bold uppercase tracking-wider mb-1" title="Maximum margin utilized during test">Max Deposit</p>
-                            <p id="btResDeposit" class="text-lg font-mono font-bold text-gray-800">-</p>
-                        </div>
-                        <div class="ui-card p-4 text-center border border-gray-100">
-                            <p class="text-[10px] text-gray-400 font-bold uppercase tracking-wider mb-1">Avg Time</p>
-                            <p id="btResDuration" class="text-lg font-mono font-bold text-gray-800">-</p>
-                        </div>
-                        <div class="ui-card p-4 text-center border border-gray-100">
-                            <p class="text-[10px] text-gray-400 font-bold uppercase tracking-wider mb-1" title="Total time span to achieve this net PnL">Total Span</p>
-                            <p id="btResSpan" class="text-lg font-mono font-bold text-gray-800">-</p>
-                        </div>
+                        <div class="ui-card p-4 text-center border border-gray-100"><p class="text-[10px] text-gray-400 font-bold">Win Rate</p><p id="btResWinrate" class="text-lg font-mono font-bold text-blue-600">-</p></div>
+                        <div class="ui-card p-4 text-center border border-gray-100"><p class="text-[10px] text-gray-400 font-bold">Net PnL</p><p id="btResPnl" class="text-lg font-mono font-bold">-</p></div>
+                        <div class="ui-card p-4 text-center border border-gray-100"><p class="text-[10px] text-gray-400 font-bold">Total Trades</p><p id="btResTrades" class="text-lg font-mono font-bold">-</p></div>
                     </div>
-
                     <div class="ui-card p-6 border border-gray-100">
-                        <h3 class="font-bold mb-4 text-sm text-gray-500 uppercase tracking-widest flex items-center gap-2"><span class="material-symbols-outlined text-[20px]">receipt_long</span> Simulated Executions</h3>
+                        <h3 class="font-bold mb-4 text-sm text-gray-500 uppercase tracking-widest">Executions</h3>
                         <div class="overflow-x-auto max-h-[400px] overflow-y-auto">
                             <table class="w-full text-left text-sm whitespace-nowrap">
-                                <thead class="text-gray-400 uppercase text-[10px] tracking-wider sticky top-0 bg-white shadow-sm">
-                                    <tr>
-                                        <th class="pb-2 px-2">Side</th>
-                                        <th class="pb-2 px-2">Size (Qty)</th>
-                                        <th class="pb-2 px-2">Reason</th>
-                                        <th class="pb-2 px-2 text-right">Gross PnL</th>
-                                        <th class="pb-2 px-2 text-right">Net PnL</th>
-                                    </tr>
+                                <thead class="text-gray-400 uppercase text-[10px] tracking-wider sticky top-0 bg-white">
+                                    <tr><th class="pb-2 px-2">Side</th><th class="pb-2 px-2">Qty</th><th class="pb-2 px-2">Reason</th><th class="pb-2 px-2 text-right">Net PnL</th></tr>
                                 </thead>
-                                <tbody id="btTableBody" class="font-mono text-xs">
-                                    <tr><td colspan="5" class="py-6 text-center text-gray-400 font-sans">No executions triggered.</td></tr>
-                                </tbody>
+                                <tbody id="btTableBody" class="font-mono text-xs"></tbody>
                             </table>
                         </div>
                     </div>
@@ -1322,14 +1166,13 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         <section id="view-login" class="view-section max-w-md w-full mx-auto px-4 py-20">
             <div class="ui-card p-8 border border-gray-100">
                 <div class="text-center mb-6">
-                    <span class="material-symbols-outlined text-4xl text-black">login</span>
                     <h2 class="text-2xl font-bold mt-2">Welcome Back</h2>
                 </div>
                 <div class="space-y-5">
-                    <div><label class="block text-xs font-semibold text-gray-400 mb-1 uppercase">Email</label><input type="email" id="login-email" class="input-minimal"></div>
-                    <div><label class="block text-xs font-semibold text-gray-400 mb-1 uppercase">Password</label><input type="password" id="login-pass" class="input-minimal"></div>
+                    <div><label class="block text-xs font-semibold text-gray-400 mb-1">Email</label><input type="email" id="login-email" class="input-minimal"></div>
+                    <div><label class="block text-xs font-semibold text-gray-400 mb-1">Password</label><input type="password" id="login-pass" class="input-minimal"></div>
                     <button onclick="doLogin()" class="btn-primary w-full mt-2 py-3">Secure Log In</button>
-                    <div id="login-err" class="text-red-500 text-xs text-center font-medium mt-2"></div>
+                    <div id="login-err" class="text-red-500 text-xs text-center mt-2"></div>
                 </div>
             </div>
         </section>
@@ -1338,15 +1181,14 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         <section id="view-register" class="view-section max-w-md w-full mx-auto px-4 py-20">
             <div class="ui-card p-8 border border-gray-100">
                 <div class="text-center mb-6">
-                    <span class="material-symbols-outlined text-4xl text-black">person_add</span>
                     <h2 class="text-2xl font-bold mt-2">Create Account</h2>
                 </div>
                 <div class="space-y-5">
-                    <div><label class="block text-xs font-semibold text-gray-400 mb-1 uppercase">Name</label><input type="text" id="reg-name" class="input-minimal"></div>
-                    <div><label class="block text-xs font-semibold text-gray-400 mb-1 uppercase">Email</label><input type="email" id="reg-email" class="input-minimal"></div>
-                    <div><label class="block text-xs font-semibold text-gray-400 mb-1 uppercase">Password</label><input type="password" id="reg-pass" class="input-minimal"></div>
+                    <div><label class="block text-xs font-semibold text-gray-400 mb-1">Name</label><input type="text" id="reg-name" class="input-minimal"></div>
+                    <div><label class="block text-xs font-semibold text-gray-400 mb-1">Email</label><input type="email" id="reg-email" class="input-minimal"></div>
+                    <div><label class="block text-xs font-semibold text-gray-400 mb-1">Password</label><input type="password" id="reg-pass" class="input-minimal"></div>
                     <button onclick="doRegister()" class="btn-primary w-full mt-2 py-3">Sign Up & Enter Terminal</button>
-                    <div id="reg-err" class="text-red-500 text-xs text-center font-medium mt-2"></div>
+                    <div id="reg-err" class="text-red-500 text-xs text-center mt-2"></div>
                 </div>
             </div>
         </section>
@@ -1355,86 +1197,54 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         <section id="view-dashboard" class="view-section max-w-[1400px] w-full mx-auto px-4 sm:px-6 py-8">
             <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-8 gap-4">
                 <div>
-                    <h2 class="text-2xl font-bold flex items-center gap-3">Trading Terminal <span id="statusBadge" class="text-[10px] bg-gray-100 text-gray-600 px-3 py-1 rounded-full uppercase font-bold tracking-wide border border-gray-200">Loading</span></h2>
-                    <p class="text-sm text-gray-400 mt-1 flex items-center gap-1"><span class="material-symbols-outlined text-[16px]">schedule</span> Engine Uptime: <span id="uptime" class="font-mono text-gray-700 font-bold">0s</span></p>
+                    <h2 class="text-2xl font-bold">Trading Terminal <span id="statusBadge" class="text-[10px] bg-gray-100 text-gray-600 px-3 py-1 rounded-full uppercase">Loading</span></h2>
                 </div>
                 <div class="flex gap-3 w-full sm:w-auto">
-                    <button onclick="nav('settings')" class="btn-secondary flex-1 sm:flex-none flex justify-center items-center gap-1 shadow-sm"><span class="material-symbols-outlined text-[18px]">key</span> Setup API</button>
-                    <button onclick="closeAll()" class="btn-secondary text-red-600 hover:bg-red-50 hover:border-red-200 flex-1 sm:flex-none flex justify-center items-center gap-1 shadow-sm"><span class="material-symbols-outlined text-[18px]">close</span> Close All</button>
+                    <button onclick="nav('settings')" class="btn-secondary flex-1 sm:flex-none">Setup API</button>
+                    <button onclick="closeAll()" class="btn-secondary text-red-600 flex-1 sm:flex-none">Close All</button>
                 </div>
             </div>
 
             <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
                 <div class="lg:col-span-8 space-y-8">
-                    
-                    <div class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-4 sm:gap-6">
+                    <div class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-4">
                         <div class="ui-card p-5 relative border border-gray-100">
-                            <button onclick="resetMetrics()" title="Reset Trade History & PnL" class="absolute top-4 right-4 text-gray-300 hover:text-red-500 transition"><span class="material-symbols-outlined text-[16px]">refresh</span></button>
-                            <p class="text-[10px] sm:text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-2">Net PnL</p>
+                            <p class="text-[10px] font-bold text-gray-400 uppercase">Net PnL</p>
                             <p id="netPnl" class="text-lg sm:text-xl font-mono font-bold tracking-tight">$0.0000</p>
                         </div>
                         <div class="ui-card p-5 border border-gray-100">
-                            <p class="text-[10px] sm:text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-2">Win Rate</p>
-                            <p id="winRateDisplay" class="text-lg sm:text-xl font-mono font-bold tracking-tight text-blue-600">0.00%</p>
+                            <p class="text-[10px] font-bold text-gray-400 uppercase">Win Rate</p>
+                            <p id="winRateDisplay" class="text-lg sm:text-xl font-mono font-bold text-blue-600">0.00%</p>
                         </div>
                         <div class="ui-card p-5 border border-gray-100">
-                            <p class="text-[10px] sm:text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-2">Wallet Balance</p>
-                            <p id="marginUsed" class="text-lg sm:text-xl font-mono font-bold tracking-tight text-gray-800">$0.0000</p>
+                            <p class="text-[10px] font-bold text-gray-400 uppercase">Wallet Balance</p>
+                            <p id="marginUsed" class="text-lg sm:text-xl font-mono font-bold">$0.0000</p>
                         </div>
                         <div class="ui-card p-5 border border-gray-100">
-                            <p class="text-[10px] sm:text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-2">Active Contracts</p>
-                            <p id="activeQty" class="text-lg sm:text-xl font-mono font-bold tracking-tight text-gray-800">0</p>
+                            <p class="text-[10px] font-bold text-gray-400 uppercase">Live ROI</p>
+                            <p id="activeRoi" class="text-lg sm:text-xl font-mono font-bold">N/A</p>
                         </div>
-                        <div class="ui-card p-5 border border-gray-100">
-                            <p class="text-[10px] sm:text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-2">Live ROI & PnL</p>
-                            <p id="activeRoi" class="text-lg sm:text-xl font-mono font-bold tracking-tight text-gray-800">N/A</p>
-                        </div>
-                        
-                        <div class="ui-card p-3 border border-gray-100 flex flex-col items-center justify-center relative">
-                            <p id="gaugeTitle" class="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-1 w-full text-left">ML Prediction</p>
+                        <div class="ui-card p-3 border border-gray-100 flex flex-col items-center">
                             <div class="relative w-full h-12 flex justify-center items-end mt-1">
                                 <canvas id="mlGauge"></canvas>
-                                <div class="absolute bottom-0 translate-y-[2px] text-center w-full">
-                                    <span id="mlValue" class="text-lg font-mono font-bold text-gray-800">0%</span>
-                                </div>
+                                <div class="absolute bottom-0 text-center w-full"><span id="mlValue" class="text-lg font-mono font-bold">0%</span></div>
                             </div>
-                            <p id="mlStatus" class="text-[9px] font-bold uppercase tracking-wider mt-1 text-gray-500">Neutral</p>
-                            <p id="mlSecondary" class="text-[8px] font-bold uppercase tracking-wider mt-1 text-gray-400 bg-gray-50 px-2 rounded">-</p>
+                            <p id="mlStatus" class="text-[9px] font-bold uppercase mt-1 text-gray-500">Neutral</p>
                         </div>
-
                     </div>
 
                     <div class="ui-card p-6 h-[350px] w-full border border-gray-100 relative">
-                        <div class="absolute top-4 left-6 flex gap-3 text-xs font-bold text-gray-400 z-10 bg-white/80 px-3 py-1 rounded-full border border-gray-100">
-                            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-black"></span> 1000SHIB Price</span>
-                            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-green-500"></span> Prob. Bullish</span>
-                            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-red-500"></span> Prob. Bearish</span>
-                            <span class="flex items-center gap-1"><span class="w-3 h-0.5 bg-blue-500"></span> Avg. Prob</span>
-                        </div>
                         <canvas id="mlChart"></canvas>
                     </div>
 
                     <div class="ui-card p-6 border border-gray-100">
-                        <h3 class="text-base font-bold mb-4 flex items-center gap-2">
-                            <span class="material-symbols-outlined text-[20px] text-gray-500">receipt_long</span> HTX Executions
-                            <span class="text-xs text-gray-400 font-normal ml-2">(Note: Trades only appear here when closed)</span>
-                        </h3>
+                        <h3 class="text-base font-bold mb-4">HTX Executions</h3>
                         <div class="overflow-x-auto">
                             <table class="w-full text-left text-sm whitespace-nowrap">
                                 <thead class="text-gray-400 uppercase text-[10px] tracking-wider border-b border-gray-100">
-                                    <tr>
-                                        <th class="pb-3 px-2">Time</th>
-                                        <th class="pb-3 px-2">Side</th>
-                                        <th class="pb-3 px-2">Contracts</th>
-                                        <th class="pb-3 px-2">Reason</th>
-                                        <th class="pb-3 px-2 text-right">Gross ROI</th>
-                                        <th class="pb-3 px-2 text-right">Gross PnL</th>
-                                        <th class="pb-3 px-2 text-right">Net PnL</th>
-                                    </tr>
+                                    <tr><th class="pb-3 px-2">Time</th><th class="pb-3 px-2">Side</th><th class="pb-3 px-2">Qty</th><th class="pb-3 px-2">Reason</th><th class="pb-3 px-2 text-right">Net PnL</th></tr>
                                 </thead>
-                                <tbody id="tradeHistoryBody" class="font-mono text-xs">
-                                    <tr><td colspan="7" class="py-6 text-center text-gray-400 font-sans">Waiting for market shift to complete trade...</td></tr>
-                                </tbody>
+                                <tbody id="tradeHistoryBody" class="font-mono text-xs"></tbody>
                             </table>
                         </div>
                     </div>
@@ -1442,88 +1252,13 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 
                 <div class="lg:col-span-4 h-fit space-y-6">
                     <div class="ui-card p-6 border border-gray-100">
-                        <h3 class="text-base font-bold mb-5 flex items-center gap-2 pb-3 border-b border-gray-50"><span class="material-symbols-outlined text-[20px] text-gray-500">tune</span> Strategy Config</h3>
-                        
-                        <div class="space-y-4 mt-2">
-                            <div class="flex justify-between items-center"><label class="text-sm font-medium text-gray-500">Take Profit (%)</label><input type="number" id="tpPctSens" step="0.1" class="input-minimal w-24 py-1.5 text-right font-mono text-green-600 font-bold bg-gray-50"></div>
-                            <div class="flex justify-between items-center"><label class="text-sm font-medium text-gray-500">Stop Loss (%)</label><input type="number" id="slPctSens" step="0.1" class="input-minimal w-24 py-1.5 text-right font-mono text-red-600 font-bold bg-gray-50"></div>
-                            
-                            <hr class="border-gray-100 my-4">
-                            
-                            <div class="flex justify-between items-center" title="How many ticks to analyze to define the baseline dataset.">
-                                <label class="text-sm font-medium text-gray-500">Training Lookback (Ticks)</label>
-                                <input type="number" id="mlLookbackSens" step="1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-50">
-                            </div>
-
-                            <div class="flex justify-between items-center" title="Confidence % Required to enter trade (0-100).">
-                                <label class="text-sm font-medium text-gray-500">Confidence Threshold (%)</label>
-                                <input type="number" id="mlThresholdSens" step="0.1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-blue-600 bg-gray-50">
-                            </div>
-
-                            <div class="flex justify-between items-center" title="Number of ticks to average for the smoothed signal.">
-                                <label class="text-sm font-medium text-gray-500">Signal Smoothing (Ticks)</label>
-                                <input type="number" id="mlAverageTicksSens" step="1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-50">
-                            </div>
-
-                            <div class="flex justify-between items-center" title="Which signal should trigger the flip?">
-                                <label class="text-sm font-medium text-gray-500">Signal Trigger</label>
-                                <select id="mlUseAverageSens" class="input-minimal w-32 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-50">
-                                    <option value="false">Raw Signal</option>
-                                    <option value="true">Averaged</option>
-                                </select>
-                            </div>
-
-                            <hr class="border-gray-100 my-4">
-
-                            <div class="flex justify-between items-center" title="If position is negative when signal flips, should it DCA or force close?">
-                                <label class="text-sm font-medium text-gray-500">Loss Behavior</label>
-                                <select id="flipOnlyInProfitSens" class="input-minimal w-32 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-50">
-                                    <option value="true">DCA in Loss</option>
-                                    <option value="false">Force Flip</option>
-                                </select>
-                            </div>
-
-                            <div class="flex justify-between items-center" title="Minimum ROI % to allow ML flip execution">
-                                <label class="text-sm font-medium text-gray-500">Flip Profit Threshold (%)</label>
-                                <input type="number" id="flipThresholdSens" step="0.1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-50">
-                            </div>
-
-                            <div class="flex justify-between items-center" title="Triggers a DCA execution every time ROI crosses this negative threshold.">
-                                <label class="text-sm font-medium text-gray-500">Loss DCA ROI Drop (%)</label>
-                                <input type="number" id="dcaRoiThresholdSens" step="0.1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-50">
-                            </div>
-
-                            <div class="flex justify-between items-center" title="Contract multiplier per DCA step in loss (e.g., 2.0 doubles size).">
-                                <label class="text-sm font-medium text-gray-500">Loss Step Multiplier</label>
-                                <input type="number" id="dcaMultiplierSens" step="0.1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-50">
-                            </div>
-
-                            <hr class="border-gray-100 my-4">
-
-                            <div class="flex justify-between items-center" title="Triggers a scale execution every time ROI crosses this positive threshold.">
-                                <label class="text-sm font-medium text-gray-500">Profit Scale ROI (%)</label>
-                                <input type="number" id="profitRoiThresholdSens" step="0.1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-50">
-                            </div>
-
-                            <div class="flex justify-between items-center" title="Contract multiplier per scale step in profit (e.g., 2.0 doubles size).">
-                                <label class="text-sm font-medium text-gray-500">Profit Step Multiplier</label>
-                                <input type="number" id="profitMultiplierSens" step="0.1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-200" disabled>
-                            </div>
-
-                            <div class="flex justify-between items-center" title="Maximum contracts allowed for Profit Scaling. Loss DCA is unlimited.">
-                                <label class="text-sm font-medium text-gray-500">Max Profit Contracts</label>
-                                <input type="number" id="maxContractsSens" step="1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-200" disabled>
-                            </div>
-
-                            <hr class="border-gray-100 my-4">
-
-                            <div class="flex justify-between items-center"><label class="text-sm font-medium text-gray-500">Start Contracts</label><input type="number" id="baseContracts" step="1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold bg-gray-200" disabled></div>
-                            <div class="flex justify-between items-center" title="Amount of tokens per 1 exchange contract. Example: HTX SHIB/USDT = 1000 (Because Binance stream is 1000SHIB)">
-                                <label class="text-sm font-medium text-gray-500">Contract Math Size</label>
-                                <input type="number" id="contractSize" step="1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-400 bg-gray-50 pointer-events-none" disabled>
-                            </div>
-                            
-                            <button onclick="saveConfig()" class="btn-primary w-full mt-6 py-3 text-sm tracking-wide shadow-sm flex items-center justify-center gap-2"><span class="material-symbols-outlined text-[18px]">save</span> Update Strategy</button>
+                        <h3 class="text-base font-bold mb-5 pb-3 border-b border-gray-50">Strategy Config</h3>
+                        <div class="space-y-4">
+                            <div class="flex justify-between items-center"><label class="text-sm font-medium text-gray-500">Take Profit (%)</label><input type="number" id="tpPctSens" step="0.1" class="input-minimal w-24 text-right"></div>
+                            <div class="flex justify-between items-center"><label class="text-sm font-medium text-gray-500">Stop Loss (%)</label><input type="number" id="slPctSens" step="0.1" class="input-minimal w-24 text-right"></div>
+                            <div class="flex justify-between items-center"><label class="text-sm font-medium text-gray-500">Confidence Threshold</label><input type="number" id="mlThresholdSens" step="0.1" class="input-minimal w-24 text-right"></div>
+                            <div class="flex justify-between items-center"><label class="text-sm font-medium text-gray-500">Max DCA Steps (Reverse)</label><input type="number" id="maxDcaStepsBeforeReverseSens" step="1" class="input-minimal w-24 text-right"></div>
+                            <button onclick="saveConfig()" class="btn-primary w-full mt-6 py-3">Update Strategy</button>
                         </div>
                     </div>
                 </div>
@@ -1532,45 +1267,31 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 
         <!-- STEP HISTORY VIEW -->
         <section id="view-step-history" class="view-section max-w-5xl mx-auto px-4 py-12">
-            <div class="text-center mb-10">
-                <span class="material-symbols-outlined text-4xl text-black">layers</span>
-                <h2 class="text-3xl font-bold mt-2">Active Position Step Breakdown</h2>
-                <p class="text-gray-500 mt-2">Historical execution triggers for the current active trade.</p>
-            </div>
+            <h2 class="text-3xl font-bold text-center mb-10">Step Breakdown</h2>
             <div class="ui-card p-6 border border-gray-100">
-                <div class="overflow-x-auto">
-                    <table class="w-full text-left text-sm whitespace-nowrap">
-                        <thead class="text-gray-400 uppercase text-[10px] tracking-wider border-b border-gray-100">
-                            <tr>
-                                <th class="pb-3 px-2">Step #</th>
-                                <th class="pb-3 px-2">Action</th>
-                                <th class="pb-3 px-2">Trigger Price</th>
-                                <th class="pb-3 px-2">ROI at Trigger</th>
-                                <th class="pb-3 px-2">Time</th>
-                            </tr>
-                        </thead>
-                        <tbody id="stepHistoryBody" class="font-mono text-xs">
-                            <tr><td colspan="5" class="py-10 text-center text-gray-400 font-sans">No active position data found.</td></tr>
-                        </tbody>
-                    </table>
-                </div>
+                <table class="w-full text-left text-sm">
+                    <thead class="text-gray-400 uppercase text-[10px] tracking-wider border-b border-gray-100">
+                        <tr><th>Step #</th><th>Action</th><th>Price</th><th>ROI</th></tr>
+                    </thead>
+                    <tbody id="stepHistoryBody" class="font-mono text-xs"></tbody>
+                </table>
             </div>
         </section>
 
         <!-- API SETTINGS VIEW -->
         <section id="view-settings" class="view-section max-w-lg mx-auto px-4 py-10">
-            <button onclick="nav('dashboard')" class="text-sm font-medium text-gray-400 hover:text-black mb-8 flex items-center gap-1 transition"><span class="material-symbols-outlined text-[18px]">arrow_back</span> Back to Terminal</button>
+            <button onclick="nav('dashboard')" class="text-sm font-medium text-gray-400 mb-8 flex items-center gap-1">Back</button>
             <div class="ui-card p-8 border border-gray-100">
-                <h2 class="text-2xl font-bold mb-6 flex items-center gap-2"><span class="material-symbols-outlined">api</span> API Integration</h2>
+                <h2 class="text-2xl font-bold mb-6">API Integration</h2>
                 <div class="space-y-6">
-                    <div class="flex items-center gap-3 p-4 bg-gray-50 border border-gray-200 rounded-xl cursor-pointer hover:bg-gray-100 transition" onclick="handleLiveToggle()">
+                    <div class="flex items-center gap-3 p-4 bg-gray-50 border border-gray-200 rounded-xl" onclick="handleLiveToggle()">
                         <input type="checkbox" id="liveTrade" class="w-5 h-5 accent-black pointer-events-none">
-                        <label class="text-sm font-bold text-gray-800 cursor-pointer pointer-events-none">Enable Live HTX Execution</label>
+                        <label class="text-sm font-bold text-gray-800">Enable Live HTX Execution</label>
                     </div>
-                    <div><label class="block text-xs font-semibold text-gray-400 mb-2 tracking-wide uppercase">HTX API Key</label><input type="password" id="apiKey" class="input-minimal font-mono tracking-widest text-lg bg-gray-50"></div>
-                    <div><label class="block text-xs font-semibold text-gray-400 mb-2 tracking-wide uppercase">HTX API Secret</label><input type="password" id="apiSecret" class="input-minimal font-mono tracking-widest text-lg bg-gray-50"></div>
-                    <button onclick="saveApiKeys()" class="btn-primary w-full py-3 mt-2 tracking-wide shadow-sm flex items-center justify-center gap-2"><span class="material-symbols-outlined text-[18px]">power_settings_new</span> Save & Restart Engine</button>
-                    <div id="key-msg" class="text-sm text-center font-medium mt-3"></div>
+                    <div><label class="block text-xs font-semibold text-gray-400 mb-2 uppercase">HTX API Key</label><input type="password" id="apiKey" class="input-minimal"></div>
+                    <div><label class="block text-xs font-semibold text-gray-400 mb-2 uppercase">HTX API Secret</label><input type="password" id="apiSecret" class="input-minimal"></div>
+                    <button onclick="saveApiKeys()" class="btn-primary w-full py-3">Save & Restart</button>
+                    <div id="key-msg" class="text-sm text-center mt-3"></div>
                 </div>
             </div>
         </section>
@@ -1578,22 +1299,16 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
     </main>
 
     <footer class="py-10 mt-auto border-t border-gray-200 bg-white">
-        <div class="max-w-6xl mx-auto px-4 text-center text-sm text-gray-400 font-medium leading-relaxed">
-            &copy; <script>document.write(new Date().getFullYear())</script> TradeBot Mathematical Engine. All rights reserved. <br>
-            Cryptocurrency trading carries severe financial risk. Use at your own discretion.
+        <div class="max-w-6xl mx-auto px-4 text-center text-sm text-gray-400">
+            &copy; <script>document.write(new Date().getFullYear())</script> TradeBot Mathematical Engine.
         </div>
     </footer>
 
-    <!-- App Logic Scripts -->
     <script>
         let authToken = localStorage.getItem('bot_token');
         let chartPoints = 800;
-
-        let sessionTrackId = localStorage.getItem('rdca_visitor_id');
-        if (!sessionTrackId) {
-            sessionTrackId = Math.random().toString(36).substring(2, 15);
-            localStorage.setItem('rdca_visitor_id', sessionTrackId);
-        }
+        let sessionTrackId = localStorage.getItem('rdca_visitor_id') || Math.random().toString(36).substring(2, 15);
+        localStorage.setItem('rdca_visitor_id', sessionTrackId);
         let currentPageView = 'home';
 
         async function pingAnalytics(isViewRecord = false) {
@@ -1606,14 +1321,13 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             document.getElementById('view-' + viewId).classList.add('active-view');
             window.scrollTo(0,0);
             currentPageView = viewId; pingAnalytics(true); 
-
             if(viewId === 'dashboard' && authToken) initDashboard();
             if(viewId === 'analytics') fetchAnalyticsData();
         }
 
         function toggleAuthUI() {
             if (authToken) { document.getElementById('nav-public').classList.add('hidden'); document.getElementById('nav-private').classList.remove('hidden'); document.getElementById('nav-private').classList.add('flex'); } 
-            else { document.getElementById('nav-public').classList.remove('hidden'); document.getElementById('nav-private').classList.add('hidden'); document.getElementById('nav-private').classList.remove('flex'); }
+            else { document.getElementById('nav-public').classList.remove('hidden'); document.getElementById('nav-private').classList.add('hidden'); }
         }
 
         function logout() { localStorage.removeItem('bot_token'); authToken = null; toggleAuthUI(); nav('home'); }
@@ -1622,310 +1336,123 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             const headers = { 'Content-Type': 'application/json' };
             if (authToken) headers['Authorization'] = authToken;
             const res = await fetch(endpoint, { method, headers, body: body ? JSON.stringify(body) : undefined });
-            const data = await res.json();
             if (res.status === 401) { logout(); return { error: "Session expired" }; }
-            if (res.status === 403) { return { error: data.error, isForbidden: true }; }
-            return data;
+            return await res.json();
         }
 
         async function runBacktest() {
-            document.getElementById('btResTrades').innerText = "Testing...";
-            document.getElementById('btResDeposit').innerText = "-";
-            document.getElementById('btResDuration').innerText = "-";
-            document.getElementById('btResSpan').innerText = "-";
-            
             const payload = {
-                ticks: document.getElementById('btTicks').value, tpPct: document.getElementById('btTp').value,
-                slPct: document.getElementById('btSl').value, baseContracts: document.getElementById('btBase').value,
+                ticks: document.getElementById('btTicks').value, tpPct: 10, slPct: -50, baseContracts: 1,
                 mlLookback: document.getElementById('btMlLookback').value, mlThreshold: document.getElementById('btMlThreshold').value,
-                mlAverageTicks: document.getElementById('btMlAvgTicks').value, mlUseAverage: document.getElementById('btMlUseAverageSens').value,
-                flipOnlyInProfit: document.getElementById('flipOnlyInProfitSens').value, flipThresholdPct: document.getElementById('flipThresholdSens').value,
-                dcaRoiThresholdPct: document.getElementById('dcaRoiThresholdSens').value, 
-                dcaMultiplier: document.getElementById('dcaMultiplierSens').value,
-                profitRoiThresholdPct: document.getElementById('profitRoiThresholdSens').value,
-                profitMultiplier: document.getElementById('profitMultiplierSens').value,
-                maxContracts: document.getElementById('maxContractsSens').value
+                maxDcaStepsBeforeReverse: document.getElementById('btMaxDcaStepsBeforeReverse').value
             };
-
             const res = await doAPI('/api/backtest', 'POST', payload);
-            if(res.error) { alert("Backtest Error: " + res.error); document.getElementById('btResTrades').innerText = "Error"; return; }
-
             document.getElementById('btResWinrate').innerText = res.winRate + "%";
             document.getElementById('btResPnl').innerText = "$" + res.netPnl.toFixed(4);
-            document.getElementById('btResPnl').className = "text-lg font-mono font-bold " + (res.netPnl >= 0 ? "text-green-600" : "text-red-600");
             document.getElementById('btResTrades').innerText = res.totalTradesCount;
-            document.getElementById('btResDeposit').innerText = "$" + (res.depositNeeded || 0).toFixed(4);
-            document.getElementById('btResDuration').innerText = res.avgDuration || "-";
-            document.getElementById('btResSpan').innerText = res.totalSpan || "-";
-
             const tbody = document.getElementById('btTableBody'); tbody.innerHTML = "";
-            if(!res.trades || res.trades.length === 0) { tbody.innerHTML = '<tr><td colspan="5" class="py-6 text-center text-gray-400 font-sans">No executions triggered.</td></tr>'; return; }
-
             [...res.trades].reverse().forEach(t => {
-                const grossPnlStr = t.grossPnl !== undefined ? '$' + t.grossPnl.toFixed(4) : '-';
-                tbody.innerHTML += '<tr class="border-b border-gray-50 hover:bg-gray-50">' +
-                    '<td class="py-2 px-2 font-bold ' + (t.side==='long'?'text-green-600':'text-red-600') + '">' + t.side.toUpperCase() + '</td>' +
-                    '<td class="py-2 px-2">' + t.contracts + '</td>' +
-                    '<td class="py-2 px-2 text-[10px] text-gray-400 uppercase tracking-wide">' + t.exitReason + '</td>' +
-                    '<td class="py-2 px-2 text-right font-bold ' + (t.grossPnl>=0?'text-green-600':'text-red-600') + '">' + grossPnlStr + '</td>' +
-                    '<td class="py-2 px-2 text-right font-bold ' + (t.netPnl>=0?'text-green-600':'text-red-600') + '">$' + t.netPnl.toFixed(4) + '</td></tr>';
+                tbody.innerHTML += '<tr><td>' + t.side + '</td><td>' + t.contracts + '</td><td>' + t.exitReason + '</td><td class="text-right">$' + t.netPnl.toFixed(4) + '</td></tr>';
             });
         }
 
         async function doLogin() {
-            const email = document.getElementById('login-email').value, password = document.getElementById('login-pass').value;
-            const res = await doAPI('/api/auth/login', 'POST', { email, password });
-            if (res.error) document.getElementById('login-err').innerText = res.error;
-            else { authToken = res.token; localStorage.setItem('bot_token', authToken); document.getElementById('nav-user-name').innerText = res.user.name; toggleAuthUI(); nav('dashboard'); }
+            const res = await doAPI('/api/auth/login', 'POST', { email: document.getElementById('login-email').value, password: document.getElementById('login-pass').value });
+            if (res.token) { authToken = res.token; localStorage.setItem('bot_token', authToken); toggleAuthUI(); nav('dashboard'); }
         }
 
         async function doRegister() {
-            const name = document.getElementById('reg-name').value, email = document.getElementById('reg-email').value, password = document.getElementById('reg-pass').value;
-            const res = await doAPI('/api/auth/register', 'POST', { name, email, password });
-            if (res.error) document.getElementById('reg-err').innerText = res.error;
-            else { authToken = res.token; localStorage.setItem('bot_token', authToken); document.getElementById('nav-user-name').innerText = res.user.name; toggleAuthUI(); nav('dashboard'); }
+            const res = await doAPI('/api/auth/register', 'POST', { name: document.getElementById('reg-name').value, email: document.getElementById('reg-email').value, password: document.getElementById('reg-pass').value });
+            if (res.token) { authToken = res.token; localStorage.setItem('bot_token', authToken); toggleAuthUI(); nav('dashboard'); }
         }
 
-        function handleLiveToggle() {
-            const cb = document.getElementById('liveTrade'); cb.checked = !cb.checked;
-        }
+        function handleLiveToggle() { document.getElementById('liveTrade').checked = !document.getElementById('liveTrade').checked; }
 
         async function saveApiKeys() {
-            const btn = document.getElementById('key-msg'); btn.innerText = "Connecting to HTX Exchange..."; btn.className = "text-sm text-center font-medium mt-3 text-gray-400";
-            const res = await doAPI('/api/user/keys', 'POST', { apiKey: document.getElementById('apiKey').value, apiSecret: document.getElementById('apiSecret').value, liveTradingEnabled: document.getElementById('liveTrade').checked });
-            
-            if(res.error) { btn.innerText = res.error; btn.className = "text-sm text-center font-medium mt-3 text-red-500"; document.getElementById('liveTrade').checked = false; }
-            else { btn.innerText = "Keys secured. Engine Ready."; btn.className = "text-sm text-center font-medium mt-3 text-green-600"; setTimeout(() => nav('dashboard'), 1500); }
+            await doAPI('/api/user/keys', 'POST', { apiKey: document.getElementById('apiKey').value, apiSecret: document.getElementById('apiSecret').value, liveTradingEnabled: document.getElementById('liveTrade').checked });
+            nav('dashboard');
         }
 
         async function saveConfig() {
             const payload = {
                 tpPct: document.getElementById("tpPctSens").value, slPct: document.getElementById("slPctSens").value, 
-                baseContracts: document.getElementById("baseContracts").value, contractSize: document.getElementById("contractSize").value,
-                mlLookbackSens: document.getElementById("mlLookbackSens").value, mlThresholdSens: document.getElementById("mlThresholdSens").value,
-                mlAverageTicksSens: document.getElementById("mlAverageTicksSens").value, mlUseAverageSens: document.getElementById("mlUseAverageSens").value,
-                flipOnlyInProfitSens: document.getElementById("flipOnlyInProfitSens").value, flipThresholdSens: document.getElementById("flipThresholdSens").value,
-                dcaRoiThresholdSens: document.getElementById("dcaRoiThresholdSens").value, 
-                dcaMultiplierSens: document.getElementById("dcaMultiplierSens").value,
-                profitRoiThresholdSens: document.getElementById("profitRoiThresholdSens").value,
-                profitMultiplierSens: document.getElementById("profitMultiplierSens").value,
-                maxContractsSens: document.getElementById("maxContractsSens").value
+                mlThresholdSens: document.getElementById("mlThresholdSens").value,
+                maxDcaStepsBeforeReverseSens: document.getElementById("maxDcaStepsBeforeReverseSens").value
             };
-            await doAPI('/api/user/config', 'POST', payload); alert("Settings updated & saved securely to database.");
+            await doAPI('/api/user/config', 'POST', payload); alert("Saved.");
         }
 
-        async function closeAll() { if(confirm("Force close position?")) await doAPI('/api/close-all', 'GET'); }
-
-        async function resetMetrics() {
-            if(confirm("Are you sure you want to reset all Trade History and Net PnL? This cannot be undone.")) {
-                await doAPI('/api/user/reset-metrics', 'POST'); lastTradesCount = -1; fetchMetrics();
-            }
-        }
+        async function closeAll() { await doAPI('/api/close-all', 'GET'); }
 
         async function fetchAnalyticsData() {
-            if(document.getElementById('view-analytics').classList.contains('active-view') === false) return;
-            try {
-                const res = await fetch('/api/analytics/stats'); const data = await res.json();
-                document.getElementById('stat-online').innerText = data.online; document.getElementById('stat-views').innerText = data.views; document.getElementById('stat-uniques').innerText = data.uniques;
-                let pagesHtml = '';
-                for(const [pageName, count] of Object.entries(data.pages)) {
-                    pagesHtml += '<div class="flex justify-between items-center p-3 border-b border-gray-100 last:border-0 hover:bg-gray-50"><span class="capitalize font-bold text-gray-800">' + pageName + '</span><span class="text-xs bg-gray-100 px-2 py-1 rounded text-gray-600 font-bold">' + count + ' Active</span></div>';
-                }
-                document.getElementById('stat-pages').innerHTML = pagesHtml || '<div class="p-4 text-center text-gray-400 font-sans">No active pages</div>';
-            } catch(e){}
+            const data = await (await fetch('/api/analytics/stats')).json();
+            document.getElementById('stat-online').innerText = data.online; document.getElementById('stat-views').innerText = data.views; document.getElementById('stat-uniques').innerText = data.uniques;
         }
 
         const ctx = document.getElementById("mlChart").getContext("2d");
         const mlChart = new Chart(ctx, {
             type: "line", 
-            data: { 
-                labels: [], 
-                datasets: [
-                    { label: "Price", data: [], borderColor: "#000000", borderWidth: 2.0, pointRadius: 0, tension: 0.1, yAxisID: 'y' },
-                    { label: "ML Prob", data: [], borderWidth: 2.0, pointRadius: 0, tension: 0.1, yAxisID: 'y1', segment: { borderColor: ctx => ctx.p1.parsed.y >= 0.5 ? '#22c55e' : '#ef4444' } },
-                    { label: "ML Avg", data: [], borderColor: "#3b82f6", borderWidth: 1.5, pointRadius: 0, tension: 0.1, yAxisID: 'y1', borderDash: [5, 5] }
-                ] 
-            },
-            options: { 
-                responsive: true, maintainAspectRatio: false, animation: false, 
-                scales: { 
-                    x: { display: false },
-                    y: { display: true, position: 'left', grid: { color: "#f3f4f6" }, ticks: { font: { family: "Roboto Mono", size: 10 } } }, 
-                    y1: { display: true, position: 'right', min: 0, max: 1, grid: { drawOnChartArea: false }, ticks: { font: { family: "Roboto Mono", size: 10 } } }
-                }, 
-                plugins: { legend: { display: false }, tooltip: { mode: 'index', intersect: false } } 
-            }
+            data: { labels: [], datasets: [{ label: "Price", data: [], borderColor: "#000", pointRadius: 0, yAxisID: 'y' }, { label: "Prob", data: [], pointRadius: 0, yAxisID: 'y1' }] },
+            options: { responsive: true, maintainAspectRatio: false, animation: false, scales: { x: { display: false }, y: { position: 'left' }, y1: { position: 'right', min: 0, max: 1 } } }
         });
 
         const gaugeCtx = document.getElementById("mlGauge").getContext("2d");
         const mlGauge = new Chart(gaugeCtx, {
-            type: 'doughnut',
-            data: { labels: ['Value', 'Empty'], datasets: [{ data: [50, 50], backgroundColor: ['#f3f4f6', '#f3f4f6'], borderWidth: 0 }] },
-            options: { rotation: -90, circumference: 180, cutout: '75%', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false }, tooltip: { enabled: false } }, animation: { animateRotate: true } }
+            type: 'doughnut', data: { datasets: [{ data: [50, 50], backgroundColor: ['#eee', '#eee'] }] },
+            options: { rotation: -90, circumference: 180, cutout: '75%', responsive: true, maintainAspectRatio: false }
         });
-        
-        let lastChartPrice = null, lastChartMl = null, frontendAvgBuffer = [];
-        
-        function pushChartData(price, mlPlotVal, avgTicks = 5) {
-            if (price === lastChartPrice && mlPlotVal === lastChartMl) return; 
-            lastChartPrice = price; lastChartMl = mlPlotVal;
 
-            frontendAvgBuffer.push(mlPlotVal); if (frontendAvgBuffer.length > avgTicks) frontendAvgBuffer.shift();
-            let avgPlotVal = frontendAvgBuffer.reduce((a,b)=>a+b,0) / frontendAvgBuffer.length;
-
-            mlChart.data.labels.push(""); 
-            mlChart.data.datasets[0].data.push(price);
-            mlChart.data.datasets[1].data.push(mlPlotVal);
-            mlChart.data.datasets[2].data.push(avgPlotVal);
-
-            if(mlChart.data.labels.length > chartPoints) { 
-                mlChart.data.labels.shift(); mlChart.data.datasets[0].data.shift(); mlChart.data.datasets[1].data.shift(); mlChart.data.datasets[2].data.shift(); 
-            }
-        }
-
-        let dashLoop = null, settingsLoaded = false, lastTradesCount = -1;
-        
+        let dashLoop = null, settingsLoaded = false;
         async function initDashboard() {
-            document.getElementById('nav-public').classList.add('hidden'); document.getElementById('nav-private').classList.remove('hidden'); document.getElementById('nav-private').classList.add('flex');
-            
             const me = await doAPI('/api/user/me', 'GET');
-            if(!me.error) {
-                document.getElementById('nav-user-name').innerText = me.name;
-                document.getElementById('liveTrade').checked = me.liveTradingEnabled; document.getElementById('apiKey').value = me.apiKey;
-            }
-
-            const history = await doAPI('/api/chart-history', 'GET');
-            if(!history.error) { 
-                mlChart.data.labels = []; mlChart.data.datasets[0].data = []; mlChart.data.datasets[1].data = []; mlChart.data.datasets[2].data = [];
-                lastChartPrice = null; lastChartMl = null; frontendAvgBuffer = [];
-                history.forEach(p => pushChartData(p.priceMid, p.mlPlot || 0.5, 5)); mlChart.update(); 
-            }
-
+            document.getElementById('nav-user-name').innerText = me.name;
             if(dashLoop) clearInterval(dashLoop);
-            dashLoop = setInterval(fetchMetrics, 300); fetchMetrics();
+            dashLoop = setInterval(fetchMetrics, 1000); fetchMetrics();
         }
 
         async function fetchMetrics() {
-            if(document.getElementById('view-dashboard').classList.contains('active-view') === false && 
-               document.getElementById('view-step-history').classList.contains('active-view') === false) return;
-
-            const data = await doAPI('/api/data', 'GET'); if(data.error) return;
-
-            // INJECTED: REFRESH STEP HISTORY TABLE IF VIEW IS ACTIVE
-            if (document.getElementById('view-step-history').classList.contains('active-view')) {
-                const tbody = document.getElementById("stepHistoryBody");
-                if (data.activePositions.length > 0 && data.activePositions[0].stepHistory) {
-                    tbody.innerHTML = "";
-                    data.activePositions[0].stepHistory.forEach(s => {
-                        const d = new Date(s.time), tStr = d.getHours().toString().padStart(2,"0")+":"+d.getMinutes().toString().padStart(2,"0")+":"+d.getSeconds().toString().padStart(2,"0");
-                        tbody.innerHTML += '<tr class="border-b border-gray-50 hover:bg-gray-50">' +
-                            '<td class="py-3 px-2 font-bold text-gray-800">' + s.step + '</td>' +
-                            '<td class="py-3 px-2 font-bold ' + (s.type === 'DCA' ? 'text-red-500' : 'text-blue-500') + '">' + s.type + '</td>' +
-                            '<td class="py-3 px-2">$' + s.price.toFixed(8) + '</td>' +
-                            '<td class="py-3 px-2 font-bold ' + (s.roi >= 0 ? 'text-green-600' : 'text-red-600') + '">' + s.roi.toFixed(2) + '%</td>' +
-                            '<td class="py-3 px-2 text-gray-400">' + tStr + '</td></tr>';
-                    });
-                } else {
-                    tbody.innerHTML = '<tr><td colspan="5" class="py-10 text-center text-gray-400 font-sans">No active position data found.</td></tr>';
-                }
-            }
-
+            const data = await doAPI('/api/data', 'GET');
             if(!settingsLoaded) {
-                document.getElementById("tpPctSens").value = data.config.takeProfitPct; document.getElementById("slPctSens").value = data.config.stopLossPct; 
-                document.getElementById("baseContracts").value = Number(data.walletBalance || 0) * 10; document.getElementById("contractSize").value = data.config.contractSize || 1000;
-                document.getElementById("mlLookbackSens").value = data.config.mlLookback || 50; document.getElementById("mlThresholdSens").value = data.config.mlThreshold || 60.0;
-                document.getElementById("mlAverageTicksSens").value = data.config.mlAverageTicks || 5; document.getElementById("mlUseAverageSens").value = data.config.mlUseAverage ? "true" : "false";
-                document.getElementById("flipOnlyInProfitSens").value = data.config.flipOnlyInProfit !== undefined ? data.config.flipOnlyInProfit.toString() : "true";
-                document.getElementById("flipThresholdSens").value = data.config.flipThresholdPct || 0.5;
-                document.getElementById("dcaRoiThresholdSens").value = data.config.dcaRoiThresholdPct || 1.0; 
-                document.getElementById("dcaMultiplierSens").value = data.config.dcaMultiplier || 2.0;
-                document.getElementById("profitRoiThresholdSens").value = data.config.profitRoiThresholdPct || 2.0;
-                document.getElementById("profitMultiplierSens").value = Number(data.walletBalance || 0) * 1;
-                document.getElementById("maxContractsSens").value = Number(data.walletBalance || 0) * 2;
+                document.getElementById("tpPctSens").value = data.config.takeProfitPct; 
+                document.getElementById("slPctSens").value = data.config.stopLossPct; 
+                document.getElementById("mlThresholdSens").value = data.config.mlThreshold;
+                document.getElementById("maxDcaStepsBeforeReverseSens").value = data.config.maxDcaStepsBeforeReverse || 10;
                 settingsLoaded = true;
             }
-
-            document.getElementById("uptime").innerText = data.uptime + "s";
-            document.getElementById("netPnl").className = "text-lg sm:text-xl font-mono font-bold tracking-tight " + (data.metrics.totalNetPnl >= 0 ? "text-green-600" : "text-red-600");
-            document.getElementById("winRateDisplay").innerText = (data.metrics.winRate || 0) + "%";
+            document.getElementById("netPnl").innerText = "$" + data.metrics.totalNetPnl.toFixed(4);
+            document.getElementById("winRateDisplay").innerText = data.metrics.winRate + "%";
             document.getElementById("marginUsed").innerText = "$" + Number(data.walletBalance || 0).toFixed(4);
-            document.getElementById("profitMultiplierSens").value = Number(data.walletBalance || 0) * 1;
-            document.getElementById("maxContractsSens").value = Number(data.walletBalance || 0) * 2;
-            document.getElementById("baseContracts").value = Number(data.walletBalance || 0) * 10;
-
-            const badge = document.getElementById("statusBadge");
+            
             if(data.activePositions.length > 0) {
                 const p = data.activePositions[0];
-                badge.innerText = p.isPaper ? "📝 Paper" : "⚡ Live"; badge.className = "text-[10px] bg-black text-white px-3 py-1 rounded-full uppercase tracking-wide font-bold";
-                
-                let roiText = (p.exchangeROI || 0).toFixed(2) + "%";
-                if (p.exchangePnl !== undefined) {
-                    const pnlSign = p.exchangePnl >= 0 ? "+" : "-";
-                    roiText += " (" + pnlSign + "$" + Math.abs(p.exchangePnl).toFixed(4) + ")";
-                }
-                
-                document.getElementById("activeRoi").innerText = roiText; 
-                document.getElementById("activeRoi").className = "text-lg sm:text-xl font-mono font-bold tracking-tight " + (p.exchangeROI >= 0 ? "text-green-600" : "text-red-600");
-                document.getElementById("activeQty").innerText = p.contracts.toLocaleString() + (p.dcaStep > 0 ? ' (Step ' + p.dcaStep + ')' : '');
-            } else {
-                badge.innerText = data.liveTradingEnabled ? "⚡ LIVE (WAITING)" : "📝 PAPER (WAITING)"; 
-                badge.className = data.liveTradingEnabled ? "text-[10px] bg-green-100 text-green-700 px-3 py-1 rounded-full uppercase tracking-wide font-bold" : "text-[10px] bg-gray-100 text-gray-400 px-3 py-1 rounded-full uppercase tracking-wide font-bold";
-                document.getElementById("activeRoi").innerText = "N/A"; document.getElementById("activeRoi").className = "text-lg sm:text-xl font-mono font-bold tracking-tight text-gray-800";
-                document.getElementById("activeQty").innerText = "0"; 
+                document.getElementById("activeRoi").innerText = p.exchangeROI.toFixed(2) + "%";
+                document.getElementById("statusBadge").innerText = p.isPaper ? "📝 Paper" : "⚡ Live";
+            }
+            
+            if (data.mlSignal) {
+                document.getElementById('mlValue').innerText = data.mlSignal.confidence.toFixed(1) + "%";
+                mlGauge.data.datasets[0].data = [data.mlSignal.confidence, 100 - data.mlSignal.confidence];
+                mlGauge.update();
             }
 
-            if (data.mlSignal && data.mlSignal.type !== 'flat') {
-                const mlSig = data.mlSignal, threshold = data.config.mlThreshold || 60.0;
-                let activeType = data.config.mlUseAverage ? mlSig.avgType : mlSig.type, activeConf = data.config.mlUseAverage ? mlSig.avgConfidence : mlSig.confidence;
-
-                document.getElementById('gaugeTitle').innerText = data.config.mlUseAverage ? "ML PREDICTION (AVG)" : "ML PREDICTION (RAW)";
-                document.getElementById('mlValue').innerText = activeConf.toFixed(1) + "%";
-                document.getElementById('mlSecondary').innerText = (data.config.mlUseAverage ? "RAW: " : "AVG: ") + (data.config.mlUseAverage ? mlSig.confidence : mlSig.avgConfidence).toFixed(1) + "% " + (data.config.mlUseAverage ? mlSig.type : mlSig.avgType).toUpperCase();
-                
-                let mlStatus = 'NEUTRAL', colorClass = 'text-gray-500', gaugeColor = '#9ca3af';
-                if (activeType === 'bull' && activeConf >= threshold) { mlStatus = 'LONG SIGNAL'; colorClass = 'text-green-500'; gaugeColor = '#22c55e'; }
-                else if (activeType === 'bear' && activeConf >= threshold) { mlStatus = 'SHORT SIGNAL'; colorClass = 'text-red-500'; gaugeColor = '#ef4444'; }
-                else if (activeType === 'bull') { mlStatus = 'BULLISH (WAIT)'; gaugeColor = '#86efac'; }
-                else if (activeType === 'bear') { mlStatus = 'BEARISH (WAIT)'; gaugeColor = '#fca5a5'; }
-
-                document.getElementById('mlStatus').innerText = mlStatus; document.getElementById('mlStatus').className = "text-[9px] sm:text-[10px] font-bold uppercase tracking-wider mt-1 " + colorClass;
-                mlGauge.data.datasets[0].data = [Math.min(Math.max(activeConf, 0), 100), 100 - Math.min(Math.max(activeConf, 0), 100)];
-                mlGauge.data.datasets[0].backgroundColor = [gaugeColor, '#f3f4f6']; mlGauge.update();
-            } else {
-                document.getElementById('mlValue').innerText = "0%"; document.getElementById('mlStatus').innerText = "CALCULATING"; document.getElementById('mlStatus').className = "text-[9px] sm:text-[10px] font-bold uppercase tracking-wider mt-1 text-gray-400";
-            }
-
-            if(data.metrics.totalTradesCount !== lastTradesCount && data.metrics.trades) {
-                lastTradesCount = data.metrics.totalTradesCount;
-                const tbody = document.getElementById("tradeHistoryBody"); tbody.innerHTML = "";
-                const recent = [...data.metrics.trades].reverse().slice(0, 10);
-                if(recent.length === 0) tbody.innerHTML = '<tr><td colspan="7" class="py-6 text-center text-gray-400 font-sans">Waiting for market shift to complete trade...</td></tr>';
-                recent.forEach(t => {
-                    const d = new Date(t.timestamp), tStr = d.getHours().toString().padStart(2,"0")+":"+d.getMinutes().toString().padStart(2,"0");
-                    tbody.innerHTML += '<tr class="border-b border-gray-50 last:border-0 hover:bg-gray-50 transition">' +
-                        '<td class="py-3 px-2 text-gray-400">' + tStr + '</td>' +
-                        '<td class="py-3 px-2 font-bold ' + (t.side==='long'?'text-green-600':'text-red-600') + '">' + t.side.toUpperCase() + '</td>' +
-                        '<td class="py-3 px-2 text-gray-800 font-bold">' + (t.contracts ? t.contracts.toLocaleString() : "-") + '</td>' +
-                        '<td class="py-3 px-2 text-[10px] text-gray-400 font-sans tracking-wide uppercase">' + t.exitReason + '</td>' +
-                        '<td class="py-3 px-2 text-right font-bold ' + (t.grossRoiPct>=0?'text-green-600':'text-red-600') + '">' + (t.grossRoiPct !== undefined ? t.grossRoiPct.toFixed(2) + '%' : '-') + '</td>' +
-                        '<td class="py-3 px-2 text-right font-bold ' + (t.grossPnl>=0?'text-green-600':'text-red-600') + '">' + (t.grossPnl !== undefined ? '$' + t.grossPnl.toFixed(4) : '-') + '</td>' +
-                        '<td class="py-3 px-2 text-right font-bold ' + (t.netPnl>=0?'text-green-600':'text-red-600') + '">$' + t.netPnl.toFixed(4) + '</td></tr>';
-                });
-            }
-
-            if(data.binance && data.mlSignal) { 
-                pushChartData(data.binance.mid, data.mlSignal.rawValue, data.config.mlAverageTicks || 5); mlChart.update(); 
-            }
+            const tbody = document.getElementById("tradeHistoryBody"); tbody.innerHTML = "";
+            [...data.metrics.trades].reverse().slice(0, 10).forEach(t => {
+                tbody.innerHTML += '<tr><td>' + new Date(t.timestamp).toLocaleTimeString() + '</td><td>' + t.side + '</td><td>' + t.contracts + '</td><td>' + t.exitReason + '</td><td class="text-right">$' + t.netPnl.toFixed(4) + '</td></tr>';
+            });
+            
+            mlChart.data.labels.push(""); 
+            mlChart.data.datasets[0].data.push(data.binance.mid);
+            mlChart.data.datasets[1].data.push(data.mlSignal.rawValue);
+            if(mlChart.data.labels.length > 100) { mlChart.data.labels.shift(); mlChart.data.datasets[0].data.shift(); mlChart.data.datasets[1].data.shift(); }
+            mlChart.update();
         }
 
-        pingAnalytics(true); setInterval(fetchAnalyticsData, 4000); 
         if(authToken) { toggleAuthUI(); nav('dashboard'); } else { toggleAuthUI(); nav('home'); }
     </script>
 </body>
 </html>`);
 });
 
-// ==================== APP INITIALIZATION ====================
 app.listen(CUSTOM_PORT, async () => {
     console.log(`✅ Server running on port ${CUSTOM_PORT}`);
     await loadAllUsers();
