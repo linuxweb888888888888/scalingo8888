@@ -6,17 +6,18 @@ const ccxt = require('ccxt');
 const PAPER_TRADING = false; 
 const API_KEY = 'a961bee8-b730aff5-qv2d5ctgbn-990d3';
 const API_SECRET = 'caab0880-9a1832ee-738173d7-c923b';
-const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/ton_trading_bot?retryWrites=true&w=majority&appName=Clusterweb8888";
+const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/ton_trading_bot?retryWrites=true&w=majority";
 
 const PORT = process.env.PORT || 3000;
-const SYMBOL = 'SHIB/USDT:USDT'; // <--- UPDATED TO SHIB
+const SYMBOL = 'SHIB/USDT:USDT'; 
+const CONTRACT_SIZE = 1; // 1 Contract = 1000 SHIB
 const LEVERAGE = 75;
 const MULTIPLIER = 1; 
 const TAKE_PROFIT = 10.0; 
 const STOP_LOSS = -30.0; 
 
 // ==================== DATABASE ====================
-mongoose.connect(MONGO_URI).then(() => console.log(`✅ MongoDB Connected - SHIB ${PAPER_TRADING ? 'PAPER' : 'REAL'} MODE`));
+mongoose.connect(MONGO_URI).then(() => console.log('✅ MongoDB Connected - SHIB Mode'));
 
 const Trade = mongoose.model('Trade_History', new mongoose.Schema({
     side: String, entryPrice: Number, exitPrice: Number,
@@ -40,18 +41,9 @@ const htx = new ccxt.htx({
 });
 
 let botStatus = {
-    active: false,
-    side: 'IDLE',
-    currentRoi: 0,
-    currentPnl: 0,
-    initialBalance: 0,
-    currentBalance: 0,
-    availableBalance: 0,
-    totalClosedRoi: 0, 
-    lastQty: 0,
-    errorMsg: null,
-    lastUpdate: 'INIT',
-    mode: PAPER_TRADING ? "PAPER" : "REAL"
+    active: false, side: 'IDLE', currentRoi: 0, currentPnl: 0,
+    initialBalance: 0, currentBalance: 0, availableBalance: 0,
+    totalClosedRoi: 0, lastQty: 0, errorMsg: null, lastUpdate: 'INIT'
 };
 
 async function syncAccount() {
@@ -68,11 +60,10 @@ async function syncAccount() {
         }
 
         const history = await Trade.find();
-        botStatus.totalClosedRoi = history.reduce((sum, trade) => sum + (trade.roi || 0), 0);
+        botStatus.totalClosedRoi = history.reduce((sum, t) => sum + (t.roi || 0), 0);
 
         let startDoc = await BotState.findOne({ key: "initial_balance" });
         if (!startDoc) startDoc = await BotState.create({ key: "initial_balance", value: botStatus.currentBalance });
-        
         botStatus.initialBalance = startDoc.value;
         botStatus.growthPnl = botStatus.currentBalance - startDoc.value;
         botStatus.growthPct = (botStatus.growthPnl / (startDoc.value || 1)) * 100;
@@ -80,38 +71,25 @@ async function syncAccount() {
 }
 
 async function tradingLoop() {
-    const markets = await htx.loadMarkets();
-    const marketInfo = markets[SYMBOL];
-    const contractSize = marketInfo.contractSize; // For SHIB this is usually 1,000,000
-
-    if (!PAPER_TRADING) {
-        try { await htx.setLeverage(LEVERAGE, SYMBOL); } catch (e) {}
-    }
-
+    await htx.loadMarkets();
     while (true) {
         botStatus.lastUpdate = new Date().toLocaleTimeString();
         try {
             await syncAccount();
             const ticker = await htx.fetchTicker(SYMBOL);
-            const currentPrice = ticker.last;
+            const price = ticker.last;
 
-            let activePos;
-            if (PAPER_TRADING) {
-                activePos = await PaperPosition.findOne({ symbol: SYMBOL });
-            } else {
-                const positions = await htx.fetchPositions([SYMBOL]);
-                activePos = positions.find(p => p.symbol === SYMBOL && p.contracts > 0);
-            }
+            let activePos = PAPER_TRADING ? await PaperPosition.findOne({ symbol: SYMBOL }) : (await htx.fetchPositions([SYMBOL])).find(p => p.symbol === SYMBOL && p.contracts > 0);
 
             if (activePos) {
                 botStatus.active = true;
                 botStatus.side = activePos.side.toUpperCase();
-                
+                botStatus.lastQty = activePos.contracts;
+
                 if (PAPER_TRADING) {
-                    const priceDiff = activePos.side === 'buy' ? (currentPrice - activePos.entryPrice) : (activePos.entryPrice - currentPrice);
-                    botStatus.currentRoi = (priceDiff / activePos.entryPrice) * LEVERAGE * 100;
-                    // PnL = Diff * Contracts * size of SHIB in contract
-                    botStatus.currentPnl = priceDiff * activePos.contracts * contractSize;
+                    const diff = activePos.side === 'buy' ? (price - activePos.entryPrice) : (activePos.entryPrice - price);
+                    botStatus.currentRoi = (diff / activePos.entryPrice) * LEVERAGE * 100;
+                    botStatus.currentPnl = diff * activePos.contracts * CONTRACT_SIZE;
                 } else {
                     botStatus.currentRoi = parseFloat(activePos.percentage) || 0;
                     botStatus.currentPnl = parseFloat(activePos.unrealizedPnl) || 0;
@@ -125,29 +103,29 @@ async function tradingLoop() {
                         const side = (activePos.side === 'long' || activePos.side === 'buy' ? 'sell' : 'buy');
                         await htx.createMarketOrder(SYMBOL, side, activePos.contracts, undefined, { 'reduceOnly': true });
                     }
-                    await Trade.create({ side: activePos.side, entryPrice: activePos.entryPrice, exitPrice: currentPrice, roi: botStatus.currentRoi, pnl: botStatus.currentPnl, reason: "AUTO_EXIT" });
+                    await Trade.create({ side: activePos.side, entryPrice: activePos.entryPrice, exitPrice: price, roi: botStatus.currentRoi, pnl: botStatus.currentPnl, reason: "AUTO_EXIT" });
                     await new Promise(r => setTimeout(r, 10000));
                 }
             } else {
                 botStatus.active = false;
                 botStatus.side = "IDLE";
 
-                // --- FORMULA FOR SHIB ---
+                // --- FORMULA START ---
                 // 1. Value of 0.1 SHIB
-                const unitValue = currentPrice * 0.1;
+                const unitValue = price * 0.1;
                 // 2. Balance divided by unit value
                 const baseDiv = botStatus.availableBalance / unitValue;
                 // 3 & 4. Multiply by Leverage (75) and Multiplier (4)
                 const totalTokensRequested = baseDiv * LEVERAGE * MULTIPLIER;
-                
-                // Convert tokens to Contracts (divide by contract size, e.g. 1,000,000)
-                const tradeQty = Math.floor(totalTokensRequested / contractSize);
+                // 5. Convert to whole contracts (1 contract = 1000 SHIB)
+                const tradeQty = Math.floor(totalTokensRequested / CONTRACT_SIZE);
 
-                if (tradeQty >= 1 && botStatus.availableBalance > 0.01) {
+                if (tradeQty >= 1) {
                     const side = Math.random() > 0.5 ? 'buy' : 'sell';
                     if (PAPER_TRADING) {
-                        await PaperPosition.create({ symbol: SYMBOL, side: side, entryPrice: currentPrice, contracts: tradeQty });
+                        await PaperPosition.create({ symbol: SYMBOL, side: side, entryPrice: price, contracts: tradeQty });
                     } else {
+                        await htx.setLeverage(LEVERAGE, SYMBOL);
                         await htx.createMarketOrder(SYMBOL, side, tradeQty);
                     }
                     botStatus.lastQty = tradeQty;
@@ -155,30 +133,21 @@ async function tradingLoop() {
                     await new Promise(r => setTimeout(r, 5000));
                 }
             }
-        } catch (e) { 
-            botStatus.errorMsg = e.message.substring(0, 50);
-            await new Promise(r => setTimeout(r, 4000)); 
-        }
+        } catch (e) { botStatus.errorMsg = e.message.substring(0, 50); await new Promise(r => setTimeout(r, 4000)); }
         await new Promise(r => setTimeout(r, 1000));
     }
 }
 
 tradingLoop();
 
-// ==================== WEB APP (UI) ====================
+// ==================== WEB APP ====================
 const app = express();
 app.get('/api/status', (req, res) => res.json(botStatus));
-app.get('/api/history', async (req, res) => {
-    const history = await Trade.find().sort({ timestamp: -1 }).limit(10);
-    res.json(history);
-});
+app.get('/api/history', async (req, res) => res.json(await Trade.find().sort({ timestamp: -1 }).limit(10)));
 app.post('/api/reset-baseline', async (req, res) => {
-    try {
-        if (PAPER_TRADING) { await BotState.updateOne({ key: "paper_balance" }, { value: 1000 }); await PaperPosition.deleteMany({}); }
-        await BotState.deleteOne({ key: "initial_balance" });
-        await syncAccount();
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    if (PAPER_TRADING) { await BotState.updateOne({ key: "paper_balance" }, { value: 1000 }); await PaperPosition.deleteMany({}); }
+    await BotState.deleteOne({ key: "initial_balance" });
+    await syncAccount(); res.json({ success: true });
 });
 
 app.get('/', (req, res) => {
@@ -188,42 +157,25 @@ app.get('/', (req, res) => {
     body{background:#020617;color:#f8fafc;font-family:'JetBrains+Mono',monospace;}.card{background:#0f172a;border:1px solid #1e293b;border-radius:12px;}</style></head>
     <body class="p-6 md:p-12"><div class="max-w-6xl mx-auto"><header class="flex justify-between items-center mb-10"><div>
     <h1 class="text-2xl font-bold tracking-tighter text-orange-500 uppercase font-black italic">SHIB.EXTREME.V4</h1>
-    <p class="text-[10px] text-slate-500 font-bold uppercase tracking-widest">${PAPER_TRADING ? 'PAPER MODE ACTIVE' : 'REAL TRADING ACTIVE'}</p></div>
+    <p class="text-[10px] text-slate-500 font-bold uppercase tracking-widest">${PAPER_TRADING ? 'PAPER MODE (1 contract = 1000 SHIB)' : 'REAL TRADING ACTIVE'}</p></div>
     <button onclick="resetBaseline()" class="text-[10px] bg-slate-800 hover:bg-rose-900 px-4 py-2 rounded-lg font-bold border border-slate-700 transition-colors">RESET PORTFOLIO</button>
     </header>
-
     <div id="err" class="mb-6 p-3 bg-rose-500/10 border border-rose-500/40 text-rose-500 text-[10px] font-bold rounded-lg text-center uppercase hidden"></div>
-    
     <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
-        <div class="card p-8 border-t-2 border-yellow-500">
-            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Total ROI</div>
-            <div id="total-roi" class="text-4xl font-bold text-yellow-400">0.00%</div>
-        </div>
-        <div class="card p-8 border-t-2 border-emerald-500">
-            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Growth %</div>
-            <div id="g-pct" class="text-4xl font-bold text-emerald-400">0.00%</div>
-        </div>
-        <div class="card p-8 border-t-2 border-blue-500">
-            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Session PnL</div>
-            <div id="g-pnl" class="text-4xl font-bold text-blue-400">+0.0000</div>
-        </div>
-        <div class="card p-8 border-t-2 border-slate-600">
-            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Equity</div>
-            <div id="s-bal" class="text-4xl font-bold text-slate-400">0.00</div>
-        </div>
+        <div class="card p-8 border-t-2 border-yellow-500"><div class="text-slate-500 text-[10px] uppercase font-bold mb-2">Total ROI</div><div id="total-roi" class="text-4xl font-bold text-yellow-400">0.00%</div></div>
+        <div class="card p-8 border-t-2 border-emerald-500"><div class="text-slate-500 text-[10px] uppercase font-bold mb-2">Growth %</div><div id="g-pct" class="text-4xl font-bold text-emerald-400">0.00%</div></div>
+        <div class="card p-8 border-t-2 border-blue-500"><div class="text-slate-500 text-[10px] uppercase font-bold mb-2">PnL</div><div id="g-pnl" class="text-4xl font-bold text-blue-400">+0.00</div></div>
+        <div class="card p-8 border-t-2 border-slate-600"><div class="text-slate-500 text-[10px] uppercase font-bold mb-2">Balance</div><div id="s-bal" class="text-4xl font-bold text-slate-400">0.00</div></div>
     </div>
-
     <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
         <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Live ROI</div><div id="roi" class="text-xl font-bold">0%</div></div>
         <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Contracts</div><div id="qty" class="text-xl font-bold text-white">0</div></div>
         <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Available</div><div id="wallet" class="text-xl font-bold text-emerald-400">0</div></div>
         <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Time</div><div id="sync" class="text-xl font-bold text-blue-500">...</div></div>
     </div>
-
     <div class="card overflow-hidden"><table class="w-full text-left"><thead class="bg-slate-900/50 text-[10px] text-slate-500 font-bold uppercase tracking-widest"><tr><th class="px-6 py-4">Side</th><th class="px-6 py-4 text-right">ROI %</th><th class="px-6 py-4 text-right">PnL</th><th class="px-6 py-4 text-right">Time</th></tr></thead><tbody id="history" class="text-xs"></tbody></table></div></div>
-
     <script>
-    async function resetBaseline() { if(confirm("Reset all data?")) { await fetch('/api/reset-baseline', { method: 'POST' }); location.reload(); } }
+    async function resetBaseline() { if(confirm("Reset all?")) { await fetch('/api/reset-baseline', { method: 'POST' }); location.reload(); } }
     async function update(){try{const res=await fetch('/api/status');const s=await res.json();
     document.getElementById('total-roi').innerText=s.totalClosedRoi.toFixed(2)+'%';
     document.getElementById('g-pct').innerText=s.growthPct.toFixed(2)+'%';
@@ -241,4 +193,4 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.listen(PORT, () => console.log(`🌐 Server active on port ${PORT}`));
+app.listen(PORT, () => console.log(`🌐 Bot running on port ${PORT}`));
