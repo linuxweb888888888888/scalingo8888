@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const ccxt = require('ccxt');
 
 // ==================== CONFIGURATION ====================
-const PAPER_TRADING = true; // SET TO FALSE TO USE REAL MONEY (Ensure funds are in USDT-M Futures)
+const PAPER_TRADING = false; // SET TO FALSE TO USE REAL MONEY (Ensure funds are in USDT-M Futures)
 const API_KEY = 'a961bee8-b730aff5-qv2d5ctgbn-990d3';
 const API_SECRET = 'caab0880-9a1832ee-738173d7-c923b';
 const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/shib_trading_bot?retryWrites=true&w=majority";
