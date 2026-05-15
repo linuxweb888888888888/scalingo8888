@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 const SYMBOL = 'TON/USDT:USDT';
 const LEVERAGE = 75;
 const TAKE_PROFIT = 5.0;  // Exit at +5% ROI
-const STOP_LOSS = -20.0;  // Exit at -20% ROI
+const STOP_LOSS = -30.0;  // Exit at -20% ROI
 
 // ==================== DATABASE SETUP ====================
 mongoose.connect(MONGO_URI)
