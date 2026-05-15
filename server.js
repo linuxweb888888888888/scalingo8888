@@ -80,10 +80,16 @@ async function syncAccount() {
 }
 
 async function tradingLoop() {
-    // ESSENTIAL: Load markets to get precision rules for SHIB
     await htx.loadMarkets();
 
+    // --- FIX FOR ERROR 1499 ---
+    // Attempt to force One-Way Mode on the exchange
     if (!PAPER_TRADING) {
+        try { 
+            await htx.setPositionMode(false, SYMBOL); 
+            console.log("✅ Exchange set to One-Way Mode");
+        } catch (e) { console.log("⚠️ Note: Account already in One-Way mode or requires Hedge params."); }
+        
         try { await htx.setLeverage(LEVERAGE, SYMBOL); } catch (e) {}
     }
 
@@ -121,9 +127,14 @@ async function tradingLoop() {
                         await BotState.updateOne({ key: "paper_balance" }, { $inc: { value: botStatus.currentPnl } });
                         await PaperPosition.deleteOne({ _id: activePos._id });
                     } else {
-                        // FIX: Use amountToPrecision to avoid Error 1499
                         const formattedQty = htx.amountToPrecision(SYMBOL, activePos.contracts);
-                        await htx.createMarketOrder(SYMBOL, (activePos.side === 'long' || activePos.side === 'buy' ? 'sell' : 'buy'), formattedQty, undefined, { 'reduceOnly': true });
+                        const exitSide = (activePos.side === 'buy' || activePos.side === 'long' ? 'sell' : 'buy');
+                        
+                        // Added posSide param to satisfy Hedge Mode if One-Way switch failed
+                        await htx.createMarketOrder(SYMBOL, exitSide, formattedQty, undefined, { 
+                            'reduceOnly': true,
+                            'posSide': activePos.side === 'buy' ? 'long' : 'short'
+                        });
                     }
                     await Trade.create({ side: activePos.side, entryPrice: activePos.entryPrice, exitPrice: currentPrice, roi: botStatus.currentRoi, pnl: botStatus.currentPnl, reason: "AUTO_EXIT" });
                     await new Promise(r => setTimeout(r, 10000));
@@ -142,9 +153,12 @@ async function tradingLoop() {
                     if (PAPER_TRADING) {
                         await PaperPosition.create({ symbol: SYMBOL, side: side, entryPrice: currentPrice, contracts: maxQty });
                     } else {
-                        // FIX: Use amountToPrecision to avoid Error 1499
                         const formattedQty = htx.amountToPrecision(SYMBOL, maxQty);
-                        await htx.createMarketOrder(SYMBOL, side, formattedQty);
+                        
+                        // Added posSide param to satisfy Hedge Mode
+                        await htx.createMarketOrder(SYMBOL, side, formattedQty, undefined, {
+                            'posSide': side === 'buy' ? 'long' : 'short'
+                        });
                     }
                     botStatus.lastQty = maxQty;
                     botStatus.errorMsg = null;
@@ -189,22 +203,10 @@ app.get('/', (req, res) => {
     </header>
     <div id="err" class="mb-6 p-3 bg-rose-500/10 border border-rose-500/40 text-rose-500 text-[10px] font-bold rounded-lg text-center uppercase hidden"></div>
     <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
-        <div class="card p-8 border-t-2 border-yellow-500">
-            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2">Total ROI</div>
-            <div id="total-roi" class="text-4xl font-bold text-yellow-400">0.00%</div>
-        </div>
-        <div class="card p-8 border-t-2 border-emerald-500">
-            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2">Growth %</div>
-            <div id="g-pct" class="text-4xl font-bold text-emerald-400">0.00%</div>
-        </div>
-        <div class="card p-8 border-t-2 border-blue-500">
-            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2">Session PnL</div>
-            <div id="g-pnl" class="text-4xl font-bold text-blue-400">+0.000000</div>
-        </div>
-        <div class="card p-8 border-t-2 border-slate-600">
-            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2">Virtual Balance</div>
-            <div id="s-bal" class="text-4xl font-bold text-slate-400">0.000000</div>
-        </div>
+        <div class="card p-8 border-t-2 border-yellow-500"><div class="text-slate-500 text-[10px] uppercase font-bold mb-2">Total ROI</div><div id="total-roi" class="text-4xl font-bold text-yellow-400">0.00%</div></div>
+        <div class="card p-8 border-t-2 border-emerald-500"><div class="text-slate-500 text-[10px] uppercase font-bold mb-2">Growth %</div><div id="g-pct" class="text-4xl font-bold text-emerald-400">0.00%</div></div>
+        <div class="card p-8 border-t-2 border-blue-500"><div class="text-slate-500 text-[10px] uppercase font-bold mb-2">Session PnL</div><div id="g-pnl" class="text-4xl font-bold text-blue-400">+0.000000</div></div>
+        <div class="card p-8 border-t-2 border-slate-600"><div class="text-slate-500 text-[10px] uppercase font-bold mb-2">Virtual Balance</div><div id="s-bal" class="text-4xl font-bold text-slate-400">0.000000</div></div>
     </div>
     <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
         <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Live ROI</div><div id="roi" class="text-xl font-bold">0%</div></div>
