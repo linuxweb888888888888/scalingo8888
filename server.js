@@ -1,281 +1,267 @@
-const fs = require('fs');
-const ccxt = require('ccxt');
 const express = require('express');
 const mongoose = require('mongoose');
-const https = require('https');
-const crypto = require('crypto');
+const ccxt = require('ccxt');
 
-const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
+// ==================== CONFIGURATION ====================
+const API_KEY = 'a961bee8-b730aff5-qv2d5ctgbn-990d3';
+const API_SECRET = 'caab0880-9a1832ee-738173d7-c923b';
+const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/ton_trading_bot?retryWrites=true&w=majority&appName=Clusterweb8888";
 
-// ==================== DB CONFIG (PRESERVING USERS) ====================
-const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
+const PORT = process.env.PORT || 3000;
+const SYMBOL = 'TON/USDT:USDT';
+const LEVERAGE = 75;
+const TAKE_PROFIT = 5.0;  // Exit at +5% ROI
+const STOP_LOSS = -20.0;  // Exit at -20% ROI
 
-mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000, socketTimeoutMS: 45000 })
-    .then(() => console.log('✅ Quantitative Engine Linked to MongoDB'))
-    .catch(err => console.error('🚨 Connection Error:', err));
+// ==================== DATABASE SETUP ====================
+mongoose.connect(MONGO_URI)
+    .then(() => console.log('✅ Connected to MongoDB Atlas'))
+    .catch(err => console.error('❌ Database Connection Error:', err));
 
-const UserModel = mongoose.model('User_V3', new mongoose.Schema({
-    name: { type: String, required: true },
-    email: { type: String, unique: true, required: true },
-    passwordHash: { type: String, required: true },
-    salt: { type: String, required: true },
-    token: { type: String },
-    apiKey: { type: String, default: "" },
-    apiSecret: { type: String, default: "" },
-    liveTradingEnabled: { type: Boolean, default: false },
-    config: { type: Object, default: {} },
-    activePosition: { type: Object, default: null }, 
-    lastCloseTime: { type: Number, default: 0 }      
-}));
+const TradeSchema = new mongoose.Schema({
+    side: String,
+    entryPrice: Number,
+    exitPrice: Number,
+    roi: Number,
+    pnl: Number,
+    reason: String,
+    timestamp: { type: Date, default: Date.now }
+});
+const Trade = mongoose.model('Trade_History', TradeSchema);
 
-const TradeModel = mongoose.model('TradeLog_V3', new mongoose.Schema({
-    userId: { type: String, required: true }, side: String, entryPrice: Number, exitPrice: Number,
-    contracts: Number, netPnl: Number, exitReason: String, timestamp: { type: Date, default: Date.now }
-}));
+// ==================== TRADING ENGINE ====================
+const htx = new ccxt.htx({
+    apiKey: API_KEY,
+    secret: API_SECRET,
+    options: { defaultType: 'swap' }
+});
 
-// ==================== INSTITUTIONAL BASE CONFIG ====================
-const CUSTOM_PORT = process.env.PORT || 3000;
-const HTX_SYMBOL = 'SHIB/USDT:USDT'; 
-const FORCED_LEVERAGE = 75;
-
-const BASE_CONFIG = {
-    takeProfitPct: 25.0,
-    stopLossPct: -50.0,
-    riskPercent: 1.0,           // Risk 1% of equity per trade
-    atrMultiplier: 5,           // ATR-based Volatility Stop distance
-    minVwapDeviation: 0.2       // Price must be 0.2% away from fair value to enter
+let botStatus = {
+    active: false,
+    side: 'IDLE',
+    currentRoi: 0,
+    currentPnl: 0,
+    totalSessionRoi: 0,
+    balance: 0,
+    lastUpdate: 'Syncing...'
 };
 
-// GLOBAL MARKET STATE
-const ALPHA_STATE = {
-    mid: 0, vwap: 0, atr: 0, rsi: 50, ema: 0,
-    prices: [], volumes: [], lookback: 150 
-};
+// Sync stats from Database and Exchange
+async function refreshMetrics() {
+    try {
+        const stats = await Trade.aggregate([
+            { $group: { _id: null, totalRoi: { $sum: "$roi" } } }
+        ]);
+        botStatus.totalSessionRoi = stats.length > 0 ? stats[0].totalRoi : 0;
 
-const publicBinance = new ccxt.pro.binance({ options: { defaultType: 'swap', defaultSubType: 'linear' } });
-
-// QUANTITATIVE CALCULATION ENGINE
-function calculateAlphaMetrics(prices, volumes) {
-    if (prices.length < 50) return;
-    let totalValue = 0, totalVol = 0, tr = 0;
-    prices.forEach((p, i) => { totalValue += p * volumes[i]; totalVol += volumes[i]; });
-    ALPHA_STATE.vwap = totalValue / (totalVol || 1);
-    for (let i = 1; i < prices.length; i++) tr += Math.abs(prices[i] - prices[i-1]);
-    ALPHA_STATE.atr = tr / prices.length;
-    const k = 2 / (50 + 1);
-    let ema = prices[0];
-    for (let i = 1; i < prices.length; i++) ema = (prices[i] * k) + (ema * (1 - k));
-    ALPHA_STATE.ema = ema;
-    let up = 0, down = 0;
-    for (let i = prices.length - 14; i < prices.length; i++) {
-        let diff = prices[i] - prices[i-1];
-        if (diff >= 0) up += diff; else down -= diff;
-    }
-    ALPHA_STATE.rsi = 100 - (100 / (1 + (up / (down || 1))));
-    ALPHA_STATE.mid = prices[prices.length - 1];
+        const bal = await htx.fetchBalance({ type: 'swap' });
+        botStatus.balance = bal.free.USDT || 0;
+    } catch (e) { console.error("Metrics Error:", e.message); }
 }
 
-// ==================== HTX.COM EXPERT INSTANCE ====================
-class ExpertAlphaInstance {
-    constructor(user) {
-        this.userId = user._id.toString();
-        this.config = { ...BASE_CONFIG, ...(user.config || {}) };
-        this.activePositions = user.activePosition ? [user.activePosition] : [];
-        this.walletBalance = 0;
-        this.isExecuting = false;
-        this.lastCloseTime = user.lastCloseTime || 0;
+async function tradingLoop() {
+    console.log("🚀 TON 75x Scalper Engine Online");
+    await htx.loadMarkets();
 
-        this.htx = new ccxt.pro.htx({ 
-            apiKey: user.apiKey, secret: user.apiSecret, agent: keepAliveAgent,
-            options: { defaultType: 'swap', defaultSubType: 'linear' }
-        });
-    }
-
-    async init() {
-        if (this.htx.apiKey && this.htx.apiKey !== "") {
-            try { 
-                await this.htx.loadMarkets(); 
-                this.syncExchange(); 
-                setInterval(() => this.syncExchange(), 5000);
-            } catch(e) {}
-        }
-    }
-
-    async syncExchange() {
-        if (!user.liveTradingEnabled) return;
+    // Verify leverage on start
+    try {
+        await htx.setLeverage(LEVERAGE, SYMBOL, { 'lever_rate': LEVERAGE });
+    } catch (e) { console.log("Leverage set check:", e.message); }
+    
+    while (true) {
         try {
-            const bal = await this.htx.fetchBalance({ type: 'swap' });
-            this.walletBalance = bal.total.USDT || 0;
-            const positions = await this.htx.fetchPositions([HTX_SYMBOL]);
-            const openPos = positions.find(p => p.contracts > 0);
-            if (openPos) {
-                if(!this.activePositions[0]) this.activePositions = [{}];
-                this.activePositions[0] = { 
-                    side: openPos.side, entryPrice: openPos.entryPrice, contracts: openPos.contracts, 
-                    roi: openPos.percentage || 0, pnl: openPos.unrealizedPnl || 0 
-                };
-            } else { this.activePositions = []; }
-        } catch (e) {}
-    }
+            const positions = await htx.fetchPositions([SYMBOL]);
+            const pos = positions.find(p => p.symbol === SYMBOL && p.contracts > 0);
 
-    async process() {
-        if (this.isExecuting || ALPHA_STATE.mid === 0) return;
-        const price = ALPHA_STATE.mid;
-        const { vwap, atr, rsi, ema } = ALPHA_STATE;
+            if (pos) {
+                botStatus.active = true;
+                botStatus.side = pos.side.toUpperCase();
+                botStatus.currentRoi = parseFloat(pos.percentage) || 0;
+                botStatus.currentPnl = parseFloat(pos.unrealizedPnl) || 0;
 
-        // ENTRY: Devation from fair value (Institutional Buy/Sell Zones)
-        if (this.activePositions.length === 0 && (Date.now() - this.lastCloseTime > 15000)) {
-            const undervalued = price < vwap * (1 - (this.config.minVwapDeviation/100)) && rsi < 35 && price > ema;
-            const overextended = price > vwap * (1 + (this.config.minVwapDeviation/100)) && rsi > 65 && price < ema;
+                // --- EXIT LOGIC ---
+                let exitTriggered = false;
+                let exitReason = "";
 
-            if (undervalued) await this.executeEntry('long');
-            else if (overextended) await this.executeEntry('short');
+                if (botStatus.currentRoi >= TAKE_PROFIT) {
+                    exitTriggered = true; exitReason = "TAKE PROFIT";
+                } else if (botStatus.currentRoi <= STOP_LOSS) {
+                    exitTriggered = true; exitReason = "STOP LOSS";
+                }
+
+                if (exitTriggered) {
+                    console.log(`[EXIT] ${exitReason} at ${botStatus.currentRoi.toFixed(2)}%`);
+                    
+                    await htx.createMarketOrder(SYMBOL, (pos.side === 'long' ? 'sell' : 'buy'), pos.contracts, undefined, {
+                        'lever_rate': LEVERAGE, 
+                        'offset': 'close', 
+                        'reduceOnly': true
+                    });
+                    
+                    // Log trade to MongoDB Atlas
+                    await Trade.create({
+                        side: pos.side,
+                        entryPrice: pos.entryPrice,
+                        exitPrice: pos.markPrice,
+                        roi: botStatus.currentRoi,
+                        pnl: botStatus.currentPnl,
+                        reason: exitReason
+                    });
+                    
+                    await refreshMetrics();
+                    await new Promise(r => setTimeout(r, 10000)); // 10s cooldown
+                }
+            } else {
+                botStatus.active = false;
+                botStatus.side = 'IDLE';
+                botStatus.currentRoi = 0;
+                botStatus.currentPnl = 0;
+
+                // --- ENTRY LOGIC ---
+                const bal = await htx.fetchBalance({ type: 'swap' });
+                const available = bal.free.USDT || 0;
+                botStatus.balance = available;
+
+                if (available >= 0.10) {
+                    const safeMargin = available * 0.90; // Keep 10% for fees
+                    const ticker = await htx.fetchTicker(SYMBOL);
+                    const randomSide = Math.random() > 0.5 ? 'buy' : 'sell';
+                    const qty = Math.floor((safeMargin * LEVERAGE) / ticker.last);
+
+                    if (qty >= 1) {
+                        console.log(`[ENTRY] ${randomSide.toUpperCase()} for ${qty} contracts...`);
+                        await htx.createMarketOrder(SYMBOL, randomSide, qty, undefined, {
+                            'lever_rate': LEVERAGE, 
+                            'offset': 'open'
+                        });
+                        await new Promise(r => setTimeout(r, 3000));
+                    }
+                }
+            }
+            botStatus.lastUpdate = new Date().toLocaleTimeString();
+        } catch (e) { 
+            console.error("Loop Error:", e.message); 
+            await new Promise(r => setTimeout(r, 5000));
         }
-
-        // RISK: Dynamic Volatility Trailing Stop
-        if (this.activePositions.length > 0) {
-            const pos = this.activePositions[0];
-            const stopDist = atr * this.config.atrMultiplier;
-            const stopPrice = pos.side === 'long' ? pos.entryPrice - stopDist : pos.entryPrice + stopDist;
-            const isStopped = pos.side === 'long' ? price < stopPrice : price > stopPrice;
-
-            if (isStopped) await this.executeClose('ATR_VOL_STOP');
-            else if (pos.roi > this.config.takeProfitPct) await this.executeClose('INSTITUTIONAL_TP');
-        }
-    }
-
-    async executeEntry(side) {
-        this.isExecuting = true;
-        try {
-            const riskUsd = Math.max(1, this.walletBalance * (this.config.riskPercent / 100));
-            const qty = Math.floor(riskUsd / (ALPHA_STATE.mid * 0.000001)); // Normalized for HTX SHIB size
-            if (user.liveTradingEnabled) await this.htx.createMarketOrder(HTX_SYMBOL, side === 'long' ? 'buy' : 'sell', qty);
-            this.activePositions = [{ side, entryPrice: ALPHA_STATE.mid, contracts: qty, entryTime: Date.now() }];
-            await UserModel.updateOne({ _id: this.userId }, { $set: { activePosition: this.activePositions[0] } });
-        } catch(e) { console.error("HTX Order Failed:", e.message); }
-        finally { this.isExecuting = false; }
-    }
-
-    async executeClose(reason) {
-        this.isExecuting = true;
-        try {
-            const pos = this.activePositions[0];
-            if (user.liveTradingEnabled) await this.htx.createMarketOrder(HTX_SYMBOL, pos.side === 'long' ? 'sell' : 'buy', pos.contracts, undefined, { reduceOnly: true });
-            await TradeModel.create({ userId: this.userId, side: pos.side, entryPrice: pos.entryPrice, exitPrice: ALPHA_STATE.mid, contracts: pos.contracts, netPnl: pos.pnl || 0, exitReason: reason });
-            this.activePositions = []; this.lastCloseTime = Date.now();
-            await UserModel.updateOne({ _id: this.userId }, { $set: { activePosition: null, lastCloseTime: this.lastCloseTime } });
-        } catch(e) {}
-        finally { this.isExecuting = false; }
+        await new Promise(r => setTimeout(r, 2000));
     }
 }
 
-// ==================== SYSTEM CORE ====================
-const activeWorkers = new Map();
-async function startAlphaSystem() {
-    (async function streamMarket() {
-        while (true) {
-            try {
-                const ticker = await publicBinance.watchTicker('1000SHIB/USDT:USDT');
-                const mid = (ticker.bid + ticker.ask) / 2;
-                ALPHA_STATE.prices.push(mid);
-                ALPHA_STATE.volumes.push(ticker.quoteVolume || 1);
-                if (ALPHA_STATE.prices.length > ALPHA_STATE.lookback) { ALPHA_STATE.prices.shift(); ALPHA_STATE.volumes.shift(); }
-                calculateAlphaMetrics(ALPHA_STATE.prices, ALPHA_STATE.volumes);
-                for (const worker of activeWorkers.values()) { worker.process(); }
-            } catch (e) { await new Promise(r => setTimeout(r, 2000)); }
-        }
-    })();
-}
+// Initial Sync
+refreshMetrics();
+tradingLoop();
 
-// ==================== EXPERT API & UI ====================
-const app = express(); app.use(express.json());
-const hash = (p, s) => crypto.scryptSync(p, s, 64).toString('hex');
+// ==================== DASHBOARD SERVER ====================
+const app = express();
 
-app.post('/api/auth/register', async (req, res) => {
-    const salt = crypto.randomBytes(16).toString('hex');
-    const user = await UserModel.create({ name: req.body.name, email: req.body.email, salt, passwordHash: hash(req.body.password, salt), token: crypto.randomBytes(32).toString('hex') });
-    const worker = new ExpertAlphaInstance(user); await worker.init(); activeWorkers.set(user._id.toString(), worker);
-    res.json({ token: user.token });
+app.get('/api/status', (req, res) => res.json(botStatus));
+app.get('/api/history', async (req, res) => {
+    const history = await Trade.find().sort({ timestamp: -1 }).limit(10);
+    res.json(history);
 });
 
-app.post('/api/auth/login', async (req, res) => {
-    const user = await UserModel.findOne({ email: req.body.email });
-    if (user && hash(req.body.password, user.salt) === user.passwordHash) {
-        user.token = crypto.randomBytes(32).toString('hex'); await user.save();
-        res.json({ token: user.token });
-    } else res.status(401).json({ error: "Auth Error" });
-});
+app.get('/', (req, res) => {
+    res.send(`
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Alpha TON Terminal</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <style>
+            @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
+            body { background: #020617; color: #f8fafc; font-family: 'JetBrains+Mono', monospace; }
+            .card { background: #0f172a; border: 1px solid #1e293b; }
+            .emerald-glow { color: #34d399; text-shadow: 0 0 10px rgba(52, 211, 153, 0.3); }
+            .rose-glow { color: #fb7185; text-shadow: 0 0 10px rgba(251, 113, 133, 0.3); }
+        </style>
+    </head>
+    <body class="p-6 md:p-12">
+        <div class="max-w-5xl mx-auto">
+            <header class="flex justify-between items-center mb-12">
+                <div>
+                    <h1 class="text-xl font-bold tracking-tighter text-blue-500 uppercase">TON.Alpha.V1</h1>
+                    <div class="text-[10px] text-slate-500">75X LEVERAGE RANDOM SCALPER</div>
+                </div>
+                <div id="status-badge" class="text-[10px] px-4 py-1 rounded-full border border-slate-700 text-slate-400 font-bold uppercase">SYNCING</div>
+            </header>
 
-app.get('/api/data', async (req, res) => {
-    const user = await UserModel.findOne({ token: req.headers.authorization });
-    if (!user) return res.status(401).send();
-    let worker = activeWorkers.get(user._id.toString());
-    if (!worker) { worker = new ExpertAlphaInstance(user); await worker.init(); activeWorkers.set(user._id.toString(), worker); }
-    const trades = await TradeModel.find({ userId: user._id.toString() }).sort({ timestamp: -1 }).limit(10);
-    res.json({ activePositions: worker.activePositions, balance: worker.walletBalance, market: ALPHA_STATE, trades });
-});
+            <!-- METRIC GRID -->
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+                <div class="card p-6 rounded-xl">
+                    <div class="text-slate-500 text-[10px] uppercase tracking-widest mb-2">Live ROI</div>
+                    <div id="roi" class="text-3xl font-bold">0.00%</div>
+                </div>
+                <div class="card p-6 rounded-xl">
+                    <div class="text-slate-500 text-[10px] uppercase tracking-widest mb-2">DB Session Total</div>
+                    <div id="session" class="text-3xl font-bold text-blue-400">0.00%</div>
+                </div>
+                <div class="card p-6 rounded-xl">
+                    <div class="text-slate-500 text-[10px] uppercase tracking-widest mb-2">Unrealized PnL</div>
+                    <div id="pnl" class="text-3xl font-bold">0.0000</div>
+                </div>
+                <div class="card p-6 rounded-xl">
+                    <div class="text-slate-500 text-[10px] uppercase tracking-widest mb-2">Wallet USDT</div>
+                    <div id="wallet" class="text-3xl font-bold text-emerald-400">0.0000</div>
+                </div>
+            </div>
 
-app.get('/', (req, res) => res.send(`
-<!DOCTYPE html><html><head><title>Quantum Expert HTX</title><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="bg-[#050505] text-gray-200 font-sans">
-    <nav class="h-16 border-b border-white/5 flex items-center justify-between px-10 bg-[#0a0a0a]">
-        <div class="font-black text-xl tracking-tighter text-white">ALPHA<span class="text-blue-500">EXPERT</span></div>
-        <div class="flex gap-6 text-xs font-bold uppercase text-gray-500">
-            <button onclick="nav('login')">Sign In</button>
-            <button onclick="nav('register')" class="bg-blue-600 text-white px-4 py-1.5 rounded hover:bg-blue-500">Deploy</button>
+            <!-- LEDGER -->
+            <div class="card rounded-xl overflow-hidden shadow-2xl">
+                <div class="px-6 py-4 bg-slate-900/50 border-b border-slate-800 flex justify-between items-center">
+                    <span class="text-xs font-bold uppercase tracking-tighter">Atlas Database Records (Closed Trades)</span>
+                    <span id="last-sync" class="text-[9px] text-slate-500 font-bold"></span>
+                </div>
+                <table class="w-full text-left">
+                    <thead class="text-[10px] text-slate-500 bg-slate-900/30">
+                        <tr>
+                            <th class="px-6 py-3 font-medium">SIDE</th>
+                            <th class="px-6 py-3 font-medium">ROI %</th>
+                            <th class="px-6 py-3 font-medium">PNL USDT</th>
+                            <th class="px-6 py-3 font-medium">EXIT REASON</th>
+                        </tr>
+                    </thead>
+                    <tbody id="history-rows" class="text-xs"></tbody>
+                </table>
+            </div>
         </div>
-    </nav>
-    <main class="max-w-6xl mx-auto py-16 px-10">
-        <section id="v-home" class="text-center">
-            <h1 class="text-8xl font-black tracking-tighter mb-6 text-white">Quantitative Core.</h1>
-            <p class="text-gray-500 text-lg max-w-2xl mx-auto leading-relaxed">High-Frequency SHIB Engine for HTX.com. Defined by VWAP Fair Value Discovery and ATR Volatility Risk Models.</p>
-        </section>
-        <section id="v-dash" class="hidden space-y-8">
-            <div class="grid grid-cols-4 gap-6">
-                <div class="bg-[#0d0d0d] p-6 rounded-2xl border border-white/5"><p class="text-[10px] text-gray-500 uppercase font-bold mb-2">VWAP (Fair Value)</p><p id="d-vwap" class="text-2xl font-mono text-blue-500">0.000000</p></div>
-                <div class="bg-[#0d0d0d] p-6 rounded-2xl border border-white/5"><p class="text-[10px] text-gray-500 uppercase font-bold mb-2">HTX.com USDT</p><p id="d-bal" class="text-2xl font-mono text-green-500">$0.00</p></div>
-                <div class="bg-[#0d0d0d] p-6 rounded-2xl border border-white/5"><p class="text-[10px] text-gray-500 uppercase font-bold mb-2">Volatility (ATR)</p><p id="d-atr" class="text-2xl font-mono text-yellow-500">0.00%</p></div>
-                <div class="bg-[#0d0d0d] p-6 rounded-2xl border border-white/5"><p class="text-[10px] text-gray-500 uppercase font-bold mb-2">Active ROI</p><p id="d-roi" class="text-2xl font-mono">0.00%</p></div>
-            </div>
-            <div class="bg-[#0d0d0d] rounded-3xl border border-white/5 overflow-hidden">
-                <table class="w-full text-left text-sm"><thead class="text-gray-500 bg-white/5"><tr><th class="p-6">Side</th><th class="p-6">Units</th><th class="p-6">Trigger</th><th class="p-6 text-right">PnL</th></tr></thead><tbody id="d-ledger" class="font-mono"></tbody></table>
-            </div>
-        </section>
-        <section id="v-auth" class="hidden max-w-sm mx-auto bg-[#0d0d0d] p-10 rounded-3xl border border-white/5 shadow-2xl">
-            <h2 id="a-title" class="text-2xl font-black mb-8 text-center uppercase">Secure Access</h2>
-            <div class="space-y-4">
-                <input type="text" id="i-name" placeholder="Name" class="w-full bg-black p-4 rounded-xl border border-white/5 hidden">
-                <input type="email" id="i-email" placeholder="Email" class="w-full bg-black p-4 rounded-xl border border-white/5">
-                <input type="password" id="i-pass" placeholder="Key" class="w-full bg-black p-4 rounded-xl border border-white/5">
-                <button onclick="auth()" class="w-full bg-blue-600 py-4 rounded-xl font-black uppercase text-xs">Establish Link</button>
-            </div>
-        </section>
-    </main>
-    <script>
-        let mode = 'login', token = localStorage.getItem('alpha_token');
-        function nav(v){ document.querySelectorAll('main > section').forEach(s=>s.classList.add('hidden')); document.getElementById('v-'+v).classList.remove('hidden'); if(v==='register'){mode='register'; document.getElementById('i-name').classList.remove('hidden'); document.getElementById('a-title').innerText='Register Node';} }
-        async function auth(){
-            const body={email:document.getElementById('i-email').value,password:document.getElementById('i-pass').value,name:document.getElementById('i-name').value};
-            const res=await fetch('/api/auth/'+mode,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-            const data=await res.json(); if(data.token){localStorage.setItem('alpha_token',data.token); location.reload();}
-        }
-        if(token){
-            nav('dash');
-            setInterval(async()=>{
-                const res=await fetch('/api/data',{headers:{'Authorization':token}}); const data=await res.json();
-                document.getElementById('d-vwap').innerText=data.market.vwap.toFixed(8);
-                document.getElementById('d-bal').innerText='$'+data.balance.toFixed(2);
-                document.getElementById('d-atr').innerText=(data.market.atr/data.market.mid*100).toFixed(3)+'%';
-                if(data.activePositions.length>0){ document.getElementById('d-roi').innerText=data.activePositions[0].roi.toFixed(2)+'%'; document.getElementById('d-roi').className='text-2xl font-mono '+(data.activePositions[0].roi>=0?'text-green-500':'text-red-500'); }
-                document.getElementById('d-ledger').innerHTML=data.trades.map(t=>\`<tr class="border-t border-white/5"><td class="p-6 font-bold \${t.side==='long'?'text-green-500':'text-red-500'}">\${t.side.toUpperCase()}</td><td class="p-6">\${t.contracts}</td><td class="p-6 text-gray-500 text-[10px] uppercase">\${t.exitReason}</td><td class="p-6 text-right font-bold \${t.netPnl>=0?'text-green-500':'text-red-500'}">$\${t.netPnl.toFixed(4)}</td></tr>\`).join('');
-            },1000);
-        }
-    </script>
-</body></html>`));
 
-app.listen(CUSTOM_PORT, async () => {
-    const users = await UserModel.find({});
-    for(const u of users) { const w = new ExpertAlphaInstance(u); await w.init(); activeWorkers.set(u._id.toString(), w); }
-    startAlphaSystem();
-    console.log(`✅ Institutional Engine Online on Port ${CUSTOM_PORT}`);
+        <script>
+            async function refresh() {
+                try {
+                    const statusRes = await fetch('/api/status');
+                    const s = await statusRes.json();
+                    
+                    document.getElementById('roi').innerText = s.currentRoi.toFixed(2) + '%';
+                    document.getElementById('roi').className = 'text-3xl font-bold ' + (s.currentRoi >= 0 ? 'emerald-glow' : 'rose-glow');
+                    
+                    document.getElementById('session').innerText = s.totalSessionRoi.toFixed(2) + '%';
+                    document.getElementById('pnl').innerText = s.currentPnl.toFixed(4);
+                    document.getElementById('wallet').innerText = s.balance.toFixed(4);
+                    document.getElementById('last-sync').innerText = 'EXCHANGE TIME: ' + s.lastUpdate;
+
+                    const badge = document.getElementById('status-badge');
+                    badge.innerText = s.active ? s.side + ' ACTIVE' : 'LIQUIDITY POOL SEARCH';
+                    badge.className = s.active ? 'text-[10px] px-4 py-1 rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-400 font-bold uppercase' : 'text-[10px] px-4 py-1 rounded-full border border-slate-700 text-slate-500 font-bold uppercase';
+
+                    const historyRes = await fetch('/api/history');
+                    const history = await historyRes.json();
+                    document.getElementById('history-rows').innerHTML = history.map(t => \`
+                        <tr class="border-b border-slate-800/50 hover:bg-slate-800/20">
+                            <td class="px-6 py-4 font-bold \${t.side === 'buy' ? 'text-emerald-500' : 'text-rose-500'}">\${t.side.toUpperCase()}</td>
+                            <td class="px-6 py-4 font-bold \${t.roi >= 0 ? 'text-emerald-400' : 'text-rose-500'}">\${t.roi.toFixed(2)}%</td>
+                            <td class="px-6 py-4 text-slate-300 font-bold">\${t.pnl.toFixed(4)}</td>
+                            <td class="px-6 py-4 text-slate-500 uppercase text-[10px] font-bold">\${t.reason}</td>
+                        </tr>
+                    \`).join('');
+                } catch (e) { }
+            }
+            setInterval(refresh, 1000);
+            refresh();
+        </script>
+    </body>
+    </html>
+    `);
 });
+
+app.listen(PORT, () => console.log(`🌐 Dashboard live at http://localhost:${PORT}`));
