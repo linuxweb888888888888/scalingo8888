@@ -4,14 +4,14 @@ const ccxt = require('ccxt');
 
 // ==================== CONFIGURATION ====================
 const API_KEY = 'a961bee8-b730aff5-qv2d5ctgbn-990d3';
-const API_SECRET = 'caab0880-9a1832ee-738173d7-c923_your_secret'; // Ensure secret is correct
-const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/ton_trading_bot?retryWrites=true&w=majority";
+const API_SECRET = 'caab0880-9a1832ee-738173d7-c923b';
+const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/ton_trading_bot?retryWrites=true&w=majority&appName=Clusterweb8888";
 
 const PORT = process.env.PORT || 3000;
 const SYMBOL = 'TON/USDT:USDT';
 const LEVERAGE = 75;
-const TAKE_PROFIT = 10.0; 
-const STOP_LOSS = -30.0; 
+const TAKE_PROFIT = 5.0; 
+const STOP_LOSS = -20.0; 
 
 // ==================== DATABASE ====================
 mongoose.connect(MONGO_URI).then(() => console.log('✅ MongoDB Atlas Connected'));
@@ -43,6 +43,7 @@ let botStatus = {
     availableBalance: 0,
     growthPnl: 0,
     growthPct: 0,
+    totalClosedRoi: 0, // <--- Added for tracking
     lastQty: 0,
     errorMsg: null,
     lastUpdate: 'INIT'
@@ -50,12 +51,16 @@ let botStatus = {
 
 async function syncAccount() {
     try {
-        const bal = await htx.fetchBalance();
-        const totalEquity = bal.total.USDT || 0;
-        const freeCash = bal.free.USDT || 0;
+        const bal = await htx.fetchBalance({ type: 'swap' });
+        const totalEquity = (bal.total && bal.total.USDT) ? bal.total.USDT : 0;
+        const freeCash = (bal.free && bal.free.USDT) ? bal.free.USDT : 0;
 
         botStatus.currentBalance = totalEquity;
         botStatus.availableBalance = freeCash;
+
+        // --- Calculate Sum of Closed ROI ---
+        const history = await Trade.find();
+        botStatus.totalClosedRoi = history.reduce((sum, trade) => sum + (trade.roi || 0), 0);
 
         if (totalEquity > 0) {
             let startDoc = await BotState.findOne({ key: "initial_balance" });
@@ -71,7 +76,7 @@ async function syncAccount() {
 
 async function tradingLoop() {
     await htx.loadMarkets();
-    try { await htx.setLeverage(LEVERAGE, SYMBOL); } catch (e) {}
+    try { await htx.setLeverage(LEVERAGE, SYMBOL, { 'lever_rate': LEVERAGE }); } catch (e) {}
 
     while (true) {
         botStatus.lastUpdate = new Date().toLocaleTimeString();
@@ -79,7 +84,7 @@ async function tradingLoop() {
             await syncAccount();
 
             const positions = await htx.fetchPositions([SYMBOL]);
-            const pos = positions.find(p => p.symbol === SYMBOL && parseFloat(p.contracts) > 0);
+            const pos = positions.find(p => p.symbol === SYMBOL && p.contracts > 0);
 
             if (pos) {
                 botStatus.active = true;
@@ -88,10 +93,9 @@ async function tradingLoop() {
                 botStatus.currentPnl = parseFloat(pos.unrealizedPnl) || 0;
                 botStatus.lastQty = pos.contracts;
 
-                // EXIT LOGIC
                 if (botStatus.currentRoi >= TAKE_PROFIT || botStatus.currentRoi <= STOP_LOSS) {
                     await htx.createMarketOrder(SYMBOL, (pos.side === 'long' ? 'sell' : 'buy'), pos.contracts, undefined, {
-                        'reduceOnly': true
+                        'lever_rate': LEVERAGE, 'offset': 'close', 'reduceOnly': true
                     });
                     
                     await Trade.create({
@@ -101,31 +105,24 @@ async function tradingLoop() {
                     await new Promise(r => setTimeout(r, 10000));
                 }
             } else {
-                // ENTRY LOGIC
                 botStatus.active = false;
                 const ticker = await htx.fetchTicker(SYMBOL);
                 const price = ticker.last;
 
-                // --- YOUR SPECIFIC FORMULA ---
-                // 1. Get the USDT value for 0.1 TON
+                // --- NEW CALCULATION LOGIC ---
+                // 1. Get USDT value for 0.1 TON
                 const unitValue = price * 0.1;
-                // 2. Take wallet balance and divide by this value
-                const baseDivision = botStatus.availableBalance / unitValue;
-                // 3. Use result with 75 leverage
-                const leveragedResult = baseDivision * 75;
-                // 4. Multiply end result units with 4
-                const finalQty = Math.floor(leveragedResult * 4);
+                // 2. Wallet balance divided by unit value
+                const baseDiv = botStatus.availableBalance / unitValue;
+                // 3 & 4. Multiply by Leverage(75) then by 4
+                const maxQty = Math.floor(baseDiv * 75 * 4);
 
-                if (finalQty >= 1 && botStatus.availableBalance > 0.01) {
+                if (maxQty >= 1 && botStatus.availableBalance > 0.01) {
                     const side = Math.random() > 0.5 ? 'buy' : 'sell';
-                    
-                    console.log(`Attempting Order: ${side} ${finalQty} units`);
-
-                    await htx.createMarketOrder(SYMBOL, side, finalQty, undefined, {
-                        'lever_rate': LEVERAGE
+                    await htx.createMarketOrder(SYMBOL, side, maxQty, undefined, {
+                        'lever_rate': LEVERAGE, 'offset': 'open'
                     });
-
-                    botStatus.lastQty = finalQty;
+                    botStatus.lastQty = maxQty;
                     botStatus.errorMsg = null;
                     await new Promise(r => setTimeout(r, 5000));
                 }
@@ -149,6 +146,7 @@ app.post('/api/reset-baseline', async (req, res) => {
     try {
         await BotState.deleteOne({ key: "initial_balance" });
         await syncAccount();
+        console.log("♻️ Baseline reset by user.");
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -165,15 +163,19 @@ app.get('/', (req, res) => {
     body{background:#020617;color:#f8fafc;font-family:'JetBrains+Mono',monospace;}.card{background:#0f172a;border:1px solid #1e293b;border-radius:12px;}</style></head>
     <body class="p-6 md:p-12"><div class="max-w-6xl mx-auto"><header class="flex justify-between items-center mb-10"><div>
     <h1 class="text-2xl font-bold tracking-tighter text-blue-500 uppercase font-black italic">TON.EXTREME.V4</h1>
-    <p class="text-[10px] text-slate-500 font-bold uppercase tracking-widest">75X | 300% AGGRESSION FORMULA</p></div>
+    <p class="text-[10px] text-slate-500 font-bold uppercase tracking-widest">Calculated Logic: (Bal / (Price*0.1)) * 75 * 4</p></div>
     <button onclick="resetBaseline()" class="text-[10px] bg-slate-800 hover:bg-rose-900 px-4 py-2 rounded-lg font-bold border border-slate-700 transition-colors">RESET BASELINE</button>
     </header>
 
     <div id="err" class="hidden mb-6 p-3 bg-rose-500/10 border border-rose-500/40 text-rose-500 text-[10px] font-bold rounded-lg text-center uppercase"></div>
     
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
+        <div class="card p-8 border-t-2 border-yellow-500">
+            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Total Closed ROI</div>
+            <div id="total-roi" class="text-4xl font-bold text-yellow-400">0.00%</div>
+        </div>
         <div class="card p-8 border-t-2 border-emerald-500">
-            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Portfolio Growth</div>
+            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Growth %</div>
             <div id="g-pct" class="text-4xl font-bold text-emerald-400">0.00%</div>
         </div>
         <div class="card p-8 border-t-2 border-blue-500">
@@ -181,14 +183,14 @@ app.get('/', (req, res) => {
             <div id="g-pnl" class="text-4xl font-bold text-blue-400">+0.0000</div>
         </div>
         <div class="card p-8 border-t-2 border-slate-600">
-            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Starting Equity</div>
+            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Baseline</div>
             <div id="s-bal" class="text-4xl font-bold text-slate-400">0.0000</div>
         </div>
     </div>
 
     <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
         <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Live ROI</div><div id="roi" class="text-xl font-bold">0%</div></div>
-        <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Leveraged QTY</div><div id="qty" class="text-xl font-bold text-white">0</div></div>
+        <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Active QTY</div><div id="qty" class="text-xl font-bold text-white">0</div></div>
         <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Free Margin</div><div id="wallet" class="text-xl font-bold text-emerald-400">0</div></div>
         <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Sync Time</div><div id="sync" class="text-xl font-bold text-blue-500">...</div></div>
     </div>
@@ -199,13 +201,14 @@ app.get('/', (req, res) => {
 
     <script>
     async function resetBaseline() {
-        if(confirm("Reset baseline?")) {
+        if(confirm("Are you sure you want to set your current balance as the new Starting Equity?")) {
             await fetch('/api/reset-baseline', { method: 'POST' });
             location.reload();
         }
     }
 
     async function update(){try{const res=await fetch('/api/status');const s=await res.json();
+    document.getElementById('total-roi').innerText=s.totalClosedRoi.toFixed(2)+'%';
     document.getElementById('g-pct').innerText=s.growthPct.toFixed(2)+'%';
     document.getElementById('g-pnl').innerText=(s.growthPnl>=0?'+':'')+s.growthPnl.toFixed(4);
     document.getElementById('s-bal').innerText=s.initialBalance.toFixed(4);
@@ -225,4 +228,4 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.listen(PORT, () => console.log(`🌐 Server active on port ${PORT}`));
+app.listen(PORT, () => console.log(`🌐 Engine online at port ${PORT}`));
