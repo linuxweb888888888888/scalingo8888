@@ -11,9 +11,9 @@ const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clus
 const PORT = process.env.PORT || 3000;
 const SYMBOL = 'TON/USDT:USDT';
 const LEVERAGE = 75;
-const MULTIPLIER = 4; 
-const TAKE_PROFIT = 5.0; 
-const STOP_LOSS = -20.0; 
+const MULTIPLIER = 1; 
+const TAKE_PROFIT = 10.0; 
+const STOP_LOSS = -30.0; 
 
 // ==================== DATABASE ====================
 mongoose.connect(MONGO_URI).then(() => console.log(`✅ MongoDB Connected (${PAPER_TRADING ? 'PAPER' : 'REAL'} MODE)`));
