@@ -9,7 +9,7 @@ const API_SECRET = 'caab0880-9a1832ee-738173d7-c923b';
 const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/ton_trading_bot?retryWrites=true&w=majority&appName=Clusterweb8888";
 
 const PORT = process.env.PORT || 3000;
-const SYMBOL = 'TON/USDT:USDT';
+const SYMBOL = 'SHIB/USDT:USDT';
 const LEVERAGE = 75;
 const MULTIPLIER = 1; 
 const TAKE_PROFIT = 10.0; 
