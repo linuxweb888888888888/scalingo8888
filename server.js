@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const ccxt = require('ccxt');
 
 // ==================== CONFIGURATION ====================
+const PAPER_TRADING = true; // <--- SET TO FALSE TO USE REAL MONEY
 const API_KEY = 'a961bee8-b730aff5-qv2d5ctgbn-990d3';
 const API_SECRET = 'caab0880-9a1832ee-738173d7-c923b';
 const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/ton_trading_bot?retryWrites=true&w=majority&appName=Clusterweb8888";
@@ -10,12 +11,12 @@ const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clus
 const PORT = process.env.PORT || 3000;
 const SYMBOL = 'TON/USDT:USDT';
 const LEVERAGE = 75;
-const MULTIPLIER = 1; // <--- NEW SETTING FOR THE MULTIPLY WITH 4
+const MULTIPLIER = 1; 
 const TAKE_PROFIT = 10.0; 
 const STOP_LOSS = -30.0; 
 
 // ==================== DATABASE ====================
-mongoose.connect(MONGO_URI).then(() => console.log('✅ MongoDB Atlas Connected'));
+mongoose.connect(MONGO_URI).then(() => console.log(`✅ MongoDB Connected (${PAPER_TRADING ? 'PAPER' : 'REAL'} MODE)`));
 
 const Trade = mongoose.model('Trade_History', new mongoose.Schema({
     side: String, entryPrice: Number, exitPrice: Number,
@@ -24,6 +25,11 @@ const Trade = mongoose.model('Trade_History', new mongoose.Schema({
 
 const BotState = mongoose.model('Bot_State', new mongoose.Schema({
     key: String, value: Number, startDate: { type: Date, default: Date.now }
+}));
+
+// Collection to store paper positions
+const PaperPosition = mongoose.model('Paper_Position', new mongoose.Schema({
+    symbol: String, side: String, entryPrice: Number, contracts: Number, timestamp: { type: Date, default: Date.now }
 }));
 
 // ==================== ENGINE ====================
@@ -42,84 +48,116 @@ let botStatus = {
     initialBalance: 0,
     currentBalance: 0,
     availableBalance: 0,
-    growthPnl: 0,
-    growthPct: 0,
     totalClosedRoi: 0, 
     lastQty: 0,
     errorMsg: null,
-    lastUpdate: 'INIT'
+    lastUpdate: 'INIT',
+    mode: PAPER_TRADING ? "PAPER" : "REAL"
 };
 
 async function syncAccount() {
     try {
-        const bal = await htx.fetchBalance({ type: 'swap' });
-        const totalEquity = (bal.total && bal.total.USDT) ? bal.total.USDT : 0;
-        const freeCash = (bal.free && bal.free.USDT) ? bal.free.USDT : 0;
+        if (PAPER_TRADING) {
+            // Paper Mode: Get balance from Database
+            let balanceDoc = await BotState.findOne({ key: "paper_balance" });
+            if (!balanceDoc) {
+                balanceDoc = await BotState.create({ key: "paper_balance", value: 1000.00 }); // Start with $1000 Paper Money
+            }
+            botStatus.currentBalance = balanceDoc.value;
+            botStatus.availableBalance = balanceDoc.value;
+        } else {
+            // Real Mode: Get balance from HTX
+            const bal = await htx.fetchBalance({ type: 'swap' });
+            botStatus.currentBalance = (bal.total && bal.total.USDT) ? bal.total.USDT : 0;
+            botStatus.availableBalance = (bal.free && bal.free.USDT) ? bal.free.USDT : 0;
+        }
 
-        botStatus.currentBalance = totalEquity;
-        botStatus.availableBalance = freeCash;
-
-        // Calculate Sum of Closed ROI
+        // Global Stats
         const history = await Trade.find();
         botStatus.totalClosedRoi = history.reduce((sum, trade) => sum + (trade.roi || 0), 0);
 
-        if (totalEquity > 0) {
-            let startDoc = await BotState.findOne({ key: "initial_balance" });
-            if (!startDoc) {
-                startDoc = await BotState.create({ key: "initial_balance", value: totalEquity });
-            }
-            botStatus.initialBalance = startDoc.value;
-            botStatus.growthPnl = totalEquity - startDoc.value;
-            botStatus.growthPct = (botStatus.growthPnl / (startDoc.value || 1)) * 100;
+        let startDoc = await BotState.findOne({ key: "initial_balance" });
+        if (!startDoc) {
+            startDoc = await BotState.create({ key: "initial_balance", value: botStatus.currentBalance });
         }
-    } catch (e) { botStatus.errorMsg = "Sync Failed"; }
+        botStatus.initialBalance = startDoc.value;
+        botStatus.growthPnl = botStatus.currentBalance - startDoc.value;
+        botStatus.growthPct = (botStatus.growthPnl / (startDoc.value || 1)) * 100;
+
+    } catch (e) { botStatus.errorMsg = "Sync Failed: " + e.message; }
 }
 
 async function tradingLoop() {
-    await htx.loadMarkets();
-    try { await htx.setLeverage(LEVERAGE, SYMBOL, { 'lever_rate': LEVERAGE }); } catch (e) {}
+    if (!PAPER_TRADING) {
+        await htx.loadMarkets();
+        try { await htx.setLeverage(LEVERAGE, SYMBOL); } catch (e) {}
+    }
 
     while (true) {
         botStatus.lastUpdate = new Date().toLocaleTimeString();
         try {
             await syncAccount();
+            const ticker = await htx.fetchTicker(SYMBOL);
+            const currentPrice = ticker.last;
 
-            const positions = await htx.fetchPositions([SYMBOL]);
-            const pos = positions.find(p => p.symbol === SYMBOL && p.contracts > 0);
+            let activePos;
+            if (PAPER_TRADING) {
+                activePos = await PaperPosition.findOne({ symbol: SYMBOL });
+            } else {
+                const positions = await htx.fetchPositions([SYMBOL]);
+                activePos = positions.find(p => p.symbol === SYMBOL && p.contracts > 0);
+            }
 
-            if (pos) {
+            if (activePos) {
+                // --- POSITION TRACKING ---
                 botStatus.active = true;
-                botStatus.side = pos.side.toUpperCase();
-                botStatus.currentRoi = parseFloat(pos.percentage) || 0;
-                botStatus.currentPnl = parseFloat(pos.unrealizedPnl) || 0;
-                botStatus.lastQty = pos.contracts;
+                botStatus.side = activePos.side.toUpperCase();
+                botStatus.lastQty = activePos.contracts;
 
+                // Calculate ROI manually for Paper or use exchange value for Real
+                if (PAPER_TRADING) {
+                    const priceDiff = activePos.side === 'buy' ? (currentPrice - activePos.entryPrice) : (activePos.entryPrice - currentPrice);
+                    botStatus.currentRoi = (priceDiff / activePos.entryPrice) * LEVERAGE * 100;
+                    botStatus.currentPnl = (priceDiff * activePos.contracts * 0.1); // 1 contract = 0.1 TON
+                } else {
+                    botStatus.currentRoi = parseFloat(activePos.percentage) || 0;
+                    botStatus.currentPnl = parseFloat(activePos.unrealizedPnl) || 0;
+                }
+
+                // --- EXIT LOGIC ---
                 if (botStatus.currentRoi >= TAKE_PROFIT || botStatus.currentRoi <= STOP_LOSS) {
-                    await htx.createMarketOrder(SYMBOL, (pos.side === 'long' ? 'sell' : 'buy'), pos.contracts, undefined, {
-                        'lever_rate': LEVERAGE, 'offset': 'close', 'reduceOnly': true
-                    });
+                    if (PAPER_TRADING) {
+                        // Update Paper Balance
+                        await BotState.updateOne({ key: "paper_balance" }, { $inc: { value: botStatus.currentPnl } });
+                        await PaperPosition.deleteOne({ _id: activePos._id });
+                    } else {
+                        await htx.createMarketOrder(SYMBOL, (activePos.side === 'long' || activePos.side === 'buy' ? 'sell' : 'buy'), activePos.contracts, undefined, { 'reduceOnly': true });
+                    }
                     
                     await Trade.create({
-                        side: pos.side, entryPrice: pos.entryPrice, exitPrice: pos.markPrice,
+                        side: activePos.side, entryPrice: activePos.entryPrice, exitPrice: currentPrice,
                         roi: botStatus.currentRoi, pnl: botStatus.currentPnl, reason: "AUTO_EXIT"
                     });
                     await new Promise(r => setTimeout(r, 10000));
                 }
             } else {
+                // --- ENTRY LOGIC ---
                 botStatus.active = false;
-                const ticker = await htx.fetchTicker(SYMBOL);
-                const price = ticker.last;
+                botStatus.side = "IDLE";
+                botStatus.currentRoi = 0;
 
-                // --- FORMULA: (Balance / (Price * 0.1)) * 75 * Multiplier ---
-                const unitValue = price * 0.1;
+                const unitValue = currentPrice * 0.1;
                 const baseDiv = botStatus.availableBalance / unitValue;
                 const maxQty = Math.floor(baseDiv * LEVERAGE * MULTIPLIER);
 
                 if (maxQty >= 1 && botStatus.availableBalance > 0.01) {
                     const side = Math.random() > 0.5 ? 'buy' : 'sell';
-                    await htx.createMarketOrder(SYMBOL, side, maxQty, undefined, {
-                        'lever_rate': LEVERAGE, 'offset': 'open'
-                    });
+                    
+                    if (PAPER_TRADING) {
+                        await PaperPosition.create({ symbol: SYMBOL, side: side, entryPrice: currentPrice, contracts: maxQty });
+                    } else {
+                        await htx.createMarketOrder(SYMBOL, side, maxQty);
+                    }
                     botStatus.lastQty = maxQty;
                     botStatus.errorMsg = null;
                     await new Promise(r => setTimeout(r, 5000));
@@ -144,6 +182,10 @@ app.get('/api/history', async (req, res) => {
 });
 app.post('/api/reset-baseline', async (req, res) => {
     try {
+        if (PAPER_TRADING) {
+            await BotState.updateOne({ key: "paper_balance" }, { value: 1000 });
+            await PaperPosition.deleteMany({});
+        }
         await BotState.deleteOne({ key: "initial_balance" });
         await syncAccount();
         res.json({ success: true });
@@ -152,13 +194,13 @@ app.post('/api/reset-baseline', async (req, res) => {
 
 app.get('/', (req, res) => {
     res.send(`
-    <!DOCTYPE html><html><head><title>TON Alpha Extreme</title><script src="https://cdn.tailwindcss.com"></script>
+    <!DOCTYPE html><html><head><title>TON Paper Extreme</title><script src="https://cdn.tailwindcss.com"></script>
     <style>@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
     body{background:#020617;color:#f8fafc;font-family:'JetBrains+Mono',monospace;}.card{background:#0f172a;border:1px solid #1e293b;border-radius:12px;}</style></head>
     <body class="p-6 md:p-12"><div class="max-w-6xl mx-auto"><header class="flex justify-between items-center mb-10"><div>
     <h1 class="text-2xl font-bold tracking-tighter text-blue-500 uppercase font-black italic">TON.EXTREME.V4</h1>
-    <p class="text-[10px] text-slate-500 font-bold uppercase tracking-widest">Multiplier: ${MULTIPLIER}x | Leverage: ${LEVERAGE}x</p></div>
-    <button onclick="resetBaseline()" class="text-[10px] bg-slate-800 hover:bg-rose-900 px-4 py-2 rounded-lg font-bold border border-slate-700 transition-colors">RESET BASELINE</button>
+    <p class="text-[10px] text-rose-500 font-bold uppercase tracking-widest">${PAPER_TRADING ? '⚠️ PAPER TRADING MODE ENABLED' : 'LIVE TRADING ACTIVE'}</p></div>
+    <button onclick="resetBaseline()" class="text-[10px] bg-slate-800 hover:bg-rose-900 px-4 py-2 rounded-lg font-bold border border-slate-700 transition-colors">RESET PORTFOLIO</button>
     </header>
 
     <div id="err" class="mb-6 p-3 bg-rose-500/10 border border-rose-500/40 text-rose-500 text-[10px] font-bold rounded-lg text-center uppercase hidden"></div>
@@ -177,16 +219,16 @@ app.get('/', (req, res) => {
             <div id="g-pnl" class="text-4xl font-bold text-blue-400">+0.0000</div>
         </div>
         <div class="card p-8 border-t-2 border-slate-600">
-            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Baseline</div>
+            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Virtual Balance</div>
             <div id="s-bal" class="text-4xl font-bold text-slate-400">0.0000</div>
         </div>
     </div>
 
     <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
-        <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Live ROI</div><div id="roi" class="text-xl font-bold">0%</div></div>
+        <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Live Paper ROI</div><div id="roi" class="text-xl font-bold">0%</div></div>
         <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Active QTY</div><div id="qty" class="text-xl font-bold text-white">0</div></div>
-        <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Free Margin</div><div id="wallet" class="text-xl font-bold text-emerald-400">0</div></div>
-        <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Sync Time</div><div id="sync" class="text-xl font-bold text-blue-500">...</div></div>
+        <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Available Cash</div><div id="wallet" class="text-xl font-bold text-emerald-400">0</div></div>
+        <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Price Sync</div><div id="sync" class="text-xl font-bold text-blue-500">...</div></div>
     </div>
 
     <div class="card overflow-hidden"><table class="w-full text-left">
@@ -195,13 +237,13 @@ app.get('/', (req, res) => {
 
     <script>
     async function resetBaseline() {
-        if(confirm("Are you sure?")) { await fetch('/api/reset-baseline', { method: 'POST' }); location.reload(); }
+        if(confirm("Reset all paper stats and balance to $1000?")) { await fetch('/api/reset-baseline', { method: 'POST' }); location.reload(); }
     }
     async function update(){try{const res=await fetch('/api/status');const s=await res.json();
     document.getElementById('total-roi').innerText=s.totalClosedRoi.toFixed(2)+'%';
     document.getElementById('g-pct').innerText=s.growthPct.toFixed(2)+'%';
     document.getElementById('g-pnl').innerText=(s.growthPnl>=0?'+':'')+s.growthPnl.toFixed(4);
-    document.getElementById('s-bal').innerText=s.initialBalance.toFixed(4);
+    document.getElementById('s-bal').innerText=s.currentBalance.toFixed(2);
     document.getElementById('roi').innerText=s.currentRoi.toFixed(2)+'%';
     document.getElementById('roi').className='text-xl font-bold '+(s.currentRoi>=0?'text-emerald-400':'text-rose-500');
     document.getElementById('wallet').innerText=s.availableBalance.toFixed(4);
@@ -218,4 +260,4 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.listen(PORT, () => console.log(`🌐 Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🌐 ${PAPER_TRADING ? 'Paper' : 'Live'} Engine active on port ${PORT}`));
