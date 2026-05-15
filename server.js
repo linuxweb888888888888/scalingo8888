@@ -12,8 +12,8 @@ const PORT = process.env.PORT || 3000;
 const SYMBOL = 'TON/USDT:USDT';
 const LEVERAGE = 75;
 const MULTIPLIER = 1; 
-const TAKE_PROFIT = 10.0; 
-const STOP_LOSS = -30.0; 
+const TAKE_PROFIT = 10.0; // Exit at +10% ROI
+const STOP_LOSS = -30.0;  // Exit at -30% ROI
 
 // ==================== DATABASE ====================
 mongoose.connect(MONGO_URI).then(() => console.log(`✅ MongoDB Connected (${PAPER_TRADING ? 'PAPER' : 'REAL'} MODE)`));
@@ -58,10 +58,10 @@ let botStatus = {
 async function syncAccount() {
     try {
         if (PAPER_TRADING) {
-            // Paper Mode: Get balance from Database
+            // Paper Mode: Get balance from Database (Starting at $10.00)
             let balanceDoc = await BotState.findOne({ key: "paper_balance" });
             if (!balanceDoc) {
-                balanceDoc = await BotState.create({ key: "paper_balance", value: 1000.00 }); // Start with $1000 Paper Money
+                balanceDoc = await BotState.create({ key: "paper_balance", value: 10.00 }); 
             }
             botStatus.currentBalance = balanceDoc.value;
             botStatus.availableBalance = balanceDoc.value;
@@ -114,7 +114,6 @@ async function tradingLoop() {
                 botStatus.side = activePos.side.toUpperCase();
                 botStatus.lastQty = activePos.contracts;
 
-                // Calculate ROI manually for Paper or use exchange value for Real
                 if (PAPER_TRADING) {
                     const priceDiff = activePos.side === 'buy' ? (currentPrice - activePos.entryPrice) : (activePos.entryPrice - currentPrice);
                     botStatus.currentRoi = (priceDiff / activePos.entryPrice) * LEVERAGE * 100;
@@ -127,7 +126,6 @@ async function tradingLoop() {
                 // --- EXIT LOGIC ---
                 if (botStatus.currentRoi >= TAKE_PROFIT || botStatus.currentRoi <= STOP_LOSS) {
                     if (PAPER_TRADING) {
-                        // Update Paper Balance
                         await BotState.updateOne({ key: "paper_balance" }, { $inc: { value: botStatus.currentPnl } });
                         await PaperPosition.deleteOne({ _id: activePos._id });
                     } else {
@@ -150,6 +148,7 @@ async function tradingLoop() {
                 const baseDiv = botStatus.availableBalance / unitValue;
                 const maxQty = Math.floor(baseDiv * LEVERAGE * MULTIPLIER);
 
+                // Open trade if we can afford at least 1 contract
                 if (maxQty >= 1 && botStatus.availableBalance > 0.01) {
                     const side = Math.random() > 0.5 ? 'buy' : 'sell';
                     
@@ -180,10 +179,12 @@ app.get('/api/history', async (req, res) => {
     const history = await Trade.find().sort({ timestamp: -1 }).limit(10);
     res.json(history);
 });
+
 app.post('/api/reset-baseline', async (req, res) => {
     try {
         if (PAPER_TRADING) {
-            await BotState.updateOne({ key: "paper_balance" }, { value: 1000 });
+            // RESET TO $10.00
+            await BotState.updateOne({ key: "paper_balance" }, { value: 10.00 });
             await PaperPosition.deleteMany({});
         }
         await BotState.deleteOne({ key: "initial_balance" });
@@ -194,12 +195,12 @@ app.post('/api/reset-baseline', async (req, res) => {
 
 app.get('/', (req, res) => {
     res.send(`
-    <!DOCTYPE html><html><head><title>TON Paper Extreme</title><script src="https://cdn.tailwindcss.com"></script>
+    <!DOCTYPE html><html><head><title>TON Paper Extreme ($10)</title><script src="https://cdn.tailwindcss.com"></script>
     <style>@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
     body{background:#020617;color:#f8fafc;font-family:'JetBrains+Mono',monospace;}.card{background:#0f172a;border:1px solid #1e293b;border-radius:12px;}</style></head>
     <body class="p-6 md:p-12"><div class="max-w-6xl mx-auto"><header class="flex justify-between items-center mb-10"><div>
     <h1 class="text-2xl font-bold tracking-tighter text-blue-500 uppercase font-black italic">TON.EXTREME.V4</h1>
-    <p class="text-[10px] text-rose-500 font-bold uppercase tracking-widest">${PAPER_TRADING ? '⚠️ PAPER TRADING MODE ENABLED' : 'LIVE TRADING ACTIVE'}</p></div>
+    <p class="text-[10px] text-rose-500 font-bold uppercase tracking-widest">${PAPER_TRADING ? '⚠️ PAPER TRADING MODE ($10)' : 'LIVE TRADING ACTIVE'}</p></div>
     <button onclick="resetBaseline()" class="text-[10px] bg-slate-800 hover:bg-rose-900 px-4 py-2 rounded-lg font-bold border border-slate-700 transition-colors">RESET PORTFOLIO</button>
     </header>
 
@@ -237,7 +238,10 @@ app.get('/', (req, res) => {
 
     <script>
     async function resetBaseline() {
-        if(confirm("Reset all paper stats and balance to $1000?")) { await fetch('/api/reset-baseline', { method: 'POST' }); location.reload(); }
+        if(confirm("Reset all paper stats and balance to $10.00?")) { 
+            await fetch('/api/reset-baseline', { method: 'POST' }); 
+            location.reload(); 
+        }
     }
     async function update(){try{const res=await fetch('/api/status');const s=await res.json();
     document.getElementById('total-roi').innerText=s.totalClosedRoi.toFixed(2)+'%';
@@ -260,4 +264,4 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.listen(PORT, () => console.log(`🌐 ${PAPER_TRADING ? 'Paper' : 'Live'} Engine active on port ${PORT}`));
+app.listen(PORT, () => console.log(`🌐 TON Bot active on port ${PORT}. Mode: ${PAPER_TRADING ? 'PAPER ($10)' : 'REAL'}`));
