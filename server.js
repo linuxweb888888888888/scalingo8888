@@ -9,34 +9,23 @@ const exchange = new ccxt.htx({ 'enableRateLimit': true });
 
 let metrics = {
     totalScans: 0,
-    opportunitiesFound: 0,
     simulatedProfit: 0,
-    totalTurnover: 0,
     history: [],
-    systemLogs: [],      // Engine events
-    liveAnalysis: [],    // Current "best" failures or wins
+    liveAnalysis: [],    // Top ROI candidates
+    randomSample: [],    // Random variety of coins
     status: "Initializing...",
-    pathsTracked: 0
+    pathsTracked: 0,
+    uniqueCoins: 0
 };
 
 let monitoredPaths = [];
 
-// Helper to add logs
-function addLog(msg) {
-    const time = new Date().toLocaleTimeString();
-    metrics.systemLogs.unshift(`[${time}] ${msg}`);
-    if (metrics.systemLogs.length > 15) metrics.systemLogs.pop();
-}
-
-/**
- * 1. GRAPH BUILDER
- */
 async function mapAllMarkets() {
     try {
-        addLog("Fetching market data from HTX...");
         const markets = await exchange.loadMarkets();
         const symbols = Object.keys(markets);
         const adj = {}; 
+        const coinSet = new Set();
 
         symbols.forEach(symbol => {
             const market = markets[symbol];
@@ -47,18 +36,18 @@ async function mapAllMarkets() {
                 if (!adj[quote]) adj[quote] = [];
                 adj[base].push({ to: quote, pair: symbol });
                 adj[quote].push({ to: base, pair: symbol });
+                coinSet.add(base); coinSet.add(quote);
             }
         });
 
-        addLog("Analyzing connections for 3-5 step loops...");
+        metrics.uniqueCoins = coinSet.size;
         const paths = [];
         const findCycles = (currentCoin, path, pairs, depth) => {
-            if (depth > 5) return;
+            if (depth > 4) return;
             if (currentCoin === 'USDT' && depth >= 3) {
                 paths.push([...pairs]);
                 return;
             }
-            if (depth === 5) return;
             const neighbors = adj[currentCoin] || [];
             for (const edge of neighbors) {
                 if (!path.includes(edge.to) || (edge.to === 'USDT' && depth >= 2)) {
@@ -68,155 +57,109 @@ async function mapAllMarkets() {
         };
 
         findCycles('USDT', ['USDT'], [], 0);
-        monitoredPaths = Array.from(new Set(paths.map(JSON.stringify)), JSON.parse).slice(0, 1500);
+        // Track up to 1000 paths to ensure we cover all coins
+        monitoredPaths = paths.slice(0, 1000);
         metrics.pathsTracked = monitoredPaths.length;
-        addLog(`Engine Ready. Monitoring ${monitoredPaths.length} paths.`);
-    } catch (e) { addLog("Error: " + e.message); }
-}
-
-/**
- * 2. CORE CALCULATION
- */
-function calculateStep(balance, pair, currentCoin, tickers) {
-    const ticker = tickers[pair];
-    if (!ticker || !ticker.ask || !ticker.bid) return null;
-    const [base, quoteRaw] = pair.split('/');
-    const quote = quoteRaw.split(':')[0];
-
-    if (currentCoin === quote) {
-        return { 
-            amount: (balance / ticker.ask) * (1 - TAKER_FEE), 
-            nextCoin: base,
-            action: 'BUY' 
-        };
-    } else {
-        return { 
-            amount: (balance * ticker.bid) * (1 - TAKER_FEE), 
-            nextCoin: quote,
-            action: 'SELL' 
-        };
-    }
+    } catch (e) { metrics.status = "Error Mapping: " + e.message; }
 }
 
 async function startScanner() {
     try {
-        addLog(`Scan #${metrics.totalScans + 1} starting...`);
         const tickers = await exchange.fetchTickers();
-        let currentBatchAnalysis = [];
+        let batchData = [];
 
         for (const path of monitoredPaths) {
             let balance = WALLET_PRINCIPAL;
             let currentCoin = 'USDT';
-            let validPath = true;
+            let valid = true;
 
             for (const pair of path) {
-                const step = calculateStep(balance, pair, currentCoin, tickers);
-                if (!step) { validPath = false; break; }
-                balance = step.amount;
-                currentCoin = step.nextCoin;
+                const ticker = tickers[pair];
+                if (!ticker || !ticker.ask || !ticker.bid) { valid = false; break; }
+                const [base, quoteRaw] = pair.split('/');
+                const quote = quoteRaw.split(':')[0];
+
+                if (currentCoin === quote) {
+                    balance = (balance / ticker.ask) * (1 - TAKER_FEE);
+                    currentCoin = base;
+                } else {
+                    balance = (balance * ticker.bid) * (1 - TAKER_FEE);
+                    currentCoin = quote;
+                }
             }
 
-            if (!validPath) continue;
+            if (!valid) continue;
+            const roi = ((balance - WALLET_PRINCIPAL) / WALLET_PRINCIPAL) * 100;
+            batchData.push({ path: path.join('→'), roi });
 
-            const profit = balance - WALLET_PRINCIPAL;
-            const roi = (profit / WALLET_PRINCIPAL) * 100;
-
-            // Track for live analysis window (Top 5 closest to profit)
-            currentBatchAnalysis.push({ path: path.join('→'), roi });
-
-            if (roi > 0.01 && roi < 5) {
-                const pathStr = path.join(' → ');
-                metrics.opportunitiesFound++;
-                metrics.simulatedProfit += profit;
-                metrics.totalTurnover += (WALLET_PRINCIPAL * path.length);
-                metrics.history.unshift({
-                    path: pathStr,
-                    roi: roi.toFixed(4) + '%',
-                    profit: profit.toFixed(6),
-                    time: new Date().toLocaleTimeString()
-                });
-                if (metrics.history.length > 20) metrics.history.pop();
-                addLog(`PROFIT FOUND: ${pathStr} (${roi.toFixed(3)}%)`);
+            if (roi > 0.01) {
+                metrics.simulatedProfit += (balance - WALLET_PRINCIPAL);
+                metrics.history.unshift({ path: path.join('→'), roi: roi.toFixed(4) + '%', time: new Date().toLocaleTimeString() });
+                if (metrics.history.length > 10) metrics.history.pop();
             }
         }
 
-        // Update Analysis Window with top 5 candidates of this scan
-        metrics.liveAnalysis = currentBatchAnalysis
-            .sort((a, b) => b.roi - a.roi)
-            .slice(0, 5);
+        // 1. Update Top 10 ROI (Usually major pairs)
+        metrics.liveAnalysis = batchData.sort((a, b) => b.roi - a.roi).slice(0, 10);
+
+        // 2. Update Random Sample (To see "All Other Coins")
+        metrics.randomSample = [];
+        for (let i = 0; i < 8; i++) {
+            const randomIdx = Math.floor(Math.random() * batchData.length);
+            metrics.randomSample.push(batchData[randomIdx]);
+        }
 
         metrics.totalScans++;
-        addLog(`Scan #${metrics.totalScans} complete. Found ${currentBatchAnalysis.length} valid paths.`);
-    } catch (e) { addLog("Scan Error: " + e.message); }
+        metrics.status = "Scanning " + metrics.pathsTracked + " loops...";
+    } catch (e) { metrics.status = "Scan Error"; }
     setTimeout(startScanner, 1000);
 }
 
-/**
- * 3. WEB DASHBOARD
- */
 app.get('/', (req, res) => {
     res.send(`
         <html>
             <head>
-                <title>Engine Log - HTX Arb</title>
+                <title>Global Arb Monitor</title>
                 <meta http-equiv="refresh" content="5">
                 <style>
-                    body { font-family: 'Courier New', monospace; background: #0a0f1e; color: #cbd5e1; padding: 20px; line-height: 1.4; }
-                    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }
-                    .card { background: #1e293b; padding: 15px; border-radius: 8px; border-left: 4px solid #38bdf8; }
-                    .panel { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-                    .log-box { background: #000; border: 1px solid #334155; padding: 15px; height: 300px; overflow-y: auto; font-size: 0.85em; }
+                    body { font-family: monospace; background: #020617; color: #94a3b8; padding: 20px; }
+                    .stats { display: flex; gap: 20px; margin-bottom: 20px; }
+                    .card { background: #1e293b; padding: 15px; border-radius: 8px; flex: 1; border: 1px solid #334155; }
+                    .box { background: #000; border: 1px solid #334155; padding: 10px; margin-bottom: 20px; font-size: 0.85em; }
                     .green { color: #4ade80; }
                     .blue { color: #38bdf8; }
-                    .gold { color: #fbbf24; }
-                    table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
-                    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #1e293b; }
-                    h3 { border-bottom: 1px solid #334155; padding-bottom: 5px; color: #f8fafc; }
+                    h3 { color: #f1f5f9; margin-bottom: 10px; }
+                    table { width: 100%; border-collapse: collapse; }
+                    td { padding: 5px; border-bottom: 1px solid #1e293b; }
                 </style>
             </head>
             <body>
-                <h2>HTX ARBITRAGE ENGINE <small class="blue">v2.0 High-Speed</small></h2>
-                
+                <h2>HTX GLOBAL ARBITRAGE <small class="blue">${metrics.uniqueCoins} Coins Mapped</small></h2>
                 <div class="stats">
-                    <div class="card">Net Profit<br><span class="green" style="font-size:1.4em">$${metrics.simulatedProfit.toFixed(6)}</span></div>
-                    <div class="card">Total Scans<br><span class="gold" style="font-size:1.4em">${metrics.totalScans}</span></div>
-                    <div class="card">Paths Tracked<br><span style="font-size:1.4em">${metrics.pathsTracked}</span></div>
-                    <div class="card">Turnover Used<br><span class="blue" style="font-size:1.4em">$${metrics.totalTurnover.toLocaleString()}</span></div>
+                    <div class="card">Profit<br><span class="green" style="font-size:1.4em">$${metrics.simulatedProfit.toFixed(6)}</span></div>
+                    <div class="card">Total Scans<br><span style="font-size:1.4em">${metrics.totalScans}</span></div>
+                    <div class="card">Paths Active<br><span style="font-size:1.4em">${metrics.pathsTracked}</span></div>
                 </div>
 
-                <div class="panel">
-                    <div>
-                        <h3>Live Scanner Analysis (Current Batch)</h3>
-                        <div class="log-box">
-                            <table>
-                                <tr><th>Path Loop</th><th>ROI %</th></tr>
-                                ${metrics.liveAnalysis.map(a => `
-                                    <tr>
-                                        <td>${a.path}</td>
-                                        <td class="${a.roi > 0 ? 'green' : ''}">${a.roi.toFixed(4)}%</td>
-                                    </tr>
-                                `).join('')}
-                            </table>
-                            <p style="font-size: 0.8em; color: #64748b; margin-top: 10px;">
-                                * ROI must be > 0.00% to clear the 0.6% fee hurdle.
-                            </p>
-                        </div>
-                    </div>
-                    <div>
-                        <h3>System Event Log</h3>
-                        <div class="log-box">
-                            ${metrics.systemLogs.map(l => `<div>${l}</div>`).join('')}
-                        </div>
-                    </div>
+                <h3>Top 10 High-Efficiency Paths (Major Liquidity)</h3>
+                <div class="box">
+                    <table>
+                        ${metrics.liveAnalysis.map(a => `<tr><td>${a.path}</td><td class="green">${a.roi.toFixed(4)}%</td></tr>`).join('')}
+                    </table>
                 </div>
 
-                <h3>Confirmed Profit History</h3>
-                <table>
-                    <tr style="color:#94a3b8"><th>Path Strategy</th><th>Complexity</th><th>Net ROI</th><th>Profit</th><th>Time</th></tr>
-                    ${metrics.history.map(h => `
-                        <tr><td class="blue"><code>${h.path}</code></td><td>${h.path.split('→').length} steps</td><td class="green">${h.roi}</td><td class="green">$${h.profit}</td><td>${h.time}</td></tr>
-                    `).join('')}
-                </table>
+                <h3>Random Market Sample (Other Coins Verification)</h3>
+                <div class="box">
+                    <table>
+                        ${metrics.randomSample.map(a => `<tr><td>${a.path}</td><td>${a?.roi.toFixed(4)}%</td></tr>`).join('')}
+                    </table>
+                </div>
+
+                <h3>Confirmed Profit Logs</h3>
+                <div class="box">
+                    ${metrics.history.map(h => `<div>[${h.time}] <span class="green">${h.roi}</span> | ${h.path}</div>`).join('')}
+                    ${metrics.history.length === 0 ? 'Waiting for gap > 0.6%...' : ''}
+                </div>
             </body>
         </html>
     `);
