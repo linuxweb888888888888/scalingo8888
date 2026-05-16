@@ -55,7 +55,6 @@ let botStatus = {
     mode: PAPER_TRADING ? "PAPER" : "REAL"
 };
 
-// EMA Calculator for arrays
 function calculateEMA(series, length) {
     let k = 2 / (length + 1);
     let ema = [series[0]];
@@ -78,7 +77,6 @@ async function syncAccount() {
             botStatus.availableBalance = bal.free.USDT || 0;
         }
 
-        // Sync EMA Settings
         let sEma = await BotState.findOne({ key: "ema_short" });
         if (!sEma) sEma = await BotState.create({ key: "ema_short", value: 9 });
         botStatus.emaShort = sEma.value;
@@ -104,7 +102,6 @@ async function tradingLoop() {
             const emaS = calculateEMA(prices, botStatus.emaShort);
             const emaL = calculateEMA(prices, botStatus.emaLong);
 
-            // Crossover Detection
             const prevS = emaS[emaS.length - 2];
             const prevL = emaL[emaL.length - 2];
             const currS = emaS[emaS.length - 1];
@@ -123,17 +120,14 @@ async function tradingLoop() {
                 botStatus.currentRoi = (diff / activePos.entryPrice) * LEVERAGE * 100;
                 botStatus.currentPnl = (diff * activePos.contracts * 0.1);
 
-                // Exit on ROI or Opposite Crossover
                 const oppositeSignal = (activePos.side === 'buy' && signal === "SELL") || (activePos.side === 'sell' && signal === "BUY");
                 
                 if (botStatus.currentRoi >= TAKE_PROFIT || botStatus.currentRoi <= STOP_LOSS || oppositeSignal) {
                     await BotState.updateOne({ key: "paper_balance" }, { $inc: { value: botStatus.currentPnl } });
                     await PaperPosition.deleteOne({ _id: activePos._id });
-                    await Trade.create({ side: activePos.side, entryPrice: activePos.entryPrice, exitPrice: currentPrice, roi: botStatus.currentRoi, pnl: botStatus.currentPnl, reason: "CROSSOVER_EXIT" });
+                    await Trade.create({ side: activePos.side, entryPrice: activePos.entryPrice, exitPrice: currentPrice, roi: botStatus.currentRoi, pnl: botStatus.currentPnl, reason: "EXIT" });
                 }
             } else if (signal !== "NONE") {
-                // Entry on Crossover
-                botStatus.active = false;
                 const qty = Math.floor((botStatus.availableBalance / (currentPrice * 0.1)) * LEVERAGE);
                 if (qty >= 1) {
                     await PaperPosition.create({ symbol: SYMBOL, side: signal.toLowerCase(), entryPrice: currentPrice, contracts: qty });
@@ -173,18 +167,18 @@ app.post('/api/reset-baseline', async (req, res) => {
 
 app.get('/', (req, res) => {
     res.send(`
-    <!DOCTYPE html><html><head><title>TON Crossover Extreme</title>
+    <!DOCTYPE html><html><head><title>TON Smooth Crossover</title>
     <script src="https://cdn.tailwindcss.com"></script><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
     body{background:#020617;color:#f8fafc;font-family:'JetBrains+Mono',monospace;}.card{background:#0f172a;border:1px solid #1e293b;border-radius:12px;}</style></head>
     <body class="p-6 md:p-12"><div class="max-w-6xl mx-auto"><header class="flex justify-between items-center mb-10"><div>
-    <h1 class="text-2xl font-bold text-blue-500 italic uppercase">TON.CROSSOVER.V4</h1>
+    <h1 class="text-2xl font-bold text-blue-500 italic uppercase">TON.SMOOTH.V4</h1>
     <p class="text-[10px] text-rose-500 font-bold uppercase tracking-widest">⚠️ PAPER MODE ($10)</p></div>
     <div class="flex gap-2">
         <div class="flex items-center gap-2 bg-slate-800 px-3 py-1 rounded-lg border border-slate-700 text-[10px] font-bold">
-            SHORT: <input id="eS" type="number" class="bg-transparent w-8 text-blue-400 outline-none" value="9">
-            LONG: <input id="eL" type="number" class="bg-transparent w-8 text-yellow-400 outline-none" value="21">
-            <button onclick="save()" class="text-emerald-400 hover:text-white">SAVE</button>
+            S: <input id="eS" type="number" class="bg-transparent w-8 text-blue-400 outline-none" value="9">
+            L: <input id="eL" type="number" class="bg-transparent w-8 text-yellow-400 outline-none" value="21">
+            <button onclick="save()" class="text-emerald-400">SAVE</button>
         </div>
         <button onclick="reset()" class="bg-slate-800 px-4 py-2 rounded-lg text-[10px] font-bold border border-slate-700">RESET</button>
     </div></header>
@@ -196,7 +190,7 @@ app.get('/', (req, res) => {
         <div class="card p-6 border-t-2 border-yellow-500"><div class="text-slate-500 text-[10px]">TOTAL ROI</div><div id="t-roi" class="text-xl font-bold text-yellow-400">0%</div></div>
     </div>
 
-    <div class="card p-6 mb-8"><canvas id="c" height="100"></canvas></div>
+    <div class="card p-6 mb-8" style="height:350px;"><canvas id="c"></canvas></div>
     <div class="card overflow-hidden"><table class="w-full text-left text-xs"><tbody id="h"></tbody></table></div></div>
 
     <script>
@@ -205,12 +199,17 @@ app.get('/', (req, res) => {
     async function reset(){ if(confirm("Reset to $10?")) { await fetch('/api/reset-baseline', { method: 'POST' }); location.reload(); } }
     
     function initChart() {
-        chart = new Chart(document.getElementById('c').getContext('2d'), {
+        const ctx = document.getElementById('c').getContext('2d');
+        const grad = ctx.createLinearGradient(0, 0, 0, 400);
+        grad.addColorStop(0, 'rgba(59, 130, 246, 0.2)');
+        grad.addColorStop(1, 'rgba(59, 130, 246, 0)');
+
+        chart = new Chart(ctx, {
             type: 'line', data: { labels: [], datasets: [
-                { label: 'Price', data: [], borderColor: '#3b82f6', tension: 0.1, borderWidth: 2, pointRadius: 0 },
-                { label: 'Short EMA', data: [], borderColor: '#60a5fa', tension: 0.4, borderWidth: 1, pointRadius: 0, borderDash:[2,2] },
-                { label: 'Long EMA', data: [], borderColor: '#fbbf24', tension: 0.4, borderWidth: 1, pointRadius: 0 }
-            ]}, options: { plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { grid: { color: '#1e293b' }, ticks: { color: '#64748b' } } } }
+                { label: 'Price', data: [], borderColor: '#3b82f6', tension: 0.4, cubicInterpolationMode: 'monotone', borderWidth: 3, pointRadius: 0, fill: true, backgroundColor: grad },
+                { label: 'Short', data: [], borderColor: '#60a5fa', tension: 0.4, borderWidth: 1, pointRadius: 0, borderDash:[3,3] },
+                { label: 'Long', data: [], borderColor: '#fbbf24', tension: 0.4, borderWidth: 1, pointRadius: 0 }
+            ]}, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { grid: { color: '#1e293b' }, ticks: { color: '#64748b' } } } }
         });
     }
 
@@ -223,8 +222,7 @@ app.get('/', (req, res) => {
             document.getElementById('t-roi').innerText = s.totalClosedRoi.toFixed(2)+'%';
             document.getElementById('side').innerText = s.side;
             document.getElementById('side').className = 'text-xl font-bold ' + (s.side === 'BUY' ? 'text-emerald-400' : (s.side === 'SELL' ? 'text-rose-500' : 'text-white'));
-            document.getElementById('eS').value = s.emaShort; document.getElementById('eL').value = s.emaLong;
-
+            
             const cRes = await fetch('/api/chart'); const cData = await cRes.json();
             chart.data.labels = cData.t; chart.data.datasets[0].data = cData.p;
             chart.data.datasets[1].data = cData.s; chart.data.datasets[2].data = cData.l;
@@ -239,4 +237,4 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.listen(PORT, () => console.log("🌐 Server active. Initial balance: $10.00"));
+app.listen(PORT, () => console.log("🌐 Server active."));
