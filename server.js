@@ -6,7 +6,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 const exchange = new ccxt.htx({ 'enableRateLimit': true });
 const STARTING_BALANCE = 1000; 
-const TRADING_FEE = 0.002; // 0.2% per leg
+const TRADING_FEE = 0.0002; // 0.2% per leg
 const SCAN_DELAY = 100;    // Milliseconds to wait between API calls (Prevents IP ban)
 
 let metrics = {
