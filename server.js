@@ -7,7 +7,7 @@ const exchange = new ccxt.htx({ 'enableRateLimit': true });
 
 // --- REALISTIC SETTINGS ---
 const WALLET_PRINCIPAL = 10.00; // The only money you actually "own"
-const TAKER_FEE = 0.001;        // 20 bps
+const TAKER_FEE = 0.0005;        // 20 bps
 
 let metrics = {
     totalScans: 0,
