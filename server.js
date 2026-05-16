@@ -27,7 +27,6 @@ const BotState = mongoose.model('Bot_State', new mongoose.Schema({
     key: String, value: Number, startDate: { type: Date, default: Date.now }
 }));
 
-// Collection to store paper positions
 const PaperPosition = mongoose.model('Paper_Position', new mongoose.Schema({
     symbol: String, side: String, entryPrice: Number, contracts: Number, timestamp: { type: Date, default: Date.now }
 }));
@@ -58,22 +57,19 @@ let botStatus = {
 async function syncAccount() {
     try {
         if (PAPER_TRADING) {
-            // Paper Mode: Get balance from Database
             let balanceDoc = await BotState.findOne({ key: "paper_balance" });
             if (!balanceDoc) {
-                // CHANGE: Initialized to 10.00 instead of 1000
+                // STARTING VIRTUAL BALANCE: $10.00
                 balanceDoc = await BotState.create({ key: "paper_balance", value: 10.00 }); 
             }
             botStatus.currentBalance = balanceDoc.value;
             botStatus.availableBalance = balanceDoc.value;
         } else {
-            // Real Mode: Get balance from HTX
             const bal = await htx.fetchBalance({ type: 'swap' });
             botStatus.currentBalance = (bal.total && bal.total.USDT) ? bal.total.USDT : 0;
             botStatus.availableBalance = (bal.free && bal.free.USDT) ? bal.free.USDT : 0;
         }
 
-        // Global Stats
         const history = await Trade.find();
         botStatus.totalClosedRoi = history.reduce((sum, trade) => sum + (trade.roi || 0), 0);
 
@@ -110,25 +106,21 @@ async function tradingLoop() {
             }
 
             if (activePos) {
-                // --- POSITION TRACKING ---
                 botStatus.active = true;
                 botStatus.side = activePos.side.toUpperCase();
                 botStatus.lastQty = activePos.contracts;
 
-                // Calculate ROI manually for Paper or use exchange value for Real
                 if (PAPER_TRADING) {
                     const priceDiff = activePos.side === 'buy' ? (currentPrice - activePos.entryPrice) : (activePos.entryPrice - currentPrice);
                     botStatus.currentRoi = (priceDiff / activePos.entryPrice) * LEVERAGE * 100;
-                    botStatus.currentPnl = (priceDiff * activePos.contracts * 0.1); // 1 contract = 0.1 TON
+                    botStatus.currentPnl = (priceDiff * activePos.contracts * 0.1); 
                 } else {
                     botStatus.currentRoi = parseFloat(activePos.percentage) || 0;
                     botStatus.currentPnl = parseFloat(activePos.unrealizedPnl) || 0;
                 }
 
-                // --- EXIT LOGIC ---
                 if (botStatus.currentRoi >= TAKE_PROFIT || botStatus.currentRoi <= STOP_LOSS) {
                     if (PAPER_TRADING) {
-                        // Update Paper Balance
                         await BotState.updateOne({ key: "paper_balance" }, { $inc: { value: botStatus.currentPnl } });
                         await PaperPosition.deleteOne({ _id: activePos._id });
                     } else {
@@ -142,7 +134,6 @@ async function tradingLoop() {
                     await new Promise(r => setTimeout(r, 10000));
                 }
             } else {
-                // --- ENTRY LOGIC ---
                 botStatus.active = false;
                 botStatus.side = "IDLE";
                 botStatus.currentRoi = 0;
@@ -181,11 +172,11 @@ app.get('/api/history', async (req, res) => {
     const history = await Trade.find().sort({ timestamp: -1 }).limit(10);
     res.json(history);
 });
+
 app.post('/api/reset-baseline', async (req, res) => {
     try {
         if (PAPER_TRADING) {
-            // CHANGE: Reset to 10 instead of 1000
-            await BotState.updateOne({ key: "paper_balance" }, { value: 10 });
+            await BotState.updateOne({ key: "paper_balance" }, { value: 10.00 });
             await PaperPosition.deleteMany({});
         }
         await BotState.deleteOne({ key: "initial_balance" });
@@ -196,7 +187,7 @@ app.post('/api/reset-baseline', async (req, res) => {
 
 app.get('/', (req, res) => {
     res.send(`
-    <!DOCTYPE html><html><head><title>TON Paper Extreme</title><script src="https://cdn.tailwindcss.com"></script>
+    <!DOCTYPE html><html><head><title>TON Paper Extreme ($10)</title><script src="https://cdn.tailwindcss.com"></script>
     <style>@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
     body{background:#020617;color:#f8fafc;font-family:'JetBrains+Mono',monospace;}.card{background:#0f172a;border:1px solid #1e293b;border-radius:12px;}</style></head>
     <body class="p-6 md:p-12"><div class="max-w-6xl mx-auto"><header class="flex justify-between items-center mb-10"><div>
@@ -208,27 +199,15 @@ app.get('/', (req, res) => {
     <div id="err" class="mb-6 p-3 bg-rose-500/10 border border-rose-500/40 text-rose-500 text-[10px] font-bold rounded-lg text-center uppercase hidden"></div>
     
     <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
-        <div class="card p-8 border-t-2 border-yellow-500">
-            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Total Closed ROI</div>
-            <div id="total-roi" class="text-4xl font-bold text-yellow-400">0.00%</div>
-        </div>
-        <div class="card p-8 border-t-2 border-emerald-500">
-            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Growth %</div>
-            <div id="g-pct" class="text-4xl font-bold text-emerald-400">0.00%</div>
-        </div>
-        <div class="card p-8 border-t-2 border-blue-500">
-            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Session PnL</div>
-            <div id="g-pnl" class="text-4xl font-bold text-blue-400">+0.0000</div>
-        </div>
-        <div class="card p-8 border-t-2 border-slate-600">
-            <div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Virtual Balance</div>
-            <div id="s-bal" class="text-4xl font-bold text-slate-400">0.0000</div>
-        </div>
+        <div class="card p-8 border-t-2 border-yellow-500"><div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Total Closed ROI</div><div id="total-roi" class="text-4xl font-bold text-yellow-400">0.00%</div></div>
+        <div class="card p-8 border-t-2 border-emerald-500"><div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Growth %</div><div id="g-pct" class="text-4xl font-bold text-emerald-400">0.00%</div></div>
+        <div class="card p-8 border-t-2 border-blue-500"><div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Session PnL</div><div id="g-pnl" class="text-4xl font-bold text-blue-400">+0.0000</div></div>
+        <div class="card p-8 border-t-2 border-slate-600"><div class="text-slate-500 text-[10px] uppercase font-bold mb-2 tracking-widest">Virtual Balance</div><div id="s-bal" class="text-4xl font-bold text-slate-400">0.0000</div></div>
     </div>
 
     <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
-        <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Live Paper ROI</div><div id="roi" class="text-xl font-bold">0%</div></div>
-        <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Active QTY</div><div id="qty" class="text-xl font-bold text-white">0</div></div>
+        <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Direction</div><div id="side-display" class="text-xl font-bold text-white">IDLE</div></div>
+        <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Live ROI</div><div id="roi" class="text-xl font-bold text-white">0%</div></div>
         <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Available Cash</div><div id="wallet" class="text-xl font-bold text-emerald-400">0</div></div>
         <div class="card p-6 text-center"><div class="text-slate-500 text-[10px] mb-1 uppercase">Price Sync</div><div id="sync" class="text-xl font-bold text-blue-500">...</div></div>
     </div>
@@ -239,8 +218,7 @@ app.get('/', (req, res) => {
 
     <script>
     async function resetBaseline() {
-        // CHANGE: Confirm text updated to $10
-        if(confirm("Reset all paper stats and balance to $10?")) { await fetch('/api/reset-baseline', { method: 'POST' }); location.reload(); }
+        if(confirm("Reset all paper stats and balance to $10.00?")) { await fetch('/api/reset-baseline', { method: 'POST' }); location.reload(); }
     }
     async function update(){try{const res=await fetch('/api/status');const s=await res.json();
     document.getElementById('total-roi').innerText=s.totalClosedRoi.toFixed(2)+'%';
@@ -249,8 +227,13 @@ app.get('/', (req, res) => {
     document.getElementById('s-bal').innerText=s.currentBalance.toFixed(2);
     document.getElementById('roi').innerText=s.currentRoi.toFixed(2)+'%';
     document.getElementById('roi').className='text-xl font-bold '+(s.currentRoi>=0?'text-emerald-400':'text-rose-500');
+    
+    // DIRECTION LOGIC
+    const sideEl = document.getElementById('side-display');
+    sideEl.innerText = s.side;
+    sideEl.className = 'text-xl font-bold ' + (s.side === 'BUY' ? 'text-emerald-400' : (s.side === 'SELL' ? 'text-rose-500' : 'text-white'));
+
     document.getElementById('wallet').innerText=s.availableBalance.toFixed(4);
-    document.getElementById('qty').innerText=s.lastQty;
     document.getElementById('sync').innerText=s.lastUpdate;
     const e=document.getElementById('err');if(s.errorMsg){e.innerText=s.errorMsg;e.classList.remove('hidden');}else{e.classList.add('hidden');}
     const hRes=await fetch('/api/history');const history=await hRes.json();
@@ -263,4 +246,4 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.listen(PORT, () => console.log(`🌐 ${PAPER_TRADING ? 'Paper' : 'Live'} Engine active on port ${PORT}`));
+app.listen(PORT, () => console.log(`🌐 Engine active on port ${PORT}`));
