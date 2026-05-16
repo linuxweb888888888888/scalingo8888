@@ -2,32 +2,27 @@ const ccxt = require('ccxt');
 const express = require('express');
 const app = express();
 
-// --- CONFIGURATION ---
 const port = process.env.PORT || 3000;
-const WALLET_PRINCIPAL = 10.00; // Your actual starting capital
-const TAKER_FEE = 0.0002;        // 20 bps (Standard HTX Taker Fee)
+const WALLET_PRINCIPAL = 10.00;
+const TAKER_FEE = 0.002; // 0.2% fee
 const exchange = new ccxt.htx({ 'enableRateLimit': true });
 
 let metrics = {
     totalScans: 0,
     opportunitiesFound: 0,
     simulatedProfit: 0,
-    totalVolume: 0,         // Cumulative turnover (Used amount)
+    totalVolume: 0,
     history: [],
+    liveLogs: [], // New: Store the last few checks
     status: "Initializing...",
-    lastLatency: 0,
     pathsTracked: 0
 };
 
 let monitoredPaths = [];
 
-/**
- * PATH DISCOVERY
- * Uses Depth-Limited Search to find cycles from 3 to 5 steps starting at USDT
- */
 async function findDeepPaths() {
     try {
-        metrics.status = "Building market graph...";
+        metrics.status = "Mapping market graph...";
         const markets = await exchange.loadMarkets();
         const adj = {}; 
 
@@ -43,7 +38,7 @@ async function findDeepPaths() {
 
         const paths = [];
         const find = (currentCoin, path, pairs, depth) => {
-            if (depth > 5) return;
+            if (depth > 4) return; // Reduced to 4 for faster debug scanning
             if (currentCoin === 'USDT' && depth >= 3) {
                 paths.push([...pairs]);
                 return;
@@ -57,36 +52,23 @@ async function findDeepPaths() {
         };
 
         find('USDT', ['USDT'], [], 0);
-        // Limit to 600 paths to maintain high-speed scanning on cloud CPU
-        monitoredPaths = paths.sort((a, b) => a.length - b.length).slice(0, 600); 
+        monitoredPaths = paths.slice(0, 400); 
         metrics.pathsTracked = monitoredPaths.length;
-        metrics.status = "Market mapped. Starting scans...";
-    } catch (e) { 
-        metrics.status = "Error loading markets: " + e.message;
-    }
+    } catch (e) { metrics.status = "Discovery Error"; }
 }
 
-/**
- * TRADE EXECUTION LOGIC
- * Correctly determines Buy/Sell direction and applies fees at every leg
- */
 function executePath(path, tickers) {
     let balance = WALLET_PRINCIPAL;
     let currentCoin = 'USDT';
-
     for (const pair of path) {
         const ticker = tickers[pair];
-        if (!ticker || !ticker.ask || !ticker.bid) return 0;
-        
+        if (!ticker || !ticker.ask || !ticker.bid) return null;
         const [base, quoteRaw] = pair.split('/');
         const quote = quoteRaw.split(':')[0];
-
         if (currentCoin === quote) {
-            // We have USDT (Quote), we want BTC (Base) -> BUY
             balance = (balance / ticker.ask) * (1 - TAKER_FEE);
             currentCoin = base;
         } else {
-            // We have BTC (Base), we want USDT (Quote) -> SELL
             balance = (balance * ticker.bid) * (1 - TAKER_FEE);
             currentCoin = quote;
         }
@@ -94,104 +76,100 @@ function executePath(path, tickers) {
     return balance;
 }
 
-/**
- * SCANNER ENGINE
- */
 async function scan() {
-    const start = Date.now();
     try {
         const tickers = await exchange.fetchTickers();
+        let bestPathInThisScan = null;
+        let highestRoiFound = -999;
+
         for (const path of monitoredPaths) {
             const finalBalance = executePath(path, tickers);
+            if (finalBalance === null) continue;
+
             const profit = finalBalance - WALLET_PRINCIPAL;
             const roi = (profit / WALLET_PRINCIPAL) * 100;
 
-            // Threshold: 0.01% Net Profit after all fees
-            if (roi > 0.01 && roi < 3) {
+            // Track the "Best of the Batch" for the debug log
+            if (roi > highestRoiFound) {
+                highestRoiFound = roi;
+                bestPathInThisScan = { path: path.join('→'), roi };
+            }
+
+            // Real Profit Logging
+            if (roi > 0.01 && roi < 5) {
                 const pathKey = path.join('>');
                 const lastSeen = metrics.history.find(h => h.path === pathKey);
-                
-                // 10-second cooldown per path to prevent dashboard spam
-                if (!lastSeen || (Date.now() - lastSeen.ts > 10000)) {
+                if (!lastSeen || (Date.now() - lastSeen.ts > 15000)) {
                     metrics.opportunitiesFound++;
                     metrics.simulatedProfit += profit;
                     metrics.totalVolume += (WALLET_PRINCIPAL * path.length);
-
                     metrics.history.unshift({
                         path: path.join(' → '),
-                        steps: path.length,
                         roi: roi.toFixed(4) + '%',
-                        profit: profit.toFixed(6) + ' USDT',
+                        profit: profit.toFixed(6),
                         time: new Date().toLocaleTimeString(),
                         ts: Date.now()
                     });
-                    if (metrics.history.length > 30) metrics.history.pop();
                 }
             }
         }
+
+        // Add to Live Debug Logs
+        if (bestPathInThisScan) {
+            const logEntry = `[${new Date().toLocaleTimeString()}] Best candidate: ${bestPathInThisScan.path} | ROI: ${highestRoiFound.toFixed(4)}%`;
+            metrics.liveLogs.unshift(logEntry);
+            if (metrics.liveLogs.length > 10) metrics.liveLogs.pop();
+        }
+
         metrics.totalScans++;
-        metrics.lastLatency = Date.now() - start;
-        metrics.status = "Running High-Speed Scan";
-    } catch (e) {
-        metrics.status = "Scan latency error: " + e.message;
-    }
-    setTimeout(scan, 400); // Respect API rate limits
+        metrics.status = `Scanning ${metrics.pathsTracked} paths...`;
+    } catch (e) { metrics.status = "API Error: " + e.message; }
+    setTimeout(scan, 800);
 }
 
-/**
- * WEB DASHBOARD
- */
 app.get('/', (req, res) => {
-    const efficiency = metrics.totalVolume > 0 ? (metrics.simulatedProfit / metrics.totalVolume * 100).toFixed(4) : 0;
     res.send(`
         <html>
             <head>
-                <title>HTX Arb Efficiency</title>
+                <title>Arb Debugger</title>
                 <meta http-equiv="refresh" content="5">
                 <style>
-                    body { font-family: -apple-system, sans-serif; background: #0f172a; color: #f8fafc; padding: 20px; }
-                    .container { max-width: 1100px; margin: auto; }
-                    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; margin-bottom: 30px; }
-                    .card { background: #1e293b; padding: 20px; border-radius: 12px; border: 1px solid #334155; }
-                    .label { color: #94a3b8; font-size: 0.75rem; text-transform: uppercase; margin-bottom: 8px; }
-                    .val { font-size: 1.5rem; font-weight: bold; color: #38bdf8; }
-                    .success { color: #4ade80; }
-                    table { width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 12px; overflow: hidden; }
-                    th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #334155; }
-                    th { background: #334155; color: #94a3b8; font-size: 0.8rem; }
-                    code { background: #0f172a; padding: 4px 8px; border-radius: 4px; color: #e2e8f0; }
+                    body { font-family: monospace; background: #0a0a0a; color: #00ff00; padding: 20px; }
+                    .card { border: 1px solid #333; padding: 15px; margin-bottom: 20px; background: #111; }
+                    .log-window { background: #000; border: 1px solid #444; padding: 10px; height: 200px; overflow-y: auto; color: #aaa; font-size: 0.9em; }
+                    .profit { color: #00ff00; font-weight: bold; font-size: 1.2em; }
+                    .fail { color: #ff4444; }
+                    table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+                    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #222; }
                 </style>
             </head>
             <body>
-                <div class="container">
-                    <h1>HTX Arbitrage Realism Dashboard</h1>
-                    <p style="color:#94a3b8">Status: ${metrics.status}</p>
-                    
-                    <div class="stats">
-                        <div class="card"><div class="label">Capital Required</div><div class="val">$${WALLET_PRINCIPAL.toFixed(2)} USDT</div></div>
-                        <div class="card"><div class="label">Net Profit Earned</div><div class="val success">$${metrics.simulatedProfit.toFixed(4)}</div></div>
-                        <div class="card"><div class="label">Turnover (Volume Used)</div><div class="val">$${metrics.totalVolume.toLocaleString()}</div></div>
-                        <div class="card"><div class="label">Capture Efficiency</div><div class="val">${efficiency}%</div><div style="font-size:0.7em; color:#94a3b8">Profit per $100 traded</div></div>
-                    </div>
-
-                    <h3>Execution Log (Latest Profit Windows)</h3>
-                    <table>
-                        <thead>
-                            <tr><th>Path Strategy</th><th>Complexity</th><th>Net ROI</th><th>Net Win</th><th>Time</th></tr>
-                        </thead>
-                        <tbody>
-                            ${metrics.history.map(o => `
-                                <tr>
-                                    <td><code>${o.path}</code></td>
-                                    <td>${o.steps} Legs</td>
-                                    <td class="success">${o.roi}</td>
-                                    <td class="success">$${o.profit}</td>
-                                    <td style="color:#64748b">${o.time}</td>
-                                </tr>
-                            `).join('')}
-                        </tbody>
-                    </table>
+                <h1>HTX ARB DEBUGGER v1.0</h1>
+                <div class="card">
+                    <div>Status: ${metrics.status}</div>
+                    <div>Total Scans: ${metrics.totalScans}</div>
+                    <div>Paths Mapped: ${metrics.pathsTracked}</div>
+                    <div class="profit">Net Profit: $${metrics.simulatedProfit.toFixed(6)} USDT</div>
                 </div>
+
+                <h3>Live Scanner Activity (Raw Output)</h3>
+                <div class="log-window">
+                    ${metrics.liveLogs.map(log => `<div>${log}</div>`).join('')}
+                </div>
+
+                <h3>Confirmed Profit Opportunities</h3>
+                <table>
+                    <tr><th>Path</th><th>Net ROI</th><th>Profit</th><th>Time</th></tr>
+                    ${metrics.history.length === 0 ? '<tr><td colspan="4">No paths have cleared the 0.6% fee hurdle yet...</td></tr>' : ''}
+                    ${metrics.history.map(o => `
+                        <tr><td>${o.path}</td><td>${o.roi}</td><td>$${o.profit}</td><td>${o.time}</td></tr>
+                    `).join('')}
+                </table>
+
+                <p style="color: #666; margin-top: 20px;">
+                    Note: If "Best candidate" ROI is negative (e.g. -0.2500%), it means the price gap is too small to cover the fees. 
+                    Opportunities only appear in the bottom table when ROI > 0.
+                </p>
             </body>
         </html>
     `);
@@ -200,5 +178,4 @@ app.get('/', (req, res) => {
 app.listen(port, async () => {
     await findDeepPaths();
     scan();
-    console.log(`Bot active on port ${port}`);
 });
