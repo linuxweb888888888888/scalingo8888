@@ -2,10 +2,9 @@ const ccxt = require('ccxt');
 const express = require('express');
 const app = express();
 
-// --- CONFIGURATION ---
 const port = process.env.PORT || 3000;
 const WALLET_PRINCIPAL = 10.00; 
-const TAKER_FEE = 0.0002; // 0.2%
+const TAKER_FEE = 0.0002; 
 const exchange = new ccxt.htx({ 'enableRateLimit': true });
 
 let metrics = {
@@ -14,57 +13,54 @@ let metrics = {
     simulatedProfit: 0,
     totalTurnover: 0,
     history: [],
-    liveDebug: "Initializing graph...",
-    pathsTracked: 0,
-    lastLatency: 0
+    systemLogs: [],      // Engine events
+    liveAnalysis: [],    // Current "best" failures or wins
+    status: "Initializing...",
+    pathsTracked: 0
 };
 
 let monitoredPaths = [];
 
+// Helper to add logs
+function addLog(msg) {
+    const time = new Date().toLocaleTimeString();
+    metrics.systemLogs.unshift(`[${time}] ${msg}`);
+    if (metrics.systemLogs.length > 15) metrics.systemLogs.pop();
+}
+
 /**
- * 1. DYNAMIC GRAPH BUILDER
- * This function crawls every single active spot market on HTX
+ * 1. GRAPH BUILDER
  */
 async function mapAllMarkets() {
     try {
-        metrics.liveDebug = "Fetching all active spot markets...";
+        addLog("Fetching market data from HTX...");
         const markets = await exchange.loadMarkets();
         const symbols = Object.keys(markets);
-        
-        const adj = {}; // Adjacency list for the graph
+        const adj = {}; 
 
-        // Filter only for spot markets and build the connection map
         symbols.forEach(symbol => {
             const market = markets[symbol];
             if (market.type === 'spot' && market.active) {
                 const [base, quoteRaw] = symbol.split('/');
                 const quote = quoteRaw.split(':')[0];
-
                 if (!adj[base]) adj[base] = [];
                 if (!adj[quote]) adj[quote] = [];
-
                 adj[base].push({ to: quote, pair: symbol });
                 adj[quote].push({ to: base, pair: symbol });
             }
         });
 
-        metrics.liveDebug = "Finding all possible loops (3-5 steps)...";
+        addLog("Analyzing connections for 3-5 step loops...");
         const paths = [];
-        
-        // Recursive Depth-Limited Search to find cycles
         const findCycles = (currentCoin, path, pairs, depth) => {
             if (depth > 5) return;
-            
-            // If we found a path back to USDT and it's long enough
             if (currentCoin === 'USDT' && depth >= 3) {
                 paths.push([...pairs]);
                 return;
             }
             if (depth === 5) return;
-
             const neighbors = adj[currentCoin] || [];
             for (const edge of neighbors) {
-                // Avoid visiting the same coin twice in one cycle (except USDT at the end)
                 if (!path.includes(edge.to) || (edge.to === 'USDT' && depth >= 2)) {
                     findCycles(edge.to, [...path, edge.to], [...pairs, edge.pair], depth + 1);
                 }
@@ -72,120 +68,153 @@ async function mapAllMarkets() {
         };
 
         findCycles('USDT', ['USDT'], [], 0);
-
-        // Deduplicate and prioritize high-volume paths
-        // We limit to 2000 paths to ensure the bot stays high-speed on cloud CPUs
-        monitoredPaths = Array.from(new Set(paths.map(JSON.stringify)), JSON.parse).slice(0, 2000);
-        
+        monitoredPaths = Array.from(new Set(paths.map(JSON.stringify)), JSON.parse).slice(0, 1500);
         metrics.pathsTracked = monitoredPaths.length;
-        metrics.liveDebug = `Active: Monitoring ${monitoredPaths.length} loops across all coins.`;
-    } catch (e) {
-        metrics.liveDebug = "Error mapping markets: " + e.message;
-    }
+        addLog(`Engine Ready. Monitoring ${monitoredPaths.length} paths.`);
+    } catch (e) { addLog("Error: " + e.message); }
 }
 
 /**
- * 2. ARBITRAGE ENGINE
+ * 2. CORE CALCULATION
  */
-function calculateProfit(path, tickers) {
-    let balance = WALLET_PRINCIPAL;
-    let currentCoin = 'USDT';
+function calculateStep(balance, pair, currentCoin, tickers) {
+    const ticker = tickers[pair];
+    if (!ticker || !ticker.ask || !ticker.bid) return null;
+    const [base, quoteRaw] = pair.split('/');
+    const quote = quoteRaw.split(':')[0];
 
-    for (const pair of path) {
-        const ticker = tickers[pair];
-        if (!ticker || !ticker.ask || !ticker.bid) return null;
-
-        const [base, quoteRaw] = pair.split('/');
-        const quote = quoteRaw.split(':')[0];
-
-        if (currentCoin === quote) {
-            // Buying base with quote (e.g. USDT -> BTC)
-            balance = (balance / ticker.ask) * (1 - TAKER_FEE);
-            currentCoin = base;
-        } else {
-            // Selling base for quote (e.g. BTC -> USDT)
-            balance = (balance * ticker.bid) * (1 - TAKER_FEE);
-            currentCoin = quote;
-        }
+    if (currentCoin === quote) {
+        return { 
+            amount: (balance / ticker.ask) * (1 - TAKER_FEE), 
+            nextCoin: base,
+            action: 'BUY' 
+        };
+    } else {
+        return { 
+            amount: (balance * ticker.bid) * (1 - TAKER_FEE), 
+            nextCoin: quote,
+            action: 'SELL' 
+        };
     }
-    return balance;
 }
 
 async function startScanner() {
-    const startTick = Date.now();
     try {
-        // Fetch every ticker on the exchange in one call
+        addLog(`Scan #${metrics.totalScans + 1} starting...`);
         const tickers = await exchange.fetchTickers();
-        
-        for (const path of monitoredPaths) {
-            const final = calculateProfit(path, tickers);
-            if (!final) continue;
+        let currentBatchAnalysis = [];
 
-            const profit = final - WALLET_PRINCIPAL;
+        for (const path of monitoredPaths) {
+            let balance = WALLET_PRINCIPAL;
+            let currentCoin = 'USDT';
+            let validPath = true;
+
+            for (const pair of path) {
+                const step = calculateStep(balance, pair, currentCoin, tickers);
+                if (!step) { validPath = false; break; }
+                balance = step.amount;
+                currentCoin = step.nextCoin;
+            }
+
+            if (!validPath) continue;
+
+            const profit = balance - WALLET_PRINCIPAL;
             const roi = (profit / WALLET_PRINCIPAL) * 100;
 
-            // Log if profit > 0 after all fees
+            // Track for live analysis window (Top 5 closest to profit)
+            currentBatchAnalysis.push({ path: path.join('→'), roi });
+
             if (roi > 0.01 && roi < 5) {
                 const pathStr = path.join(' → ');
-                const last = metrics.history.find(h => h.path === pathStr);
-                
-                if (!last || (Date.now() - last.ts > 15000)) {
-                    metrics.opportunitiesFound++;
-                    metrics.simulatedProfit += profit;
-                    metrics.totalTurnover += (WALLET_PRINCIPAL * path.length);
-                    metrics.history.unshift({
-                        path: pathStr,
-                        roi: roi.toFixed(4) + '%',
-                        profit: profit.toFixed(6) + ' USDT',
-                        time: new Date().toLocaleTimeString(),
-                        ts: Date.now()
-                    });
-                    if (metrics.history.length > 50) metrics.history.pop();
-                }
+                metrics.opportunitiesFound++;
+                metrics.simulatedProfit += profit;
+                metrics.totalTurnover += (WALLET_PRINCIPAL * path.length);
+                metrics.history.unshift({
+                    path: pathStr,
+                    roi: roi.toFixed(4) + '%',
+                    profit: profit.toFixed(6),
+                    time: new Date().toLocaleTimeString()
+                });
+                if (metrics.history.length > 20) metrics.history.pop();
+                addLog(`PROFIT FOUND: ${pathStr} (${roi.toFixed(3)}%)`);
             }
         }
+
+        // Update Analysis Window with top 5 candidates of this scan
+        metrics.liveAnalysis = currentBatchAnalysis
+            .sort((a, b) => b.roi - a.roi)
+            .slice(0, 5);
+
         metrics.totalScans++;
-        metrics.lastLatency = Date.now() - startTick;
-    } catch (e) { }
-    
-    // Cycle every 500ms to stay within API limits while scanning thousands of paths
-    setTimeout(startScanner, 500);
+        addLog(`Scan #${metrics.totalScans} complete. Found ${currentBatchAnalysis.length} valid paths.`);
+    } catch (e) { addLog("Scan Error: " + e.message); }
+    setTimeout(startScanner, 1000);
 }
 
-// --- DASHBOARD ---
+/**
+ * 3. WEB DASHBOARD
+ */
 app.get('/', (req, res) => {
     res.send(`
         <html>
             <head>
-                <title>Global HTX Arb</title>
+                <title>Engine Log - HTX Arb</title>
                 <meta http-equiv="refresh" content="5">
                 <style>
-                    body { font-family: monospace; background: #020617; color: #f1f5f9; padding: 20px; }
+                    body { font-family: 'Courier New', monospace; background: #0a0f1e; color: #cbd5e1; padding: 20px; line-height: 1.4; }
                     .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }
-                    .card { background: #1e293b; padding: 15px; border-radius: 8px; border: 1px solid #334155; }
-                    .green { color: #4ade80; font-weight: bold; }
+                    .card { background: #1e293b; padding: 15px; border-radius: 8px; border-left: 4px solid #38bdf8; }
+                    .panel { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+                    .log-box { background: #000; border: 1px solid #334155; padding: 15px; height: 300px; overflow-y: auto; font-size: 0.85em; }
+                    .green { color: #4ade80; }
                     .blue { color: #38bdf8; }
-                    table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-                    th, td { text-align: left; padding: 10px; border-bottom: 1px solid #334155; font-size: 0.85em; }
-                    th { color: #94a3b8; }
+                    .gold { color: #fbbf24; }
+                    table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+                    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #1e293b; }
+                    h3 { border-bottom: 1px solid #334155; padding-bottom: 5px; color: #f8fafc; }
                 </style>
             </head>
             <body>
-                <h2>HTX GLOBAL SCANNER <small style="color:#64748b">All Spot Coins</small></h2>
-                <div style="margin-bottom: 20px; color: #fbbf24;">Status: ${metrics.liveDebug}</div>
+                <h2>HTX ARBITRAGE ENGINE <small class="blue">v2.0 High-Speed</small></h2>
                 
                 <div class="stats">
-                    <div class="card">Net Profit<br><span class="green" style="font-size:1.5em">$${metrics.simulatedProfit.toFixed(6)}</span></div>
-                    <div class="card">Turnover (Used)<br><span class="blue" style="font-size:1.5em">$${metrics.totalTurnover.toLocaleString()}</span></div>
-                    <div class="card">Paths Tracked<br><span style="font-size:1.5em">${metrics.pathsTracked}</span></div>
-                    <div class="card">Total Scans<br><span style="font-size:1.5em">${metrics.totalScans}</span></div>
+                    <div class="card">Net Profit<br><span class="green" style="font-size:1.4em">$${metrics.simulatedProfit.toFixed(6)}</span></div>
+                    <div class="card">Total Scans<br><span class="gold" style="font-size:1.4em">${metrics.totalScans}</span></div>
+                    <div class="card">Paths Tracked<br><span style="font-size:1.4em">${metrics.pathsTracked}</span></div>
+                    <div class="card">Turnover Used<br><span class="blue" style="font-size:1.4em">$${metrics.totalTurnover.toLocaleString()}</span></div>
                 </div>
 
-                <h3>Real Profit Logs (After Fees)</h3>
+                <div class="panel">
+                    <div>
+                        <h3>Live Scanner Analysis (Current Batch)</h3>
+                        <div class="log-box">
+                            <table>
+                                <tr><th>Path Loop</th><th>ROI %</th></tr>
+                                ${metrics.liveAnalysis.map(a => `
+                                    <tr>
+                                        <td>${a.path}</td>
+                                        <td class="${a.roi > 0 ? 'green' : ''}">${a.roi.toFixed(4)}%</td>
+                                    </tr>
+                                `).join('')}
+                            </table>
+                            <p style="font-size: 0.8em; color: #64748b; margin-top: 10px;">
+                                * ROI must be > 0.00% to clear the 0.6% fee hurdle.
+                            </p>
+                        </div>
+                    </div>
+                    <div>
+                        <h3>System Event Log</h3>
+                        <div class="log-box">
+                            ${metrics.systemLogs.map(l => `<div>${l}</div>`).join('')}
+                        </div>
+                    </div>
+                </div>
+
+                <h3>Confirmed Profit History</h3>
                 <table>
-                    <tr><th>Loop Strategy</th><th>ROI</th><th>Net Win</th><th>Time</th></tr>
-                    ${metrics.history.map(o => `
-                        <tr><td><code>${o.path}</code></td><td class="green">${o.roi}</td><td class="green">$${o.profit}</td><td>${o.time}</td></tr>
+                    <tr style="color:#94a3b8"><th>Path Strategy</th><th>Complexity</th><th>Net ROI</th><th>Profit</th><th>Time</th></tr>
+                    ${metrics.history.map(h => `
+                        <tr><td class="blue"><code>${h.path}</code></td><td>${h.path.split('→').length} steps</td><td class="green">${h.roi}</td><td class="green">$${h.profit}</td><td>${h.time}</td></tr>
                     `).join('')}
                 </table>
             </body>
