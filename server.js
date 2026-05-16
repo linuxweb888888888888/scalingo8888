@@ -11,11 +11,11 @@ const MONGO_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clus
 const PORT = process.env.PORT || 3000;
 const SYMBOL = 'TON/USDT:USDT';
 const LEVERAGE = 75;
-const TAKE_PROFIT = 10.0; 
+const TAKE_PROFIT = 15.0; // Higher TP for longer trends
 const STOP_LOSS = -30.0; 
 
 // ==================== DATABASE ====================
-mongoose.connect(MONGO_URI).then(() => console.log(`✅ AI Engine Connected ($10.00 Mode)`));
+mongoose.connect(MONGO_URI).then(() => console.log(`✅ Macro AI Engine Connected ($10.00)`));
 
 const Trade = mongoose.model('Trade_History', new mongoose.Schema({
     side: String, entryPrice: Number, exitPrice: Number,
@@ -30,20 +30,18 @@ const PaperPosition = mongoose.model('Paper_Position', new mongoose.Schema({
     symbol: String, side: String, entryPrice: Number, contracts: Number, timestamp: { type: Date, default: Date.now }
 }));
 
-// ==================== AI & TRADING ENGINE ====================
+// ==================== AI CORE (MACRO TREND) ====================
 const htx = new ccxt.htx({ apiKey: API_KEY, secret: API_SECRET, options: { defaultType: 'swap' }, enableRateLimit: true });
 
 let botStatus = {
     active: false,
     side: 'IDLE',
     currentRoi: 0,
-    currentPnl: 0,
     currentBalance: 0,
     totalClosedRoi: 0, 
     lastUpdate: 'INIT'
 };
 
-// AI Weighted Kernels
 function calculateAI(series, window) {
     let results = [];
     for (let i = 0; i < series.length; i++) {
@@ -73,12 +71,14 @@ async function tradingLoop() {
         botStatus.lastUpdate = new Date().toLocaleTimeString();
         try {
             await syncAccount();
-            const ohlcv = await htx.fetchOHLCV(SYMBOL, '1m', undefined, 100);
+            const ohlcv = await htx.fetchOHLCV(SYMBOL, '1m', undefined, 120);
             const prices = ohlcv.map(x => x[4]);
             const currentPrice = prices[prices.length - 1];
 
-            const fast = calculateAI(prices, 10);
-            const slow = calculateAI(prices, 30);
+            // INCREASED WINDOWS FOR LONGER LINES (20/60)
+            const fast = calculateAI(prices, 20);
+            const slow = calculateAI(prices, 60);
+            
             const fC = fast[fast.length-1], fP = fast[fast.length-2];
             const sC = slow[slow.length-1], sP = slow[slow.length-2];
 
@@ -100,7 +100,7 @@ async function tradingLoop() {
                 if (botStatus.currentRoi >= TAKE_PROFIT || botStatus.currentRoi <= STOP_LOSS || shouldFlip) {
                     await BotState.updateOne({ key: "paper_balance" }, { $inc: { value: botStatus.currentPnl } });
                     await PaperPosition.deleteOne({ _id: activePos._id });
-                    await Trade.create({ side: activePos.side, entryPrice: activePos.entryPrice, exitPrice: currentPrice, roi: botStatus.currentRoi, pnl: botStatus.currentPnl, reason: shouldFlip ? "AI_FLIP" : "EXIT" });
+                    await Trade.create({ side: activePos.side, entryPrice: activePos.entryPrice, exitPrice: currentPrice, roi: botStatus.currentRoi, pnl: botStatus.currentPnl, reason: shouldFlip ? "MACRO_FLIP" : "EXIT" });
                     
                     if (shouldFlip) {
                         const qty = Math.floor((botStatus.currentBalance / (currentPrice * 0.1)) * LEVERAGE);
@@ -112,38 +112,39 @@ async function tradingLoop() {
                 if (qty >= 1) await PaperPosition.create({ symbol: SYMBOL, side: signal.toLowerCase(), entryPrice: currentPrice, contracts: qty });
             }
         } catch (e) {}
-        await new Promise(r => setTimeout(r, 4000));
+        await new Promise(r => setTimeout(r, 5000));
     }
 }
 tradingLoop();
 
 // ==================== WEB APP ====================
 const app = express();
+
 app.get('/api/status', (req, res) => res.json(botStatus));
 app.get('/api/history', async (req, res) => res.json(await Trade.find().sort({ timestamp: -1 }).limit(10)));
 
 app.get('/api/chart', async (req, res) => {
     try {
-        const ohlcv = await htx.fetchOHLCV(SYMBOL, '1m', undefined, 150);
+        const ohlcv = await htx.fetchOHLCV(SYMBOL, '1m', undefined, 200);
         const prices = ohlcv.map(x => x[4]);
-        const fast = calculateAI(prices, 10);
-        const slow = calculateAI(prices, 30);
+        const fast = calculateAI(prices, 20);
+        const slow = calculateAI(prices, 60);
         
         let trendPoints = [];
-        // Add the first point
+        // Anchor the start
         trendPoints.push({ t: new Date(ohlcv[0][0]).toLocaleTimeString(), y: ohlcv[0][4] });
 
-        // Identify only crossover points for long straight lines
+        // Identify ONLY high-confidence crossover points
         for (let i = 1; i < prices.length; i++) {
             const crossUp = fast[i-1] <= slow[i-1] && fast[i] > slow[i];
             const crossDown = fast[i-1] >= slow[i-1] && fast[i] < slow[i];
-            
             if (crossUp || crossDown) {
                 trendPoints.push({ t: new Date(ohlcv[i][0]).toLocaleTimeString(), y: ohlcv[i][4] });
             }
         }
-        // Add current price as the last point to keep chart live
-        trendPoints.push({ t: new Date(ohlcv[ohlcv.length-1][0]).toLocaleTimeString(), y: ohlcv[ohlcv.length-1][4] });
+        
+        // Final point is current price, ensuring a long single line from last flip
+        trendPoints.push({ t: 'NOW', y: ohlcv[ohlcv.length-1][4] });
 
         res.json(trendPoints);
     } catch (e) { res.json([]); }
@@ -157,24 +158,23 @@ app.post('/api/reset-baseline', async (req, res) => {
 
 app.get('/', (req, res) => {
     res.send(`
-    <!DOCTYPE html><html><head><title>TON Long Trend</title><script src="https://cdn.tailwindcss.com"></script><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!DOCTYPE html><html><head><title>TON Macro Flip</title><script src="https://cdn.tailwindcss.com"></script><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
     body{background:#020617;color:#f8fafc;font-family:'JetBrains+Mono',monospace;}</style></head>
     <body class="p-6 md:p-12"><div class="max-w-6xl mx-auto"><header class="flex justify-between items-center mb-10"><div>
-    <h1 class="text-2xl font-bold text-blue-500 italic uppercase">TON.LONG.TREND</h1>
-    <p class="text-[10px] text-rose-500 font-bold uppercase tracking-widest">⚠️ LONG DIRECTION MODE ($10)</p></div>
-    <button onclick="resetBaseline()" class="text-[10px] bg-slate-800 px-4 py-2 rounded-lg font-bold border border-slate-700 hover:bg-rose-900 transition-all">RESET $10</button>
+    <h1 class="text-2xl font-bold text-emerald-500 italic uppercase">TON.MACRO.V4</h1>
+    <p class="text-[10px] text-slate-500 font-bold tracking-widest uppercase">Clean Zig-Zag Direction Mode</p></div>
+    <button onclick="resetBaseline()" class="text-[10px] bg-slate-900 px-4 py-2 rounded border border-slate-700 hover:bg-rose-900">RESET $10</button>
     </header>
 
-    <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8 text-center">
-        <div class="card bg-slate-900/50 p-6 rounded-xl border border-slate-800"><div class="text-slate-500 text-[10px] mb-1">DIRECTION</div><div id="side" class="text-xl font-bold">IDLE</div></div>
-        <div class="card bg-slate-900/50 p-6 rounded-xl border border-slate-800"><div class="text-slate-500 text-[10px] mb-1">BALANCE</div><div id="bal" class="text-xl font-bold text-emerald-400">$0.00</div></div>
-        <div class="card bg-slate-900/50 p-6 rounded-xl border border-slate-800"><div class="text-slate-500 text-[10px] mb-1">LIVE ROI</div><div id="roi" class="text-xl font-bold">0%</div></div>
-        <div class="card bg-slate-900/50 p-6 rounded-xl border border-slate-800"><div class="text-slate-500 text-[10px] mb-1">TOTAL ROI</div><div id="t-roi" class="text-xl font-bold text-yellow-500">0%</div></div>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8 text-center">
+        <div class="bg-slate-900/50 p-6 rounded-xl border border-slate-800"><div class="text-slate-500 text-[10px] mb-1 uppercase">Direction</div><div id="side" class="text-2xl font-bold italic">IDLE</div></div>
+        <div class="bg-slate-900/50 p-6 rounded-xl border border-slate-800"><div class="text-slate-500 text-[10px] mb-1 uppercase">Cash</div><div id="bal" class="text-2xl font-bold text-emerald-400">$0.00</div></div>
+        <div class="bg-slate-900/50 p-6 rounded-xl border border-slate-800"><div class="text-slate-500 text-[10px] mb-1 uppercase">ROI</div><div id="roi" class="text-2xl font-bold text-white">0%</div></div>
     </div>
 
     <div class="bg-slate-900/50 p-6 rounded-2xl border border-slate-800 mb-8" style="height:400px;"><canvas id="c"></canvas></div>
-    <div class="bg-slate-900/50 rounded-2xl border border-slate-800 overflow-hidden"><table class="w-full text-left text-xs"><tbody id="h"></tbody></table></div></div>
+    <div class="bg-slate-900/50 rounded-xl border border-slate-800 overflow-hidden"><table class="w-full text-left text-xs"><tbody id="h"></tbody></table></div></div>
 
     <script>
     let chart;
@@ -183,10 +183,18 @@ app.get('/', (req, res) => {
     function initChart() {
         chart = new Chart(document.getElementById('c').getContext('2d'), {
             type: 'line', data: { labels: [], datasets: [{ 
-                label: 'Trend Direction', data: [], borderWidth: 5, pointRadius: 4, pointBackgroundColor: '#fff', tension: 0, 
+                label: 'Trend', data: [], borderWidth: 6, pointRadius: 5, pointHoverRadius: 8, 
+                pointBackgroundColor: '#fff', tension: 0, // FORCED STRAIGHT LINES
                 segment: { borderColor: ctx => ctx.p0.parsed.y <= ctx.p1.parsed.y ? '#10b981' : '#f43f5e' }
             }]}, 
-            options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { grid: { color: '#1e293b' }, ticks: { color: '#64748b' } } } }
+            options: { 
+                responsive: true, maintainAspectRatio: false, 
+                plugins: { legend: { display: false } },
+                scales: { 
+                    x: { display: false }, 
+                    y: { grid: { color: '#0f172a' }, ticks: { color: '#475569', font: { weight: 'bold' } } } 
+                } 
+            }
         });
     }
 
@@ -195,10 +203,9 @@ app.get('/', (req, res) => {
             const res = await fetch('/api/status'); const s = await res.json();
             document.getElementById('bal').innerText = '$' + s.currentBalance.toFixed(2);
             document.getElementById('roi').innerText = s.currentRoi.toFixed(2)+'%';
-            document.getElementById('roi').className = 'text-xl font-bold '+(s.currentRoi>=0?'text-emerald-400':'text-rose-500');
-            document.getElementById('t-roi').innerText = s.totalClosedRoi.toFixed(2)+'%';
+            document.getElementById('roi').className = 'text-2xl font-bold '+(s.currentRoi>=0?'text-emerald-400':'text-rose-500');
             document.getElementById('side').innerText = s.side;
-            document.getElementById('side').className = 'text-xl font-bold ' + (s.side === 'BUY' ? 'text-emerald-400' : (s.side === 'SELL' ? 'text-rose-500' : 'text-white'));
+            document.getElementById('side').className = 'text-2xl font-bold italic ' + (s.side === 'BUY' ? 'text-emerald-400' : (s.side === 'SELL' ? 'text-rose-500' : 'text-white'));
             
             const cRes = await fetch('/api/chart'); const cData = await cRes.json();
             chart.data.labels = cData.map(d=>d.t); 
@@ -206,7 +213,7 @@ app.get('/', (req, res) => {
             chart.update('none');
 
             const hRes = await fetch('/api/history'); const hData = await hRes.json();
-            document.getElementById('h').innerHTML = hData.map(t => \`<tr class="border-b border-slate-800/50"><td class="p-4 font-bold \${t.side==='buy'?'text-emerald-500':'text-rose-500'}">\${t.side.toUpperCase()}</td><td class="p-4 text-right \${t.roi>=0?'text-emerald-400':'text-rose-500'} font-bold">\${t.roi.toFixed(2)}%</td><td class="p-4 text-right text-slate-500">\${new Date(t.timestamp).toLocaleTimeString()}</td></tr>\`).join('');
+            document.getElementById('h').innerHTML = hData.map(t => \`<tr class="border-b border-slate-800/50"><td class="p-4 font-bold \${t.side==='buy'?'text-emerald-500':'text-rose-500'}">\${t.side.toUpperCase()}</td><td class="p-4 text-right \${t.roi>=0?'text-emerald-400':'text-rose-500'} font-bold">\${t.roi.toFixed(2)}%</td><td class="p-4 text-right text-slate-500 uppercase">\${new Date(t.timestamp).toLocaleTimeString()}</td></tr>\`).join('');
         } catch(e){}
     }
     initChart(); setInterval(update, 2000); update();
@@ -214,4 +221,4 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.listen(PORT, () => console.log("🌐 Long-Trend AI Engine Online ($10.00)"));
+app.listen(PORT, () => console.log("🌐 Macro-ZigZag AI Online ($10.00)"));
