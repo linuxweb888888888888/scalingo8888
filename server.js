@@ -1,13 +1,3 @@
-To show exactly how much capital was "used" to generate your profit, we need to
-track Cumulative Volume (Turnover).
-
-In arbitrage, you aren't spending $297 to make $297. You are taking the same $10
-and "rolling it over" thousands of times. This new version adds a "Total Capital
-Cycled" metric, which shows the total dollar volume the bot moved through the
-exchange to reach your profit goal.
-
-Updated High-Speed Bot with Volume Metrics
-
 const ccxt = require('ccxt');
 const express = require('express');
 const app = express();
