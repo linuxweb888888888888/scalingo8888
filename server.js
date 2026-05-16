@@ -5,7 +5,7 @@ const app = express();
 // --- CONFIGURATION ---
 const port = process.env.PORT || 3000;
 const WALLET_PRINCIPAL = 10.00; // Your actual starting capital
-const TAKER_FEE = 0.0005;        // 20 bps (Standard HTX Taker Fee)
+const TAKER_FEE = 0.0002;        // 20 bps (Standard HTX Taker Fee)
 const exchange = new ccxt.htx({ 'enableRateLimit': true });
 
 let metrics = {
