@@ -190,30 +190,3 @@ app.listen(port, async () => {
     await findDeepPaths();
     scan();
 });
-
-Understanding the "Used Amount" (Total Capital Cycled)
-
-Arbitrage is Capital Efficient. If you have $10 and the bot finds a profitable
-path:
-
-1.  It trades $10 for Coin A. (Volume: $10)
-2.  It trades Coin A for Coin B. (Volume: $10)
-3.  It trades Coin B for USDT. (Volume: $10)
-
-  - Total Volume Used in one 3-step loop: $30.00.
-  - Total Volume Used in one 6-step loop: $60.00.
-
-Why your Total Profit (297) is high compared to your Wallet (10): The bot
-doesn't "spend" the
-10 and lose it. It uses it to buy something and sell it back immediately. If the bot has performed thousands of scans and found hundreds of small wins, your **Total Capital Cycled** might show **50,000+**.
-
-This means your $10 was "used" to facilitate $50,000 worth of trades to generate
-that $297 profit. In the dashboard, this is shown as the "Wallet Rollover"
-(e.g., your wallet was flipped 5,000 times).
-
-Summary of the New Metrics:
-
-  - Net Profit: The real money added to your $10.
-  - Total Capital Cycled: The "Used" amount (Turnover).
-  - Trade Size: Always $10.00 (the amount used per individual trade).
-  - Wallet Rollover: How many times your $10 has worked for you.
