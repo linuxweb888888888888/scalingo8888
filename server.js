@@ -4,7 +4,7 @@ const app = express();
 
 const port = process.env.PORT || 3000;
 const WALLET_PRINCIPAL = 10.00; 
-const TAKER_FEE = 0.0002; 
+const TAKER_FEE = 0.0015; 
 const exchange = new ccxt.htx({ 'enableRateLimit': true });
 
 let metrics = {
