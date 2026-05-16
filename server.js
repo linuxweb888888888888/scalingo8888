@@ -5,10 +5,8 @@ const app = express();
 const port = process.env.PORT || 3000;
 const exchange = new ccxt.htx({ 'enableRateLimit': true });
 
-// --- SETTINGS ---
-const STARTING_BALANCE = 10;   // Your $10 Paper Wallet
-const STD_FEE = 0.002;         // 0.2% (Standard)
-const VIP_FEE = 0.0012;        // 0.12% (If you use HTX Token for fees)
+const STARTING_BALANCE = 10;
+const STD_FEE = 0.0002; // 20 bps
 
 let metrics = {
     totalScans: 0,
@@ -16,177 +14,166 @@ let metrics = {
     simulatedProfit: 0,
     history: [],
     status: "Initializing...",
-    lastScanTime: 0,
-    trianglesCount: 0
+    pathsTracked: 0
 };
 
-const MAX_HISTORY = 500;
-const PAGE_SIZE = 15;
+let allPaths = [];
 
-// --- DYNAMIC PATH FINDING ---
-let triangles = [];
-async function findTriangles() {
+/**
+ * ADVANCED PATH FINDER
+ * Finds 3-step and 4-step loops and ranks them by 24h Volume
+ */
+async function findAdvancedPaths() {
     try {
+        metrics.status = "Deep mapping market structures...";
         const markets = await exchange.loadMarkets();
-        const symbols = Object.keys(markets);
+        const tickers = await exchange.fetchTickers(); // Get volume data
+        const symbols = Object.keys(markets).filter(s => markets[s].active);
         const paths = [];
+
         const base = 'USDT';
         const usdtPairs = symbols.filter(s => s.includes(base));
+
         for (const pair1 of usdtPairs) {
             const parts1 = pair1.split('/');
             const alt1 = parts1[0] === base ? parts1[1].split(':')[0] : parts1[0];
+            
+            // Look for intermediate steps
             const alt1Pairs = symbols.filter(s => s.includes(alt1) && !s.includes(base));
+
             for (const pair2 of alt1Pairs) {
                 const parts2 = pair2.split('/');
                 const alt2 = parts2[0] === alt1 ? parts2[1].split(':')[0] : parts2[0];
-                const pair3 = symbols.find(s => s === `${alt2}/${base}` || s === `${base}/${alt2}`);
-                if (pair3) paths.push([pair1, pair2, pair3]);
+
+                // OPTION A: 3-Step (Triangular)
+                const pair3Tri = symbols.find(s => s === `${alt2}/${base}` || s === `${base}/${alt2}`);
+                if (pair3Tri) {
+                    paths.push({ steps: [pair1, pair2, pair3Tri], vol: (tickers[pair1]?.quoteVolume || 0) });
+                }
+
+                // OPTION B: 4-Step (Quadrangular)
+                const alt2Pairs = symbols.filter(s => s.includes(alt2) && !s.includes(alt1) && !s.includes(base));
+                for (const pair3Quad of alt2Pairs) {
+                    const parts3 = pair3Quad.split('/');
+                    const alt3 = parts3[0] === alt2 ? parts3[1].split(':')[0] : parts3[0];
+                    const pair4Quad = symbols.find(s => s === `${alt3}/${base}` || s === `${base}/${alt3}`);
+                    
+                    if (pair4Quad) {
+                        paths.push({ steps: [pair1, pair2, pair3Quad, pair4Quad], vol: (tickers[pair1]?.quoteVolume || 0) });
+                    }
+                }
             }
         }
-        triangles = Array.from(new Set(paths.map(JSON.stringify)), JSON.parse).slice(0, 250);
-        metrics.trianglesCount = triangles.length;
-    } catch (e) { console.error(e); }
+
+        // Sort by volume (highest first) and remove duplicates
+        const sorted = paths.sort((a, b) => b.vol - a.vol);
+        allPaths = Array.from(new Set(sorted.map(p => JSON.stringify(p.steps))), JSON.parse).slice(0, 600);
+        
+        metrics.pathsTracked = allPaths.length;
+        metrics.status = `Monitoring ${allPaths.length} high-volume loops`;
+    } catch (e) { console.error("Discovery Error:", e); }
 }
 
-// --- TRADE CALCULATOR ---
-function runSimulation(path, tickers, feeRate) {
+/**
+ * CALCULATOR ENGINE (Handles N-step paths)
+ */
+function runPath(path, tickers) {
     let balance = STARTING_BALANCE;
     let currentCoin = 'USDT';
 
     for (const pair of path) {
         const ticker = tickers[pair];
         if (!ticker || !ticker.ask || !ticker.bid) return 0;
+        
         const [base, quoteRaw] = pair.split('/');
         const quote = quoteRaw.split(':')[0];
 
         if (currentCoin === quote) {
-            balance = (balance / ticker.ask) * (1 - feeRate);
+            balance = (balance / ticker.ask) * (1 - STD_FEE);
             currentCoin = base;
         } else {
-            balance = (balance * ticker.bid) * (1 - feeRate);
+            balance = (balance * ticker.bid) * (1 - STD_FEE);
             currentCoin = quote;
         }
     }
     return balance;
 }
 
-// --- SCANNER ---
 async function fastScan() {
-    const startTick = Date.now();
     try {
         const tickers = await exchange.fetchTickers();
-        for (const path of triangles) {
-            // Calculate with Standard Fee
-            const finalBalanceStd = runSimulation(path, tickers, STD_FEE);
-            const netProfitStd = finalBalanceStd - STARTING_BALANCE;
-            const roiStd = (netProfitStd / STARTING_BALANCE) * 100;
+        for (const path of allPaths) {
+            const finalBalance = runPath(path, tickers);
+            const netProfit = finalBalance - STARTING_BALANCE;
+            const roi = (netProfit / STARTING_BALANCE) * 100;
 
-            // Calculate with VIP Fee (to show how much "smaller" the fee could be)
-            const finalBalanceVip = runSimulation(path, tickers, VIP_FEE);
-            const netProfitVip = finalBalanceVip - STARTING_BALANCE;
+            // Log if profitable after fees (Adjusted threshold for 4-step)
+            const minRoi = path.length === 3 ? 0.02 : 0.04; 
 
-            // Log if even slightly profitable (using 0.01% threshold)
-            if (roiStd > 0.01 && roiStd < 4) {
+            if (roi > minRoi && roi < 3) {
                 const pathStr = path.join(' → ');
                 const lastSeen = metrics.history.find(h => h.path === pathStr);
                 
-                if (!lastSeen || (Date.now() - lastSeen.timestamp > 8000)) {
+                if (!lastSeen || (Date.now() - lastSeen.timestamp > 10000)) {
                     metrics.opportunitiesFound++;
-                    metrics.simulatedProfit += netProfitStd;
+                    metrics.simulatedProfit += netProfit;
                     metrics.history.unshift({
                         path: pathStr,
-                        tradeAmount: STARTING_BALANCE.toFixed(2),
-                        roi: roiStd.toFixed(3) + '%',
-                        profit: netProfitStd.toFixed(4),
-                        vipProfit: netProfitVip.toFixed(4), // Comparison
+                        steps: path.length,
+                        roi: roi.toFixed(3) + '%',
+                        profit: netProfit.toFixed(4) + ' USDT',
                         time: new Date().toLocaleTimeString(),
                         timestamp: Date.now()
                     });
-                    if (metrics.history.length > MAX_HISTORY) metrics.history.pop();
+                    if (metrics.history.length > 500) metrics.history.pop();
                 }
             }
         }
         metrics.totalScans++;
-        metrics.lastScanTime = Date.now() - startTick;
-        metrics.status = "Scanning...";
     } catch (e) { }
-    setTimeout(fastScan, 100);
+    setTimeout(fastScan, 250); // Slightly more delay to handle 600 paths
 }
 
 // --- DASHBOARD ---
 app.get('/', (req, res) => {
-    const page = parseInt(req.query.page) || 1;
-    const items = metrics.history.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
-    const totalPages = Math.ceil(metrics.history.length / PAGE_SIZE);
-
     res.send(`
         <html>
-            <head>
-                <title>HTX $10 Arb Bot</title>
-                <style>
-                    body { font-family: sans-serif; background: #020617; color: white; padding: 20px; }
-                    .header { display: flex; gap: 20px; margin-bottom: 20px; }
-                    .card { background: #1e293b; padding: 15px; border-radius: 10px; border: 1px solid #334155; flex: 1; }
-                    .fee-box { font-size: 0.8em; color: #94a3b8; }
-                    table { width: 100%; border-collapse: collapse; }
-                    th, td { padding: 12px; text-align: left; border-bottom: 1px solid #334155; }
-                    .profit { color: #4ade80; font-weight: bold; }
-                    .vip { color: #38bdf8; font-size: 0.9em; }
-                    .btn { padding: 5px 15px; background: #334155; color: white; text-decoration: none; border-radius: 5px; }
-                </style>
+            <head><title>Advanced Arb Bot</title><meta http-equiv="refresh" content="10">
+            <style>
+                body { font-family: sans-serif; background: #020617; color: white; padding: 20px; }
+                .grid { display: flex; gap: 15px; margin-bottom: 20px; }
+                .card { background: #1e293b; padding: 20px; border-radius: 10px; border: 1px solid #334155; flex: 1; }
+                table { width: 100%; border-collapse: collapse; }
+                th, td { padding: 12px; text-align: left; border-bottom: 1px solid #334155; }
+                .profit { color: #4ade80; }
+                .tag { font-size: 0.7em; padding: 3px 6px; border-radius: 4px; background: #334155; margin-left: 10px; }
+            </style>
             </head>
             <body>
-                <h1>HTX Arbitrage <small style="color:#64748b">$10 Paper Wallet</small></h1>
-                
-                <div class="header">
-                    <div class="card">
-                        <div class="fee-box">Total Paper Profit</div>
-                        <div class="profit" style="font-size:1.5em">$${metrics.simulatedProfit.toFixed(4)} USDT</div>
-                    </div>
-                    <div class="card">
-                        <div class="fee-box">Current Fee Setup</div>
-                        <div>Standard: <b>20 bps</b> (0.2%)</div>
-                        <div class="vip">VIP Target: <b>12 bps</b> (0.12%)</div>
-                    </div>
-                    <div class="card">
-                        <div class="fee-box">System Info</div>
-                        <div>Scans: ${metrics.totalScans}</div>
-                        <div>Latency: ${metrics.lastScanTime}ms</div>
-                    </div>
+                <h1>HTX Advanced Arbitrage <small style="color:#64748b">3 & 4-Step Loops</small></h1>
+                <div class="grid">
+                    <div class="card">Total Profit<br><b class="profit" style="font-size:1.5em">$${metrics.simulatedProfit.toFixed(4)}</b></div>
+                    <div class="card">Paths Scanned<br><b style="font-size:1.5em">${metrics.pathsTracked}</b></div>
+                    <div class="card">Total Scans<br><b style="font-size:1.5em">${metrics.totalScans}</b></div>
                 </div>
-
                 <table>
-                    <tr>
-                        <th>Path</th>
-                        <th>Trade Vol</th>
-                        <th>Net ROI</th>
-                        <th>Net Profit</th>
-                        <th>If VIP Profit</th>
-                        <th>Time</th>
-                    </tr>
-                    ${items.map(o => `
+                    <tr><th>Path Strategy</th><th>Step Count</th><th>ROI</th><th>Profit</th><th>Time</th></tr>
+                    ${metrics.history.map(o => `
                         <tr>
-                            <td>${o.path}</td>
-                            <td>$${o.tradeAmount}</td>
+                            <td><code>${o.path}</code></td>
+                            <td><span class="tag">${o.steps} Legs</span></td>
                             <td class="profit">${o.roi}</td>
                             <td class="profit">$${o.profit}</td>
-                            <td class="vip">$${o.vipProfit}</td>
-                            <td style="color:#64748b">${o.time}</td>
+                            <td style="color:#94a3b8">${o.time}</td>
                         </tr>
                     `).join('')}
                 </table>
-
-                <div style="margin-top:20px;">
-                    <a class="btn" href="/?page=${page - 1}">Back</a>
-                    <span> Page ${page} of ${totalPages || 1} </span>
-                    <a class="btn" href="/?page=${page + 1}">Next</a>
-                </div>
             </body>
         </html>
     `);
 });
 
 app.listen(port, async () => {
-    await findTriangles();
+    await findAdvancedPaths();
     fastScan();
 });
