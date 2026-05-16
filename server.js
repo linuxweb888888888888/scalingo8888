@@ -1,3 +1,13 @@
+To show exactly how much capital was "used" to generate your profit, we need to
+track Cumulative Volume (Turnover).
+
+In arbitrage, you aren't spending $297 to make $297. You are taking the same $10
+and "rolling it over" thousands of times. This new version adds a "Total Capital
+Cycled" metric, which shows the total dollar volume the bot moved through the
+exchange to reach your profit goal.
+
+Updated High-Speed Bot with Volume Metrics
+
 const ccxt = require('ccxt');
 const express = require('express');
 const app = express();
@@ -7,7 +17,7 @@ const exchange = new ccxt.htx({ 'enableRateLimit': true });
 
 // --- SETTINGS ---
 const STARTING_BALANCE = 10; // Your actual capital
-const TAKER_FEE = 0.001;     // 20 bps (Standard HTX Fee)
+const TAKER_FEE = 0.0002;     // 20 bps (Standard HTX Fee)
 
 let metrics = {
     totalScans: 0,
