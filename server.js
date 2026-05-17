@@ -1,4 +1,5 @@
 // stratum-relay.js - Single file Stratum relay for Scalingo.com
+//
 const net = require('net');
 const http = require('http');
 
