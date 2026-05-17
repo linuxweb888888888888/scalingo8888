@@ -1,7 +1,5 @@
 const express = require('express');
 const mongoose = require('mongoose');
-const { ethers } = require('ethers');
-const ccxt = require('ccxt');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
@@ -9,187 +7,187 @@ const port = process.env.PORT || 3000;
 app.use(express.json());
 
 // --- 1. DATABASE CONNECTION ---
-// Replace with your connection string in environment variables for safety
-const MONGODB_URI = process.env.MONGODB_URI || "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb";
+const MONGODB_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb";
+mongoose.connect(MONGODB_URI);
 
-mongoose.connect(MONGODB_URI)
-    .then(() => console.log("MongoDB Connected"))
-    .catch(err => console.error("MongoDB Connection Error:", err));
-
-// --- 2. DATABASE SCHEMAS ---
-const WalletSchema = new mongoose.Schema({
-    address: String,
-    privateKey: String,
-    createdAt: { type: Date, default: Date.now }
+// --- 2. SCHEMAS ---
+const AccountSchema = new mongoose.Schema({
+    userId: { type: String, unique: true },
+    balances: { type: Map, of: Number, default: {} }
 });
-
-const StatsSchema = new mongoose.Schema({
-    totalScanned: { type: Number, default: 0 },
-    totalProfit: { type: Number, default: 0 },
-    bestRoi: { type: Number, default: 0 }
+const OrderBookSchema = new mongoose.Schema({
+    pair: { type: String, unique: true },
+    buys: { type: Array, default: [] }, // Format: {price, amount, userId}
+    sells: { type: Array, default: [] }
 });
+const Account = mongoose.model('Account', AccountSchema);
+const OrderBook = mongoose.model('OrderBook', OrderBookSchema);
 
-const LogSchema = new mongoose.Schema({
-    time: String,
-    ex: String,
-    path: String,
-    roi: Number,
-    profit: Number,
-    color: String
-});
-
-const WalletModel = mongoose.model('Wallet', WalletSchema);
-const StatsModel = mongoose.model('Stats', StatsSchema);
-const LogModel = mongoose.model('Log', LogSchema);
-
-// --- 3. EXCHANGE CONFIGURATION ---
-const exchangeConfig = {
-    mexc: { fee: 0.0005, color: '#00ff00', name: 'MEXC' },
-    lbank: { fee: 0.0010, color: '#38bdf8', name: 'LBANK' },
-    bitget: { fee: 0.0010, color: '#38bdf8', name: 'BITGET' },
-    phemex: { fee: 0.0010, color: '#facc15', name: 'PHEMEX' },
-    bitrue: { fee: 0.00098, color: '#ef4444', name: 'BITRUE' },
-    coinex: { fee: 0.0020, color: '#10b981', name: 'COINEX' },
-    htx: { fee: 0.0020, color: '#818cf8', name: 'HTX' },
-    xt: { fee: 0.0020, color: '#a855f7', name: 'XT' }
-};
-
-// --- 4. BOT ENGINE ---
-let masterWallet = null;
-let currentStats = { scanned: 0, profit: 0, bestRoi: 0 };
-let currentEx = "Initializing...";
-let currentPair = "---";
-
-async function init() {
-    // A. Handle Wallet Persistence
-    let walletData = await WalletModel.findOne();
-    if (!walletData) {
-        console.log("No wallet found. Generating new master wallet...");
-        const newWallet = ethers.Wallet.createRandom();
-        walletData = await WalletModel.create({
-            address: newWallet.address,
-            privateKey: newWallet.privateKey
-        });
-    }
-    masterWallet = new ethers.Wallet(walletData.privateKey);
-    console.log(`Master Wallet Active: ${masterWallet.address}`);
-
-    // B. Handle Stats Persistence
-    const dbStats = await StatsModel.findOne();
-    if (dbStats) {
-        currentStats.scanned = dbStats.totalScanned;
-        currentStats.profit = dbStats.totalProfit;
-        currentStats.bestRoi = dbStats.bestRoi;
-    } else {
-        await StatsModel.create({});
+// --- 3. EXCHANGE ENGINE ---
+class PrivateExchange {
+    constructor() {
+        this.fee = 0.0005; 
+        this.coins = Array.from({length: 149}, (_, i) => `C${i+1}`); // C1 to C149
+        this.allAssets = ['USDT', 'BTC', ...this.coins]; // 150 Total
     }
 
-    runScanner();
-}
-
-async function runScanner() {
-    const ids = Object.keys(exchangeConfig);
-    while (true) {
-        for (const id of ids) {
-            try {
-                currentEx = exchangeConfig[id].name;
-                const ex = new ccxt[id]({ enableRateLimit: true });
-                const markets = await ex.loadMarkets();
-                const symbols = Object.keys(markets).filter(s => markets[s].active);
-                
-                const quotes = ['BTC', 'ETH', 'USDC'];
-                const paths = [];
-                for (const q of quotes) {
-                    const cross = symbols.filter(s => markets[s].quote === q);
-                    for (const cp of cross) {
-                        const alt = cp.split('/')[0];
-                        if (markets[`${alt}/USDT`] && markets[`${q}/USDT`]) {
-                            paths.push([`${q}/USDT`, cp, `${alt}/USDT`]);
-                        }
-                    }
-                }
-
-                const tickers = await ex.fetchTickers();
-                for (const [s1, s2, s3] of paths) {
-                    currentPair = s2;
-                    currentStats.scanned++;
-                    const t1 = tickers[s1], t2 = tickers[s2], t3 = tickers[s3];
-                    if (!t1?.ask || !t2?.ask || !t3?.bid) continue;
-
-                    const net = (100 / t1.ask / t2.ask) * t3.bid * Math.pow((1 - exchangeConfig[id].fee), 3);
-                    const roi = net - 100;
-
-                    if (roi > 0.01 && roi < 15) {
-                        currentStats.profit += roi;
-                        if (roi > currentStats.bestRoi) currentStats.bestRoi = roi;
-
-                        await LogModel.create({
-                            time: new Date().toLocaleTimeString(),
-                            ex: currentEx,
-                            path: `${s1}>${s2}>${s3}`,
-                            roi: roi.toFixed(4),
-                            profit: roi.toFixed(4),
-                            color: exchangeConfig[id].color
-                        });
-
-                        // Update DB stats every profit found
-                        await StatsModel.updateOne({}, {
-                            totalScanned: currentStats.scanned,
-                            totalProfit: currentStats.profit,
-                            bestRoi: currentStats.bestRoi
-                        });
-                    }
-                }
-                // Memory Cleanup
-                ex.markets = {};
-                if (global.gc) global.gc();
-            } catch (e) {
-                console.log(`Scan Error ${id}: ${e.message}`);
-            }
-            await new Promise(r => setTimeout(r, 3000));
+    async getAccount(userId) {
+        let acc = await Account.findOne({ userId });
+        if (!acc) {
+            const initialBalances = { USDT: 100000, BTC: 10 };
+            this.coins.forEach(c => initialBalances[c] = 1000);
+            acc = await Account.create({ userId, balances: initialBalances });
         }
+        return acc;
+    }
+
+    async placeOrder(userId, pair, side, price, amount) {
+        let book = await OrderBook.findOne({ pair });
+        if (!book) book = await OrderBook.create({ pair });
+
+        const takerOrder = { userId, side, price: parseFloat(price), amount: parseFloat(amount), id: uuidv4() };
+        let opposite = side === 'buy' ? book.sells : book.buys;
+        
+        // Match Logic
+        opposite.sort((a, b) => side === 'buy' ? a.price - b.price : b.price - a.price);
+        
+        const takerAcc = await this.getAccount(userId);
+        for (let i = 0; i < opposite.length; i++) {
+            const maker = opposite[i];
+            const isMatch = side === 'buy' ? takerOrder.price >= maker.price : takerOrder.price <= maker.price;
+
+            if (isMatch) {
+                const tradeSize = Math.min(takerOrder.amount, maker.amount);
+                const makerAcc = await this.getAccount(maker.userId);
+                
+                await this.executeTrade(takerAcc, makerAcc, tradeSize, maker.price, pair, side);
+                
+                takerOrder.amount -= tradeSize;
+                maker.amount -= tradeSize;
+                if (maker.amount <= 0) opposite.splice(i, 1);
+                if (takerOrder.amount <= 0) break;
+            }
+        }
+
+        if (takerOrder.amount > 0) {
+            side === 'buy' ? book.buys.push(takerOrder) : book.sells.push(takerOrder);
+        }
+
+        await OrderBook.updateOne({ pair }, { buys: book.buys, sells: book.sells });
+        await takerAcc.save();
+    }
+
+    async executeTrade(taker, maker, size, price, pair, side) {
+        const [base, quote] = pair.split('/');
+        const cost = size * price;
+        const fee = cost * this.fee;
+
+        if (side === 'buy') {
+            taker.balances.set(quote, taker.balances.get(quote) - (cost + fee));
+            taker.balances.set(base, taker.balances.get(base) + size);
+            maker.balances.set(quote, maker.balances.get(quote) + cost);
+            maker.balances.set(base, maker.balances.get(base) - size);
+        } else {
+            taker.balances.set(quote, taker.balances.get(quote) + (cost - fee));
+            taker.balances.set(base, taker.balances.get(base) - size);
+            maker.balances.set(quote, maker.balances.get(quote) - cost);
+            maker.balances.set(base, maker.balances.get(base) + size);
+        }
+        await maker.save();
     }
 }
 
-// --- 5. UI & API ---
-app.get('/status', async (req, res) => {
-    const recentLogs = await LogModel.find().sort({ _id: -1 }).limit(20);
-    res.json({ stats: currentStats, logs: recentLogs, wallet: masterWallet.address, currentEx, currentPair });
+const engine = new PrivateExchange();
+
+// --- 4. LIQUIDITY GENERATOR (Injects Orders) ---
+// This mimics a real market so the Arb Bot has something to scan
+async function injectLiquidity() {
+    console.log("Injecting Synthetic Liquidity into 150 books...");
+    const symbols = engine.coins; // C1...C149
+    
+    for (const sym of symbols) {
+        // Create price for Coin/USDT (Randomized around $10)
+        const priceUSDT = 10 + (Math.random() * 2 - 1); 
+        await engine.placeOrder('MARKET_MAKER', `${sym}/USDT`, 'sell', priceUSDT + 0.05, 10);
+        await engine.placeOrder('MARKET_MAKER', `${sym}/USDT`, 'buy', priceUSDT - 0.05, 10);
+
+        // Create price for Coin/BTC (Randomized around 0.0001 BTC)
+        const priceBTC = 0.0001 + (Math.random() * 0.00002 - 0.00001);
+        await engine.placeOrder('MARKET_MAKER', `${sym}/BTC`, 'sell', priceBTC + 0.000001, 10);
+        await engine.placeOrder('MARKET_MAKER', `${sym}/BTC`, 'buy', priceBTC - 0.000001, 10);
+    }
+    // Also provide BTC/USDT liquidity
+    await engine.placeOrder('MARKET_MAKER', 'BTC/USDT', 'sell', 60000.10, 5);
+    await engine.placeOrder('MARKET_MAKER', 'BTC/USDT', 'buy', 59999.90, 5);
+}
+
+// --- 5. TRIANGULAR ARB BOT ---
+async function runArbBot() {
+    console.log("Internal Arb Bot Scanning...");
+    while (true) {
+        const books = await OrderBook.find();
+        const map = {};
+        books.forEach(b => map[b.pair] = b);
+
+        for (const sym of engine.coins) {
+            try {
+                // Path: USDT -> BTC -> Coin -> USDT
+                const p1 = map['BTC/USDT']?.sells[0]?.price;
+                const p2 = map[`${sym}/BTC`]?.sells[0]?.price;
+                const p3 = map[`${sym}/USDT`]?.buys[0]?.price;
+
+                if (p1 && p2 && p3) {
+                    const result = (100 / p1 / p2) * p3 * Math.pow(0.9995, 3);
+                    if (result > 100.05) {
+                        console.log(`[PROFIT] Triangle Found on ${sym}: $${(result - 100).toFixed(4)}`);
+                        // Execute the Arb trades against the Market Maker
+                        await engine.placeOrder('ARB_BOT', 'BTC/USDT', 'buy', p1, 100/p1);
+                        await engine.placeOrder('ARB_BOT', `${sym}/BTC`, 'buy', p2, (100/p1)/p2);
+                        await engine.placeOrder('ARB_BOT', `${sym}/USDT`, 'sell', p3, (100/p1)/p2);
+                    }
+                }
+            } catch (e) {}
+        }
+        await new Promise(r => setTimeout(r, 5000));
+    }
+}
+
+// --- 6. API & UI ---
+app.get('/api/stats', async (req, res) => {
+    const arb = await engine.getAccount('ARB_BOT');
+    const mm = await engine.getAccount('MARKET_MAKER');
+    res.json({ arbBalance: arb.balances, mmBalance: mm.balances });
 });
 
 app.get('/', (req, res) => {
     res.send(`
         <body style="background:#020617; color:#f1f5f9; font-family:monospace; padding:20px;">
-            <div style="max-width:900px; margin:auto;">
-                <h2 style="color:#38bdf8">ArbFleet Pro + MongoDB Persistence</h2>
-                <div style="background:#0f172a; padding:15px; border-radius:8px; border:1px solid #1e293b; margin-bottom:15px;">
-                    <div>WALLET: <b id="wAddr">...</b></div>
-                    <div style="margin-top:10px;">ENGINE: <b id="exName">...</b> | SCANNING: <b id="pName">...</b></div>
+            <h2>Private Exchange: 150 Coins + Arb Bot</h2>
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:20px;">
+                <div style="background:#0f172a; padding:15px; border-radius:10px;">
+                    <h3>Arb Bot Performance (Ledger)</h3>
+                    <pre id="arb" style="font-size:0.7rem; height:400px; overflow-y:auto;"></pre>
                 </div>
-                <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; margin-bottom:15px;">
-                    <div style="background:#1e293b; padding:10px; border-radius:5px; text-align:center;">SCANS<br><b id="scanned">0</b></div>
-                    <div style="background:#1e293b; padding:10px; border-radius:5px; text-align:center;">BEST ROI<br><b id="roi" style="color:#4ade80">0%</b></div>
-                    <div style="background:#1e293b; padding:10px; border-radius:5px; text-align:center;">TOTAL PROFIT<br><b id="profit" style="color:#4ade80">$0.00</b></div>
+                <div style="background:#0f172a; padding:15px; border-radius:10px;">
+                    <h3>Market Maker Inventory</h3>
+                    <pre id="mm" style="font-size:0.7rem; height:400px; overflow-y:auto;"></pre>
                 </div>
-                <div id="logBox" style="background:#09090b; padding:15px; height:400px; overflow-y:auto; border-radius:8px; border:1px solid #1e293b;"></div>
             </div>
             <script>
                 async function update() {
-                    const r = await fetch('/status'); const d = await r.json();
-                    document.getElementById('wAddr').innerText = d.wallet;
-                    document.getElementById('exName').innerText = d.currentEx;
-                    document.getElementById('pName').innerText = d.currentPair;
-                    document.getElementById('scanned').innerText = d.stats.scanned.toLocaleString();
-                    document.getElementById('roi').innerText = d.stats.bestRoi.toFixed(3) + '%';
-                    document.getElementById('profit').innerText = '$' + d.stats.profit.toFixed(2);
-                    document.getElementById('logBox').innerHTML = d.logs.map(l => 
-                        '<div style="border-bottom:1px solid #1e293b; padding:5px 0;"><b>['+l.ex+']</b> '+l.path+' <span style="float:right" style="color:#4ade80">+$'+l.profit+'</span></div>'
-                    ).join('');
+                    const res = await fetch('/api/stats');
+                    const d = await res.json();
+                    document.getElementById('arb').innerText = JSON.stringify(d.arbBalance, null, 2);
+                    document.getElementById('mm').innerText = JSON.stringify(d.mmBalance, null, 2);
                 }
-                setInterval(update, 1000);
+                setInterval(update, 3000); update();
             </script>
         </body>
     `);
 });
 
-app.listen(port, () => init());
+app.listen(port, async () => {
+    await injectLiquidity(); // Fill books once at start
+    setInterval(injectLiquidity, 60000); // Re-fill every minute
+    runArbBot();
+});
