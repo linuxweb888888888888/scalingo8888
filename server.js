@@ -14,51 +14,70 @@ let metrics = {
     liveAnalysis: [],
     status: "Initializing...",
     proxyInUse: "None",
-    activePaths: 0
+    activePaths: 0,
+    errors: 0
 };
 
 let monitoredPaths = [];
 let proxyList = [];
 let currentAgent = null;
 
-// 1. Scrape a list of fresh proxies
+// 1. Scrape fresh proxies from multiple sources
 async function refreshProxyList() {
     try {
         metrics.status = "Scraping fresh proxy list...";
-        const res = await axios.get('https://api.proxyscrape.com/v2/?proxytype=http&timeout=10000&country=all&ssl=all&anonymity=all');
-        proxyList = res.data.split('\r\n').filter(p => p.length > 0);
+        // Fixed ProxyScrape URL + Fallback
+        const sources = [
+            'https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all',
+            'https://www.proxy-list.download/api/v1/get?type=http'
+        ];
+        
+        let allProxies = [];
+        for (let url of sources) {
+            try {
+                const res = await axios.get(url, { timeout: 5000 });
+                const list = res.data.split(/\r?\n/).filter(p => p.trim().includes(':'));
+                allProxies = [...allProxies, ...list];
+            } catch (e) { continue; }
+        }
+
+        // Shuffle list to avoid everyone using the same "top" proxy
+        proxyList = allProxies.sort(() => Math.random() - 0.5);
         console.log(`Found ${proxyList.length} potential proxies.`);
-        return true;
+        return proxyList.length > 0;
     } catch (e) {
-        metrics.status = "Failed to scrape proxy list.";
+        metrics.status = "Failed to fetch any proxies.";
         return false;
     }
 }
 
-// 2. Find a proxy that actually works for KCEX
+// 2. Find a proxy that bypasses Cloudflare 403
 async function findWorkingProxy() {
-    if (proxyList.length === 0) await refreshProxyList();
+    if (proxyList.length < 5) await refreshProxyList();
 
-    for (let i = 0; i < 20; i++) { // Try up to 20 proxies
+    let attempts = 0;
+    while (attempts < 15) {
         const proxy = proxyList.shift();
         if (!proxy) break;
 
-        const testAgent = new HttpsProxyAgent(`http://${proxy}`);
-        metrics.status = `Testing proxy: ${proxy}...`;
+        const testAgent = new HttpsProxyAgent(`http://${proxy.trim()}`);
+        metrics.status = `Testing: ${proxy.trim()}...`;
         
         try {
-            // Test if this proxy can reach KCEX
-            await axios.get(`${API_BASE}/market/symbols`, { 
+            // Test against KCEX Symbols endpoint
+            const res = await axios.get(`${API_BASE}/market/symbols`, { 
                 httpsAgent: testAgent, 
-                timeout: 5000,
-                headers: { 'User-Agent': 'Mozilla/5.0' }
+                timeout: 4000,
+                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
             });
             
-            currentAgent = testAgent;
-            metrics.proxyInUse = proxy;
-            console.log("Success! Found working proxy:", proxy);
-            return true;
+            if (res.data && res.data.data) {
+                currentAgent = testAgent;
+                metrics.proxyInUse = proxy;
+                return true;
+            }
         } catch (e) {
+            attempts++;
             console.log(`Proxy ${proxy} failed.`);
         }
     }
@@ -101,7 +120,7 @@ async function mapKcex() {
         metrics.activePaths = monitoredPaths.length;
         metrics.status = "Scanner Active";
     } catch (e) {
-        metrics.status = "Proxy lost connection. Re-routing...";
+        metrics.status = "Cloudflare Blocked Proxy. Rotating...";
         currentAgent = null;
     }
 }
@@ -110,6 +129,8 @@ async function startScanner() {
     if (!currentAgent) {
         const found = await findWorkingProxy();
         if (!found) {
+            metrics.status = "No working proxies found. Retrying scraper...";
+            proxyList = [];
             setTimeout(startScanner, 5000);
             return;
         }
@@ -117,7 +138,7 @@ async function startScanner() {
 
     if (monitoredPaths.length === 0) {
         await mapKcex();
-        setTimeout(startScanner, 2000);
+        setTimeout(startScanner, 1000);
         return;
     }
 
@@ -127,6 +148,8 @@ async function startScanner() {
             headers: { 'User-Agent': 'Mozilla/5.0' },
             timeout: 5000
         });
+
+        if (!response.data || !response.data.data) throw new Error("Empty Ticker");
 
         const tickers = {};
         response.data.data.forEach(t => {
@@ -154,8 +177,12 @@ async function startScanner() {
         metrics.liveAnalysis = batchData.sort((a,b) => b.roi - a.roi).slice(0, 10);
         metrics.totalScans++;
     } catch (e) {
-        metrics.status = "Connection dropped. Finding new proxy...";
-        currentAgent = null;
+        metrics.errors++;
+        if (metrics.errors > 3) {
+            metrics.status = "Proxy unstable. Rotating...";
+            currentAgent = null;
+            metrics.errors = 0;
+        }
     }
     setTimeout(startScanner, 3000);
 }
@@ -165,20 +192,18 @@ app.get('/', (req, res) => {
         <body style="background:#020617; color:#94a3b8; font-family:monospace; padding:20px;">
             <h2 style="color:#f1f5f9">KCEX ARB MONITOR (0% FEE)</h2>
             <div style="background:#1e293b; padding:15px; border-radius:8px; border:1px solid #334155; margin-bottom:20px;">
-                <p>Engine Status: <span style="color:#4ade80">${metrics.status}</span></p>
+                <p>Engine Status: <span style="color:${metrics.status.includes('Active') ? '#4ade80' : '#fb7185'}">${metrics.status}</span></p>
                 <p>Proxy IP: <span style="color:#38bdf8">${metrics.proxyInUse}</span></p>
                 <p>Total Profit: <span style="color:#4ade80; font-size:1.5em;">$${metrics.simulatedProfit.toFixed(6)}</span></p>
-                <p>Paths Tracked: ${metrics.activePaths}</p>
             </div>
             <div style="display:grid; grid-template-columns: 1fr 1fr; gap:20px;">
                 <div style="background:#0f172a; padding:15px; border-radius:8px;">
-                    <h3>Best ROI (Live)</h3>
+                    <h3>Live Best ROI</h3>
                     ${metrics.liveAnalysis.map(a => `<div style="margin-bottom:5px;"><span style="color:#4ade80">${a.roi.toFixed(3)}%</span> | ${a.path}</div>`).join('')}
                 </div>
                 <div style="background:#0f172a; padding:15px; border-radius:8px;">
-                    <h3>Confirmed Success</h3>
+                    <h3>Log</h3>
                     ${metrics.history.map(h => `<div style="font-size:0.9em">${h.time}: <span style="color:#4ade80">${h.roi}</span></div>`).join('')}
-                    ${metrics.history.length === 0 ? 'Watching for gaps...' : ''}
                 </div>
             </div>
             <script>setTimeout(() => location.reload(), 4000);</script>
