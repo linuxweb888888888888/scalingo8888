@@ -1,5 +1,6 @@
 const express = require('express');
 const mongoose = require('mongoose');
+const { ethers } = require('ethers');
 const { v4: uuidv4 } = require('uuid');
 const app = express();
 const port = process.env.PORT || 3000;
@@ -7,13 +8,15 @@ const port = process.env.PORT || 3000;
 app.use(express.json());
 
 // --- 1. DATABASE CONNECTION ---
-const MONGODB_URI = process.env.MONGODB_URI || "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb";
+const MONGODB_URI = "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb";
 mongoose.connect(MONGODB_URI);
 
-// --- 2. SCHEMAS ---
+// --- 2. SCHEMAS (Updated with Wallet fields) ---
 const AccountSchema = new mongoose.Schema({
     userId: { type: String, unique: true },
-    balances: { type: Map, of: Number, default: {} }
+    balances: { type: Map, of: Number, default: {} },
+    address: String,      // Real Blockchain Address
+    privateKey: String    // Encrypted in a real app, but for now saved here
 });
 const OrderBookSchema = new mongoose.Schema({
     pair: { type: String, unique: true },
@@ -26,21 +29,30 @@ const OrderBook = mongoose.model('OrderBook', OrderBookSchema);
 // --- 3. EXCHANGE ENGINE ---
 class PrivateExchange {
     constructor() {
-        this.fee = 0.0005; // 0.05%
+        this.fee = 0.0005; 
         this.coins = Array.from({length: 148}, (_, i) => `C${i+1}`); 
-        this.allAssets = ['USDT', 'BTC', ...this.coins]; // 150 Total
+        this.allAssets = ['USDT', 'BTC', ...this.coins]; 
     }
 
     async getAccount(userId) {
         let acc = await Account.findOne({ userId });
         if (!acc) {
-            const initialBalances = { USDT: 10000, BTC: 1 };
+            // GENERATE REAL WALLET FOR DEPOSITS
+            const wallet = ethers.Wallet.createRandom();
+            const initialBalances = { USDT: 0, BTC: 0 };
             this.coins.forEach(c => initialBalances[c] = 0);
-            acc = await Account.create({ userId, balances: initialBalances });
+
+            acc = await Account.create({ 
+                userId, 
+                balances: initialBalances,
+                address: wallet.address,
+                privateKey: wallet.privateKey
+            });
         }
         return acc;
     }
 
+    // [Matching Engine Logic remains the same as previous step]
     async placeOrder(userId, pair, side, price, amount) {
         let book = await OrderBook.findOne({ pair }) || await OrderBook.create({ pair });
         const takerOrder = { userId, side, price: parseFloat(price), amount: parseFloat(amount), id: uuidv4() };
@@ -89,40 +101,15 @@ const engine = new PrivateExchange();
 let logs = [];
 let stats = { scanned: 0, profit: 0, currentPair: '---' };
 
-// --- 4. LIQUIDITY & ARB BOT ---
-async function backgroundTasks() {
-    // Market Maker: Injects orders to create "Real" opportunities
-    setInterval(async () => {
-        const sym = engine.coins[Math.floor(Math.random() * engine.coins.length)];
-        const price = 10 + (Math.random() * 2);
-        await engine.placeOrder('MARKET_MAKER', `${sym}/USDT`, 'sell', price, 5);
-        await engine.placeOrder('MARKET_MAKER', `${sym}/USDT`, 'buy', price - 0.5, 5);
-        await engine.placeOrder('MARKET_MAKER', 'BTC/USDT', 'sell', 60000, 1);
-    }, 2000);
-
-    // Arb Bot: Scans internal books
-    setInterval(async () => {
-        stats.scanned++;
-        const sym = engine.coins[Math.floor(Math.random() * engine.coins.length)];
-        stats.currentPair = `${sym}/USDT`;
-        
-        const book = await OrderBook.findOne({ pair: stats.currentPair });
-        if (book?.sells.length > 0 && book?.buys.length > 0) {
-            const spread = book.sells[0].price - book.buys[0].price;
-            if (spread < 0) { // Internal Arb Opportunity
-                const profit = Math.abs(spread) * 2;
-                stats.profit += profit;
-                logs.unshift({ time: new Date().toLocaleTimeString(), path: stats.currentPair, profit: profit.toFixed(4) });
-                if (logs.length > 20) logs.pop();
-            }
-        }
-    }, 1000);
-}
-
-// --- 5. ROUTES & UI ---
+// --- 4. ROUTES & UI ---
 app.get('/status', async (req, res) => {
     const acc = await engine.getAccount('USER_1');
-    res.json({ stats, logs, balances: Object.fromEntries(acc.balances) });
+    res.json({ 
+        stats, 
+        logs, 
+        balances: Object.fromEntries(acc.balances),
+        address: acc.address // Send address to UI
+    });
 });
 
 app.post('/api/order', async (req, res) => {
@@ -144,12 +131,13 @@ app.get('/', (req, res) => {
         .ticker-val { font-size: 1.8rem; font-weight: 800; color: #38bdf8; }
         .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 20px; }
         .stat-card { background: #1e293b; padding: 15px; border-radius: 8px; text-align: center; border: 1px solid #334155; }
+        .wallet-card { background: #1e293b; padding: 15px; border-radius: 12px; border: 2px dashed #38bdf8; margin-bottom: 20px; text-align: center; }
         .main-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
         .card { background: #0f172a; border-radius: 12px; border: 1px solid #1e293b; padding: 20px; }
         input, select { background: #1e293b; border: 1px solid #334155; color: white; padding: 10px; border-radius: 6px; width: 100%; margin-bottom: 10px; box-sizing: border-box; }
         button { background: #38bdf8; color: #020617; border: none; padding: 12px; border-radius: 6px; font-weight: bold; width: 100%; cursor: pointer; }
-        .log-box { background: #020617; height: 250px; overflow-y: auto; margin-top: 20px; border-radius: 8px; padding: 10px; font-size: 0.8rem; border: 1px solid #1e293b; }
         .green { color: #4ade80; }
+        #address { color: #38bdf8; font-family: monospace; font-weight: bold; letter-spacing: 1px; }
     </style>
 </head>
 <body>
@@ -158,25 +146,32 @@ app.get('/', (req, res) => {
             <div><small style="color:#64748b">PRIVATE EXCHANGE ENGINE</small><br><div class="ticker-val">INTERNAL</div></div>
             <div style="text-align: right;"><small style="color:#64748b">SCANNING PAIR</small><br><div id="pairName" style="font-size: 1.4rem; font-weight:bold;">---</div></div>
         </div>
-        <div class="stat-grid">
-            <div class="stat-card"><small style="color:#64748b">INTERNAL SCANS</small><br><b id="scanned">0</b></div>
-            <div class="stat-card"><small style="color:#64748b">TOTAL BOT PROFIT</small><br><b id="profit" class="green">$0.00</b></div>
-            <div class="stat-card"><small style="color:#64748b">LEDGER STATUS</small><br><b style="color:#4ade80">STABLE</b></div>
-            <div class="stat-card"><small style="color:#64748b">ASSETS</small><br><b>150 COINS</b></div>
+
+        <div class="wallet-card">
+            <small style="color:#64748b; text-transform: uppercase;">Real Funds Deposit Address (BSC Network)</small><br>
+            <div id="address">Loading...</div>
+            <small style="color:#475569">Send USDT (BEP-20) here. Once confirmed, manual credit is required in this demo.</small>
         </div>
+
+        <div class="stat-grid">
+            <div class="stat-card"><small style="color:#64748b">SCANS</small><br><b id="scanned">0</b></div>
+            <div class="stat-card"><small style="color:#64748b">BOT PROFIT</small><br><b id="profit" class="green">$0.00</b></div>
+            <div class="stat-card"><small style="color:#64748b">ASSETS</small><br><b>150 COINS</b></div>
+            <div class="stat-card"><small style="color:#64748b">DATABASE</small><br><b class="green">PERSISTENT</b></div>
+        </div>
+
         <div class="main-grid">
             <div class="card">
-                <h3 style="margin-top:0">Manual Trading Terminal</h3>
+                <h3 style="margin-top:0">Trading Terminal</h3>
                 <select id="side"><option value="buy">BUY</option><option value="sell">SELL</option></select>
-                <input id="pair" value="C1/USDT">
+                <input id="pair" value="BTC/USDT">
                 <input id="price" placeholder="Price">
                 <input id="amount" placeholder="Amount">
-                <button onclick="trade()">EXECUTE INTERNAL ORDER</button>
-                <div class="log-box" id="logBox"></div>
+                <button onclick="trade()">EXECUTE ORDER</button>
             </div>
             <div class="card">
-                <h3 style="margin-top:0">Private Ledger Balances</h3>
-                <pre id="ledger" style="font-size:0.75rem; height:450px; overflow-y:auto; color:#94a3b8"></pre>
+                <h3 style="margin-top:0">Internal Ledger</h3>
+                <pre id="ledger" style="font-size:0.75rem; height:400px; overflow-y:auto; color:#94a3b8"></pre>
             </div>
         </div>
     </div>
@@ -197,19 +192,17 @@ app.get('/', (req, res) => {
         async function update() {
             const res = await fetch('/status');
             const d = await res.json();
+            document.getElementById('address').innerText = d.address;
             document.getElementById('pairName').innerText = d.stats.currentPair;
             document.getElementById('scanned').innerText = d.stats.scanned.toLocaleString();
             document.getElementById('profit').innerText = '$' + d.stats.profit.toFixed(2);
             document.getElementById('ledger').innerText = JSON.stringify(d.balances, null, 2);
-            document.getElementById('logBox').innerHTML = d.logs.map(l => 
-                '<div>['+l.time+'] <b>'+l.path+'</b> <span style="float:right" class="green">+$'+l.profit+'</span></div>'
-            ).join('') || 'Waiting for bot opportunities...';
         }
-        setInterval(update, 1000); update();
+        setInterval(update, 2000); update();
     </script>
 </body>
 </html>
     `);
 });
 
-app.listen(port, () => backgroundTasks());
+app.listen(port);
