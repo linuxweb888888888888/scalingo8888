@@ -1,25 +1,12 @@
 const axios = require('axios');
 const express = require('express');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 const app = express();
 
 const port = process.env.PORT || 3000;
 const WALLET_PRINCIPAL = 10.00;
-const TAKER_FEE = 0.0000; 
-
-// KCEX Mobile API Endpoint (sometimes less protected)
+const TAKER_FEE = 0.00;
 const API_BASE = 'https://api.kcex.com/api/v1';
-
-const stealthConfig = {
-    headers: {
-        // Impersonating the KCEX Android App
-        'User-Agent': 'okhttp/4.9.1',
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-        'x-mxc-sdk-version': '1.0.0',
-        'Cache-Control': 'no-cache'
-    },
-    timeout: 15000
-};
 
 let metrics = {
     totalScans: 0,
@@ -27,151 +14,141 @@ let metrics = {
     history: [],
     liveAnalysis: [],
     status: "Initializing...",
-    pathsTracked: 0,
-    uniqueCoins: 0
+    proxyInUse: "None"
 };
 
 let monitoredPaths = [];
+let currentAgent = null;
 
-async function mapKcexMarkets() {
+// Function to get a "fresh" free proxy
+async function refreshProxy() {
     try {
-        metrics.status = "Attempting Mobile API handshake...";
-        const response = await axios.get(`${API_BASE}/market/symbols`, stealthConfig);
-        
-        if (!response.data || !response.data.data) {
-            throw new Error("Empty response from exchange");
+        metrics.status = "Fetching new proxy...";
+        // Fetching a free anonymous proxy from a public API
+        const res = await axios.get('https://pubproxy.com/api/proxy?format=json&type=http&last_check=60&limit=1&level=anonymous');
+        if (res.data && res.data.data) {
+            const proxy = res.data.data[0];
+            const proxyUrl = `http://${proxy.ip}:${proxy.port}`;
+            currentAgent = new HttpsProxyAgent(proxyUrl);
+            metrics.proxyInUse = proxyUrl;
+            console.log("New Proxy assigned:", proxyUrl);
+            return true;
         }
+    } catch (e) {
+        console.log("Failed to fetch free proxy, trying fallback...");
+        // Fallback to a known public proxy if API fails
+        metrics.proxyInUse = "Searching for stable node...";
+    }
+    return false;
+}
 
+async function fetchWithRetry(url) {
+    const config = {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        timeout: 8000
+    };
+    if (currentAgent) config.httpsAgent = currentAgent;
+
+    try {
+        return await axios.get(url, config);
+    } catch (err) {
+        if (err.response && err.response.status === 403) {
+            console.log("403 Detected. Rotating proxy...");
+            await refreshProxy();
+            // Retry once with new proxy
+            if (currentAgent) config.httpsAgent = currentAgent;
+            return await axios.get(url, config);
+        }
+        throw err;
+    }
+}
+
+async function mapKcex() {
+    try {
+        const response = await fetchWithRetry(`${API_BASE}/market/symbols`);
         const symbols = response.data.data;
         const adj = {};
-        const coinSet = new Set();
-
+        
         symbols.forEach(s => {
-            if (s.symbol && s.symbol.endsWith('USDT')) {
+            if (s.symbol?.endsWith('USDT')) {
                 const base = s.symbol.replace('USDT', '');
-                const quote = 'USDT';
                 if (!adj[base]) adj[base] = [];
-                if (!adj[quote]) adj[quote] = [];
-                adj[base].push({ to: quote, pair: s.symbol, type: 'sell' });
-                adj[quote].push({ to: base, pair: s.symbol, type: 'buy' });
-                coinSet.add(base);
+                if (!adj['USDT']) adj['USDT'] = [];
+                adj[base].push({ to: 'USDT', pair: s.symbol, type: 'sell' });
+                adj['USDT'].push({ to: base, pair: s.symbol, type: 'buy' });
             }
         });
 
-        metrics.uniqueCoins = coinSet.size;
         const paths = [];
-        const startNode = 'USDT';
-        const neighborsA = adj[startNode] || [];
-
-        neighborsA.forEach(edge1 => {
-            const coinA = edge1.to;
-            const neighborsB = adj[coinA] || [];
-            neighborsB.forEach(edge2 => {
-                const coinB = edge2.to;
-                if (coinB === startNode) return;
-                const neighborsC = adj[coinB] || [];
-                neighborsC.forEach(edge3 => {
-                    if (edge3.to === startNode) {
-                        paths.push([edge1, edge2, edge3]);
-                    }
+        const neighborsA = adj['USDT'] || [];
+        neighborsA.forEach(e1 => {
+            const coinA = e1.to;
+            (adj[coinA] || []).forEach(e2 => {
+                const coinB = e2.to;
+                if (coinB === 'USDT') return;
+                (adj[coinB] || []).forEach(e3 => {
+                    if (e3.to === 'USDT') paths.push([e1, e2, e3]);
                 });
             });
         });
 
-        monitoredPaths = paths;
-        metrics.pathsTracked = monitoredPaths.length;
-        metrics.status = "KCEX Mobile-Link Active";
+        monitoredPaths = paths.slice(0, 500);
+        metrics.status = "Scanning Active";
     } catch (e) {
-        let errorMsg = e.response ? `Code ${e.response.status}` : e.message;
-        metrics.status = "Connection Failed: " + errorMsg;
-        
-        if (errorMsg.includes("403")) {
-            metrics.status = "BLOCKED BY CLOUDFLARE (IP Block)";
-        }
+        metrics.status = "Proxy Error - Retrying...";
+        setTimeout(mapKcex, 5000);
     }
 }
 
 async function startScanner() {
-    if (monitoredPaths.length === 0) {
-        await mapKcexMarkets();
-        setTimeout(startScanner, 10000); // Wait longer if blocked
-        return;
-    }
+    if (monitoredPaths.length === 0) { await mapKcex(); return; }
 
     try {
-        const response = await axios.get(`${API_BASE}/market/ticker/bookTicker`, stealthConfig);
-        const tickersArr = response.data.data;
+        const response = await fetchWithRetry(`${API_BASE}/market/ticker/bookTicker`);
         const tickers = {};
-        tickersArr.forEach(t => {
+        response.data.data.forEach(t => {
             tickers[t.symbol] = { bid: parseFloat(t.bidPrice), ask: parseFloat(t.askPrice) };
         });
 
         let batchData = [];
         for (const path of monitoredPaths) {
-            let balance = WALLET_PRINCIPAL;
+            let bal = WALLET_PRINCIPAL;
             let valid = true;
             for (const step of path) {
-                const ticker = tickers[step.pair];
-                if (!ticker || !ticker.ask || !ticker.bid || ticker.ask === 0) { valid = false; break; }
-                if (step.type === 'buy') balance = (balance / ticker.ask);
-                else balance = (balance * ticker.bid);
+                const t = tickers[step.pair];
+                if (!t || !t.ask) { valid = false; break; }
+                bal = step.type === 'buy' ? (bal / t.ask) : (bal * t.bid);
             }
             if (!valid) continue;
-            const roi = ((balance - WALLET_PRINCIPAL) / WALLET_PRINCIPAL) * 100;
-            if (roi > -2.0) batchData.push({ path: `${path[0].pair}→${path[1].pair}→${path[2].pair}`, roi });
-            
-            if (roi > 0.001) {
-                metrics.simulatedProfit += (balance - WALLET_PRINCIPAL);
-                metrics.history.unshift({ path: `${path[0].pair}→${path[1].pair}→${path[2].pair}`, roi: roi.toFixed(4) + '%', time: new Date().toLocaleTimeString() });
-                if (metrics.history.length > 10) metrics.history.pop();
+            const roi = ((bal - WALLET_PRINCIPAL) / WALLET_PRINCIPAL) * 100;
+            if (roi > -0.5) batchData.push({ path: `${path[0].pair}→${path[1].pair}→${path[2].pair}`, roi });
+            if (roi > 0.02) {
+                metrics.simulatedProfit += (bal - WALLET_PRINCIPAL);
+                metrics.history.unshift({ path: path.map(p=>p.pair).join('→'), roi: roi.toFixed(3)+'%', time: new Date().toLocaleTimeString() });
             }
         }
-        metrics.liveAnalysis = batchData.sort((a, b) => b.roi - a.roi).slice(0, 10);
+        metrics.liveAnalysis = batchData.sort((a,b) => b.roi - a.roi).slice(0, 10);
         metrics.totalScans++;
-        metrics.status = "Scanning Active";
     } catch (e) {
-        metrics.status = "Scan Interrupted";
+        metrics.status = "Scanner lag - switching proxy...";
     }
-    setTimeout(startScanner, 2000);
+    setTimeout(startScanner, 4000);
 }
 
 app.get('/', (req, res) => {
     res.send(`
-        <html>
-            <head><title>KCEX Stealth Monitor</title><meta http-equiv="refresh" content="3">
-            <style>
-                body { background: #0b0e11; color: #fff; font-family: monospace; padding: 20px; text-align: center;}
-                .green { color: #02c076; } .red { color: #ff3b30; }
-                .card { background: #1e2329; padding: 20px; border-radius: 10px; border: 1px solid #333; display: inline-block; min-width: 300px; }
-                .box { background: #161a1e; padding: 15px; border-radius: 5px; margin-top: 20px; text-align: left; }
-                table { width: 100%; margin-top: 10px; border-collapse: collapse; }
-                td { padding: 5px; border-bottom: 1px solid #333; }
-            </style></head>
-            <body>
-                <h2>KCEX SCANNER (0% FEES)</h2>
-                <div class="card">
-                    <div style="font-size: 0.8em; color: #848e9c;">ENGINE STATUS</div>
-                    <div class="${metrics.status.includes('BLOCKED') ? 'red' : 'green'}" style="font-size: 1.2em; font-weight: bold;">${metrics.status}</div>
-                    <hr style="border: 0; border-top: 1px solid #333; margin: 15px 0;">
-                    <div style="font-size: 0.8em; color: #848e9c;">SIMULATED PROFIT</div>
-                    <div class="green" style="font-size: 2em;">$${metrics.simulatedProfit.toFixed(6)}</div>
-                </div>
-
-                <div style="max-width: 800px; margin: auto; display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
-                    <div class="box">
-                        <h3>Live Gaps</h3>
-                        <table>
-                            ${metrics.liveAnalysis.map(a => `<tr><td>${a.path}</td><td class="green">${a.roi.toFixed(3)}%</td></tr>`).join('')}
-                        </table>
-                    </div>
-                    <div class="box">
-                        <h3>History</h3>
-                        ${metrics.history.map(h => `<div style="font-size: 0.85em; margin-bottom: 5px;">[${h.time}] <span class="green">${h.roi}</span></div>`).join('')}
-                    </div>
-                </div>
-                ${metrics.status.includes('BLOCKED') ? `<p class="red">Your server's IP is banned by KCEX. You must run this locally or use a VPN/Proxy.</p>` : ''}
-            </body>
-        </html>
+        <body style="background:#020617; color:#94a3b8; font-family:monospace; padding:20px;">
+            <h2 style="color:#f1f5f9">KCEX ARB MONITOR</h2>
+            <div style="background:#1e293b; padding:15px; border-radius:8px; border:1px solid #334155">
+                <p>Status: <span style="color:#4ade80">${metrics.status}</span></p>
+                <p>Proxy: <span style="color:#38bdf8">${metrics.proxyInUse}</span></p>
+                <p>Profit: <span style="color:#4ade80">$${metrics.simulatedProfit.toFixed(6)}</span></p>
+            </div>
+            <h3>Top ROI</h3>
+            ${metrics.liveAnalysis.map(a => `<div>${a.roi.toFixed(3)}% | ${a.path}</div>`).join('')}
+            <h3>Success Log</h3>
+            ${metrics.history.slice(0,10).map(h => `<div>${h.time}: ${h.roi} | ${h.path}</div>`).join('')}
+        </body>
     `);
 });
 
