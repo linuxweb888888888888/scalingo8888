@@ -5,31 +5,37 @@ const port = process.env.PORT || 3000;
 
 // --- CONFIGURATION ---
 const exchange = new ccxt.mexc();
-const takerFee = 0.0005; // 0.05%
-const minProfitUsdt = 0.05; // Minimum profit to log ($0.05 per $100)
-let logs = [];
-let lastScan = "Initializing...";
-let trianglePaths = [];
+const TAKER_FEE = 0.0005; // 0.05% per trade
+const START_CAPITAL = 100; // Hypothetical $100 for ROI calculation
 
-// --- BOT LOGIC ---
+// --- BOT STATE ---
+let logs = [];
+let lastScanTime = null;
+let trianglePaths = [];
+let stats = {
+    totalScanned: 0,
+    trianglesFound: 0,
+    bestRoi: 0,
+    uptime: Date.now()
+};
+
 async function initBot() {
-    console.log("Loading MEXC markets...");
+    console.log("Initializing MEXC Arb Bot...");
     const markets = await exchange.loadMarkets();
     const symbols = Object.keys(markets);
-    const base = 'USDT';
-
-    // Build unique triangular paths: USDT -> A -> B -> USDT
+    
+    // Find paths: USDT -> A -> B -> USDT
     for (const s1 of symbols) {
         const [t1, q1] = s1.split('/');
-        if (q1 !== base) continue;
+        if (q1 !== 'USDT') continue;
         for (const s2 of symbols) {
             const [t2, q2] = s2.split('/');
             if (q2 !== t1) continue;
-            const s3 = `${t2}/${base}`;
+            const s3 = `${t2}/USDT`;
             if (markets[s3]) trianglePaths.push([s1, s2, s3]);
         }
     }
-    console.log(`Found ${trianglePaths.length} paths. Starting scan...`);
+    stats.trianglesFound = trianglePaths.length;
     runLoop();
 }
 
@@ -37,58 +43,108 @@ async function runLoop() {
     while (true) {
         try {
             const tickers = await exchange.fetchTickers();
-            lastScan = new Date().toLocaleTimeString();
+            lastScanTime = new Date().toLocaleTimeString();
             
             for (const path of trianglePaths) {
+                stats.totalScanned++;
                 const [s1, s2, s3] = path;
                 if (!tickers[s1] || !tickers[s2] || !tickers[s3]) continue;
 
-                const p1 = tickers[s1].ask; // Buy A with USDT
-                const p2 = tickers[s2].ask; // Buy B with A
-                const p3 = tickers[s3].bid; // Sell B for USDT
+                // Step 1: USDT -> CoinA (Ask Price)
+                const price1 = tickers[s1].ask;
+                // Step 2: CoinA -> CoinB (Ask Price)
+                const price2 = tickers[s2].ask;
+                // Step 3: CoinB -> USDT (Bid Price)
+                const price3 = tickers[s3].bid;
 
-                const final = (100 / p1 / p2) * p3;
-                const profit = final - (100 * (1 + takerFee * 3));
+                if (price1 === 0 || price2 === 0) continue;
 
-                if (profit > minProfitUsdt) {
-                    const entry = `[${lastScan}] ${path.join(' ➔ ')} | Profit: +$${profit.toFixed(4)}`;
-                    logs.unshift(entry);
-                    if (logs.length > 30) logs.pop();
-                    console.log(entry);
+                // Math: How much USDT we end with
+                const amount1 = START_CAPITAL / price1;
+                const amount2 = amount1 / price2;
+                const finalUsdt = amount2 * price3;
+
+                // Subtract Fees (3 trades * 0.05%)
+                const totalFees = START_CAPITAL * (TAKER_FEE * 3);
+                const netResult = finalUsdt - totalFees;
+                const roi = ((netResult - START_CAPITAL) / START_CAPITAL) * 100;
+
+                if (roi > 0.01) { // Log anything with > 0.01% ROI
+                    if (roi > stats.bestRoi) stats.bestRoi = roi;
+
+                    const logEntry = {
+                        time: lastScanTime,
+                        path: path.join(' ➔ '),
+                        details: `Rates: [1]${price1} [2]${price2} [3]${price3}`,
+                        roi: roi.toFixed(4),
+                        profit: (netResult - START_CAPITAL).toFixed(4)
+                    };
+
+                    logs.unshift(logEntry);
+                    if (logs.length > 50) logs.pop();
                 }
             }
         } catch (e) {
-            console.error("Scan error:", e.message);
+            console.error("Loop Error:", e.message);
         }
-        await new Promise(r => setTimeout(r, 5000)); // Scan every 5 seconds
+        await new Promise(r => setTimeout(r, 3000)); // Cool down to avoid rate limits
     }
 }
 
-// --- WEB INTERFACE ---
+// --- WEB UI ---
 app.get('/', (req, res) => {
-    const logHtml = logs.map(l => `<div style="padding:5px; border-bottom:1px solid #1e293b;">${l}</div>`).join('');
+    const uptimeMins = Math.floor((Date.now() - stats.uptime) / 60000);
+    const logRows = logs.map(l => `
+        <div style="border-bottom: 1px solid #1e293b; padding: 10px 0;">
+            <span style="color: #94a3b8;">[${l.time}]</span> 
+            <b style="color: #f8fafc;">${l.path}</b><br>
+            <small style="color: #64748b;">${l.details}</small> | 
+            <span style="color: #4ade80; font-weight: bold;">ROI: ${l.roi}% (+$${l.profit})</span>
+        </div>
+    `).join('');
+
     res.send(`
         <!DOCTYPE html>
-        <html>
+        <html lang="en">
         <head>
-            <title>ArbBot MEXC</title>
-            <meta http-equiv="refresh" content="5">
+            <meta charset="UTF-8"><meta http-equiv="refresh" content="5">
+            <title>MEXC Arb Monitor</title>
             <style>
-                body { background: #0f172a; color: #38bdf8; font-family: monospace; padding: 20px; line-height: 1.5; }
-                .card { max-width: 900px; margin: auto; border: 1px solid #1e293b; padding: 20px; border-radius: 10px; background: #111827; }
-                h1 { color: #f8fafc; font-size: 1.2rem; border-bottom: 2px solid #334155; padding-bottom: 10px; }
-                .status { color: #4ade80; margin: 10px 0; font-weight: bold; }
-                .logs { background: #020617; height: 400px; overflow-y: auto; padding: 10px; border-radius: 5px; font-size: 0.85rem; border: 1px solid #1e293b; }
+                body { background: #020617; color: #f1f5f9; font-family: 'Segoe UI', sans-serif; padding: 20px; }
+                .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-bottom: 20px; }
+                .stat-card { background: #0f172a; padding: 15px; border-radius: 8px; border: 1px solid #1e293b; text-align: center; }
+                .stat-val { display: block; font-size: 1.5rem; font-weight: bold; color: #38bdf8; }
+                .stat-label { font-size: 0.75rem; color: #64748b; text-transform: uppercase; }
+                .log-container { background: #0f172a; padding: 20px; border-radius: 8px; border: 1px solid #1e293b; height: 500px; overflow-y: auto; }
+                h1 { font-size: 1.2rem; margin-bottom: 20px; color: #94a3b8; }
+                .green { color: #4ade80; }
             </style>
         </head>
         <body>
-            <div class="card">
-                <h1>Triangular Arbitrage Dashboard (MEXC)</h1>
-                <div class="status">● SCANNING ${trianglePaths.length} PAIRS | Last Update: ${lastScan}</div>
-                <div class="logs">
-                    ${logs.length > 0 ? logHtml : "<div>Watching markets for spreads...</div>"}
+            <h1>Arbitrage Performance Monitor <span style="font-size:0.8rem">| MEXC Low-Fee Engine</span></h1>
+            
+            <div class="grid">
+                <div class="stat-card">
+                    <span class="stat-label">Total Paths Scanned</span>
+                    <span class="stat-val">${stats.totalScanned.toLocaleString()}</span>
                 </div>
-                <p style="font-size: 0.7rem; color: #64748b;">Fee: 0.05% Taker | Logic: USDT ➔ AltA ➔ AltB ➔ USDT</p>
+                <div class="stat-card">
+                    <span class="stat-label">Best ROI Found</span>
+                    <span class="stat-val green">${stats.bestRoi.toFixed(3)}%</span>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-label">Triangles Tracked</span>
+                    <span class="stat-val">${stats.trianglesFound}</span>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-label">Bot Uptime</span>
+                    <span class="stat-val">${uptimeMins}m</span>
+                </div>
+            </div>
+
+            <div class="log-container">
+                <div style="margin-bottom: 10px; color: #38bdf8; font-size: 0.8rem; border-bottom: 1px solid #38bdf8;">LIVE PROFIT OPPORTUNITIES (AFTER FEES)</div>
+                ${logs.length > 0 ? logRows : '<div style="color:#64748b">Scanning markets... No profitable triangles detected yet.</div>'}
             </div>
         </body>
         </html>
@@ -96,6 +152,6 @@ app.get('/', (req, res) => {
 });
 
 app.listen(port, () => {
-    console.log(`Web server active on port ${port}`);
+    console.log(`Server: http://localhost:${port}`);
     initBot();
 });
