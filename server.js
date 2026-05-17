@@ -4,154 +4,141 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // --- CONFIGURATION ---
-const exchange = new ccxt.mexc();
-const TAKER_FEE = 0.0005; // 0.05% per trade
-const START_CAPITAL = 100; // Hypothetical $100 for ROI calculation
+const exchange = new ccxt.phemex({
+    apiKey: 'YOUR_API_KEY',
+    secret: 'YOUR_SECRET_KEY',
+    options: { 'defaultType': 'spot' }
+});
 
-// --- BOT STATE ---
+const TAKER_FEE = 0.001; // 0.10% per trade
+const START_CAPITAL = 100; // Hypothetical USDT for ROI math
+
 let logs = [];
-let lastScanTime = null;
 let trianglePaths = [];
-let stats = {
-    totalScanned: 0,
-    trianglesFound: 0,
-    bestRoi: 0,
-    uptime: Date.now()
-};
+let stats = { scanned: 0, bestRoi: 0, uptime: Date.now() };
 
+// --- BOT LOGIC ---
 async function initBot() {
-    console.log("Initializing MEXC Arb Bot...");
-    const markets = await exchange.loadMarkets();
-    const symbols = Object.keys(markets);
-    
-    // Find paths: USDT -> A -> B -> USDT
-    for (const s1 of symbols) {
-        const [t1, q1] = s1.split('/');
-        if (q1 !== 'USDT') continue;
-        for (const s2 of symbols) {
-            const [t2, q2] = s2.split('/');
-            if (q2 !== t1) continue;
-            const s3 = `${t2}/USDT`;
-            if (markets[s3]) trianglePaths.push([s1, s2, s3]);
+    console.log("Connecting to Phemex...");
+    try {
+        const markets = await exchange.loadMarkets();
+        const symbols = Object.keys(markets);
+        const base = 'USDT';
+
+        // Find: USDT -> A -> B -> USDT
+        for (const s1 of symbols) {
+            const m1 = markets[s1];
+            if (m1.quote !== base || !m1.active) continue;
+            
+            const coinA = m1.base;
+
+            for (const s2 of symbols) {
+                const m2 = markets[s2];
+                if (m2.quote !== coinA || !m2.active) continue;
+
+                const coinB = m2.base;
+                const s3 = `${coinB}/${base}`;
+
+                if (markets[s3] && markets[s3].active) {
+                    trianglePaths.push([s1, s2, s3]);
+                }
+            }
         }
+        console.log(`Phemex Bot Ready: ${trianglePaths.length} paths discovered.`);
+        runLoop();
+    } catch (e) {
+        console.error("Init Error:", e.message);
     }
-    stats.trianglesFound = trianglePaths.length;
-    runLoop();
 }
 
 async function runLoop() {
     while (true) {
         try {
+            // Phemex fetchTickers provides all spot prices in one call
             const tickers = await exchange.fetchTickers();
-            lastScanTime = new Date().toLocaleTimeString();
+            const now = new Date().toLocaleTimeString();
             
             for (const path of trianglePaths) {
-                stats.totalScanned++;
+                stats.scanned++;
                 const [s1, s2, s3] = path;
+
                 if (!tickers[s1] || !tickers[s2] || !tickers[s3]) continue;
 
-                // Step 1: USDT -> CoinA (Ask Price)
-                const price1 = tickers[s1].ask;
-                // Step 2: CoinA -> CoinB (Ask Price)
-                const price2 = tickers[s2].ask;
-                // Step 3: CoinB -> USDT (Bid Price)
-                const price3 = tickers[s3].bid;
+                const p1 = tickers[s1].ask; // Buy A with USDT
+                const p2 = tickers[s2].ask; // Buy B with A
+                const p3 = tickers[s3].bid; // Sell B for USDT
 
-                if (price1 === 0 || price2 === 0) continue;
+                if (!p1 || !p2 || !p3) continue;
 
-                // Math: How much USDT we end with
-                const amount1 = START_CAPITAL / price1;
-                const amount2 = amount1 / price2;
-                const finalUsdt = amount2 * price3;
+                // Triangulation Math
+                const amount1 = START_CAPITAL / p1;
+                const amount2 = amount1 / p2;
+                const finalUsdt = amount2 * p3;
 
-                // Subtract Fees (3 trades * 0.05%)
-                const totalFees = START_CAPITAL * (TAKER_FEE * 3);
-                const netResult = finalUsdt - totalFees;
+                // Deduct 0.1% fee per trade (3 trades)
+                const netResult = finalUsdt * Math.pow((1 - TAKER_FEE), 3);
                 const roi = ((netResult - START_CAPITAL) / START_CAPITAL) * 100;
 
-                if (roi > 0.01) { // Log anything with > 0.01% ROI
+                if (roi > 0.001) { // Threshold for logging
                     if (roi > stats.bestRoi) stats.bestRoi = roi;
-
-                    const logEntry = {
-                        time: lastScanTime,
+                    logs.unshift({
+                        time: now,
                         path: path.join(' ➔ '),
-                        details: `Rates: [1]${price1} [2]${price2} [3]${price3}`,
                         roi: roi.toFixed(4),
                         profit: (netResult - START_CAPITAL).toFixed(4)
-                    };
-
-                    logs.unshift(logEntry);
+                    });
                     if (logs.length > 50) logs.pop();
                 }
             }
         } catch (e) {
-            console.error("Loop Error:", e.message);
+            console.log("Phemex API Pulse Error:", e.message);
         }
-        await new Promise(r => setTimeout(r, 3000)); // Cool down to avoid rate limits
+        // Respect Phemex Rate Limits
+        await new Promise(r => setTimeout(r, 3000));
     }
 }
 
-// --- WEB UI ---
+// --- WEB DASHBOARD ---
 app.get('/', (req, res) => {
-    const uptimeMins = Math.floor((Date.now() - stats.uptime) / 60000);
-    const logRows = logs.map(l => `
-        <div style="border-bottom: 1px solid #1e293b; padding: 10px 0;">
-            <span style="color: #94a3b8;">[${l.time}]</span> 
-            <b style="color: #f8fafc;">${l.path}</b><br>
-            <small style="color: #64748b;">${l.details}</small> | 
-            <span style="color: #4ade80; font-weight: bold;">ROI: ${l.roi}% (+$${l.profit})</span>
-        </div>
-    `).join('');
-
     res.send(`
         <!DOCTYPE html>
-        <html lang="en">
+        <html>
         <head>
-            <meta charset="UTF-8"><meta http-equiv="refresh" content="5">
-            <title>MEXC Arb Monitor</title>
+            <title>Phemex Arb Bot</title>
+            <meta http-equiv="refresh" content="5">
             <style>
-                body { background: #020617; color: #f1f5f9; font-family: 'Segoe UI', sans-serif; padding: 20px; }
-                .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-bottom: 20px; }
-                .stat-card { background: #0f172a; padding: 15px; border-radius: 8px; border: 1px solid #1e293b; text-align: center; }
-                .stat-val { display: block; font-size: 1.5rem; font-weight: bold; color: #38bdf8; }
-                .stat-label { font-size: 0.75rem; color: #64748b; text-transform: uppercase; }
-                .log-container { background: #0f172a; padding: 20px; border-radius: 8px; border: 1px solid #1e293b; height: 500px; overflow-y: auto; }
-                h1 { font-size: 1.2rem; margin-bottom: 20px; color: #94a3b8; }
-                .green { color: #4ade80; }
+                body { background: #0a0a0a; color: #d4d4d8; font-family: 'Segoe UI', Tahoma, sans-serif; padding: 30px; }
+                .grid { display: flex; gap: 20px; margin-bottom: 30px; }
+                .card { background: #18181b; padding: 20px; border-radius: 12px; border: 1px solid #27272a; flex: 1; }
+                .val { display: block; font-size: 1.8rem; font-weight: bold; color: #60a5fa; }
+                .label { font-size: 0.75rem; color: #71717a; text-transform: uppercase; letter-spacing: 1px; }
+                .log-box { background: #09090b; padding: 20px; border-radius: 12px; height: 450px; overflow-y: auto; border: 1px solid #27272a; }
+                .log-row { display: flex; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid #18181b; font-family: monospace; }
+                .roi-pos { color: #4ade80; font-weight: bold; }
             </style>
         </head>
         <body>
-            <h1>Arbitrage Performance Monitor <span style="font-size:0.8rem">| MEXC Low-Fee Engine</span></h1>
-            
+            <h2 style="color: #f4f4f5;">Phemex Arbitrage Dashboard</h2>
             <div class="grid">
-                <div class="stat-card">
-                    <span class="stat-label">Total Paths Scanned</span>
-                    <span class="stat-val">${stats.totalScanned.toLocaleString()}</span>
-                </div>
-                <div class="stat-card">
-                    <span class="stat-label">Best ROI Found</span>
-                    <span class="stat-val green">${stats.bestRoi.toFixed(3)}%</span>
-                </div>
-                <div class="stat-card">
-                    <span class="stat-label">Triangles Tracked</span>
-                    <span class="stat-val">${stats.trianglesFound}</span>
-                </div>
-                <div class="stat-card">
-                    <span class="stat-label">Bot Uptime</span>
-                    <span class="stat-val">${uptimeMins}m</span>
-                </div>
+                <div class="card"><span class="label">Paths Scanned</span><span class="val">${stats.scanned.toLocaleString()}</span></div>
+                <div class="card"><span class="label">Best ROI Found</span><span class="val" style="color:#4ade80">${stats.bestRoi.toFixed(3)}%</span></div>
+                <div class="card"><span class="label">Bot Uptime</span><span class="val">${Math.floor((Date.now()-stats.uptime)/60000)}m</span></div>
             </div>
-
-            <div class="log-container">
-                <div style="margin-bottom: 10px; color: #38bdf8; font-size: 0.8rem; border-bottom: 1px solid #38bdf8;">LIVE PROFIT OPPORTUNITIES (AFTER FEES)</div>
-                ${logs.length > 0 ? logRows : '<div style="color:#64748b">Scanning markets... No profitable triangles detected yet.</div>'}
+            <div class="log-box">
+                <div style="color: #60a5fa; margin-bottom: 15px; font-size: 0.8rem;">LIVE OPPORTUNITIES (> 0.3% spread)</div>
+                ${logs.length > 0 ? logs.map(l => `
+                    <div class="log-row">
+                        <span><span style="color:#52525b">[${l.time}]</span> ${l.path}</span>
+                        <span class="roi-pos">+${l.roi}% ($${l.profit})</span>
+                    </div>
+                `).join('') : '<div style="color:#3f3f46">Scanning Phemex spot markets...</div>'}
             </div>
+            <p style="font-size:0.7rem; color:#3f3f46; margin-top:10px;">Fees: 0.1% Taker per trade. Refresh: 5s.</p>
         </body>
         </html>
     `);
 });
 
 app.listen(port, () => {
-    console.log(`Server: http://localhost:${port}`);
     initBot();
 });
