@@ -1,164 +1,195 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const { ethers } = require('ethers');
+const ccxt = require('ccxt');
 const { v4: uuidv4 } = require('uuid');
+
 const app = express();
 const port = process.env.PORT || 3000;
-
 app.use(express.json());
 
-// --- 1. EXCHANGE CORE ENGINE ---
-class PrivateExchange {
-    constructor() {
-        this.fee = 0.0005; // YOUR CUSTOM FEE (0.05%)
-        this.balances = {
-            'ADMIN_RESERVE': {},
-            'USER_BOT_1': { USDT: 10000 }
-        };
-        this.orderBooks = {};
-        this.assets = {};
-        this.initAssets();
+// --- 1. DATABASE CONNECTION ---
+// Replace with your connection string in environment variables for safety
+const MONGODB_URI = process.env.MONGODB_URI || "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb";
+
+mongoose.connect(MONGODB_URI)
+    .then(() => console.log("MongoDB Connected"))
+    .catch(err => console.error("MongoDB Connection Error:", err));
+
+// --- 2. DATABASE SCHEMAS ---
+const WalletSchema = new mongoose.Schema({
+    address: String,
+    privateKey: String,
+    createdAt: { type: Date, default: Date.now }
+});
+
+const StatsSchema = new mongoose.Schema({
+    totalScanned: { type: Number, default: 0 },
+    totalProfit: { type: Number, default: 0 },
+    bestRoi: { type: Number, default: 0 }
+});
+
+const LogSchema = new mongoose.Schema({
+    time: String,
+    ex: String,
+    path: String,
+    roi: Number,
+    profit: Number,
+    color: String
+});
+
+const WalletModel = mongoose.model('Wallet', WalletSchema);
+const StatsModel = mongoose.model('Stats', StatsSchema);
+const LogModel = mongoose.model('Log', LogSchema);
+
+// --- 3. EXCHANGE CONFIGURATION ---
+const exchangeConfig = {
+    mexc: { fee: 0.0005, color: '#00ff00', name: 'MEXC' },
+    lbank: { fee: 0.0010, color: '#38bdf8', name: 'LBANK' },
+    bitget: { fee: 0.0010, color: '#38bdf8', name: 'BITGET' },
+    phemex: { fee: 0.0010, color: '#facc15', name: 'PHEMEX' },
+    bitrue: { fee: 0.00098, color: '#ef4444', name: 'BITRUE' },
+    coinex: { fee: 0.0020, color: '#10b981', name: 'COINEX' },
+    htx: { fee: 0.0020, color: '#818cf8', name: 'HTX' },
+    xt: { fee: 0.0020, color: '#a855f7', name: 'XT' }
+};
+
+// --- 4. BOT ENGINE ---
+let masterWallet = null;
+let currentStats = { scanned: 0, profit: 0, bestRoi: 0 };
+let currentEx = "Initializing...";
+let currentPair = "---";
+
+async function init() {
+    // A. Handle Wallet Persistence
+    let walletData = await WalletModel.findOne();
+    if (!walletData) {
+        console.log("No wallet found. Generating new master wallet...");
+        const newWallet = ethers.Wallet.createRandom();
+        walletData = await WalletModel.create({
+            address: newWallet.address,
+            privateKey: newWallet.privateKey
+        });
+    }
+    masterWallet = new ethers.Wallet(walletData.privateKey);
+    console.log(`Master Wallet Active: ${masterWallet.address}`);
+
+    // B. Handle Stats Persistence
+    const dbStats = await StatsModel.findOne();
+    if (dbStats) {
+        currentStats.scanned = dbStats.totalScanned;
+        currentStats.profit = dbStats.totalProfit;
+        currentStats.bestRoi = dbStats.bestRoi;
+    } else {
+        await StatsModel.create({});
     }
 
-    initAssets() {
-        // Define 150 coins dynamically
-        const bases = ['BTC', 'ETH', 'BNB', 'SOL', 'GOLD', 'SILV', 'AAPL', 'TSLA', 'MARS', 'PEPE'];
-        for (let i = 1; i <= 150; i++) {
-            let symbol = i <= bases.length ? bases[i-1] : `COIN_${i}`;
-            this.assets[symbol] = { id: i, name: `Asset ${symbol}`, balance: 0 };
-            this.balances['USER_BOT_1'][symbol] = 0;
-            this.balances['ADMIN_RESERVE'][symbol] = 0;
-            if (symbol !== 'USDT') {
-                this.orderBooks[`${symbol}/USDT`] = { buys: [], sells: [] };
+    runScanner();
+}
+
+async function runScanner() {
+    const ids = Object.keys(exchangeConfig);
+    while (true) {
+        for (const id of ids) {
+            try {
+                currentEx = exchangeConfig[id].name;
+                const ex = new ccxt[id]({ enableRateLimit: true });
+                const markets = await ex.loadMarkets();
+                const symbols = Object.keys(markets).filter(s => markets[s].active);
+                
+                const quotes = ['BTC', 'ETH', 'USDC'];
+                const paths = [];
+                for (const q of quotes) {
+                    const cross = symbols.filter(s => markets[s].quote === q);
+                    for (const cp of cross) {
+                        const alt = cp.split('/')[0];
+                        if (markets[`${alt}/USDT`] && markets[`${q}/USDT`]) {
+                            paths.push([`${q}/USDT`, cp, `${alt}/USDT`]);
+                        }
+                    }
+                }
+
+                const tickers = await ex.fetchTickers();
+                for (const [s1, s2, s3] of paths) {
+                    currentPair = s2;
+                    currentStats.scanned++;
+                    const t1 = tickers[s1], t2 = tickers[s2], t3 = tickers[s3];
+                    if (!t1?.ask || !t2?.ask || !t3?.bid) continue;
+
+                    const net = (100 / t1.ask / t2.ask) * t3.bid * Math.pow((1 - exchangeConfig[id].fee), 3);
+                    const roi = net - 100;
+
+                    if (roi > 0.01 && roi < 15) {
+                        currentStats.profit += roi;
+                        if (roi > currentStats.bestRoi) currentStats.bestRoi = roi;
+
+                        await LogModel.create({
+                            time: new Date().toLocaleTimeString(),
+                            ex: currentEx,
+                            path: `${s1}>${s2}>${s3}`,
+                            roi: roi.toFixed(4),
+                            profit: roi.toFixed(4),
+                            color: exchangeConfig[id].color
+                        });
+
+                        // Update DB stats every profit found
+                        await StatsModel.updateOne({}, {
+                            totalScanned: currentStats.scanned,
+                            totalProfit: currentStats.profit,
+                            bestRoi: currentStats.bestRoi
+                        });
+                    }
+                }
+                // Memory Cleanup
+                ex.markets = {};
+                if (global.gc) global.gc();
+            } catch (e) {
+                console.log(`Scan Error ${id}: ${e.message}`);
             }
-        }
-        this.balances['ADMIN_RESERVE']['USDT'] = 0;
-    }
-
-    // Matching Engine (Price-Time Priority)
-    placeOrder(userId, pair, side, price, amount) {
-        const book = this.orderBooks[pair];
-        if (!book) return { error: "Pair not found" };
-
-        const takerOrder = { userId, side, price: parseFloat(price), amount: parseFloat(amount), id: uuidv4() };
-        const opposite = side === 'buy' ? book.sells : book.buys;
-
-        // Sort: Sells (low to high), Buys (high to low)
-        opposite.sort((a, b) => side === 'buy' ? a.price - b.price : b.price - a.price);
-
-        for (let i = 0; i < opposite.length; i++) {
-            const maker = opposite[i];
-            const match = side === 'buy' ? takerOrder.price >= maker.price : takerOrder.price <= maker.price;
-
-            if (match) {
-                const tradeSize = Math.min(takerOrder.amount, maker.amount);
-                this.executeTrade(takerOrder, maker, tradeSize, maker.price, pair);
-                takerOrder.amount -= tradeSize;
-                maker.amount -= tradeSize;
-                if (maker.amount === 0) opposite.splice(i, 1);
-                if (takerOrder.amount === 0) break;
-            }
-        }
-
-        if (takerOrder.amount > 0) {
-            (side === 'buy' ? book.buys : book.sells).push(takerOrder);
-        }
-        return { status: "processed", balance: this.balances[userId] };
-    }
-
-    executeTrade(taker, maker, size, price, pair) {
-        const [base, quote] = pair.split('/');
-        const cost = size * price;
-        const fee = cost * this.fee;
-
-        if (taker.side === 'buy') {
-            this.balances[taker.userId][quote] -= (cost + fee);
-            this.balances[taker.userId][base] += size;
-            this.balances[maker.userId][quote] += cost;
-            this.balances[maker.userId][base] -= size;
-            this.balances['ADMIN_RESERVE'][quote] += fee; // YOU EARN THE FEE
-        } else {
-            this.balances[taker.userId][quote] += (cost - fee);
-            this.balances[taker.userId][base] -= size;
-            this.balances[maker.userId][quote] -= cost;
-            this.balances[maker.userId][base] += size;
-            this.balances['ADMIN_RESERVE'][quote] += fee; // YOU EARN THE FEE
+            await new Promise(r => setTimeout(r, 3000));
         }
     }
 }
 
-const engine = new PrivateExchange();
-
-// --- 2. BLOCKCHAIN BRIDGE (REAL FUNDS) ---
-const BSC_PROVIDER = 'https://bsc-dataseed.binance.org/';
-const USDT_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
-
-async function connectBlockchain() {
-    try {
-        const provider = new ethers.JsonRpcProvider(BSC_PROVIDER);
-        console.log("Connected to Real Blockchain: BSC");
-        
-        // Example: Logic to watch your Master Wallet for real USDT deposits
-        // and credit engine.balances['USER_BOT_1'].USDT would go here.
-    } catch (e) { console.log("Blockchain Offline - Running in Local Ledger Mode"); }
-}
-
-// --- 3. DASHBOARD & API ---
-app.get('/api/state', (req, res) => res.json({
-    balances: engine.balances['USER_BOT_1'],
-    feesEarned: engine.balances['ADMIN_RESERVE'],
-    assets: Object.keys(engine.assets).length
-}));
-
-app.post('/api/order', (req, res) => {
-    const { side, pair, price, amount } = req.body;
-    res.json(engine.placeOrder('USER_BOT_1', pair, side, price, amount));
+// --- 5. UI & API ---
+app.get('/status', async (req, res) => {
+    const recentLogs = await LogModel.find().sort({ _id: -1 }).limit(20);
+    res.json({ stats: currentStats, logs: recentLogs, wallet: masterWallet.address, currentEx, currentPair });
 });
 
 app.get('/', (req, res) => {
     res.send(`
         <body style="background:#020617; color:#f1f5f9; font-family:monospace; padding:20px;">
-            <h1 style="color:#38bdf8">Private Asset Exchange (150 Coins)</h1>
-            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:20px;">
-                <div style="background:#0f172a; padding:20px; border-radius:10px; border:1px solid #1e293b;">
-                    <h3>Submit Internal Trade</h3>
-                    <input id="pair" value="GOLD/USDT" style="width:100%; margin-bottom:10px;">
-                    <input id="price" placeholder="Price" style="width:100%; margin-bottom:10px;">
-                    <input id="amount" placeholder="Amount" style="width:100%; margin-bottom:10px;">
-                    <button onclick="trade('buy')" style="width:48%; background:#4ade80; border:none; padding:10px; font-weight:bold;">BUY</button>
-                    <button onclick="trade('sell')" style="width:48%; background:#f87171; border:none; padding:10px; font-weight:bold;">SELL</button>
+            <div style="max-width:900px; margin:auto;">
+                <h2 style="color:#38bdf8">ArbFleet Pro + MongoDB Persistence</h2>
+                <div style="background:#0f172a; padding:15px; border-radius:8px; border:1px solid #1e293b; margin-bottom:15px;">
+                    <div>WALLET: <b id="wAddr">...</b></div>
+                    <div style="margin-top:10px;">ENGINE: <b id="exName">...</b> | SCANNING: <b id="pName">...</b></div>
                 </div>
-                <div style="background:#0f172a; padding:20px; border-radius:10px; border:1px solid #1e293b;">
-                    <h3>Internal Ledger</h3>
-                    <div id="ledger" style="font-size:0.8rem; height:200px; overflow-y:auto;"></div>
+                <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; margin-bottom:15px;">
+                    <div style="background:#1e293b; padding:10px; border-radius:5px; text-align:center;">SCANS<br><b id="scanned">0</b></div>
+                    <div style="background:#1e293b; padding:10px; border-radius:5px; text-align:center;">BEST ROI<br><b id="roi" style="color:#4ade80">0%</b></div>
+                    <div style="background:#1e293b; padding:10px; border-radius:5px; text-align:center;">TOTAL PROFIT<br><b id="profit" style="color:#4ade80">$0.00</b></div>
                 </div>
+                <div id="logBox" style="background:#09090b; padding:15px; height:400px; overflow-y:auto; border-radius:8px; border:1px solid #1e293b;"></div>
             </div>
             <script>
-                async function trade(side) {
-                    await fetch('/api/order', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({
-                            side, 
-                            pair: document.getElementById('pair').value,
-                            price: document.getElementById('price').value,
-                            amount: document.getElementById('amount').value
-                        })
-                    });
-                    update();
-                }
                 async function update() {
-                    const res = await fetch('/api/state');
-                    const data = await res.json();
-                    document.getElementById('ledger').innerHTML = '<pre>' + JSON.stringify(data.balances, null, 2) + '</pre>';
+                    const r = await fetch('/status'); const d = await r.json();
+                    document.getElementById('wAddr').innerText = d.wallet;
+                    document.getElementById('exName').innerText = d.currentEx;
+                    document.getElementById('pName').innerText = d.currentPair;
+                    document.getElementById('scanned').innerText = d.stats.scanned.toLocaleString();
+                    document.getElementById('roi').innerText = d.stats.bestRoi.toFixed(3) + '%';
+                    document.getElementById('profit').innerText = '$' + d.stats.profit.toFixed(2);
+                    document.getElementById('logBox').innerHTML = d.logs.map(l => 
+                        '<div style="border-bottom:1px solid #1e293b; padding:5px 0;"><b>['+l.ex+']</b> '+l.path+' <span style="float:right" style="color:#4ade80">+$'+l.profit+'</span></div>'
+                    ).join('');
                 }
-                setInterval(update, 2000);
-                update();
+                setInterval(update, 1000);
             </script>
         </body>
     `);
 });
 
-app.listen(port, () => {
-    console.log(`Exchange Server active on port ${port}`);
-    connectBlockchain();
-});
+app.listen(port, () => init());
