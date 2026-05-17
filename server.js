@@ -5,146 +5,119 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // --- CONFIGURATION ---
-// Defaulting to Polygon (QuickSwap) for low gas fees
-const RPC_URL = process.env.RPC_URL; 
-const PRIVATE_KEY = (process.env.PRIVATE_KEY || "").trim().startsWith('0x') 
-    ? process.env.PRIVATE_KEY.trim() 
-    : `0x${(process.env.PRIVATE_KEY || "").trim()}`;
+// I've included a public RPC fallback, but Scalingo works best if you set your own RPC_URL
+const RPC_URL = process.env.RPC_URL || "https://polygon-rpc.com"; 
 
-const ROUTER_ADDRESS = "0xa5E0829CaCEd8fFDD03942104b105c07C8510ed5"; // QuickSwap Router (Polygon)
+const ROUTER_ADDRESS = "0xa5E0829CaCEd8fFDD03942104b105c07C8510ed5"; // QuickSwap on Polygon
 
-// Polygon Mainnet Token Addresses
 const TOKENS = {
     WMATIC: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270",
     USDC:   "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
     USDT:   "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"
 };
 
-const ABI = [
-    "function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)",
-    "function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)",
-    "function approve(address spender, uint256 amount) external returns (bool)"
-];
+const ROUTER_ABI = ["function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)"];
 
-// --- BOT STATE ---
+// --- BOT STATE (Stored in Memory) ---
 let botState = {
     isRunning: false,
-    lastCheck: "Never",
-    totalTrades: 0,
-    balance: "0",
-    error: null,
-    logs: []
+    virtualBalance: 100, // Starting with 100 "Virtual" MATIC
+    totalVirtualProfit: 0,
+    lastSpread: "0%",
+    history: [],
+    error: null
 };
 
-let provider, wallet, router;
+// --- INITIALIZE PROVIDER ---
+const provider = new ethers.JsonRpcProvider(RPC_URL);
+const router = new ethers.Contract(ROUTER_ADDRESS, ROUTER_ABI, provider);
 
-// --- INITIALIZATION ---
-function init() {
-    try {
-        if (!RPC_URL || RPC_URL.length < 10) throw new Error("RPC_URL is missing or invalid");
-        if (PRIVATE_KEY.length < 60) throw new Error("PRIVATE_KEY is missing or invalid");
-
-        provider = new ethers.JsonRpcProvider(RPC_URL);
-        wallet = new ethers.Wallet(PRIVATE_KEY, provider);
-        router = new ethers.Contract(ROUTER_ADDRESS, ABI, wallet);
-        
-        addLog("System Initialized. Ready to trade on Polygon.");
-        updateBalance();
-    } catch (e) {
-        botState.error = e.message;
-    }
-}
-
-function addLog(msg) {
-    const time = new Date().toLocaleTimeString();
-    botState.logs.unshift(`[${time}] ${msg}`);
-    if (botState.logs.length > 10) botState.logs.pop();
-}
-
-async function updateBalance() {
-    if (!wallet) return;
-    const bal = await provider.getBalance(wallet.address);
-    botState.balance = ethers.formatEther(bal);
-}
-
-// --- ARBITRAGE CORE ---
-async function checkAndTrade() {
-    if (!botState.isRunning || botState.error) return;
+// --- SIMULATION ENGINE ---
+async function runSimulation() {
+    if (!botState.isRunning) return;
 
     try {
         // Path: WMATIC -> USDC -> USDT -> WMATIC
         const path = [TOKENS.WMATIC, TOKENS.USDC, TOKENS.USDT, TOKENS.WMATIC];
-        const amountIn = ethers.parseEther("1.0"); // Testing with 1 WMATIC
+        const tradeSize = ethers.parseEther("10"); // Simulating a 10 MATIC trade
 
-        const amounts = await router.getAmountsOut(amountIn, path);
-        const amountOut = amounts[amounts.length - 1];
+        // Fetch real prices from DEX
+        const amounts = await router.getAmountsOut(tradeSize, path);
+        const finalAmount = amounts[amounts.length - 1];
+        
+        // Calculate Profit/Loss
+        const profit = finalAmount - tradeSize;
+        const profitReadable = ethers.formatEther(profit);
+        const percentage = (Number(profit) / Number(tradeSize)) * 100;
 
-        // Calculation: Is output > input + gas?
-        const profit = amountOut - amountIn;
-        const profitInEth = ethers.formatEther(profit);
+        botState.lastSpread = `${percentage.toFixed(4)}%`;
 
-        botState.lastCheck = `${profitInEth} WMATIC`;
-
+        // If profit > 0 (In paper trading, we "execute" every positive spread)
         if (profit > 0n) {
-            addLog(`Opportunity found! Potential: ${profitInEth} WMATIC`);
+            botState.virtualBalance += parseFloat(profitReadable);
+            botState.totalVirtualProfit += parseFloat(profitReadable);
             
-            // EXECUTION (Uncomment below to enable actual trading)
-            /*
-            addLog("Executing Swap...");
-            const tx = await router.swapExactTokensForTokens(
-                amountIn,
-                amountIn, // In production, use a tiny bit less for slippage
-                path,
-                wallet.address,
-                Math.floor(Date.now() / 1000) + 60 * 10
-            );
-            await tx.wait();
-            botState.totalTrades++;
-            updateBalance();
-            */
+            const log = `PROFIT: +${parseFloat(profitReadable).toFixed(6)} MATIC via USDC/USDT`;
+            botState.history.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+        } else {
+            // Just log the check
+            console.log(`Check performed: ${percentage.toFixed(4)}% spread (No profit)`);
         }
-    } catch (e) {
-        console.error(e);
-        addLog("Price check failed. Check RPC connection.");
+
+        if (botState.history.length > 10) botState.history.pop();
+        botState.error = null;
+
+    } catch (err) {
+        console.error("Price Fetch Error:", err.message);
+        botState.error = "RPC Error: Check your RPC_URL connection.";
     }
 
-    setTimeout(checkAndTrade, 5000); // Check every 5 seconds
+    // Run again in 5 seconds
+    setTimeout(runSimulation, 5000);
 }
 
 // --- WEB INTERFACE ---
 app.get('/', (req, res) => {
     res.send(`
     <!DOCTYPE html>
-    <html>
+    <html lang="en">
     <head>
-        <title>DEX Arb Bot</title>
+        <meta charset="UTF-8">
+        <title>Paper Trading Bot</title>
         <style>
-            body { font-family: sans-serif; background: #1a1a1a; color: white; padding: 20px; display: flex; justify-content: center; }
-            .container { width: 100%; max-width: 500px; background: #2a2a2a; padding: 20px; border-radius: 10px; border: 1px solid #444; }
-            .status { font-size: 20px; font-weight: bold; color: ${botState.isRunning ? '#4CAF50' : '#f44336'}; }
-            .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 20px 0; }
-            .stat-card { background: #333; padding: 15px; border-radius: 5px; text-align: center; }
-            .log-box { background: black; padding: 10px; height: 150px; overflow-y: auto; font-family: monospace; font-size: 12px; border-radius: 5px; }
-            button { width: 100%; padding: 15px; border: none; border-radius: 5px; font-weight: bold; cursor: pointer; background: #2196F3; color: white; }
-            .error { color: #ff5252; background: #422; padding: 10px; border-radius: 5px; margin-bottom: 10px; }
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #0e1111; color: #00ff41; padding: 20px; text-align: center; }
+            .container { max-width: 600px; margin: auto; background: #1a1a1a; padding: 30px; border-radius: 15px; border: 1px solid #00ff41; box-shadow: 0 0 20px rgba(0,255,65,0.2); }
+            .status { font-size: 24px; margin: 20px 0; color: ${botState.isRunning ? '#00ff41' : '#ff4141'}; }
+            .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
+            .card { background: #222; padding: 15px; border-radius: 10px; border: 1px solid #333; }
+            .val { font-size: 20px; font-weight: bold; display: block; color: white; }
+            button { background: transparent; color: #00ff41; border: 2px solid #00ff41; padding: 15px 30px; font-size: 18px; cursor: pointer; border-radius: 5px; width: 100%; transition: 0.3s; }
+            button:hover { background: #00ff41; color: black; }
+            .logs { text-align: left; background: black; padding: 10px; font-family: monospace; height: 120px; overflow-y: auto; font-size: 12px; margin-top: 20px; color: #aaa; border: 1px solid #333; }
+            .error { color: #ff4141; margin-bottom: 10px; font-weight: bold; }
         </style>
     </head>
     <body>
         <div class="container">
-            <h2>Triangular Arb Bot (Polygon)</h2>
-            ${botState.error ? `<div class="error"><b>Error:</b> ${botState.error}</div>` : ''}
+            <h1>ARB-BOT SIMULATOR</h1>
+            ${botState.error ? `<div class="error">${botState.error}</div>` : ''}
             
-            <div class="status">● ${botState.isRunning ? 'RUNNING' : 'STOPPED'}</div>
-            
-            <div class="stat-grid">
-                <div class="stat-card"><small>Profit/Check</small><br><b>${botState.lastCheck}</b></div>
-                <div class="stat-card"><small>Balance</small><br><b>${parseFloat(botState.balance).toFixed(4)} MATIC</b></div>
+            <div class="status">SYSTEM: ${botState.isRunning ? 'ACTIVE' : 'IDLE'}</div>
+
+            <div class="grid">
+                <div class="card"><small>VIRTUAL BALANCE</small><span class="val">${botState.virtualBalance.toFixed(4)} MATIC</span></div>
+                <div class="card"><small>TOTAL PROFIT</small><span class="val">${botState.totalVirtualProfit.toFixed(6)}</span></div>
+                <div class="card"><small>CURRENT SPREAD</small><span class="val">${botState.lastSpread}</span></div>
+                <div class="card"><small>NETWORK</small><span class="val">Polygon</span></div>
             </div>
 
-            <form action="/toggle" method="POST"><button>${botState.isRunning ? 'STOP BOT' : 'START BOT'}</button></form>
+            <form action="/toggle" method="POST">
+                <button type="submit">${botState.isRunning ? 'STOP SIMULATION' : 'START SIMULATION'}</button>
+            </form>
 
-            <h4>Activity Log:</h4>
-            <div class="log-box">${botState.logs.join('<br>')}</div>
+            <div class="logs">
+                ${botState.history.length > 0 ? botState.history.join('<br>') : 'Waiting for market data...'}
+            </div>
         </div>
     </body>
     </html>
@@ -152,12 +125,9 @@ app.get('/', (req, res) => {
 });
 
 app.post('/toggle', (req, res) => {
-    if (!botState.error) {
-        botState.isRunning = !botState.isRunning;
-        if (botState.isRunning) checkAndTrade();
-    }
+    botState.isRunning = !botState.isRunning;
+    if (botState.isRunning) runSimulation();
     res.redirect('/');
 });
 
-init();
-app.listen(PORT, () => console.log(`Server ready on port ${PORT}`));
+app.listen(PORT, () => console.log(`Paper trading active on port ${PORT}`));
