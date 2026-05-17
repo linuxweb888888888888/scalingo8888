@@ -1,14 +1,30 @@
 {
-  "name": "private-exchange-core",
+  "name": "arb-fleet-mongodb-real-funds",
   "version": "1.0.0",
-  "description": "Private Exchange with 150 Assets and Real Fund Bridge",
+  "description": "Multi-exchange triangular arbitrage bot with MongoDB persistence and real fund wallet bridge",
   "main": "server.js",
   "scripts": {
-    "start": "node --expose-gc --max-old-space-size=450 server.js"
+    "start": "node --expose-gc --max-old-space-size=400 server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "ethers": "^6.10.0",
+    "ccxt": "latest",
+    "ethers": "^6.11.1",
+    "express": "^4.18.3",
+    "mongoose": "^8.2.1",
     "uuid": "^9.0.1"
-  }
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "arbitrage",
+    "crypto",
+    "bot",
+    "mongodb",
+    "ethers",
+    "ccxt"
+  ],
+  "author": "BotDev",
+  "license": "ISC"
 }
