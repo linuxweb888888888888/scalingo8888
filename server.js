@@ -3,104 +3,154 @@ const ccxt = require('ccxt');
 const app = express();
 const port = process.env.PORT || 3000;
 
-const exchange = new ccxt.lbank({ apiKey: 'YOUR_KEY', secret: 'YOUR_SECRET' });
-const TAKER_FEE = 0.001; // 0.1%
+// --- CONFIGURATION ---
+const exchanges = {
+    lbank: { inst: new ccxt.lbank(), fee: 0.0010, color: '#38bdf8' },
+    phemex: { inst: new ccxt.phemex({ options: { 'defaultType': 'spot' } }), fee: 0.0010, color: '#facc15' },
+    htx: { inst: new ccxt.htx(), fee: 0.0020, color: '#818cf8' }
+};
+
 const START_CAPITAL = 100;
-
 let logs = [];
-let trianglePaths = [];
-let lastScanTime = "Initializing...";
-let stats = { scanned: 0, paths: 0, bestRoi: -100, uptime: Date.now() };
+let allPaths = { lbank: [], phemex: [], htx: [] };
+let stats = { scanned: 0, bestRoi: -100, currentEx: 'Initializing...', currentPair: '---' };
 
-async function initBot() {
-    console.log("Deep Scanning LBank Markets...");
-    const markets = await exchange.loadMarkets();
+// --- PATHFINDER ---
+async function buildPaths(id) {
+    console.log(`Mapping ${id} markets...`);
+    const markets = await exchanges[id].inst.loadMarkets();
     const symbols = Object.keys(markets).filter(s => markets[s].active);
-    
-    const usdtPairs = symbols.filter(s => markets[s].quote === 'USDT');
-    const btcPairs = symbols.filter(s => markets[s].quote === 'BTC');
-    const ethPairs = symbols.filter(s => markets[s].quote === 'ETH');
-    const usdcPairs = symbols.filter(s => markets[s].quote === 'USDC');
+    const paths = [];
 
-    // PATH TYPE 1: USDT -> BTC -> ALT -> USDT
-    for (const btcPair of btcPairs) {
-        const alt = btcPair.split('/')[0];
-        if (markets[`${alt}/USDT`] && markets['BTC/USDT']) {
-            trianglePaths.push({type: 'BBS', s1: 'BTC/USDT', s2: btcPair, s3: `${alt}/USDT`});
-            trianglePaths.push({type: 'BSS', s1: `${alt}/USDT`, s2: btcPair, s3: 'BTC/USDT'});
-        }
-    }
-
-    // PATH TYPE 2: USDT -> USDC -> ALT -> USDT (Very active!)
-    for (const usdcPair of usdcPairs) {
-        const alt = usdcPair.split('/')[0];
-        if (markets[`${alt}/USDT`] && markets['USDC/USDT']) {
-            trianglePaths.push({type: 'BBS', s1: 'USDC/USDT', s2: usdcPair, s3: `${alt}/USDT`});
-        }
-    }
-
-    stats.paths = trianglePaths.length;
-    console.log(`Expansion Complete: Monitoring ${trianglePaths.length} paths.`);
-    runLoop();
-}
-
-async function runLoop() {
-    while (true) {
-        try {
-            const tickers = await exchange.fetchTickers();
-            lastScanTime = new Date().toLocaleTimeString();
-            
-            for (const path of trianglePaths) {
-                stats.scanned++;
-                const {s1, s2, s3, type} = path;
-                if (!tickers[s1] || !tickers[s2] || !tickers[s3]) continue;
-
-                let final = 0;
-                if (type === 'BBS') {
-                    // Buy A with USDT -> Buy B with A -> Sell B for USDT
-                    final = (START_CAPITAL / tickers[s1].ask / tickers[s2].ask) * tickers[s3].bid;
-                } else {
-                    // Buy B with USDT -> Sell B for A -> Sell A for USDT
-                    final = (START_CAPITAL / tickers[s1].ask) * tickers[s2].bid * tickers[s3].bid;
-                }
-
-                const net = final * Math.pow((1 - TAKER_FEE), 3);
-                const roi = ((net - START_CAPITAL) / START_CAPITAL) * 100;
-
-                if (roi > -5) { // Track best ROI even if negative to show it's working
-                    if (roi > stats.bestRoi) stats.bestRoi = roi;
-                }
-
-                if (roi > 0.01) {
-                    logs.unshift({ time: lastScanTime, path: `${s1}>${s2}>${s3}`, roi: roi.toFixed(4) });
-                    if (logs.length > 50) logs.pop();
-                }
+    // Find USDT -> A -> B -> USDT
+    const quotes = ['BTC', 'ETH', 'USDC'];
+    for (const q of quotes) {
+        const crossPairs = symbols.filter(s => markets[s].quote === q);
+        for (const cp of crossPairs) {
+            const alt = cp.split('/')[0];
+            if (markets[`${alt}/USDT`] && markets[`${q}/USDT`]) {
+                paths.push({ s1: `${q}/USDT`, s2: cp, s3: `${alt}/USDT` });
             }
-        } catch (e) { console.log("API Error"); }
-        await new Promise(r => setTimeout(r, 3000));
+        }
+    }
+    return paths;
+}
+
+async function runMasterLoop() {
+    // Initialize paths for all exchanges
+    for (const id in exchanges) {
+        allPaths[id] = await buildPaths(id);
+    }
+
+    while (true) {
+        for (const id in exchanges) {
+            stats.currentEx = id.toUpperCase();
+            const ex = exchanges[id];
+            
+            try {
+                const tickers = await ex.inst.fetchTickers();
+                
+                for (const path of allPaths[id]) {
+                    stats.scanned++;
+                    stats.currentPair = path.s2;
+
+                    const t1 = tickers[path.s1];
+                    const t2 = tickers[path.s2];
+                    const t3 = tickers[path.s3];
+
+                    if (!t1?.ask || !t2?.ask || !t3?.bid) continue;
+
+                    // Compounded fee math for 3 trades
+                    const net = (START_CAPITAL / t1.ask / t2.ask) * t3.bid * Math.pow((1 - ex.fee), 3);
+                    const roi = ((net - START_CAPITAL) / START_CAPITAL) * 100;
+
+                    if (roi > stats.bestRoi) stats.bestRoi = roi;
+
+                    if (roi > 0.01) {
+                        logs.unshift({
+                            time: new Date().toLocaleTimeString(),
+                            ex: id.toUpperCase(),
+                            path: `${path.s1}>${path.s2}>${path.s3}`,
+                            roi: roi.toFixed(4),
+                            color: ex.color
+                        });
+                        if (logs.length > 50) logs.pop();
+                    }
+                }
+            } catch (e) { console.error(`${id} error:`, e.message); }
+            
+            // Wait between exchanges to respect rate limits
+            await new Promise(r => setTimeout(r, 2000));
+        }
     }
 }
+
+// --- WEB INTERFACE ---
+app.get('/status', (req, res) => res.json({ stats, logs }));
 
 app.get('/', (req, res) => {
     res.send(`
-        <body style="background:#0f172a; color:#f8fafc; font-family:monospace; padding:20px;">
-            <div style="max-width:800px; margin:auto;">
-                <h2>LBank Pro Scanner</h2>
-                <div style="display:flex; gap:10px; margin-bottom:20px;">
-                    <div style="background:#1e293b; padding:15px; flex:1; border-radius:8px;">
-                        PATHS: <b>${stats.paths}</b>
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Multi-Exchange Arb</title>
+            <style>
+                body { background: #020617; color: #f1f5f9; font-family: monospace; padding: 20px; }
+                .container { max-width: 900px; margin: auto; }
+                .monitor { background: #0f172a; padding: 20px; border-radius: 12px; border: 1px solid #1e293b; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center;}
+                .ticker { color: #38bdf8; font-size: 1.8rem; font-weight: bold; }
+                .stat-grid { display: flex; gap: 15px; margin-bottom: 20px; }
+                .stat-item { flex: 1; background: #1e293b; padding: 15px; border-radius: 8px; text-align: center; border: 1px solid #334155; }
+                .log-box { background: #020617; height: 400px; overflow-y: auto; padding: 15px; border-radius: 8px; border: 1px solid #1e293b; font-size: 0.8rem; }
+                .log-entry { display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid #0f172a; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="monitor">
+                    <div>
+                        <div style="font-size: 0.7rem; color: #64748b; text-transform: uppercase;">Active Exchange</div>
+                        <div id="exName" class="ticker">---</div>
                     </div>
-                    <div style="background:#1e293b; padding:15px; flex:1; border-radius:8px;">
-                        BEST ROI: <b style="color:${stats.bestRoi > 0 ? '#4ade80' : '#f87171'}">${stats.bestRoi.toFixed(3)}%</b>
+                    <div style="text-align: right;">
+                        <div style="font-size: 0.7rem; color: #64748b; text-transform: uppercase;">Scanning Pair</div>
+                        <div id="pairName" style="font-size: 1.2rem; color: #f8fafc;">---</div>
                     </div>
                 </div>
-                <div style="background:#020617; padding:20px; height:400px; overflow-y:auto; border-radius:8px; border:1px solid #1e293b;">
-                    ${logs.length > 0 ? logs.map(l => `<div>[${l.time}] ${l.path} <span style="float:right; color:#4ade80">+${l.roi}%</span></div>`).join('') : 'Scanning for spreads > 0.30%...'}
+
+                <div class="stat-grid">
+                    <div class="stat-item"><small>TOTAL SCANS</small><br><b id="totalScanned">0</b></div>
+                    <div class="stat-item"><small>BEST ROI</small><br><b id="bestRoi" style="color:#4ade80">-100%</b></div>
+                    <div class="stat-item"><small>PHEMEX (0.3%)</small><br><b>ACTIVE</b></div>
+                    <div class="stat-item"><small>HTX (0.6%)</small><br><b>ACTIVE</b></div>
+                    <div class="stat-item"><small>LBANK (0.3%)</small><br><b>ACTIVE</b></div>
                 </div>
+
+                <div class="log-box" id="logBox">Waiting for profitable market gap...</div>
             </div>
-            <script>setTimeout(()=>location.reload(), 5000)</script>
+
+            <script>
+                async function update() {
+                    try {
+                        const res = await fetch('/status');
+                        const data = await res.json();
+                        document.getElementById('exName').innerText = data.stats.currentEx;
+                        document.getElementById('pairName').innerText = data.stats.currentPair;
+                        document.getElementById('totalScanned').innerText = data.stats.scanned.toLocaleString();
+                        document.getElementById('bestRoi').innerText = data.stats.bestRoi + '%';
+                        
+                        if (data.logs.length > 0) {
+                            document.getElementById('logBox').innerHTML = data.logs.map(l => 
+                                '<div class="log-entry"><span><b style="color:'+l.color+'">['+l.ex+']</b> '+l.path+'</span><span style="color:#4ade80">+' + l.roi + '%</span></div>'
+                            ).join('');
+                        }
+                    } catch (e) {}
+                }
+                setInterval(update, 200);
+            </script>
         </body>
+        </html>
     `);
 });
 
-app.listen(port, () => initBot());
+app.listen(port, () => runMasterLoop());
