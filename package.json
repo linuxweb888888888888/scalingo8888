@@ -1,13 +1,14 @@
 {
-  "name": "mexc-arb-bot",
+  "name": "private-exchange-core",
   "version": "1.0.0",
+  "description": "Private Exchange with 150 Assets and Real Fund Bridge",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node --expose-gc --max-old-space-size=450 server.js"
   },
   "dependencies": {
-    "ccxt": "^4.2.0",
-    "ejs": "^3.1.9",
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "ethers": "^6.10.0",
+    "uuid": "^9.0.1"
   }
 }
