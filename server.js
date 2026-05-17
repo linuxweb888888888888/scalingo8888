@@ -3,9 +3,19 @@ const express = require('express');
 const app = express();
 
 const port = process.env.PORT || 3000;
-const WALLET_PRINCIPAL = 100.00;
-const TAKER_FEE = 0; // KCEX Spot Taker fee is typically 0.1%
+const WALLET_PRINCIPAL = 10.00; 
+const TAKER_FEE = 0.0000; // 0% Fee for KCEX Spot
 const API_BASE = 'https://api.kcex.com';
+
+// Standard Browser Headers to prevent 403 Forbidden
+const axiosConfig = {
+    headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+        'Content-Type': 'application/json'
+    },
+    timeout: 10000
+};
 
 let metrics = {
     totalScans: 0,
@@ -23,15 +33,18 @@ let monitoredPaths = [];
 async function mapKcexMarkets() {
     try {
         console.log("Fetching KCEX Market Data...");
-        const response = await axios.get(`${API_BASE}/api/v1/market/symbols`);
-        const symbols = response.data.data; // KCEX returns list of symbols
+        // Added headers here to prevent 403
+        const response = await axios.get(`${API_BASE}/api/v1/market/symbols`, axiosConfig);
         
+        if (!response.data || !response.data.data) {
+            throw new Error("Invalid API Response Structure");
+        }
+
+        const symbols = response.data.data;
         const adj = {};
         const coinSet = new Set();
 
         symbols.forEach(s => {
-            // KCEX symbol format is usually "BTCUSDT"
-            // We need to parse these. Usually, Quote is USDT.
             if (s.symbol.endsWith('USDT')) {
                 const base = s.symbol.replace('USDT', '');
                 const quote = 'USDT';
@@ -39,30 +52,23 @@ async function mapKcexMarkets() {
                 if (!adj[base]) adj[base] = [];
                 if (!adj[quote]) adj[quote] = [];
 
-                // Store relation
                 adj[base].push({ to: quote, pair: s.symbol, type: 'sell' });
                 adj[quote].push({ to: base, pair: s.symbol, type: 'buy' });
                 coinSet.add(base); coinSet.add(quote);
-            } else {
-                // Handle cross pairs like ETHBTC if they exist on KCEX spot
-                // For now, most KCEX liquidity is in USDT pairs.
             }
         });
 
         metrics.uniqueCoins = coinSet.size;
         const paths = [];
         const startNode = 'USDT';
-
-        // Logic: USDT -> CoinA -> CoinB -> USDT
         const neighborsA = adj[startNode] || [];
+
         neighborsA.forEach(edge1 => {
             const coinA = edge1.to;
             const neighborsB = adj[coinA] || [];
-
             neighborsB.forEach(edge2 => {
                 const coinB = edge2.to;
                 if (coinB === startNode) return;
-
                 const neighborsC = adj[coinB] || [];
                 neighborsC.forEach(edge3 => {
                     if (edge3.to === startNode) {
@@ -75,20 +81,19 @@ async function mapKcexMarkets() {
         monitoredPaths = paths;
         metrics.pathsTracked = monitoredPaths.length;
         metrics.status = "KCEX Scanner Ready";
-        console.log(`Mapped ${metrics.pathsTracked} paths on KCEX.`);
     } catch (e) {
-        metrics.status = "Mapping Error: " + e.message;
+        metrics.status = "Mapping Error: " + (e.response ? `Status ${e.response.status}` : e.message);
+        console.error("Mapping Error Details:", e.message);
     }
 }
 
 // 2. Main Scanner Loop
 async function startScanner() {
     try {
-        // KCEX Book Ticker gives us best Bid/Ask for all symbols
-        const response = await axios.get(`${API_BASE}/api/v1/market/ticker/bookTicker`);
+        // Added headers here to prevent 403
+        const response = await axios.get(`${API_BASE}/api/v1/market/ticker/bookTicker`, axiosConfig);
         const tickersArr = response.data.data;
         
-        // Convert array to object for O(1) lookup
         const tickers = {};
         tickersArr.forEach(t => {
             tickers[t.symbol] = {
@@ -105,31 +110,27 @@ async function startScanner() {
 
             for (const step of path) {
                 const ticker = tickers[step.pair];
-                if (!ticker || !ticker.ask || !ticker.bid) {
+                if (!ticker || !ticker.ask || !ticker.bid || ticker.ask === 0) {
                     valid = false; break;
                 }
-
                 if (step.type === 'buy') {
-                    // Buying the base (e.g., USDT -> BTC)
                     balance = (balance / ticker.ask) * (1 - TAKER_FEE);
                 } else {
-                    // Selling the base (e.g., BTC -> USDT)
                     balance = (balance * ticker.bid) * (1 - TAKER_FEE);
                 }
             }
 
             if (!valid) continue;
-
             const roi = ((balance - WALLET_PRINCIPAL) / WALLET_PRINCIPAL) * 100;
 
-            if (roi > -1.5) {
+            if (roi > -1.0) {
                 batchData.push({
                     path: `${path[0].pair} → ${path[1].pair} → ${path[2].pair}`,
                     roi: roi
                 });
             }
 
-            if (roi > 0.05) { // Log if profit > 0.05%
+            if (roi > 0.01) { 
                 metrics.simulatedProfit += (balance - WALLET_PRINCIPAL);
                 metrics.history.unshift({
                     path: `${path[0].pair} → ${path[1].pair} → ${path[2].pair}`,
@@ -142,73 +143,57 @@ async function startScanner() {
 
         metrics.liveAnalysis = batchData.sort((a, b) => b.roi - a.roi).slice(0, 15);
         metrics.totalScans++;
+        metrics.status = "Scanning Active (0% Fees)";
     } catch (e) {
-        metrics.status = "Scan Error: " + e.message;
+        metrics.status = "Scan Error: " + (e.response ? `Status ${e.response.status}` : e.message);
     }
-    setTimeout(startScanner, 2000); 
+    setTimeout(startScanner, 3000); // Wait 3 seconds to stay safe
 }
 
-// 3. Express Dashboard
+// 3. UI Dashboard
 app.get('/', (req, res) => {
     res.send(`
         <html>
             <head>
-                <title>KCEX Arbitrage Monitor</title>
-                <meta http-equiv="refresh" content="3">
+                <title>KCEX Monitor</title>
+                <meta http-equiv="refresh" content="4">
                 <style>
-                    body { font-family: 'Segoe UI', sans-serif; background: #0b0e11; color: #eaecef; padding: 20px; }
-                    .container { max-width: 1000px; margin: auto; }
-                    .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-bottom: 20px; }
-                    .card { background: #1e2329; padding: 20px; border-radius: 8px; border: 1px solid #333; text-align: center; }
-                    .box { background: #1e2329; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
+                    body { font-family: monospace; background: #0b0e11; color: #eaecef; padding: 20px; }
+                    .card { background: #1e2329; padding: 15px; border-radius: 5px; margin-bottom: 20px; border: 1px solid #333; }
                     .green { color: #02c076; }
-                    table { width: 100%; border-collapse: collapse; }
-                    td, th { padding: 10px; text-align: left; border-bottom: 1px solid #2b2f36; }
-                    .header { display: flex; justify-content: space-between; align-items: center; }
-                    .status-dot { height: 10px; width: 10px; background-color: #02c076; border-radius: 50%; display: inline-block; margin-right: 5px; }
+                    .red { color: #cf304a; }
+                    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+                    td { padding: 8px; border-bottom: 1px solid #2b2f36; }
+                    .box { background: #161a1e; padding: 10px; border-radius: 4px; }
                 </style>
             </head>
             <body>
-                <div class="container">
-                    <div class="header">
-                        <h2>KCEX TRIANGULAR MONITOR</h2>
-                        <div><span class="status-dot"></span> ${metrics.status}</div>
-                    </div>
-                    
-                    <div class="stats">
-                        <div class="card">Simulated Profit<br><span class="green" style="font-size:1.8em">$${metrics.simulatedProfit.toFixed(6)}</span></div>
-                        <div class="card">Unique Coins<br><span style="font-size:1.8em">${metrics.uniqueCoins}</span></div>
-                        <div class="card">Paths Scanned<br><span style="font-size:1.8em">${(metrics.totalScans * metrics.pathsTracked).toLocaleString()}</span></div>
-                    </div>
-
-                    <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 20px;">
-                        <div>
-                            <h3>Real-time Opportunities</h3>
-                            <div class="box">
-                                <table>
-                                    <thead><tr><th>Path</th><th>ROI</th></tr></thead>
-                                    <tbody>
-                                        ${metrics.liveAnalysis.map(a => `
-                                            <tr>
-                                                <td>${a.path}</td>
-                                                <td class="${a.roi > 0 ? 'green' : ''}">${a.roi.toFixed(4)}%</td>
-                                            </tr>
-                                        `).join('')}
-                                    </tbody>
-                                </table>
-                            </div>
-                        </div>
-                        <div>
-                            <h3>Profit Log</h3>
-                            <div class="box" style="font-size: 0.85em; max-height: 400px; overflow-y: auto;">
-                                ${metrics.history.map(h => `
-                                    <div style="margin-bottom: 8px; border-bottom: 1px solid #2b2f36; padding-bottom: 4px;">
-                                        <span class="green">${h.roi}</span><br>
-                                        <small>${h.path}</small>
-                                    </div>
+                <h2>KCEX ARBITRAGE DASHBOARD</h2>
+                <div class="card">
+                    Status: <span class="${metrics.status.includes('Error') ? 'red' : 'green'}">${metrics.status}</span> | 
+                    Coins: ${metrics.uniqueCoins} | 
+                    Total Scans: ${metrics.totalScans}
+                </div>
+                
+                <div style="display:flex; gap: 20px;">
+                    <div style="flex: 2;">
+                        <h3>Live Best ROI</h3>
+                        <div class="box">
+                            <table>
+                                ${metrics.liveAnalysis.map(a => `
+                                    <tr>
+                                        <td>${a.path}</td>
+                                        <td class="${a.roi > 0 ? 'green' : ''}">${a.roi.toFixed(4)}%</td>
+                                    </tr>
                                 `).join('')}
-                                ${metrics.history.length === 0 ? 'Scanning for gaps...' : ''}
-                            </div>
+                            </table>
+                        </div>
+                    </div>
+                    <div style="flex: 1;">
+                        <h3>Profit History</h3>
+                        <div class="box" style="font-size: 0.8em;">
+                            ${metrics.history.map(h => `<div>[${h.time}] <span class="green">${h.roi}</span></div>`).join('')}
+                            ${metrics.history.length === 0 ? 'Watching...' : ''}
                         </div>
                     </div>
                 </div>
