@@ -3,23 +3,28 @@ const { ethers } = require('ethers');
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
-const RPC_URL = process.env.RPC_URL; // e.g., Quicknode or Infura URL
-const PRIVATE_KEY = process.env.PRIVATE_KEY;
-const ROUTER_ADDRESS = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"; // Uniswap V2 Router
+const RPC_URL = process.env.RPC_URL;
 
-// Token Addresses (Example: WETH, USDC, DAI on Ethereum Mainnet)
+// Fix for Private Key formatting
+let rawKey = process.env.PRIVATE_KEY || "";
+if (rawKey && !rawKey.startsWith('0x')) {
+    rawKey = `0x${rawKey}`;
+}
+const PRIVATE_KEY = rawKey.trim();
+
+const ROUTER_ADDRESS = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"; 
+
+// WETH, USDC, DAI (Ethereum Mainnet Example)
 const TOKENS = [
-    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // WETH
-    "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eb48", // USDC
-    "0x6B175474E89094C44Da98b954EedeAC495271d0F"  // DAI
+    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", 
+    "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eb48", 
+    "0x6B175474E89094C44Da98b954EedeAC495271d0F"  
 ];
 
 const ROUTER_ABI = [
-    "function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)",
-    "function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)"
+    "function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)"
 ];
 
-// --- BOT STATE ---
 let botState = {
     isRunning: false,
     lastCheck: null,
@@ -28,73 +33,68 @@ let botState = {
 };
 
 const app = express();
-const provider = new ethers.JsonRpcProvider(RPC_URL);
-const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
-const router = new ethers.Contract(ROUTER_ADDRESS, ROUTER_ABI, wallet);
+
+// --- VALIDATION & INITIALIZATION ---
+let provider;
+let wallet;
+let router;
+
+try {
+    if (!RPC_URL) throw new Error("RPC_URL is missing in environment variables");
+    if (!PRIVATE_KEY || PRIVATE_KEY.length < 64) throw new Error("PRIVATE_KEY is missing or too short");
+
+    provider = new ethers.JsonRpcProvider(RPC_URL);
+    wallet = new ethers.Wallet(PRIVATE_KEY, provider);
+    router = new ethers.Contract(ROUTER_ADDRESS, ROUTER_ABI, wallet);
+    console.log("Wallet initialized for address:", wallet.address);
+} catch (e) {
+    console.error("Initialization Error:", e.message);
+    botState.error = "Configuration Error: " + e.message;
+}
 
 // --- ARBITRAGE ENGINE ---
 async function performTriangularCheck() {
-    if (!botState.isRunning) return;
+    if (!botState.isRunning || botState.error) return;
 
     try {
-        const amountIn = ethers.parseEther("0.1"); // Amount of WETH to test with
+        const amountIn = ethers.parseEther("0.1"); 
         const path = [TOKENS[0], TOKENS[1], TOKENS[2], TOKENS[0]];
 
-        // Get expected output
         const amounts = await router.getAmountsOut(amountIn, path);
         const amountOut = amounts[amounts.length - 1];
-
         const profit = amountOut - amountIn;
-        const profitReadable = ethers.formatEther(profit);
 
         botState.lastCheck = {
             time: new Date().toISOString(),
-            expectedProfit: profitReadable,
+            expectedProfit: ethers.formatEther(profit),
             profitable: profit > 0n
         };
-
-        console.log(`Checking: Profit potential ${profitReadable} ETH`);
-
-        // EXECUTION LOGIC
-        // Note: Realistically, you'd only swap if (profit > gas_costs)
-        if (profit > 0n) {
-            console.log("Profit detected! Attempting swap...");
-            // Add swap logic here
-            botState.totalTrades++;
-        }
-
     } catch (err) {
-        console.error("Engine Error:", err.message);
-        botState.error = err.message;
+        console.error("Loop Error:", err.message);
     }
 
-    // Loop every 10 seconds
     setTimeout(performTriangularCheck, 10000);
 }
 
-// --- EXPRESS ROUTES ---
+// --- ROUTES ---
 app.get('/', (req, res) => {
     res.send(`
+        <style>body { font-family: sans-serif; padding: 20px; line-height: 1.6; }</style>
         <h1>Triangular Bot Dashboard</h1>
-        <p>Status: <strong>${botState.isRunning ? 'RUNNING' : 'STOPPED'}</strong></p>
-        <p>Last Check: ${JSON.stringify(botState.lastCheck)}</p>
-        <p>Trades Executed: ${botState.totalTrades}</p>
-        <hr>
-        <form action="/toggle" method="POST"><button>Toggle Bot Start/Stop</button></form>
+        <p>Status: <strong style="color: ${botState.isRunning ? 'green' : 'red'}">${botState.isRunning ? 'RUNNING' : 'STOPPED'}</strong></p>
+        ${botState.error ? `<p style="color: red"><b>Error:</b> ${botState.error}</p>` : ''}
+        <pre>${JSON.stringify(botState.lastCheck, null, 2)}</pre>
+        <form action="/toggle" method="POST"><button style="padding: 10px 20px; cursor: pointer;">Start/Stop Bot</button></form>
     `);
 });
 
 app.post('/toggle', (req, res) => {
+    if (botState.error) return res.status(500).send("Cannot start bot with configuration errors.");
     botState.isRunning = !botState.isRunning;
-    if (botState.isRunning) {
-        botState.error = null;
-        performTriangularCheck();
-    }
+    if (botState.isRunning) performTriangularCheck();
     res.redirect('/');
 });
 
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
 
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
