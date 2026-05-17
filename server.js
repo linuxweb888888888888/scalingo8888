@@ -27,11 +27,12 @@ const exchangeConfig = {
     latoken: { fee: 0.0010, color: '#fbbf24', name: 'LATOKEN' },
     whitebit: { fee: 0.0010, color: '#ec4899', name: 'WHITEBIT' },
     coinw: { fee: 0.0020, color: '#ff6600', name: 'COINW' },
-    azbit: { fee: 0.0010, color: '#14b8a6', name: 'AZBIT' }
+    azbit: { fee: 0.0010, color: '#14b8a6', name: 'AZBIT' },
+    probit: { fee: 0.0020, color: '#3b82f6', name: 'PROBIT' }
 };
 
 // --- 2. BOT STATE ---
-const START_CAPITAL = 100; // Profit based on $100 trades
+const START_CAPITAL = 100; // All calcs based on $100 trade
 let logs = [];
 let stats = { 
     scanned: 0, 
@@ -48,6 +49,8 @@ async function runMasterLoop() {
     
     while (true) {
         for (const id of exchangeIds) {
+            if (!ccxt[id]) continue; // Skip if exchange doesn't exist in CCXT
+            
             let ex = null;
             try {
                 stats.currentEx = exchangeConfig[id].name;
@@ -70,9 +73,10 @@ async function runMasterLoop() {
                     }
                 }
 
+                // Fetch Prices
                 const tickers = await ex.fetchTickers();
                 
-                // Calculate
+                // Calculation Loop
                 for (const [s1, s2, s3] of paths) {
                     stats.scanned++;
                     stats.currentPair = s2;
@@ -83,25 +87,30 @@ async function runMasterLoop() {
                     const netProfit = net - START_CAPITAL;
                     const roi = (netProfit / START_CAPITAL) * 100;
 
-                    if (roi > stats.bestRoi) stats.bestRoi = roi;
-
-                    if (roi > 0.01) {
+                    // --- SANITY FILTER ---
+                    // Arbitrage over 10% is almost always a pricing error or low liquidity (Fake)
+                    if (roi > 0.01 && roi < 10) {
+                        if (roi > stats.bestRoi) stats.bestRoi = roi;
                         stats.totalProfit += netProfit;
+
                         logs.unshift({ 
                             time: new Date().toLocaleTimeString(), 
                             ex: exchangeConfig[id].name, 
-                            path: `${s1}>${s2}>${s3}`, 
+                            path: `${s1} ➔ ${s2} ➔ ${s3}`, 
                             roi: roi.toFixed(4), 
                             profit: netProfit.toFixed(4),
                             color: exchangeConfig[id].color 
                         });
                         if (logs.length > 500) logs.pop();
+                    } else if (roi >= 10) {
+                        // We skip adding these to stats because they are likely fake
+                        console.log(`[Filtered] Suspect ROI of ${roi.toFixed(0)}% on ${exchangeConfig[id].name} (${s2})`);
                     }
                 }
             } catch (e) {
                 console.log(`[Error] ${id}: ${e.message}`);
             } finally {
-                // IMPORTANT: Wipe memory completely
+                // IMPORTANT: Wipe memory completely to prevent Scalingo crash
                 if (ex) { ex.markets = {}; ex = null; }
                 forceGC(); 
             }
@@ -117,67 +126,76 @@ app.get('/', (req, res) => {
         <!DOCTYPE html>
         <html>
         <head>
-            <title>Global Arb Fleet v3.2</title>
+            <title>ArbFleet v3.5 Pro</title>
             <style>
-                body { background: #020617; color: #f1f5f9; font-family: monospace; padding: 20px; }
-                .wrapper { max-width: 1000px; margin: auto; }
+                body { background: #020617; color: #f1f5f9; font-family: 'Inter', sans-serif; padding: 20px; margin: 0; }
+                .wrapper { max-width: 1100px; margin: auto; }
                 .header { background: #0f172a; padding: 20px; border-radius: 12px; border: 1px solid #1e293b; display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+                .ticker-val { font-size: 1.8rem; font-weight: 800; color: #38bdf8; }
                 .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 20px; }
                 .stat-card { background: #1e293b; padding: 15px; border-radius: 8px; text-align: center; border: 1px solid #334155; }
-                .log-box { background: #020617; min-height: 500px; border-radius: 12px; border: 1px solid #1e293b; overflow: hidden; }
-                .log-row { display: flex; justify-content: space-between; padding: 10px 20px; border-bottom: 1px solid #0f172a; font-size: 0.8rem; align-items: center; }
-                .ex-tag { padding: 2px 6px; border-radius: 4px; font-weight: bold; font-size: 0.7rem; border: 1px solid; }
+                .log-box { background: #020617; min-height: 600px; border-radius: 12px; border: 1px solid #1e293b; overflow: hidden; display: flex; flex-direction: column; }
+                .log-header { background: #1e293b; padding: 12px 20px; display: flex; justify-content: space-between; font-size: 0.8rem; color: #94a3b8; font-weight: bold; }
+                .log-row { display: flex; justify-content: space-between; padding: 12px 20px; border-bottom: 1px solid #0f172a; font-size: 0.85rem; align-items: center; }
+                .ex-tag { padding: 3px 10px; border-radius: 4px; font-size: 0.7rem; font-weight: bold; text-transform: uppercase; border: 1px solid; }
                 .green { color: #4ade80; font-weight: bold; }
                 .pagination { display: flex; justify-content: center; align-items: center; gap: 20px; padding: 15px; background: #0f172a; }
-                button { background: #38bdf8; color: #020617; border: none; padding: 5px 15px; border-radius: 4px; cursor: pointer; font-weight: bold; }
+                button { background: #38bdf8; color: #020617; border: none; padding: 8px 18px; border-radius: 6px; font-weight: bold; cursor: pointer; }
+                button:disabled { background: #334155; color: #94a3b8; }
             </style>
         </head>
         <body>
             <div class="wrapper">
                 <div class="header">
-                    <div><small style="color:#64748b">SCANNING ENGINE</small><br><div id="exName" style="font-size:1.5rem; color:#38bdf8; font-weight:bold;">...</div></div>
-                    <div style="text-align:right"><small style="color:#64748b">PATH</small><br><div id="pairName" style="font-weight:bold;">---</div></div>
+                    <div><small style="color:#64748b">ENGINE STATUS</small><br><div id="exName" class="ticker-val">BOOTING</div></div>
+                    <div style="text-align: right;"><small style="color:#64748b">SCANNING PAIR</small><br><div id="pairName" style="font-size: 1.4rem; font-weight:bold;">---</div></div>
                 </div>
                 <div class="stat-grid">
-                    <div class="stat-card"><small>SCANS</small><br><b id="scanned">0</b></div>
-                    <div class="stat-card"><small>BEST ROI</small><br><b id="bestRoi" class="green">0%</b></div>
-                    <div class="stat-card"><small>TOTAL PROFIT FOUND</small><br><b id="totalProfit" class="green">$0.00</b></div>
-                    <div class="stat-card"><small>RAM PROTECTION</small><br><b style="color:#38bdf8">ACTIVE</b></div>
+                    <div class="stat-card"><small style="color:#64748b">TOTAL SCANS</small><br><b id="scanned">0</b></div>
+                    <div class="stat-card"><small style="color:#64748b">BEST REAL ROI</small><br><b id="bestRoi" class="green">0%</b></div>
+                    <div class="stat-card"><small style="color:#64748b">ESTIMATED PROFIT</small><br><b id="totalProfit" class="green">$0.00</b></div>
+                    <div class="stat-card"><small style="color:#64748b">FLEET SIZE</small><br><b>${Object.keys(exchangeConfig).length} EXCHANGES</b></div>
                 </div>
                 <div class="log-box">
-                    <div id="logContent"></div>
+                    <div class="log-header"><span>EXCHANGE & TRIANGLE PATH</span><span style="text-align:right">NET PROFIT / ROI</span></div>
+                    <div id="logContent" style="flex:1"></div>
                     <div class="pagination">
-                        <button onclick="changePage(-1)">PREV</button>
+                        <button id="prevBtn" onclick="changePage(-1)">PREV</button>
                         <span id="pageInfo">Page 1</span>
-                        <button onclick="changePage(1)">NEXT</button>
+                        <button id="nextBtn" onclick="changePage(1)">NEXT</button>
                     </div>
                 </div>
             </div>
             <script>
-                let currentPage = 1; let pageSize = 12; let allLogs = [];
+                let currentPage = 1; let pageSize = 15; let allLogs = [];
                 async function update() {
-                    const r = await fetch('/status'); const d = await r.json();
-                    allLogs = d.logs;
-                    document.getElementById('exName').innerText = d.stats.currentEx;
-                    document.getElementById('pairName').innerText = d.stats.currentPair;
-                    document.getElementById('scanned').innerText = d.stats.scanned.toLocaleString();
-                    document.getElementById('bestRoi').innerText = d.stats.bestRoi.toFixed(3) + '%';
-                    document.getElementById('totalProfit').innerText = '$' + d.stats.totalProfit.toFixed(2);
-                    render();
+                    try {
+                        const r = await fetch('/status'); const d = await r.json();
+                        allLogs = d.logs;
+                        document.getElementById('exName').innerText = d.stats.currentEx;
+                        document.getElementById('pairName').innerText = d.stats.currentPair;
+                        document.getElementById('scanned').innerText = d.stats.scanned.toLocaleString();
+                        document.getElementById('bestRoi').innerText = d.stats.bestRoi.toFixed(3) + '%';
+                        document.getElementById('totalProfit').innerText = '$' + d.stats.totalProfit.toFixed(2);
+                        render();
+                    } catch(e) {}
                 }
                 function render() {
+                    const totalPages = Math.max(1, Math.ceil(allLogs.length / pageSize));
                     const start = (currentPage-1)*pageSize;
                     const pageLogs = allLogs.slice(start, start+pageSize);
                     document.getElementById('logContent').innerHTML = pageLogs.map(l => \`
                         <div class="log-row">
-                            <span><span class="ex-tag" style="color:\${l.color}; border-color:\${l.color}">\${l.ex}</span> \${l.path}</span>
-                            <span style="text-align:right"><span class="green">+\$ \${l.profit}</span><br><small style="color:#64748b">\${l.roi}%</small></span>
+                            <span><span class="ex-tag" style="color:\${l.color}; border-color:\${l.color}">\${l.ex}</span> <small style="color:#64748b">[\${l.time}]</small> \${l.path}</span>
+                            <span style="text-align:right"><span class="green">+\$ \${l.profit}</span><br><small style="color:#64748b">ROI: \${l.roi}%</small></span>
                         </div>
-                    \`).join('') || '<div style="padding:50px; text-align:center">Scanning for gaps...</div>';
-                    document.getElementById('pageInfo').innerText = "Page " + currentPage;
+                    \`).join('') || '<div style="padding:100px; text-align:center">Scanning for realistic spreads...</div>';
+                    document.getElementById('pageInfo').innerText = "Page " + currentPage + " of " + totalPages;
+                    document.getElementById('prevBtn').disabled = currentPage === 1;
+                    document.getElementById('nextBtn').disabled = currentPage >= totalPages;
                 }
                 function changePage(s) { currentPage = Math.max(1, currentPage + s); render(); }
-                setInterval(update, 800);
+                setInterval(update, 500);
             </script>
         </body>
         </html>
