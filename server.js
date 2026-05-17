@@ -4,13 +4,15 @@ const { ethers } = require('ethers');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- MULTIPLE RPC FALLBACKS ---
+// --- ROBUST RPC LIST ---
 const RPC_ENDPOINTS = [
+    "https://polygon-bor-rpc.publicnode.com",
     "https://polygon.llamarpc.com",
+    "https://1rpc.io/matic",
     "https://rpc.ankr.com/polygon",
-    "https://polygon-rpc.com"
+    "https://polygon-mainnet.public.blastapi.io"
 ];
-let currentRpcIndex = 0;
+let rpcIndex = 0;
 
 const ROUTER_ADDRESS = "0xa5E0829CaCEd8fFDD03942104b105c07C8510ed5"; 
 const TOKENS = {
@@ -19,7 +21,7 @@ const TOKENS = {
     USDT:   "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"
 };
 
-const ROUTER_ABI = ["function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)"];
+const ABI = ["function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)"];
 
 let botState = {
     isRunning: false,
@@ -28,19 +30,23 @@ let botState = {
     lastSpread: "0.00%",
     history: [],
     error: null,
-    currentRpc: RPC_ENDPOINTS[0]
+    activeNode: RPC_ENDPOINTS[0]
 };
 
 async function runSimulation() {
     if (!botState.isRunning) return;
 
     try {
-        const provider = new ethers.JsonRpcProvider(botState.currentRpc);
-        const router = new ethers.Contract(ROUTER_ADDRESS, ROUTER_ABI, provider);
+        // Use Fetch-based provider with a timeout to prevent hanging
+        const provider = new ethers.JsonRpcProvider(botState.activeNode, undefined, {
+            staticNetwork: true
+        });
 
+        const router = new ethers.Contract(ROUTER_ADDRESS, ABI, provider);
         const path = [TOKENS.WMATIC, TOKENS.USDC, TOKENS.USDT, TOKENS.WMATIC];
         const tradeSize = ethers.parseEther("10"); 
 
+        // Get prices
         const amounts = await router.getAmountsOut(tradeSize, path);
         const finalAmount = amounts[amounts.length - 1];
         
@@ -49,28 +55,32 @@ async function runSimulation() {
         const percentage = (profitReadable / 10) * 100;
 
         botState.lastSpread = `${percentage.toFixed(4)}%`;
-        botState.error = null; // Clear error on success
+        botState.error = null; // Success!
 
+        const time = new Date().toLocaleTimeString();
         if (profit > 0n) {
             botState.virtualBalance += profitReadable;
             botState.totalVirtualProfit += profitReadable;
-            botState.history.unshift(`[${new Date().toLocaleTimeString()}] PROFIT: +${profitReadable.toFixed(6)} MATIC`);
+            botState.history.unshift(`[${time}] 💰 PROFIT: +${profitReadable.toFixed(6)}`);
         } else {
-            botState.history.unshift(`[${new Date().toLocaleTimeString()}] Scan: No margin (${percentage.toFixed(4)}%)`);
+            botState.history.unshift(`[${time}] Scan: ${percentage.toFixed(4)}%`);
         }
 
-        if (botState.history.length > 8) botState.history.pop();
-
     } catch (err) {
-        console.error("RPC Error:", err.message);
-        // Switch to next RPC if one fails
-        currentRpcIndex = (currentRpcIndex + 1) % RPC_ENDPOINTS.length;
-        botState.currentRpc = RPC_ENDPOINTS[currentRpcIndex];
-        botState.error = "Connection Busy. Switching Node...";
+        console.log(`Node ${botState.activeNode} failed:`, err.message);
+        
+        // Pick next node
+        rpcIndex = (rpcIndex + 1) % RPC_ENDPOINTS.length;
+        botState.activeNode = RPC_ENDPOINTS[rpcIndex];
+        
+        // Show short error on UI
+        botState.error = err.message.includes("429") ? "Rate Limited (429)" : "Node Busy/Timeout";
     }
 
-    // Increased delay slightly to avoid rate-limiting (6 seconds)
-    setTimeout(runSimulation, 6000);
+    if (botState.history.length > 10) botState.history.pop();
+
+    // Slower polling to respect public node limits
+    setTimeout(runSimulation, 8000);
 }
 
 app.get('/', (req, res) => {
@@ -79,42 +89,38 @@ app.get('/', (req, res) => {
     <html>
     <head>
         <title>Paper Trading Console</title>
+        <meta http-equiv="refresh" content="10"> <!-- Auto-refresh page every 10s -->
         <style>
-            body { font-family: monospace; background: #0a0a0a; color: #00ff41; padding: 20px; }
-            .terminal { max-width: 600px; margin: auto; border: 1px solid #00ff41; padding: 20px; box-shadow: 0 0 15px #00ff4133; }
-            .header { border-bottom: 1px solid #00ff41; padding-bottom: 10px; margin-bottom: 20px; }
-            .stat-line { display: flex; justify-content: space-between; margin: 10px 0; font-size: 1.1em; }
-            .status { color: ${botState.isRunning ? '#00ff41' : '#ff4141'}; font-weight: bold; }
-            .logs { background: #000; padding: 10px; height: 180px; overflow-y: hidden; border: 1px solid #111; margin: 20px 0; color: #888; font-size: 0.85em; line-height: 1.4; }
-            button { width: 100%; background: transparent; border: 1px solid #00ff41; color: #00ff41; padding: 15px; cursor: pointer; font-family: monospace; font-size: 1.2em; }
-            button:hover { background: #00ff41; color: #000; }
-            .error { color: #000; background: #ff4141; text-align: center; margin-bottom: 10px; padding: 5px; font-weight: bold; }
-            .node-info { font-size: 0.7em; color: #444; margin-top: 10px; display: block; }
+            body { font-family: 'Courier New', monospace; background: #050505; color: #00ff41; padding: 20px; }
+            .terminal { max-width: 600px; margin: auto; border: 1px solid #00ff41; padding: 20px; }
+            .status-bar { display: flex; justify-content: space-between; padding: 5px; background: #003300; color: white; margin-bottom: 20px; font-size: 0.8em; }
+            .stat-line { display: flex; justify-content: space-between; margin: 10px 0; border-bottom: 1px dotted #222; }
+            .logs { height: 200px; overflow: hidden; color: #888; font-size: 0.9em; margin: 20px 0; }
+            button { width: 100%; padding: 15px; background: #00ff41; color: black; border: none; cursor: pointer; font-family: monospace; font-weight: bold; }
+            .error { color: #ff0000; font-weight: bold; }
         </style>
     </head>
     <body>
         <div class="terminal">
-            <div class="header">
-                <h2>TRIANGULAR_ARB_SIMULATOR v1.1</h2>
-                <div>NETWORK: POLYGON_MAINNET</div>
+            <div class="status-bar">
+                <span>NODE: ${botState.activeNode.split('/')[2]}</span>
+                <span>STATUS: ${botState.isRunning ? 'RUNNING' : 'STOPPED'}</span>
             </div>
 
-            ${botState.error ? `<div class="error">STATUS: ${botState.error}</div>` : ''}
+            ${botState.error ? `<div class="error">ERROR: ${botState.error}</div>` : ''}
 
-            <div class="stat-line"><span>ENGINE:</span> <span class="status">${botState.isRunning ? 'ACTIVE' : 'IDLE'}</span></div>
             <div class="stat-line"><span>VIRTUAL WALLET:</span> <span>${botState.virtualBalance.toFixed(4)} MATIC</span></div>
             <div class="stat-line"><span>TOTAL PROFIT:</span> <span>+${botState.totalVirtualProfit.toFixed(6)}</span></div>
-            <div class="stat-line"><span>CURRENT SPREAD:</span> <span>${botState.lastSpread}</span></div>
+            <div class="stat-line"><span>LAST SPREAD:</span> <span>${botState.lastSpread}</span></div>
 
             <div class="logs">
-                ${botState.history.length > 0 ? botState.history.join('<br>') : 'Initializing connection to DEX liquidity pools...'}
+                ${botState.history.join('<br>')}
             </div>
 
             <form action="/toggle" method="POST">
-                <button type="submit">${botState.isRunning ? 'TERMINATE SESSION' : 'INITIALIZE SIMULATION'}</button>
+                <button type="submit">${botState.isRunning ? 'HALT TRADING' : 'START SIMULATION'}</button>
             </form>
-            
-            <span class="node-info">Active Node: ${botState.currentRpc}</span>
+            <p style="font-size: 0.7em; color: #333; text-align: center;">Page auto-refreshes every 10s</p>
         </div>
     </body>
     </html>
@@ -123,8 +129,11 @@ app.get('/', (req, res) => {
 
 app.post('/toggle', (req, res) => {
     botState.isRunning = !botState.isRunning;
-    if (botState.isRunning) runSimulation();
+    if (botState.isRunning) {
+        botState.error = null;
+        runSimulation();
+    }
     res.redirect('/');
 });
 
-app.listen(PORT, () => console.log(`Dashboard active on port ${PORT}`));
+app.listen(PORT, () => console.log(`Dashboard active` || 3000));
