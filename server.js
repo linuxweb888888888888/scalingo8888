@@ -27,36 +27,30 @@ const ALL_NAMESPACES = [
 
 // Remove duplicates
 const NAMESPACES = [...new Set(ALL_NAMESPACES)].filter(ns => ns && ns.trim());
-const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL) || 20000;
+const CHECK_INTERVAL = 30000; // 30 seconds
 
 console.log(`========================================`);
 console.log(`🚀 Docker Hub Metrics Dashboard`);
 console.log(`========================================`);
 console.log(`📋 Total namespaces: ${NAMESPACES.length}`);
-console.log(`📋 Namespaces: ${NAMESPACES.join(', ')}`);
 console.log(`⏱️  Check interval: ${CHECK_INTERVAL / 1000}s`);
 console.log(`========================================\n`);
 
-// Cache with initial empty state
+// Initialize cache with default data
 let cachedData = {
   images: [],
-  lastUpdate: new Date(),
   totalPulls: 0,
   totalImages: 0,
   namespaceStats: {},
-  trends: {},
-  changes: [],
-  previousChanges: [],
-  isStable: false,
-  validNamespaces: [],
-  lastSuccessfulUpdate: null
+  recentChanges: [],
+  lastUpdate: new Date(),
+  isReady: false
 };
 
-let previousSnapshot = new Map();
+let previousPullCounts = new Map();
 let isUpdating = false;
-let firstUpdateDone = false;
 
-// Fetch helper with timeout
+// Fetch helper
 async function fetchJSON(url, timeout = 10000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('Timeout')), timeout);
@@ -75,116 +69,81 @@ async function fetchJSON(url, timeout = 10000) {
   });
 }
 
-async function checkNamespaceExists(namespace) {
+// Get all repositories for a namespace
+async function getRepositories(namespace) {
   try {
-    const url = `https://hub.docker.com/v2/repositories/${namespace}/?page_size=1`;
+    const url = `https://hub.docker.com/v2/repositories/${namespace}/?page_size=100`;
+    const data = await fetchJSON(url, 8000);
+    return data.results || [];
+  } catch (error) {
+    console.log(`  ⚠️ No repos found for ${namespace}`);
+    return [];
+  }
+}
+
+// Get pull count for a specific image
+async function getPullCount(namespace, image) {
+  try {
+    const url = `https://hub.docker.com/v2/repositories/${namespace}/${image}`;
     const data = await fetchJSON(url, 5000);
-    const hasRepos = data.results && data.results.length > 0;
-    const count = data.count || 0;
-    
-    return {
-      exists: true,
-      hasRepositories: hasRepos,
-      repositoryCount: count
-    };
+    return data.pull_count || 0;
   } catch (error) {
-    return {
-      exists: false,
-      hasRepositories: false,
-      repositoryCount: 0
-    };
+    return 0;
   }
 }
 
-async function getAllRepositories(namespace) {
-  let allRepos = [];
-  let url = `https://hub.docker.com/v2/repositories/${namespace}/?page_size=100`;
-  
-  while (url) {
-    try {
-      const data = await fetchJSON(url);
-      if (data.results && data.results.length > 0) {
-        allRepos = allRepos.concat(data.results);
-        url = data.next || null;
-      } else {
-        break;
-      }
-    } catch (error) {
-      break;
-    }
-  }
-  
-  return allRepos;
-}
-
-async function getImagePullCount(fullName) {
-  try {
-    const data = await fetchJSON(`https://hub.docker.com/v2/repositories/${fullName}`, 8000);
-    return {
-      pullCount: data.pull_count || 0,
-      lastUpdated: data.last_updated || data.pushed_at || new Date().toISOString(),
-      exists: true
-    };
-  } catch (error) {
-    return {
-      pullCount: 0,
-      lastUpdated: null,
-      exists: false
-    };
-  }
-}
-
+// Main data fetch function
 async function fetchAllData() {
   const allImages = [];
   const changes = [];
-  const validNamespaces = [];
   
-  // Find valid namespaces
+  console.log(`\n🔍 Scanning ${NAMESPACES.length} namespaces...`);
+  
   for (const namespace of NAMESPACES) {
-    const status = await checkNamespaceExists(namespace);
-    if (status.hasRepositories) {
-      validNamespaces.push(namespace);
+    console.log(`  Checking: ${namespace}`);
+    const repos = await getRepositories(namespace);
+    
+    if (repos.length === 0) {
+      console.log(`    ❌ No public repositories`);
+      continue;
     }
-  }
-  
-  // Fetch images from valid namespaces
-  for (const namespace of validNamespaces) {
-    try {
-      const repositories = await getAllRepositories(namespace);
+    
+    console.log(`    ✅ Found ${repos.length} repositories`);
+    
+    for (const repo of repos) {
+      const imageName = repo.name;
+      const pullCount = await getPullCount(namespace, imageName);
       
-      for (const repo of repositories) {
-        const repoName = repo.name;
-        const fullName = `${namespace}/${repoName}`;
-        const data = await getImagePullCount(fullName);
+      if (pullCount > 0) {
+        const fullName = `${namespace}/${imageName}`;
+        const previousCount = previousPullCounts.get(fullName) || 0;
         
-        if (data.exists && data.pullCount > 0) {
-          const imageData = {
-            name: repoName,
+        if (previousCount > 0 && pullCount > previousCount) {
+          const diff = pullCount - previousCount;
+          changes.push({
+            name: imageName,
             namespace: namespace,
             fullName: fullName,
-            pullCount: data.pullCount,
-            lastUpdated: data.lastUpdated
-          };
-          
-          // Check for changes
-          const previous = previousSnapshot.get(fullName);
-          if (previous !== undefined && previous !== data.pullCount && data.pullCount > previous) {
-            const diff = data.pullCount - previous;
-            changes.push({
-              ...imageData,
-              diff: diff,
-              timestamp: new Date()
-            });
-          }
-          
-          previousSnapshot.set(fullName, data.pullCount);
-          allImages.push(imageData);
+            diff: diff,
+            newCount: pullCount,
+            timestamp: new Date()
+          });
+          console.log(`      🔔 ${imageName}: +${diff} pulls`);
         }
         
-        await new Promise(resolve => setTimeout(resolve, 20));
+        previousPullCounts.set(fullName, pullCount);
+        
+        allImages.push({
+          name: imageName,
+          namespace: namespace,
+          fullName: fullName,
+          pullCount: pullCount,
+          lastUpdated: repo.last_updated || new Date().toISOString()
+        });
       }
-    } catch (error) {
-      console.error(`Error fetching ${namespace}:`, error.message);
+      
+      // Small delay to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
   }
   
@@ -193,81 +152,65 @@ async function fetchAllData() {
   
   // Calculate namespace stats
   const namespaceStats = {};
-  for (const namespace of validNamespaces) {
-    const nsImages = allImages.filter(img => img.namespace === namespace);
-    if (nsImages.length > 0) {
-      namespaceStats[namespace] = {
-        totalPulls: nsImages.reduce((sum, img) => sum + img.pullCount, 0),
-        imageCount: nsImages.length,
-        topImage: nsImages[0]?.name || 'None',
-        topImagePulls: nsImages[0]?.pullCount || 0
+  for (const img of allImages) {
+    if (!namespaceStats[img.namespace]) {
+      namespaceStats[img.namespace] = {
+        imageCount: 0,
+        totalPulls: 0
       };
     }
+    namespaceStats[img.namespace].imageCount++;
+    namespaceStats[img.namespace].totalPulls += img.pullCount;
   }
   
   const totalPulls = allImages.reduce((sum, img) => sum + img.pullCount, 0);
+  
+  console.log(`\n📊 Summary: ${allImages.length} images, ${totalPulls.toLocaleString()} total pulls`);
+  console.log(`📦 Namespaces with images: ${Object.keys(namespaceStats).join(', ') || 'none'}`);
   
   return {
     images: allImages,
     totalPulls: totalPulls,
     totalImages: allImages.length,
     namespaceStats: namespaceStats,
-    changes: changes,
-    lastUpdate: new Date(),
-    validNamespaces: validNamespaces.filter(ns => namespaceStats[ns])
+    recentChanges: changes.slice(0, 20),
+    lastUpdate: new Date()
   };
 }
 
+// Background updater
 async function updateData() {
-  if (isUpdating) return;
+  if (isUpdating) {
+    console.log('⏳ Update already in progress...');
+    return;
+  }
   
   isUpdating = true;
   
   try {
-    console.log(`[${new Date().toISOString()}] Fetching data...`);
+    console.log(`\n[${new Date().toISOString()}] Starting data update...`);
     const newData = await fetchAllData();
     
-    if (newData.images && newData.images.length > 0) {
-      // Update trends
-      const updatedTrends = { ...cachedData.trends };
-      for (const change of newData.changes) {
-        updatedTrends[change.fullName] = (updatedTrends[change.fullName] || 0) + change.diff;
-      }
-      
-      const updatedChanges = [...newData.changes, ...(cachedData.previousChanges || [])].slice(0, 100);
-      
+    if (newData.totalImages > 0 || !cachedData.isReady) {
       cachedData = {
-        images: newData.images,
-        totalPulls: newData.totalPulls,
-        totalImages: newData.totalImages,
-        namespaceStats: newData.namespaceStats,
-        trends: updatedTrends,
-        changes: newData.changes,
-        previousChanges: updatedChanges,
-        lastUpdate: newData.lastUpdate,
-        isStable: true,
-        validNamespaces: newData.validNamespaces,
-        lastSuccessfulUpdate: new Date()
+        ...newData,
+        isReady: true
       };
-      
-      console.log(`✅ Updated: ${newData.totalImages} images, ${newData.totalPulls.toLocaleString()} pulls from ${Object.keys(newData.namespaceStats).length} namespaces`);
-      firstUpdateDone = true;
-    } else if (!firstUpdateDone) {
-      console.log('⏳ Waiting for first valid data...');
+      console.log(`✅ Cache updated successfully`);
     } else {
-      console.log('⚠️ No new data, keeping cache');
+      console.log(`⚠️ No data received, keeping existing cache`);
     }
   } catch (error) {
-    console.error('❌ Update error:', error.message);
+    console.error(`❌ Update error:`, error.message);
   } finally {
     isUpdating = false;
   }
 }
 
-// Middleware
+// Express middleware
 app.use(express.json());
 
-// API endpoint
+// API endpoint - always returns data
 app.get('/api/metrics', (req, res) => {
   res.json({
     success: true,
@@ -277,23 +220,20 @@ app.get('/api/metrics', (req, res) => {
       totalPulls: cachedData.totalPulls || 0,
       totalImages: cachedData.totalImages || 0,
       namespaceStats: cachedData.namespaceStats || {},
-      recentChanges: cachedData.previousChanges?.slice(0, 20) || [],
-      trends: cachedData.trends || {},
-      lastUpdate: cachedData.lastUpdate,
-      isStable: cachedData.isStable,
-      validNamespaces: cachedData.validNamespaces || []
+      recentChanges: cachedData.recentChanges || [],
+      lastUpdate: cachedData.lastUpdate || new Date(),
+      isReady: cachedData.isReady
     }
   });
 });
 
+// Health check
 app.get('/api/health', (req, res) => {
   res.json({
-    status: cachedData.isStable ? 'healthy' : 'starting',
-    uptime: process.uptime(),
+    status: cachedData.isReady ? 'healthy' : 'starting',
     totalImages: cachedData.totalImages,
     totalPulls: cachedData.totalPulls,
-    lastUpdate: cachedData.lastUpdate,
-    validNamespaces: cachedData.validNamespaces
+    lastUpdate: cachedData.lastUpdate
   });
 });
 
@@ -308,14 +248,25 @@ app.get('/', (req, res) => {
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
         body {
-            font-family: 'Inter', sans-serif;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
             color: #1a202c;
         }
-        .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+
         .header {
             background: white;
             border-radius: 24px;
@@ -323,6 +274,7 @@ app.get('/', (req, res) => {
             margin-bottom: 32px;
             box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);
         }
+
         .header h1 {
             font-size: 2rem;
             font-weight: 700;
@@ -332,21 +284,32 @@ app.get('/', (req, res) => {
             color: transparent;
             margin-bottom: 8px;
         }
-        .header-subtitle { color: #718096; font-size: 0.875rem; }
+
+        .header-subtitle {
+            color: #718096;
+            font-size: 0.875rem;
+        }
+
         .stats-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
             gap: 24px;
             margin-bottom: 32px;
         }
+
         .stat-card {
             background: white;
             border-radius: 20px;
             padding: 24px;
-            transition: transform 0.2s;
+            transition: transform 0.2s, box-shadow 0.2s;
             box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1);
         }
-        .stat-card:hover { transform: translateY(-4px); }
+
+        .stat-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);
+        }
+
         .stat-icon {
             width: 48px;
             height: 48px;
@@ -357,12 +320,30 @@ app.get('/', (req, res) => {
             font-size: 24px;
             margin-bottom: 16px;
         }
+
         .stat-icon.blue { background: rgba(59, 130, 246, 0.1); color: #3b82f6; }
         .stat-icon.purple { background: rgba(139, 92, 246, 0.1); color: #8b5cf6; }
         .stat-icon.green { background: rgba(16, 185, 129, 0.1); color: #10b981; }
-        .stat-value { font-size: 2rem; font-weight: 700; margin-bottom: 8px; }
-        .stat-label { color: #718096; font-size: 0.875rem; font-weight: 500; }
-        .stat-sub { font-size: 0.75rem; color: #a0aec0; margin-top: 4px; }
+        .stat-icon.orange { background: rgba(245, 158, 11, 0.1); color: #f59e0b; }
+
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+
+        .stat-label {
+            color: #718096;
+            font-size: 0.875rem;
+            font-weight: 500;
+        }
+
+        .stat-sub {
+            font-size: 0.75rem;
+            color: #a0aec0;
+            margin-top: 4px;
+        }
+
         .section-title {
             font-size: 1.5rem;
             font-weight: 600;
@@ -372,6 +353,7 @@ app.get('/', (req, res) => {
             gap: 12px;
             color: white;
         }
+
         .table-container {
             background: white;
             border-radius: 20px;
@@ -379,11 +361,33 @@ app.get('/', (req, res) => {
             margin-bottom: 32px;
             box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1);
         }
-        table { width: 100%; border-collapse: collapse; }
-        thead { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
-        th, td { padding: 16px 20px; text-align: left; }
-        td { border-bottom: 1px solid #e2e8f0; }
-        tr:hover { background: #f7fafc; }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        thead {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        th {
+            padding: 16px 20px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 0.875rem;
+        }
+
+        td {
+            padding: 16px 20px;
+            border-bottom: 1px solid #e2e8f0;
+        }
+
+        tr:hover {
+            background: #f7fafc;
+        }
+
         .badge {
             display: inline-flex;
             padding: 4px 12px;
@@ -393,11 +397,37 @@ app.get('/', (req, res) => {
             background: rgba(102, 126, 234, 0.1);
             color: #667eea;
         }
-        .trend-up { color: #10b981; font-weight: 600; }
-        .progress-bar { width: 100px; height: 6px; background: #e2e8f0; border-radius: 3px; overflow: hidden; }
-        .progress-fill { height: 100%; background: linear-gradient(90deg, #667eea, #764ba2); transition: width 0.3s; }
-        .loading { text-align: center; padding: 48px; color: #718096; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+        .trend-up {
+            color: #10b981;
+            font-weight: 600;
+        }
+
+        .progress-bar {
+            width: 100px;
+            height: 6px;
+            background: #e2e8f0;
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            transition: width 0.3s;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 48px;
+            color: #718096;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
         .live-indicator {
             display: inline-block;
             width: 8px;
@@ -407,8 +437,15 @@ app.get('/', (req, res) => {
             animation: pulse 2s infinite;
             margin-right: 8px;
         }
-        .footer { text-align: center; padding: 24px; color: white; font-size: 0.875rem; }
-        .info-note {
+
+        .footer {
+            text-align: center;
+            padding: 24px;
+            color: white;
+            font-size: 0.875rem;
+        }
+
+        .info-card {
             background: #e0e7ff;
             padding: 12px 20px;
             border-radius: 12px;
@@ -416,14 +453,10 @@ app.get('/', (req, res) => {
             font-size: 0.875rem;
             color: #3730a3;
         }
-        .refresh-btn {
-            background: white;
-            border: none;
-            padding: 8px 16px;
-            border-radius: 12px;
-            cursor: pointer;
-            font-weight: 600;
-            margin-left: auto;
+
+        .success-card {
+            background: #d1fae5;
+            color: #065f46;
         }
     </style>
 </head>
@@ -433,25 +466,27 @@ app.get('/', (req, res) => {
             <h1><i class="fab fa-docker"></i> Docker Hub Metrics Dashboard</h1>
             <div class="header-subtitle">Monitoring ${NAMESPACES.length} namespaces | Real-time pull statistics</div>
         </div>
-        
-        <div class="info-note" id="infoNote">
+
+        <div id="statusCard" class="info-card">
             <i class="fas fa-spinner fa-pulse"></i> Loading data from Docker Hub...
         </div>
 
         <div class="stats-grid" id="statsGrid">
-            <div class="loading"><i class="fas fa-spinner fa-pulse"></i> Loading statistics...</div>
+            <div class="loading">Loading statistics...</div>
         </div>
 
         <div class="section-title">
             <i class="fas fa-chart-line"></i>
             <span>Recent Activity</span>
             <span class="live-indicator"></span>
-            <span style="font-size: 0.875rem; opacity: 0.9;" id="lastUpdate">Loading...</span>
+            <span id="lastUpdateText" style="font-size: 0.875rem; opacity: 0.9;"></span>
         </div>
 
         <div class="table-container">
-            <table id="recentChangesTable">
-                <thead><tr><th>Image</th><th>Namespace</th><th>New Pulls</th><th>Time</th></tr></thead>
+            <table>
+                <thead>
+                    <tr><th>Image</th><th>Namespace</th><th>New Pulls</th><th>Time</th></tr>
+                </thead>
                 <tbody id="recentChangesBody">
                     <tr><td colspan="4" class="loading">Loading...</td></tr>
                 </tbody>
@@ -464,134 +499,140 @@ app.get('/', (req, res) => {
         </div>
 
         <div class="table-container">
-            <table id="imagesTable">
-                <thead><tr><th>#</th><th>Image Name</th><th>Namespace</th><th>Pull Count</th><th>Trend</th><th>Activity</th></tr></thead>
+            <table>
+                <thead>
+                    <tr><th>#</th><th>Image Name</th><th>Namespace</th><th>Pull Count</th><th>Activity</th></tr>
+                </thead>
                 <tbody id="imagesBody">
-                    <tr><td colspan="6" class="loading">Loading...</td></tr>
+                    <tr><td colspan="5" class="loading">Loading...</td></tr>
                 </tbody>
             </table>
         </div>
-        
+
         <div class="footer">
             <i class="fas fa-sync-alt"></i> Auto-refreshes every 5 seconds | Data from Docker Hub API
         </div>
     </div>
 
     <script>
-        let metricsData = null;
-        let refreshCount = 0;
+        let updateCount = 0;
         
-        async function fetchMetrics() {
+        async function loadData() {
             try {
                 const response = await fetch('/api/metrics');
                 const result = await response.json();
+                
                 if (result.success && result.data) {
-                    metricsData = result.data;
-                    updateDashboard();
-                    refreshCount = 0;
+                    updateDashboard(result.data);
+                    updateCount = 0;
+                } else {
+                    throw new Error('Invalid response');
                 }
             } catch (error) {
                 console.error('Error:', error);
-                refreshCount++;
-                if (refreshCount > 3) {
-                    document.getElementById('infoNote').innerHTML = '<i class="fas fa-exclamation-triangle"></i> Connection issues, retrying...';
+                updateCount++;
+                if (updateCount > 3) {
+                    document.getElementById('statusCard').innerHTML = '<i class="fas fa-exclamation-triangle"></i> Connection issues, retrying...';
                 }
+                setTimeout(loadData, 2000);
             }
         }
         
         function formatNumber(num) {
-            if (num === undefined || num === null) return '0';
-            return new Intl.NumberFormat().format(num);
+            return new Intl.NumberFormat().format(num || 0);
         }
         
-        function formatRelativeTime(date) {
-            if (!date) return 'Just now';
+        function formatTime(date) {
+            if (!date) return 'Never';
             const now = new Date();
             const diff = Math.floor((now - new Date(date)) / 1000);
             if (diff < 5) return 'Just now';
-            if (diff < 60) return \`\${diff} seconds ago\`;
-            if (diff < 3600) return \`\${Math.floor(diff / 60)} minutes ago\`;
-            if (diff < 86400) return \`\${Math.floor(diff / 3600)} hours ago\`;
-            return \`\${Math.floor(diff / 86400)} days ago\`;
+            if (diff < 60) return diff + ' seconds ago';
+            if (diff < 3600) return Math.floor(diff / 60) + ' minutes ago';
+            if (diff < 86400) return Math.floor(diff / 3600) + ' hours ago';
+            return Math.floor(diff / 86400) + ' days ago';
         }
         
-        function updateDashboard() {
-            if (!metricsData) return;
-            
-            // Update info note
-            const namespaceCount = Object.keys(metricsData.namespaceStats || {}).length;
-            if (metricsData.totalImages > 0) {
-                document.getElementById('infoNote').innerHTML = \`
-                    <i class="fas fa-check-circle"></i> 
-                    Found \${metricsData.totalImages} images across \${namespaceCount} namespaces | 
-                    Last scan: \${formatRelativeTime(metricsData.lastUpdate)}
-                \`;
+        function updateDashboard(data) {
+            // Update status card
+            if (data.totalImages > 0) {
+                const namespaces = Object.keys(data.namespaceStats).length;
+                document.getElementById('statusCard').innerHTML = 
+                    '<i class="fas fa-check-circle"></i> ✓ Found ' + data.totalImages + 
+                    ' images across ' + namespaces + ' namespaces | ' +
+                    formatNumber(data.totalPulls) + ' total pulls';
+                document.getElementById('statusCard').className = 'info-card success-card';
+            } else if (data.isReady) {
+                document.getElementById('statusCard').innerHTML = 
+                    '<i class="fas fa-info-circle"></i> No images found. Check Docker Hub namespaces.';
             }
+            
+            // Update last update time
+            document.getElementById('lastUpdateText').innerHTML = 
+                'Last updated: ' + formatTime(data.lastUpdate);
             
             // Update stats grid
-            const statsHtml = [
-                '<div class="stat-card"><div class="stat-icon blue"><i class="fas fa-images"></i></div>',
-                '<div class="stat-value">' + formatNumber(metricsData.totalImages) + '</div>',
-                '<div class="stat-label">Total Images</div></div>',
-                '<div class="stat-card"><div class="stat-icon purple"><i class="fas fa-download"></i></div>',
-                '<div class="stat-value">' + formatNumber(metricsData.totalPulls) + '</div>',
-                '<div class="stat-label">Total Pulls (All Time)</div></div>'
-            ].join('');
+            const statsHtml = [];
             
-            const namespaceStats = metricsData.namespaceStats || {};
-            for (const [ns, stats] of Object.entries(namespaceStats)) {
-                statsHtml.push(\`
-                    <div class="stat-card">
-                        <div class="stat-icon green"><i class="fas fa-cube"></i></div>
-                        <div class="stat-value">\${stats.imageCount}</div>
-                        <div class="stat-label">\${ns}</div>
-                        <div class="stat-sub">\${formatNumber(stats.totalPulls)} pulls</div>
-                    </div>
-                \`);
+            // Total Images card
+            statsHtml.push('<div class="stat-card"><div class="stat-icon blue"><i class="fas fa-images"></i></div>');
+            statsHtml.push('<div class="stat-value">' + data.totalImages + '</div>');
+            statsHtml.push('<div class="stat-label">Total Images</div></div>');
+            
+            // Total Pulls card
+            statsHtml.push('<div class="stat-card"><div class="stat-icon purple"><i class="fas fa-download"></i></div>');
+            statsHtml.push('<div class="stat-value">' + formatNumber(data.totalPulls) + '</div>');
+            statsHtml.push('<div class="stat-label">Total Pulls</div></div>');
+            
+            // Namespace cards
+            for (const [ns, stats] of Object.entries(data.namespaceStats || {})) {
+                statsHtml.push('<div class="stat-card"><div class="stat-icon green"><i class="fas fa-cube"></i></div>');
+                statsHtml.push('<div class="stat-value">' + stats.imageCount + '</div>');
+                statsHtml.push('<div class="stat-label">' + ns + '</div>');
+                statsHtml.push('<div class="stat-sub">' + formatNumber(stats.totalPulls) + ' pulls</div></div>');
             }
             
-            document.getElementById('statsGrid').innerHTML = statsHtml;
-            document.getElementById('lastUpdate').innerHTML = \`Last updated: \${formatRelativeTime(metricsData.lastUpdate)}\`;
+            document.getElementById('statsGrid').innerHTML = statsHtml.join('');
             
             // Update recent changes
-            const changes = metricsData.recentChanges || [];
+            const changes = data.recentChanges || [];
             const changesBody = document.getElementById('recentChangesBody');
             if (changes.length === 0) {
-                changesBody.innerHTML = '<tr><td colspan="4" style="text-align: center;">No recent changes detected</td></tr>';
+                changesBody.innerHTML = '<tr><td colspan="4" class="loading">No recent changes detected</td></tr>';
             } else {
-                changesBody.innerHTML = changes.slice(0, 10).map(change => \`
+                changesBody.innerHTML = changes.slice(0, 10).map(change => `
                     <tr>
-                        <td><strong>\${escapeHtml(change.name || 'Unknown')}</strong></td>
-                        <td><span class="badge">\${escapeHtml(change.namespace || 'Unknown')}</span></td>
-                        <td class="trend-up">+\${change.diff || 0} pulls</td>
-                        <td>\${formatRelativeTime(change.timestamp)}</td>
+                        <td><strong>${escapeHtml(change.name)}</strong></td>
+                        <td><span class="badge">${escapeHtml(change.namespace)}</span></td>
+                        <td class="trend-up">+${change.diff} pulls</td>
+                        <td>${formatTime(change.timestamp)}</td>
                     </tr>
-                \`).join('');
+                `).join('');
             }
             
             // Update images table
-            const images = metricsData.images || [];
-            const trends = metricsData.trends || {};
-            const maxPulls = images.length > 0 ? images[0].pullCount : 1;
+            const images = data.images || [];
             const imagesBody = document.getElementById('imagesBody');
+            const maxPulls = images.length > 0 ? images[0].pullCount : 1;
             
             if (images.length === 0) {
-                imagesBody.innerHTML = '<tr><td colspan="6" style="text-align: center;">No images found - loading...</td></tr>';
+                imagesBody.innerHTML = '<tr><td colspan="5" class="loading">No images found</td></tr>';
             } else {
-                imagesBody.innerHTML = images.slice(0, 100).map((image, index) => {
-                    const trend = trends[image.fullName] || 0;
-                    const trendIcon = trend > 0 ? '↑' : '→';
-                    const percentage = (image.pullCount / maxPulls) * 100;
-                    return \`
+                imagesBody.innerHTML = images.slice(0, 50).map((img, idx) => {
+                    const percentage = (img.pullCount / maxPulls) * 100;
+                    return `
                         <tr>
-                            <td>\${index + 1}</td>
-                            <td><strong>\${escapeHtml(image.name)}</strong></td>
-                            <td><span class="badge">\${escapeHtml(image.namespace)}</span></td>
-                            <td>\${formatNumber(image.pullCount)}</td>
-                            <td class="trend-up">\${trendIcon} \${Math.abs(trend)}</td>
-                            <td><div class="progress-bar"><div class="progress-fill" style="width: \${percentage}%"></div></div></td>
+                            <td>${idx + 1}</td>
+                            <td><strong>${escapeHtml(img.name)}</strong></td>
+                            <td><span class="badge">${escapeHtml(img.namespace)}</span></td>
+                            <td>${formatNumber(img.pullCount)}</td>
+                            <td>
+                                <div class="progress-bar">
+                                    <div class="progress-fill" style="width: ${percentage}%"></div>
+                                </div>
+                            </td>
                         </tr>
-                    \`;
+                    `;
                 }).join('');
             }
         }
@@ -604,10 +645,10 @@ app.get('/', (req, res) => {
         }
         
         // Initial load
-        fetchMetrics();
+        loadData();
         
-        // Auto-refresh every 3 seconds
-        setInterval(fetchMetrics, 3000);
+        // Auto-refresh every 5 seconds
+        setInterval(loadData, 5000);
     </script>
 </body>
 </html>
@@ -616,18 +657,17 @@ app.get('/', (req, res) => {
 
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🚀 Server running on http://0.0.0.0:${PORT}`);
+  console.log(`\n✨ Dashboard ready!`);
+  console.log(`📍 http://localhost:${PORT}`);
   console.log(`📊 Monitoring ${NAMESPACES.length} namespaces`);
-  console.log(`⏱️  Update interval: ${CHECK_INTERVAL / 1000}s`);
-  console.log(`========================================\n`);
+  console.log(`🔄 First data fetch starting...\n`);
   
-  // Initial update
+  // Start background updates
   updateData();
-  
-  // Periodic updates
   setInterval(updateData, CHECK_INTERVAL);
 });
 
+// Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('Shutting down...');
   process.exit(0);
