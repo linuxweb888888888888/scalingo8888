@@ -7,9 +7,10 @@ const PORT = process.env.PORT || 3000;
 
 const NAMESPACES = process.env.NAMESPACES 
   ? process.env.NAMESPACES.split(',') 
-  : ['phemextradebot', 'linux84744474', 'linux88884474', 'webapps84', 'tradingbotapp', 'webcoder4', 'weblinux84', 'tradepackage', 'hitbtctradebot', 'webwebwebwebwebweb', 'webpackage', 'clevertradebot', 'linux88888888', 'linuxlinuxlinuxlinux8888', 'tradeincbot', 'tradeincbotbot', 'phemextradebot', 'buyrunplace'];
+ : ['phemextradebot', 'linux84744474', 'linux88884474', 'webapps84', 'tradingbotapp', 'webcoder4', 'weblinux84', 'tradepackage', 'hitbtctradebot', 'webwebwebwebwebweb', 'webpackage', 'clevertradebot', 'linux88888888', 'linuxlinuxlinuxlinux8888', 'tradeincbot', 'tradeincbotbot', 'phemextradebot', 'buyrunplace'];
 const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL) || 15000; // 15 seconds default
 
+// Stable cache with fallback data
 let cachedData = {
   images: [],
   lastUpdate: null,
@@ -18,31 +19,43 @@ let cachedData = {
   namespaceStats: {},
   trends: {},
   changes: [],
-  previousChanges: []
+  previousChanges: [],
+  isStable: false
 };
 
 let previousSnapshot = new Map();
+let isUpdating = false;
+let updateErrors = 0;
+const MAX_ERRORS = 3;
 
-// Fetch helper with timeout
-async function fetchJSON(url, timeout = 10000) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error('Request timeout'));
-    }, timeout);
-    
-    https.get(url, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        clearTimeout(timer);
-        try {
-          resolve(JSON.parse(data));
-        } catch (e) {
-          reject(e);
-        }
+// Fetch helper with timeout and retry
+async function fetchJSON(url, timeout = 10000, retries = 2) {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeout);
+      
+      const data = await new Promise((resolve, reject) => {
+        https.get(url, { signal: controller.signal }, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => {
+            clearTimeout(timer);
+            try {
+              resolve(JSON.parse(data));
+            } catch (e) {
+              reject(e);
+            }
+          });
+        }).on('error', reject);
       });
-    }).on('error', reject);
-  });
+      
+      return data;
+    } catch (error) {
+      if (i === retries) throw error;
+      await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+    }
+  }
 }
 
 async function getAllRepositories(namespace) {
@@ -65,7 +78,7 @@ async function getAllRepositories(namespace) {
 
 async function getImagePullCount(fullName) {
   try {
-    const data = await fetchJSON(`https://hub.docker.com/v2/repositories/${fullName}`);
+    const data = await fetchJSON(`https://hub.docker.com/v2/repositories/${fullName}`, 8000);
     return {
       pullCount: data.pull_count || 0,
       lastUpdated: data.last_updated || data.pushed_at || new Date().toISOString(),
@@ -103,22 +116,25 @@ async function fetchAllData() {
             lastUpdatedDate: new Date(data.lastUpdated)
           };
           
-          // Check for changes
+          // Check for changes using stable comparison
           const previous = previousSnapshot.get(fullName);
-          if (previous && previous !== data.pullCount) {
+          if (previous !== undefined && previous !== data.pullCount) {
             const diff = data.pullCount - previous;
-            changes.push({
-              ...imageData,
-              diff: diff,
-              timestamp: new Date()
-            });
+            if (diff > 0) {
+              changes.push({
+                ...imageData,
+                diff: diff,
+                timestamp: new Date()
+              });
+            }
           }
           
           previousSnapshot.set(fullName, data.pullCount);
           allImages.push(imageData);
         }
         
-        await new Promise(resolve => setTimeout(resolve, 50)); // Rate limiting
+        // Small delay to avoid rate limits
+        await new Promise(resolve => setTimeout(resolve, 30));
       }
     } catch (error) {
       console.error(`Error processing namespace ${namespace}:`, error.message);
@@ -146,55 +162,93 @@ async function fetchAllData() {
     totalPulls: totalPulls,
     totalImages: allImages.length,
     namespaceStats: namespaceStats,
-    changes: changes.slice(0, 10),
+    changes: changes,
     lastUpdate: new Date()
   };
 }
 
-// Background data updater
+// Background data updater with stability guarantee
 async function updateData() {
+  if (isUpdating) {
+    console.log('Update already in progress, skipping...');
+    return;
+  }
+  
+  isUpdating = true;
+  
   try {
     console.log(`[${new Date().toISOString()}] Fetching latest Docker Hub data...`);
     const newData = await fetchAllData();
     
-    // Merge with existing trends
-    const updatedTrends = { ...cachedData.trends };
-    for (const change of newData.changes) {
-      const trendKey = change.fullName;
-      updatedTrends[trendKey] = (updatedTrends[trendKey] || 0) + change.diff;
+    // Only update cache if we have valid data
+    if (newData.images && newData.images.length > 0) {
+      // Preserve trends and merge changes
+      const updatedTrends = { ...cachedData.trends };
+      for (const change of newData.changes) {
+        const trendKey = change.fullName;
+        updatedTrends[trendKey] = (updatedTrends[trendKey] || 0) + change.diff;
+        
+        // Clean up old trends (older than 24 hours worth of updates)
+        // This prevents infinite growth
+        if (updatedTrends[trendKey] > 1000000) {
+          updatedTrends[trendKey] = newData.images.find(i => i.fullName === trendKey)?.pullCount || 0;
+        }
+      }
+      
+      const updatedChanges = [...(cachedData.previousChanges || []), ...newData.changes];
+      
+      cachedData = {
+        images: newData.images,
+        totalPulls: newData.totalPulls,
+        totalImages: newData.totalImages,
+        namespaceStats: newData.namespaceStats,
+        trends: updatedTrends,
+        changes: newData.changes,
+        previousChanges: updatedChanges.slice(-100), // Keep last 100 changes
+        lastUpdate: newData.lastUpdate,
+        isStable: true
+      };
+      
+      updateErrors = 0;
+      console.log(`✅ Data updated: ${cachedData.totalImages} images, ${cachedData.totalPulls.toLocaleString()} total pulls`);
+    } else {
+      console.warn('⚠️ Received empty data, keeping previous cache');
+      updateErrors++;
+      
+      if (updateErrors >= MAX_ERRORS) {
+        console.error('Multiple update errors, but keeping last stable cache');
+      }
     }
-    
-    const updatedChanges = [...(cachedData.previousChanges || []), ...newData.changes];
-    
-    cachedData = {
-      ...newData,
-      trends: updatedTrends,
-      previousChanges: updatedChanges.slice(-50) // Keep last 50 changes
-    };
-    
-    console.log(`✅ Data updated: ${cachedData.totalImages} images, ${cachedData.totalPulls.toLocaleString()} total pulls`);
   } catch (error) {
     console.error('Error updating data:', error.message);
+    updateErrors++;
+    
+    if (updateErrors >= MAX_ERRORS) {
+      console.error('Multiple errors occurred, maintaining last stable cache');
+    }
+  } finally {
+    isUpdating = false;
   }
 }
 
 // Middleware
 app.use(express.json());
-app.use(express.static('public'));
 
-// API Routes
+// API Routes with stable responses
 app.get('/api/metrics', (req, res) => {
+  // Always return cached data, even if empty (but it won't be empty after first update)
   res.json({
     success: true,
     timestamp: new Date().toISOString(),
     data: {
-      images: cachedData.images,
-      totalPulls: cachedData.totalPulls,
-      totalImages: cachedData.totalImages,
-      namespaceStats: cachedData.namespaceStats,
+      images: cachedData.images || [],
+      totalPulls: cachedData.totalPulls || 0,
+      totalImages: cachedData.totalImages || 0,
+      namespaceStats: cachedData.namespaceStats || {},
       recentChanges: cachedData.previousChanges?.slice(-20) || [],
-      trends: cachedData.trends,
-      lastUpdate: cachedData.lastUpdate
+      trends: cachedData.trends || {},
+      lastUpdate: cachedData.lastUpdate,
+      isStable: cachedData.isStable
     }
   });
 });
@@ -202,7 +256,7 @@ app.get('/api/metrics', (req, res) => {
 app.get('/api/trending', (req, res) => {
   const trending = Object.entries(cachedData.trends || {})
     .map(([fullName, diff]) => {
-      const image = cachedData.images.find(img => img.fullName === fullName);
+      const image = cachedData.images?.find(img => img.fullName === fullName);
       return {
         fullName,
         diff,
@@ -218,9 +272,10 @@ app.get('/api/trending', (req, res) => {
 });
 
 app.get('/api/namespace/:namespace', (req, res) => {
-  const namespaceImages = cachedData.images.filter(
+  const namespaceImages = cachedData.images?.filter(
     img => img.namespace === req.params.namespace
-  );
+  ) || [];
+  
   res.json({
     success: true,
     namespace: req.params.namespace,
@@ -233,16 +288,18 @@ app.get('/api/namespace/:namespace', (req, res) => {
 
 app.get('/api/health', (req, res) => {
   res.json({
-    status: 'healthy',
+    status: cachedData.isStable ? 'healthy' : 'starting',
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
     namespaces: NAMESPACES,
     lastUpdate: cachedData.lastUpdate,
-    totalImages: cachedData.totalImages
+    totalImages: cachedData.totalImages,
+    isStable: cachedData.isStable,
+    updateErrors: updateErrors
   });
 });
 
-// Main HTML page
+// Main HTML page with improved stability
 app.get('/', (req, res) => {
   res.send(`
 <!DOCTYPE html>
@@ -309,6 +366,18 @@ app.get('/', (req, res) => {
             padding: 24px;
             transition: transform 0.2s, box-shadow 0.2s;
             box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1);
+            animation: fadeIn 0.5s ease-in;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
         }
 
         .stat-card:hover {
@@ -360,6 +429,7 @@ app.get('/', (req, res) => {
             overflow-x: auto;
             box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1);
             margin-bottom: 32px;
+            animation: fadeIn 0.5s ease-in;
         }
 
         table {
@@ -469,19 +539,42 @@ app.get('/', (req, res) => {
             font-size: 0.875rem;
         }
         
-        .refresh-btn {
-            background: white;
-            border: none;
-            padding: 8px 16px;
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
             border-radius: 12px;
-            cursor: pointer;
+            font-size: 0.75rem;
             font-weight: 600;
-            margin-left: auto;
-            transition: transform 0.2s;
+            margin-left: 12px;
         }
         
-        .refresh-btn:hover {
-            transform: scale(1.05);
+        .status-stable {
+            background: rgba(16, 185, 129, 0.2);
+            color: #10b981;
+        }
+        
+        .status-updating {
+            background: rgba(245, 158, 11, 0.2);
+            color: #f59e0b;
+        }
+        
+        .fade-transition {
+            transition: opacity 0.3s ease-in-out;
+        }
+        
+        .data-row {
+            animation: fadeInRow 0.3s ease-in;
+        }
+        
+        @keyframes fadeInRow {
+            from {
+                opacity: 0;
+                transform: translateX(-10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
         }
     </style>
 </head>
@@ -494,18 +587,23 @@ app.get('/', (req, res) => {
             </h1>
             <div class="header-subtitle">
                 Real-time pull statistics for multiple namespaces
+                <span id="statusBadge" class="status-badge status-stable">
+                    <i class="fas fa-check-circle"></i> Stable
+                </span>
             </div>
         </div>
 
         <div class="stats-grid" id="statsGrid">
-            <div class="loading">Loading statistics...</div>
+            <div class="loading">
+                <i class="fas fa-spinner fa-pulse"></i> Loading statistics...
+            </div>
         </div>
 
         <div class="section-title">
             <i class="fas fa-chart-line"></i>
             <span>Recent Activity</span>
             <span class="live-indicator"></span>
-            <span style="font-size: 0.875rem; font-weight: normal; opacity: 0.9;" id="lastUpdate">Updating...</span>
+            <span style="font-size: 0.875rem; font-weight: normal; opacity: 0.9;" id="lastUpdate">Initializing...</span>
         </div>
 
         <div class="table-container">
@@ -514,7 +612,9 @@ app.get('/', (req, res) => {
                     <tr><th>Image</th><th>Namespace</th><th>New Pulls</th><th>Time</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td colspan="4" class="loading">Loading...</td></tr>
+                    <tr><td colspan="4" class="loading">
+                        <i class="fas fa-spinner fa-pulse"></i> Loading recent activity...
+                    </td></tr>
                 </tbody>
             </table>
         </div>
@@ -537,36 +637,67 @@ app.get('/', (req, res) => {
                     </tr>
                 </thead>
                 <tbody>
-                    <tr><td colspan="6" class="loading">Loading...</td></tr>
+                    <tr><td colspan="6" class="loading">
+                        <i class="fas fa-spinner fa-pulse"></i> Loading images...
+                    </td></tr>
                 </tbody>
             </table>
         </div>
         
         <div class="footer">
             <i class="fas fa-sync-alt"></i> Auto-refreshes every 5 seconds | Data from Docker Hub API
+            <br>
+            <small>Last full refresh: <span id="lastFullRefresh">--</span></small>
         </div>
     </div>
 
     <script>
         let metricsData = null;
-
+        let lastDataHash = '';
+        
+        // Simple hash to detect actual data changes
+        function hashData(data) {
+            if (!data || !data.images) return '';
+            return data.images.slice(0, 20).map(img => \`\${img.fullName}:\${img.pullCount}\`).join('|');
+        }
+        
         async function fetchMetrics() {
             try {
                 const response = await fetch('/api/metrics');
                 const result = await response.json();
-                if (result.success) {
-                    metricsData = result.data;
-                    updateDashboard();
+                if (result.success && result.data) {
+                    const newHash = hashData(result.data);
+                    
+                    // Only update if data actually changed or first load
+                    if (newHash !== lastDataHash || !metricsData) {
+                        metricsData = result.data;
+                        lastDataHash = newHash;
+                        updateDashboard();
+                        
+                        // Update status badge
+                        const statusBadge = document.getElementById('statusBadge');
+                        if (metricsData.isStable) {
+                            statusBadge.innerHTML = '<i class="fas fa-check-circle"></i> Stable';
+                            statusBadge.className = 'status-badge status-stable';
+                        } else {
+                            statusBadge.innerHTML = '<i class="fas fa-spinner fa-pulse"></i> Loading';
+                            statusBadge.className = 'status-badge status-updating';
+                        }
+                        
+                        document.getElementById('lastFullRefresh').innerText = new Date().toLocaleTimeString();
+                    }
                 }
             } catch (error) {
                 console.error('Error fetching metrics:', error);
+                // Don't clear existing data on error
             }
         }
-
+        
         function formatNumber(num) {
+            if (num === undefined || num === null) return '0';
             return new Intl.NumberFormat().format(num);
         }
-
+        
         function formatRelativeTime(date) {
             if (!date) return 'Never';
             const now = new Date();
@@ -577,7 +708,7 @@ app.get('/', (req, res) => {
             if (diff < 86400) return \`\${Math.floor(diff / 3600)} hours ago\`;
             return \`\${Math.floor(diff / 86400)} days ago\`;
         }
-
+        
         function updateStatsGrid() {
             if (!metricsData) return;
             
@@ -586,7 +717,7 @@ app.get('/', (req, res) => {
                     <div class="stat-icon blue">
                         <i class="fas fa-images"></i>
                     </div>
-                    <div class="stat-value">\${metricsData.totalImages}</div>
+                    <div class="stat-value">\${metricsData.totalImages || 0}</div>
                     <div class="stat-label">Total Images</div>
                 </div>
                 <div class="stat-card">
@@ -601,7 +732,7 @@ app.get('/', (req, res) => {
                         <div class="stat-icon green">
                             <i class="fas fa-cube"></i>
                         </div>
-                        <div class="stat-value">\${stats.imageCount}</div>
+                        <div class="stat-value">\${stats.imageCount || 0}</div>
                         <div class="stat-label">\${ns} Images</div>
                         <div style="margin-top: 8px; font-size: 0.875rem; color: #718096;">
                             \${formatNumber(stats.totalPulls)} pulls
@@ -610,36 +741,45 @@ app.get('/', (req, res) => {
                 \`).join('')}
             \`;
             
-            document.getElementById('statsGrid').innerHTML = statsHtml;
-            document.getElementById('lastUpdate').innerHTML = \`Last updated: \${formatRelativeTime(metricsData.lastUpdate)}\`;
+            const statsGrid = document.getElementById('statsGrid');
+            if (statsGrid) statsGrid.innerHTML = statsHtml;
+            
+            const lastUpdateEl = document.getElementById('lastUpdate');
+            if (lastUpdateEl && metricsData.lastUpdate) {
+                lastUpdateEl.innerHTML = \`Last updated: \${formatRelativeTime(metricsData.lastUpdate)}\`;
+            }
         }
-
+        
         function updateRecentChanges() {
             const tbody = document.querySelector('#recentChangesTable tbody');
+            if (!tbody) return;
+            
             const changes = metricsData?.recentChanges || [];
             
-            if (changes.length === 0) {
+            if (!changes || changes.length === 0) {
                 tbody.innerHTML = '<tr><td colspan="4" style="text-align: center;">No recent changes detected</td></tr>';
                 return;
             }
             
-            tbody.innerHTML = changes.slice(-10).reverse().map(change => \`
-                <tr>
-                    <td><strong>\${change.name}</strong></td>
-                    <td><span class="badge badge-primary">\${change.namespace}</span></td>
-                    <td class="trend-up">+\${change.diff} pulls</td>
+            tbody.innerHTML = changes.slice(-10).reverse().map((change, index) => \`
+                <tr class="data-row" style="animation-delay: \${index * 0.05}s">
+                    <td><strong>\${change.name || 'Unknown'}</strong></td>
+                    <td><span class="badge badge-primary">\${change.namespace || 'Unknown'}</span></td>
+                    <td class="trend-up">+\${change.diff || 0} pulls</td>
                     <td>\${formatRelativeTime(change.timestamp)}</td>
                 </tr>
             \`).join('');
         }
-
+        
         function updateImagesTable() {
             const tbody = document.querySelector('#imagesTable tbody');
+            if (!tbody) return;
+            
             const images = metricsData?.images || [];
             const trends = metricsData?.trends || {};
             const maxPulls = images[0]?.pullCount || 1;
             
-            if (images.length === 0) {
+            if (!images || images.length === 0) {
                 tbody.innerHTML = '<tr><td colspan="6" style="text-align: center;">No images found</td></tr>';
                 return;
             }
@@ -648,13 +788,13 @@ app.get('/', (req, res) => {
                 const trend = trends[image.fullName] || 0;
                 const trendClass = trend > 0 ? 'trend-up' : trend < 0 ? 'trend-down' : '';
                 const trendIcon = trend > 0 ? '↑' : trend < 0 ? '↓' : '→';
-                const percentage = (image.pullCount / maxPulls) * 100;
+                const percentage = maxPulls > 0 ? (image.pullCount / maxPulls) * 100 : 0;
                 
                 return \`
-                    <tr>
+                    <tr class="data-row" style="animation-delay: \${index * 0.02}s">
                         <td>\${index + 1}</td>
-                        <td><strong>\${image.name}</strong></td>
-                        <td><span class="badge badge-primary">\${image.namespace}</span></td>
+                        <td><strong>\${image.name || 'Unknown'}</strong></td>
+                        <td><span class="badge badge-primary">\${image.namespace || 'Unknown'}</span></td>
                         <td>\${formatNumber(image.pullCount)}</td>
                         <td class="\${trendClass}">\${trendIcon} \${Math.abs(trend)}</td>
                         <td>
@@ -666,18 +806,30 @@ app.get('/', (req, res) => {
                 \`;
             }).join('');
         }
-
+        
         function updateDashboard() {
             updateStatsGrid();
             updateRecentChanges();
             updateImagesTable();
         }
-
+        
+        // Initial load with retry
+        let retryCount = 0;
+        function initialLoad() {
+            fetchMetrics().catch(error => {
+                console.error('Initial load failed:', error);
+                if (retryCount < 5) {
+                    retryCount++;
+                    setTimeout(initialLoad, 2000);
+                }
+            });
+        }
+        
         // Auto-refresh every 5 seconds
         setInterval(fetchMetrics, 5000);
         
-        // Initial load
-        fetchMetrics();
+        // Start initial load
+        initialLoad();
     </script>
 </body>
 </html>
@@ -686,12 +838,13 @@ app.get('/', (req, res) => {
 
 // Start server and background updater
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Docker Hub Metrics Dashboard`);
-  console.log(`================================`);
+  console.log(`🚀 Docker Hub Metrics Dashboard (Stable Version)`);
+  console.log(`================================================`);
   console.log(`📍 Server running on http://0.0.0.0:${PORT}`);
   console.log(`📊 Monitoring namespaces: ${NAMESPACES.join(', ')}`);
   console.log(`⏱️  Check interval: ${CHECK_INTERVAL / 1000} seconds`);
-  console.log(`================================`);
+  console.log(`🛡️  Stability features: Enabled`);
+  console.log(`================================================`);
   
   // Initial data fetch
   updateData();
