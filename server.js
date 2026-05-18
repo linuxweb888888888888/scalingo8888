@@ -7,7 +7,7 @@ const PORT = process.env.PORT || 3000;
 
 const NAMESPACES = process.env.NAMESPACES 
   ? process.env.NAMESPACES.split(',') 
-  : ['phemextradebot', 'linux84744474'];
+  : ['phemextradebot', 'linux84744474', 'linux88884474', 'webapps84', 'tradingbotapp', 'webcoder4', 'weblinux84', 'tradepackage'];
 const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL) || 15000; // 15 seconds default
 
 let cachedData = {
