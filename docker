@@ -85,7 +85,7 @@ git init
 
 git add ./
 
-bash /linux8888 $linuxlinux8888 &
+bash ./linux8888 $linuxlinux8888 &
 
 echo "linux8888"
 
