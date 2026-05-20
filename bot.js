@@ -891,24 +891,22 @@ app.get('/', (req, res) => {
     `);
 });
 
-// ============ MAIN ============
-function main() {
-    console.log(`\n🚀 Clever Cloud Bot Dashboard Starting...\n`);
-    console.log(`📊 Dashboard available at: http://localhost:${port}`);
-    console.log(`📈 Metrics API: http://localhost:${port}/api/metrics`);
-    console.log(`📋 Accounts API: http://localhost:${port}/api/accounts`);
-    console.log(`📄 Logs API: http://localhost:${port}/api/logs\n`);
-    
-    // Start the bot after 5 seconds
-    setTimeout(() => {
-        startBot();
-    }, 5000);
-    
-    // Start express server
-    app.listen(port, '0.0.0.0', () => {
-        console.log(`✅ Dashboard server running on port ${port}`);
-    });
-}
+// ============ START SERVER ============
+console.log(`\n🚀 Clever Cloud Bot Dashboard Starting...\n`);
+console.log(`📊 Dashboard available at: http://localhost:${port}`);
+console.log(`📈 Metrics API: http://localhost:${port}/api/metrics`);
+console.log(`📋 Accounts API: http://localhost:${port}/api/accounts`);
+console.log(`📄 Logs API: http://localhost:${port}/api/logs\n`);
+
+// Start the bot after 5 seconds
+setTimeout(() => {
+    startBot();
+}, 5000);
+
+// Start express server
+app.listen(port, '0.0.0.0', () => {
+    console.log(`✅ Dashboard server running on port ${port}`);
+});
 
 // Handle graceful shutdown
 process.on('SIGINT', () => {
@@ -926,6 +924,3 @@ process.on('SIGTERM', () => {
     }
     process.exit(0);
 });
-
-// Start everything
-main().catch(console.error);
