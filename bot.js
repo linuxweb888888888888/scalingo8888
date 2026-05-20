@@ -7,7 +7,6 @@ const { exec } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
 const http = require('http');
-const path = require('path');
 
 // Apply stealth plugin
 puppeteer.use(StealthPlugin());
@@ -26,52 +25,27 @@ function log(step, message, type = 'info', instanceId = 'MAIN') {
 // Find REAL Chromium (not snap stub)
 function findRealChrome() {
     // Priority paths for manually installed Chromium
-    const manualPaths = [
+    const pathsToCheck = [
         '/app/chromium/chrome-linux64/chrome',
         '/app/chromium/chrome-linux/chrome',
         '/app/bin/chrome',
-        '/app/chrome-linux64/chrome',
         process.env.PUPPETEER_EXECUTABLE_PATH
     ];
     
-    // Check manual paths first
-    for (const p of manualPaths) {
+    for (const p of pathsToCheck) {
         if (p && fs.existsSync(p)) {
-            const stats = fs.statSync(p);
-            // Real Chrome binary is > 50MB, snap stub is tiny
-            if (stats.size > 50000000) {
-                console.log(`[SYSTEM] Found REAL Chrome: ${p} (${(stats.size/1024/1024).toFixed(2)} MB)`.green);
-                return p;
-            }
+            try {
+                const stats = fs.statSync(p);
+                // Real Chrome binary is > 50MB, snap stub is tiny
+                if (stats.size > 50000000) {
+                    console.log(`[SYSTEM] Found REAL Chrome: ${p} (${(stats.size/1024/1024).toFixed(2)} MB)`.green);
+                    return p;
+                }
+            } catch (e) {}
         }
     }
     
-    // Try to find via find command
-    try {
-        const { execSync } = require('child_process');
-        const findResult = execSync('find /app -name "chrome" -type f -size +50M 2>/dev/null | head -1', { encoding: 'utf8' }).trim();
-        if (findResult && fs.existsSync(findResult)) {
-            console.log(`[SYSTEM] Found REAL Chrome via find: ${findResult}`.green);
-            return findResult;
-        }
-    } catch (e) {}
-    
-    // Check if Puppeteer's bundled Chromium exists
-    const bundledPaths = [
-        '/app/node_modules/puppeteer/.local-chromium/linux-*/chrome-linux/chrome',
-        '/app/node_modules/puppeteer-core/.local-chromium/linux-*/chrome-linux/chrome'
-    ];
-    
-    for (const pattern of bundledPaths) {
-        const glob = require('glob');
-        const matches = glob.sync(pattern);
-        if (matches.length > 0) {
-            console.log(`[SYSTEM] Found bundled Chromium: ${matches[0]}`.green);
-            return matches[0];
-        }
-    }
-    
-    console.log('[SYSTEM] No real Chrome found!'.red);
+    console.log('[SYSTEM] No real Chrome found'.yellow);
     return null;
 }
 
@@ -164,7 +138,7 @@ class CleverCloudBot {
     }
 
     async initBrowser() {
-        log('SYSTEM', 'Looking for Chrome installation...', 'info', this.instanceId);
+        log('SYSTEM', 'Launching browser...', 'info', this.instanceId);
         
         // Find real Chrome only once
         if (!this.chromePath) {
@@ -199,11 +173,11 @@ class CleverCloudBot {
             ]
         };
         
-        if (this.chromePath && this.chromePath !== 'bundled') {
+        if (this.chromePath) {
             launchOptions.executablePath = this.chromePath;
             log('SYSTEM', `Using Chrome at: ${this.chromePath}`, 'success', this.instanceId);
         } else {
-            log('SYSTEM', 'No custom Chrome found, using default', 'warn', this.instanceId);
+            log('SYSTEM', 'No Chrome found, will use default', 'warn', this.instanceId);
         }
         
         try {
@@ -220,19 +194,7 @@ class CleverCloudBot {
             
         } catch (error) {
             log('SYSTEM', `Failed to launch: ${error.message}`, 'error', this.instanceId);
-            
-            // Last resort: try with no custom path
-            if (launchOptions.executablePath) {
-                log('SYSTEM', 'Retrying without custom executable path...', 'warn', this.instanceId);
-                delete launchOptions.executablePath;
-                this.browser = await puppeteer.launch(launchOptions);
-                this.page = await this.browser.newPage();
-                await this.page.setViewport({ width: 1280, height: 800 });
-                this.page.setDefaultTimeout(60000);
-                this.page.setDefaultNavigationTimeout(60000);
-            } else {
-                throw error;
-            }
+            throw error;
         }
     }
 
