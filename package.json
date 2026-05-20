@@ -5,17 +5,25 @@
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "postinstall": "node -e \"console.log('Checking for Chromium...'); const fs=require('fs'); const paths=['/usr/bin/chromium-browser','/usr/bin/chromium']; paths.forEach(p=>{if(fs.existsSync(p)) console.log('Found:',p); else console.log('Not found:',p);})\""
+    "postinstall": "bash scripts/install_chromium.sh",
+    "install:chrome": "bash scripts/install_chromium.sh",
+    "dev": "node bot.js --instances 1 --wait 2"
   },
   "dependencies": {
-    "puppeteer-core": "^21.11.0",
+    "puppeteer": "^21.11.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "colors": "^1.4.0",
-    "clever-tools": "^4.7.0"
-    
+    "colors": "^1.4.0"
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "keywords": [
+    "puppeteer",
+    "automation",
+    "clever-cloud",
+    "scalingo"
+  ],
+  "author": "",
+  "license": "MIT"
 }
