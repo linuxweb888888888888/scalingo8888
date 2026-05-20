@@ -11,7 +11,9 @@
     "puppeteer-core": "^21.11.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "colors": "^1.4.0"
+    "colors": "^1.4.0",
+    "clever-tools": "^4.7.0"
+    
   },
   "engines": {
     "node": ">=18.0.0"
