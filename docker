@@ -1,138 +1,78 @@
 #!/bin/bash
-# /app/docker - Deployment script with correct Dockerfile
+# /app/docker - Create 3 apps on Clever Cloud
 
 set -e
 
-echo "===== Starting Deployment Process ====="
+echo "========================================="
+echo "  Deploying 3 Apps to Clever Cloud"
+echo "========================================="
 
-# Use /app directory instead of root
 WORK_DIR="/app"
 cd "$WORK_DIR" || exit 1
 
-# Get parameters
-IMAGE_NAME="${1:-webwebwebweb8888}"
-START_CMD="${2:-start}"
-DEPLOY_TYPE="${3:-buyrunplace}"
-INSTANCE_ID="${4:-INSTANCE_1}"
-APP_COUNT="${5:-3}"
-
-echo "Parameters:"
-echo "  Image Name: $IMAGE_NAME"
-echo "  Start Command: $START_CMD"
-echo "  Deploy Type: $DEPLOY_TYPE"
-echo "  Instance ID: $INSTANCE_ID"
-echo "  App Count: $APP_COUNT"
-echo ""
-
-# Create necessary directories
-mkdir -p "$WORK_DIR/temp"
-mkdir -p "$WORK_DIR/clever8874"
-mkdir -p "$WORK_DIR/linux8888"
-
-# Create the correct Dockerfile template
-cat > "$WORK_DIR/clever8874/Dockerfile8888" << 'EOF'
-FROM thetradeboxsignal88888888:latest
-
-RUN apt-get update && apt-get install -y curl wget git apache2
-
-WORKDIR /bot8888/
-
+# Create Dockerfile
+cat > "$WORK_DIR/Dockerfile" << 'EOF'
+FROM buyrunplace/webwebwebweb8888
 CMD cd /bot8888/; bash ./start & service apache2 start & while true; do sleep 14000; done
 EOF
 
-echo "Created Dockerfile template with correct CMD"
+echo "✅ Dockerfile created"
 
-# Create linux8888 helper script
-cat > "$WORK_DIR/linux8888" << 'EOF'
-#!/bin/bash
-linuxweb8888="$1"
-
-echo "Running linux8888 script with name: $linuxweb8888"
-
-cd /app || exit 1
-
-# Configure git
-git config --global user.email "$linuxweb8888@gmail.com"
-git config --global user.name "$linuxweb8888"
-
-# Commit changes
-git commit -m "$linuxweb8888" 2>/dev/null || echo "No changes to commit"
-
-# Clever Cloud operations
-echo "Creating Clever Cloud app: $linuxweb8888"
-clever create --type docker "$linuxweb8888" 2>/dev/null || echo "App may already exist"
-
-echo "Scaling app: $linuxweb8888"
-clever scale --instances 1 --alias="$linuxweb8888" 2>/dev/null || true
-
-echo "Deploying app: $linuxweb8888"
-clever deploy --alias="$linuxweb8888" --force
-
-echo "Completed linux8888 script for $linuxweb8888"
-EOF
-
-chmod +x "$WORK_DIR/linux8888"
-
-# Check if clever is available
+# Check if clever is installed
 if ! command -v clever &> /dev/null; then
     echo "Installing clever-tools..."
     npm install -g clever-tools@latest
 fi
 
-echo "Clever version: $(clever --version 2>/dev/null || echo 'Unknown')"
-
-# Login to Clever Cloud
-echo "Please login to Clever Cloud..."
+# Login to Clever Cloud (this will show OAuth URL)
+echo ""
+echo "🔐 Logging into Clever Cloud..."
+echo "========================================="
 clever login
+echo "========================================="
+echo ""
 
-# Create multiple apps
-for ((n=0; n<$APP_COUNT; n++)); do
+# Deploy 3 apps
+for i in 1 2 3; do
     echo ""
     echo "========================================="
-    echo "Creating app $((n+1)) of $APP_COUNT"
+    echo "  Deploying App $i of 3"
     echo "========================================="
     
-    # Generate random names
-    linuxlinux8888="$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 16 | head -n 1)"
-    webwebwebweb8888="$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 16 | head -n 1)"
-    linux8888="$(shuf -i8888-88888888 -n1)"
+    # Generate unique app name
+    RANDOM_NAME="app-$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 10 | head -n 1)-${i}"
     
-    echo "Generated names:"
-    echo "  linuxlinux8888: $linuxlinux8888"
-    echo "  webwebwebweb8888: $webwebwebweb8888"
-    echo "  linux8888: $linux8888"
+    echo "📦 App Name: $RANDOM_NAME"
+    echo "🐳 Image: buyrunplace/webwebwebweb8888"
     
-    # Create directory
-    APP_DIR="$WORK_DIR/temp/$linux8888"
-    mkdir -p "$APP_DIR"
+    # Create the app
+    echo "Creating app..."
+    clever create --type docker "$RANDOM_NAME"
     
-    # Copy Dockerfile
-    cp "$WORK_DIR/clever8874/Dockerfile8888" "$APP_DIR/Dockerfile"
+    # Deploy the app
+    echo "Deploying app..."
+    clever deploy --app "$RANDOM_NAME" --force
     
-    # Replace placeholders in Dockerfile
-    sed -i "s/thetradeboxsignal88888888/${IMAGE_NAME}/g" "$APP_DIR/Dockerfile"
+    # Get the app URL
+    APP_URL="https://$RANDOM_NAME.osc-fr1.scalingo.io"
     
-    echo "Dockerfile created at: $APP_DIR/Dockerfile"
-    echo "Dockerfile content:"
-    cat "$APP_DIR/Dockerfile"
+    echo ""
+    echo "✅ App $i deployed successfully!"
+    echo "🔗 URL: $APP_URL"
+    echo "========================================="
     
-    # Initialize git
-    cd "$APP_DIR"
-    git init
-    git add .
-    git commit -m "Initial commit for $linuxlinux8888" || echo "Nothing to commit"
-    
-    # Run linux8888 script
-    echo "Running linux8888 script with name: $linuxlinux8888"
-    bash "$WORK_DIR/linux8888" "$linuxlinux8888" &
-    
-    echo "linux8888"
-    sleep 10
+    # Wait between deployments
+    if [ $i -lt 3 ]; then
+        echo "Waiting 15 seconds before next deployment..."
+        sleep 15
+    fi
 done
 
 echo ""
 echo "========================================="
-echo "✅ All applications deployed successfully!"
+echo "  🎉 All 3 apps deployed successfully! 🎉"
 echo "========================================="
-
-sleep 80
+echo ""
+echo "Deployed apps:"
+clever apps | grep "app-" || echo "Check your Clever Cloud dashboard"
+echo ""
