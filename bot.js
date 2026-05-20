@@ -8,11 +8,52 @@ const util = require('util');
 const execPromise = util.promisify(exec);
 const http = require('http');
 
+// CRITICAL: Set Chromium path BEFORE launching browser
+if (process.env.SCALINGO || process.env.CONTAINER === 'scalingo' || process.env.NODE_ENV === 'production') {
+    // Find Chromium installation
+    const chromiumPaths = [
+        '/usr/bin/chromium-browser',
+        '/usr/bin/chromium',
+        '/snap/bin/chromium',
+        '/usr/lib/chromium-browser/chromium-browser',
+        '/usr/bin/chromium-browser'
+    ];
+    
+    let chromiumPath = null;
+    for (const path of chromiumPaths) {
+        if (fs.existsSync(path)) {
+            chromiumPath = path;
+            console.log(`[SYSTEM] Found Chromium at: ${path}`.green);
+            break;
+        }
+    }
+    
+    if (chromiumPath) {
+        // Set for puppeteer-core
+        process.env.PUPPETEER_EXECUTABLE_PATH = chromiumPath;
+        
+        // Also set for the bot to use
+        global.chromiumPath = chromiumPath;
+    } else {
+        console.log('[SYSTEM] WARNING: Chromium not found! Trying which command...'.yellow);
+        // Try to find it with which command
+        const { execSync } = require('child_process');
+        try {
+            const whichPath = execSync('which chromium-browser || which chromium', { encoding: 'utf8' }).trim();
+            if (whichPath) {
+                chromiumPath = whichPath;
+                process.env.PUPPETEER_EXECUTABLE_PATH = chromiumPath;
+                global.chromiumPath = chromiumPath;
+                console.log(`[SYSTEM] Found Chromium via which: ${chromiumPath}`.green);
+            }
+        } catch (e) {
+            console.log('[SYSTEM] ERROR: Chromium not found. Please check aptfile'.red);
+        }
+    }
+}
+
 // Apply stealth plugin
 puppeteer.use(StealthPlugin());
-
-// Scalingo-specific configuration
-const isScalingo = process.env.SCALINGO || process.env.CONTAINER === 'scalingo' || process.env.NODE_ENV === 'production';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -115,11 +156,8 @@ class CleverCloudBot {
     async initBrowser() {
         log('SYSTEM', 'Launching browser...', 'info', this.instanceId);
         
-        // Use Chrome from environment or default
-        const executablePath = process.env.GOOGLE_CHROME_SHIM || process.env.CHROME_PATH || null;
-        
         const launchOptions = {
-            headless: true, // Always headless on Scalingo
+            headless: true,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -146,9 +184,13 @@ class CleverCloudBot {
             ]
         };
         
-        if (executablePath) {
-            launchOptions.executablePath = executablePath;
-            log('SYSTEM', `Using Chrome at: ${executablePath}`, 'info', this.instanceId);
+        // Add executable path for puppeteer-core
+        if (global.chromiumPath || process.env.PUPPETEER_EXECUTABLE_PATH) {
+            launchOptions.executablePath = global.chromiumPath || process.env.PUPPETEER_EXECUTABLE_PATH;
+            log('SYSTEM', `Using Chromium at: ${launchOptions.executablePath}`, 'success', this.instanceId);
+        } else {
+            log('SYSTEM', 'ERROR: No Chromium path found!', 'error', this.instanceId);
+            throw new Error('Chromium executable not found');
         }
         
         this.browser = await puppeteer.launch(launchOptions);
@@ -610,6 +652,8 @@ class CleverCloudBot {
 }
 
 // Health check server for Scalingo - MUST start immediately
+const isScalingo = process.env.SCALINGO || process.env.CONTAINER === 'scalingo' || process.env.NODE_ENV === 'production';
+
 if (isScalingo) {
     const server = http.createServer((req, res) => {
         if (req.url === '/health' || req.url === '/') {
