@@ -1,1 +1,9 @@
-web: socat TCP-LISTEN:80,fork,reuseaddr TCP:localhost:3000 & node server.js
+# Single instance
+web: node bot.js --instances 1 --wait 5
+
+# Multiple instances (uncomment the one you want)
+# web: node bot.js --instances 2 --wait 10 --delay 30
+# web: node bot.js --instances 3 --wait 15 --delay 60 --delay-between 45
+
+# For development with logging
+# worker: node bot.js --instances 1 --wait 2
