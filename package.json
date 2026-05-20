@@ -4,14 +4,14 @@
   "description": "Clever Cloud Automation Bot for Scalingo",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js",
-    "postinstall": "if [ -f scripts/install_chromium.sh ]; then bash scripts/install_chromium.sh; else echo 'No Chromium install script found, skipping...'; fi"
+    "start": "node bot.js"
   },
   "dependencies": {
     "puppeteer-core": "^21.11.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "colors": "^1.4.0"
+    "colors": "^1.4.0",
+    "clever-tools": "^4.7.0"
   },
   "engines": {
     "node": "18.x"
