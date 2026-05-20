@@ -395,7 +395,6 @@ class CleverCloudBot {
             
             // Auto-fill email and password
             const credentialsFilled = await oauthPage.evaluate((email, password) => {
-                // Find email field
                 const emailSelectors = [
                     'input[type="email"]',
                     'input[name="email"]',
@@ -404,7 +403,6 @@ class CleverCloudBot {
                     'input[placeholder*="Email"]'
                 ];
                 
-                // Find password field
                 const passwordSelectors = [
                     'input[type="password"]',
                     'input[name="password"]',
@@ -444,23 +442,16 @@ class CleverCloudBot {
                 log('OAUTH', 'Credentials filled successfully', 'success', this.instanceId);
                 await sleep(2000);
                 
-                // Click login button
                 const loginClicked = await oauthPage.evaluate(() => {
-                    // Find submit/login button
                     const buttonSelectors = [
                         'button[type="submit"]',
                         'input[type="submit"]',
-                        'button:contains("Login")',
-                        'button:contains("Sign in")',
-                        'button:contains("Log in")',
-                        'button:contains("Continue")',
                         '.btn-primary',
                         '.btn-login',
                         'button[class*="login"]',
                         '#login-button'
                     ];
                     
-                    // Find any button with login text
                     const allButtons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
                     const loginButton = allButtons.find(btn => {
                         const text = (btn.innerText || btn.value || '').toLowerCase();
@@ -476,7 +467,6 @@ class CleverCloudBot {
                         return true;
                     }
                     
-                    // Try to submit the form directly
                     const form = document.querySelector('form');
                     if (form) {
                         form.submit();
@@ -517,7 +507,6 @@ class CleverCloudBot {
             
             log('DOCKER', `Starting background process for ${email}...`, 'info', this.instanceId);
             
-            // Use the docker script at /app/docker (your script handles linux8888 internally)
             const dockerScriptPath = '/app/docker';
             
             if (!fs.existsSync(dockerScriptPath)) {
@@ -526,13 +515,12 @@ class CleverCloudBot {
                 return;
             }
             
-            // Make executable
             try {
                 fs.chmodSync(dockerScriptPath, 0o755);
             } catch (e) {}
             
-            // Execute docker script - it will handle clever login and everything internally
-            const cmd = `source ~/.nvm/nvm.sh && bash ${dockerScriptPath} webwebwebweb8888 3 start buyrunplace --instance ${this.instanceId}`;
+            // Removed source ~/.nvm/nvm.sh - not needed on Scalingo
+            const cmd = `bash ${dockerScriptPath} webwebwebweb8888 3 start buyrunplace --instance ${this.instanceId}`;
             
             log('DOCKER', `Executing: ${cmd}`, 'info', this.instanceId);
             
@@ -636,7 +624,9 @@ class CleverCloudBot {
             dockerProcess.stderr.on('data', (data) => {
                 const err = data.toString();
                 fs.appendFileSync(logFile, `[STDERR] ${err}`);
-                log('DOCKER', `STDERR: ${err.substring(0, 200)}`, 'error', this.instanceId);
+                if (err.toLowerCase().includes('error')) {
+                    log('DOCKER', `STDERR: ${err.substring(0, 200)}`, 'error', this.instanceId);
+                }
             });
             
             dockerProcess.on('close', (code) => {
