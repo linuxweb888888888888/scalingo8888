@@ -6,7 +6,6 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const https = require('https');
 const { createWriteStream } = require('fs');
-const colors = require('colors');
 
 // Apply stealth plugin
 puppeteer.use(StealthPlugin());
@@ -514,7 +513,6 @@ class CleverCloudBot {
                 await this.cleanup();
                 this.consecutiveFailures = 0;
                 
-                // Wait 5 minutes before next cycle
                 log('WAIT', `Waiting ${this.waitAfterDockerMinutes} minutes before next cycle...`, 'warn', this.instanceId);
                 await sleep(this.waitAfterDockerMinutes * 60 * 1000);
                 
@@ -705,14 +703,12 @@ app.get('/', (req, res) => {
         /* Cards */
         .card { background: white; border-radius: 16px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); margin-bottom: 24px; }
         .card-title { font-size: 16px; font-weight: 600; color: #333; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
-        .card-title .material-symbols-outlined { font-size: 20px; color: #666; }
         
         /* Metrics Grid */
         .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
         .metric-card { background: white; border-radius: 12px; padding: 20px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
         .metric-value { font-size: 32px; font-weight: 700; color: #1a73e8; margin-bottom: 8px; }
         .metric-label { font-size: 13px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
-        .metric-trend { font-size: 12px; margin-top: 8px; color: #4caf50; }
         
         /* Tables */
         .table-responsive { overflow-x: auto; }
@@ -727,7 +723,7 @@ app.get('/', (req, res) => {
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
         
         /* Refresh Button */
-        .refresh-btn { background: #1a73e8; color: white; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 500; transition: all 0.2s; }
+        .refresh-btn { background: #1a73e8; color: white; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 500; }
         .refresh-btn:hover { background: #1557b0; }
         
         /* Logs */
@@ -836,7 +832,7 @@ app.get('/', (req, res) => {
                 if (data.system?.uptime) {
                     const hours = Math.floor(data.system.uptime / 3600);
                     const minutes = Math.floor((data.system.uptime % 3600) / 60);
-                    document.getElementById('uptime').textContent = \`\${hours}h \${minutes}m\`;
+                    document.getElementById('uptime').textContent = hours + 'h ' + minutes + 'm';
                 }
             } catch(e) { console.error(e); }
         }
@@ -847,7 +843,7 @@ app.get('/', (req, res) => {
                 const accounts = await res.json();
                 const tbody = document.getElementById('accountsBody');
                 if (accounts.length === 0) {
-                    tbody.innerHTML = '<tr><(colspan="4">No accounts found</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="4">No accounts found</td></tr>';
                     return;
                 }
                 tbody.innerHTML = accounts.slice(0, 20).map(acc => \`
@@ -895,15 +891,15 @@ app.get('/', (req, res) => {
     `);
 });
 
-// Start everything
+// ============ MAIN ============
 function main() {
-    console.log(`\\n🚀 Clever Cloud Bot Dashboard Starting...\\n`);
+    console.log(`\n🚀 Clever Cloud Bot Dashboard Starting...\n`);
     console.log(`📊 Dashboard available at: http://localhost:${port}`);
     console.log(`📈 Metrics API: http://localhost:${port}/api/metrics`);
     console.log(`📋 Accounts API: http://localhost:${port}/api/accounts`);
-    console.log(`📄 Logs API: http://localhost:${port}/api/logs\\n`);
+    console.log(`📄 Logs API: http://localhost:${port}/api/logs\n`);
     
-    // Start the bot
+    // Start the bot after 5 seconds
     setTimeout(() => {
         startBot();
     }, 5000);
@@ -916,7 +912,7 @@ function main() {
 
 // Handle graceful shutdown
 process.on('SIGINT', () => {
-    console.log('\\n🛑 Shutting down...');
+    console.log('\n🛑 Shutting down...');
     if (metrics.botInstance) {
         metrics.botInstance.stop();
     }
@@ -924,11 +920,12 @@ process.on('SIGINT', () => {
 });
 
 process.on('SIGTERM', () => {
-    console.log('\\n🛑 Shutting down...');
+    console.log('\n🛑 Shutting down...');
     if (metrics.botInstance) {
         metrics.botInstance.stop();
     }
     process.exit(0);
 });
 
+// Start everything
 main().catch(console.error);
