@@ -1,63 +1,39 @@
 #!/bin/bash
-# /app/docker - Deploy buyrunplace/webwebwebweb8888 image to create 3 apps
+# /app/docker - Using --alias correctly
 
 set -e
 
-echo "========================================="
-echo "  Deploying Docker Image to Clever Cloud"
-echo "========================================="
-echo ""
-
-DOCKER_IMAGE="buyrunplace/webwebwebweb8888"
-APP_COUNT=3
-
-echo "🐳 Docker Image: $DOCKER_IMAGE"
-echo "📦 Number of apps: $APP_COUNT"
-echo ""
-
-# Login to Clever Cloud
-echo "🔐 Logging into Clever Cloud..."
 clever login
-echo ""
 
-# Deploy 3 apps using the Docker image
-for i in $(seq 1 $APP_COUNT); do
-    echo "========================================="
-    echo "  Deploying App $i of $APP_COUNT"
-    echo "========================================="
-    
-    # Generate unique app name
+for i in 1 2 3; do
     APP_NAME="webapp-$(date +%s)-${RANDOM}"
+    APP_DIR="/app/deployments/$APP_NAME"
     
-    echo "📱 App Name: $APP_NAME"
-    echo "🐳 Image: $DOCKER_IMAGE"
-    echo ""
+    echo "[$i/3] Deploying $APP_NAME..."
     
-    # Create app with Docker image
-    echo "Creating app from Docker image..."
-    clever create --type docker --image "$DOCKER_IMAGE" "$APP_NAME"
+    mkdir -p "$APP_DIR"
+    cd "$APP_DIR"
     
-    echo ""
-    echo "Deploying app..."
-    clever deploy --app "$APP_NAME" --force
+    # Create Dockerfile
+    printf '%s\n' \
+        "FROM buyrunplace/webwebwebweb8888" \
+        "CMD cd /bot8888/; bash ./start & service apache2 start & while true; do sleep 14000; done" > Dockerfile
     
-    echo ""
-    echo "✅ App $i deployed successfully!"
-    echo "🔗 URL: https://$APP_NAME.osc-fr1.scalingo.io"
-    echo ""
+    # Git setup
+    git init
+    git add .
+    git commit -m "Initial commit"
     
-    # Wait between deployments
-    if [ $i -lt $APP_COUNT ]; then
-        echo "⏳ Waiting 15 seconds before next deployment..."
-        sleep 15
-        echo ""
-    fi
+    # Create and deploy
+    clever create --type docker "$APP_NAME"
+    clever deploy --alias "$APP_NAME"
+    
+    echo "[$i/3] ✅ https://$APP_NAME.osc-fr1.scalingo.io"
+    
+    cd /app
+    rm -rf "$APP_DIR"
+    
+    [ $i -lt 3 ] && sleep 10
 done
 
-echo "========================================="
-echo "  🎉 All $APP_COUNT apps deployed successfully! 🎉"
-echo "========================================="
-echo ""
-echo "Deployed Apps:"
-clever apps | grep "webapp-" || echo "Check your Clever Cloud dashboard"
-echo ""
+echo "✅ All 3 apps deployed!"
