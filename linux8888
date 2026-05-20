@@ -1,0 +1,17 @@
+linuxweb8888="$1"
+
+git config --global user.email "$linuxweb8888@gmail.com"
+
+git config --global user.name "$linuxweb8888"
+
+git commit -m "$linuxweb8888"
+
+git config --global user.email "$linuxweb8888@gmail.com"
+
+git config --global user.name "$linuxweb8888"
+
+clever create --type docker $linuxweb8888
+
+clever scale --instances 1 --alias="$linuxweb8888"
+
+clever deploy --alias="$linuxweb8888"
