@@ -1,0 +1,96 @@
+#linux8888="$(bash /project-name-generator/generate)"
+
+#docker tag webwebwebwebwebweb/linuxpage webpackage/$(echo "$linux8888")
+
+#docker push webpackage/$(echo "$linux8888")
+
+#cp /clever8874/Dockerfile8888 /clever8874/Dockerfile
+
+#sed -i "s/tradepage/$(echo "$linux8888")/g" /clever8874/Dockerfile
+
+#cd /clever8874/
+
+/root/.nvm/versions/node/v20.20.2/bin/clever login
+
+#web="$(rig | cut -d$'\n' -f1 | sed "s/ /-/g" | tr '[:upper:]' '[:lower:]')"
+
+for ((n=0;n<$(echo "$2");n++))
+do
+
+#docker system prune -af
+
+linuxlinux8888="$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 16 | head -n 1)"
+
+#linux8888="$(cat /linuxwebweb8888 | shuf | tail -n1)"
+
+webwebwebweb8888="$(bash /docker8888)"
+
+#docker pull webwebwebwebwebweb/linuxpage
+
+#docker run -it -d webwebwebwebwebweb/linuxpage /bin/bash
+
+#docker export $(docker ps | grep "linuxpage" | sed "s/.* //g" | head -n1) > /latest.tar
+
+#cat /latest.tar | docker import - webwebwebwebwebweb/linuxpage
+
+#docker tag webwebwebwebwebweb/linuxpage webdomain/$(echo "$linuxlinux8888")
+
+#docker push webdomain/$(echo "$linuxlinux8888")
+
+linux8888="$(shuf -i8888-88888888 -n1)"
+
+mkdir /$linux8888/
+
+cp /clever8874/Dockerfile8888 /$linux8888/Dockerfile
+
+#random=$((RANDOM % 100))
+
+#if [ $random -lt 50 ]; then
+
+#cp /clever8874/Dockerfile8888 /$linux8888/Dockerfile"
+
+#else
+
+#cp /clever8874/Dockerfileubuntu8888 /$linux8888/Dockerfile"
+
+#fi
+
+random=$((RANDOM % 100))
+
+if [ $random -lt 50 ]; then
+
+sed -i "s/thetradeboxsignal88888888/ubuntuvnc8888/g" /$linux8888/Dockerfile
+
+sed -i "s/start/start/g" /$linux8888/Dockerfile
+
+sed -i "s/tradeinc/phemextradebot/g" /$linux8888/Dockerfile
+
+else
+
+sed -i "s/thetradeboxsignal88888888/webwebwebweb8888/g" /$linux8888/Dockerfile
+
+sed -i "s/start/start/g" /$linux8888/Dockerfile
+
+sed -i "s/tradeinc/buyrunplace/g" /$linux8888/Dockerfile
+
+fi
+
+#sed -i "s/webweb8888/$(shuf -i8888-88888888 -n1)/g" /clever8874/Dockerfile
+
+#sed -i "s/tradepage/$(echo "$linuxlinux8888")/g" /clever8874/Dockerfile
+
+cd /$linux8888/
+
+git init
+
+git add ./
+
+bash /linux8888 $linuxlinux8888 &
+
+echo "linux8888"
+
+sleep 10
+
+done
+
+sleep 80
