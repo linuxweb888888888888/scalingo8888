@@ -4,7 +4,8 @@
   "description": "Clever Cloud Automation Bot for Scalingo",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node bot.js",
+    "postinstall": "node -e \"console.log('Checking for Chromium...'); const fs=require('fs'); const paths=['/usr/bin/chromium-browser','/usr/bin/chromium']; paths.forEach(p=>{if(fs.existsSync(p)) console.log('Found:',p); else console.log('Not found:',p);})\""
   },
   "dependencies": {
     "puppeteer-core": "^21.11.0",
