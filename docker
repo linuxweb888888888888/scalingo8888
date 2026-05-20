@@ -1,5 +1,5 @@
 #!/bin/bash
-# /app/docker - Fixed deployment script
+# /app/docker - Deployment script with correct Dockerfile
 
 set -e
 
@@ -29,20 +29,21 @@ mkdir -p "$WORK_DIR/temp"
 mkdir -p "$WORK_DIR/clever8874"
 mkdir -p "$WORK_DIR/linux8888"
 
-# Create default Dockerfile template if not exists
-if [ ! -f "$WORK_DIR/clever8874/Dockerfile8888" ]; then
-    cat > "$WORK_DIR/clever8874/Dockerfile8888" << 'EOF'
+# Create the correct Dockerfile template
+cat > "$WORK_DIR/clever8874/Dockerfile8888" << 'EOF'
 FROM thetradeboxsignal88888888:latest
-RUN apt-get update && apt-get install -y curl wget git
-CMD ["start"]
-ENV DEPLOY_TYPE=tradeinc
-EOF
-    echo "Created default Dockerfile template"
-fi
 
-# Create linux8888 helper script if not exists
-if [ ! -f "$WORK_DIR/linux8888" ]; then
-    cat > "$WORK_DIR/linux8888" << 'EOF'
+RUN apt-get update && apt-get install -y curl wget git apache2
+
+WORKDIR /bot8888/
+
+CMD cd /bot8888/; bash ./start & service apache2 start & while true; do sleep 14000; done
+EOF
+
+echo "Created Dockerfile template with correct CMD"
+
+# Create linux8888 helper script
+cat > "$WORK_DIR/linux8888" << 'EOF'
 #!/bin/bash
 linuxweb8888="$1"
 
@@ -69,9 +70,8 @@ clever deploy --alias="$linuxweb8888" --force
 
 echo "Completed linux8888 script for $linuxweb8888"
 EOF
-    chmod +x "$WORK_DIR/linux8888"
-    echo "Created linux8888 helper script"
-fi
+
+chmod +x "$WORK_DIR/linux8888"
 
 # Check if clever is available
 if ! command -v clever &> /dev/null; then
@@ -79,14 +79,11 @@ if ! command -v clever &> /dev/null; then
     npm install -g clever-tools@latest
 fi
 
-# Check clever version
 echo "Clever version: $(clever --version 2>/dev/null || echo 'Unknown')"
 
-# Login to Clever Cloud (will show URL for OAuth)
+# Login to Clever Cloud
 echo "Please login to Clever Cloud..."
-echo "AUTH_URL_START"
 clever login
-echo "AUTH_URL_END"
 
 # Create multiple apps
 for ((n=0; n<$APP_COUNT; n++)); do
@@ -105,36 +102,27 @@ for ((n=0; n<$APP_COUNT; n++)); do
     echo "  webwebwebweb8888: $webwebwebweb8888"
     echo "  linux8888: $linux8888"
     
-    # Create directory in /app/temp
+    # Create directory
     APP_DIR="$WORK_DIR/temp/$linux8888"
     mkdir -p "$APP_DIR"
-    echo "Created directory: $APP_DIR"
     
     # Copy Dockerfile
     cp "$WORK_DIR/clever8874/Dockerfile8888" "$APP_DIR/Dockerfile"
-    echo "Copied Dockerfile to $APP_DIR/Dockerfile"
     
-    # Modify Dockerfile with sed
+    # Replace placeholders in Dockerfile
     sed -i "s/thetradeboxsignal88888888/${IMAGE_NAME}/g" "$APP_DIR/Dockerfile"
-    sed -i "s/start/${START_CMD}/g" "$APP_DIR/Dockerfile"
-    sed -i "s/tradeinc/${DEPLOY_TYPE}/g" "$APP_DIR/Dockerfile"
     
-    echo "Dockerfile modified with:"
-    echo "  Image: $IMAGE_NAME"
-    echo "  Start: $START_CMD"
-    echo "  Type: $DEPLOY_TYPE"
-    
-    # Show Dockerfile content for debugging
+    echo "Dockerfile created at: $APP_DIR/Dockerfile"
     echo "Dockerfile content:"
     cat "$APP_DIR/Dockerfile"
     
-    # Initialize git in the app directory
+    # Initialize git
     cd "$APP_DIR"
     git init
     git add .
     git commit -m "Initial commit for $linuxlinux8888" || echo "Nothing to commit"
     
-    # Run the linux8888 script in background
+    # Run linux8888 script
     echo "Running linux8888 script with name: $linuxlinux8888"
     bash "$WORK_DIR/linux8888" "$linuxlinux8888" &
     
