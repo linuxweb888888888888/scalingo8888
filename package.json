@@ -6,24 +6,15 @@
   "scripts": {
     "start": "node bot.js",
     "postinstall": "bash scripts/install_chromium.sh",
-    "install:chrome": "bash scripts/install_chromium.sh",
-    "dev": "node bot.js --instances 1 --wait 2"
+    "install:chrome": "bash scripts/install_chromium.sh"
   },
   "dependencies": {
-    "puppeteer": "^21.11.0",
+    "puppeteer-core": "^21.11.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "colors": "^1.4.0"
   },
   "engines": {
     "node": ">=18.0.0"
-  },
-  "keywords": [
-    "puppeteer",
-    "automation",
-    "clever-cloud",
-    "scalingo"
-  ],
-  "author": "",
-  "license": "MIT"
+  }
 }
