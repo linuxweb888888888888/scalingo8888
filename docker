@@ -1,78 +1,63 @@
 #!/bin/bash
-# /app/docker - Create 3 apps on Clever Cloud
+# /app/docker - Deploy buyrunplace/webwebwebweb8888 image to create 3 apps
 
 set -e
 
 echo "========================================="
-echo "  Deploying 3 Apps to Clever Cloud"
+echo "  Deploying Docker Image to Clever Cloud"
 echo "========================================="
-
-WORK_DIR="/app"
-cd "$WORK_DIR" || exit 1
-
-# Create Dockerfile
-cat > "$WORK_DIR/Dockerfile" << 'EOF'
-FROM buyrunplace/webwebwebweb8888
-CMD cd /bot8888/; bash ./start & service apache2 start & while true; do sleep 14000; done
-EOF
-
-echo "✅ Dockerfile created"
-
-# Check if clever is installed
-if ! command -v clever &> /dev/null; then
-    echo "Installing clever-tools..."
-    npm install -g clever-tools@latest
-fi
-
-# Login to Clever Cloud (this will show OAuth URL)
 echo ""
+
+DOCKER_IMAGE="buyrunplace/webwebwebweb8888"
+APP_COUNT=3
+
+echo "🐳 Docker Image: $DOCKER_IMAGE"
+echo "📦 Number of apps: $APP_COUNT"
+echo ""
+
+# Login to Clever Cloud
 echo "🔐 Logging into Clever Cloud..."
-echo "========================================="
 clever login
-echo "========================================="
 echo ""
 
-# Deploy 3 apps
-for i in 1 2 3; do
-    echo ""
+# Deploy 3 apps using the Docker image
+for i in $(seq 1 $APP_COUNT); do
     echo "========================================="
-    echo "  Deploying App $i of 3"
+    echo "  Deploying App $i of $APP_COUNT"
     echo "========================================="
     
     # Generate unique app name
-    RANDOM_NAME="app-$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 10 | head -n 1)-${i}"
+    APP_NAME="webapp-$(date +%s)-${RANDOM}"
     
-    echo "📦 App Name: $RANDOM_NAME"
-    echo "🐳 Image: buyrunplace/webwebwebweb8888"
+    echo "📱 App Name: $APP_NAME"
+    echo "🐳 Image: $DOCKER_IMAGE"
+    echo ""
     
-    # Create the app
-    echo "Creating app..."
-    clever create --type docker "$RANDOM_NAME"
+    # Create app with Docker image
+    echo "Creating app from Docker image..."
+    clever create --type docker --image "$DOCKER_IMAGE" "$APP_NAME"
     
-    # Deploy the app
+    echo ""
     echo "Deploying app..."
-    clever deploy --app "$RANDOM_NAME" --force
-    
-    # Get the app URL
-    APP_URL="https://$RANDOM_NAME.osc-fr1.scalingo.io"
+    clever deploy --app "$APP_NAME" --force
     
     echo ""
     echo "✅ App $i deployed successfully!"
-    echo "🔗 URL: $APP_URL"
-    echo "========================================="
+    echo "🔗 URL: https://$APP_NAME.osc-fr1.scalingo.io"
+    echo ""
     
     # Wait between deployments
-    if [ $i -lt 3 ]; then
-        echo "Waiting 15 seconds before next deployment..."
+    if [ $i -lt $APP_COUNT ]; then
+        echo "⏳ Waiting 15 seconds before next deployment..."
         sleep 15
+        echo ""
     fi
 done
 
-echo ""
 echo "========================================="
-echo "  🎉 All 3 apps deployed successfully! 🎉"
+echo "  🎉 All $APP_COUNT apps deployed successfully! 🎉"
 echo "========================================="
 echo ""
-echo "Deployed apps:"
-clever apps | grep "app-" || echo "Check your Clever Cloud dashboard"
+echo "Deployed Apps:"
+clever apps | grep "webapp-" || echo "Check your Clever Cloud dashboard"
 echo ""
