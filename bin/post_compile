@@ -1,0 +1,35 @@
+#!/bin/bash
+# bin/post_compile
+
+echo "===== Post-compile: Installing Chromium ====="
+
+# Create directories
+mkdir -p /app/bin
+mkdir -p /app/chromium
+
+# Chromium version
+CHROME_VERSION="121.0.6167.85"
+CHROME_URL="https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}/linux64/chrome-linux64.zip"
+
+# Download Chromium
+echo "Downloading Chromium..."
+wget -q --timeout=300 -O /tmp/chromium.zip "$CHROME_URL"
+
+if [ -f "/tmp/chromium.zip" ]; then
+    echo "Extracting Chromium..."
+    unzip -q /tmp/chromium.zip -d /app/chromium/
+    rm /tmp/chromium.zip
+    
+    # Find and set Chrome binary
+    CHROME_BIN=$(find /app/chromium -name "chrome" -type f | head -1)
+    if [ -n "$CHROME_BIN" ]; then
+        chmod +x "$CHROME_BIN"
+        export PUPPETEER_EXECUTABLE_PATH="$CHROME_BIN"
+        echo "Chromium installed at: $CHROME_BIN"
+        echo "export PUPPETEER_EXECUTABLE_PATH=$CHROME_BIN" >> /app/.profile.d/chrome.sh
+    fi
+else
+    echo "WARNING: Failed to download Chromium"
+fi
+
+echo "===== Post-compile completed ====="
