@@ -1,12 +1,16 @@
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const colors = require('colors');
 const { exec } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
-const http = require('http');
+const http = require('https');
+const { createWriteStream } = require('fs');
+const { pipeline } = require('stream');
+const { promisify } = require('util');
+const streamPipeline = promisify(pipeline);
 
 // Apply stealth plugin
 puppeteer.use(StealthPlugin());
@@ -20,6 +24,87 @@ function log(step, message, type = 'info', instanceId = 'MAIN') {
     else if (type === 'error') console.log(`${prefix} ${'✘'.red} ${message.red}`);
     else if (type === 'warn') console.log(`${prefix} ${'!'.yellow} ${message.yellow}`);
     else console.log(`${prefix} ${'ℹ'.cyan} ${message.white}`);
+}
+
+// Download file helper
+async function downloadFile(url, destPath) {
+    return new Promise((resolve, reject) => {
+        const file = createWriteStream(destPath);
+        http.get(url, (response) => {
+            if (response.statusCode !== 200) {
+                reject(new Error(`Failed to download: ${response.statusCode}`));
+                return;
+            }
+            response.pipe(file);
+            file.on('finish', () => {
+                file.close();
+                resolve();
+            });
+        }).on('error', reject);
+    });
+}
+
+// Install Chromium at runtime
+async function installChromiumRuntime() {
+    const chromePath = '/app/chrome-linux64/chrome';
+    
+    // Check if already installed
+    if (fs.existsSync(chromePath)) {
+        const stats = fs.statSync(chromePath);
+        if (stats.size > 50000000) {
+            log('SYSTEM', `Chromium already installed at: ${chromePath}`, 'success', 'MAIN');
+            return chromePath;
+        }
+    }
+    
+    log('SYSTEM', 'Installing Chromium at runtime...', 'info', 'MAIN');
+    
+    try {
+        // Create directory
+        if (!fs.existsSync('/app')) {
+            fs.mkdirSync('/app', { recursive: true });
+        }
+        
+        // Download Chromium
+        const chromeUrl = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
+        const zipPath = '/tmp/chromium.zip';
+        
+        log('SYSTEM', 'Downloading Chromium (this may take a minute)...', 'info', 'MAIN');
+        await downloadFile(chromeUrl, zipPath);
+        log('SYSTEM', 'Download complete', 'success', 'MAIN');
+        
+        // Extract
+        log('SYSTEM', 'Extracting Chromium...', 'info', 'MAIN');
+        execSync(`unzip -q ${zipPath} -d /app/`, { stdio: 'inherit' });
+        
+        // Make executable
+        if (fs.existsSync(chromePath)) {
+            fs.chmodSync(chromePath, 0o755);
+            log('SYSTEM', `Chromium installed successfully at: ${chromePath}`, 'success', 'MAIN');
+            
+            // Test it
+            const version = execSync(`${chromePath} --version`, { encoding: 'utf8' });
+            log('SYSTEM', `Chromium version: ${version.trim()}`, 'success', 'MAIN');
+            
+            // Cleanup
+            fs.unlinkSync(zipPath);
+            
+            return chromePath;
+        } else {
+            // Try to find where it was extracted
+            const findResult = execSync('find /app -name "chrome" -type f 2>/dev/null | head -1', { encoding: 'utf8' }).trim();
+            if (findResult) {
+                fs.chmodSync(findResult, 0o755);
+                log('SYSTEM', `Found Chromium at: ${findResult}`, 'success', 'MAIN');
+                return findResult;
+            }
+            throw new Error('Chrome binary not found after extraction');
+        }
+        
+    } catch (error) {
+        log('SYSTEM', `Failed to install Chromium: ${error.message}`, 'error', 'MAIN');
+        return null;
+    }
 }
 
 class CleverCloudBot {
@@ -41,6 +126,7 @@ class CleverCloudBot {
         this.consecutiveFailures = 0;
         this.waitAfterDockerMinutes = parseInt(process.env.BOT_WAIT_MINUTES) || 5;
         this.oauthUrl = null;
+        this.chromePath = null;
     }
 
     async getDockerProcessCount() {
@@ -110,32 +196,20 @@ class CleverCloudBot {
     }
 
     async initBrowser() {
-        log('SYSTEM', 'Launching browser...', 'info', this.instanceId);
+        log('SYSTEM', 'Setting up browser...', 'info', this.instanceId);
         
-        // Direct path to the installed Chromium
-        const chromePath = '/app/chromium/chrome-linux64/chrome';
+        // Install Chromium if not found
+        if (!this.chromePath || !fs.existsSync(this.chromePath)) {
+            this.chromePath = await installChromiumRuntime();
+        }
         
-        // Check if Chrome exists at the path
-        if (fs.existsSync(chromePath)) {
-            const stats = fs.statSync(chromePath);
-            log('SYSTEM', `Found Chromium at: ${chromePath} (${(stats.size/1024/1024).toFixed(2)} MB)`, 'success', this.instanceId);
-        } else {
-            log('SYSTEM', `Chromium not found at ${chromePath}`, 'error', this.instanceId);
-            // Try to find it anywhere
-            const { execSync } = require('child_process');
-            try {
-                const found = execSync('find /app -name "chrome" -type f 2>/dev/null | head -1', { encoding: 'utf8' }).trim();
-                if (found) {
-                    log('SYSTEM', `Found Chromium at: ${found}`, 'success', this.instanceId);
-                } else {
-                    log('SYSTEM', 'No Chromium found!', 'error', this.instanceId);
-                }
-            } catch (e) {}
+        if (!this.chromePath) {
+            throw new Error('Could not install or find Chromium');
         }
         
         const launchOptions = {
             headless: true,
-            executablePath: '/app/chromium/chrome-linux64/chrome',
+            executablePath: this.chromePath,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -161,6 +235,8 @@ class CleverCloudBot {
                 '--max_old_space_size=512'
             ]
         };
+        
+        log('SYSTEM', `Launching browser with: ${this.chromePath}`, 'success', this.instanceId);
         
         try {
             this.browser = await puppeteer.launch(launchOptions);
