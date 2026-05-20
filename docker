@@ -10,7 +10,7 @@
 
 #cd /clever8874/
 
-/root/.nvm/versions/node/v20.20.2/bin/clever login
+clever login
 
 #web="$(rig | cut -d$'\n' -f1 | sed "s/ /-/g" | tr '[:upper:]' '[:lower:]')"
 
