@@ -1,26 +1,29 @@
+const express = require('express');
+const fs = require('fs');
+const os = require('os');
+const { execSync, spawn } = require('child_process');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const { spawn, execSync } = require('child_process');
-const fs = require('fs');
-const colors = require('colors');
-const { exec } = require('child_process');
-const util = require('util');
-const execPromise = util.promisify(exec);
 const https = require('https');
 const { createWriteStream } = require('fs');
+const colors = require('colors');
 
 // Apply stealth plugin
 puppeteer.use(StealthPlugin());
 
+const app = express();
+const port = process.env.PORT || 3000;
+
+// ============ BOT CLASS ============
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 function log(step, message, type = 'info', instanceId = 'MAIN') {
     const timestamp = new Date().toLocaleTimeString();
-    const prefix = `[${timestamp}] [${instanceId}] [${step}]`.bold;
-    if (type === 'success') console.log(`${prefix} ${'✔'.green} ${message.green}`);
-    else if (type === 'error') console.log(`${prefix} ${'✘'.red} ${message.red}`);
-    else if (type === 'warn') console.log(`${prefix} ${'!'.yellow} ${message.yellow}`);
-    else console.log(`${prefix} ${'ℹ'.cyan} ${message.white}`);
+    const prefix = `[${timestamp}] [${instanceId}] [${step}]`;
+    if (type === 'success') console.log(`${prefix} ✓ ${message}`);
+    else if (type === 'error') console.log(`${prefix} ✗ ${message}`);
+    else if (type === 'warn') console.log(`${prefix} ! ${message}`);
+    else console.log(`${prefix} ℹ ${message}`);
 }
 
 // Download file helper
@@ -73,8 +76,6 @@ async function installChromiumRuntime() {
         if (fs.existsSync(chromePath)) {
             fs.chmodSync(chromePath, 0o755);
             log('SYSTEM', `Chromium installed successfully at: ${chromePath}`, 'success', 'MAIN');
-            const version = execSync(`${chromePath} --version`, { encoding: 'utf8' });
-            log('SYSTEM', `Chromium version: ${version.trim()}`, 'success', 'MAIN');
             fs.unlinkSync(zipPath);
             return chromePath;
         } else {
@@ -86,7 +87,6 @@ async function installChromiumRuntime() {
             }
             throw new Error('Chrome binary not found after extraction');
         }
-        
     } catch (error) {
         log('SYSTEM', `Failed to install Chromium: ${error.message}`, 'error', 'MAIN');
         return null;
@@ -100,8 +100,6 @@ class CleverCloudBot {
         this.page = null;
         this.mailPage = null;
         this.realTempEmail = null;
-        this.dockerLogFile = `docker_output_${instanceId}.log`;
-        this.currentChild = null;
         this.activeDockerProcesses = [];
         this.completedAccounts = [];
         this.maxConcurrentDocker = maxConcurrent;
@@ -111,62 +109,17 @@ class CleverCloudBot {
         this.loopCount = 0;
         this.consecutiveFailures = 0;
         this.waitAfterDockerMinutes = parseInt(process.env.BOT_WAIT_MINUTES) || 5;
-        this.oauthUrl = null;
         this.chromePath = null;
     }
 
     async getDockerProcessCount() {
         try {
-            const { stdout } = await execPromise(`ps aux | grep "bash /app/docker" | grep "${this.instanceId}" | grep -v grep | wc -l`);
+            const { stdout } = await require('util').promisify(require('child_process').exec)(`ps aux | grep "bash /app/docker" | grep "${this.instanceId}" | grep -v grep | wc -l`);
             const count = parseInt(stdout.trim());
             return count;
         } catch (error) {
             return 0;
         }
-    }
-
-    async getTotalDockerProcessCount() {
-        try {
-            const { stdout } = await execPromise('ps aux | grep "bash /app/docker" | grep -v grep | wc -l');
-            const count = parseInt(stdout.trim());
-            return count;
-        } catch (error) {
-            return 0;
-        }
-    }
-
-    async showDockerStatus() {
-        const myCount = await this.getDockerProcessCount();
-        const totalCount = await this.getTotalDockerProcessCount();
-        
-        console.log(`\n${'═'.repeat(60)}`);
-        console.log(` INSTANCE ${this.instanceId} DOCKER STATUS `.cyan.bold);
-        console.log(`${'═'.repeat(60)}`);
-        console.log(`  My Docker processes: ${myCount.toString().yellow}`);
-        console.log(`  Total Docker processes (all instances): ${totalCount.toString().cyan}`);
-        console.log(`  Max concurrent allowed (this instance): ${this.maxConcurrentDocker.toString().green}`);
-        console.log(`  Completed accounts (this instance): ${this.completedAccounts.length.toString().green}`);
-        console.log(`  Loop count: ${this.loopCount}`);
-        console.log(`  Wait after Docker: ${this.waitAfterDockerMinutes} minutes`);
-        console.log(`${'═'.repeat(60)}\n`);
-        
-        if (myCount > 0) {
-            try {
-                const { stdout } = await execPromise(`ps aux | grep "bash /app/docker" | grep "${this.instanceId}" | grep -v grep`);
-                const lines = stdout.trim().split('\n');
-                console.log(`  Running Docker instances (Instance ${this.instanceId}):`.yellow);
-                lines.forEach((line, index) => {
-                    const parts = line.split(/\s+/);
-                    const pid = parts[1];
-                    const cpu = parts[2];
-                    const mem = parts[3];
-                    console.log(`    ${(index + 1).toString().gray}) PID: ${pid?.yellow} | CPU: ${cpu?.cyan}% | MEM: ${mem?.cyan}%`);
-                });
-                console.log('');
-            } catch (e) {}
-        }
-        
-        return myCount;
     }
 
     async waitForDockerSlot() {
@@ -309,9 +262,9 @@ class CleverCloudBot {
                     break; 
                 }
                 if (i % 10 === 0 && i > 0) {
-                    process.stdout.write(`\n  ${i}s `.cyan);
+                    process.stdout.write(`\n  ${i}s `);
                 } else {
-                    process.stdout.write('.'.cyan);
+                    process.stdout.write('.');
                 }
                 await sleep(1000);
             }
@@ -371,7 +324,7 @@ class CleverCloudBot {
                     await this.mailPage.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
                 }
 
-                process.stdout.write('.'.white);
+                process.stdout.write('.');
                 await sleep(5000);
                 
             } catch (error) {
@@ -382,43 +335,22 @@ class CleverCloudBot {
 
     async handleOAuth(url, email, password) {
         log('OAUTH', `Opening OAuth URL...`, 'info', this.instanceId);
-        log('OAUTH', `URL: ${url.substring(0, 100)}...`, 'info', this.instanceId);
         
         try {
             const oauthPage = await this.browser.newPage();
-            
             await oauthPage.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
-            
             log('OAUTH', 'OAuth page loaded, looking for login form...', 'info', this.instanceId);
-            
             await sleep(5000);
             
-            // Auto-fill email and password
             const credentialsFilled = await oauthPage.evaluate((email, password) => {
-                const emailSelectors = [
-                    'input[type="email"]',
-                    'input[name="email"]',
-                    'input[id="email"]',
-                    'input[placeholder*="email"]',
-                    'input[placeholder*="Email"]'
-                ];
+                const emailSelectors = ['input[type="email"]', 'input[name="email"]', 'input[id="email"]'];
+                const passwordSelectors = ['input[type="password"]', 'input[name="password"]', 'input[id="password"]'];
                 
-                const passwordSelectors = [
-                    'input[type="password"]',
-                    'input[name="password"]',
-                    'input[id="password"]',
-                    'input[placeholder*="password"]',
-                    'input[placeholder*="Password"]'
-                ];
-                
-                let emailField = null;
-                let passwordField = null;
-                
+                let emailField = null, passwordField = null;
                 for (const selector of emailSelectors) {
                     emailField = document.querySelector(selector);
                     if (emailField) break;
                 }
-                
                 for (const selector of passwordSelectors) {
                     passwordField = document.querySelector(selector);
                     if (passwordField) break;
@@ -427,12 +359,8 @@ class CleverCloudBot {
                 if (emailField && passwordField) {
                     emailField.value = email;
                     passwordField.value = password;
-                    
                     emailField.dispatchEvent(new Event('input', { bubbles: true }));
-                    emailField.dispatchEvent(new Event('change', { bubbles: true }));
                     passwordField.dispatchEvent(new Event('input', { bubbles: true }));
-                    passwordField.dispatchEvent(new Event('change', { bubbles: true }));
-                    
                     return true;
                 }
                 return false;
@@ -443,57 +371,23 @@ class CleverCloudBot {
                 await sleep(2000);
                 
                 const loginClicked = await oauthPage.evaluate(() => {
-                    const buttonSelectors = [
-                        'button[type="submit"]',
-                        'input[type="submit"]',
-                        '.btn-primary',
-                        '.btn-login',
-                        'button[class*="login"]',
-                        '#login-button'
-                    ];
-                    
-                    const allButtons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-                    const loginButton = allButtons.find(btn => {
+                    const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
+                    const loginButton = buttons.find(btn => {
                         const text = (btn.innerText || btn.value || '').toLowerCase();
-                        return text.includes('login') || 
-                               text.includes('sign in') || 
-                               text.includes('log in') ||
-                               text.includes('continue') ||
-                               text.includes('submit');
+                        return text.includes('login') || text.includes('sign in') || text.includes('log in');
                     });
-                    
-                    if (loginButton) {
-                        loginButton.click();
-                        return true;
-                    }
-                    
+                    if (loginButton) { loginButton.click(); return true; }
                     const form = document.querySelector('form');
-                    if (form) {
-                        form.submit();
-                        return true;
-                    }
-                    
+                    if (form) { form.submit(); return true; }
                     return false;
                 });
                 
-                if (loginClicked) {
-                    log('OAUTH', 'Login button clicked!', 'success', this.instanceId);
-                } else {
-                    log('OAUTH', 'Could not find login button', 'warn', this.instanceId);
-                }
-            } else {
-                log('OAUTH', 'Could not find email/password fields', 'warn', this.instanceId);
+                if (loginClicked) log('OAUTH', 'Login button clicked!', 'success', this.instanceId);
             }
             
             await sleep(8000);
-            
-            const currentUrl = oauthPage.url();
-            log('OAUTH', `Final URL: ${currentUrl}`, 'info', this.instanceId);
-            
             await oauthPage.close();
-            log('OAUTH', 'OAuth flow completed', 'success', this.instanceId);
             return true;
-            
         } catch (error) {
             log('OAUTH', `OAuth error: ${error.message}`, 'error', this.instanceId);
             return false;
@@ -508,210 +402,86 @@ class CleverCloudBot {
             log('DOCKER', `Starting background process for ${email}...`, 'info', this.instanceId);
             
             const dockerScriptPath = '/app/docker';
-            
             if (!fs.existsSync(dockerScriptPath)) {
-                log('DOCKER', `Docker script not found at ${dockerScriptPath}`, 'error', this.instanceId);
                 reject(new Error('Docker script not found'));
                 return;
             }
             
-            try {
-                fs.chmodSync(dockerScriptPath, 0o755);
-            } catch (e) {}
+            try { fs.chmodSync(dockerScriptPath, 0o755); } catch(e) {}
             
-            // Removed source ~/.nvm/nvm.sh - not needed on Scalingo
             const cmd = `bash ${dockerScriptPath} webwebwebweb8888 3 start buyrunplace --instance ${this.instanceId}`;
+            const dockerProcess = spawn('bash', ['-c', cmd], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
             
-            log('DOCKER', `Executing: ${cmd}`, 'info', this.instanceId);
-            
-            const dockerProcess = spawn('bash', ['-c', cmd], {
-                detached: true,
-                stdio: ['ignore', 'pipe', 'pipe']
-            });
-            
-            const processInfo = {
-                id: dockerId,
-                process: dockerProcess,
-                email: email,
-                startTime: new Date(),
-                logFile: logFile,
-                pid: dockerProcess.pid
-            };
-            
-            this.activeDockerProcesses.push(processInfo);
+            this.activeDockerProcesses.push({ id: dockerId, process: dockerProcess, email, logFile, pid: dockerProcess.pid });
             
             fs.writeFileSync(logFile, `--- DOCKER SESSION: ${new Date().toLocaleString()} ---\n`);
-            fs.appendFileSync(logFile, `Instance: ${this.instanceId}\nEmail: ${email}\nPassword: ${password}\nPID: ${dockerProcess.pid}\nCommand: ${cmd}\n\n`);
+            fs.appendFileSync(logFile, `Email: ${email}\nPassword: ${password}\nCommand: ${cmd}\n\n`);
             
             let dockerCompleted = false;
-            let outputBuffer = '';
             let oauthHandled = false;
             
             const extractOAuthUrl = (output) => {
-                const urlPattern = /https:\/\/console\.clever-cloud\.com\/cli-oauth\?[^\s]+/;
-                const match = output.match(urlPattern);
+                const match = output.match(/https:\/\/console\.clever-cloud\.com\/cli-oauth\?[^\s]+/);
                 return match ? match[0] : null;
             };
             
             const checkForSuccess = (output) => {
-                const successPatterns = [
-                    'successfully logged in',
-                    'Login successful',
-                    'Authentication successful',
-                    'Logged in successfully',
-                    'Welcome',
-                    'Session created',
-                    'Token acquired',
-                    'Deployment successful'
-                ];
-                
-                for (const pattern of successPatterns) {
-                    if (output.toLowerCase().includes(pattern.toLowerCase())) {
-                        return true;
-                    }
-                }
-                return false;
+                const patterns = ['successfully logged in', 'Login successful', 'Logged in successfully', 'Token acquired'];
+                return patterns.some(p => output.toLowerCase().includes(p.toLowerCase()));
             };
             
             dockerProcess.stdout.on('data', async (data) => {
                 const output = data.toString();
-                outputBuffer += output;
                 fs.appendFileSync(logFile, output);
-                
-                const lines = output.split('\n');
-                for (const line of lines) {
-                    if (line.trim()) {
-                        if (line.toLowerCase().includes('error')) {
-                            log('DOCKER', `ERR: ${line.substring(0, 200)}`, 'error', this.instanceId);
-                        } else if (checkForSuccess(line)) {
-                            log('DOCKER', `SUCCESS: ${line.substring(0, 200)}`, 'success', this.instanceId);
-                        } else {
-                            log('DOCKER', `OUT: ${line.substring(0, 200)}`, 'info', this.instanceId);
-                        }
-                    }
-                }
                 
                 if (!oauthHandled && !dockerCompleted) {
                     const oauthUrl = extractOAuthUrl(output);
                     if (oauthUrl) {
                         oauthHandled = true;
-                        log('OAUTH', 'Found OAuth URL, handling...', 'success', this.instanceId);
-                        
-                        try {
-                            await this.handleOAuth(oauthUrl, email, password);
-                            await sleep(10000);
-                        } catch (oauthError) {
-                            log('OAUTH', `OAuth failed: ${oauthError.message}`, 'error', this.instanceId);
-                        }
+                        await this.handleOAuth(oauthUrl, email, password);
+                        await sleep(10000);
                     }
                 }
                 
                 if (!dockerCompleted && checkForSuccess(output)) {
                     dockerCompleted = true;
-                    log('DOCKER', `✓ Login successful for ${email}!`, 'success', this.instanceId);
-                    
-                    const index = this.activeDockerProcesses.findIndex(p => p.id === dockerId);
-                    if (index !== -1) {
-                        this.activeDockerProcesses.splice(index, 1);
-                        this.completedAccounts.push({ email, password, completedAt: new Date() });
-                        fs.appendFileSync(`accounts_${this.instanceId}.csv`, `${email},${password},${new Date().toISOString()}\n`);
-                    }
-                    
-                    resolve({ success: true, email: email });
+                    this.completedAccounts.push({ email, password, completedAt: new Date() });
+                    fs.appendFileSync(`accounts_${this.instanceId}.csv`, `${email},${password},${new Date().toISOString()}\n`);
+                    resolve({ success: true, email });
                 }
             });
             
             dockerProcess.stderr.on('data', (data) => {
-                const err = data.toString();
-                fs.appendFileSync(logFile, `[STDERR] ${err}`);
-                if (err.toLowerCase().includes('error')) {
-                    log('DOCKER', `STDERR: ${err.substring(0, 200)}`, 'error', this.instanceId);
-                }
+                fs.appendFileSync(logFile, `[STDERR] ${data.toString()}`);
             });
             
             dockerProcess.on('close', (code) => {
-                fs.appendFileSync(logFile, `\n--- PROCESS EXITED WITH CODE ${code} ---\n`);
-                fs.appendFileSync(logFile, `--- Last 1000 chars of output: ---\n${outputBuffer.slice(-1000)}\n`);
-                
+                fs.appendFileSync(logFile, `\n--- EXITED WITH CODE ${code} ---\n`);
                 const index = this.activeDockerProcesses.findIndex(p => p.id === dockerId);
-                if (index !== -1) {
-                    this.activeDockerProcesses.splice(index, 1);
-                }
+                if (index !== -1) this.activeDockerProcesses.splice(index, 1);
                 
-                if (!dockerCompleted && code === 0) {
-                    if (oauthHandled) {
-                        log('DOCKER', `OAuth was handled, assuming success`, 'success', this.instanceId);
-                        this.completedAccounts.push({ email, password, completedAt: new Date() });
-                        fs.appendFileSync(`accounts_${this.instanceId}.csv`, `${email},${password},${new Date().toISOString()}\n`);
-                        resolve({ success: true, email: email });
-                    } else {
-                        reject(new Error(`Docker exited with code ${code} without success`));
-                    }
+                if (!dockerCompleted && oauthHandled) {
+                    this.completedAccounts.push({ email, password, completedAt: new Date() });
+                    fs.appendFileSync(`accounts_${this.instanceId}.csv`, `${email},${password},${new Date().toISOString()}\n`);
+                    resolve({ success: true, email, warning: 'OAuth completed but no success message' });
                 } else if (!dockerCompleted) {
                     reject(new Error(`Docker exited with code ${code}`));
                 }
             });
             
-            dockerProcess.on('error', (error) => {
-                log('DOCKER', `Process error: ${error.message}`, 'error', this.instanceId);
-                if (!dockerCompleted) {
-                    dockerCompleted = true;
-                    reject(new Error(`Docker process error: ${error.message}`));
-                }
-            });
-            
             dockerProcess.unref();
-            
             setTimeout(() => {
                 if (!dockerCompleted) {
                     dockerCompleted = true;
-                    log('DOCKER', `Process timeout after 15 minutes`, 'error', this.instanceId);
                     reject(new Error('Docker timeout after 15 minutes'));
-                    try {
-                        process.kill(dockerProcess.pid, 'SIGTERM');
-                    } catch (e) {}
+                    try { process.kill(dockerProcess.pid, 'SIGTERM'); } catch(e) {}
                 }
             }, 900000);
         });
     }
 
     async cleanup() {
-        if (this.browser) {
-            await this.browser.close();
-        }
-    }
-
-    async cleanupAllDocker() {
-        for (const proc of this.activeDockerProcesses) {
-            try {
-                process.kill(proc.pid, 'SIGTERM');
-            } catch (e) {}
-        }
-    }
-
-    async waitAfterDockerCompletion() {
-        const waitMs = this.waitAfterDockerMinutes * 60 * 1000;
-        const waitMinutes = this.waitAfterDockerMinutes;
-        
-        log('WAIT', `========================================`, 'info', this.instanceId);
-        log('WAIT', `⏰ Waiting ${waitMinutes} minutes before next cycle...`, 'warn', this.instanceId);
-        log('WAIT', `========================================`, 'info', this.instanceId);
-        
-        const startTime = Date.now();
-        const endTime = startTime + waitMs;
-        
-        while (Date.now() < endTime && this.isRunning) {
-            const remaining = endTime - Date.now();
-            const remainingMinutes = Math.floor(remaining / 60000);
-            const remainingSeconds = Math.floor((remaining % 60000) / 1000);
-            
-            if (remaining % 30000 < 1000) {
-                log('WAIT', `Remaining: ${remainingMinutes}m ${remainingSeconds}s`, 'info', this.instanceId);
-            }
-            await sleep(1000);
-        }
-        
-        log('WAIT', `✅ Wait period complete! Resuming...`, 'success', this.instanceId);
+        if (this.browser) await this.browser.close();
     }
 
     async run() {
@@ -722,18 +492,11 @@ class CleverCloudBot {
         
         log('START', `=== Instance ${this.instanceId} Starting ===`, 'info', this.instanceId);
         
-        const statusInterval = setInterval(() => {
-            if (this.isRunning) {
-                this.showDockerStatus();
-            }
-        }, 60000);
-        
         while (this.isRunning) {
             this.loopCount++;
             
             try {
                 await this.waitForDockerSlot();
-                
                 log('START', `=== Loop #${this.loopCount} ===`, 'info', this.instanceId);
                 await this.initBrowser();
                 
@@ -745,31 +508,24 @@ class CleverCloudBot {
                 await this.page.goto(verifyLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
                 await sleep(5000);
                 
-                const result = await this.startDockerInBackground(email, this.password);
-                
-                if (result.warning) {
-                    log('FINISH', `Account ${email} created but with warning: ${result.warning}`, 'warn', this.instanceId);
-                } else {
-                    log('FINISH', `Account ${email} created successfully!`, 'success', this.instanceId);
-                }
+                await this.startDockerInBackground(email, this.password);
+                log('FINISH', `Account ${email} created successfully!`, 'success', this.instanceId);
                 
                 await this.cleanup();
                 this.consecutiveFailures = 0;
                 
-                await this.waitAfterDockerCompletion();
+                // Wait 5 minutes before next cycle
+                log('WAIT', `Waiting ${this.waitAfterDockerMinutes} minutes before next cycle...`, 'warn', this.instanceId);
+                await sleep(this.waitAfterDockerMinutes * 60 * 1000);
                 
             } catch (e) {
                 this.consecutiveFailures++;
                 log('ERROR', `${e.message} (failure ${this.consecutiveFailures})`, 'error', this.instanceId);
                 await this.cleanup();
-                
                 const backoff = Math.min(60000, 10000 * Math.pow(2, this.consecutiveFailures));
-                log('RESTART', `Waiting ${backoff/1000}s...`, 'warn', this.instanceId);
                 await sleep(backoff);
             }
         }
-        
-        clearInterval(statusInterval);
     }
 
     stop() {
@@ -777,185 +533,402 @@ class CleverCloudBot {
     }
 }
 
-// Health check server for Scalingo
-const isScalingo = process.env.SCALINGO || process.env.CONTAINER === 'scalingo' || process.env.NODE_ENV === 'production';
+// ============ METRICS ============
+let metrics = {
+    startTime: new Date(),
+    totalAccounts: 0,
+    activeDockerProcesses: 0,
+    completedToday: 0,
+    failedAttempts: 0,
+    lastAccountCreated: null,
+    currentLoopCount: 0,
+    botStatus: 'starting',
+    botInstance: null
+};
 
-if (isScalingo) {
-    const http = require('http');
-    const server = http.createServer((req, res) => {
-        if (req.url === '/health' || req.url === '/') {
-            res.writeHead(200, { 'Content-Type': 'text/plain' });
-            res.end('OK');
-        } else {
-            res.writeHead(404);
-            res.end();
-        }
-    });
-    
-    const port = process.env.PORT || 3000;
-    server.listen(port, '0.0.0.0', () => {
-        console.log(`[SYSTEM] Health check server listening on port ${port}`.green);
-        console.log(`[SYSTEM] Bot is starting up...`.cyan);
-    });
-}
-
-class InstanceManager {
-    constructor() {
-        this.bots = [];
-        this.isShuttingDown = false;
-    }
-
-    async startInstances(config) {
-        const {
-            instances: instanceCount = parseInt(process.env.BOT_INSTANCES) || 1,
-            baseId = process.env.BOT_BASE_ID || 'INSTANCE',
-            maxConcurrent = parseInt(process.env.BOT_MAX_CONCURRENT) || 1,
-            password = process.env.BOT_PASSWORD || 'Linuxdistro&84',
-            startDelay = parseInt(process.env.BOT_START_DELAY) || 10,
-            delayBetweenInstances = parseInt(process.env.BOT_DELAY_BETWEEN) || 15,
-            waitAfterDocker = parseInt(process.env.BOT_WAIT_MINUTES) || 5
-        } = config;
-
-        console.log('\n' + '='.repeat(70));
-        console.log(' CLEVER CLOUD BOT STARTING '.yellow.bold);
-        console.log('='.repeat(70));
-        console.log(`  Instances: ${instanceCount}`);
-        console.log(`  Max concurrent: ${maxConcurrent}`);
-        console.log(`  Wait after Docker: ${waitAfterDocker} minutes`.green);
-        console.log(`  Environment: ${isScalingo ? 'Scalingo (Production)' : 'Local'}`);
-        console.log('='.repeat(70) + '\n');
-
-        for (let i = 1; i <= instanceCount; i++) {
-            const instanceId = `${baseId}_${i}`;
-            const instanceStartDelay = startDelay + (i - 1) * delayBetweenInstances;
-            
-            console.log(`[MANAGER] Starting ${instanceId}...`);
-            
-            const bot = new CleverCloudBot(
-                instanceId,
-                maxConcurrent,
-                password,
-                instanceStartDelay
-            );
-            
-            bot.waitAfterDockerMinutes = waitAfterDocker;
-            this.bots.push(bot);
-            
-            this.runBot(bot).catch(error => {
-                console.error(`[${instanceId}] Fatal error:`, error);
-            });
-            
-            if (i < instanceCount) {
-                await sleep(delayBetweenInstances * 1000);
+function getTotalAccounts() {
+    try {
+        const files = fs.readdirSync('.');
+        let total = 0;
+        files.forEach(file => {
+            if (file.startsWith('accounts_') && file.endsWith('.csv')) {
+                const data = fs.readFileSync(file, 'utf8');
+                total += data.trim().split('\n').length;
             }
-        }
-        
-        console.log(`\n[MANAGER] All ${instanceCount} instances started!`);
-        console.log(`[MANAGER] Bot is running. Press Ctrl+C to stop.\n`);
-        
-        this.setupGracefulShutdown();
-    }
-    
-    async runBot(bot) {
-        try {
-            await bot.run();
-        } catch (error) {
-            console.error(`[${bot.instanceId}] Bot error:`, error);
-        }
-    }
-    
-    setupGracefulShutdown() {
-        const shutdownHandler = async () => {
-            if (this.isShuttingDown) return;
-            this.isShuttingDown = true;
-            
-            console.log('\n' + '='.repeat(70).red);
-            console.log(' SHUTTING DOWN... '.red.bold);
-            console.log('='.repeat(70).red);
-            
-            const stopPromises = this.bots.map(async (bot) => {
-                console.log(`Stopping ${bot.instanceId}...`);
-                bot.stop();
-                await bot.cleanupAllDocker();
-                await bot.cleanup();
-            });
-            
-            await Promise.all(stopPromises);
-            console.log('[MANAGER] All instances stopped. Goodbye!'.yellow);
-            process.exit(0);
-        };
-        
-        process.on('SIGINT', shutdownHandler);
-        process.on('SIGTERM', shutdownHandler);
+        });
+        return total;
+    } catch (error) {
+        return 0;
     }
 }
 
-function parseArgs() {
-    const args = process.argv.slice(2);
-    const params = {
-        instances: parseInt(process.env.BOT_INSTANCES) || 1,
-        baseId: process.env.BOT_BASE_ID || 'INSTANCE',
-        maxConcurrent: parseInt(process.env.BOT_MAX_CONCURRENT) || 1,
-        password: process.env.BOT_PASSWORD || 'Linuxdistro&84',
-        startDelay: parseInt(process.env.BOT_START_DELAY) || 10,
-        delayBetweenInstances: parseInt(process.env.BOT_DELAY_BETWEEN) || 15,
-        waitAfterDocker: parseInt(process.env.BOT_WAIT_MINUTES) || 5
+function getTodayAccounts() {
+    try {
+        const files = fs.readdirSync('.');
+        let today = 0;
+        const todayStr = new Date().toISOString().split('T')[0];
+        files.forEach(file => {
+            if (file.startsWith('accounts_') && file.endsWith('.csv')) {
+                const data = fs.readFileSync(file, 'utf8');
+                const lines = data.trim().split('\n');
+                lines.forEach(line => {
+                    if (line.includes(todayStr)) today++;
+                });
+            }
+        });
+        return today;
+    } catch (error) {
+        return 0;
+    }
+}
+
+function getDockerProcessCount() {
+    try {
+        const stdout = execSync('ps aux | grep "bash /app/docker" | grep -v grep | wc -l', { encoding: 'utf8' });
+        return parseInt(stdout.trim());
+    } catch (error) {
+        return 0;
+    }
+}
+
+function getSystemMetrics() {
+    return {
+        cpuUsage: os.loadavg()[0].toFixed(2),
+        memoryUsage: {
+            total: (os.totalmem() / 1024 / 1024 / 1024).toFixed(2),
+            free: (os.freemem() / 1024 / 1024 / 1024).toFixed(2),
+            used: ((os.totalmem() - os.freemem()) / 1024 / 1024 / 1024).toFixed(2),
+            percentage: ((1 - os.freemem() / os.totalmem()) * 100).toFixed(1)
+        },
+        uptime: process.uptime(),
+        platform: os.platform(),
+        hostname: os.hostname()
     };
-    
-    for (let i = 0; i < args.length; i++) {
-        switch (args[i]) {
-            case '--instances':
-            case '-n':
-                if (args[i + 1] && !args[i + 1].startsWith('-')) {
-                    params.instances = parseInt(args[++i]);
-                }
-                break;
-            case '--wait':
-            case '-w':
-                if (args[i + 1] && !args[i + 1].startsWith('-')) {
-                    params.waitAfterDocker = parseInt(args[++i]);
-                }
-                break;
-            case '--help':
-            case '-h':
-                console.log(`
-Clever Cloud Bot - Scalingo Deployment
+}
 
-Features:
-  ✓ Automatic account creation with temporary email
-  ✓ Auto-fills email and password on OAuth page
-  ✓ Automatically clicks login button
-  ✓ Handles Docker deployment
-  ✓ Waits 5 minutes between accounts
-
-Usage: node bot.js [options]
-
-Options:
-  --instances, -n <number>     Number of instances (default: 1)
-  --wait, -w <minutes>         Wait time after Docker (default: 5)
-  --help, -h                   Show this help
-
-Environment Variables:
-  BOT_INSTANCES                Number of instances
-  BOT_PASSWORD                 Default password
-  BOT_WAIT_MINUTES             Wait time in minutes
-  PORT                         Health check port (default: 3000)
-                `);
-                process.exit(0);
-                break;
-        }
+// Start the bot
+function startBot() {
+    if (metrics.botInstance) {
+        console.log('[SERVER] Bot already running');
+        return;
     }
     
-    return params;
+    console.log('[SERVER] Starting bot...');
+    const bot = new CleverCloudBot('INSTANCE_1', 1, process.env.BOT_PASSWORD || 'Linuxdistro&84', 10);
+    metrics.botInstance = bot;
+    metrics.botStatus = 'running';
+    metrics.startTime = new Date();
+    
+    // Update metrics periodically
+    const interval = setInterval(() => {
+        metrics.totalAccounts = getTotalAccounts();
+        metrics.completedToday = getTodayAccounts();
+        metrics.activeDockerProcesses = getDockerProcessCount();
+        metrics.currentLoopCount = bot.loopCount;
+    }, 10000);
+    
+    bot.run().catch(error => {
+        console.error('[SERVER] Bot error:', error);
+        metrics.botStatus = 'error';
+    });
 }
 
-async function main() {
-    console.log(`\n🚀 Clever Cloud Bot Starting on Scalingo...\n`);
+// ============ EXPRESS ROUTES ============
+app.get('/api/metrics', (req, res) => {
+    const systemMetrics = getSystemMetrics();
+    res.json({
+        ...metrics,
+        system: systemMetrics,
+        timestamp: new Date()
+    });
+});
+
+app.get('/api/accounts', (req, res) => {
+    try {
+        const accounts = [];
+        const files = fs.readdirSync('.');
+        files.forEach(file => {
+            if (file.startsWith('accounts_') && file.endsWith('.csv')) {
+                const data = fs.readFileSync(file, 'utf8');
+                const lines = data.trim().split('\n');
+                lines.forEach(line => {
+                    const [email, password, date] = line.split(',');
+                    if (email && password) {
+                        accounts.push({ email, password, date, instance: file.replace('accounts_', '').replace('.csv', '') });
+                    }
+                });
+            }
+        });
+        res.json(accounts.reverse().slice(0, 100));
+    } catch (error) {
+        res.json([]);
+    }
+});
+
+app.get('/api/logs', (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit) || 50;
+        const files = fs.readdirSync('.');
+        const logFiles = files.filter(f => f.endsWith('.log')).sort().reverse();
+        let logs = [];
+        for (const file of logFiles.slice(0, 5)) {
+            const data = fs.readFileSync(file, 'utf8');
+            const lines = data.trim().split('\n').slice(-limit);
+            logs.push({ file, lines });
+        }
+        res.json(logs);
+    } catch (error) {
+        res.json([]);
+    }
+});
+
+// Dashboard HTML
+app.get('/', (req, res) => {
+    res.send(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clever Cloud Bot Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Inter', sans-serif; background: #f5f5f5; color: #1e1e2f; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+        
+        /* Header */
+        .header { margin-bottom: 32px; }
+        h1 { font-size: 28px; font-weight: 600; color: #1a1a2e; margin-bottom: 8px; }
+        .subtitle { color: #666; font-size: 14px; }
+        
+        /* Cards */
+        .card { background: white; border-radius: 16px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); margin-bottom: 24px; }
+        .card-title { font-size: 16px; font-weight: 600; color: #333; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+        .card-title .material-symbols-outlined { font-size: 20px; color: #666; }
+        
+        /* Metrics Grid */
+        .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+        .metric-card { background: white; border-radius: 12px; padding: 20px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+        .metric-value { font-size: 32px; font-weight: 700; color: #1a73e8; margin-bottom: 8px; }
+        .metric-label { font-size: 13px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
+        .metric-trend { font-size: 12px; margin-top: 8px; color: #4caf50; }
+        
+        /* Tables */
+        .table-responsive { overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; }
+        th { text-align: left; padding: 12px; background: #f8f9fa; font-weight: 600; font-size: 13px; color: #666; }
+        td { padding: 12px; border-bottom: 1px solid #eee; font-size: 13px; }
+        
+        /* Status Badge */
+        .status { display: inline-flex; align-items: center; gap: 6px; }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #4caf50; animation: pulse 2s infinite; }
+        .status-dot.stopped { background: #f44336; animation: none; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        
+        /* Refresh Button */
+        .refresh-btn { background: #1a73e8; color: white; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 500; transition: all 0.2s; }
+        .refresh-btn:hover { background: #1557b0; }
+        
+        /* Logs */
+        .log-entry { font-family: 'Monaco', monospace; font-size: 11px; padding: 4px 0; border-bottom: 1px solid #f0f0f0; color: #555; }
+        
+        @media (max-width: 768px) {
+            .container { padding: 16px; }
+            .metric-value { font-size: 24px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 Clever Cloud Bot Dashboard</h1>
+            <p class="subtitle">Real-time monitoring and metrics for your automation bot</p>
+        </div>
+        
+        <div class="metrics-grid" id="metricsGrid">
+            <div class="metric-card">
+                <div class="metric-value" id="totalAccounts">0</div>
+                <div class="metric-label">Total Accounts</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value" id="todayAccounts">0</div>
+                <div class="metric-label">Today's Accounts</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value" id="dockerProcesses">0</div>
+                <div class="metric-label">Active Docker Processes</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value" id="loopCount">0</div>
+                <div class="metric-label">Loop Count</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value" id="failedAttempts">0</div>
+                <div class="metric-label">Failed Attempts</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value" id="cpuUsage">0%</div>
+                <div class="metric-label">CPU Usage</div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <div class="card-title">
+                <span>📊</span> System Status
+                <div style="margin-left: auto;">
+                    <button class="refresh-btn" onclick="refreshData()">⟳ Refresh</button>
+                </div>
+            </div>
+            <div class="status">
+                <span class="status-dot" id="statusDot"></span>
+                <span id="botStatus">Loading...</span>
+                <span style="margin-left: 20px;">Started: <span id="startTime">-</span></span>
+                <span style="margin-left: 20px;">Uptime: <span id="uptime">-</span></span>
+            </div>
+        </div>
+        
+        <div class="card">
+            <div class="card-title">📋 Recent Accounts</div>
+            <div class="table-responsive">
+                <table id="accountsTable">
+                    <thead>
+                        <tr><th>Email</th><th>Password</th><th>Date</th><th>Instance</th></tr>
+                    </thead>
+                    <tbody id="accountsBody">
+                        <tr><td colspan="4">Loading...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <div class="card">
+            <div class="card-title">📄 Recent Logs</div>
+            <div id="logsContainer">Loading...</div>
+        </div>
+    </div>
     
-    const config = parseArgs();
-    const manager = new InstanceManager();
+    <script>
+        async function fetchMetrics() {
+            try {
+                const res = await fetch('/api/metrics');
+                const data = await res.json();
+                
+                document.getElementById('totalAccounts').textContent = data.totalAccounts || 0;
+                document.getElementById('todayAccounts').textContent = data.completedToday || 0;
+                document.getElementById('dockerProcesses').textContent = data.activeDockerProcesses || 0;
+                document.getElementById('loopCount').textContent = data.currentLoopCount || 0;
+                document.getElementById('failedAttempts').textContent = data.failedAttempts || 0;
+                document.getElementById('cpuUsage').textContent = (data.system?.cpuUsage || 0) + '%';
+                
+                const statusDot = document.getElementById('statusDot');
+                const botStatus = document.getElementById('botStatus');
+                if (data.botStatus === 'running') {
+                    statusDot.className = 'status-dot';
+                    botStatus.textContent = 'Running';
+                } else {
+                    statusDot.className = 'status-dot stopped';
+                    botStatus.textContent = 'Stopped';
+                }
+                
+                document.getElementById('startTime').textContent = new Date(data.startTime).toLocaleString();
+                
+                if (data.system?.uptime) {
+                    const hours = Math.floor(data.system.uptime / 3600);
+                    const minutes = Math.floor((data.system.uptime % 3600) / 60);
+                    document.getElementById('uptime').textContent = \`\${hours}h \${minutes}m\`;
+                }
+            } catch(e) { console.error(e); }
+        }
+        
+        async function fetchAccounts() {
+            try {
+                const res = await fetch('/api/accounts');
+                const accounts = await res.json();
+                const tbody = document.getElementById('accountsBody');
+                if (accounts.length === 0) {
+                    tbody.innerHTML = '<tr><(colspan="4">No accounts found</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = accounts.slice(0, 20).map(acc => \`
+                    <tr>
+                        <td>\${acc.email}</td>
+                        <td>\${acc.password}</td>
+                        <td>\${new Date(acc.date).toLocaleString()}</td>
+                        <td>\${acc.instance || '-'}</td>
+                    </tr>
+                \`).join('');
+            } catch(e) { console.error(e); }
+        }
+        
+        async function fetchLogs() {
+            try {
+                const res = await fetch('/api/logs');
+                const logs = await res.json();
+                const container = document.getElementById('logsContainer');
+                if (logs.length === 0) {
+                    container.innerHTML = '<div>No logs found</div>';
+                    return;
+                }
+                container.innerHTML = logs.map(log => \`
+                    <div style="margin-bottom: 16px;">
+                        <div style="font-weight: 600; margin-bottom: 8px;">📄 \${log.file}</div>
+                        <div style="background: #f8f9fa; padding: 12px; border-radius: 8px; font-size: 11px; font-family: monospace; max-height: 200px; overflow-y: auto;">
+                            \${log.lines.map(line => '<div class="log-entry">' + escapeHtml(line.substring(0, 200)) + '</div>').join('')}
+                        </div>
+                    </div>
+                \`).join('');
+            } catch(e) { console.error(e); }
+        }
+        
+        function escapeHtml(text) { return text.replace(/[&<>]/g, function(m) { if (m === '&') return '&amp;'; if (m === '<') return '&lt;'; if (m === '>') return '&gt;'; return m; }); }
+        
+        async function refreshData() {
+            await Promise.all([fetchMetrics(), fetchAccounts(), fetchLogs()]);
+        }
+        
+        refreshData();
+        setInterval(refreshData, 10000);
+    </script>
+</body>
+</html>
+    `);
+});
+
+// Start everything
+function main() {
+    console.log(`\\n🚀 Clever Cloud Bot Dashboard Starting...\\n`);
+    console.log(`📊 Dashboard available at: http://localhost:${port}`);
+    console.log(`📈 Metrics API: http://localhost:${port}/api/metrics`);
+    console.log(`📋 Accounts API: http://localhost:${port}/api/accounts`);
+    console.log(`📄 Logs API: http://localhost:${port}/api/logs\\n`);
     
-    await manager.startInstances(config);
+    // Start the bot
+    setTimeout(() => {
+        startBot();
+    }, 5000);
+    
+    // Start express server
+    app.listen(port, '0.0.0.0', () => {
+        console.log(`✅ Dashboard server running on port ${port}`);
+    });
 }
+
+// Handle graceful shutdown
+process.on('SIGINT', () => {
+    console.log('\\n🛑 Shutting down...');
+    if (metrics.botInstance) {
+        metrics.botInstance.stop();
+    }
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+    console.log('\\n🛑 Shutting down...');
+    if (metrics.botInstance) {
+        metrics.botInstance.stop();
+    }
+    process.exit(0);
+});
 
 main().catch(console.error);
