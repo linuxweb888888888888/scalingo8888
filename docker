@@ -1,96 +1,81 @@
-#linux8888="$(bash /project-name-generator/generate)"
+#!/bin/bash
+# /app/docker - Deploy 3 apps using buyrunplace/webwebwebweb8888 image
 
-#docker tag webwebwebwebwebweb/linuxpage webpackage/$(echo "$linux8888")
+set -e
 
-#docker push webpackage/$(echo "$linux8888")
+echo "===== Deploying 3 Apps with buyrunplace/webwebwebweb8888 ====="
 
-#cp /clever8874/Dockerfile8888 /clever8874/Dockerfile
-
-#sed -i "s/tradepage/$(echo "$linux8888")/g" /clever8874/Dockerfile
-
-#cd /clever8874/
-
-clever login
-
-#web="$(rig | cut -d$'\n' -f1 | sed "s/ /-/g" | tr '[:upper:]' '[:lower:]')"
-
-for ((n=0;n<$(echo "$2");n++))
-do
-
-#docker system prune -af
-
-linuxlinux8888="$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 16 | head -n 1)"
-
-#linux8888="$(cat /linuxwebweb8888 | shuf | tail -n1)"
-
-webwebwebweb8888="$(bash /docker8888)"
-
-#docker pull webwebwebwebwebweb/linuxpage
-
-#docker run -it -d webwebwebwebwebweb/linuxpage /bin/bash
-
-#docker export $(docker ps | grep "linuxpage" | sed "s/.* //g" | head -n1) > /latest.tar
-
-#cat /latest.tar | docker import - webwebwebwebwebweb/linuxpage
-
-#docker tag webwebwebwebwebweb/linuxpage webdomain/$(echo "$linuxlinux8888")
-
-#docker push webdomain/$(echo "$linuxlinux8888")
-
-linux8888="$(shuf -i8888-88888888 -n1)"
-
-mkdir /$linux8888/
-
-cp /clever8874/Dockerfile8888 /$linux8888/Dockerfile
-
-#random=$((RANDOM % 100))
-
-#if [ $random -lt 50 ]; then
-
-#cp /clever8874/Dockerfile8888 /$linux8888/Dockerfile"
-
-#else
-
-#cp /clever8874/Dockerfileubuntu8888 /$linux8888/Dockerfile"
-
-#fi
-
-random=$((RANDOM % 100))
-
-if [ $random -lt 50 ]; then
-
-sed -i "s/thetradeboxsignal88888888/ubuntuvnc8888/g" /$linux8888/Dockerfile
-
-sed -i "s/start/start/g" /$linux8888/Dockerfile
-
-sed -i "s/tradeinc/phemextradebot/g" /$linux8888/Dockerfile
-
-else
-
-sed -i "s/thetradeboxsignal88888888/webwebwebweb8888/g" /$linux8888/Dockerfile
-
-sed -i "s/start/start/g" /$linux8888/Dockerfile
-
-sed -i "s/tradeinc/buyrunplace/g" /$linux8888/Dockerfile
-
+# Check if clever is available
+if ! command -v clever &> /dev/null; then
+    echo "ERROR: clever command not found"
+    echo "Installing clever-tools..."
+    npm install -g clever-tools
 fi
 
-#sed -i "s/webweb8888/$(shuf -i8888-88888888 -n1)/g" /clever8874/Dockerfile
+# Check token
+if [ -z "$CLEVER_TOKEN" ]; then
+    echo "ERROR: CLEVER_TOKEN environment variable not set"
+    exit 1
+fi
 
-#sed -i "s/tradepage/$(echo "$linuxlinux8888")/g" /clever8874/Dockerfile
+# Login to Clever Cloud
+echo "Logging into Clever Cloud..."
+clever login --token "$CLEVER_TOKEN"
 
-cd /$linux8888/
+# Configuration
+IMAGE_NAME="buyrunplace/webwebwebweb8888"
+APP_COUNT=3
 
-git init
+echo "Image: $IMAGE_NAME"
+echo "Number of apps: $APP_COUNT"
 
-git add ./
+# Function to generate random name
+generate_name() {
+    cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 10 | head -n 1
+}
 
-bash ./linux8888 $linuxlinux8888 &
-
-echo "linux8888"
-
-sleep 10
-
+# Deploy apps
+for ((i=1; i<=$APP_COUNT; i++)); do
+    echo ""
+    echo "========================================="
+    echo "Deploying app $i of $APP_COUNT"
+    echo "========================================="
+    
+    # Generate unique app name
+    APP_NAME="webapp-$(generate_name)-${i}"
+    
+    echo "App name: $APP_NAME"
+    echo "Image: $IMAGE_NAME"
+    
+    # Create app with Docker image
+    clever create --type docker --image "$IMAGE_NAME" "$APP_NAME"
+    
+    # Set environment variables
+    clever env set APP_NUMBER "$i" --app "$APP_NAME"
+    clever env set DEPLOY_TIME "$(date)" --app "$APP_NAME"
+    clever env set DEPLOY_TYPE "buyrunplace" --app "$APP_NAME"
+    
+    # Deploy
+    echo "Deploying $APP_NAME..."
+    clever deploy --app "$APP_NAME" --force
+    
+    # Get the app URL
+    APP_URL="https://$APP_NAME.osc-fr1.scalingo.io"
+    echo "✅ App $i deployed: $APP_URL"
+    
+    # Wait between deployments
+    if [ $i -lt $APP_COUNT ]; then
+        echo "Waiting 15 seconds before next deployment..."
+        sleep 15
+    fi
 done
 
-sleep 80
+echo ""
+echo "========================================="
+echo "✅ All 3 apps deployed successfully!"
+echo "========================================="
+echo ""
+echo "Deployed apps:"
+clever apps | grep "webapp-" || echo "Check Clever Cloud dashboard"
+
+exit 0
