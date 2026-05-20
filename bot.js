@@ -12,27 +12,7 @@ const http = require('http');
 puppeteer.use(StealthPlugin());
 
 // Scalingo-specific configuration
-const isScalingo = process.env.SCALINGO || process.env.CONTAINER === 'scalingo';
-if (isScalingo) {
-    console.log('[SYSTEM] Running on Scalingo - configuring for headless environment'.yellow);
-}
-
-// Health check server for Scalingo
-if (isScalingo) {
-    const server = http.createServer((req, res) => {
-        if (req.url === '/health' || req.url === '/') {
-            res.writeHead(200);
-            res.end('OK');
-        } else {
-            res.writeHead(404);
-            res.end();
-        }
-    });
-    const port = process.env.PORT || 3000;
-    server.listen(port, () => {
-        console.log(`[SYSTEM] Health check server listening on port ${port}`.green);
-    });
-}
+const isScalingo = process.env.SCALINGO || process.env.CONTAINER === 'scalingo' || process.env.NODE_ENV === 'production';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -135,8 +115,11 @@ class CleverCloudBot {
     async initBrowser() {
         log('SYSTEM', 'Launching browser...', 'info', this.instanceId);
         
+        // Use Chrome from environment or default
+        const executablePath = process.env.GOOGLE_CHROME_SHIM || process.env.CHROME_PATH || null;
+        
         const launchOptions = {
-            headless: isScalingo ? 'new' : false,
+            headless: true, // Always headless on Scalingo
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -155,16 +138,17 @@ class CleverCloudBot {
                 '--safebrowsing-disable-auto-update',
                 '--disable-features=TranslateUI',
                 '--disable-ipc-flooding-protection',
-                '--use-fake-ui-for-media-stream'
+                '--use-fake-ui-for-media-stream',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+                '--max_old_space_size=512'
             ]
         };
         
-        // Add Scalingo-specific args
-        if (isScalingo) {
-            launchOptions.args.push('--single-process');
-            launchOptions.args.push('--disable-background-timer-throttling');
-            launchOptions.args.push('--disable-backgrounding-occluded-windows');
-            launchOptions.args.push('--disable-renderer-backgrounding');
+        if (executablePath) {
+            launchOptions.executablePath = executablePath;
+            log('SYSTEM', `Using Chrome at: ${executablePath}`, 'info', this.instanceId);
         }
         
         this.browser = await puppeteer.launch(launchOptions);
@@ -326,7 +310,6 @@ class CleverCloudBot {
 
     async handleOAuth(url, email, password) {
         log('OAUTH', `Opening OAuth URL...`, 'info', this.instanceId);
-        log('OAUTH', `URL: ${url.substring(0, 100)}...`, 'info', this.instanceId);
         
         try {
             const oauthPage = await this.browser.newPage();
@@ -336,13 +319,6 @@ class CleverCloudBot {
             log('OAUTH', 'OAuth page loaded, looking for login form...', 'info', this.instanceId);
             
             await sleep(5000);
-            
-            // Save debug files only if not on Scalingo (to save space)
-            if (!isScalingo) {
-                const screenshotPath = `oauth_debug_${this.instanceId}_${Date.now()}.png`;
-                await oauthPage.screenshot({ path: screenshotPath });
-                log('OAUTH', `Screenshot saved: ${screenshotPath}`, 'info', this.instanceId);
-            }
             
             // Try to find and fill email and password fields
             const credentialsFilled = await oauthPage.evaluate((email, password) => {
@@ -384,20 +360,13 @@ class CleverCloudBot {
                 
                 if (loginClicked) {
                     log('OAUTH', 'Login form submitted', 'success', this.instanceId);
-                } else {
-                    log('OAUTH', 'Could not find submit button', 'warn', this.instanceId);
                 }
             } else {
                 log('OAUTH', 'Could not find email/password fields', 'warn', this.instanceId);
             }
             
             await sleep(8000);
-            
-            const currentUrl = oauthPage.url();
-            log('OAUTH', `Final URL: ${currentUrl}`, 'info', this.instanceId);
-            
             await oauthPage.close();
-            
             log('OAUTH', 'OAuth flow completed', 'success', this.instanceId);
             return true;
             
@@ -413,7 +382,6 @@ class CleverCloudBot {
             const logFile = `docker_${this.instanceId}_${dockerId}.log`;
             
             log('DOCKER', `Starting background process for ${email}...`, 'info', this.instanceId);
-            log('DOCKER', `Log file: ${logFile}`, 'info', this.instanceId);
             
             const cmd = `source ~/.nvm/nvm.sh && bash /docker webwebwebweb8888 3 start buyrunplace --instance ${this.instanceId}`;
             const dockerProcess = spawn('bash', ['-c', cmd], {
@@ -453,9 +421,7 @@ class CleverCloudBot {
                     'Logged in successfully',
                     'Welcome',
                     'Session created',
-                    'Token acquired',
-                    'API token saved',
-                    'You are now logged in'
+                    'Token acquired'
                 ];
                 
                 for (const pattern of successPatterns) {
@@ -471,37 +437,17 @@ class CleverCloudBot {
                 outputBuffer += output;
                 fs.appendFileSync(logFile, output);
                 
-                const lines = output.split('\n');
-                for (const line of lines) {
-                    if (line.trim()) {
-                        if (line.toLowerCase().includes('error')) {
-                            log('DOCKER', `ERR: ${line.substring(0, 200)}`, 'error', this.instanceId);
-                        } else if (checkForSuccess(line)) {
-                            log('DOCKER', `SUCCESS: ${line.substring(0, 200)}`, 'success', this.instanceId);
-                        } else {
-                            log('DOCKER', `OUT: ${line.substring(0, 200)}`, 'info', this.instanceId);
-                        }
-                    }
-                }
-                
                 if (!oauthHandled && !dockerCompleted) {
                     const oauthUrl = extractOAuthUrl(output);
                     if (oauthUrl) {
                         oauthHandled = true;
-                        log('OAUTH', 'Found OAuth URL, opening in browser...', 'success', this.instanceId);
+                        log('OAUTH', 'Found OAuth URL, handling...', 'success', this.instanceId);
                         
                         try {
-                            const oauthSuccess = await this.handleOAuth(oauthUrl, email, password);
-                            if (oauthSuccess) {
-                                log('OAUTH', 'OAuth flow completed successfully', 'success', this.instanceId);
-                            } else {
-                                log('OAUTH', 'OAuth flow had issues', 'warn', this.instanceId);
-                            }
-                            
+                            await this.handleOAuth(oauthUrl, email, password);
                             await sleep(10000);
-                            
                         } catch (oauthError) {
-                            log('OAUTH', `OAuth handling failed: ${oauthError.message}`, 'error', this.instanceId);
+                            log('OAUTH', `OAuth failed: ${oauthError.message}`, 'error', this.instanceId);
                         }
                     }
                 }
@@ -524,16 +470,13 @@ class CleverCloudBot {
             dockerProcess.stderr.on('data', (data) => {
                 const err = data.toString();
                 fs.appendFileSync(logFile, `[STDERR] ${err}`);
-                log('DOCKER', `STDERR: ${err.substring(0, 200)}`, 'error', this.instanceId);
-                
-                if (err.toLowerCase().includes('cancelled')) {
-                    log('DOCKER', 'Deployment was cancelled', 'warn', this.instanceId);
+                if (err.toLowerCase().includes('error')) {
+                    log('DOCKER', `ERR: ${err.substring(0, 200)}`, 'error', this.instanceId);
                 }
             });
             
             dockerProcess.on('close', (code) => {
                 fs.appendFileSync(logFile, `\n--- PROCESS EXITED WITH CODE ${code} ---\n`);
-                fs.appendFileSync(logFile, `--- Last 1000 chars of output: ---\n${outputBuffer.slice(-1000)}\n`);
                 
                 const index = this.activeDockerProcesses.findIndex(p => p.id === dockerId);
                 if (index !== -1) {
@@ -541,37 +484,16 @@ class CleverCloudBot {
                 }
                 
                 if (!dockerCompleted && code === 0) {
-                    if (checkForSuccess(outputBuffer)) {
-                        dockerCompleted = true;
-                        log('DOCKER', `✓ Login successful for ${email} (detected in final output)!`, 'success', this.instanceId);
+                    if (oauthHandled) {
+                        log('DOCKER', `OAuth was handled, assuming success`, 'success', this.instanceId);
                         this.completedAccounts.push({ email, password, completedAt: new Date() });
                         fs.appendFileSync(`accounts_${this.instanceId}.csv`, `${email},${password},${new Date().toISOString()}\n`);
                         resolve({ success: true, email: email });
-                        return;
-                    }
-                    
-                    log('DOCKER', `Process exited with code 0 but no success message detected`, 'warn', this.instanceId);
-                    
-                    if (oauthHandled) {
-                        log('DOCKER', `OAuth was handled, assuming login successful`, 'success', this.instanceId);
-                        dockerCompleted = true;
-                        this.completedAccounts.push({ email, password, completedAt: new Date() });
-                        fs.appendFileSync(`accounts_${this.instanceId}.csv`, `${email},${password},${new Date().toISOString()},OAUTH_COMPLETED\n`);
-                        resolve({ success: true, email: email, warning: 'OAuth completed but no success message' });
                     } else {
-                        reject(new Error(`Docker process exited with code 0 without successful login or OAuth`));
+                        reject(new Error(`Docker exited with code ${code} without success`));
                     }
-                } 
-                else if (!dockerCompleted && code !== 0) {
-                    reject(new Error(`Docker process exited with code ${code} without successful login`));
-                }
-            });
-            
-            dockerProcess.on('error', (error) => {
-                log('DOCKER', `Process error: ${error.message}`, 'error', this.instanceId);
-                if (!dockerCompleted) {
-                    dockerCompleted = true;
-                    reject(new Error(`Docker process error: ${error.message}`));
+                } else if (!dockerCompleted) {
+                    reject(new Error(`Docker exited with code ${code}`));
                 }
             });
             
@@ -580,8 +502,7 @@ class CleverCloudBot {
             setTimeout(() => {
                 if (!dockerCompleted) {
                     dockerCompleted = true;
-                    log('DOCKER', `Process timeout after 15 minutes`, 'error', this.instanceId);
-                    reject(new Error('Docker process timeout after 15 minutes'));
+                    reject(new Error('Docker timeout after 15 minutes'));
                     try {
                         process.kill(dockerProcess.pid, 'SIGTERM');
                     } catch (e) {}
@@ -609,7 +530,6 @@ class CleverCloudBot {
         const waitMinutes = this.waitAfterDockerMinutes;
         
         log('WAIT', `========================================`, 'info', this.instanceId);
-        log('WAIT', `⏰ Docker process completed!`, 'success', this.instanceId);
         log('WAIT', `⏰ Waiting ${waitMinutes} minutes before next cycle...`, 'warn', this.instanceId);
         log('WAIT', `========================================`, 'info', this.instanceId);
         
@@ -621,24 +541,22 @@ class CleverCloudBot {
             const remainingMinutes = Math.floor(remaining / 60000);
             const remainingSeconds = Math.floor((remaining % 60000) / 1000);
             
-            if (remainingSeconds === 0 || remaining % 30000 < 1000) {
+            if (remaining % 30000 < 1000) {
                 log('WAIT', `Remaining: ${remainingMinutes}m ${remainingSeconds}s`, 'info', this.instanceId);
             }
             await sleep(1000);
         }
         
-        log('WAIT', `✅ Wait period complete! Resuming account creation...`, 'success', this.instanceId);
-        log('WAIT', `========================================`, 'info', this.instanceId);
+        log('WAIT', `✅ Wait period complete! Resuming...`, 'success', this.instanceId);
     }
 
     async run() {
         if (this.startDelay > 0) {
-            log('START', `Waiting ${this.startDelay} seconds before starting...`, 'warn', this.instanceId);
+            log('START', `Waiting ${this.startDelay} seconds...`, 'warn', this.instanceId);
             await sleep(this.startDelay * 1000);
         }
         
         log('START', `=== Instance ${this.instanceId} Starting ===`, 'info', this.instanceId);
-        log('START', `⏰ Will wait ${this.waitAfterDockerMinutes} minutes after each Docker completion`, 'info', this.instanceId);
         
         const statusInterval = setInterval(() => {
             if (this.isRunning) {
@@ -665,14 +583,9 @@ class CleverCloudBot {
                 
                 const result = await this.startDockerInBackground(email, this.password);
                 
-                if (result.warning) {
-                    log('FINISH', `Account ${email} created but with warning: ${result.warning}`, 'warn', this.instanceId);
-                } else {
-                    log('FINISH', `Account ${email} created successfully!`, 'success', this.instanceId);
-                }
+                log('FINISH', `Account ${email} created successfully!`, 'success', this.instanceId);
                 
                 await this.cleanup();
-                
                 this.consecutiveFailures = 0;
                 
                 await this.waitAfterDockerCompletion();
@@ -683,7 +596,7 @@ class CleverCloudBot {
                 await this.cleanup();
                 
                 const backoff = Math.min(60000, 10000 * Math.pow(2, this.consecutiveFailures));
-                log('RESTART', `Waiting ${backoff/1000}s before restart...`, 'warn', this.instanceId);
+                log('RESTART', `Waiting ${backoff/1000}s...`, 'warn', this.instanceId);
                 await sleep(backoff);
             }
         }
@@ -694,6 +607,25 @@ class CleverCloudBot {
     stop() {
         this.isRunning = false;
     }
+}
+
+// Health check server for Scalingo - MUST start immediately
+if (isScalingo) {
+    const server = http.createServer((req, res) => {
+        if (req.url === '/health' || req.url === '/') {
+            res.writeHead(200, { 'Content-Type': 'text/plain' });
+            res.end('OK');
+        } else {
+            res.writeHead(404);
+            res.end();
+        }
+    });
+    
+    const port = process.env.PORT || 3000;
+    server.listen(port, '0.0.0.0', () => {
+        console.log(`[SYSTEM] Health check server listening on port ${port}`.green);
+        console.log(`[SYSTEM] Bot is starting up...`.cyan);
+    });
 }
 
 class InstanceManager {
@@ -708,31 +640,25 @@ class InstanceManager {
             baseId = process.env.BOT_BASE_ID || 'INSTANCE',
             maxConcurrent = parseInt(process.env.BOT_MAX_CONCURRENT) || 1,
             password = process.env.BOT_PASSWORD || 'Linuxdistro&84',
-            startDelay = parseInt(process.env.BOT_START_DELAY) || 30,
-            delayBetweenInstances = parseInt(process.env.BOT_DELAY_BETWEEN) || 30,
+            startDelay = parseInt(process.env.BOT_START_DELAY) || 10,
+            delayBetweenInstances = parseInt(process.env.BOT_DELAY_BETWEEN) || 15,
             waitAfterDocker = parseInt(process.env.BOT_WAIT_MINUTES) || 5
         } = config;
 
         console.log('\n' + '='.repeat(70));
-        console.log(' MULTI-INSTANCE BOT MANAGER '.yellow.bold);
+        console.log(' CLEVER CLOUD BOT STARTING '.yellow.bold);
         console.log('='.repeat(70));
-        console.log(`  Total instances: ${instanceCount}`);
-        console.log(`  Base instance ID: ${baseId}`);
-        console.log(`  Max concurrent per instance: ${maxConcurrent}`);
-        console.log(`  Password: ${password}`);
-        console.log(`  Initial start delay: ${startDelay}s`);
-        console.log(`  Delay between instances: ${delayBetweenInstances}s`);
-        console.log(`  ⏰ Wait after Docker: ${waitAfterDocker} minutes`.green.bold);
-        console.log(`  🖥️  Environment: ${isScalingo ? 'Scalingo (Headless)' : 'Local (GUI)'}`);
+        console.log(`  Instances: ${instanceCount}`);
+        console.log(`  Max concurrent: ${maxConcurrent}`);
+        console.log(`  Wait after Docker: ${waitAfterDocker} minutes`.green);
+        console.log(`  Environment: ${isScalingo ? 'Scalingo (Production)' : 'Local'}`);
         console.log('='.repeat(70) + '\n');
-
-        console.log('[MANAGER] Starting instances...\n');
 
         for (let i = 1; i <= instanceCount; i++) {
             const instanceId = `${baseId}_${i}`;
             const instanceStartDelay = startDelay + (i - 1) * delayBetweenInstances;
             
-            console.log(`[MANAGER] Starting ${instanceId} (delay: ${instanceStartDelay}s)...`);
+            console.log(`[MANAGER] Starting ${instanceId}...`);
             
             const bot = new CleverCloudBot(
                 instanceId,
@@ -741,30 +667,23 @@ class InstanceManager {
                 instanceStartDelay
             );
             
-            if (waitAfterDocker) {
-                bot.waitAfterDockerMinutes = waitAfterDocker;
-            }
-            
+            bot.waitAfterDockerMinutes = waitAfterDocker;
             this.bots.push(bot);
             
+            // Run bot asynchronously
             this.runBot(bot).catch(error => {
                 console.error(`[${instanceId}] Fatal error:`, error);
             });
             
             if (i < instanceCount) {
-                console.log(`[MANAGER] Waiting ${delayBetweenInstances}s before next instance...`);
                 await sleep(delayBetweenInstances * 1000);
             }
         }
         
-        console.log(`\n[MANAGER] All ${instanceCount} instances started successfully!`);
-        console.log(`[MANAGER] ⏰ Each instance will wait ${waitAfterDocker} minutes after Docker completes`);
-        console.log(`[MANAGER] 🔐 OAuth will be automatically handled`);
-        console.log(`[MANAGER] Use Ctrl+C to stop all instances.\n`);
+        console.log(`\n[MANAGER] All ${instanceCount} instances started!`);
+        console.log(`[MANAGER] Bot is running. Press Ctrl+C to stop.\n`);
         
         this.setupGracefulShutdown();
-        
-        return new Promise(() => {});
     }
     
     async runBot(bot) {
@@ -781,20 +700,17 @@ class InstanceManager {
             this.isShuttingDown = true;
             
             console.log('\n' + '='.repeat(70).red);
-            console.log(' SHUTTING DOWN ALL INSTANCES '.red.bold);
+            console.log(' SHUTTING DOWN... '.red.bold);
             console.log('='.repeat(70).red);
             
-            console.log('[MANAGER] Stopping all bots...');
-            
             const stopPromises = this.bots.map(async (bot) => {
-                console.log(`[MANAGER] Stopping ${bot.instanceId}...`);
+                console.log(`Stopping ${bot.instanceId}...`);
                 bot.stop();
                 await bot.cleanupAllDocker();
                 await bot.cleanup();
             });
             
             await Promise.all(stopPromises);
-            
             console.log('[MANAGER] All instances stopped. Goodbye!'.yellow);
             process.exit(0);
         };
@@ -811,8 +727,8 @@ function parseArgs() {
         baseId: process.env.BOT_BASE_ID || 'INSTANCE',
         maxConcurrent: parseInt(process.env.BOT_MAX_CONCURRENT) || 1,
         password: process.env.BOT_PASSWORD || 'Linuxdistro&84',
-        startDelay: parseInt(process.env.BOT_START_DELAY) || 30,
-        delayBetweenInstances: parseInt(process.env.BOT_DELAY_BETWEEN) || 30,
+        startDelay: parseInt(process.env.BOT_START_DELAY) || 10,
+        delayBetweenInstances: parseInt(process.env.BOT_DELAY_BETWEEN) || 15,
         waitAfterDocker: parseInt(process.env.BOT_WAIT_MINUTES) || 5
     };
     
@@ -824,30 +740,6 @@ function parseArgs() {
                     params.instances = parseInt(args[++i]);
                 }
                 break;
-            case '--max':
-            case '-m':
-                if (args[i + 1] && !args[i + 1].startsWith('-')) {
-                    params.maxConcurrent = parseInt(args[++i]);
-                }
-                break;
-            case '--password':
-            case '-p':
-                if (args[i + 1] && !args[i + 1].startsWith('-')) {
-                    params.password = args[++i];
-                }
-                break;
-            case '--delay':
-            case '-d':
-                if (args[i + 1] && !args[i + 1].startsWith('-')) {
-                    params.startDelay = parseInt(args[++i]);
-                }
-                break;
-            case '--delay-between':
-            case '-db':
-                if (args[i + 1] && !args[i + 1].startsWith('-')) {
-                    params.delayBetweenInstances = parseInt(args[++i]);
-                }
-                break;
             case '--wait':
             case '-w':
                 if (args[i + 1] && !args[i + 1].startsWith('-')) {
@@ -857,37 +749,22 @@ function parseArgs() {
             case '--help':
             case '-h':
                 console.log(`
-╔═══════════════════════════════════════════════════════════════╗
-║         CLEVER CLOUD BOT - MULTI-INSTANCE MANAGER            ║
-╚═══════════════════════════════════════════════════════════════╝
+Clever Cloud Bot - Scalingo Deployment
 
 Usage: node bot.js [options]
 
 Options:
   --instances, -n <number>     Number of instances (default: 1)
-  --max, -m <number>           Max concurrent Docker per instance (default: 1)
-  --password, -p <pass>        Password for accounts (default: Linuxdistro&84)
-  --delay, -d <seconds>        Initial delay before first instance (default: 30)
-  --delay-between, -db <sec>   Delay between instances (default: 30)
-  --wait, -w <minutes>         Wait time after Docker completes (default: 5)
+  --wait, -w <minutes>         Wait time after Docker (default: 5)
   --help, -h                   Show this help
 
-Environment Variables (for Scalingo):
+Environment Variables:
   BOT_INSTANCES                Number of instances
-  BOT_PASSWORD                 Default password for accounts
-  BOT_WAIT_MINUTES             Wait time after Docker completes
-  BOT_MAX_CONCURRENT           Max concurrent Docker processes
-  BOT_START_DELAY              Initial start delay in seconds
-  BOT_DELAY_BETWEEN            Delay between instances in seconds
-
-The bot automatically detects Scalingo environment and adjusts settings.
+  BOT_PASSWORD                 Default password
+  BOT_WAIT_MINUTES             Wait time in minutes
+  PORT                         Health check port (default: 3000)
                 `);
                 process.exit(0);
-                break;
-            default:
-                if (!args[i].startsWith('-') && params.password === 'Linuxdistro&84') {
-                    params.password = args[i];
-                }
                 break;
         }
     }
@@ -895,21 +772,16 @@ The bot automatically detects Scalingo environment and adjusts settings.
     return params;
 }
 
+// Main entry point
 async function main() {
+    console.log(`\n🚀 Clever Cloud Bot Starting on Scalingo...\n`);
+    
     const config = parseArgs();
-    
-    if (config.instances < 1 || isNaN(config.instances)) {
-        console.error('Error: Invalid number of instances. Using default: 1');
-        config.instances = 1;
-    }
-    
-    console.log('\nConfiguration:', config);
-    console.log(`\n⏰ Bot will wait ${config.waitAfterDocker} minutes after each Docker command completes`);
-    console.log(`🔐 Bot will automatically handle OAuth authentication`);
-    console.log(`🖥️  Running in ${isScalingo ? 'Scalingo (Headless)' : 'Local (GUI)'} mode\n`);
-    
     const manager = new InstanceManager();
+    
+    // Start the bot instances
     await manager.startInstances(config);
 }
 
+// Start the application
 main().catch(console.error);
