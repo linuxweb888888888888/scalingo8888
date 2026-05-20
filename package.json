@@ -1,14 +1,13 @@
 {
   "name": "clever-cloud-bot",
   "version": "1.0.0",
-  "description": "Clever Cloud Automation Bot",
+  "description": "Clever Cloud Automation Bot for Scalingo",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js",
-    "start:multi": "node bot.js --instances 2 --wait 5",
-    "dev": "node bot.js --instances 1 --wait 2"
+    "start": "node bot.js"
   },
   "dependencies": {
+    "puppeteer": "^21.11.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "colors": "^1.4.0"
