@@ -6,11 +6,8 @@ const colors = require('colors');
 const { exec } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
-const http = require('https');
+const https = require('https');
 const { createWriteStream } = require('fs');
-const { pipeline } = require('stream');
-const { promisify } = require('util');
-const streamPipeline = promisify(pipeline);
 
 // Apply stealth plugin
 puppeteer.use(StealthPlugin());
@@ -30,7 +27,7 @@ function log(step, message, type = 'info', instanceId = 'MAIN') {
 async function downloadFile(url, destPath) {
     return new Promise((resolve, reject) => {
         const file = createWriteStream(destPath);
-        http.get(url, (response) => {
+        https.get(url, (response) => {
             if (response.statusCode !== 200) {
                 reject(new Error(`Failed to download: ${response.statusCode}`));
                 return;
@@ -48,7 +45,6 @@ async function downloadFile(url, destPath) {
 async function installChromiumRuntime() {
     const chromePath = '/app/chrome-linux64/chrome';
     
-    // Check if already installed
     if (fs.existsSync(chromePath)) {
         const stats = fs.statSync(chromePath);
         if (stats.size > 50000000) {
@@ -60,12 +56,10 @@ async function installChromiumRuntime() {
     log('SYSTEM', 'Installing Chromium at runtime...', 'info', 'MAIN');
     
     try {
-        // Create directory
         if (!fs.existsSync('/app')) {
             fs.mkdirSync('/app', { recursive: true });
         }
         
-        // Download Chromium
         const chromeUrl = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
         const zipPath = '/tmp/chromium.zip';
         
@@ -73,25 +67,17 @@ async function installChromiumRuntime() {
         await downloadFile(chromeUrl, zipPath);
         log('SYSTEM', 'Download complete', 'success', 'MAIN');
         
-        // Extract
         log('SYSTEM', 'Extracting Chromium...', 'info', 'MAIN');
         execSync(`unzip -q ${zipPath} -d /app/`, { stdio: 'inherit' });
         
-        // Make executable
         if (fs.existsSync(chromePath)) {
             fs.chmodSync(chromePath, 0o755);
             log('SYSTEM', `Chromium installed successfully at: ${chromePath}`, 'success', 'MAIN');
-            
-            // Test it
             const version = execSync(`${chromePath} --version`, { encoding: 'utf8' });
             log('SYSTEM', `Chromium version: ${version.trim()}`, 'success', 'MAIN');
-            
-            // Cleanup
             fs.unlinkSync(zipPath);
-            
             return chromePath;
         } else {
-            // Try to find where it was extracted
             const findResult = execSync('find /app -name "chrome" -type f 2>/dev/null | head -1', { encoding: 'utf8' }).trim();
             if (findResult) {
                 fs.chmodSync(findResult, 0o755);
@@ -131,7 +117,7 @@ class CleverCloudBot {
 
     async getDockerProcessCount() {
         try {
-            const { stdout } = await execPromise(`ps aux | grep "bash /docker" | grep "${this.instanceId}" | grep -v grep | wc -l`);
+            const { stdout } = await execPromise(`ps aux | grep "bash /app/docker" | grep "${this.instanceId}" | grep -v grep | wc -l`);
             const count = parseInt(stdout.trim());
             return count;
         } catch (error) {
@@ -141,7 +127,7 @@ class CleverCloudBot {
 
     async getTotalDockerProcessCount() {
         try {
-            const { stdout } = await execPromise('ps aux | grep "bash /docker" | grep -v grep | wc -l');
+            const { stdout } = await execPromise('ps aux | grep "bash /app/docker" | grep -v grep | wc -l');
             const count = parseInt(stdout.trim());
             return count;
         } catch (error) {
@@ -166,7 +152,7 @@ class CleverCloudBot {
         
         if (myCount > 0) {
             try {
-                const { stdout } = await execPromise(`ps aux | grep "bash /docker" | grep "${this.instanceId}" | grep -v grep`);
+                const { stdout } = await execPromise(`ps aux | grep "bash /app/docker" | grep "${this.instanceId}" | grep -v grep`);
                 const lines = stdout.trim().split('\n');
                 console.log(`  Running Docker instances (Instance ${this.instanceId}):`.yellow);
                 lines.forEach((line, index) => {
@@ -198,7 +184,6 @@ class CleverCloudBot {
     async initBrowser() {
         log('SYSTEM', 'Setting up browser...', 'info', this.instanceId);
         
-        // Install Chromium if not found
         if (!this.chromePath || !fs.existsSync(this.chromePath)) {
             this.chromePath = await installChromiumRuntime();
         }
@@ -240,16 +225,12 @@ class CleverCloudBot {
         
         try {
             this.browser = await puppeteer.launch(launchOptions);
-            
             this.page = await this.browser.newPage();
             await this.page.setViewport({ width: 1280, height: 800 });
-            
             this.page.setDefaultTimeout(60000);
             this.page.setDefaultNavigationTimeout(60000);
-            
             const version = await this.browser.version();
             log('SYSTEM', `Browser version: ${version}`, 'success', this.instanceId);
-            
         } catch (error) {
             log('SYSTEM', `Failed to launch: ${error.message}`, 'error', this.instanceId);
             throw error;
@@ -282,7 +263,6 @@ class CleverCloudBot {
             
             log('EMAIL', `Temp Email: ${this.realTempEmail}`, 'success', this.instanceId);
             return this.realTempEmail;
-            
         } catch (error) {
             await this.mailPage.close();
             throw error;
@@ -297,9 +277,7 @@ class CleverCloudBot {
                 waitUntil: 'domcontentloaded', 
                 timeout: 60000 
             });
-            
             await sleep(3000);
-            
             await this.page.waitForSelector('input[type="email"]', { timeout: 30000 });
             await this.page.type('input[type="email"]', email, { delay: 20 });
             await this.page.type('input[type="password"]', password, { delay: 20 });
@@ -337,7 +315,6 @@ class CleverCloudBot {
                 }
                 await sleep(1000);
             }
-            
             console.log();
 
             log('SIGNUP', 'Submitting form...', 'info', this.instanceId);
@@ -346,7 +323,6 @@ class CleverCloudBot {
                 if (b) b.click();
             });
             await sleep(8000);
-            
         } catch (error) {
             log('SIGNUP', `Failed: ${error.message}`, 'error', this.instanceId);
             throw error;
@@ -406,6 +382,7 @@ class CleverCloudBot {
 
     async handleOAuth(url, email, password) {
         log('OAUTH', `Opening OAuth URL...`, 'info', this.instanceId);
+        log('OAUTH', `URL: ${url.substring(0, 100)}...`, 'info', this.instanceId);
         
         try {
             const oauthPage = await this.browser.newPage();
@@ -416,9 +393,38 @@ class CleverCloudBot {
             
             await sleep(5000);
             
+            // Auto-fill email and password
             const credentialsFilled = await oauthPage.evaluate((email, password) => {
-                const emailField = document.querySelector('input[type="email"], input[name="email"], input[id="email"]');
-                const passwordField = document.querySelector('input[type="password"], input[name="password"], input[id="password"]');
+                // Find email field
+                const emailSelectors = [
+                    'input[type="email"]',
+                    'input[name="email"]',
+                    'input[id="email"]',
+                    'input[placeholder*="email"]',
+                    'input[placeholder*="Email"]'
+                ];
+                
+                // Find password field
+                const passwordSelectors = [
+                    'input[type="password"]',
+                    'input[name="password"]',
+                    'input[id="password"]',
+                    'input[placeholder*="password"]',
+                    'input[placeholder*="Password"]'
+                ];
+                
+                let emailField = null;
+                let passwordField = null;
+                
+                for (const selector of emailSelectors) {
+                    emailField = document.querySelector(selector);
+                    if (emailField) break;
+                }
+                
+                for (const selector of passwordSelectors) {
+                    passwordField = document.querySelector(selector);
+                    if (passwordField) break;
+                }
                 
                 if (emailField && passwordField) {
                     emailField.value = email;
@@ -438,29 +444,62 @@ class CleverCloudBot {
                 log('OAUTH', 'Credentials filled successfully', 'success', this.instanceId);
                 await sleep(2000);
                 
+                // Click login button
                 const loginClicked = await oauthPage.evaluate(() => {
-                    const submitBtn = document.querySelector('button[type="submit"], input[type="submit"]');
-                    if (submitBtn) {
-                        submitBtn.click();
+                    // Find submit/login button
+                    const buttonSelectors = [
+                        'button[type="submit"]',
+                        'input[type="submit"]',
+                        'button:contains("Login")',
+                        'button:contains("Sign in")',
+                        'button:contains("Log in")',
+                        'button:contains("Continue")',
+                        '.btn-primary',
+                        '.btn-login',
+                        'button[class*="login"]',
+                        '#login-button'
+                    ];
+                    
+                    // Find any button with login text
+                    const allButtons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
+                    const loginButton = allButtons.find(btn => {
+                        const text = (btn.innerText || btn.value || '').toLowerCase();
+                        return text.includes('login') || 
+                               text.includes('sign in') || 
+                               text.includes('log in') ||
+                               text.includes('continue') ||
+                               text.includes('submit');
+                    });
+                    
+                    if (loginButton) {
+                        loginButton.click();
                         return true;
                     }
                     
+                    // Try to submit the form directly
                     const form = document.querySelector('form');
                     if (form) {
                         form.submit();
                         return true;
                     }
+                    
                     return false;
                 });
                 
                 if (loginClicked) {
-                    log('OAUTH', 'Login form submitted', 'success', this.instanceId);
+                    log('OAUTH', 'Login button clicked!', 'success', this.instanceId);
+                } else {
+                    log('OAUTH', 'Could not find login button', 'warn', this.instanceId);
                 }
             } else {
                 log('OAUTH', 'Could not find email/password fields', 'warn', this.instanceId);
             }
             
             await sleep(8000);
+            
+            const currentUrl = oauthPage.url();
+            log('OAUTH', `Final URL: ${currentUrl}`, 'info', this.instanceId);
+            
             await oauthPage.close();
             log('OAUTH', 'OAuth flow completed', 'success', this.instanceId);
             return true;
@@ -478,7 +517,25 @@ class CleverCloudBot {
             
             log('DOCKER', `Starting background process for ${email}...`, 'info', this.instanceId);
             
-            const cmd = `source ~/.nvm/nvm.sh && bash /docker webwebwebweb8888 3 start buyrunplace --instance ${this.instanceId}`;
+            // Use the docker script at /app/docker (your script handles linux8888 internally)
+            const dockerScriptPath = '/app/docker';
+            
+            if (!fs.existsSync(dockerScriptPath)) {
+                log('DOCKER', `Docker script not found at ${dockerScriptPath}`, 'error', this.instanceId);
+                reject(new Error('Docker script not found'));
+                return;
+            }
+            
+            // Make executable
+            try {
+                fs.chmodSync(dockerScriptPath, 0o755);
+            } catch (e) {}
+            
+            // Execute docker script - it will handle clever login and everything internally
+            const cmd = `source ~/.nvm/nvm.sh && bash ${dockerScriptPath} webwebwebweb8888 3 start buyrunplace --instance ${this.instanceId}`;
+            
+            log('DOCKER', `Executing: ${cmd}`, 'info', this.instanceId);
+            
             const dockerProcess = spawn('bash', ['-c', cmd], {
                 detached: true,
                 stdio: ['ignore', 'pipe', 'pipe']
@@ -516,7 +573,8 @@ class CleverCloudBot {
                     'Logged in successfully',
                     'Welcome',
                     'Session created',
-                    'Token acquired'
+                    'Token acquired',
+                    'Deployment successful'
                 ];
                 
                 for (const pattern of successPatterns) {
@@ -531,6 +589,19 @@ class CleverCloudBot {
                 const output = data.toString();
                 outputBuffer += output;
                 fs.appendFileSync(logFile, output);
+                
+                const lines = output.split('\n');
+                for (const line of lines) {
+                    if (line.trim()) {
+                        if (line.toLowerCase().includes('error')) {
+                            log('DOCKER', `ERR: ${line.substring(0, 200)}`, 'error', this.instanceId);
+                        } else if (checkForSuccess(line)) {
+                            log('DOCKER', `SUCCESS: ${line.substring(0, 200)}`, 'success', this.instanceId);
+                        } else {
+                            log('DOCKER', `OUT: ${line.substring(0, 200)}`, 'info', this.instanceId);
+                        }
+                    }
+                }
                 
                 if (!oauthHandled && !dockerCompleted) {
                     const oauthUrl = extractOAuthUrl(output);
@@ -565,13 +636,12 @@ class CleverCloudBot {
             dockerProcess.stderr.on('data', (data) => {
                 const err = data.toString();
                 fs.appendFileSync(logFile, `[STDERR] ${err}`);
-                if (err.toLowerCase().includes('error')) {
-                    log('DOCKER', `ERR: ${err.substring(0, 200)}`, 'error', this.instanceId);
-                }
+                log('DOCKER', `STDERR: ${err.substring(0, 200)}`, 'error', this.instanceId);
             });
             
             dockerProcess.on('close', (code) => {
                 fs.appendFileSync(logFile, `\n--- PROCESS EXITED WITH CODE ${code} ---\n`);
+                fs.appendFileSync(logFile, `--- Last 1000 chars of output: ---\n${outputBuffer.slice(-1000)}\n`);
                 
                 const index = this.activeDockerProcesses.findIndex(p => p.id === dockerId);
                 if (index !== -1) {
@@ -592,11 +662,20 @@ class CleverCloudBot {
                 }
             });
             
+            dockerProcess.on('error', (error) => {
+                log('DOCKER', `Process error: ${error.message}`, 'error', this.instanceId);
+                if (!dockerCompleted) {
+                    dockerCompleted = true;
+                    reject(new Error(`Docker process error: ${error.message}`));
+                }
+            });
+            
             dockerProcess.unref();
             
             setTimeout(() => {
                 if (!dockerCompleted) {
                     dockerCompleted = true;
+                    log('DOCKER', `Process timeout after 15 minutes`, 'error', this.instanceId);
                     reject(new Error('Docker timeout after 15 minutes'));
                     try {
                         process.kill(dockerProcess.pid, 'SIGTERM');
@@ -678,7 +757,11 @@ class CleverCloudBot {
                 
                 const result = await this.startDockerInBackground(email, this.password);
                 
-                log('FINISH', `Account ${email} created successfully!`, 'success', this.instanceId);
+                if (result.warning) {
+                    log('FINISH', `Account ${email} created but with warning: ${result.warning}`, 'warn', this.instanceId);
+                } else {
+                    log('FINISH', `Account ${email} created successfully!`, 'success', this.instanceId);
+                }
                 
                 await this.cleanup();
                 this.consecutiveFailures = 0;
@@ -708,6 +791,7 @@ class CleverCloudBot {
 const isScalingo = process.env.SCALINGO || process.env.CONTAINER === 'scalingo' || process.env.NODE_ENV === 'production';
 
 if (isScalingo) {
+    const http = require('http');
     const server = http.createServer((req, res) => {
         if (req.url === '/health' || req.url === '/') {
             res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -767,7 +851,6 @@ class InstanceManager {
             bot.waitAfterDockerMinutes = waitAfterDocker;
             this.bots.push(bot);
             
-            // Run bot asynchronously
             this.runBot(bot).catch(error => {
                 console.error(`[${instanceId}] Fatal error:`, error);
             });
@@ -848,6 +931,13 @@ function parseArgs() {
                 console.log(`
 Clever Cloud Bot - Scalingo Deployment
 
+Features:
+  ✓ Automatic account creation with temporary email
+  ✓ Auto-fills email and password on OAuth page
+  ✓ Automatically clicks login button
+  ✓ Handles Docker deployment
+  ✓ Waits 5 minutes between accounts
+
 Usage: node bot.js [options]
 
 Options:
@@ -869,16 +959,13 @@ Environment Variables:
     return params;
 }
 
-// Main entry point
 async function main() {
     console.log(`\n🚀 Clever Cloud Bot Starting on Scalingo...\n`);
     
     const config = parseArgs();
     const manager = new InstanceManager();
     
-    // Start the bot instances
     await manager.startInstances(config);
 }
 
-// Start the application
 main().catch(console.error);
