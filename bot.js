@@ -22,33 +22,6 @@ function log(step, message, type = 'info', instanceId = 'MAIN') {
     else console.log(`${prefix} ${'ℹ'.cyan} ${message.white}`);
 }
 
-// Find REAL Chromium (not snap stub)
-function findRealChrome() {
-    // Priority paths for manually installed Chromium
-    const pathsToCheck = [
-        '/app/chromium/chrome-linux64/chrome',
-        '/app/chromium/chrome-linux/chrome',
-        '/app/bin/chrome',
-        process.env.PUPPETEER_EXECUTABLE_PATH
-    ];
-    
-    for (const p of pathsToCheck) {
-        if (p && fs.existsSync(p)) {
-            try {
-                const stats = fs.statSync(p);
-                // Real Chrome binary is > 50MB, snap stub is tiny
-                if (stats.size > 50000000) {
-                    console.log(`[SYSTEM] Found REAL Chrome: ${p} (${(stats.size/1024/1024).toFixed(2)} MB)`.green);
-                    return p;
-                }
-            } catch (e) {}
-        }
-    }
-    
-    console.log('[SYSTEM] No real Chrome found'.yellow);
-    return null;
-}
-
 class CleverCloudBot {
     constructor(instanceId, maxConcurrent, password, startDelay = 0) {
         this.instanceId = instanceId;
@@ -68,7 +41,6 @@ class CleverCloudBot {
         this.consecutiveFailures = 0;
         this.waitAfterDockerMinutes = parseInt(process.env.BOT_WAIT_MINUTES) || 5;
         this.oauthUrl = null;
-        this.chromePath = null;
     }
 
     async getDockerProcessCount() {
@@ -140,13 +112,30 @@ class CleverCloudBot {
     async initBrowser() {
         log('SYSTEM', 'Launching browser...', 'info', this.instanceId);
         
-        // Find real Chrome only once
-        if (!this.chromePath) {
-            this.chromePath = findRealChrome();
+        // Direct path to the installed Chromium
+        const chromePath = '/app/chromium/chrome-linux64/chrome';
+        
+        // Check if Chrome exists at the path
+        if (fs.existsSync(chromePath)) {
+            const stats = fs.statSync(chromePath);
+            log('SYSTEM', `Found Chromium at: ${chromePath} (${(stats.size/1024/1024).toFixed(2)} MB)`, 'success', this.instanceId);
+        } else {
+            log('SYSTEM', `Chromium not found at ${chromePath}`, 'error', this.instanceId);
+            // Try to find it anywhere
+            const { execSync } = require('child_process');
+            try {
+                const found = execSync('find /app -name "chrome" -type f 2>/dev/null | head -1', { encoding: 'utf8' }).trim();
+                if (found) {
+                    log('SYSTEM', `Found Chromium at: ${found}`, 'success', this.instanceId);
+                } else {
+                    log('SYSTEM', 'No Chromium found!', 'error', this.instanceId);
+                }
+            } catch (e) {}
         }
         
         const launchOptions = {
             headless: true,
+            executablePath: '/app/chromium/chrome-linux64/chrome',
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -172,13 +161,6 @@ class CleverCloudBot {
                 '--max_old_space_size=512'
             ]
         };
-        
-        if (this.chromePath) {
-            launchOptions.executablePath = this.chromePath;
-            log('SYSTEM', `Using Chrome at: ${this.chromePath}`, 'success', this.instanceId);
-        } else {
-            log('SYSTEM', 'No Chrome found, will use default', 'warn', this.instanceId);
-        }
         
         try {
             this.browser = await puppeteer.launch(launchOptions);
