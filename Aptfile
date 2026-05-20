@@ -1,4 +1,6 @@
 chromium
+chromium-browser
+chromium-codecs-ffmpeg-extra
 libx11-6
 libx11-xcb1
 libxcb1
