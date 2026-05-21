@@ -11,7 +11,9 @@
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "express": "^4.18.2",
-    "clever-tools": "^4.7.0"
+    "clever-tools": "^4.7.0",
+    "https-proxy-agent": "^7.0.0",
+    "socks-proxy-agent": "^8.0.0"
   },
   "engines": {
     "node": "20.x"
