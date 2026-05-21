@@ -124,15 +124,28 @@ async function installChromiumRuntime() {
     }
 }
 
-// ============ INSTALL SCALINGO CLI (FIXED) ============
+// ============ INSTALL SCALINGO CLI (NO APT-GET) ============
 async function installScalingoCLI() {
+    const cliPath = '/app/bin/scalingo';
+    
+    // Check if already installed
+    if (fs.existsSync(cliPath)) {
+        log('CLI', 'Scalingo CLI already installed', 'success', 'MAIN');
+        return true;
+    }
+    
+    log('CLI', 'Installing Scalingo CLI...', 'info', 'MAIN');
+    
     return new Promise((resolve) => {
-        log('CLI', 'Installing Scalingo CLI...', 'info', 'MAIN');
+        // Create bin directory
+        if (!fs.existsSync('/app/bin')) {
+            fs.mkdirSync('/app/bin', { recursive: true });
+        }
         
-        // Method 1: Try apt-get
-        const installCmd = `apt-get update && apt-get install -y scalingo-cli 2>/dev/null || curl -fsSL https://cli.scalingo.com/install.sh | bash`;
+        // Download the CLI binary directly - NO apt-get!
+        const downloadCmd = `curl -L -o /app/bin/scalingo https://github.com/Scalingo/cli/releases/latest/download/scalingo-linux-amd64 && chmod +x /app/bin/scalingo`;
         
-        const child = spawn('bash', ['-c', installCmd], {
+        const child = spawn('bash', ['-c', downloadCmd], {
             stdio: ['ignore', 'pipe', 'pipe']
         });
         
@@ -141,10 +154,13 @@ async function installScalingoCLI() {
         child.stderr.on('data', (data) => { output += data.toString(); });
         
         child.on('close', (code) => {
-            if (code === 0) {
+            if (code === 0 && fs.existsSync(cliPath)) {
                 log('CLI', 'Scalingo CLI installed successfully', 'success', 'MAIN');
-                // Add to PATH
-                process.env.PATH = `/usr/local/bin:/usr/bin:/bin:${process.env.PATH}`;
+                // Create symlink
+                try {
+                    fs.symlinkSync(cliPath, '/usr/local/bin/scalingo');
+                } catch(e) {}
+                process.env.PATH = `/app/bin:${process.env.PATH}`;
                 resolve(true);
             } else {
                 log('CLI', `Failed to install Scalingo CLI: ${output.substring(0, 200)}`, 'error', 'MAIN');
@@ -157,16 +173,22 @@ async function installScalingoCLI() {
 // ============ LOGIN TO SCALINGO ============
 async function loginToScalingo() {
     const apiToken = ENV.SCALINGO_API_TOKEN;
+    const cliPath = '/app/bin/scalingo';
     
     if (!apiToken) {
         log('CLI', 'No API token found', 'warn', 'MAIN');
         return false;
     }
     
+    if (!fs.existsSync(cliPath)) {
+        log('CLI', 'Scalingo CLI not found', 'error', 'MAIN');
+        return false;
+    }
+    
     log('CLI', 'Logging into Scalingo...', 'info', 'MAIN');
     
     return new Promise((resolve) => {
-        const loginCmd = `scalingo login --api-token "${apiToken}"`;
+        const loginCmd = `${cliPath} login --api-token "${apiToken}"`;
         
         const child = spawn('bash', ['-c', loginCmd], {
             stdio: ['pipe', 'pipe', 'pipe']
@@ -187,16 +209,22 @@ async function loginToScalingo() {
 // ============ RESTART VIA CLI ============
 async function restartWithCLI() {
     const appName = ENV.SCALINGO_APP_NAME;
+    const cliPath = '/app/bin/scalingo';
     
     if (!appName) {
         log('RESTART', 'SCALINGO_APP_NAME not set', 'error', 'MAIN');
         return false;
     }
     
+    if (!fs.existsSync(cliPath)) {
+        log('RESTART', 'Scalingo CLI not found', 'error', 'MAIN');
+        return false;
+    }
+    
     log('RESTART', `Restarting ${appName} via CLI...`, 'info', 'MAIN');
     
     return new Promise((resolve) => {
-        const restartCmd = `scalingo --app ${appName} restart`;
+        const restartCmd = `${cliPath} --app ${appName} restart`;
         
         const child = spawn('bash', ['-c', restartCmd], {
             stdio: ['ignore', 'pipe', 'pipe']
@@ -323,7 +351,7 @@ class CleverCloudBot {
     }
 
     async getVerificationLink() {
-        log('VERIFY', 'Waiting for verification email (max 3 min)...', 'info', this.instanceId);
+        log('VERIFY', 'Waiting for verification email...', 'info', this.instanceId);
         const startTime = Date.now();
         let emailFound = false;
         
@@ -364,11 +392,10 @@ class CleverCloudBot {
             }
             
             const elapsed = Math.floor((Date.now() - startTime) / 1000);
-            process.stdout.write(`\r  Waiting for email... ${elapsed}s / 180s`);
+            console.log(`  Waiting for email... ${elapsed}s / 180s`);
             await sleep(5000);
         }
         
-        console.log();
         throw new Error('No verification email received after 3 minutes');
     }
 
@@ -577,14 +604,14 @@ class CleverCloudBot {
         log('RESTART', `This was attempt #${botStatus.restartCount}`, 'info', this.instanceId);
         log('RESTART', `========================================`, 'info', this.instanceId);
         
-        // Install Scalingo CLI and restart
+        // Install Scalingo CLI (no apt-get!)
         const cliInstalled = await installScalingoCLI();
         
-        if (cliInstalled) {
+        if (cliInstalled && ENV.SCALINGO_API_TOKEN && ENV.SCALINGO_APP_NAME) {
             await loginToScalingo();
             await restartWithCLI();
         } else {
-            log('RESTART', 'CLI installation failed, using exit restart', 'warn', 'MAIN');
+            log('RESTART', 'CLI not available, using exit restart', 'warn', 'MAIN');
         }
         
         await sleep(2000);
@@ -628,6 +655,7 @@ app.get('/api/accounts', async (req, res) => {
     res.json(accounts);
 });
 
+// ============ DASHBOARD ============
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
