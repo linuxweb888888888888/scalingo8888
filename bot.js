@@ -125,108 +125,59 @@ async function installChromiumRuntime() {
     }
 }
 
-// ============ TEST SCALINGO CLI AT STARTUP ============
-async function testScalingoCLI() {
-    console.log('\n========================================');
-    console.log('  TESTING SCALINGO CLI');
-    console.log('========================================');
+// ============ INSTALL SCALINGO CLI AT RUNTIME ============
+function installScalingoCLI() {
+    const cliPath = '/app/bin/scalingo';
     
-    const cliPaths = [
-        '/app/bin/scalingo',
-        '/usr/local/bin/scalingo',
-        '/usr/bin/scalingo',
-        '/root/bin/scalingo'
-    ];
-    
-    let cliPath = null;
-    
-    // Find Scalingo CLI
-    for (const path of cliPaths) {
-        if (fs.existsSync(path)) {
-            cliPath = path;
-            console.log(`✅ Scalingo CLI found at: ${cliPath}`);
-            break;
-        }
+    // Check if already installed
+    if (fs.existsSync(cliPath)) {
+        console.log('[CLI] Scalingo CLI already installed');
+        return true;
     }
     
-    if (!cliPath) {
-        console.log('❌ Scalingo CLI not found');
-        console.log('Checking with which command...');
-        try {
-            const whichResult = execSync('which scalingo 2>/dev/null', { encoding: 'utf8' });
-            if (whichResult.trim()) {
-                cliPath = whichResult.trim();
-                console.log(`✅ Found via which: ${cliPath}`);
-            } else {
-                console.log('❌ Scalingo CLI not installed');
-                return false;
-            }
-        } catch(e) {
-            console.log('❌ Scalingo CLI not installed');
-            return false;
-        }
-    }
+    console.log('[CLI] Installing Scalingo CLI...');
     
-    // Test version
     try {
-        const version = execSync(`${cliPath} version 2>/dev/null`, { encoding: 'utf8' });
-        console.log(`✅ Version: ${version.trim()}`);
-    } catch(e) {
-        console.log(`❌ Failed to get version: ${e.message}`);
-    }
-    
-    // Test login if token is set
-    if (ENV.SCALINGO_API_TOKEN) {
-        console.log('\n--- Testing Login ---');
-        try {
-            execSync(`${cliPath} login --api-token "${ENV.SCALINGO_API_TOKEN}" 2>/dev/null`, { encoding: 'utf8' });
-            console.log('✅ Login successful');
-        } catch(e) {
-            console.log(`❌ Login failed: ${e.message}`);
+        // Create bin directory
+        if (!fs.existsSync('/app/bin')) {
+            fs.mkdirSync('/app/bin', { recursive: true });
         }
-    } else {
-        console.log('⚠️ SCALINGO_API_TOKEN not set, skipping login test');
+        
+        // Download and extract
+        console.log('[CLI] Downloading...');
+        execSync('curl -L -o /tmp/scalingo.tar.gz https://github.com/Scalingo/cli/releases/download/1.44.1/scalingo_1.44.1_linux_amd64.tar.gz', { stdio: 'inherit' });
+        
+        console.log('[CLI] Extracting...');
+        execSync('cd /tmp && tar -xzf scalingo.tar.gz', { stdio: 'inherit' });
+        
+        console.log('[CLI] Copying binary...');
+        execSync('cp /tmp/scalingo_1.44.1_linux_amd64/scalingo /app/bin/scalingo', { stdio: 'inherit' });
+        
+        // Make executable
+        execSync('chmod +x /app/bin/scalingo', { stdio: 'inherit' });
+        
+        // Clean up
+        execSync('rm -rf /tmp/scalingo_1.44.1_linux_amd64 /tmp/scalingo.tar.gz', { stdio: 'inherit' });
+        
+        console.log('[CLI] ✅ Scalingo CLI installed successfully');
+        return true;
+        
+    } catch (error) {
+        console.error('[CLI] Failed to install:', error.message);
+        return false;
     }
-    
-    // Test restart if app name is set
-    if (ENV.SCALINGO_APP_NAME && ENV.SCALINGO_API_TOKEN) {
-        console.log('\n--- Testing Restart Command ---');
-        try {
-            const testCmd = `${cliPath} --app ${ENV.SCALINGO_APP_NAME} restart --help`;
-            execSync(testCmd, { stdio: 'ignore' });
-            console.log('✅ Restart command available');
-        } catch(e) {
-            console.log(`⚠️ Restart command check: ${e.message}`);
-        }
-    }
-    
-    console.log('========================================\n');
-    return true;
 }
 
 // ============ RESTART VIA CLI ============
 async function restartWithCLI() {
-    const cliPaths = [
-        '/app/bin/scalingo',
-        '/usr/local/bin/scalingo',
-        '/usr/bin/scalingo'
-    ];
+    const cliPath = '/app/bin/scalingo';
+    const appName = ENV.SCALINGO_APP_NAME;
+    const apiToken = ENV.SCALINGO_API_TOKEN;
     
-    let cliPath = null;
-    for (const path of cliPaths) {
-        if (fs.existsSync(path)) {
-            cliPath = path;
-            break;
-        }
-    }
-    
-    if (!cliPath) {
+    if (!fs.existsSync(cliPath)) {
         log('RESTART', 'Scalingo CLI not found', 'error', 'MAIN');
         return false;
     }
-    
-    const appName = ENV.SCALINGO_APP_NAME;
-    const apiToken = ENV.SCALINGO_API_TOKEN;
     
     if (!appName) {
         log('RESTART', 'SCALINGO_APP_NAME not set', 'error', 'MAIN');
@@ -263,6 +214,29 @@ async function restartWithCLI() {
             }
         });
     });
+}
+
+// ============ TEST SCALINGO CLI ============
+function testScalingoCLI() {
+    const cliPath = '/app/bin/scalingo';
+    
+    console.log('\n========================================');
+    console.log('  TESTING SCALINGO CLI');
+    console.log('========================================');
+    
+    if (fs.existsSync(cliPath)) {
+        console.log(`✅ Scalingo CLI found at: ${cliPath}`);
+        try {
+            const version = execSync(`${cliPath} version`, { encoding: 'utf8' });
+            console.log(`✅ Version: ${version.trim()}`);
+        } catch(e) {
+            console.log(`❌ Failed to get version: ${e.message}`);
+        }
+    } else {
+        console.log('❌ Scalingo CLI not found');
+    }
+    
+    console.log('========================================\n');
 }
 
 // ============ BOT CLASS ============
@@ -720,9 +694,8 @@ app.get('/', (req, res) => {
         <\/div>
         
         <div class="info-box">
-            <p>✅ Bot creates ONE account → Calls Scalingo CLI → Restarts → NEW IP</p>
+            <p>✅ Bot creates ONE account → Installs CLI → Restarts → NEW IP</p>
             <p>🔐 OAuth is automatically handled (fills email/password, clicks login)</p>
-            <p>🔑 Scalingo CLI tested at startup</p>
         <\/div>
     <\/div>
     
@@ -742,7 +715,7 @@ app.get('/', (req, res) => {
                 if (accounts && accounts.length) {
                     let html = '';
                     for (const acc of accounts) {
-                        html += '<tr><td>' + acc.email + '<\/td><td>' + acc.password + '<\/td><td>' + new Date(acc.createdAt).toLocaleString() + '<\/td><\/tr>';
+                        html += '<tr><td>' + acc.email + '<\/td><tr>' + acc.password + '<\/td><td>' + new Date(acc.createdAt).toLocaleString() + '<\/td><\/tr>';
                     }
                     tbody.innerHTML = html;
                 }
@@ -762,17 +735,24 @@ async function main() {
     console.log(`🔄 Mode: Creates ONE account, then CLI RESTART for NEW IP`);
     console.log(`\n`);
     
-    // TEST SCALINGO CLI FIRST
-    await testScalingoCLI();
+    // FIRST: Install Scalingo CLI
+    console.log('[START] Installing Scalingo CLI...');
+    installScalingoCLI();
     
+    // SECOND: Test the CLI
+    testScalingoCLI();
+    
+    // THIRD: Connect to MongoDB
     await connectMongoDB();
     
+    // FOURTH: Start the dashboard
     app.listen(port, '0.0.0.0', () => {
         console.log(`✅ Dashboard server running on port ${port}`);
     });
     
     await sleep(2000);
     
+    // FIFTH: Run the bot
     const bot = new CleverCloudBot('INSTANCE_1', ENV.BOT_PASSWORD, ENV.BOT_START_DELAY);
     await bot.run();
 }
