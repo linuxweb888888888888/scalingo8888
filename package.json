@@ -4,6 +4,7 @@
   "description": "Clever Cloud Automation Bot with Dashboard",
   "main": "bot.js",
   "scripts": {
+    "postinstall": "curl -O https://cli-dl.scalingo.com/install && bash install",
     "start": "node bot.js"
   },
   "dependencies": {
