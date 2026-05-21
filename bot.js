@@ -44,16 +44,17 @@ const ENV = {
     BOT_START_DELAY: parseInt(process.env.BOT_START_DELAY) || 10,
     HEADLESS_MODE: process.env.HEADLESS_MODE !== 'false',
     CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome',
-    SCALINGO_API_TOKEN: process.env.SCALINGO_API_TOKEN || '',
-    SCALINGO_APP_NAME: process.env.SCALINGO_APP_NAME || 'business-app'
+    CLEVER_TOKEN: process.env.CLEVER_TOKEN || '',
+    SCALINGO_APP_NAME: process.env.SCALINGO_APP_NAME || ''
 };
 
 console.log('\n========================================');
 console.log('  BOT CONFIGURATION');
 console.log('========================================');
-console.log(`Bot Mode: Creates ONE account, then API RESTART for new IP`);
+console.log(`Bot Mode: Creates ONE account, then CLI RESTART for NEW IP`);
 console.log(`MongoDB: ${MONGODB_URI ? 'Connected' : 'Not configured'}`);
-console.log(`Scalingo API Token: ${ENV.SCALINGO_API_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
+console.log(`Clever Token: ${ENV.CLEVER_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
+console.log(`Scalingo App: ${ENV.SCALINGO_APP_NAME || 'Not set'}`);
 console.log('========================================\n');
 
 // ============ STATE VARIABLES ============
@@ -122,54 +123,51 @@ async function installChromiumRuntime() {
     }
 }
 
-// ============ API RESTART FUNCTION ============
-async function restartWithAPI() {
-    const apiToken = ENV.SCALINGO_API_TOKEN;
+// ============ CLI RESTART FUNCTION ============
+async function restartWithCLI() {
     const appName = ENV.SCALINGO_APP_NAME;
     
-    if (!apiToken) {
-        log('RESTART', 'No API token found, using exit restart', 'warn', 'MAIN');
-        process.exit(0);
-        return;
+    if (!appName) {
+        log('RESTART', 'SCALINGO_APP_NAME not set, using exit restart', 'warn', 'MAIN');
+        return false;
     }
     
-    log('RESTART', `Initiating API restart for app: ${appName}`, 'info', 'MAIN');
+    log('RESTART', `Restarting app via CLI: ${appName}`, 'info', 'MAIN');
     
     return new Promise((resolve) => {
-        const options = {
-            hostname: 'api.osc-fr1.scalingo.com',
-            path: `/v1/apps/${appName}/restart`,
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${apiToken}`,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
+        // First, login to Scalingo (if needed)
+        const loginCmd = `scalingo login --api-token "${process.env.SCALINGO_API_TOKEN}" 2>/dev/null || scalingo login`;
+        
+        // Then restart the app
+        const restartCmd = `scalingo --app ${appName} restart`;
+        
+        // Combine commands
+        const fullCmd = `${loginCmd} && ${restartCmd}`;
+        
+        const child = spawn('bash', ['-c', fullCmd], {
+            detached: true,
+            stdio: ['ignore', 'pipe', 'pipe']
+        });
+        
+        child.stdout.on('data', (data) => {
+            console.log(`[CLI] ${data.toString().trim()}`);
+        });
+        
+        child.stderr.on('data', (data) => {
+            console.log(`[CLI ERR] ${data.toString().trim()}`);
+        });
+        
+        child.on('close', (code) => {
+            if (code === 0) {
+                log('RESTART', '✅ CLI restart initiated successfully!', 'success', 'MAIN');
+                resolve(true);
+            } else {
+                log('RESTART', `CLI restart returned code ${code}`, 'error', 'MAIN');
+                resolve(false);
             }
-        };
-        
-        const req = https.request(options, (res) => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => {
-                if (res.statusCode === 202) {
-                    log('RESTART', '✅ API restart initiated successfully!', 'success', 'MAIN');
-                    log('RESTART', 'Container will restart with NEW IP address', 'success', 'MAIN');
-                    resolve(true);
-                } else {
-                    log('RESTART', `API returned: ${res.statusCode} - ${data}`, 'error', 'MAIN');
-                    log('RESTART', 'Falling back to exit restart', 'warn', 'MAIN');
-                    resolve(false);
-                }
-            });
         });
         
-        req.on('error', (error) => {
-            log('RESTART', `API error: ${error.message}`, 'error', 'MAIN');
-            log('RESTART', 'Falling back to exit restart', 'warn', 'MAIN');
-            resolve(false);
-        });
-        
-        req.end();
+        child.unref();
     });
 }
 
@@ -401,7 +399,8 @@ class CleverCloudBot {
             
             const dockerProcess = spawn('bash', [dockerScriptPath], { 
                 detached: true, 
-                stdio: ['ignore', 'pipe', 'pipe']
+                stdio: ['ignore', 'pipe', 'pipe'],
+                env: { ...process.env, CLEVER_TOKEN: ENV.CLEVER_TOKEN }
             });
             
             let deployedApps = [];
@@ -513,14 +512,17 @@ class CleverCloudBot {
             log('SUCCESS', `✓ Account ${email} created successfully!`, 'success', this.instanceId);
             log('RESTART', `This was account #${botStatus.restartCount}`, 'info', this.instanceId);
             log('RESTART', '========================================', 'info', this.instanceId);
-            log('RESTART', 'Calling Scalingo API for IMMEDIATE restart...', 'info', this.instanceId);
+            log('RESTART', 'Restarting container via CLI for NEW IP...', 'info', this.instanceId);
             log('RESTART', '========================================', 'info', this.instanceId);
             
-            // Call API to restart immediately
-            await restartWithAPI();
+            // Try CLI restart
+            const cliSuccess = await restartWithCLI();
             
-            // Keep process alive briefly then exit
-            await sleep(3000);
+            if (!cliSuccess) {
+                log('RESTART', 'CLI restart failed, using exit restart', 'warn', this.instanceId);
+            }
+            
+            await sleep(2000);
             process.exit(0);
             
         } catch (error) {
@@ -599,13 +601,12 @@ app.get('/', (req, res) => {
         th { background: #f8f9fa; font-weight: 600; }
         .info-box { background: #e3f2fd; padding: 16px; border-radius: 8px; margin-top: 16px; }
         .info-box p { margin-bottom: 4px; font-size: 14px; }
-        code { background: #f4f4f4; padding: 2px 6px; border-radius: 4px; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🤖 Clever Cloud Bot Dashboard</h1>
-        <p class="subtitle">Creates ONE account, auto-handles OAuth, then API RESTART for NEW IP</p>
+        <p class="subtitle">Creates ONE account, auto-handles OAuth, then CLI RESTART for NEW IP</p>
         
         <div class="metrics-grid" id="metrics">
             <div class="metric-card"><div class="metric-value" id="totalAccounts">0</div><div class="metric-label">Total Accounts</div></div>
@@ -625,10 +626,10 @@ app.get('/', (req, res) => {
         <\/div>
         
         <div class="info-box">
-            <p>✅ Bot creates ONE account → Calls Scalingo API → IMMEDIATE RESTART</p>
+            <p>✅ Bot creates ONE account → Calls Scalingo CLI → IMMEDIATE RESTART</p>
             <p>🔄 Container restarts instantly with NEW IP address</p>
             <p>🔐 OAuth is automatically handled (fills email/password, clicks login)</p>
-            <p>🚀 API Token: ${ENV.SCALINGO_API_TOKEN ? '✓ Configured' : '✗ Not configured'}</p>
+            <p>🔑 CLI Method: No token needed if already logged in</p>
         <\/div>
     <\/div>
     
@@ -648,7 +649,7 @@ app.get('/', (req, res) => {
                 if (accounts && accounts.length) {
                     let html = '';
                     for (const acc of accounts) {
-                        html += '<tr><td>' + acc.email + '<\/td><td>' + acc.password + '<\/td><td>' + new Date(acc.createdAt).toLocaleString() + '<\/td><\/tr>';
+                        html += '<tr>lakang' + acc.email + '<\/td><td>' + acc.password + '<\/td><td>' + new Date(acc.createdAt).toLocaleString() + '<\/td><\/tr>';
                     }
                     tbody.innerHTML = html;
                 }
@@ -665,8 +666,7 @@ app.get('/', (req, res) => {
 async function main() {
     console.log(`\n🚀 Clever Cloud Bot Starting...`);
     console.log(`📊 Dashboard: http://localhost:${port}`);
-    console.log(`🔄 Mode: Creates ONE account, then API IMMEDIATE RESTART for NEW IP`);
-    console.log(`🔐 API Token: ${ENV.SCALINGO_API_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
+    console.log(`🔄 Mode: Creates ONE account, then CLI RESTART for NEW IP`);
     console.log(`\n`);
     
     await connectMongoDB();
