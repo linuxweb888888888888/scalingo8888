@@ -129,7 +129,6 @@ async function installChromiumRuntime() {
 function installScalingoCLI() {
     const cliPath = '/app/bin/scalingo';
     
-    // Check if already installed
     if (fs.existsSync(cliPath)) {
         console.log('[CLI] Scalingo CLI already installed');
         return true;
@@ -138,12 +137,10 @@ function installScalingoCLI() {
     console.log('[CLI] Installing Scalingo CLI...');
     
     try {
-        // Create bin directory
         if (!fs.existsSync('/app/bin')) {
             fs.mkdirSync('/app/bin', { recursive: true });
         }
         
-        // Download and extract
         console.log('[CLI] Downloading...');
         execSync('curl -L -o /tmp/scalingo.tar.gz https://github.com/Scalingo/cli/releases/download/1.44.1/scalingo_1.44.1_linux_amd64.tar.gz', { stdio: 'inherit' });
         
@@ -153,10 +150,7 @@ function installScalingoCLI() {
         console.log('[CLI] Copying binary...');
         execSync('cp /tmp/scalingo_1.44.1_linux_amd64/scalingo /app/bin/scalingo', { stdio: 'inherit' });
         
-        // Make executable
         execSync('chmod +x /app/bin/scalingo', { stdio: 'inherit' });
-        
-        // Clean up
         execSync('rm -rf /tmp/scalingo_1.44.1_linux_amd64 /tmp/scalingo.tar.gz', { stdio: 'inherit' });
         
         console.log('[CLI] ✅ Scalingo CLI installed successfully');
@@ -593,7 +587,6 @@ class CleverCloudBot {
         log('RESTART', `This was attempt #${botStatus.restartCount}`, 'info', this.instanceId);
         log('RESTART', `========================================`, 'info', this.instanceId);
         
-        // Try CLI restart
         const cliSuccess = await restartWithCLI();
         
         if (!cliSuccess) {
@@ -641,91 +634,127 @@ app.get('/api/accounts', async (req, res) => {
     res.json(accounts);
 });
 
-// ============ DASHBOARD ============
+// ============ MATERIAL DESIGN WHITE DASHBOARD ============
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Clever Cloud Bot Dashboard</title>
+    <title>Clever Cloud Bot • Material Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;14..32,400;14..32,500;14..32,600;14..32,700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0,200" />
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; }
-        .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
-        h1 { font-size: 28px; margin-bottom: 8px; }
-        .subtitle { color: #666; margin-bottom: 24px; }
-        .card { background: white; border-radius: 12px; padding: 24px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        .card-title { font-size: 18px; font-weight: 600; margin-bottom: 16px; }
-        .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
-        .metric-card { background: white; border-radius: 12px; padding: 20px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        .metric-value { font-size: 32px; font-weight: 700; color: #1976d2; }
-        .metric-label { font-size: 13px; color: #666; margin-top: 8px; }
-        .status { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 8px; }
-        .status-running { background: #4caf50; animation: pulse 1s infinite; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #e0e0e0; }
-        th { background: #f8f9fa; font-weight: 600; }
-        .info-box { background: #e3f2fd; padding: 16px; border-radius: 8px; margin-top: 16px; }
-        .info-box p { margin-bottom: 4px; font-size: 14px; }
+        body {
+            background: #f5f7fb;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            color: #1e293b;
+            line-height: 1.5;
+        }
+        .md-surface { background: #ffffff; border-radius: 28px; box-shadow: 0 1px 3px 0 rgba(0,0,0,0.05), 0 1px 2px -1px rgba(0,0,0,0.03); }
+        .container { max-width: 1280px; margin: 0 auto; padding: 32px 24px; }
+        /* header */
+        .header { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; margin-bottom: 32px; }
+        .title-section h1 { font-size: 28px; font-weight: 600; letter-spacing: -0.01em; background: linear-gradient(135deg, #1e293b 0%, #2d3a4f 100%); background-clip: text; -webkit-background-clip: text; color: transparent; margin-bottom: 6px; }
+        .subhead { color: #5b6e8c; font-size: 14px; font-weight: 400; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .status-chip { display: inline-flex; align-items: center; gap: 6px; background: #eef2ff; padding: 4px 12px; border-radius: 40px; font-size: 12px; font-weight: 500; color: #1e40af; }
+        /* metric cards */
+        .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; margin-bottom: 32px; }
+        .metric-card { background: white; border-radius: 24px; padding: 20px 20px; transition: all 0.2s ease; border: 1px solid #edf2f7; box-shadow: 0 1px 2px rgba(0,0,0,0.02); }
+        .metric-icon { background: #f8fafc; width: 44px; height: 44px; border-radius: 28px; display: flex; align-items: center; justify-content: center; margin-bottom: 16px; }
+        .metric-icon .material-symbols-outlined { font-size: 26px; color: #3b82f6; }
+        .metric-value { font-size: 34px; font-weight: 700; color: #0f172a; letter-spacing: -0.02em; line-height: 1.2; }
+        .metric-label { font-size: 13px; font-weight: 500; color: #5b6e8c; margin-top: 8px; text-transform: uppercase; letter-spacing: 0.3px; }
+        /* table card */
+        .data-card { background: white; border-radius: 28px; border: 1px solid #edf2f7; overflow: hidden; margin-bottom: 24px; box-shadow: 0 4px 6px -2px rgba(0,0,0,0.02); }
+        .card-header { padding: 20px 24px 8px 24px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #f0f2f5; }
+        .card-header h3 { font-size: 18px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+        .table-wrapper { overflow-x: auto; padding: 0 4px; }
+        table { width: 100%; border-collapse: collapse; font-size: 14px; }
+        th { text-align: left; padding: 16px 20px; background: #fefefe; font-weight: 600; color: #475569; border-bottom: 1px solid #eef2f6; }
+        td { padding: 14px 20px; border-bottom: 1px solid #f1f5f9; color: #1e293b; }
+        tr:last-child td { border-bottom: none; }
+        .email-cell { font-family: monospace; font-weight: 500; background: #f8fafc; padding: 4px 10px; border-radius: 40px; display: inline-block; font-size: 12px; }
+        .badge-pwd { font-family: monospace; background: #fef9e3; padding: 4px 10px; border-radius: 40px; font-size: 12px; color: #b45309; }
+        .info-note { background: #f8fafc; border-radius: 20px; padding: 16px 24px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; border: 1px solid #eef2ff; margin-top: 16px; }
+        .info-note .material-symbols-outlined { color: #3b82f6; }
+        .footer-text { font-size: 12px; color: #7e8aa2; text-align: center; margin-top: 32px; }
+        @keyframes pulse-ring { 0% { opacity: 0.6; } 100% { opacity: 1; } }
+        .live-dot { width: 10px; height: 10px; background: #22c55e; border-radius: 50%; display: inline-block; box-shadow: 0 0 0 0 rgba(34,197,94,0.4); animation: pulse-ring 1.2s infinite; margin-right: 6px; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>🤖 Clever Cloud Bot Dashboard</h1>
-        <p class="subtitle">Creates ONE account, then CLI RESTART for NEW IP</p>
-        
-        <div class="metrics-grid" id="metrics">
-            <div class="metric-card"><div class="metric-value" id="totalAccounts">0</div><div class="metric-label">Total Accounts</div></div>
-            <div class="metric-card"><div class="metric-value" id="todayAccounts">0</div><div class="metric-label">Today</div></div>
-            <div class="metric-card"><div class="metric-value" id="restartCount">0</div><div class="metric-label">Restarts</div></div>
-            <div class="metric-card"><div class="metric-value" id="botState">-</div><div class="metric-label">State</div></div>
+<div class="container">
+    <div class="header">
+        <div class="title-section">
+            <h1>Clever Cloud Bot</h1>
+            <div class="subhead">
+                <span class="status-chip"><span class="live-dot"></span> ACTIVE · ONE ACCOUNT PER RESTART</span>
+                <span>⚡ Auto OAuth · IP rotation via CLI restart</span>
+            </div>
         </div>
-        
-        <div class="card">
-            <div class="card-title">📋 Recent Accounts</div>
-            <div class="table-responsive">
-                <table id="accountsTable">
-                    <thead><tr><th>Email</th><th>Password</th><th>Date</th></tr></thead>
-                    <tbody id="accountsBody"><tr><td colspan="3">Loading...<\/td><\/tr><\/tbody>
-                点able
-            <\/div>
-        <\/div>
-        
-        <div class="info-box">
-            <p>✅ Bot creates ONE account → Installs CLI → Restarts → NEW IP</p>
-            <p>🔐 OAuth is automatically handled (fills email/password, clicks login)</p>
-        <\/div>
-    <\/div>
-    
-    <script>
-        async function refreshData() {
-            try {
-                const res = await fetch('/api/metrics');
-                const data = await res.json();
-                document.getElementById('totalAccounts').textContent = data.totalAccounts || 0;
-                document.getElementById('todayAccounts').textContent = data.completedToday || 0;
-                document.getElementById('restartCount').textContent = data.restartCount || 0;
-                document.getElementById('botState').innerHTML = '<span class="status status-' + data.botState + '"></span>' + data.botState;
-                
-                const accountsRes = await fetch('/api/accounts');
-                const accounts = await accountsRes.json();
-                const tbody = document.getElementById('accountsBody');
-                if (accounts && accounts.length) {
-                    let html = '';
-                    for (const acc of accounts) {
-                        html += '<tr><td>' + acc.email + '<\/td><tr>' + acc.password + '<\/td><td>' + new Date(acc.createdAt).toLocaleString() + '<\/td><\/tr>';
-                    }
-                    tbody.innerHTML = html;
+    </div>
+
+    <div class="grid-4">
+        <div class="metric-card"><div class="metric-icon"><span class="material-symbols-outlined">group</span></div><div class="metric-value" id="totalAccounts">0</div><div class="metric-label">Total accounts</div></div>
+        <div class="metric-card"><div class="metric-icon"><span class="material-symbols-outlined">today</span></div><div class="metric-value" id="todayAccounts">0</div><div class="metric-label">Created today</div></div>
+        <div class="metric-card"><div class="metric-icon"><span class="material-symbols-outlined">autorenew</span></div><div class="metric-value" id="restartCount">0</div><div class="metric-label">Restart attempts</div></div>
+        <div class="metric-card"><div class="metric-icon"><span class="material-symbols-outlined">memory</span></div><div class="metric-value" id="botState">—</div><div class="metric-label">Bot state</div></div>
+    </div>
+
+    <div class="data-card">
+        <div class="card-header"><h3><span class="material-symbols-outlined" style="font-size:22px">description</span> Recently created accounts</h3><span style="font-size:12px; color:#6c86a3;">⬇ last 50 records</span></div>
+        <div class="table-wrapper">
+            <table id="accountsTable">
+                <thead><tr><th>Email address</th><th>Password</th><th>Created at</th></tr></thead>
+                <tbody id="accountsBody"><tr><td colspan="3" style="text-align:center; padding:48px;">Loading secure data...</td></tr></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="info-note">
+        <span class="material-symbols-outlined">info</span>
+        <span><strong>Material Design · White UI</strong> — Bot creates exactly ONE account, then triggers CLI restart (new IP). OAuth is auto-filled and submitted. MongoDB stores credentials & deployed apps. Dashboard updates every 5s.</span>
+    </div>
+    <div class="footer-text">Clever Cloud automation · stealth puppeteer · scalingo restart engine</div>
+</div>
+
+<script>
+    async function refreshDashboard() {
+        try {
+            const metricsRes = await fetch('/api/metrics');
+            const metrics = await metricsRes.json();
+            document.getElementById('totalAccounts').innerText = metrics.totalAccounts || 0;
+            document.getElementById('todayAccounts').innerText = metrics.completedToday || 0;
+            document.getElementById('restartCount').innerText = metrics.restartCount || 0;
+            let stateDisplay = metrics.botState || 'unknown';
+            if (metrics.botState === 'running') stateDisplay = '⚙️ running';
+            else if (metrics.botState === 'completed') stateDisplay = '✅ completed';
+            else if (metrics.botState === 'failed') stateDisplay = '⚠️ failed';
+            else if (metrics.botState === 'starting') stateDisplay = '🔄 starting';
+            document.getElementById('botState').innerHTML = stateDisplay;
+            
+            const accountsRes = await fetch('/api/accounts');
+            const accounts = await accountsRes.json();
+            const tbody = document.getElementById('accountsBody');
+            if (accounts && accounts.length) {
+                let html = '';
+                for (let acc of accounts) {
+                    let dateStr = acc.createdAt ? new Date(acc.createdAt).toLocaleString() : 'just now';
+                    html += \`<tr><td><span class="email-cell">\${acc.email || 'N/A'}</span></td><td><span class="badge-pwd">\${acc.password || '••••••'}</span></td><td style="font-size:12px; color:#4b5563;">\${dateStr}</td></tr>\`;
                 }
-            } catch(e) { console.error(e); }
-        }
-        refreshData();
-        setInterval(refreshData, 5000);
-    <\/script>
-<\/body>
-<\/html>`);
+                tbody.innerHTML = html;
+            } else {
+                tbody.innerHTML = '<tr><td colspan="3" style="text-align:center; padding:32px;">✨ No accounts yet — waiting for first creation...</td></tr>';
+            }
+        } catch(e) { console.warn(e); }
+    }
+    refreshDashboard();
+    setInterval(refreshDashboard, 5000);
+</script>
+</body>
+</html>`);
 });
 
 // ============ START ============
@@ -735,24 +764,19 @@ async function main() {
     console.log(`🔄 Mode: Creates ONE account, then CLI RESTART for NEW IP`);
     console.log(`\n`);
     
-    // FIRST: Install Scalingo CLI
     console.log('[START] Installing Scalingo CLI...');
     installScalingoCLI();
     
-    // SECOND: Test the CLI
     testScalingoCLI();
     
-    // THIRD: Connect to MongoDB
     await connectMongoDB();
     
-    // FOURTH: Start the dashboard
     app.listen(port, '0.0.0.0', () => {
         console.log(`✅ Dashboard server running on port ${port}`);
     });
     
     await sleep(2000);
     
-    // FIFTH: Run the bot
     const bot = new CleverCloudBot('INSTANCE_1', ENV.BOT_PASSWORD, ENV.BOT_START_DELAY);
     await bot.run();
 }
