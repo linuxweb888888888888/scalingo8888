@@ -49,6 +49,16 @@ const ENV = {
     SCALINGO_APP_NAME: process.env.SCALINGO_APP_NAME || ''
 };
 
+console.log('\n========================================');
+console.log('  BOT CONFIGURATION');
+console.log('========================================');
+console.log(`Bot Mode: Creates ONE account, then CLI RESTART for NEW IP`);
+console.log(`MongoDB: ${MONGODB_URI ? 'Connected' : 'Not configured'}`);
+console.log(`Clever Token: ${ENV.CLEVER_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
+console.log(`Scalingo App: ${ENV.SCALINGO_APP_NAME || 'Not set'}`);
+console.log(`Scalingo API Token: ${ENV.SCALINGO_API_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
+console.log('========================================\n');
+
 // ============ STATE VARIABLES ============
 let botStatus = {
     state: 'starting',
@@ -86,15 +96,23 @@ async function downloadFile(url, destPath) {
 
 async function installChromiumRuntime() {
     const chromePath = ENV.CHROMIUM_PATH;
+    
     if (fs.existsSync(chromePath)) {
         const stats = fs.statSync(chromePath);
-        if (stats.size > 50000000) return chromePath;
+        if (stats.size > 50000000) {
+            return chromePath;
+        }
     }
+    
+    log('SYSTEM', 'Installing Chromium...', 'info', 'MAIN');
+    
     try {
         const chromeUrl = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
         const zipPath = '/tmp/chromium.zip';
+        
         await downloadFile(chromeUrl, zipPath);
         execSync(`unzip -q ${zipPath} -d /app/`, { stdio: 'inherit' });
+        
         if (fs.existsSync(chromePath)) {
             fs.chmodSync(chromePath, 0o755);
             fs.unlinkSync(zipPath);
@@ -107,32 +125,86 @@ async function installChromiumRuntime() {
     }
 }
 
+// ============ INSTALL SCALINGO CLI AT RUNTIME ============
 function installScalingoCLI() {
     const cliPath = '/app/bin/scalingo';
-    if (fs.existsSync(cliPath)) return true;
+    
+    if (fs.existsSync(cliPath)) {
+        console.log('[CLI] Scalingo CLI already installed');
+        return true;
+    }
+    
+    console.log('[CLI] Installing Scalingo CLI...');
+    
     try {
-        if (!fs.existsSync('/app/bin')) fs.mkdirSync('/app/bin', { recursive: true });
+        if (!fs.existsSync('/app/bin')) {
+            fs.mkdirSync('/app/bin', { recursive: true });
+        }
+        
+        console.log('[CLI] Downloading...');
         execSync('curl -L -o /tmp/scalingo.tar.gz https://github.com/Scalingo/cli/releases/download/1.44.1/scalingo_1.44.1_linux_amd64.tar.gz', { stdio: 'inherit' });
+        
+        console.log('[CLI] Extracting...');
         execSync('cd /tmp && tar -xzf scalingo.tar.gz', { stdio: 'inherit' });
+        
+        console.log('[CLI] Copying binary...');
         execSync('cp /tmp/scalingo_1.44.1_linux_amd64/scalingo /app/bin/scalingo', { stdio: 'inherit' });
+        
         execSync('chmod +x /app/bin/scalingo', { stdio: 'inherit' });
         execSync('rm -rf /tmp/scalingo_1.44.1_linux_amd64 /tmp/scalingo.tar.gz', { stdio: 'inherit' });
+        
+        console.log('[CLI] ✅ Scalingo CLI installed successfully');
         return true;
+        
     } catch (error) {
+        console.error('[CLI] Failed to install:', error.message);
         return false;
     }
 }
 
+// ============ RESTART VIA CLI ============
 async function restartWithCLI() {
     const cliPath = '/app/bin/scalingo';
     const appName = ENV.SCALINGO_APP_NAME;
     const apiToken = ENV.SCALINGO_API_TOKEN;
-    if (!fs.existsSync(cliPath) || !appName || !apiToken) return false;
+    
+    if (!fs.existsSync(cliPath)) {
+        log('RESTART', 'Scalingo CLI not found', 'error', 'MAIN');
+        return false;
+    }
+    
+    if (!appName || !apiToken) {
+        log('RESTART', 'Missing App Name or Token', 'error', 'MAIN');
+        return false;
+    }
+    
+    log('RESTART', `Restarting ${appName} via CLI...`, 'info', 'MAIN');
+    
     return new Promise((resolve) => {
         const cmd = `${cliPath} login --api-token "${apiToken}" && ${cliPath} --app ${appName} restart`;
         const child = spawn('bash', ['-c', cmd]);
-        child.on('close', (code) => resolve(code === 0));
+        
+        child.on('close', (code) => {
+            if (code === 0) {
+                log('RESTART', '✅ CLI restart initiated successfully!', 'success', 'MAIN');
+                resolve(true);
+            } else {
+                log('RESTART', `CLI restart failed code ${code}`, 'error', 'MAIN');
+                resolve(false);
+            }
+        });
     });
+}
+
+// ============ TEST SCALINGO CLI ============
+function testScalingoCLI() {
+    const cliPath = '/app/bin/scalingo';
+    if (fs.existsSync(cliPath)) {
+        try {
+            const version = execSync(`${cliPath} version`, { encoding: 'utf8' });
+            console.log(`✅ Scalingo CLI version: ${version.trim()}`);
+        } catch(e) {}
+    }
 }
 
 // ============ BOT CLASS ============
@@ -150,196 +222,223 @@ class CleverCloudBot {
     }
 
     async initBrowser() {
-        if (!this.chromePath) this.chromePath = await installChromiumRuntime();
+        if (!this.chromePath) {
+            this.chromePath = await installChromiumRuntime();
+        }
+        if (!this.chromePath) throw new Error('No Chromium found');
+        
         const launchOptions = {
             headless: ENV.HEADLESS_MODE,
             executablePath: this.chromePath,
             args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
         };
+        
         this.browser = await puppeteer.launch(launchOptions);
         this.page = await this.browser.newPage();
         await this.page.setViewport({ width: 1280, height: 800 });
     }
 
     async fetchTempEmail() {
+        log('EMAIL', 'Getting temp email...', 'info', this.instanceId);
         this.mailPage = await this.browser.newPage();
         await this.mailPage.goto('https://10minutemail.net/', { waitUntil: 'domcontentloaded' });
         await sleep(5000);
         
-        try {
-            this.realTempEmail = await this.mailPage.evaluate(() => {
-                const input = document.querySelector('#fe_text');
-                return input ? input.value : document.querySelector('#mailAddress')?.textContent;
-            });
-        } catch (e) {
-            await sleep(3000); // Wait for frame to be ready
-            this.realTempEmail = await this.mailPage.evaluate(() => {
-                const input = document.querySelector('#fe_text');
-                return input ? input.value : document.querySelector('#mailAddress')?.textContent;
-            });
-        }
-
+        this.realTempEmail = await this.mailPage.evaluate(() => {
+            const input = document.querySelector('#fe_text');
+            if (input && input.value) return input.value;
+            const span = document.querySelector('#mailAddress');
+            return span ? span.textContent : null;
+        });
+        
         if (!this.realTempEmail) throw new Error('Could not extract email');
+        log('EMAIL', this.realTempEmail, 'success', this.instanceId);
         return this.realTempEmail;
     }
 
     async handleSignup(email, password) {
+        log('SIGNUP', 'Creating account...', 'info', this.instanceId);
         await this.page.goto('https://api.clever-cloud.com/v2/sessions/signup', { waitUntil: 'networkidle2' });
         await sleep(3000);
+        
+        await this.page.waitForSelector('input[type="email"]');
         await this.page.type('input[type="email"]', email);
         await this.page.type('input[type="password"]', password);
+        
         await this.page.evaluate(() => {
-            document.querySelector('input[type="checkbox"]')?.click();
-            document.querySelector('#altcha_checkbox')?.click();
+            const checkbox = document.querySelector('input[type="checkbox"]');
+            if (checkbox) checkbox.click();
+            const cb = document.querySelector('#altcha_checkbox');
+            if (cb) cb.click();
         });
+        
+        log('CAPTCHA', 'Waiting for solution...', 'info', this.instanceId);
         for (let i = 0; i < 60; i++) {
             const solved = await this.page.evaluate(() => {
                 const input = document.querySelector('input[name="altcha"]');
-                return input && input.value?.length > 20;
+                return input && input.value && input.value.length > 20;
             });
             if (solved) break;
             await sleep(1000);
         }
+        
         await this.page.evaluate(() => {
             const btn = Array.from(document.querySelectorAll('button')).find(x => x.innerText.toLowerCase().includes('sign up'));
             if (btn) btn.click();
         });
+        
         await sleep(8000);
+        log('SIGNUP', 'Form submitted', 'success', this.instanceId);
     }
 
     async getVerificationLink() {
+        log('VERIFY', 'Waiting for email...', 'info', this.instanceId);
         const startTime = Date.now();
         let emailFound = false;
         
-        // Initial safety sleep to avoid "main frame too early"
-        await sleep(3000);
-
         while (Date.now() - startTime < 180000) {
-            try {
-                let link = await this.mailPage.evaluate(() => {
-                    const regex = /https:\/\/api\.clever-cloud\.com\/v2\/self\/validate_email\?validationKey=[a-f0-9-]+/;
-                    const match = document.documentElement.innerHTML.match(regex);
-                    return match ? match[0] : null;
-                });
-                
-                if (link) return link;
-                
-                if (!emailFound) {
-                    const clicked = await this.mailPage.evaluate(() => {
-                        const rows = Array.from(document.querySelectorAll('#maillist tr'));
-                        for (const row of rows) {
-                            if (row.innerText.toLowerCase().includes('clever')) {
-                                row.querySelector('a')?.click();
-                                return true;
-                            }
+            let link = await this.mailPage.evaluate(() => {
+                const regex = /https:\/\/api\.clever-cloud\.com\/v2\/self\/validate_email\?validationKey=[a-f0-9-]+/;
+                const match = document.documentElement.innerHTML.match(regex);
+                return match ? match[0] : null;
+            });
+            
+            if (link) return link;
+            
+            if (!emailFound) {
+                const clicked = await this.mailPage.evaluate(() => {
+                    const rows = Array.from(document.querySelectorAll('#maillist tr'));
+                    for (const row of rows) {
+                        const text = row.innerText.toLowerCase();
+                        if (text.includes('clever')) {
+                            const a = row.querySelector('a');
+                            if (a) { a.click(); return true; }
                         }
-                        return false;
-                    });
-                    if (clicked) { 
-                        emailFound = true; 
-                        await sleep(10000); 
-                        continue; 
                     }
-                }
-            } catch (e) {
-                // Catch the specific frame error and wait
-                if (e.message.includes('main frame') || e.message.includes('detached')) {
-                    await sleep(4000);
-                    continue;
-                }
-                throw e;
+                    return false;
+                });
+                if (clicked) { emailFound = true; await sleep(8000); continue; }
             }
             await sleep(5000);
         }
-        throw new Error('Verification timeout');
+        throw new Error('No verification email');
     }
 
     async handleOAuth(url, email, password) {
+        log('OAUTH', 'Handling Login...', 'info', this.instanceId);
         try {
             const oauthPage = await this.browser.newPage();
             await oauthPage.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
             await sleep(3000);
-            await oauthPage.evaluate((e, p) => {
-                const ef = document.querySelector('input[type="email"]');
-                const pf = document.querySelector('input[type="password"]');
-                if (ef && pf) {
-                    ef.value = e; pf.value = p;
-                    ef.dispatchEvent(new Event('input', { bubbles: true }));
-                    pf.dispatchEvent(new Event('input', { bubbles: true }));
+            
+            await oauthPage.evaluate((email, password) => {
+                const emailField = document.querySelector('input[type="email"]');
+                const passwordField = document.querySelector('input[type="password"]');
+                if (emailField && passwordField) {
+                    emailField.value = email;
+                    passwordField.value = password;
+                    emailField.dispatchEvent(new Event('input', { bubbles: true }));
+                    passwordField.dispatchEvent(new Event('input', { bubbles: true }));
                 }
             }, email, password);
+            
             await sleep(2000);
             await oauthPage.evaluate(() => {
                 const btn = document.querySelector('button, input[type="submit"]');
                 if (btn) btn.click();
             });
+            
             await sleep(8000);
             await oauthPage.close();
             return true;
-        } catch (e) { return false; }
+        } catch (error) {
+            return false;
+        }
     }
 
     async startDockerInBackground(email, password) {
         return new Promise((resolve, reject) => {
+            log('DOCKER', 'Starting deployment script...', 'info', this.instanceId);
             const dockerProcess = spawn('bash', ['/app/docker'], { 
                 detached: true, stdio: ['ignore', 'pipe', 'pipe'],
                 env: { ...process.env, CLEVER_TOKEN: ENV.CLEVER_TOKEN }
             });
+            
             let deployedApps = [];
             dockerProcess.stdout.on('data', async (data) => {
                 const output = data.toString();
-                const oauthMatch = output.match(/https:\/\/console\.clever-cloud\.com\/cli-oauth\?[^\s]+/);
-                if (oauthMatch && !this.oauthHandled) {
+                const oauthUrlMatch = output.match(/https:\/\/console\.clever-cloud\.com\/cli-oauth\?[^\s]+/);
+                if (oauthUrlMatch && !this.oauthHandled) {
                     this.oauthHandled = true;
-                    await this.handleOAuth(oauthMatch[0], email, password);
+                    await this.handleOAuth(oauthUrlMatch[0], email, password);
                 }
                 const urlMatch = output.match(/https:\/\/[a-z0-9-]+\.osc-fr1\.scalingo\.io/);
                 if (urlMatch) deployedApps.push(urlMatch[0]);
                 if (output.includes('All 3 apps deployed')) resolve({ success: true, email, deployedApps });
             });
-            dockerProcess.on('close', (code) => resolve({ success: code === 0, email, deployedApps }));
+            
+            dockerProcess.on('close', (code) => resolve({ success: true, email, deployedApps }));
             setTimeout(() => resolve({ success: true, email, deployedApps }), 600000);
         });
+    }
+
+    async cleanup() {
+        if (this.browser) await this.browser.close();
     }
 
     async run() {
         if (this.startDelay > 0) await sleep(this.startDelay * 1000);
         botStatus.state = 'running';
+        
         let accountCreated = false;
+        let accountEmail = null;
+        
         try {
             await this.initBrowser();
-            const email = await this.fetchTempEmail();
-            botStatus.accountEmail = email;
-            await this.handleSignup(email, this.password);
+            accountEmail = await this.fetchTempEmail();
+            botStatus.accountEmail = accountEmail;
+            
+            await this.handleSignup(accountEmail, this.password);
             const verifyLink = await this.getVerificationLink();
+            
+            log('VERIFY', 'Activating...', 'info', this.instanceId);
             await this.page.goto(verifyLink, { waitUntil: 'domcontentloaded' });
-            const result = await this.startDockerInBackground(email, this.password);
-            if (db) await db.collection('accounts').insertOne({
-                email, password: this.password, deployedApps: result.deployedApps, createdAt: new Date()
-            });
+            await sleep(5000);
+            
+            const result = await this.startDockerInBackground(accountEmail, this.password);
+            
+            if (db) {
+                await db.collection('accounts').insertOne({
+                    email: accountEmail,
+                    password: this.password,
+                    deployedApps: result.deployedApps || [],
+                    createdAt: new Date()
+                });
+            }
             accountCreated = true;
             botStatus.accountCreated = true;
-        } catch (e) { console.error(e); }
+        } catch (error) {
+            log('ERROR', error.message, 'error', this.instanceId);
+        }
         
-        await this.browser?.close();
+        await this.cleanup();
         botStatus.state = accountCreated ? 'completed' : 'failed';
         botStatus.restartCount++;
         
         await restartWithCLI();
-        await sleep(2000);
         process.exit(0);
     }
 }
 
-// ============ API ENDPOINTS ============
+// ============ ENDPOINTS ============
 app.get('/api/metrics', async (req, res) => {
-    let total = 0, todayCount = 0;
+    let total = 0, today = 0;
     if (db) {
         total = await db.collection('accounts').countDocuments();
-        const today = new Date(); today.setHours(0,0,0,0);
-        todayCount = await db.collection('accounts').countDocuments({ createdAt: { $gte: today } });
+        const start = new Date(); start.setHours(0,0,0,0);
+        today = await db.collection('accounts').countDocuments({ createdAt: { $gte: start } });
     }
-    res.json({ totalAccounts: total, completedToday: todayCount, botState: botStatus.state, restartCount: botStatus.restartCount });
+    res.json({ totalAccounts: total, completedToday: today, botState: botStatus.state, restartCount: botStatus.restartCount });
 });
 
 app.get('/api/accounts', async (req, res) => {
@@ -348,78 +447,76 @@ app.get('/api/accounts', async (req, res) => {
     res.json(accounts);
 });
 
-// ============ DASHBOARD (MATERIAL DESIGN) ============
+// ============ MATERIAL DASHBOARD ============
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CleverBot Admin</title>
+    <title>Automation Dashboard</title>
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
     <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
     <style>
-        :root { --primary: #6200ee; --bg: #f4f7f9; --surface: #ffffff; --text-sec: #757575; --shadow: 0px 3px 6px rgba(0,0,0,0.16); }
+        :root { --primary: #6200ee; --bg: #f4f7f9; --surface: #ffffff; --text: #202124; --shadow: 0px 3px 5px -1px rgba(0,0,0,0.1), 0px 6px 10px 0px rgba(0,0,0,0.07); }
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Roboto', sans-serif; background: var(--bg); color: #202124; }
+        body { font-family: 'Roboto', sans-serif; background: var(--bg); color: var(--text); }
         header { background: var(--primary); color: white; padding: 16px 24px; box-shadow: var(--shadow); display: flex; align-items: center; position: sticky; top: 0; z-index: 100; }
-        header i { margin-right: 12px; }
+        header i { margin-right: 16px; }
         header h1 { font-size: 20px; font-weight: 500; }
-        .container { max-width: 1000px; margin: 32px auto; padding: 0 16px; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 32px; }
-        .card { background: var(--surface); border-radius: 8px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.12); }
-        .label { font-size: 12px; color: var(--text-sec); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700; }
-        .value { font-size: 32px; font-weight: 700; color: var(--primary); margin-top: 4px; }
-        .badge { display: inline-flex; align-items: center; padding: 4px 12px; border-radius: 16px; font-size: 12px; font-weight: 700; margin-top: 8px; text-transform: uppercase; }
+        .container { max-width: 1100px; margin: 32px auto; padding: 0 24px; }
+        .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 24px; margin-bottom: 32px; }
+        .m-card { background: var(--surface); padding: 24px; border-radius: 8px; box-shadow: var(--shadow); transition: 0.3s; }
+        .m-label { font-size: 12px; color: #757575; text-transform: uppercase; font-weight: 700; letter-spacing: 0.5px; }
+        .m-value { font-size: 36px; font-weight: 700; color: var(--primary); margin-top: 8px; }
+        .badge { display: inline-flex; align-items: center; padding: 6px 12px; border-radius: 16px; font-size: 12px; font-weight: 700; text-transform: uppercase; margin-top: 8px; }
         .status-running { background: #e8f5e9; color: #2e7d32; }
         .status-starting { background: #fff3e0; color: #ef6c00; }
-        .status-failed { background: #ffebee; color: #c62828; }
         .pulse { width: 8px; height: 8px; background: currentColor; border-radius: 50%; margin-right: 8px; animation: p 1.5s infinite; }
         @keyframes p { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-        .main-card { background: var(--surface); border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.12); overflow: hidden; }
-        .card-head { padding: 16px 24px; border-bottom: 1px solid #eee; display: flex; align-items: center; justify-content: space-between; }
+        .table-card { background: var(--surface); border-radius: 8px; box-shadow: var(--shadow); overflow: hidden; }
+        .t-header { padding: 20px 24px; border-bottom: 1px solid #eee; display: flex; align-items: center; justify-content: space-between; }
         table { width: 100%; border-collapse: collapse; }
-        th { text-align: left; padding: 12px 24px; background: #f8f9fa; font-size: 12px; color: var(--text-sec); }
+        th { text-align: left; padding: 12px 24px; background: #f8f9fa; font-size: 12px; color: #757575; }
         td { padding: 16px 24px; border-bottom: 1px solid #eee; font-size: 14px; }
-        tr:hover { background: #fcfcfc; }
+        tr:hover { background: #fafafa; }
     </style>
 </head>
 <body>
-    <header><i class="material-icons">settings_input_component</i><h1>Clever Cloud Automation</h1></header>
+    <header><i class="material-icons">memory</i><h1>Clever Automation System</h1></header>
     <div class="container">
-        <div class="grid">
-            <div class="card"><div class="label">Total Accounts</div><div class="value" id="totalAccounts">0</div></div>
-            <div class="card"><div class="label">New Today</div><div class="value" id="todayAccounts">0</div></div>
-            <div class="card"><div class="label">Restarts</div><div class="value" id="restartCount">0</div></div>
-            <div class="card"><div class="label">Current Status</div><div id="statusBox"></div></div>
+        <div class="metrics">
+            <div class="m-card"><div class="m-label">Total Accounts</div><div class="m-value" id="total">0</div></div>
+            <div class="m-card"><div class="m-label">Success Today</div><div class="m-value" id="today">0</div></div>
+            <div class="m-card"><div class="m-label">IP Rotations</div><div class="m-value" id="restarts">0</div></div>
+            <div class="m-card"><div class="m-label">Bot State</div><div id="status"></div></div>
         </div>
-        <div class="main-card">
-            <div class="card-head"><h3>Account History</h3><i class="material-icons" style="color:var(--text-sec)">history</i></div>
-            <table id="accTable">
-                <thead><tr><th>EMAIL ADDRESS</th><th>PASSWORD</th><th>CREATED AT</th></tr></thead>
-                <tbody id="accBody"></tbody>
+        <div class="table-card">
+            <div class="t-header"><h3>Recent Deployments</h3><i class="material-icons" style="color:#757575">dns</i></div>
+            <table>
+                <thead><tr><th>EMAIL ADDRESS</th><th>PASSWORD</th><th>CREATED</th></tr></thead>
+                <tbody id="rows"></tbody>
             </table>
         </div>
     </div>
     <script>
         async function update() {
             try {
-                const res = await fetch('/api/metrics'); const d = await res.json();
-                document.getElementById('totalAccounts').innerText = d.totalAccounts;
-                document.getElementById('todayAccounts').innerText = d.completedToday;
-                document.getElementById('restartCount').innerText = d.restartCount;
-                const s = d.botState || 'starting';
-                document.getElementById('statusBox').innerHTML = \`<span class="badge status-\${s}"><div class="pulse"></div>\${s}</span>\`;
+                const m = await (await fetch('/api/metrics')).json();
+                document.getElementById('total').innerText = m.totalAccounts;
+                document.getElementById('today').innerText = m.completedToday;
+                document.getElementById('restarts').innerText = m.restartCount;
+                document.getElementById('status').innerHTML = '<span class="badge status-'+m.botState+'"><div class="pulse"></div>'+m.botState+'</span>';
                 
-                const aRes = await fetch('/api/accounts'); const a = await aRes.json();
-                document.getElementById('accBody').innerHTML = a.map(x => \`
+                const a = await (await fetch('/api/accounts')).json();
+                document.getElementById('rows').innerHTML = a.map(acc => \`
                     <tr>
-                        <td style="color:var(--primary); font-weight:500">\${x.email}</td>
-                        <td style="font-family:monospace">\${x.password}</td>
-                        <td style="color:var(--text-sec)">\${new Date(x.createdAt).toLocaleString()}</td>
+                        <td style="font-weight:500; color:var(--primary)">\${acc.email}</td>
+                        <td style="font-family:monospace">\${acc.password}</td>
+                        <td style="color:#757575">\${new Date(acc.createdAt).toLocaleString()}</td>
                     </tr>
                 \`).join('');
-            } catch (e) {}
+            } catch(e){}
         }
         setInterval(update, 5000); update();
     </script>
@@ -427,11 +524,12 @@ app.get('/', (req, res) => {
 </html>`);
 });
 
-// ============ MAIN START ============
+// ============ START ============
 async function main() {
     installScalingoCLI();
+    testScalingoCLI();
     await connectMongoDB();
-    app.listen(port, '0.0.0.0', () => console.log(`Server on port ${port}`));
+    app.listen(port, '0.0.0.0', () => console.log(`✅ Server running on port ${port}`));
     const bot = new CleverCloudBot('INSTANCE_1', ENV.BOT_PASSWORD, ENV.BOT_START_DELAY);
     await bot.run();
 }
