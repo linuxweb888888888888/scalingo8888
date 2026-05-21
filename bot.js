@@ -6,6 +6,8 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const https = require('https');
 const { createWriteStream } = require('fs');
+const axios = require('axios');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 
 // Apply stealth plugin
 puppeteer.use(StealthPlugin());
@@ -13,7 +15,189 @@ puppeteer.use(StealthPlugin());
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ============ BOT CLASS ============
+// ============ PROXY MANAGER CLASS ============
+class ProxyManager {
+    constructor() {
+        this.proxies = [];
+        this.workingProxies = [];
+        this.currentProxyIndex = 0;
+        this.lastFetchTime = 0;
+        this.requestCount = 0;
+        this.minRequestInterval = 1000;
+    }
+
+    async delay(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async waitForRateLimit() {
+        const now = Date.now();
+        const timeSinceLastFetch = now - this.lastFetchTime;
+        if (timeSinceLastFetch < this.minRequestInterval) {
+            await this.delay(this.minRequestInterval - timeSinceLastFetch);
+        }
+        this.lastFetchTime = Date.now();
+    }
+
+    async fetchProxies(options = {}) {
+        await this.waitForRateLimit();
+        
+        const defaultOptions = {
+            protocol: 'http',
+            https: true,
+            level: 'anonymous',
+            limit: 10,
+            countries: [],
+            notCountries: [],
+            port: null,
+            lastChecked: 60,
+            timeToConnect: 10,
+            cookies: true,
+            post: true,
+            google: false,
+            userAgent: true
+        };
+        
+        const mergedOptions = { ...defaultOptions, ...options };
+        
+        let url = 'http://pubproxy.com/api/proxy?';
+        const params = [];
+        
+        if (mergedOptions.protocol) params.push(`protocol=${mergedOptions.protocol}`);
+        if (mergedOptions.https) params.push(`https=true`);
+        if (mergedOptions.level) params.push(`level=${mergedOptions.level}`);
+        if (mergedOptions.limit) params.push(`limit=${mergedOptions.limit}`);
+        if (mergedOptions.countries && mergedOptions.countries.length > 0) params.push(`country=${mergedOptions.countries.join(',')}`);
+        if (mergedOptions.notCountries && mergedOptions.notCountries.length > 0) params.push(`notCountry=${mergedOptions.notCountries.join(',')}`);
+        if (mergedOptions.port) params.push(`port=${mergedOptions.port}`);
+        if (mergedOptions.lastChecked) params.push(`last_check=${mergedOptions.lastChecked}`);
+        if (mergedOptions.timeToConnect) params.push(`time_to_connect=${mergedOptions.timeToConnect}`);
+        if (mergedOptions.cookies) params.push(`cookies=true`);
+        if (mergedOptions.post) params.push(`post=true`);
+        if (mergedOptions.google) params.push(`google=true`);
+        if (mergedOptions.userAgent) params.push(`user_agent=true`);
+        
+        url += params.join('&');
+        
+        console.log(`[ProxyManager] Fetching proxies...`);
+        
+        try {
+            const response = await axios.get(url, {
+                timeout: 10000,
+                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+            });
+            
+            if (response.data && response.data.data && response.data.data.length > 0) {
+                this.proxies = response.data.data;
+                console.log(`[ProxyManager] Fetched ${this.proxies.length} proxies`);
+                return this.proxies;
+            }
+            return [];
+        } catch (error) {
+            console.error(`[ProxyManager] Failed to fetch proxies: ${error.message}`);
+            return [];
+        }
+    }
+
+    async testProxy(proxy, timeout = 10000) {
+        const proxyUrl = `${proxy.protocol}://${proxy.ip}:${proxy.port}`;
+        
+        try {
+            const agent = new HttpsProxyAgent(proxyUrl);
+            const startTime = Date.now();
+            const response = await axios.get('https://api.ipify.org?format=json', {
+                httpsAgent: agent,
+                timeout: timeout,
+                proxy: false
+            });
+            
+            const responseTime = Date.now() - startTime;
+            
+            if (response.status === 200) {
+                return { working: true, responseTime: responseTime, ip: response.data.ip, proxyIp: proxy.ip };
+            }
+        } catch (error) {
+            return { working: false, error: error.message };
+        }
+        
+        return { working: false };
+    }
+
+    async testMultipleProxies(proxies, maxConcurrent = 5) {
+        console.log(`[ProxyManager] Testing ${proxies.length} proxies...`);
+        
+        const working = [];
+        
+        for (let i = 0; i < proxies.length; i += maxConcurrent) {
+            const batch = proxies.slice(i, i + maxConcurrent);
+            const batchPromises = batch.map(async (proxy) => {
+                const result = await this.testProxy(proxy);
+                if (result.working) {
+                    working.push({ ...proxy, responseTime: result.responseTime, testedIp: result.ip });
+                }
+                return result;
+            });
+            
+            await Promise.all(batchPromises);
+            console.log(`[ProxyManager] Tested ${Math.min(i + maxConcurrent, proxies.length)}/${proxies.length} proxies`);
+            await this.delay(500);
+        }
+        
+        working.sort((a, b) => a.responseTime - b.responseTime);
+        
+        console.log(`[ProxyManager] Found ${working.length} working proxies`);
+        if (working.length > 0) {
+            console.log(`[ProxyManager] Fastest proxy: ${working[0].ip}:${working[0].port} (${working[0].responseTime}ms)`);
+        }
+        
+        this.workingProxies = working;
+        return working;
+    }
+
+    async refreshProxies(options = {}) {
+        this.requestCount++;
+        
+        if (this.requestCount > 50) {
+            console.log('[ProxyManager] Daily request limit reached');
+            return [];
+        }
+        
+        const proxies = await this.fetchProxies(options);
+        if (proxies.length === 0) return [];
+        
+        const working = await this.testMultipleProxies(proxies);
+        return working;
+    }
+
+    getNextProxy() {
+        if (this.workingProxies.length === 0) return null;
+        const proxy = this.workingProxies[this.currentProxyIndex];
+        this.currentProxyIndex = (this.currentProxyIndex + 1) % this.workingProxies.length;
+        return proxy;
+    }
+
+    getProxyUrl(proxy) {
+        if (!proxy) return null;
+        return `${proxy.protocol}://${proxy.ip}:${proxy.port}`;
+    }
+
+    getProxyAgent(proxy) {
+        if (!proxy) return null;
+        return new HttpsProxyAgent(this.getProxyUrl(proxy));
+    }
+
+    getStats() {
+        return {
+            totalProxies: this.proxies.length,
+            workingProxies: this.workingProxies.length,
+            requestsMade: this.requestCount,
+            currentProxyIndex: this.currentProxyIndex,
+            fastestProxy: this.workingProxies.length > 0 ? `${this.workingProxies[0].ip}:${this.workingProxies[0].port} (${this.workingProxies[0].responseTime}ms)` : 'None'
+        };
+    }
+}
+
+// ============ HELPER FUNCTIONS ============
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 function log(step, message, type = 'info', instanceId = 'MAIN') {
@@ -92,6 +276,7 @@ async function installChromiumRuntime() {
     }
 }
 
+// ============ BOT CLASS ============
 class CleverCloudBot {
     constructor(instanceId, maxConcurrent, password, startDelay = 0) {
         this.instanceId = instanceId;
@@ -109,6 +294,8 @@ class CleverCloudBot {
         this.consecutiveFailures = 0;
         this.waitAfterDockerMinutes = parseInt(process.env.BOT_WAIT_MINUTES) || 5;
         this.chromePath = null;
+        this.proxyManager = new ProxyManager();
+        this.useProxy = process.env.USE_PROXY === 'true' || false;
     }
 
     async getDockerProcessCount() {
@@ -144,6 +331,28 @@ class CleverCloudBot {
             throw new Error('Could not install or find Chromium');
         }
         
+        // Get proxy if enabled
+        let proxyServer = null;
+        if (this.useProxy) {
+            if (this.proxyManager.workingProxies.length === 0) {
+                log('PROXY', 'Refreshing proxy list...', 'info', this.instanceId);
+                await this.proxyManager.refreshProxies({
+                    protocol: 'http',
+                    https: true,
+                    level: 'anonymous',
+                    limit: 10
+                });
+            }
+            
+            const proxy = this.proxyManager.getNextProxy();
+            if (proxy) {
+                proxyServer = `${proxy.protocol}://${proxy.ip}:${proxy.port}`;
+                log('PROXY', `Using proxy: ${proxyServer}`, 'success', this.instanceId);
+            } else {
+                log('PROXY', 'No working proxies available, continuing without proxy', 'warn', this.instanceId);
+            }
+        }
+        
         const launchOptions = {
             headless: true,
             executablePath: this.chromePath,
@@ -172,6 +381,11 @@ class CleverCloudBot {
                 '--max_old_space_size=512'
             ]
         };
+        
+        // Add proxy if available
+        if (proxyServer) {
+            launchOptions.args.push(`--proxy-server=${proxyServer}`);
+        }
         
         log('SYSTEM', `Launching browser with: ${this.chromePath}`, 'success', this.instanceId);
         
@@ -409,7 +623,10 @@ class CleverCloudBot {
             try { fs.chmodSync(dockerScriptPath, 0o755); } catch(e) {}
             
             const cmd = `bash ${dockerScriptPath} webwebwebweb8888 3 start buyrunplace --instance ${this.instanceId}`;
-            const dockerProcess = spawn('bash', ['-c', cmd], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+            const dockerProcess = spawn('bash', ['-c', cmd], { 
+                detached: true, 
+                stdio: ['ignore', 'pipe', 'pipe'] 
+            });
             
             this.activeDockerProcesses.push({ id: dockerId, process: dockerProcess, email, logFile, pid: dockerProcess.pid });
             
@@ -634,9 +851,12 @@ function startBot() {
 // ============ EXPRESS ROUTES ============
 app.get('/api/metrics', (req, res) => {
     const systemMetrics = getSystemMetrics();
+    const proxyStats = metrics.botInstance ? metrics.botInstance.proxyManager.getStats() : null;
     res.json({
         ...metrics,
         system: systemMetrics,
+        proxy: proxyStats,
+        useProxy: metrics.botInstance ? metrics.botInstance.useProxy : false,
         timestamp: new Date()
     });
 });
@@ -660,6 +880,23 @@ app.get('/api/accounts', (req, res) => {
         res.json(accounts.reverse().slice(0, 100));
     } catch (error) {
         res.json([]);
+    }
+});
+
+app.get('/api/proxy/stats', (req, res) => {
+    if (metrics.botInstance && metrics.botInstance.proxyManager) {
+        res.json(metrics.botInstance.proxyManager.getStats());
+    } else {
+        res.json({ error: 'Bot not initialized' });
+    }
+});
+
+app.get('/api/proxy/refresh', async (req, res) => {
+    if (metrics.botInstance && metrics.botInstance.proxyManager) {
+        await metrics.botInstance.proxyManager.refreshProxies();
+        res.json({ success: true, stats: metrics.botInstance.proxyManager.getStats() });
+    } else {
+        res.json({ error: 'Bot not initialized' });
     }
 });
 
@@ -694,41 +931,26 @@ app.get('/', (req, res) => {
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Inter', sans-serif; background: #f5f5f5; color: #1e1e2f; }
         .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
-        
-        /* Header */
         .header { margin-bottom: 32px; }
         h1 { font-size: 28px; font-weight: 600; color: #1a1a2e; margin-bottom: 8px; }
         .subtitle { color: #666; font-size: 14px; }
-        
-        /* Cards */
         .card { background: white; border-radius: 16px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); margin-bottom: 24px; }
         .card-title { font-size: 16px; font-weight: 600; color: #333; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
-        
-        /* Metrics Grid */
         .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
         .metric-card { background: white; border-radius: 12px; padding: 20px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
         .metric-value { font-size: 32px; font-weight: 700; color: #1a73e8; margin-bottom: 8px; }
         .metric-label { font-size: 13px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
-        
-        /* Tables */
         .table-responsive { overflow-x: auto; }
         table { width: 100%; border-collapse: collapse; }
         th { text-align: left; padding: 12px; background: #f8f9fa; font-weight: 600; font-size: 13px; color: #666; }
         td { padding: 12px; border-bottom: 1px solid #eee; font-size: 13px; }
-        
-        /* Status Badge */
         .status { display: inline-flex; align-items: center; gap: 6px; }
         .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #4caf50; animation: pulse 2s infinite; }
         .status-dot.stopped { background: #f44336; animation: none; }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-        
-        /* Refresh Button */
         .refresh-btn { background: #1a73e8; color: white; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 500; }
         .refresh-btn:hover { background: #1557b0; }
-        
-        /* Logs */
         .log-entry { font-family: 'Monaco', monospace; font-size: 11px; padding: 4px 0; border-bottom: 1px solid #f0f0f0; color: #555; }
-        
         @media (max-width: 768px) {
             .container { padding: 16px; }
             .metric-value { font-size: 24px; }
@@ -743,65 +965,22 @@ app.get('/', (req, res) => {
         </div>
         
         <div class="metrics-grid" id="metricsGrid">
-            <div class="metric-card">
-                <div class="metric-value" id="totalAccounts">0</div>
-                <div class="metric-label">Total Accounts</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-value" id="todayAccounts">0</div>
-                <div class="metric-label">Today's Accounts</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-value" id="dockerProcesses">0</div>
-                <div class="metric-label">Active Docker Processes</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-value" id="loopCount">0</div>
-                <div class="metric-label">Loop Count</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-value" id="failedAttempts">0</div>
-                <div class="metric-label">Failed Attempts</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-value" id="cpuUsage">0%</div>
-                <div class="metric-label">CPU Usage</div>
-            </div>
+            <div class="metric-card"><div class="metric-value" id="totalAccounts">0</div><div class="metric-label">Total Accounts</div></div>
+            <div class="metric-card"><div class="metric-value" id="todayAccounts">0</div><div class="metric-label">Today's Accounts</div></div>
+            <div class="metric-card"><div class="metric-value" id="dockerProcesses">0</div><div class="metric-label">Active Docker Processes</div></div>
+            <div class="metric-card"><div class="metric-value" id="loopCount">0</div><div class="metric-label">Loop Count</div></div>
+            <div class="metric-card"><div class="metric-value" id="failedAttempts">0</div><div class="metric-label">Failed Attempts</div></div>
+            <div class="metric-card"><div class="metric-value" id="cpuUsage">0%</div><div class="metric-label">CPU Usage</div></div>
         </div>
         
         <div class="card">
-            <div class="card-title">
-                <span>📊</span> System Status
-                <div style="margin-left: auto;">
-                    <button class="refresh-btn" onclick="refreshData()">⟳ Refresh</button>
-                </div>
-            </div>
-            <div class="status">
-                <span class="status-dot" id="statusDot"></span>
-                <span id="botStatus">Loading...</span>
-                <span style="margin-left: 20px;">Started: <span id="startTime">-</span></span>
-                <span style="margin-left: 20px;">Uptime: <span id="uptime">-</span></span>
-            </div>
+            <div class="card-title">📊 System Status <div style="margin-left: auto;"><button class="refresh-btn" onclick="refreshData()">⟳ Refresh</button></div></div>
+            <div class="status"><span class="status-dot" id="statusDot"></span><span id="botStatus">Loading...</span><span style="margin-left: 20px;">Started: <span id="startTime">-</span></span><span style="margin-left: 20px;">Uptime: <span id="uptime">-</span></span></div>
+            <div id="proxyStats" style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #eee; font-size: 12px; color: #666;"></div>
         </div>
         
-        <div class="card">
-            <div class="card-title">📋 Recent Accounts</div>
-            <div class="table-responsive">
-                <table id="accountsTable">
-                    <thead>
-                        <tr><th>Email</th><th>Password</th><th>Date</th><th>Instance</th></tr>
-                    </thead>
-                    <tbody id="accountsBody">
-                        <tr><td colspan="4">Loading...</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </div>
-        
-        <div class="card">
-            <div class="card-title">📄 Recent Logs</div>
-            <div id="logsContainer">Loading...</div>
-        </div>
+        <div class="card"><div class="card-title">📋 Recent Accounts</div><div class="table-responsive"><table id="accountsTable"><thead><tr><th>Email</th><th>Password</th><th>Date</th><th>Instance</th></tr></thead><tbody id="accountsBody"><tr><td colspan="4">Loading...</td></tr></tbody></table></div></div>
+        <div class="card"><div class="card-title">📄 Recent Logs</div><div id="logsContainer">Loading...</div></div>
     </div>
     
     <script>
@@ -818,21 +997,14 @@ app.get('/', (req, res) => {
                 document.getElementById('cpuUsage').textContent = (data.system?.cpuUsage || 0) + '%';
                 
                 const statusDot = document.getElementById('statusDot');
-                const botStatus = document.getElementById('botStatus');
-                if (data.botStatus === 'running') {
-                    statusDot.className = 'status-dot';
-                    botStatus.textContent = 'Running';
-                } else {
-                    statusDot.className = 'status-dot stopped';
-                    botStatus.textContent = 'Stopped';
-                }
+                if (data.botStatus === 'running') { statusDot.className = 'status-dot'; document.getElementById('botStatus').textContent = 'Running'; }
+                else { statusDot.className = 'status-dot stopped'; document.getElementById('botStatus').textContent = 'Stopped'; }
                 
                 document.getElementById('startTime').textContent = new Date(data.startTime).toLocaleString();
+                if (data.system?.uptime) { const hours = Math.floor(data.system.uptime / 3600); const minutes = Math.floor((data.system.uptime % 3600) / 60); document.getElementById('uptime').textContent = hours + 'h ' + minutes + 'm'; }
                 
-                if (data.system?.uptime) {
-                    const hours = Math.floor(data.system.uptime / 3600);
-                    const minutes = Math.floor((data.system.uptime % 3600) / 60);
-                    document.getElementById('uptime').textContent = hours + 'h ' + minutes + 'm';
+                if (data.proxy) {
+                    document.getElementById('proxyStats').innerHTML = \`🔐 Proxy: \${data.useProxy ? 'Enabled' : 'Disabled'} | Working Proxies: \${data.proxy.workingProxies} | Fastest: \${data.proxy.fastestProxy}\`;
                 }
             } catch(e) { console.error(e); }
         }
@@ -842,18 +1014,8 @@ app.get('/', (req, res) => {
                 const res = await fetch('/api/accounts');
                 const accounts = await res.json();
                 const tbody = document.getElementById('accountsBody');
-                if (accounts.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="4">No accounts found</td></tr>';
-                    return;
-                }
-                tbody.innerHTML = accounts.slice(0, 20).map(acc => \`
-                    <tr>
-                        <td>\${acc.email}</td>
-                        <td>\${acc.password}</td>
-                        <td>\${new Date(acc.date).toLocaleString()}</td>
-                        <td>\${acc.instance || '-'}</td>
-                    </tr>
-                \`).join('');
+                if (accounts.length === 0) { tbody.innerHTML = '<tr><td colspan="4">No accounts found</td></tr>'; return; }
+                tbody.innerHTML = accounts.slice(0, 20).map(acc => \`<tr><td>\${acc.email}</td><td>\${acc.password}</td><td>\${new Date(acc.date).toLocaleString()}</td><td>\${acc.instance || '-'}</td></tr>\`).join('');
             } catch(e) { console.error(e); }
         }
         
@@ -862,27 +1024,13 @@ app.get('/', (req, res) => {
                 const res = await fetch('/api/logs');
                 const logs = await res.json();
                 const container = document.getElementById('logsContainer');
-                if (logs.length === 0) {
-                    container.innerHTML = '<div>No logs found</div>';
-                    return;
-                }
-                container.innerHTML = logs.map(log => \`
-                    <div style="margin-bottom: 16px;">
-                        <div style="font-weight: 600; margin-bottom: 8px;">📄 \${log.file}</div>
-                        <div style="background: #f8f9fa; padding: 12px; border-radius: 8px; font-size: 11px; font-family: monospace; max-height: 200px; overflow-y: auto;">
-                            \${log.lines.map(line => '<div class="log-entry">' + escapeHtml(line.substring(0, 200)) + '</div>').join('')}
-                        </div>
-                    </div>
-                \`).join('');
+                if (logs.length === 0) { container.innerHTML = '<div>No logs found</div>'; return; }
+                container.innerHTML = logs.map(log => \`<div style="margin-bottom: 16px;"><div style="font-weight: 600; margin-bottom: 8px;">📄 \${log.file}</div><div style="background: #f8f9fa; padding: 12px; border-radius: 8px; font-size: 11px; font-family: monospace; max-height: 200px; overflow-y: auto;">\${log.lines.map(line => '<div class="log-entry">' + escapeHtml(line.substring(0, 200)) + '</div>').join('')}</div></div>\`).join('');
             } catch(e) { console.error(e); }
         }
         
         function escapeHtml(text) { return text.replace(/[&<>]/g, function(m) { if (m === '&') return '&amp;'; if (m === '<') return '&lt;'; if (m === '>') return '&gt;'; return m; }); }
-        
-        async function refreshData() {
-            await Promise.all([fetchMetrics(), fetchAccounts(), fetchLogs()]);
-        }
-        
+        async function refreshData() { await Promise.all([fetchMetrics(), fetchAccounts(), fetchLogs()]); }
         refreshData();
         setInterval(refreshData, 10000);
     </script>
@@ -896,7 +1044,8 @@ console.log(`\n🚀 Clever Cloud Bot Dashboard Starting...\n`);
 console.log(`📊 Dashboard available at: http://localhost:${port}`);
 console.log(`📈 Metrics API: http://localhost:${port}/api/metrics`);
 console.log(`📋 Accounts API: http://localhost:${port}/api/accounts`);
-console.log(`📄 Logs API: http://localhost:${port}/api/logs\n`);
+console.log(`📄 Logs API: http://localhost:${port}/api/logs`);
+console.log(`🔐 Proxy Stats: http://localhost:${port}/api/proxy/stats\n`);
 
 // Start the bot after 5 seconds
 setTimeout(() => {
