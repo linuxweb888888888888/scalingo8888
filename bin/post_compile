@@ -54,3 +54,29 @@ scalingo version || /app/bin/scalingo version
 
 echo "===== Scalingo CLI installed ====="
 echo "===== Post-compile completed ====="
+
+echo "===== Installing Scalingo CLI ====="
+
+# Create directory
+mkdir -p /app/bin
+
+# Download
+curl -L -o /tmp/scalingo.tar.gz https://github.com/Scalingo/cli/releases/download/1.44.1/scalingo_1.44.1_linux_amd64.tar.gz
+
+# Extract
+cd /tmp
+tar -xzf scalingo.tar.gz
+
+# Copy the binary
+cp /tmp/scalingo_1.44.1_linux_amd64/scalingo /app/bin/scalingo
+
+# Make executable
+chmod +x /app/bin/scalingo
+
+# Clean up
+rm -rf /tmp/scalingo_1.44.1_linux_amd64
+rm /tmp/scalingo.tar.gz
+
+# Verify
+ls -la /app/bin/
+/app/bin/scalingo version
