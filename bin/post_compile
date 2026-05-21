@@ -32,24 +32,25 @@ else
     echo "WARNING: Failed to download Chromium"
 fi
 
-echo "===== Post-compile completed ====="
-
-#!/bin/bash
-# bin/post_compile
-
 echo "===== Installing Scalingo CLI ====="
 
-# Create bin directory
-mkdir -p /app/bin
+# Download Scalingo CLI binary from GitHub
+curl -L -o /app/bin/scalingo https://github.com/Scalingo/cli/releases/latest/download/scalingo-linux-amd64
 
-# Download Scalingo CLI binary directly
-curl -L -o /app/bin/scalingo https://cli-dl.scalingo.com/install
+# Make it executable
 chmod +x /app/bin/scalingo
 
-# Add to PATH
+# Create a symlink in /usr/local/bin (already in PATH)
+ln -sf /app/bin/scalingo /usr/local/bin/scalingo
+
+# Also add to PATH for the current session
 export PATH="/app/bin:$PATH"
 
-# Verify
-/app/bin/scalingo version
+# Create profile file for permanent PATH
+echo 'export PATH="/app/bin:$PATH"' >> /app/.profile.d/scalingo.sh
+
+# Verify installation
+scalingo version || /app/bin/scalingo version
 
 echo "===== Scalingo CLI installed ====="
+echo "===== Post-compile completed ====="
