@@ -27,7 +27,6 @@ async function connectMongoDB() {
         db = dbClient.db('botdb');
         console.log('[MongoDB] Connected successfully');
         
-        // Drop existing problematic indexes
         try {
             await db.collection('accounts').dropIndex('userId_1');
         } catch(e) {}
@@ -35,12 +34,10 @@ async function connectMongoDB() {
             await db.collection('accounts').dropIndex('email_1');
         } catch(e) {}
         
-        // Create collections if they don't exist
         await db.createCollection('accounts', { capped: false });
         await db.createCollection('metrics', { capped: false });
         await db.createCollection('deployments', { capped: false });
         
-        // Create indexes without unique constraints where not needed
         await db.collection('accounts').createIndex({ createdAt: -1 });
         await db.collection('metrics').createIndex({ timestamp: -1 });
         await db.collection('deployments').createIndex({ createdAt: -1 });
@@ -77,7 +74,7 @@ console.log('========================================\n');
 async function saveAccountToDB(account) {
     if (!db) return false;
     try {
-        const result = await db.collection('accounts').insertOne({
+        await db.collection('accounts').insertOne({
             ...account,
             createdAt: new Date(),
             instanceId: account.instanceId || 'INSTANCE_1'
@@ -85,7 +82,6 @@ async function saveAccountToDB(account) {
         console.log(`[MongoDB] Account saved: ${account.email}`);
         return true;
     } catch (error) {
-        // Don't fail if duplicate - just log it
         if (error.code === 11000) {
             console.log(`[MongoDB] Account ${account.email} already exists, skipping`);
             return true;
@@ -603,7 +599,7 @@ class CleverCloudBot {
                     deployedApps.push(appUrl);
                     appCount++;
                     log('DOCKER', `App ${appCount}/3 deployed: ${appUrl}`, 'success', this.instanceId);
-                    await saveDeploymentToDB({
+                    saveDeploymentToDB({
                         appName: appUrl.split('//')[1].split('.')[0],
                         url: appUrl,
                         email: email,
@@ -620,8 +616,8 @@ class CleverCloudBot {
                     const oauthUrl = extractOAuthUrl(output);
                     if (oauthUrl) {
                         oauthHandled = true;
-                        await this.handleOAuth(oauthUrl, email, password);
-                        await sleep(10000);
+                        this.handleOAuth(oauthUrl, email, password).catch(e => console.error(e));
+                        sleep(10000);
                     }
                 }
                 
@@ -636,7 +632,7 @@ class CleverCloudBot {
                         loopCount: this.loopCount
                     };
                     this.completedAccounts.push(accountData);
-                    await saveAccountToDB(accountData);
+                    saveAccountToDB(accountData);
                     fs.appendFileSync(`accounts_${this.instanceId}.csv`, `${email},${password},${new Date().toISOString()}\n`);
                     resolve({ success: true, email, deployedApps });
                 }
@@ -665,7 +661,7 @@ class CleverCloudBot {
                         warning: appCount < 3 ? `Only ${appCount}/3 apps deployed` : 'OAuth completed'
                     };
                     this.completedAccounts.push(accountData);
-                    await saveAccountToDB(accountData);
+                    saveAccountToDB(accountData);
                     fs.appendFileSync(`accounts_${this.instanceId}.csv`, `${email},${password},${new Date().toISOString()},WARNING\n`);
                     resolve({ success: true, email, deployedApps });
                 } else if (!dockerCompleted) {
@@ -714,64 +710,64 @@ class CleverCloudBot {
         
         log('START', `=== Instance ${this.instanceId} Starting ===`, 'info', this.instanceId);
         
-        while (this.isRunning) {
-            this.loopCount++;
+        // Run one account creation cycle
+        try {
+            await this.initBrowser();
             
-            try {
-                log('START', `=== Loop #${this.loopCount} ===`, 'info', this.instanceId);
-                await this.initBrowser();
-                
-                const email = await this.fetchTempEmail();
-                await this.handleSignup(email, this.password);
-                const verifyLink = await this.getVerificationLink();
-                
-                log('VERIFY', 'Activating account...', 'info', this.instanceId);
-                await this.page.goto(verifyLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
-                await sleep(5000);
-                
-                log('DOCKER', 'Starting Docker deployment, waiting for completion...', 'info', this.instanceId);
-                const result = await this.startDockerInBackground(email, this.password);
-                
-                log('FINISH', `Account ${email} created successfully! Deployed ${result.deployedApps?.length || 3} apps`, 'success', this.instanceId);
-                
-                const totalAccounts = await getTotalAccountsFromDB();
-                const todayAccounts = await getTodayAccountsFromDB();
-                await saveMetricsToDB({
-                    totalAccounts: totalAccounts + 1,
-                    completedToday: todayAccounts + 1,
-                    loopCount: this.loopCount,
-                    failedAttempts: this.consecutiveFailures,
-                    uptime: process.uptime(),
-                    deployedApps: result.deployedApps || []
-                });
-                
-                await this.cleanup();
-                this.consecutiveFailures = 0;
-                
-                await sleep(5000);
-                
-                log('RESTART', 'Docker deployment completed, restarting container for new IP...', 'info', this.instanceId);
-                log('RESTART', 'Process will exit in 2 seconds. Scalingo will restart automatically.', 'warn', this.instanceId);
-                
-                await sleep(2000);
-                process.exit(0);
-                
-            } catch (e) {
-                this.consecutiveFailures++;
-                log('ERROR', `${e.message} (failure ${this.consecutiveFailures})`, 'error', this.instanceId);
-                await this.cleanup();
-                
-                await saveMetricsToDB({
-                    error: e.message,
-                    failureCount: this.consecutiveFailures,
-                    loopCount: this.loopCount,
-                    timestamp: new Date()
-                });
-                
-                const backoff = Math.min(60000, 10000 * Math.pow(2, this.consecutiveFailures));
-                log('RESTART', `Waiting ${backoff/1000}s before retry...`, 'warn', this.instanceId);
-                await sleep(backoff);
-            }
+            const email = await this.fetchTempEmail();
+            await this.handleSignup(email, this.password);
+            const verifyLink = await this.getVerificationLink();
+            
+            log('VERIFY', 'Activating account...', 'info', this.instanceId);
+            await this.page.goto(verifyLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await sleep(5000);
+            
+            log('DOCKER', 'Starting Docker deployment, waiting for completion...', 'info', this.instanceId);
+            const result = await this.startDockerInBackground(email, this.password);
+            
+            log('FINISH', `Account ${email} created successfully! Deployed ${result.deployedApps?.length || 3} apps`, 'success', this.instanceId);
+            
+            const totalAccounts = await getTotalAccountsFromDB();
+            const todayAccounts = await getTodayAccountsFromDB();
+            await saveMetricsToDB({
+                totalAccounts: totalAccounts + 1,
+                completedToday: todayAccounts + 1,
+                loopCount: this.loopCount,
+                failedAttempts: this.consecutiveFailures,
+                uptime: process.uptime(),
+                deployedApps: result.deployedApps || []
+            });
+            
+            await this.cleanup();
+            this.consecutiveFailures = 0;
+            
+            await sleep(3000);
+            
+            log('RESTART', 'Account created successfully. Exiting for restart...', 'info', this.instanceId);
+            log('RESTART', 'Scalingo will automatically restart the container with a new IP.', 'warn', this.instanceId);
+            
+            // Force exit - Scalingo will restart automatically
+            process.exit(0);
+            
+        } catch (e) {
+            this.consecutiveFailures++;
+            log('ERROR', `${e.message} (failure ${this.consecutiveFailures})`, 'error', this.instanceId);
+            await this.cleanup();
+            
+            await saveMetricsToDB({
+                error: e.message,
+                failureCount: this.consecutiveFailures,
+                loopCount: this.loopCount,
+                timestamp: new Date()
+            });
+            
+            // Wait before retry
+            const backoff = Math.min(60000, 10000 * Math.pow(2, this.consecutiveFailures));
+            log('RESTART', `Waiting ${backoff/1000}s before exit...`, 'warn', this.instanceId);
+            await sleep(backoff);
+            
+            // Exit to restart
+            process.exit(1);
         }
     }
 
@@ -831,6 +827,7 @@ function startBot() {
     bot.run().catch(error => {
         console.error('[SERVER] Bot error:', error);
         metrics.botStatus = 'error';
+        process.exit(1);
     });
 }
 
@@ -911,7 +908,7 @@ app.get('/', (req, res) => {
     <div class="container">
         <div class="header">
             <h1>🤖 Clever Cloud Bot Dashboard</h1>
-            <p class="subtitle">Auto-restarts after each account for new IP | Data stored in MongoDB</p>
+            <p class="subtitle">Creates one account then restarts for new IP | Data stored in MongoDB</p>
         </div>
         
         <div class="metrics-grid">
@@ -927,7 +924,7 @@ app.get('/', (req, res) => {
             <div class="card-title">📊 System Status <button class="refresh-btn" onclick="refreshData()" style="margin-left: 10px;">Refresh</button></div>
             <div class="status"><span class="status-dot" id="statusDot"></span><span id="botStatus">Loading...</span><span style="margin-left: 20px;">Started: <span id="startTime">-</span></span><span style="margin-left: 20px;">Uptime: <span id="uptime">-</span></span></div>
             <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #eee; font-size: 12px; color: #666;">
-                ✅ MongoDB Connected | 🔄 Auto-restart after each account | 🌐 New IP each restart
+                ✅ MongoDB Connected | 🔄 Restarts after each account | 🌐 New IP each restart
             </div>
         </div>
         
@@ -986,7 +983,7 @@ app.get('/', (req, res) => {
                 let html = '';
                 for (let i = 0; i < Math.min(accounts.length, 20); i++) {
                     const acc = accounts[i];
-                    html += '<tr><td>' + acc.email + '</td><td>' + acc.password + '<td>ecause' + new Date(acc.createdAt).toLocaleString() + '</td><td>' + (acc.deployedApps?.length || 3) + '</td>';
+                    html += '<tr><td>' + acc.email + '</td><td>' + acc.password + '</td><td>' + new Date(acc.createdAt).toLocaleString() + '</td><td>' + (acc.deployedApps?.length || 3) + '</td>';
                 }
                 tbody.innerHTML = html;
             } catch(e) { console.error(e); }
@@ -1008,7 +1005,7 @@ app.get('/', (req, res) => {
 async function main() {
     console.log(`\n🚀 Clever Cloud Bot Dashboard Starting...\n`);
     console.log(`📊 Dashboard available at: http://localhost:${port}`);
-    console.log(`🔄 Bot will restart after each account for new IP`);
+    console.log(`🔄 Bot will create ONE account then exit - Scalingo will restart with new IP`);
     console.log(`💾 MongoDB: ${MONGODB_URI ? 'Configured' : 'Not configured'}\n`);
     
     await connectMongoDB();
