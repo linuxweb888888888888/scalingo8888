@@ -49,7 +49,7 @@ const ENV = {
 console.log('\n========================================');
 console.log('  BOT CONFIGURATION');
 console.log('========================================');
-console.log(`Bot Mode: Creates ONE account, then exits for restart`);
+console.log(`Bot Mode: Creates ONE account, then FORCE RESTART via process.exit`);
 console.log(`MongoDB: ${MONGODB_URI ? 'Connected' : 'Not configured'}`);
 console.log('========================================\n');
 
@@ -59,7 +59,8 @@ let botStatus = {
     accountCreated: false,
     accountEmail: null,
     startTime: new Date(),
-    completionTime: null
+    completionTime: null,
+    restartCount: 0
 };
 
 // ============ HELPER FUNCTIONS ============
@@ -129,6 +130,7 @@ class CleverCloudBot {
         this.password = password;
         this.startDelay = startDelay;
         this.chromePath = null;
+        this.oauthHandled = false;
     }
 
     async initBrowser() {
@@ -149,7 +151,7 @@ class CleverCloudBot {
     }
 
     async fetchTempEmail() {
-        log('EMAIL', 'Getting temp email from 10MinuteMail...', 'info', this.instanceId);
+        log('EMAIL', 'Getting temp email...', 'info', this.instanceId);
         this.mailPage = await this.browser.newPage();
         await this.mailPage.goto('https://10minutemail.net/', { waitUntil: 'domcontentloaded' });
         await sleep(5000);
@@ -162,7 +164,7 @@ class CleverCloudBot {
         });
         
         if (!this.realTempEmail) {
-            throw new Error('Could not extract email from 10MinuteMail');
+            throw new Error('Could not extract email');
         }
         
         log('EMAIL', this.realTempEmail, 'success', this.instanceId);
@@ -218,12 +220,11 @@ class CleverCloudBot {
     }
 
     async getVerificationLink() {
-        log('VERIFY', 'Waiting for verification email (max 5 minutes)...', 'info', this.instanceId);
+        log('VERIFY', 'Waiting for verification email (max 5 min)...', 'info', this.instanceId);
         const startTime = Date.now();
         let emailFound = false;
         
         while (Date.now() - startTime < 300000) {
-            // Check for verification link in current page
             let link = await this.mailPage.evaluate(() => {
                 const regex = /https:\/\/api\.clever-cloud\.com\/v2\/self\/validate_email\?validationKey=[a-f0-9-]+/;
                 const match = document.documentElement.innerHTML.match(regex);
@@ -235,7 +236,6 @@ class CleverCloudBot {
                 return link;
             }
             
-            // Look for Clever Cloud email in inbox
             if (!emailFound) {
                 const clicked = await this.mailPage.evaluate(() => {
                     const rows = Array.from(document.querySelectorAll('#maillist tr'));
@@ -260,51 +260,87 @@ class CleverCloudBot {
                 }
             }
             
-            // Refresh inbox periodically
             const elapsed = Math.floor((Date.now() - startTime) / 1000);
             process.stdout.write(`\r  Waiting for email... ${elapsed}s / 300s`);
-            
             await sleep(5000);
         }
         
-        console.log(); // New line after progress
+        console.log();
         throw new Error('No verification email received after 5 minutes');
     }
 
     async handleOAuth(url, email, password) {
-        log('OAUTH', 'Processing OAuth...', 'info', this.instanceId);
+        log('OAUTH', '========================================', 'info', this.instanceId);
+        log('OAUTH', 'Opening OAuth URL for auto-login...', 'info', this.instanceId);
         
-        const oauthPage = await this.browser.newPage();
-        await oauthPage.goto(url, { waitUntil: 'networkidle2' });
-        await sleep(5000);
-        
-        await oauthPage.evaluate((email, password) => {
-            const emailField = document.querySelector('input[type="email"]');
-            const passwordField = document.querySelector('input[type="password"]');
-            if (emailField && passwordField) {
-                emailField.value = email;
-                passwordField.value = password;
+        try {
+            const oauthPage = await this.browser.newPage();
+            await oauthPage.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+            log('OAUTH', 'OAuth page loaded', 'success', this.instanceId);
+            await sleep(3000);
+            
+            const credentialsFilled = await oauthPage.evaluate((email, password) => {
+                const emailField = document.querySelector('input[type="email"], input[name="email"], input[id="email"]');
+                const passwordField = document.querySelector('input[type="password"], input[name="password"], input[id="password"]');
+                
+                if (emailField && passwordField) {
+                    emailField.value = email;
+                    passwordField.value = password;
+                    emailField.dispatchEvent(new Event('input', { bubbles: true }));
+                    passwordField.dispatchEvent(new Event('input', { bubbles: true }));
+                    return true;
+                }
+                return false;
+            }, email, password);
+            
+            if (credentialsFilled) {
+                log('OAUTH', 'Credentials filled successfully', 'success', this.instanceId);
+                await sleep(2000);
+                
+                const loginClicked = await oauthPage.evaluate(() => {
+                    const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
+                    const loginButton = buttons.find(btn => {
+                        const text = (btn.innerText || btn.value || '').toLowerCase();
+                        return text.includes('login') || text.includes('sign in') || text.includes('log in');
+                    });
+                    if (loginButton) {
+                        loginButton.click();
+                        return true;
+                    }
+                    const form = document.querySelector('form');
+                    if (form) {
+                        form.submit();
+                        return true;
+                    }
+                    return false;
+                });
+                
+                if (loginClicked) {
+                    log('OAUTH', 'Login button clicked!', 'success', this.instanceId);
+                }
             }
-        }, email, password);
-        
-        await sleep(2000);
-        
-        await oauthPage.evaluate(() => {
-            const btn = Array.from(document.querySelectorAll('button')).find(x => 
-                x.innerText.toLowerCase().includes('login')
-            );
-            if (btn) btn.click();
-        });
-        
-        await sleep(8000);
-        await oauthPage.close();
-        log('OAUTH', 'OAuth completed', 'success', this.instanceId);
+            
+            await sleep(8000);
+            await oauthPage.close();
+            log('OAUTH', 'OAuth flow completed', 'success', this.instanceId);
+            log('OAUTH', '========================================', 'info', this.instanceId);
+            return true;
+        } catch (error) {
+            log('OAUTH', `OAuth error: ${error.message}`, 'error', this.instanceId);
+            return false;
+        }
     }
 
     async startDockerInBackground(email, password) {
-        return new Promise((resolve) => {
+        return new Promise((resolve, reject) => {
+            const dockerId = `${this.instanceId}_${Date.now()}`;
+            const logFile = `docker_${this.instanceId}_${dockerId}.log`;
+            
+            log('DOCKER', 'Starting Docker deployment...', 'info', this.instanceId);
+            
             const dockerScriptPath = '/app/docker';
             if (!fs.existsSync(dockerScriptPath)) {
+                log('DOCKER', 'Docker script not found', 'warn', this.instanceId);
                 resolve({ success: true, email, deployedApps: [] });
                 return;
             }
@@ -315,20 +351,63 @@ class CleverCloudBot {
             });
             
             let deployedApps = [];
+            let oauthUrlDetected = false;
             
-            dockerProcess.stdout.on('data', (data) => {
+            const extractOAuthUrl = (output) => {
+                const match = output.match(/https:\/\/console\.clever-cloud\.com\/cli-oauth\?[^\s]+/);
+                return match ? match[0] : null;
+            };
+            
+            dockerProcess.stdout.on('data', async (data) => {
                 const output = data.toString();
                 console.log(`[DOCKER] ${output.trim()}`);
+                
+                if (!oauthUrlDetected && !this.oauthHandled) {
+                    const oauthUrl = extractOAuthUrl(output);
+                    if (oauthUrl) {
+                        oauthUrlDetected = true;
+                        this.oauthHandled = true;
+                        log('OAUTH', 'Detected OAuth URL, handling automatically...', 'success', this.instanceId);
+                        await this.handleOAuth(oauthUrl, email, password);
+                    }
+                }
+                
                 const urlMatch = output.match(/https:\/\/[a-z0-9-]+\.osc-fr1\.scalingo\.io/);
                 if (urlMatch && !deployedApps.includes(urlMatch[0])) {
                     deployedApps.push(urlMatch[0]);
+                    log('DOCKER', `App deployed: ${urlMatch[0]}`, 'success', this.instanceId);
+                }
+                
+                if (output.includes('All 3 apps deployed')) {
+                    log('DOCKER', 'Deployment completed successfully!', 'success', this.instanceId);
+                    resolve({ success: true, email, deployedApps });
                 }
             });
             
-            dockerProcess.on('close', () => {
-                resolve({ success: true, email, deployedApps });
+            dockerProcess.stderr.on('data', (data) => {
+                const err = data.toString();
+                console.error(`[DOCKER ERR] ${err.trim()}`);
             });
+            
+            dockerProcess.on('close', (code) => {
+                if (deployedApps.length > 0) {
+                    resolve({ success: true, email, deployedApps });
+                } else if (code === 0) {
+                    resolve({ success: true, email, deployedApps: [] });
+                } else {
+                    reject(new Error(`Docker exited with code ${code}`));
+                }
+            });
+            
             dockerProcess.unref();
+            
+            setTimeout(() => {
+                if (deployedApps.length > 0) {
+                    resolve({ success: true, email, deployedApps });
+                } else {
+                    reject(new Error('Docker deployment timeout'));
+                }
+            }, 600000);
         });
     }
 
@@ -354,11 +433,9 @@ class CleverCloudBot {
             await this.handleSignup(email, this.password);
             const verifyLink = await this.getVerificationLink();
             
+            log('VERIFY', 'Activating account...', 'info', this.instanceId);
             await this.page.goto(verifyLink, { waitUntil: 'domcontentloaded' });
             await sleep(5000);
-            
-            // Handle OAuth if needed (this will come from docker script)
-            // await this.handleOAuth(oauthUrl, email, password);
             
             const result = await this.startDockerInBackground(email, this.password);
             
@@ -377,42 +454,30 @@ class CleverCloudBot {
             botStatus.accountCreated = true;
             botStatus.completionTime = new Date();
             botStatus.state = 'completed';
+            botStatus.restartCount++;
             
             log('SUCCESS', `✓ Account ${email} created successfully!`, 'success', this.instanceId);
+            log('RESTART', `This was account #${botStatus.restartCount}`, 'info', this.instanceId);
+            log('RESTART', '========================================', 'info', this.instanceId);
+            log('RESTART', 'FORCE RESTART: Exiting process to get NEW IP', 'info', this.instanceId);
+            log('RESTART', 'Scalingo will automatically restart the container', 'info', this.instanceId);
+            log('RESTART', '========================================', 'info', this.instanceId);
+            
+            // FORCE RESTART - Exit the process
+            await sleep(2000);
+            process.exit(0);
             
         } catch (error) {
             log('ERROR', error.message, 'error', this.instanceId);
             await this.cleanup();
             botStatus.state = 'failed';
             botStatus.completionTime = new Date();
-            log('FAILED', 'Account creation failed', 'error', this.instanceId);
+            log('RESTART', 'Account creation failed, exiting to restart...', 'warn', this.instanceId);
+            await sleep(2000);
+            process.exit(1);
         }
     }
 }
-
-// ============ HEALTH CHECK ENDPOINT ============
-app.get('/health', (req, res) => {
-    const uptime = process.uptime();
-    console.log(`[HEALTH] State: ${botStatus.state}, Account: ${botStatus.accountCreated ? 'created' : 'not yet'}`);
-    
-    if (botStatus.state === 'starting' || botStatus.state === 'running') {
-        // Bot is working - healthy
-        res.status(200).json({ status: 'healthy', state: botStatus.state });
-    } else {
-        // Bot completed or failed - trigger restart
-        console.log('[HEALTH] Bot completed/failed, returning 500 to trigger restart');
-        res.status(500).json({ status: 'unhealthy', state: botStatus.state, restart: true });
-    }
-});
-
-// ============ READINESS CHECK ============
-app.get('/ready', (req, res) => {
-    if (botStatus.state === 'running') {
-        res.status(200).json({ ready: true });
-    } else {
-        res.status(503).json({ ready: false });
-    }
-});
 
 // ============ METRICS ENDPOINTS ============
 let metrics = { totalAccounts: 0, completedToday: 0 };
@@ -430,89 +495,110 @@ async function updateMetrics() {
 app.get('/api/metrics', async (req, res) => {
     await updateMetrics();
     res.json({
-        ...metrics,
+        totalAccounts: metrics.totalAccounts,
+        completedToday: metrics.completedToday,
         botState: botStatus.state,
         accountCreated: botStatus.accountCreated,
         lastAccount: botStatus.accountEmail,
+        restartCount: botStatus.restartCount,
         uptime: process.uptime()
     });
 });
 
 app.get('/api/accounts', async (req, res) => {
     if (!db) return res.json([]);
-    const accounts = await db.collection('accounts').find({}).sort({ createdAt: -1 }).limit(50).toArray();
+    const accounts = await db.collection('accounts')
+        .find({ email: { $exists: true, $ne: null } })
+        .sort({ createdAt: -1 })
+        .limit(50)
+        .toArray();
     res.json(accounts);
 });
 
-app.get('/api/status', (req, res) => {
-    res.json({
-        botState: botStatus.state,
-        accountCreated: botStatus.accountCreated,
-        accountEmail: botStatus.accountEmail,
-        startTime: botStatus.startTime,
-        completionTime: botStatus.completionTime,
-        uptime: process.uptime()
-    });
-});
-
+// ============ DASHBOARD ============
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Clever Cloud Bot</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clever Cloud Bot Dashboard</title>
     <style>
-        body { font-family: Arial; margin: 20px; background: #f0f0f0; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        .card { background: white; padding: 20px; margin-bottom: 20px; border-radius: 8px; }
-        .metric { display: inline-block; margin: 10px; padding: 15px; background: #e3f2fd; border-radius: 8px; }
-        .value { font-size: 28px; font-weight: bold; color: #1976d2; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { text-align: left; padding: 8px; border-bottom: 1px solid #ddd; }
-        .status { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+        h1 { font-size: 28px; margin-bottom: 8px; }
+        .subtitle { color: #666; margin-bottom: 24px; }
+        .card { background: white; border-radius: 12px; padding: 24px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .card-title { font-size: 18px; font-weight: 600; margin-bottom: 16px; }
+        .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
+        .metric-card { background: white; border-radius: 12px; padding: 20px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .metric-value { font-size: 32px; font-weight: 700; color: #1976d2; }
+        .metric-label { font-size: 13px; color: #666; margin-top: 8px; }
+        .status { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 8px; }
         .status-running { background: #4caf50; animation: pulse 1s infinite; }
-        .status-completed { background: #2196f3; }
-        .status-failed { background: #f44336; }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #e0e0e0; }
+        th { background: #f8f9fa; font-weight: 600; }
+        .info-box { background: #e3f2fd; padding: 16px; border-radius: 8px; margin-top: 16px; }
+        .info-box p { margin-bottom: 4px; font-size: 14px; }
+        code { background: #f4f4f4; padding: 2px 6px; border-radius: 4px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🤖 Clever Cloud Bot</h1>
-        <div class="card">
-            <h3>📊 Stats</h3>
-            <div id="stats"></div>
+        <h1>🤖 Clever Cloud Bot Dashboard</h1>
+        <p class="subtitle">Creates ONE account, auto-handles OAuth, then FORCE RESTARTS for new IP</p>
+        
+        <div class="metrics-grid" id="metrics">
+            <div class="metric-card"><div class="metric-value" id="totalAccounts">0</div><div class="metric-label">Total Accounts</div></div>
+            <div class="metric-card"><div class="metric-value" id="todayAccounts">0</div><div class="metric-label">Today</div></div>
+            <div class="metric-card"><div class="metric-value" id="restartCount">0</div><div class="metric-label">Restarts</div></div>
+            <div class="metric-card"><div class="metric-value" id="botState">-</div><div class="metric-label">State</div></div>
         </div>
+        
         <div class="card">
-            <h3>📋 Recent Accounts</h3>
-            <div id="accounts"></div>
+            <div class="card-title">📋 Recent Accounts</div>
+            <div class="table-responsive">
+                <table id="accountsTable">
+                    <thead><tr><th>Email</th><th>Password</th><th>Date</th></tr></thead>
+                    <tbody id="accountsBody"><tr><td colspan="3">Loading...</td></tr></tbody>
+                </table>
+            </div>
         </div>
-        <div class="card">
-            <h3>ℹ️ Info</h3>
-            <p>Health check: <code>/health</code></p>
-            <p>Bot creates 1 account, then health check returns 500 → Scalingo restarts → New IP</p>
+        
+        <div class="info-box">
+            <p>✅ Bot creates ONE account → Exits with process.exit(0)</p>
+            <p>🔄 Scalingo automatically restarts container with NEW IP address</p>
+            <p>🔐 OAuth is automatically handled (fills email/password, clicks login)</p>
         </div>
     </div>
+    
     <script>
-        async function load() {
-            const stats = await fetch('/api/metrics').then(r => r.json());
-            document.getElementById('stats').innerHTML = \`
-                <div class="metric"><div class="value">\${stats.totalAccounts || 0}</div>Total Accounts</div>
-                <div class="metric"><div class="value">\${stats.completedToday || 0}</div>Today</div>
-                <div class="metric"><div class="value"><span class="status status-\${stats.botState}"></span>\${stats.botState}</div>State</div>
-            \`;
-            
-            const accounts = await fetch('/api/accounts').then(r => r.json());
-            if (accounts.length) {
-                document.getElementById('accounts').innerHTML = \`
-                    </table>
-                        <tr><th>Email</th><th>Password</th><th>Date</th></tr>
-                        \${accounts.map(a => \`<tr><td>\${a.email}</td><td>\${a.password}</td><td>\${new Date(a.createdAt).toLocaleString()}</td></tr>\`).join('')}
-                    20点
-                \`;
-            }
+        async function refreshData() {
+            try {
+                const res = await fetch('/api/metrics');
+                const data = await res.json();
+                document.getElementById('totalAccounts').textContent = data.totalAccounts || 0;
+                document.getElementById('todayAccounts').textContent = data.completedToday || 0;
+                document.getElementById('restartCount').textContent = data.restartCount || 0;
+                document.getElementById('botState').innerHTML = '<span class="status status-' + data.botState + '"></span>' + data.botState;
+                
+                const accountsRes = await fetch('/api/accounts');
+                const accounts = await accountsRes.json();
+                const tbody = document.getElementById('accountsBody');
+                if (accounts && accounts.length) {
+                    let html = '';
+                    for (const acc of accounts) {
+                        html += '<tr><td>' + acc.email + '</td><td>' + acc.password + '</td><td>' + new Date(acc.createdAt).toLocaleString() + '</td></tr>';
+                    }
+                    tbody.innerHTML = html;
+                }
+            } catch(e) { console.error(e); }
         }
-        load();
-        setInterval(load, 5000);
+        refreshData();
+        setInterval(refreshData, 5000);
     </script>
 </body>
 </html>`);
@@ -522,30 +608,20 @@ app.get('/', (req, res) => {
 async function main() {
     console.log(`\n🚀 Clever Cloud Bot Starting...`);
     console.log(`📊 Dashboard: http://localhost:${port}`);
-    console.log(`🩺 Health Check: http://localhost:${port}/health`);
-    console.log(`🔄 Mode: Creates ONE account, then health check triggers restart for NEW IP`);
+    console.log(`🔄 Mode: Creates ONE account, then FORCE RESTART via process.exit()`);
+    console.log(`🌐 Each restart gives a NEW PUBLIC IP address`);
     console.log(`\n`);
     
     await connectMongoDB();
     
-    // Start server
     app.listen(port, '0.0.0.0', () => {
         console.log(`✅ Dashboard server running on port ${port}`);
     });
     
-    // Wait for server to start
     await sleep(2000);
     
-    // Run bot
     const bot = new CleverCloudBot('INSTANCE_1', ENV.BOT_PASSWORD, ENV.BOT_START_DELAY);
     await bot.run();
-    
-    // Keep process alive for health checks
-    console.log('\n[MAIN] Bot finished, keeping alive for health checks...');
-    console.log('[MAIN] Health check will return 500, triggering restart for new IP\n');
-    
-    // Keep alive
-    setInterval(() => {}, 1000);
 }
 
 process.on('SIGINT', () => {
