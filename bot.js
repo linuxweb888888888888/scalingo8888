@@ -44,7 +44,7 @@ const ENV = {
     BOT_START_DELAY: parseInt(process.env.BOT_START_DELAY) || 10,
     HEADLESS_MODE: process.env.HEADLESS_MODE !== 'false',
     CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome',
-    SCALINGO_API_TOKEN: 'tk-us-mllbylpj_U6C0WpMZkMLaToMDawI13ZPhAd2TdtpcqiwAP_S',
+    SCALINGO_API_TOKEN: process.env.SCALINGO_API_TOKEN || '',
     SCALINGO_APP_NAME: process.env.SCALINGO_APP_NAME || 'business-app'
 };
 
@@ -127,7 +127,13 @@ async function restartWithAPI() {
     const apiToken = ENV.SCALINGO_API_TOKEN;
     const appName = ENV.SCALINGO_APP_NAME;
     
-    log('RESTART', 'Initiating API restart...', 'info', 'MAIN');
+    if (!apiToken) {
+        log('RESTART', 'No API token found, using exit restart', 'warn', 'MAIN');
+        process.exit(0);
+        return;
+    }
+    
+    log('RESTART', `Initiating API restart for app: ${appName}`, 'info', 'MAIN');
     
     return new Promise((resolve) => {
         const options = {
@@ -150,7 +156,8 @@ async function restartWithAPI() {
                     log('RESTART', 'Container will restart with NEW IP address', 'success', 'MAIN');
                     resolve(true);
                 } else {
-                    log('RESTART', `API returned: ${res.statusCode}`, 'error', 'MAIN');
+                    log('RESTART', `API returned: ${res.statusCode} - ${data}`, 'error', 'MAIN');
+                    log('RESTART', 'Falling back to exit restart', 'warn', 'MAIN');
                     resolve(false);
                 }
             });
@@ -158,6 +165,7 @@ async function restartWithAPI() {
         
         req.on('error', (error) => {
             log('RESTART', `API error: ${error.message}`, 'error', 'MAIN');
+            log('RESTART', 'Falling back to exit restart', 'warn', 'MAIN');
             resolve(false);
         });
         
@@ -506,14 +514,13 @@ class CleverCloudBot {
             log('RESTART', `This was account #${botStatus.restartCount}`, 'info', this.instanceId);
             log('RESTART', '========================================', 'info', this.instanceId);
             log('RESTART', 'Calling Scalingo API for IMMEDIATE restart...', 'info', this.instanceId);
-            log('RESTART', 'Container will restart with NEW IP address', 'info', this.instanceId);
             log('RESTART', '========================================', 'info', this.instanceId);
             
             // Call API to restart immediately
             await restartWithAPI();
             
-            // Give API time to process then exit
-            await sleep(2000);
+            // Keep process alive briefly then exit
+            await sleep(3000);
             process.exit(0);
             
         } catch (error) {
@@ -521,7 +528,7 @@ class CleverCloudBot {
             await this.cleanup();
             botStatus.state = 'failed';
             botStatus.completionTime = new Date();
-            log('RESTART', 'Account creation failed, exiting to restart...', 'warn', this.instanceId);
+            log('RESTART', 'Account creation failed, exiting...', 'warn', this.instanceId);
             await sleep(2000);
             process.exit(1);
         }
@@ -621,7 +628,7 @@ app.get('/', (req, res) => {
             <p>✅ Bot creates ONE account → Calls Scalingo API → IMMEDIATE RESTART</p>
             <p>🔄 Container restarts instantly with NEW IP address</p>
             <p>🔐 OAuth is automatically handled (fills email/password, clicks login)</p>
-            <p>🚀 API Token: Configured ✓</p>
+            <p>🚀 API Token: ${ENV.SCALINGO_API_TOKEN ? '✓ Configured' : '✗ Not configured'}</p>
         <\/div>
     <\/div>
     
