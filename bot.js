@@ -53,21 +53,19 @@ async function connectMongoDB() {
 // ============ ENVIRONMENT VARIABLES ============
 const ENV = {
     BOT_PASSWORD: process.env.BOT_PASSWORD || 'Linuxdistro&84',
-    BOT_WAIT_MINUTES: parseInt(process.env.BOT_WAIT_MINUTES) || 5,
     BOT_START_DELAY: parseInt(process.env.BOT_START_DELAY) || 10,
-    USE_PROXY: process.env.USE_PROXY === 'true' || false,
-    DOCKER_IMAGE: process.env.DOCKER_IMAGE || 'buyrunplace/webwebwebweb8888',
-    DOCKER_APP_COUNT: parseInt(process.env.DOCKER_APP_COUNT) || 3,
     HEADLESS_MODE: process.env.HEADLESS_MODE !== 'false',
     CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome',
-    DEBUG_MODE: process.env.DEBUG_MODE === 'true' || false
+    SCALINGO_API_TOKEN: process.env.SCALINGO_API_TOKEN || '',
+    SCALINGO_APP_NAME: process.env.SCALINGO_APP_NAME || 'business-app'
 };
 
 console.log('\n========================================');
 console.log('  BOT CONFIGURATION');
 console.log('========================================');
-console.log(`Bot Settings: Password: ${ENV.BOT_PASSWORD}, Wait: ${ENV.BOT_WAIT_MINUTES}m`);
+console.log(`Bot Settings: Password: ${ENV.BOT_PASSWORD}`);
 console.log(`MongoDB: ${MONGODB_URI ? 'Configured' : 'Not configured'}`);
+console.log(`Scalingo API: ${ENV.SCALINGO_API_TOKEN ? '✓ Token configured' : '✗ Not configured'}`);
 console.log('========================================\n');
 
 // ============ DATABASE OPERATIONS ============
@@ -117,20 +115,6 @@ async function saveDeploymentToDB(deployment) {
     } catch (error) {
         console.error('[MongoDB] Save deployment error:', error.message);
         return false;
-    }
-}
-
-async function getAccountsFromDB(limit = 100) {
-    if (!db) return [];
-    try {
-        return await db.collection('accounts')
-            .find({})
-            .sort({ createdAt: -1 })
-            .limit(limit)
-            .toArray();
-    } catch (error) {
-        console.error('[MongoDB] Get accounts error:', error.message);
-        return [];
     }
 }
 
@@ -235,6 +219,53 @@ async function installChromiumRuntime() {
     }
 }
 
+// ============ RESTART FUNCTION ============
+async function immediateRestart() {
+    console.log('[RESTART] Initiating immediate restart...');
+    
+    const apiToken = ENV.SCALINGO_API_TOKEN;
+    const appName = ENV.SCALINGO_APP_NAME;
+    
+    if (!apiToken) {
+        console.log('[RESTART] No API token, exiting normally (will have delay)');
+        process.exit(0);
+        return;
+    }
+    
+    return new Promise((resolve) => {
+        const options = {
+            hostname: 'api.osc-fr1.scalingo.com',
+            path: `/v1/apps/${appName}/restart`,
+            method: 'POST',
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiToken}`
+            }
+        };
+        
+        const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                if (res.statusCode === 202) {
+                    console.log('[RESTART] ✅ Restart initiated successfully!');
+                } else {
+                    console.log(`[RESTART] Restart API returned: ${res.statusCode}`);
+                }
+                resolve(true);
+            });
+        });
+        
+        req.on('error', (error) => {
+            console.log(`[RESTART] API error: ${error.message}`);
+            resolve(false);
+        });
+        
+        req.end();
+    });
+}
+
 // ============ BOT CLASS ============
 class CleverCloudBot {
     constructor(instanceId, password, startDelay = 0) {
@@ -250,7 +281,6 @@ class CleverCloudBot {
         this.isRunning = true;
         this.loopCount = 0;
         this.consecutiveFailures = 0;
-        this.waitAfterDockerMinutes = ENV.BOT_WAIT_MINUTES;
         this.chromePath = null;
         this.startTime = new Date();
     }
@@ -419,14 +449,14 @@ class CleverCloudBot {
     }
 
     async getVerificationLink() {
-        log('VERIFY', 'Polling for email content (4m limit)...', 'info', this.instanceId);
+        log('VERIFY', 'Polling for email content (5m limit)...', 'info', this.instanceId);
         const startTime = Date.now();
         let emailFound = false;
         let retryCount = 0;
 
         while (true) {
-            if (Date.now() - startTime > 240000) {
-                throw new Error("RESTART_NEEDED - No verification email after 4 minutes");
+            if (Date.now() - startTime > 300000) {
+                throw new Error("RESTART_NEEDED - No verification email after 5 minutes");
             }
 
             try {
@@ -443,10 +473,10 @@ class CleverCloudBot {
 
                 if (!emailFound) {
                     const rowClicked = await this.mailPage.evaluate(() => {
-                        const rows = Array.from(document.querySelectorAll('#maillist tr, .mail-list tr, .inbox tr, [class*="mail"] tr'));
+                        const rows = Array.from(document.querySelectorAll('#maillist tr, .mail-list tr, .inbox tr'));
                         const cleverRow = rows.find(r => {
                             const text = (r.innerText || '').toLowerCase();
-                            return text.includes('clever cloud') || text.includes('clever-cloud') || text.includes('clevercloud');
+                            return text.includes('clever cloud') || text.includes('clever-cloud');
                         });
                         if (cleverRow) {
                             const a = cleverRow.querySelector('a');
@@ -473,7 +503,7 @@ class CleverCloudBot {
                 }
 
                 const elapsed = Math.floor((Date.now() - startTime) / 1000);
-                console.log(`  Waiting for email... ${elapsed}s / 240s`);
+                console.log(`  Waiting for email... ${elapsed}s / 300s`);
                 
                 await sleep(5000);
                 retryCount++;
@@ -496,18 +526,8 @@ class CleverCloudBot {
             await sleep(5000);
             
             const credentialsFilled = await oauthPage.evaluate((email, password) => {
-                const emailSelectors = ['input[type="email"]', 'input[name="email"]', 'input[id="email"]'];
-                const passwordSelectors = ['input[type="password"]', 'input[name="password"]', 'input[id="password"]'];
-                
-                let emailField = null, passwordField = null;
-                for (const selector of emailSelectors) {
-                    emailField = document.querySelector(selector);
-                    if (emailField) break;
-                }
-                for (const selector of passwordSelectors) {
-                    passwordField = document.querySelector(selector);
-                    if (passwordField) break;
-                }
+                const emailField = document.querySelector('input[type="email"], input[name="email"], input[id="email"]');
+                const passwordField = document.querySelector('input[type="password"], input[name="password"], input[id="password"]');
                 
                 if (emailField && passwordField) {
                     emailField.value = email;
@@ -527,7 +547,7 @@ class CleverCloudBot {
                     const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
                     const loginButton = buttons.find(btn => {
                         const text = (btn.innerText || btn.value || '').toLowerCase();
-                        return text.includes('login') || text.includes('sign in') || text.includes('log in');
+                        return text.includes('login') || text.includes('sign in');
                     });
                     if (loginButton) { loginButton.click(); return true; }
                     const form = document.querySelector('form');
@@ -576,7 +596,6 @@ class CleverCloudBot {
             let dockerCompleted = false;
             let oauthHandled = false;
             let deployedApps = [];
-            let allAppsDeployed = false;
             let appCount = 0;
             
             const extractOAuthUrl = (output) => {
@@ -607,11 +626,6 @@ class CleverCloudBot {
                     });
                 }
                 
-                if (appCount >= 3 && !allAppsDeployed) {
-                    allAppsDeployed = true;
-                    log('DOCKER', '✅ All 3 apps deployed successfully!', 'success', this.instanceId);
-                }
-                
                 if (!oauthHandled && !dockerCompleted) {
                     const oauthUrl = extractOAuthUrl(output);
                     if (oauthUrl) {
@@ -621,7 +635,7 @@ class CleverCloudBot {
                     }
                 }
                 
-                if (!dockerCompleted && (allAppsDeployed || output.includes('All 3 apps deployed'))) {
+                if (!dockerCompleted && (appCount >= 3 || output.includes('All 3 apps deployed'))) {
                     dockerCompleted = true;
                     const accountData = {
                         email: email,
@@ -710,7 +724,6 @@ class CleverCloudBot {
         
         log('START', `=== Instance ${this.instanceId} Starting ===`, 'info', this.instanceId);
         
-        // Run one account creation cycle
         try {
             await this.initBrowser();
             
@@ -722,10 +735,10 @@ class CleverCloudBot {
             await this.page.goto(verifyLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
             await sleep(5000);
             
-            log('DOCKER', 'Starting Docker deployment, waiting for completion...', 'info', this.instanceId);
+            log('DOCKER', 'Starting Docker deployment...', 'info', this.instanceId);
             const result = await this.startDockerInBackground(email, this.password);
             
-            log('FINISH', `Account ${email} created successfully! Deployed ${result.deployedApps?.length || 3} apps`, 'success', this.instanceId);
+            log('FINISH', `Account ${email} created! Deployed ${result.deployedApps?.length || 3} apps`, 'success', this.instanceId);
             
             const totalAccounts = await getTotalAccountsFromDB();
             const todayAccounts = await getTodayAccountsFromDB();
@@ -733,40 +746,29 @@ class CleverCloudBot {
                 totalAccounts: totalAccounts + 1,
                 completedToday: todayAccounts + 1,
                 loopCount: this.loopCount,
-                failedAttempts: this.consecutiveFailures,
-                uptime: process.uptime(),
                 deployedApps: result.deployedApps || []
             });
             
             await this.cleanup();
-            this.consecutiveFailures = 0;
             
-            await sleep(3000);
+            // IMMEDIATE RESTART VIA API
+            log('RESTART', '========================================', 'info', this.instanceId);
+            log('RESTART', 'Account created successfully!', 'success', this.instanceId);
+            log('RESTART', 'Initiating immediate restart via API...', 'info', this.instanceId);
+            log('RESTART', '========================================', 'info', this.instanceId);
             
-            log('RESTART', 'Account created successfully. Exiting for restart...', 'info', this.instanceId);
-            log('RESTART', 'Scalingo will automatically restart the container with a new IP.', 'warn', this.instanceId);
+            await immediateRestart();
             
-            // Force exit - Scalingo will restart automatically
+            // Give API time to process then exit
+            log('RESTART', 'Restart command sent, exiting...', 'info', this.instanceId);
+            await sleep(2000);
             process.exit(0);
             
         } catch (e) {
-            this.consecutiveFailures++;
-            log('ERROR', `${e.message} (failure ${this.consecutiveFailures})`, 'error', this.instanceId);
+            log('ERROR', `${e.message}`, 'error', this.instanceId);
             await this.cleanup();
-            
-            await saveMetricsToDB({
-                error: e.message,
-                failureCount: this.consecutiveFailures,
-                loopCount: this.loopCount,
-                timestamp: new Date()
-            });
-            
-            // Wait before retry
-            const backoff = Math.min(60000, 10000 * Math.pow(2, this.consecutiveFailures));
-            log('RESTART', `Waiting ${backoff/1000}s before exit...`, 'warn', this.instanceId);
-            await sleep(backoff);
-            
-            // Exit to restart
+            log('RESTART', 'Error occurred, exiting...', 'warn', this.instanceId);
+            await sleep(2000);
             process.exit(1);
         }
     }
@@ -781,7 +783,6 @@ let metrics = {
     startTime: new Date(),
     totalAccounts: 0,
     completedToday: 0,
-    failedAttempts: 0,
     currentLoopCount: 0,
     botStatus: 'starting',
     botInstance: null
@@ -827,7 +828,6 @@ function startBot() {
     bot.run().catch(error => {
         console.error('[SERVER] Bot error:', error);
         metrics.botStatus = 'error';
-        process.exit(1);
     });
 }
 
@@ -860,16 +860,19 @@ app.get('/api/stats', async (req, res) => {
     });
 });
 
+// Manual restart endpoint
 app.post('/api/restart', async (req, res) => {
     res.json({ success: true, message: 'Restarting...' });
     setTimeout(() => {
-        process.exit(0);
-    }, 1000);
+        immediateRestart().then(() => {
+            setTimeout(() => process.exit(0), 1000);
+        });
+    }, 500);
 });
 
 // Dashboard HTML
 app.get('/', (req, res) => {
-    const html = `<!DOCTYPE html>
+    res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -908,7 +911,7 @@ app.get('/', (req, res) => {
     <div class="container">
         <div class="header">
             <h1>🤖 Clever Cloud Bot Dashboard</h1>
-            <p class="subtitle">Creates one account then restarts for new IP | Data stored in MongoDB</p>
+            <p class="subtitle">Creates one account then immediately restarts for new IP via API</p>
         </div>
         
         <div class="metrics-grid">
@@ -924,7 +927,7 @@ app.get('/', (req, res) => {
             <div class="card-title">📊 System Status <button class="refresh-btn" onclick="refreshData()" style="margin-left: 10px;">Refresh</button></div>
             <div class="status"><span class="status-dot" id="statusDot"></span><span id="botStatus">Loading...</span><span style="margin-left: 20px;">Started: <span id="startTime">-</span></span><span style="margin-left: 20px;">Uptime: <span id="uptime">-</span></span></div>
             <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #eee; font-size: 12px; color: #666;">
-                ✅ MongoDB Connected | 🔄 Restarts after each account | 🌐 New IP each restart
+                ✅ MongoDB Connected | 🔄 Immediate restart via API | 🌐 New IP each restart
             </div>
         </div>
         
@@ -996,17 +999,16 @@ app.get('/', (req, res) => {
         setInterval(refreshData, 10000);
     </script>
 </body>
-</html>`;
-    
-    res.send(html);
+</html>`);
 });
 
 // ============ START SERVER ============
 async function main() {
     console.log(`\n🚀 Clever Cloud Bot Dashboard Starting...\n`);
     console.log(`📊 Dashboard available at: http://localhost:${port}`);
-    console.log(`🔄 Bot will create ONE account then exit - Scalingo will restart with new IP`);
-    console.log(`💾 MongoDB: ${MONGODB_URI ? 'Configured' : 'Not configured'}\n`);
+    console.log(`🔄 Bot will create ONE account then restart via API for new IP`);
+    console.log(`💾 MongoDB: ${MONGODB_URI ? 'Configured' : 'Not configured'}`);
+    console.log(`🔑 Scalingo API: ${ENV.SCALINGO_API_TOKEN ? '✓ Token configured - Immediate restart enabled' : '✗ Not configured - Will use exit restart'}\n`);
     
     await connectMongoDB();
     
