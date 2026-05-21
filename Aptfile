@@ -1,6 +1,7 @@
 git
 wget
 curl
+ca-certificates
 unzip
 chromium-browser
 chromium-codecs-ffmpeg-extra
