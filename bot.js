@@ -36,7 +36,6 @@ async function connectMongoDB() {
         await db.collection('metrics').createIndex({ timestamp: -1 });
         await db.collection('deployments').createIndex({ createdAt: -1 });
         
-        console.log('[MongoDB] Collections and indexes created');
         return true;
     } catch (error) {
         console.error('[MongoDB] Connection failed:', error.message);
@@ -60,9 +59,7 @@ console.log('\n========================================');
 console.log('  BOT CONFIGURATION');
 console.log('========================================');
 console.log(`Bot Settings: Password: ${ENV.BOT_PASSWORD}, Wait: ${ENV.BOT_WAIT_MINUTES}m`);
-console.log(`MongoDB: ${MONGODB_URI ? '✓ Configured' : '✗ Not configured'}`);
-console.log(`Clever Token: NOT NEEDED - Using OAuth login`);
-console.log(`Restart Method: Self-restart (process.exit) - No API token needed`);
+console.log(`MongoDB: ${MONGODB_URI ? 'Configured' : 'Not configured'}`);
 console.log('========================================\n');
 
 // ============ DATABASE OPERATIONS ============
@@ -678,7 +675,6 @@ class CleverCloudBot {
                 await this.cleanup();
                 this.consecutiveFailures = 0;
                 
-                // RESTART THE APP AFTER EACH SUCCESSFUL ACCOUNT
                 log('RESTART', 'Account completed, restarting container for new IP...', 'info', this.instanceId);
                 log('RESTART', 'Process will exit in 2 seconds. Scalingo will restart automatically.', 'warn', this.instanceId);
                 
@@ -798,10 +794,9 @@ app.post('/api/restart', async (req, res) => {
     }, 1000);
 });
 
-// Dashboard HTML
+// Dashboard HTML - Fixed syntax
 app.get('/', (req, res) => {
-    res.send(`
-<!DOCTYPE html>
+    const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -809,7 +804,7 @@ app.get('/', (req, res) => {
     <title>Clever Cloud Bot Dashboard</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Inter', sans-serif; background: #f5f5f5; color: #1e1e2f; }
+        body { font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f5; color: #1e1e2f; }
         .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
         .header { margin-bottom: 32px; }
         h1 { font-size: 28px; font-weight: 600; color: #1a1a2e; margin-bottom: 8px; }
@@ -843,7 +838,7 @@ app.get('/', (req, res) => {
             <p class="subtitle">Auto-restarts after each account for new IP | Data stored in MongoDB</p>
         </div>
         
-        <div class="metrics-grid" id="metricsGrid">
+        <div class="metrics-grid">
             <div class="metric-card"><div class="metric-value" id="totalAccounts">0</div><div class="metric-label">Total Accounts</div></div>
             <div class="metric-card"><div class="metric-value" id="todayAccounts">0</div><div class="metric-label">Today's Accounts</div></div>
             <div class="metric-card"><div class="metric-value" id="loopCount">0</div><div class="metric-label">Loop Count</div></div>
@@ -853,7 +848,7 @@ app.get('/', (req, res) => {
         </div>
         
         <div class="card">
-            <div class="card-title">📊 System Status <button class="refresh-btn" onclick="refreshData()" style="margin-left: 10px;">⟳ Refresh</button></div>
+            <div class="card-title">📊 System Status <button class="refresh-btn" onclick="refreshData()" style="margin-left: 10px;">Refresh</button></div>
             <div class="status"><span class="status-dot" id="statusDot"></span><span id="botStatus">Loading...</span><span style="margin-left: 20px;">Started: <span id="startTime">-</span></span><span style="margin-left: 20px;">Uptime: <span id="uptime">-</span></span></div>
             <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #eee; font-size: 12px; color: #666;">
                 ✅ MongoDB Connected | 🔄 Auto-restart after each account | 🌐 New IP each restart
@@ -864,8 +859,8 @@ app.get('/', (req, res) => {
             <div class="card-title">📋 Recent Accounts</div>
             <div class="table-responsive">
                 <table id="accountsTable">
-                    <thead><tr><th>Email</th><th>Password</th><th>Date</th><th>Apps</th></thead>
-                    <tbody id="accountsBody"><tr><td colspan="4">Loading...</tr</tbody>
+                    <thead><tr><th>Email</th><th>Password</th><th>Date</th><th>Apps</th></tr></thead>
+                    <tbody id="accountsBody"><tr><td colspan="4">Loading...</td></tr></tbody>
                 </table>
             </div>
         </div>
@@ -876,28 +871,29 @@ app.get('/', (req, res) => {
             try {
                 const res = await fetch('/api/metrics');
                 const data = await res.json();
-                
-                document.getElementById('totalAccounts').textContent = data.current?.totalAccounts || 0;
-                document.getElementById('todayAccounts').textContent = data.current?.completedToday || 0;
-                document.getElementById('loopCount').textContent = data.current?.currentLoopCount || 0;
-                document.getElementById('failedAttempts').textContent = data.current?.failedAttempts || 0;
-                document.getElementById('cpuUsage').textContent = (data.current?.system?.cpuUsage || 0) + '%';
-                document.getElementById('memoryUsage').textContent = (data.current?.system?.memoryUsage?.percentage || 0) + '%';
-                
-                const statusDot = document.getElementById('statusDot');
-                if (data.current?.botStatus === 'running') { 
-                    statusDot.className = 'status-dot'; 
-                    document.getElementById('botStatus').textContent = 'Running'; 
-                } else { 
-                    statusDot.className = 'status-dot stopped'; 
-                    document.getElementById('botStatus').textContent = 'Restarting for new IP'; 
-                }
-                
-                document.getElementById('startTime').textContent = new Date(data.current?.startTime).toLocaleString();
-                if (data.current?.system?.uptime) {
-                    const hours = Math.floor(data.current.system.uptime / 3600);
-                    const minutes = Math.floor((data.current.system.uptime % 3600) / 60);
-                    document.getElementById('uptime').textContent = hours + 'h ' + minutes + 'm';
+                if (data.current) {
+                    document.getElementById('totalAccounts').textContent = data.current.totalAccounts || 0;
+                    document.getElementById('todayAccounts').textContent = data.current.completedToday || 0;
+                    document.getElementById('loopCount').textContent = data.current.currentLoopCount || 0;
+                    document.getElementById('failedAttempts').textContent = data.current.failedAttempts || 0;
+                    document.getElementById('cpuUsage').textContent = (data.current.system?.cpuUsage || 0) + '%';
+                    document.getElementById('memoryUsage').textContent = (data.current.system?.memoryUsage?.percentage || 0) + '%';
+                    
+                    const statusDot = document.getElementById('statusDot');
+                    if (data.current.botStatus === 'running') {
+                        statusDot.className = 'status-dot';
+                        document.getElementById('botStatus').textContent = 'Running';
+                    } else {
+                        statusDot.className = 'status-dot stopped';
+                        document.getElementById('botStatus').textContent = 'Restarting for new IP';
+                    }
+                    
+                    document.getElementById('startTime').textContent = new Date(data.current.startTime).toLocaleString();
+                    if (data.current.system?.uptime) {
+                        const hours = Math.floor(data.current.system.uptime / 3600);
+                        const minutes = Math.floor((data.current.system.uptime % 3600) / 60);
+                        document.getElementById('uptime').textContent = hours + 'h ' + minutes + 'm';
+                    }
                 }
             } catch(e) { console.error(e); }
         }
@@ -907,25 +903,29 @@ app.get('/', (req, res) => {
                 const res = await fetch('/api/accounts');
                 const accounts = await res.json();
                 const tbody = document.getElementById('accountsBody');
-                if (accounts.length === 0) { tbody.innerHTML = '<tr><td colspan="4">No accounts found</td></tr>'; return; }
-                tbody.innerHTML = accounts.slice(0, 20).map(acc => `
-                    <tr>
-                        <td>${acc.email}</td>
-                        <td>${acc.password}</td>
-                        <td>${new Date(acc.createdAt).toLocaleString()}</td>
-                        <td>${acc.deployedApps?.length || 3}</td>
-                    </tr>
-                `).join('');
+                if (!accounts || accounts.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="4">No accounts found</td></tr>';
+                    return;
+                }
+                let html = '';
+                for (let i = 0; i < Math.min(accounts.length, 20); i++) {
+                    const acc = accounts[i];
+                    html += '<tr><td>' + acc.email + '</td><td>' + acc.password + '</td><td>' + new Date(acc.createdAt).toLocaleString() + '</td><td>' + (acc.deployedApps?.length || 3) + '</td></tr>';
+                }
+                tbody.innerHTML = html;
             } catch(e) { console.error(e); }
         }
         
-        async function refreshData() { await Promise.all([fetchMetrics(), fetchAccounts()]); }
+        async function refreshData() {
+            await Promise.all([fetchMetrics(), fetchAccounts()]);
+        }
         refreshData();
         setInterval(refreshData, 10000);
     </script>
 </body>
-</html>
-    `);
+</html>`;
+    
+    res.send(html);
 });
 
 // ============ START SERVER ============
@@ -933,8 +933,7 @@ async function main() {
     console.log(`\n🚀 Clever Cloud Bot Dashboard Starting...\n`);
     console.log(`📊 Dashboard available at: http://localhost:${port}`);
     console.log(`🔄 Bot will restart after each account for new IP`);
-    console.log(`💾 MongoDB: ${MONGODB_URI ? 'Configured' : 'Not configured'}`);
-    console.log(`🔑 Clever Token: NOT NEEDED - Using OAuth login\n`);
+    console.log(`💾 MongoDB: ${MONGODB_URI ? 'Configured' : 'Not configured'}\n`);
     
     await connectMongoDB();
     
