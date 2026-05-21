@@ -33,3 +33,23 @@ else
 fi
 
 echo "===== Post-compile completed ====="
+
+#!/bin/bash
+# bin/post_compile
+
+echo "===== Installing Scalingo CLI ====="
+
+# Create bin directory
+mkdir -p /app/bin
+
+# Download Scalingo CLI binary directly
+curl -L -o /app/bin/scalingo https://cli-dl.scalingo.com/install
+chmod +x /app/bin/scalingo
+
+# Add to PATH
+export PATH="/app/bin:$PATH"
+
+# Verify
+/app/bin/scalingo version
+
+echo "===== Scalingo CLI installed ====="
