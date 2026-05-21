@@ -43,14 +43,17 @@ const ENV = {
     BOT_PASSWORD: process.env.BOT_PASSWORD || 'Linuxdistro&84',
     BOT_START_DELAY: parseInt(process.env.BOT_START_DELAY) || 10,
     HEADLESS_MODE: process.env.HEADLESS_MODE !== 'false',
-    CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome'
+    CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome',
+    SCALINGO_API_TOKEN: 'tk-us-mllbylpj_U6C0WpMZkMLaToMDawI13ZPhAd2TdtpcqiwAP_S',
+    SCALINGO_APP_NAME: process.env.SCALINGO_APP_NAME || 'business-app'
 };
 
 console.log('\n========================================');
 console.log('  BOT CONFIGURATION');
 console.log('========================================');
-console.log(`Bot Mode: Creates ONE account, then FORCE RESTART via process.exit`);
+console.log(`Bot Mode: Creates ONE account, then API RESTART for new IP`);
 console.log(`MongoDB: ${MONGODB_URI ? 'Connected' : 'Not configured'}`);
+console.log(`Scalingo API Token: ${ENV.SCALINGO_API_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
 console.log('========================================\n');
 
 // ============ STATE VARIABLES ============
@@ -117,6 +120,49 @@ async function installChromiumRuntime() {
         log('SYSTEM', `Failed: ${error.message}`, 'error', 'MAIN');
         return null;
     }
+}
+
+// ============ API RESTART FUNCTION ============
+async function restartWithAPI() {
+    const apiToken = ENV.SCALINGO_API_TOKEN;
+    const appName = ENV.SCALINGO_APP_NAME;
+    
+    log('RESTART', 'Initiating API restart...', 'info', 'MAIN');
+    
+    return new Promise((resolve) => {
+        const options = {
+            hostname: 'api.osc-fr1.scalingo.com',
+            path: `/v1/apps/${appName}/restart`,
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${apiToken}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            }
+        };
+        
+        const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                if (res.statusCode === 202) {
+                    log('RESTART', '✅ API restart initiated successfully!', 'success', 'MAIN');
+                    log('RESTART', 'Container will restart with NEW IP address', 'success', 'MAIN');
+                    resolve(true);
+                } else {
+                    log('RESTART', `API returned: ${res.statusCode}`, 'error', 'MAIN');
+                    resolve(false);
+                }
+            });
+        });
+        
+        req.on('error', (error) => {
+            log('RESTART', `API error: ${error.message}`, 'error', 'MAIN');
+            resolve(false);
+        });
+        
+        req.end();
+    });
 }
 
 // ============ BOT CLASS ============
@@ -459,11 +505,14 @@ class CleverCloudBot {
             log('SUCCESS', `✓ Account ${email} created successfully!`, 'success', this.instanceId);
             log('RESTART', `This was account #${botStatus.restartCount}`, 'info', this.instanceId);
             log('RESTART', '========================================', 'info', this.instanceId);
-            log('RESTART', 'FORCE RESTART: Exiting process to get NEW IP', 'info', this.instanceId);
-            log('RESTART', 'Scalingo will automatically restart the container', 'info', this.instanceId);
+            log('RESTART', 'Calling Scalingo API for IMMEDIATE restart...', 'info', this.instanceId);
+            log('RESTART', 'Container will restart with NEW IP address', 'info', this.instanceId);
             log('RESTART', '========================================', 'info', this.instanceId);
             
-            // FORCE RESTART - Exit the process
+            // Call API to restart immediately
+            await restartWithAPI();
+            
+            // Give API time to process then exit
             await sleep(2000);
             process.exit(0);
             
@@ -549,7 +598,7 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <h1>🤖 Clever Cloud Bot Dashboard</h1>
-        <p class="subtitle">Creates ONE account, auto-handles OAuth, then FORCE RESTARTS for new IP</p>
+        <p class="subtitle">Creates ONE account, auto-handles OAuth, then API RESTART for NEW IP</p>
         
         <div class="metrics-grid" id="metrics">
             <div class="metric-card"><div class="metric-value" id="totalAccounts">0</div><div class="metric-label">Total Accounts</div></div>
@@ -563,17 +612,18 @@ app.get('/', (req, res) => {
             <div class="table-responsive">
                 <table id="accountsTable">
                     <thead><tr><th>Email</th><th>Password</th><th>Date</th></tr></thead>
-                    <tbody id="accountsBody"><tr><td colspan="3">Loading...</td></tr></tbody>
-                </table>
-            </div>
-        </div>
+                    <tbody id="accountsBody"><tr><td colspan="3">Loading...<\/td><\/tr><\/tbody>
+                点able
+            <\/div>
+        <\/div>
         
         <div class="info-box">
-            <p>✅ Bot creates ONE account → Exits with process.exit(0)</p>
-            <p>🔄 Scalingo automatically restarts container with NEW IP address</p>
+            <p>✅ Bot creates ONE account → Calls Scalingo API → IMMEDIATE RESTART</p>
+            <p>🔄 Container restarts instantly with NEW IP address</p>
             <p>🔐 OAuth is automatically handled (fills email/password, clicks login)</p>
-        </div>
-    </div>
+            <p>🚀 API Token: Configured ✓</p>
+        <\/div>
+    <\/div>
     
     <script>
         async function refreshData() {
@@ -591,7 +641,7 @@ app.get('/', (req, res) => {
                 if (accounts && accounts.length) {
                     let html = '';
                     for (const acc of accounts) {
-                        html += '<tr><td>' + acc.email + '</td><td>' + acc.password + '</td><td>' + new Date(acc.createdAt).toLocaleString() + '</td></tr>';
+                        html += '<tr><td>' + acc.email + '<\/td><td>' + acc.password + '<\/td><td>' + new Date(acc.createdAt).toLocaleString() + '<\/td><\/tr>';
                     }
                     tbody.innerHTML = html;
                 }
@@ -599,17 +649,17 @@ app.get('/', (req, res) => {
         }
         refreshData();
         setInterval(refreshData, 5000);
-    </script>
-</body>
-</html>`);
+    <\/script>
+<\/body>
+<\/html>`);
 });
 
 // ============ START ============
 async function main() {
     console.log(`\n🚀 Clever Cloud Bot Starting...`);
     console.log(`📊 Dashboard: http://localhost:${port}`);
-    console.log(`🔄 Mode: Creates ONE account, then FORCE RESTART via process.exit()`);
-    console.log(`🌐 Each restart gives a NEW PUBLIC IP address`);
+    console.log(`🔄 Mode: Creates ONE account, then API IMMEDIATE RESTART for NEW IP`);
+    console.log(`🔐 API Token: ${ENV.SCALINGO_API_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
     console.log(`\n`);
     
     await connectMongoDB();
