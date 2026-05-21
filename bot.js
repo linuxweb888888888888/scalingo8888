@@ -165,10 +165,20 @@ class CleverCloudBot {
         this.mailPage = await this.browser.newPage();
         await this.mailPage.goto('https://10minutemail.net/', { waitUntil: 'domcontentloaded' });
         await sleep(5000);
-        this.realTempEmail = await this.mailPage.evaluate(() => {
-            const input = document.querySelector('#fe_text');
-            return input ? input.value : document.querySelector('#mailAddress')?.textContent;
-        });
+        
+        try {
+            this.realTempEmail = await this.mailPage.evaluate(() => {
+                const input = document.querySelector('#fe_text');
+                return input ? input.value : document.querySelector('#mailAddress')?.textContent;
+            });
+        } catch (e) {
+            await sleep(3000); // Wait for frame to be ready
+            this.realTempEmail = await this.mailPage.evaluate(() => {
+                const input = document.querySelector('#fe_text');
+                return input ? input.value : document.querySelector('#mailAddress')?.textContent;
+            });
+        }
+
         if (!this.realTempEmail) throw new Error('Could not extract email');
         return this.realTempEmail;
     }
@@ -200,25 +210,44 @@ class CleverCloudBot {
     async getVerificationLink() {
         const startTime = Date.now();
         let emailFound = false;
+        
+        // Initial safety sleep to avoid "main frame too early"
+        await sleep(3000);
+
         while (Date.now() - startTime < 180000) {
-            let link = await this.mailPage.evaluate(() => {
-                const regex = /https:\/\/api\.clever-cloud\.com\/v2\/self\/validate_email\?validationKey=[a-f0-9-]+/;
-                const match = document.documentElement.innerHTML.match(regex);
-                return match ? match[0] : null;
-            });
-            if (link) return link;
-            if (!emailFound) {
-                const clicked = await this.mailPage.evaluate(() => {
-                    const rows = Array.from(document.querySelectorAll('#maillist tr'));
-                    for (const row of rows) {
-                        if (row.innerText.toLowerCase().includes('clever')) {
-                            row.querySelector('a')?.click();
-                            return true;
-                        }
-                    }
-                    return false;
+            try {
+                let link = await this.mailPage.evaluate(() => {
+                    const regex = /https:\/\/api\.clever-cloud\.com\/v2\/self\/validate_email\?validationKey=[a-f0-9-]+/;
+                    const match = document.documentElement.innerHTML.match(regex);
+                    return match ? match[0] : null;
                 });
-                if (clicked) { emailFound = true; await sleep(8000); continue; }
+                
+                if (link) return link;
+                
+                if (!emailFound) {
+                    const clicked = await this.mailPage.evaluate(() => {
+                        const rows = Array.from(document.querySelectorAll('#maillist tr'));
+                        for (const row of rows) {
+                            if (row.innerText.toLowerCase().includes('clever')) {
+                                row.querySelector('a')?.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    });
+                    if (clicked) { 
+                        emailFound = true; 
+                        await sleep(10000); 
+                        continue; 
+                    }
+                }
+            } catch (e) {
+                // Catch the specific frame error and wait
+                if (e.message.includes('main frame') || e.message.includes('detached')) {
+                    await sleep(4000);
+                    continue;
+                }
+                throw e;
             }
             await sleep(5000);
         }
@@ -374,21 +403,23 @@ app.get('/', (req, res) => {
     </div>
     <script>
         async function update() {
-            const res = await fetch('/api/metrics'); const d = await res.json();
-            document.getElementById('totalAccounts').innerText = d.totalAccounts;
-            document.getElementById('todayAccounts').innerText = d.completedToday;
-            document.getElementById('restartCount').innerText = d.restartCount;
-            const s = d.botState || 'starting';
-            document.getElementById('statusBox').innerHTML = \`<span class="badge status-\${s}"><div class="pulse"></div>\${s}</span>\`;
-            
-            const aRes = await fetch('/api/accounts'); const a = await aRes.json();
-            document.getElementById('accBody').innerHTML = a.map(x => \`
-                <tr>
-                    <td style="color:var(--primary); font-weight:500">\${x.email}</td>
-                    <td style="font-family:monospace">\${x.password}</td>
-                    <td style="color:var(--text-sec)">\${new Date(x.createdAt).toLocaleString()}</td>
-                </tr>
-            \`).join('');
+            try {
+                const res = await fetch('/api/metrics'); const d = await res.json();
+                document.getElementById('totalAccounts').innerText = d.totalAccounts;
+                document.getElementById('todayAccounts').innerText = d.completedToday;
+                document.getElementById('restartCount').innerText = d.restartCount;
+                const s = d.botState || 'starting';
+                document.getElementById('statusBox').innerHTML = \`<span class="badge status-\${s}"><div class="pulse"></div>\${s}</span>\`;
+                
+                const aRes = await fetch('/api/accounts'); const a = await aRes.json();
+                document.getElementById('accBody').innerHTML = a.map(x => \`
+                    <tr>
+                        <td style="color:var(--primary); font-weight:500">\${x.email}</td>
+                        <td style="font-family:monospace">\${x.password}</td>
+                        <td style="color:var(--text-sec)">\${new Date(x.createdAt).toLocaleString()}</td>
+                    </tr>
+                \`).join('');
+            } catch (e) {}
         }
         setInterval(update, 5000); update();
     </script>
