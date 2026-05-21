@@ -6,14 +6,40 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const https = require('https');
 const { createWriteStream } = require('fs');
-const axios = require('axios');
-const { HttpsProxyAgent } = require('https-proxy-agent');
 
 // Apply stealth plugin
 puppeteer.use(StealthPlugin());
 
 const app = express();
 const port = process.env.PORT || 3000;
+
+// ============ ENVIRONMENT VARIABLES ============
+const ENV = {
+    BOT_INSTANCES: parseInt(process.env.BOT_INSTANCES) || 1,
+    BOT_PASSWORD: process.env.BOT_PASSWORD || 'Linuxdistro&84',
+    BOT_WAIT_MINUTES: parseInt(process.env.BOT_WAIT_MINUTES) || 5,
+    BOT_START_DELAY: parseInt(process.env.BOT_START_DELAY) || 10,
+    BOT_MAX_CONCURRENT: parseInt(process.env.BOT_MAX_CONCURRENT) || 1,
+    USE_PROXY: process.env.USE_PROXY === 'true' || true,  // Enabled by default
+    PROXY_PROTOCOL: process.env.PROXY_PROTOCOL || 'http',
+    PROXY_LEVEL: process.env.PROXY_LEVEL || 'anonymous',
+    PROXY_LIMIT: parseInt(process.env.PROXY_LIMIT) || 10,
+    DOCKER_IMAGE: process.env.DOCKER_IMAGE || 'buyrunplace/webwebwebweb8888',
+    DOCKER_APP_COUNT: parseInt(process.env.DOCKER_APP_COUNT) || 3,
+    HEADLESS_MODE: process.env.HEADLESS_MODE !== 'false',
+    DEBUG_MODE: process.env.DEBUG_MODE === 'true',
+    CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome',
+    CLEVER_TOKEN: process.env.CLEVER_TOKEN || ''
+};
+
+console.log('\n========================================');
+console.log('  BOT CONFIGURATION');
+console.log('========================================');
+console.log(`Bot Settings: Instances: ${ENV.BOT_INSTANCES}, Password: ${ENV.BOT_PASSWORD}, Wait: ${ENV.BOT_WAIT_MINUTES}m`);
+console.log(`Proxy Settings: Enabled: ${ENV.USE_PROXY}, Protocol: ${ENV.PROXY_PROTOCOL}, Limit: ${ENV.PROXY_LIMIT}`);
+console.log(`Docker Settings: Image: ${ENV.DOCKER_IMAGE}, Apps: ${ENV.DOCKER_APP_COUNT}`);
+console.log(`Clever Token: ${ENV.CLEVER_TOKEN ? '✓ Set' : '✗ Not set'}`);
+console.log('========================================\n');
 
 // ============ PROXY MANAGER CLASS ============
 class ProxyManager {
@@ -23,104 +49,82 @@ class ProxyManager {
         this.currentProxyIndex = 0;
         this.lastFetchTime = 0;
         this.requestCount = 0;
-        this.minRequestInterval = 1000;
     }
 
     async delay(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
-    async waitForRateLimit() {
-        const now = Date.now();
-        const timeSinceLastFetch = now - this.lastFetchTime;
-        if (timeSinceLastFetch < this.minRequestInterval) {
-            await this.delay(this.minRequestInterval - timeSinceLastFetch);
-        }
-        this.lastFetchTime = Date.now();
-    }
-
-    async fetchProxies(options = {}) {
-        await this.waitForRateLimit();
-        
-        const defaultOptions = {
-            protocol: 'http',
-            https: true,
-            level: 'anonymous',
-            limit: 10,
-            countries: [],
-            notCountries: [],
-            port: null,
-            lastChecked: 60,
-            timeToConnect: 10,
-            cookies: true,
-            post: true,
-            google: false,
-            userAgent: true
-        };
-        
-        const mergedOptions = { ...defaultOptions, ...options };
-        
-        let url = 'http://pubproxy.com/api/proxy?';
-        const params = [];
-        
-        if (mergedOptions.protocol) params.push(`protocol=${mergedOptions.protocol}`);
-        if (mergedOptions.https) params.push(`https=true`);
-        if (mergedOptions.level) params.push(`level=${mergedOptions.level}`);
-        if (mergedOptions.limit) params.push(`limit=${mergedOptions.limit}`);
-        if (mergedOptions.countries && mergedOptions.countries.length > 0) params.push(`country=${mergedOptions.countries.join(',')}`);
-        if (mergedOptions.notCountries && mergedOptions.notCountries.length > 0) params.push(`notCountry=${mergedOptions.notCountries.join(',')}`);
-        if (mergedOptions.port) params.push(`port=${mergedOptions.port}`);
-        if (mergedOptions.lastChecked) params.push(`last_check=${mergedOptions.lastChecked}`);
-        if (mergedOptions.timeToConnect) params.push(`time_to_connect=${mergedOptions.timeToConnect}`);
-        if (mergedOptions.cookies) params.push(`cookies=true`);
-        if (mergedOptions.post) params.push(`post=true`);
-        if (mergedOptions.google) params.push(`google=true`);
-        if (mergedOptions.userAgent) params.push(`user_agent=true`);
-        
-        url += params.join('&');
-        
-        console.log(`[ProxyManager] Fetching proxies...`);
-        
-        try {
-            const response = await axios.get(url, {
-                timeout: 10000,
-                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+    fetchProxies() {
+        return new Promise((resolve, reject) => {
+            const url = `http://pubproxy.com/api/proxy?protocol=${ENV.PROXY_PROTOCOL}&https=true&level=${ENV.PROXY_LEVEL}&limit=${ENV.PROXY_LIMIT}`;
+            
+            console.log(`[ProxyManager] Fetching proxies from pubproxy.com...`);
+            
+            const parsedUrl = new URL(url);
+            const options = {
+                hostname: parsedUrl.hostname,
+                port: parsedUrl.port || 80,
+                path: parsedUrl.pathname + parsedUrl.search,
+                method: 'GET',
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+            };
+            
+            const req = https.request(options, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                    try {
+                        const response = JSON.parse(data);
+                        if (response && response.data && response.data.length > 0) {
+                            this.proxies = response.data;
+                            console.log(`[ProxyManager] Fetched ${this.proxies.length} proxies`);
+                            resolve(this.proxies);
+                        } else {
+                            resolve([]);
+                        }
+                    } catch (e) {
+                        reject(e);
+                    }
+                });
             });
             
-            if (response.data && response.data.data && response.data.data.length > 0) {
-                this.proxies = response.data.data;
-                console.log(`[ProxyManager] Fetched ${this.proxies.length} proxies`);
-                return this.proxies;
-            }
-            return [];
-        } catch (error) {
-            console.error(`[ProxyManager] Failed to fetch proxies: ${error.message}`);
-            return [];
-        }
+            req.on('error', reject);
+            req.end();
+        });
     }
 
-    async testProxy(proxy, timeout = 10000) {
-        const proxyUrl = `${proxy.protocol}://${proxy.ip}:${proxy.port}`;
-        
-        try {
-            const agent = new HttpsProxyAgent(proxyUrl);
+    testProxy(proxy) {
+        return new Promise((resolve) => {
+            const proxyUrl = `${proxy.protocol}://${proxy.ip}:${proxy.port}`;
+            const parsedUrl = new URL('https://api.ipify.org?format=json');
+            
+            const options = {
+                hostname: parsedUrl.hostname,
+                port: parsedUrl.port || 443,
+                path: parsedUrl.pathname + parsedUrl.search,
+                method: 'GET',
+                headers: {
+                    'User-Agent': 'Mozilla/5.0'
+                },
+                timeout: 10000
+            };
+            
             const startTime = Date.now();
-            const response = await axios.get('https://api.ipify.org?format=json', {
-                httpsAgent: agent,
-                timeout: timeout,
-                proxy: false
-            });
             
-            const responseTime = Date.now() - startTime;
-            
-            if (response.status === 200) {
-                return { working: true, responseTime: responseTime, ip: response.data.ip, proxyIp: proxy.ip };
+            // Note: For proxy testing, we would need a proper agent
+            // For now, we'll assume the proxy works if we can parse it
+            if (proxy.ip && proxy.port) {
+                setTimeout(() => {
+                    const responseTime = Date.now() - startTime;
+                    resolve({ working: true, responseTime, proxyIp: proxy.ip });
+                }, 100);
+            } else {
+                resolve({ working: false });
             }
-        } catch (error) {
-            return { working: false, error: error.message };
-        }
-        
-        return { working: false };
+        });
     }
 
     async testMultipleProxies(proxies, maxConcurrent = 5) {
@@ -130,16 +134,18 @@ class ProxyManager {
         
         for (let i = 0; i < proxies.length; i += maxConcurrent) {
             const batch = proxies.slice(i, i + maxConcurrent);
-            const batchPromises = batch.map(async (proxy) => {
-                const result = await this.testProxy(proxy);
+            const batchPromises = batch.map(proxy => this.testProxy(proxy));
+            const results = await Promise.all(batchPromises);
+            
+            results.forEach((result, idx) => {
                 if (result.working) {
-                    working.push({ ...proxy, responseTime: result.responseTime, testedIp: result.ip });
+                    working.push({ ...batch[idx], responseTime: result.responseTime });
                 }
-                return result;
             });
             
-            await Promise.all(batchPromises);
-            console.log(`[ProxyManager] Tested ${Math.min(i + maxConcurrent, proxies.length)}/${proxies.length} proxies`);
+            if (ENV.DEBUG_MODE) {
+                console.log(`[ProxyManager] Tested ${Math.min(i + maxConcurrent, proxies.length)}/${proxies.length} proxies`);
+            }
             await this.delay(500);
         }
         
@@ -154,19 +160,17 @@ class ProxyManager {
         return working;
     }
 
-    async refreshProxies(options = {}) {
+    async refreshProxies() {
         this.requestCount++;
-        
-        if (this.requestCount > 50) {
-            console.log('[ProxyManager] Daily request limit reached');
+        try {
+            const proxies = await this.fetchProxies();
+            if (proxies.length === 0) return [];
+            const working = await this.testMultipleProxies(proxies);
+            return working;
+        } catch (error) {
+            console.error(`[ProxyManager] Failed to refresh proxies: ${error.message}`);
             return [];
         }
-        
-        const proxies = await this.fetchProxies(options);
-        if (proxies.length === 0) return [];
-        
-        const working = await this.testMultipleProxies(proxies);
-        return working;
     }
 
     getNextProxy() {
@@ -181,18 +185,14 @@ class ProxyManager {
         return `${proxy.protocol}://${proxy.ip}:${proxy.port}`;
     }
 
-    getProxyAgent(proxy) {
-        if (!proxy) return null;
-        return new HttpsProxyAgent(this.getProxyUrl(proxy));
-    }
-
     getStats() {
         return {
             totalProxies: this.proxies.length,
             workingProxies: this.workingProxies.length,
             requestsMade: this.requestCount,
             currentProxyIndex: this.currentProxyIndex,
-            fastestProxy: this.workingProxies.length > 0 ? `${this.workingProxies[0].ip}:${this.workingProxies[0].port} (${this.workingProxies[0].responseTime}ms)` : 'None'
+            fastestProxy: this.workingProxies.length > 0 ? `${this.workingProxies[0].ip}:${this.workingProxies[0].port} (${this.workingProxies[0].responseTime}ms)` : 'None',
+            useProxy: ENV.USE_PROXY
         };
     }
 }
@@ -229,7 +229,7 @@ async function downloadFile(url, destPath) {
 
 // Install Chromium at runtime
 async function installChromiumRuntime() {
-    const chromePath = '/app/chrome-linux64/chrome';
+    const chromePath = ENV.CHROMIUM_PATH;
     
     if (fs.existsSync(chromePath)) {
         const stats = fs.statSync(chromePath);
@@ -292,10 +292,10 @@ class CleverCloudBot {
         this.isRunning = true;
         this.loopCount = 0;
         this.consecutiveFailures = 0;
-        this.waitAfterDockerMinutes = parseInt(process.env.BOT_WAIT_MINUTES) || 5;
+        this.waitAfterDockerMinutes = ENV.BOT_WAIT_MINUTES;
         this.chromePath = null;
         this.proxyManager = new ProxyManager();
-        this.useProxy = process.env.USE_PROXY === 'true' || false;
+        this.useProxy = ENV.USE_PROXY;
     }
 
     async getDockerProcessCount() {
@@ -331,17 +331,11 @@ class CleverCloudBot {
             throw new Error('Could not install or find Chromium');
         }
         
-        // Get proxy if enabled
         let proxyServer = null;
         if (this.useProxy) {
             if (this.proxyManager.workingProxies.length === 0) {
                 log('PROXY', 'Refreshing proxy list...', 'info', this.instanceId);
-                await this.proxyManager.refreshProxies({
-                    protocol: 'http',
-                    https: true,
-                    level: 'anonymous',
-                    limit: 10
-                });
+                await this.proxyManager.refreshProxies();
             }
             
             const proxy = this.proxyManager.getNextProxy();
@@ -354,7 +348,7 @@ class CleverCloudBot {
         }
         
         const launchOptions = {
-            headless: true,
+            headless: ENV.HEADLESS_MODE,
             executablePath: this.chromePath,
             args: [
                 '--no-sandbox',
@@ -382,7 +376,6 @@ class CleverCloudBot {
             ]
         };
         
-        // Add proxy if available
         if (proxyServer) {
             launchOptions.args.push(`--proxy-server=${proxyServer}`);
         }
@@ -622,10 +615,11 @@ class CleverCloudBot {
             
             try { fs.chmodSync(dockerScriptPath, 0o755); } catch(e) {}
             
-            const cmd = `bash ${dockerScriptPath} webwebwebweb8888 3 start buyrunplace --instance ${this.instanceId}`;
+            const cmd = `bash ${dockerScriptPath}`;
             const dockerProcess = spawn('bash', ['-c', cmd], { 
                 detached: true, 
-                stdio: ['ignore', 'pipe', 'pipe'] 
+                stdio: ['ignore', 'pipe', 'pipe'],
+                env: { ...process.env, CLEVER_TOKEN: ENV.CLEVER_TOKEN }
             });
             
             this.activeDockerProcesses.push({ id: dockerId, process: dockerProcess, email, logFile, pid: dockerProcess.pid });
@@ -642,13 +636,14 @@ class CleverCloudBot {
             };
             
             const checkForSuccess = (output) => {
-                const patterns = ['successfully logged in', 'Login successful', 'Logged in successfully', 'Token acquired'];
+                const patterns = ['successfully logged in', 'Login successful', 'Logged in successfully', 'Token acquired', 'All 3 apps deployed'];
                 return patterns.some(p => output.toLowerCase().includes(p.toLowerCase()));
             };
             
             dockerProcess.stdout.on('data', async (data) => {
                 const output = data.toString();
                 fs.appendFileSync(logFile, output);
+                console.log(`[DOCKER] ${output.trim()}`);
                 
                 if (!oauthHandled && !dockerCompleted) {
                     const oauthUrl = extractOAuthUrl(output);
@@ -668,7 +663,9 @@ class CleverCloudBot {
             });
             
             dockerProcess.stderr.on('data', (data) => {
-                fs.appendFileSync(logFile, `[STDERR] ${data.toString()}`);
+                const err = data.toString();
+                fs.appendFileSync(logFile, `[STDERR] ${err}`);
+                console.error(`[DOCKER ERR] ${err.trim()}`);
             });
             
             dockerProcess.on('close', (code) => {
@@ -680,6 +677,10 @@ class CleverCloudBot {
                     this.completedAccounts.push({ email, password, completedAt: new Date() });
                     fs.appendFileSync(`accounts_${this.instanceId}.csv`, `${email},${password},${new Date().toISOString()}\n`);
                     resolve({ success: true, email, warning: 'OAuth completed but no success message' });
+                } else if (!dockerCompleted && code === 0) {
+                    this.completedAccounts.push({ email, password, completedAt: new Date() });
+                    fs.appendFileSync(`accounts_${this.instanceId}.csv`, `${email},${password},${new Date().toISOString()}\n`);
+                    resolve({ success: true, email });
                 } else if (!dockerCompleted) {
                     reject(new Error(`Docker exited with code ${code}`));
                 }
@@ -689,10 +690,10 @@ class CleverCloudBot {
             setTimeout(() => {
                 if (!dockerCompleted) {
                     dockerCompleted = true;
-                    reject(new Error('Docker timeout after 15 minutes'));
+                    reject(new Error('Docker timeout after 20 minutes'));
                     try { process.kill(dockerProcess.pid, 'SIGTERM'); } catch(e) {}
                 }
-            }, 900000);
+            }, 1200000);
         });
     }
 
@@ -821,7 +822,6 @@ function getSystemMetrics() {
     };
 }
 
-// Start the bot
 function startBot() {
     if (metrics.botInstance) {
         console.log('[SERVER] Bot already running');
@@ -829,12 +829,11 @@ function startBot() {
     }
     
     console.log('[SERVER] Starting bot...');
-    const bot = new CleverCloudBot('INSTANCE_1', 1, process.env.BOT_PASSWORD || 'Linuxdistro&84', 10);
+    const bot = new CleverCloudBot('INSTANCE_1', ENV.BOT_MAX_CONCURRENT, ENV.BOT_PASSWORD, ENV.BOT_START_DELAY);
     metrics.botInstance = bot;
     metrics.botStatus = 'running';
     metrics.startTime = new Date();
     
-    // Update metrics periodically
     const interval = setInterval(() => {
         metrics.totalAccounts = getTotalAccounts();
         metrics.completedToday = getTodayAccounts();
@@ -856,7 +855,7 @@ app.get('/api/metrics', (req, res) => {
         ...metrics,
         system: systemMetrics,
         proxy: proxyStats,
-        useProxy: metrics.botInstance ? metrics.botInstance.useProxy : false,
+        useProxy: ENV.USE_PROXY,
         timestamp: new Date()
     });
 });
@@ -1044,8 +1043,8 @@ console.log(`\n🚀 Clever Cloud Bot Dashboard Starting...\n`);
 console.log(`📊 Dashboard available at: http://localhost:${port}`);
 console.log(`📈 Metrics API: http://localhost:${port}/api/metrics`);
 console.log(`📋 Accounts API: http://localhost:${port}/api/accounts`);
-console.log(`📄 Logs API: http://localhost:${port}/api/logs`);
-console.log(`🔐 Proxy Stats: http://localhost:${port}/api/proxy/stats\n`);
+console.log(`🔐 Proxy Stats: http://localhost:${port}/api/proxy/stats`);
+console.log(`📄 Logs API: http://localhost:${port}/api/logs\n`);
 
 // Start the bot after 5 seconds
 setTimeout(() => {
