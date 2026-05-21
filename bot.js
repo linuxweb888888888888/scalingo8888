@@ -25,22 +25,18 @@ async function connectMongoDB() {
         dbClient = new MongoClient(MONGODB_URI);
         await dbClient.connect();
         db = dbClient.db('botdb');
-        console.log('[MongoDB] Connected successfully'.green);
+        console.log('[MongoDB] Connected successfully');
         
-        // Create collections if they don't exist
         await db.createCollection('accounts', { capped: false });
         await db.createCollection('metrics', { capped: false });
         await db.createCollection('deployments', { capped: false });
-        await db.createCollection('logs', { capped: false });
         
-        // Create indexes
         await db.collection('accounts').createIndex({ createdAt: -1 });
         await db.collection('accounts').createIndex({ email: 1 });
         await db.collection('metrics').createIndex({ timestamp: -1 });
         await db.collection('deployments').createIndex({ createdAt: -1 });
-        await db.collection('logs').createIndex({ timestamp: -1 });
         
-        console.log('[MongoDB] Collections and indexes created'.green);
+        console.log('[MongoDB] Collections and indexes created');
         return true;
     } catch (error) {
         console.error('[MongoDB] Connection failed:', error.message);
@@ -57,10 +53,7 @@ const ENV = {
     DOCKER_IMAGE: process.env.DOCKER_IMAGE || 'buyrunplace/webwebwebweb8888',
     DOCKER_APP_COUNT: parseInt(process.env.DOCKER_APP_COUNT) || 3,
     HEADLESS_MODE: process.env.HEADLESS_MODE !== 'false',
-    CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome',
-    CLEVER_TOKEN: process.env.CLEVER_TOKEN || '',
-    SCALINGO_API_TOKEN: process.env.SCALINGO_API_TOKEN || '',
-    SCALINGO_APP_NAME: process.env.SCALINGO_APP_NAME || 'business-app'
+    CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome'
 };
 
 console.log('\n========================================');
@@ -68,7 +61,8 @@ console.log('  BOT CONFIGURATION');
 console.log('========================================');
 console.log(`Bot Settings: Password: ${ENV.BOT_PASSWORD}, Wait: ${ENV.BOT_WAIT_MINUTES}m`);
 console.log(`MongoDB: ${MONGODB_URI ? '✓ Configured' : '✗ Not configured'}`);
-console.log(`Clever Token: ${ENV.CLEVER_TOKEN ? '✓ Set' : '✗ Not set'}`);
+console.log(`Clever Token: NOT NEEDED - Using OAuth login`);
+console.log(`Restart Method: Self-restart (process.exit) - No API token needed`);
 console.log('========================================\n');
 
 // ============ DATABASE OPERATIONS ============
@@ -117,34 +111,6 @@ async function saveDeploymentToDB(deployment) {
     }
 }
 
-async function saveLogToDB(logEntry) {
-    if (!db) return false;
-    try {
-        await db.collection('logs').insertOne({
-            ...logEntry,
-            timestamp: new Date()
-        });
-        return true;
-    } catch (error) {
-        console.error('[MongoDB] Save log error:', error.message);
-        return false;
-    }
-}
-
-async function getMetricsFromDB(limit = 100) {
-    if (!db) return [];
-    try {
-        return await db.collection('metrics')
-            .find({})
-            .sort({ timestamp: -1 })
-            .limit(limit)
-            .toArray();
-    } catch (error) {
-        console.error('[MongoDB] Get metrics error:', error.message);
-        return [];
-    }
-}
-
 async function getAccountsFromDB(limit = 100) {
     if (!db) return [];
     try {
@@ -189,26 +155,12 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 function log(step, message, type = 'info', instanceId = 'MAIN') {
     const timestamp = new Date().toLocaleTimeString();
     const prefix = `[${timestamp}] [${instanceId}] [${step}]`;
-    let coloredMessage = '';
-    if (type === 'success') {
-        coloredMessage = `✓ ${message}`;
-        console.log(`${prefix} ✓ ${message}`);
-    } else if (type === 'error') {
-        coloredMessage = `✗ ${message}`;
-        console.log(`${prefix} ✗ ${message}`);
-    } else if (type === 'warn') {
-        coloredMessage = `! ${message}`;
-        console.log(`${prefix} ! ${message}`);
-    } else {
-        coloredMessage = `ℹ ${message}`;
-        console.log(`${prefix} ℹ ${message}`);
-    }
-    
-    // Save to MongoDB (async, don't wait)
-    saveLogToDB({ step, message: coloredMessage, type, instanceId });
+    if (type === 'success') console.log(`${prefix} ✓ ${message}`);
+    else if (type === 'error') console.log(`${prefix} ✗ ${message}`);
+    else if (type === 'warn') console.log(`${prefix} ! ${message}`);
+    else console.log(`${prefix} ℹ ${message}`);
 }
 
-// Download file helper
 async function downloadFile(url, destPath) {
     return new Promise((resolve, reject) => {
         const file = createWriteStream(destPath);
@@ -226,7 +178,6 @@ async function downloadFile(url, destPath) {
     });
 }
 
-// Install Chromium at runtime
 async function installChromiumRuntime() {
     const chromePath = ENV.CHROMIUM_PATH;
     
@@ -275,28 +226,6 @@ async function installChromiumRuntime() {
     }
 }
 
-// ============ PROXY MANAGER CLASS ============
-class ProxyManager {
-    constructor() {
-        this.workingProxies = [];
-        this.currentProxyIndex = 0;
-    }
-
-    getNextProxy() {
-        if (this.workingProxies.length === 0) return null;
-        const proxy = this.workingProxies[this.currentProxyIndex];
-        this.currentProxyIndex = (this.currentProxyIndex + 1) % this.workingProxies.length;
-        return proxy;
-    }
-
-    getStats() {
-        return {
-            workingProxies: this.workingProxies.length,
-            useProxy: ENV.USE_PROXY
-        };
-    }
-}
-
 // ============ BOT CLASS ============
 class CleverCloudBot {
     constructor(instanceId, password, startDelay = 0) {
@@ -314,8 +243,6 @@ class CleverCloudBot {
         this.consecutiveFailures = 0;
         this.waitAfterDockerMinutes = ENV.BOT_WAIT_MINUTES;
         this.chromePath = null;
-        this.proxyManager = new ProxyManager();
-        this.useProxy = ENV.USE_PROXY;
         this.startTime = new Date();
     }
 
@@ -597,8 +524,7 @@ class CleverCloudBot {
             const cmd = `bash ${dockerScriptPath}`;
             const dockerProcess = spawn('bash', ['-c', cmd], { 
                 detached: true, 
-                stdio: ['ignore', 'pipe', 'pipe'],
-                env: { ...process.env, CLEVER_TOKEN: ENV.CLEVER_TOKEN }
+                stdio: ['ignore', 'pipe', 'pipe']
             });
             
             this.activeDockerProcesses.push({ id: dockerId, process: dockerProcess, email, logFile, pid: dockerProcess.pid });
@@ -630,7 +556,6 @@ class CleverCloudBot {
                 fs.appendFileSync(logFile, output);
                 console.log(`[DOCKER] ${output.trim()}`);
                 
-                // Extract and save app URLs
                 const appUrl = extractAppUrl(output);
                 if (appUrl && !deployedApps.includes(appUrl)) {
                     deployedApps.push(appUrl);
@@ -713,58 +638,6 @@ class CleverCloudBot {
         if (this.browser) await this.browser.close();
     }
 
-    async restartScalingoApp() {
-        log('SYSTEM', 'Restarting Scalingo app to get new IP...', 'info', this.instanceId);
-        
-        const apiToken = ENV.SCALINGO_API_TOKEN;
-        const appName = ENV.SCALINGO_APP_NAME;
-        
-        if (!apiToken) {
-            log('SYSTEM', 'SCALINGO_API_TOKEN not set, using self-restart', 'warn', this.instanceId);
-            return this.restartSelf();
-        }
-        
-        return new Promise((resolve) => {
-            const options = {
-                hostname: 'api.osc-fr1.scalingo.com',
-                path: `/v1/apps/${appName}/restart`,
-                method: 'POST',
-                headers: {
-                    'Accept': 'application/json',
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${apiToken}`
-                }
-            };
-            
-            const req = https.request(options, (res) => {
-                let data = '';
-                res.on('data', chunk => data += chunk);
-                res.on('end', () => {
-                    if (res.statusCode === 202) {
-                        log('SYSTEM', '✅ Restart initiated, new IP will be assigned', 'success', this.instanceId);
-                        resolve(true);
-                    } else {
-                        log('SYSTEM', `Restart failed: ${res.statusCode}`, 'error', this.instanceId);
-                        resolve(false);
-                    }
-                });
-            });
-            
-            req.on('error', (error) => {
-                log('SYSTEM', `Restart error: ${error.message}`, 'error', this.instanceId);
-                resolve(false);
-            });
-            
-            req.end();
-        });
-    }
-
-    async restartSelf() {
-        log('SYSTEM', 'Self-restarting container to get new IP...', 'info', this.instanceId);
-        await sleep(2000);
-        process.exit(0);
-    }
-
     async run() {
         if (this.startDelay > 0) {
             log('START', `Waiting ${this.startDelay} seconds...`, 'warn', this.instanceId);
@@ -791,7 +664,6 @@ class CleverCloudBot {
                 const result = await this.startDockerInBackground(email, this.password);
                 log('FINISH', `Account ${email} created successfully! Deployed ${result.deployedApps?.length || 3} apps`, 'success', this.instanceId);
                 
-                // Save metrics to MongoDB
                 const totalAccounts = await getTotalAccountsFromDB();
                 const todayAccounts = await getTodayAccountsFromDB();
                 await saveMetricsToDB({
@@ -807,18 +679,17 @@ class CleverCloudBot {
                 this.consecutiveFailures = 0;
                 
                 // RESTART THE APP AFTER EACH SUCCESSFUL ACCOUNT
-                log('RESTART', 'Account completed, restarting app for new IP...', 'info', this.instanceId);
-                this.isRunning = false;
-                await this.restartScalingoApp();
+                log('RESTART', 'Account completed, restarting container for new IP...', 'info', this.instanceId);
+                log('RESTART', 'Process will exit in 2 seconds. Scalingo will restart automatically.', 'warn', this.instanceId);
+                
+                await sleep(2000);
                 process.exit(0);
-                break;
                 
             } catch (e) {
                 this.consecutiveFailures++;
                 log('ERROR', `${e.message} (failure ${this.consecutiveFailures})`, 'error', this.instanceId);
                 await this.cleanup();
                 
-                // Save failure to MongoDB
                 await saveMetricsToDB({
                     error: e.message,
                     failureCount: this.consecutiveFailures,
@@ -841,7 +712,6 @@ class CleverCloudBot {
 let metrics = {
     startTime: new Date(),
     totalAccounts: 0,
-    activeDockerProcesses: 0,
     completedToday: 0,
     failedAttempts: 0,
     currentLoopCount: 0,
@@ -883,7 +753,6 @@ function startBot() {
     
     const interval = setInterval(async () => {
         await updateMetrics();
-        metrics.activeDockerProcesses = 0;
         metrics.currentLoopCount = bot.loopCount;
     }, 10000);
     
@@ -897,13 +766,11 @@ function startBot() {
 app.get('/api/metrics', async (req, res) => {
     await updateMetrics();
     const systemMetrics = getSystemMetrics();
-    const historicalMetrics = await getMetricsFromDB(30);
     res.json({
         current: {
             ...metrics,
             system: systemMetrics
         },
-        historical: historicalMetrics,
         timestamp: new Date()
     });
 });
@@ -916,17 +783,14 @@ app.get('/api/accounts', async (req, res) => {
 app.get('/api/stats', async (req, res) => {
     const total = await getTotalAccountsFromDB();
     const today = await getTodayAccountsFromDB();
-    const recentMetrics = await getMetricsFromDB(10);
     res.json({
         totalAccounts: total,
         todayAccounts: today,
-        recentMetrics: recentMetrics,
         uptime: process.uptime(),
         memory: process.memoryUsage()
     });
 });
 
-// Restart endpoint
 app.post('/api/restart', async (req, res) => {
     res.json({ success: true, message: 'Restarting...' });
     setTimeout(() => {
@@ -976,7 +840,7 @@ app.get('/', (req, res) => {
     <div class="container">
         <div class="header">
             <h1>🤖 Clever Cloud Bot Dashboard</h1>
-            <p class="subtitle">Real-time monitoring - Data stored in MongoDB</p>
+            <p class="subtitle">Auto-restarts after each account for new IP | Data stored in MongoDB</p>
         </div>
         
         <div class="metrics-grid" id="metricsGrid">
@@ -992,7 +856,7 @@ app.get('/', (req, res) => {
             <div class="card-title">📊 System Status <button class="refresh-btn" onclick="refreshData()" style="margin-left: 10px;">⟳ Refresh</button></div>
             <div class="status"><span class="status-dot" id="statusDot"></span><span id="botStatus">Loading...</span><span style="margin-left: 20px;">Started: <span id="startTime">-</span></span><span style="margin-left: 20px;">Uptime: <span id="uptime">-</span></span></div>
             <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #eee; font-size: 12px; color: #666;">
-                ✅ MongoDB Connected | Data persists across restarts
+                ✅ MongoDB Connected | 🔄 Auto-restart after each account | 🌐 New IP each restart
             </div>
         </div>
         
@@ -1000,8 +864,8 @@ app.get('/', (req, res) => {
             <div class="card-title">📋 Recent Accounts</div>
             <div class="table-responsive">
                 <table id="accountsTable">
-                    <thead><tr><th>Email</th><th>Password</th><th>Date</th><th>Apps Deployed</th></thead>
-                    <tbody id="accountsBody"><tr><td colspan="4">Loading...</td></tr></tbody>
+                    <thead><tr><th>Email</th><th>Password</th><th>Date</th><th>Apps</th></thead>
+                    <tbody id="accountsBody"><tr><td colspan="4">Loading...</tr</tbody>
                 </table>
             </div>
         </div>
@@ -1026,7 +890,7 @@ app.get('/', (req, res) => {
                     document.getElementById('botStatus').textContent = 'Running'; 
                 } else { 
                     statusDot.className = 'status-dot stopped'; 
-                    document.getElementById('botStatus').textContent = 'Stopped - Restarting for new IP'; 
+                    document.getElementById('botStatus').textContent = 'Restarting for new IP'; 
                 }
                 
                 document.getElementById('startTime').textContent = new Date(data.current?.startTime).toLocaleString();
@@ -1044,14 +908,14 @@ app.get('/', (req, res) => {
                 const accounts = await res.json();
                 const tbody = document.getElementById('accountsBody');
                 if (accounts.length === 0) { tbody.innerHTML = '<tr><td colspan="4">No accounts found</td></tr>'; return; }
-                tbody.innerHTML = accounts.slice(0, 20).map(acc => \`
+                tbody.innerHTML = accounts.slice(0, 20).map(acc => `
                     <tr>
-                        <td>\${acc.email}</td>
-                        <td>\${acc.password}</td>
-                        <td>\${new Date(acc.createdAt).toLocaleString()}</td>
-                        <td>\${acc.deployedApps?.length || 3}</td>
+                        <td>${acc.email}</td>
+                        <td>${acc.password}</td>
+                        <td>${new Date(acc.createdAt).toLocaleString()}</td>
+                        <td>${acc.deployedApps?.length || 3}</td>
                     </tr>
-                \`).join('');
+                `).join('');
             } catch(e) { console.error(e); }
         }
         
@@ -1069,23 +933,20 @@ async function main() {
     console.log(`\n🚀 Clever Cloud Bot Dashboard Starting...\n`);
     console.log(`📊 Dashboard available at: http://localhost:${port}`);
     console.log(`🔄 Bot will restart after each account for new IP`);
-    console.log(`💾 MongoDB: ${MONGODB_URI ? 'Configured' : 'Not configured'}\n`);
+    console.log(`💾 MongoDB: ${MONGODB_URI ? 'Configured' : 'Not configured'}`);
+    console.log(`🔑 Clever Token: NOT NEEDED - Using OAuth login\n`);
     
-    // Connect to MongoDB
     await connectMongoDB();
     
-    // Start the bot after 5 seconds
     setTimeout(() => {
         startBot();
     }, 5000);
     
-    // Start express server
     app.listen(port, '0.0.0.0', () => {
         console.log(`✅ Dashboard server running on port ${port}`);
     });
 }
 
-// Handle graceful shutdown
 process.on('SIGINT', async () => {
     console.log('\n🛑 Shutting down...');
     if (dbClient) {
