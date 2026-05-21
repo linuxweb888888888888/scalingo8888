@@ -52,11 +52,9 @@ const ENV = {
 console.log('\n========================================');
 console.log('  BOT CONFIGURATION');
 console.log('========================================');
-console.log(`Bot Mode: Creates ONE account, then CLI RESTART for NEW IP`);
+console.log(`Bot Mode: Creates ONE account, on failure CLI RESTART for NEW IP`);
 console.log(`MongoDB: ${MONGODB_URI ? 'Connected' : 'Not configured'}`);
-console.log(`Clever Token: ${ENV.CLEVER_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
 console.log(`Scalingo App: ${ENV.SCALINGO_APP_NAME || 'Not set'}`);
-console.log(`Scalingo Token: ${ENV.SCALINGO_API_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
 console.log('========================================\n');
 
 // ============ STATE VARIABLES ============
@@ -139,8 +137,6 @@ async function installScalingoCLI() {
         child.on('close', (code) => {
             if (code === 0) {
                 log('CLI', 'Scalingo CLI installed successfully', 'success', 'MAIN');
-                
-                // Add to PATH
                 process.env.PATH = `/root/.local/share/scalingo/bin:${process.env.PATH}`;
                 resolve(true);
             } else {
@@ -151,12 +147,12 @@ async function installScalingoCLI() {
     });
 }
 
-// ============ LOGIN TO SCALINGO USING TOKEN ============
+// ============ LOGIN TO SCALINGO ============
 async function loginToScalingo() {
     const apiToken = ENV.SCALINGO_API_TOKEN;
     
     if (!apiToken) {
-        log('CLI', 'No API token found, cannot login', 'error', 'MAIN');
+        log('CLI', 'No API token found, skipping login', 'warn', 'MAIN');
         return false;
     }
     
@@ -167,14 +163,6 @@ async function loginToScalingo() {
         
         const child = spawn('bash', ['-c', loginCmd], {
             stdio: ['pipe', 'pipe', 'pipe']
-        });
-        
-        child.stdout.on('data', (data) => {
-            console.log(`[CLI] ${data.toString().trim()}`);
-        });
-        
-        child.stderr.on('data', (data) => {
-            console.log(`[CLI ERR] ${data.toString().trim()}`);
         });
         
         child.on('close', (code) => {
@@ -194,7 +182,7 @@ async function restartWithCLI() {
     const appName = ENV.SCALINGO_APP_NAME;
     
     if (!appName) {
-        log('RESTART', 'SCALINGO_APP_NAME not set', 'error', 'MAIN');
+        log('RESTART', 'SCALINGO_APP_NAME not set, cannot restart', 'error', 'MAIN');
         return false;
     }
     
@@ -533,24 +521,27 @@ class CleverCloudBot {
         log('START', '=== CREATING ONE ACCOUNT ===', 'info', this.instanceId);
         botStatus.state = 'running';
         
+        let accountCreated = false;
+        let accountEmail = null;
+        
         try {
             await this.initBrowser();
             
-            const email = await this.fetchTempEmail();
-            botStatus.accountEmail = email;
+            accountEmail = await this.fetchTempEmail();
+            botStatus.accountEmail = accountEmail;
             
-            await this.handleSignup(email, this.password);
+            await this.handleSignup(accountEmail, this.password);
             const verifyLink = await this.getVerificationLink();
             
             log('VERIFY', 'Activating account...', 'info', this.instanceId);
             await this.page.goto(verifyLink, { waitUntil: 'domcontentloaded' });
             await sleep(5000);
             
-            const result = await this.startDockerInBackground(email, this.password);
+            const result = await this.startDockerInBackground(accountEmail, this.password);
             
             if (db) {
                 await db.collection('accounts').insertOne({
-                    email: email,
+                    email: accountEmail,
                     password: this.password,
                     deployedApps: result.deployedApps || [],
                     createdAt: new Date(),
@@ -558,42 +549,38 @@ class CleverCloudBot {
                 });
             }
             
-            await this.cleanup();
-            
+            accountCreated = true;
             botStatus.accountCreated = true;
-            botStatus.completionTime = new Date();
-            botStatus.state = 'completed';
-            botStatus.restartCount++;
             
-            log('SUCCESS', `✓ Account ${email} created successfully!`, 'success', this.instanceId);
-            log('RESTART', `This was account #${botStatus.restartCount}`, 'info', this.instanceId);
-            log('RESTART', '========================================', 'info', this.instanceId);
-            log('RESTART', 'Installing Scalingo CLI and restarting...', 'info', this.instanceId);
-            log('RESTART', '========================================', 'info', this.instanceId);
-            
-            // Install Scalingo CLI if not present
-            const cliInstalled = await installScalingoCLI();
-            
-            if (cliInstalled) {
-                // Login with token
-                await loginToScalingo();
-                // Restart
-                await restartWithCLI();
-            }
-            
-            // Exit anyway
-            await sleep(2000);
-            process.exit(0);
+            log('SUCCESS', `✓ Account ${accountEmail} created successfully!`, 'success', this.instanceId);
             
         } catch (error) {
-            log('ERROR', error.message, 'error', this.instanceId);
-            await this.cleanup();
-            botStatus.state = 'failed';
-            botStatus.completionTime = new Date();
-            log('RESTART', 'Account creation failed, exiting...', 'warn', this.instanceId);
-            await sleep(2000);
-            process.exit(1);
+            log('ERROR', `${error.message}`, 'error', this.instanceId);
+            log('FAILURE', 'Account creation failed - will restart to retry', 'warn', this.instanceId);
         }
+        
+        await this.cleanup();
+        
+        botStatus.completionTime = new Date();
+        botStatus.state = accountCreated ? 'completed' : 'failed';
+        botStatus.restartCount++;
+        
+        log('RESTART', `========================================`, 'info', this.instanceId);
+        log('RESTART', `${accountCreated ? 'Account created' : 'Account creation failed'} - Restarting for NEW IP`, 'info', this.instanceId);
+        log('RESTART', `This was attempt #${botStatus.restartCount}`, 'info', this.instanceId);
+        log('RESTART', `========================================`, 'info', this.instanceId);
+        
+        // Install Scalingo CLI and restart
+        const cliInstalled = await installScalingoCLI();
+        
+        if (cliInstalled) {
+            await loginToScalingo();
+            await restartWithCLI();
+        }
+        
+        // If CLI restart fails, exit anyway
+        await sleep(2000);
+        process.exit(0);
     }
 }
 
@@ -633,7 +620,6 @@ app.get('/api/accounts', async (req, res) => {
     res.json(accounts);
 });
 
-// ============ DASHBOARD ============
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -666,7 +652,7 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <h1>🤖 Clever Cloud Bot Dashboard</h1>
-        <p class="subtitle">Creates ONE account, auto-handles OAuth, then CLI RESTART for NEW IP</p>
+        <p class="subtitle">Creates ONE account OR fails - then CLI RESTART for NEW IP</p>
         
         <div class="metrics-grid" id="metrics">
             <div class="metric-card"><div class="metric-value" id="totalAccounts">0</div><div class="metric-label">Total Accounts</div></div>
@@ -686,8 +672,8 @@ app.get('/', (req, res) => {
         <\/div>
         
         <div class="info-box">
-            <p>✅ Bot creates ONE account → Installs Scalingo CLI → Logs in with token → Restarts</p>
-            <p>🔄 Container restarts instantly with NEW IP address</p>
+            <p>✅ Bot attempts to create ONE account</p>
+            <p>🔄 On SUCCESS or FAILURE → CLI RESTART → NEW IP</p>
             <p>🔐 OAuth is automatically handled (fills email/password, clicks login)</p>
         <\/div>
     <\/div>
@@ -725,7 +711,7 @@ app.get('/', (req, res) => {
 async function main() {
     console.log(`\n🚀 Clever Cloud Bot Starting...`);
     console.log(`📊 Dashboard: http://localhost:${port}`);
-    console.log(`🔄 Mode: Creates ONE account, then CLI RESTART for NEW IP`);
+    console.log(`🔄 Mode: Creates ONE account, then CLI RESTART for NEW IP (even on failure)`);
     console.log(`\n`);
     
     await connectMongoDB();
