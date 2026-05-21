@@ -27,15 +27,25 @@ async function connectMongoDB() {
         db = dbClient.db('botdb');
         console.log('[MongoDB] Connected successfully');
         
+        // Drop existing problematic indexes
+        try {
+            await db.collection('accounts').dropIndex('userId_1');
+        } catch(e) {}
+        try {
+            await db.collection('accounts').dropIndex('email_1');
+        } catch(e) {}
+        
+        // Create collections if they don't exist
         await db.createCollection('accounts', { capped: false });
         await db.createCollection('metrics', { capped: false });
         await db.createCollection('deployments', { capped: false });
         
+        // Create indexes without unique constraints where not needed
         await db.collection('accounts').createIndex({ createdAt: -1 });
-        await db.collection('accounts').createIndex({ email: 1 });
         await db.collection('metrics').createIndex({ timestamp: -1 });
         await db.collection('deployments').createIndex({ createdAt: -1 });
         
+        console.log('[MongoDB] Collections and indexes created');
         return true;
     } catch (error) {
         console.error('[MongoDB] Connection failed:', error.message);
@@ -67,7 +77,7 @@ console.log('========================================\n');
 async function saveAccountToDB(account) {
     if (!db) return false;
     try {
-        await db.collection('accounts').insertOne({
+        const result = await db.collection('accounts').insertOne({
             ...account,
             createdAt: new Date(),
             instanceId: account.instanceId || 'INSTANCE_1'
@@ -75,6 +85,11 @@ async function saveAccountToDB(account) {
         console.log(`[MongoDB] Account saved: ${account.email}`);
         return true;
     } catch (error) {
+        // Don't fail if duplicate - just log it
+        if (error.code === 11000) {
+            console.log(`[MongoDB] Account ${account.email} already exists, skipping`);
+            return true;
+        }
         console.error('[MongoDB] Save account error:', error.message);
         return false;
     }
@@ -401,16 +416,6 @@ class CleverCloudBot {
             const currentUrl = this.page.url();
             log('SIGNUP', `Current URL after signup: ${currentUrl}`, 'info', this.instanceId);
             
-            const pageError = await this.page.evaluate(() => {
-                const errorEl = document.querySelector('.error, .alert-danger, .alert');
-                return errorEl ? errorEl.innerText : null;
-            });
-            
-            if (pageError) {
-                log('SIGNUP', `Page error: ${pageError}`, 'error', this.instanceId);
-                throw new Error(`Signup error: ${pageError}`);
-            }
-            
         } catch (error) {
             log('SIGNUP', `Failed: ${error.message}`, 'error', this.instanceId);
             throw error;
@@ -593,7 +598,6 @@ class CleverCloudBot {
                 fs.appendFileSync(logFile, output);
                 console.log(`[DOCKER] ${output.trim()}`);
                 
-                // Count deployed apps
                 const appUrl = extractAppUrl(output);
                 if (appUrl && !deployedApps.includes(appUrl)) {
                     deployedApps.push(appUrl);
@@ -607,13 +611,11 @@ class CleverCloudBot {
                     });
                 }
                 
-                // Check if all 3 apps are deployed
                 if (appCount >= 3 && !allAppsDeployed) {
                     allAppsDeployed = true;
                     log('DOCKER', '✅ All 3 apps deployed successfully!', 'success', this.instanceId);
                 }
                 
-                // Handle OAuth if needed
                 if (!oauthHandled && !dockerCompleted) {
                     const oauthUrl = extractOAuthUrl(output);
                     if (oauthUrl) {
@@ -623,7 +625,6 @@ class CleverCloudBot {
                     }
                 }
                 
-                // Check for success and all apps deployed
                 if (!dockerCompleted && (allAppsDeployed || output.includes('All 3 apps deployed'))) {
                     dockerCompleted = true;
                     const accountData = {
@@ -652,7 +653,6 @@ class CleverCloudBot {
                 const index = this.activeDockerProcesses.findIndex(p => p.id === dockerId);
                 if (index !== -1) this.activeDockerProcesses.splice(index, 1);
                 
-                // Check if we have at least 1 app deployed
                 if (!dockerCompleted && (appCount > 0 || oauthHandled || code === 0)) {
                     dockerCompleted = true;
                     const accountData = {
@@ -675,7 +675,6 @@ class CleverCloudBot {
             
             dockerProcess.unref();
             
-            // Timeout after 30 minutes to allow all 3 apps to deploy
             setTimeout(() => {
                 if (!dockerCompleted) {
                     dockerCompleted = true;
@@ -699,7 +698,7 @@ class CleverCloudBot {
                     }
                     try { process.kill(dockerProcess.pid, 'SIGTERM'); } catch(e) {}
                 }
-            }, 1800000); // 30 minutes
+            }, 1800000);
         });
     }
 
@@ -730,7 +729,6 @@ class CleverCloudBot {
                 await this.page.goto(verifyLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
                 await sleep(5000);
                 
-                // Start Docker deployment and WAIT for it to complete
                 log('DOCKER', 'Starting Docker deployment, waiting for completion...', 'info', this.instanceId);
                 const result = await this.startDockerInBackground(email, this.password);
                 
@@ -750,10 +748,8 @@ class CleverCloudBot {
                 await this.cleanup();
                 this.consecutiveFailures = 0;
                 
-                // Wait a moment for everything to finish
                 await sleep(5000);
                 
-                // ONLY restart after Docker deployment is complete
                 log('RESTART', 'Docker deployment completed, restarting container for new IP...', 'info', this.instanceId);
                 log('RESTART', 'Process will exit in 2 seconds. Scalingo will restart automatically.', 'warn', this.instanceId);
                 
@@ -990,7 +986,7 @@ app.get('/', (req, res) => {
                 let html = '';
                 for (let i = 0; i < Math.min(accounts.length, 20); i++) {
                     const acc = accounts[i];
-                    html += '<tr><td>' + acc.email + '</td><td>' + acc.password + '</td><td>' + new Date(acc.createdAt).toLocaleString() + '</td><td>' + (acc.deployedApps?.length || 3) + '</td>';
+                    html += '<tr><td>' + acc.email + '</td><td>' + acc.password + '<td>ecause' + new Date(acc.createdAt).toLocaleString() + '</td><td>' + (acc.deployedApps?.length || 3) + '</td>';
                 }
                 tbody.innerHTML = html;
             } catch(e) { console.error(e); }
