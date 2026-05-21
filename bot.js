@@ -124,107 +124,28 @@ async function installChromiumRuntime() {
     }
 }
 
-// ============ INSTALL SCALINGO CLI - ONLY CURL, NO APT-GET ============
-async function installScalingoCLI() {
+// ============ RESTART VIA CLI (NO INSTALLATION) ============
+async function restartWithCLI() {
     const cliPath = '/app/bin/scalingo';
-    
-    // Check if already installed
-    if (fs.existsSync(cliPath)) {
-        log('CLI', 'Scalingo CLI already installed', 'success', 'MAIN');
-        return true;
-    }
-    
-    log('CLI', 'Installing Scalingo CLI with curl...', 'info', 'MAIN');
-    
-    // Create bin directory
-    if (!fs.existsSync('/app/bin')) {
-        fs.mkdirSync('/app/bin', { recursive: true });
-    }
-    
-    return new Promise((resolve) => {
-        // ONLY curl - NO apt-get, NO bash install scripts
-        const child = spawn('curl', [
-            '-L',
-            '-o', '/app/bin/scalingo',
-            'https://github.com/Scalingo/cli/releases/latest/download/scalingo-linux-amd64'
-        ]);
-        
-        child.on('close', (code) => {
-            if (code === 0 && fs.existsSync(cliPath)) {
-                // Make it executable
-                try {
-                    fs.chmodSync(cliPath, 0o755);
-                    log('CLI', 'Scalingo CLI installed successfully', 'success', 'MAIN');
-                    process.env.PATH = `/app/bin:${process.env.PATH}`;
-                    resolve(true);
-                } catch (err) {
-                    log('CLI', `Failed to set executable: ${err.message}`, 'error', 'MAIN');
-                    resolve(false);
-                }
-            } else {
-                log('CLI', `Curl failed with code ${code}`, 'error', 'MAIN');
-                resolve(false);
-            }
-        });
-        
-        child.on('error', (err) => {
-            log('CLI', `Curl error: ${err.message}`, 'error', 'MAIN');
-            resolve(false);
-        });
-    });
-}
-
-// ============ LOGIN TO SCALINGO ============
-async function loginToScalingo() {
+    const appName = ENV.SCALINGO_APP_NAME;
     const apiToken = ENV.SCALINGO_API_TOKEN;
-    const cliPath = '/app/bin/scalingo';
-    
-    if (!apiToken) {
-        log('CLI', 'No API token found', 'warn', 'MAIN');
-        return false;
-    }
     
     if (!fs.existsSync(cliPath)) {
-        log('CLI', 'Scalingo CLI not found', 'error', 'MAIN');
+        log('RESTART', 'Scalingo CLI not found at /app/bin/scalingo', 'error', 'MAIN');
         return false;
     }
-    
-    log('CLI', 'Logging into Scalingo...', 'info', 'MAIN');
-    
-    return new Promise((resolve) => {
-        const child = spawn(cliPath, ['login', '--api-token', apiToken]);
-        
-        child.on('close', (code) => {
-            if (code === 0) {
-                log('CLI', 'Logged into Scalingo successfully', 'success', 'MAIN');
-                resolve(true);
-            } else {
-                log('CLI', `Failed to login with code ${code}`, 'error', 'MAIN');
-                resolve(false);
-            }
-        });
-    });
-}
-
-// ============ RESTART VIA CLI ============
-async function restartWithCLI() {
-    const appName = ENV.SCALINGO_APP_NAME;
-    const cliPath = '/app/bin/scalingo';
     
     if (!appName) {
         log('RESTART', 'SCALINGO_APP_NAME not set', 'error', 'MAIN');
         return false;
     }
     
-    if (!fs.existsSync(cliPath)) {
-        log('RESTART', 'Scalingo CLI not found', 'error', 'MAIN');
-        return false;
-    }
-    
     log('RESTART', `Restarting ${appName} via CLI...`, 'info', 'MAIN');
     
     return new Promise((resolve) => {
-        const child = spawn(cliPath, ['--app', appName, 'restart']);
+        const cmd = `export PATH="/app/bin:$PATH" && ${cliPath} login --api-token "${apiToken}" && ${cliPath} --app ${appName} restart`;
+        
+        const child = spawn('bash', ['-c', cmd]);
         
         child.stdout.on('data', (data) => {
             console.log(`[CLI] ${data.toString().trim()}`);
@@ -600,14 +521,11 @@ class CleverCloudBot {
         log('RESTART', `This was attempt #${botStatus.restartCount}`, 'info', this.instanceId);
         log('RESTART', `========================================`, 'info', this.instanceId);
         
-        // Install Scalingo CLI with curl only
-        const cliInstalled = await installScalingoCLI();
+        // Try CLI restart (CLI already installed via postinstall)
+        const cliSuccess = await restartWithCLI();
         
-        if (cliInstalled && ENV.SCALINGO_API_TOKEN && ENV.SCALINGO_APP_NAME) {
-            await loginToScalingo();
-            await restartWithCLI();
-        } else {
-            log('RESTART', 'CLI not available, using exit restart', 'warn', 'MAIN');
+        if (!cliSuccess) {
+            log('RESTART', 'CLI restart failed, using exit restart', 'warn', 'MAIN');
         }
         
         await sleep(2000);
@@ -704,8 +622,9 @@ app.get('/', (req, res) => {
         <\/div>
         
         <div class="info-box">
-            <p>✅ Bot creates ONE account → Installs CLI → Restarts → NEW IP</p>
+            <p>✅ Bot creates ONE account → Calls Scalingo CLI → Restarts → NEW IP</p>
             <p>🔐 OAuth is automatically handled (fills email/password, clicks login)</p>
+            <p>📦 Scalingo CLI installed via postinstall script</p>
         <\/div>
     <\/div>
     
