@@ -6,194 +6,180 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const https = require('https');
 const { createWriteStream } = require('fs');
+const { MongoClient } = require('mongodb');
 
 // Apply stealth plugin
 puppeteer.use(StealthPlugin());
 
 const app = express();
+app.use(express.json());
 const port = process.env.PORT || 3000;
+
+// ============ MONGODB CONNECTION ============
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888';
+let dbClient = null;
+let db = null;
+
+async function connectMongoDB() {
+    try {
+        dbClient = new MongoClient(MONGODB_URI);
+        await dbClient.connect();
+        db = dbClient.db('botdb');
+        console.log('[MongoDB] Connected successfully'.green);
+        
+        // Create collections if they don't exist
+        await db.createCollection('accounts', { capped: false });
+        await db.createCollection('metrics', { capped: false });
+        await db.createCollection('deployments', { capped: false });
+        await db.createCollection('logs', { capped: false });
+        
+        // Create indexes
+        await db.collection('accounts').createIndex({ createdAt: -1 });
+        await db.collection('accounts').createIndex({ email: 1 });
+        await db.collection('metrics').createIndex({ timestamp: -1 });
+        await db.collection('deployments').createIndex({ createdAt: -1 });
+        await db.collection('logs').createIndex({ timestamp: -1 });
+        
+        console.log('[MongoDB] Collections and indexes created'.green);
+        return true;
+    } catch (error) {
+        console.error('[MongoDB] Connection failed:', error.message);
+        return false;
+    }
+}
 
 // ============ ENVIRONMENT VARIABLES ============
 const ENV = {
-    BOT_INSTANCES: parseInt(process.env.BOT_INSTANCES) || 1,
     BOT_PASSWORD: process.env.BOT_PASSWORD || 'Linuxdistro&84',
     BOT_WAIT_MINUTES: parseInt(process.env.BOT_WAIT_MINUTES) || 5,
     BOT_START_DELAY: parseInt(process.env.BOT_START_DELAY) || 10,
-    BOT_MAX_CONCURRENT: parseInt(process.env.BOT_MAX_CONCURRENT) || 1,
-    USE_PROXY: process.env.USE_PROXY === 'true' || true,  // Enabled by default
-    PROXY_PROTOCOL: process.env.PROXY_PROTOCOL || 'http',
-    PROXY_LEVEL: process.env.PROXY_LEVEL || 'anonymous',
-    PROXY_LIMIT: parseInt(process.env.PROXY_LIMIT) || 10,
+    USE_PROXY: process.env.USE_PROXY === 'true' || false,
     DOCKER_IMAGE: process.env.DOCKER_IMAGE || 'buyrunplace/webwebwebweb8888',
     DOCKER_APP_COUNT: parseInt(process.env.DOCKER_APP_COUNT) || 3,
     HEADLESS_MODE: process.env.HEADLESS_MODE !== 'false',
-    DEBUG_MODE: process.env.DEBUG_MODE === 'true',
     CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome',
-    CLEVER_TOKEN: process.env.CLEVER_TOKEN || ''
+    CLEVER_TOKEN: process.env.CLEVER_TOKEN || '',
+    SCALINGO_API_TOKEN: process.env.SCALINGO_API_TOKEN || '',
+    SCALINGO_APP_NAME: process.env.SCALINGO_APP_NAME || 'business-app'
 };
 
 console.log('\n========================================');
 console.log('  BOT CONFIGURATION');
 console.log('========================================');
-console.log(`Bot Settings: Instances: ${ENV.BOT_INSTANCES}, Password: ${ENV.BOT_PASSWORD}, Wait: ${ENV.BOT_WAIT_MINUTES}m`);
-console.log(`Proxy Settings: Enabled: ${ENV.USE_PROXY}, Protocol: ${ENV.PROXY_PROTOCOL}, Limit: ${ENV.PROXY_LIMIT}`);
-console.log(`Docker Settings: Image: ${ENV.DOCKER_IMAGE}, Apps: ${ENV.DOCKER_APP_COUNT}`);
+console.log(`Bot Settings: Password: ${ENV.BOT_PASSWORD}, Wait: ${ENV.BOT_WAIT_MINUTES}m`);
+console.log(`MongoDB: ${MONGODB_URI ? '✓ Configured' : '✗ Not configured'}`);
 console.log(`Clever Token: ${ENV.CLEVER_TOKEN ? '✓ Set' : '✗ Not set'}`);
 console.log('========================================\n');
 
-// ============ PROXY MANAGER CLASS ============
-class ProxyManager {
-    constructor() {
-        this.proxies = [];
-        this.workingProxies = [];
-        this.currentProxyIndex = 0;
-        this.lastFetchTime = 0;
-        this.requestCount = 0;
-    }
-
-    async delay(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
-    }
-
-    fetchProxies() {
-        return new Promise((resolve, reject) => {
-            const url = `http://pubproxy.com/api/proxy?protocol=${ENV.PROXY_PROTOCOL}&https=true&level=${ENV.PROXY_LEVEL}&limit=${ENV.PROXY_LIMIT}`;
-            
-            console.log(`[ProxyManager] Fetching proxies from pubproxy.com...`);
-            
-            const parsedUrl = new URL(url);
-            const options = {
-                hostname: parsedUrl.hostname,
-                port: parsedUrl.port || 80,
-                path: parsedUrl.pathname + parsedUrl.search,
-                method: 'GET',
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
-            };
-            
-            const req = https.request(options, (res) => {
-                let data = '';
-                res.on('data', chunk => data += chunk);
-                res.on('end', () => {
-                    try {
-                        const response = JSON.parse(data);
-                        if (response && response.data && response.data.length > 0) {
-                            this.proxies = response.data;
-                            console.log(`[ProxyManager] Fetched ${this.proxies.length} proxies`);
-                            resolve(this.proxies);
-                        } else {
-                            resolve([]);
-                        }
-                    } catch (e) {
-                        reject(e);
-                    }
-                });
-            });
-            
-            req.on('error', reject);
-            req.end();
+// ============ DATABASE OPERATIONS ============
+async function saveAccountToDB(account) {
+    if (!db) return false;
+    try {
+        await db.collection('accounts').insertOne({
+            ...account,
+            createdAt: new Date(),
+            instanceId: account.instanceId || 'INSTANCE_1'
         });
+        console.log(`[MongoDB] Account saved: ${account.email}`);
+        return true;
+    } catch (error) {
+        console.error('[MongoDB] Save account error:', error.message);
+        return false;
     }
+}
 
-    testProxy(proxy) {
-        return new Promise((resolve) => {
-            const proxyUrl = `${proxy.protocol}://${proxy.ip}:${proxy.port}`;
-            const parsedUrl = new URL('https://api.ipify.org?format=json');
-            
-            const options = {
-                hostname: parsedUrl.hostname,
-                port: parsedUrl.port || 443,
-                path: parsedUrl.pathname + parsedUrl.search,
-                method: 'GET',
-                headers: {
-                    'User-Agent': 'Mozilla/5.0'
-                },
-                timeout: 10000
-            };
-            
-            const startTime = Date.now();
-            
-            // Note: For proxy testing, we would need a proper agent
-            // For now, we'll assume the proxy works if we can parse it
-            if (proxy.ip && proxy.port) {
-                setTimeout(() => {
-                    const responseTime = Date.now() - startTime;
-                    resolve({ working: true, responseTime, proxyIp: proxy.ip });
-                }, 100);
-            } else {
-                resolve({ working: false });
-            }
+async function saveMetricsToDB(metrics) {
+    if (!db) return false;
+    try {
+        await db.collection('metrics').insertOne({
+            ...metrics,
+            timestamp: new Date()
         });
+        return true;
+    } catch (error) {
+        console.error('[MongoDB] Save metrics error:', error.message);
+        return false;
     }
+}
 
-    async testMultipleProxies(proxies, maxConcurrent = 5) {
-        console.log(`[ProxyManager] Testing ${proxies.length} proxies...`);
-        
-        const working = [];
-        
-        for (let i = 0; i < proxies.length; i += maxConcurrent) {
-            const batch = proxies.slice(i, i + maxConcurrent);
-            const batchPromises = batch.map(proxy => this.testProxy(proxy));
-            const results = await Promise.all(batchPromises);
-            
-            results.forEach((result, idx) => {
-                if (result.working) {
-                    working.push({ ...batch[idx], responseTime: result.responseTime });
-                }
-            });
-            
-            if (ENV.DEBUG_MODE) {
-                console.log(`[ProxyManager] Tested ${Math.min(i + maxConcurrent, proxies.length)}/${proxies.length} proxies`);
-            }
-            await this.delay(500);
-        }
-        
-        working.sort((a, b) => a.responseTime - b.responseTime);
-        
-        console.log(`[ProxyManager] Found ${working.length} working proxies`);
-        if (working.length > 0) {
-            console.log(`[ProxyManager] Fastest proxy: ${working[0].ip}:${working[0].port} (${working[0].responseTime}ms)`);
-        }
-        
-        this.workingProxies = working;
-        return working;
+async function saveDeploymentToDB(deployment) {
+    if (!db) return false;
+    try {
+        await db.collection('deployments').insertOne({
+            ...deployment,
+            createdAt: new Date()
+        });
+        console.log(`[MongoDB] Deployment saved: ${deployment.appName}`);
+        return true;
+    } catch (error) {
+        console.error('[MongoDB] Save deployment error:', error.message);
+        return false;
     }
+}
 
-    async refreshProxies() {
-        this.requestCount++;
-        try {
-            const proxies = await this.fetchProxies();
-            if (proxies.length === 0) return [];
-            const working = await this.testMultipleProxies(proxies);
-            return working;
-        } catch (error) {
-            console.error(`[ProxyManager] Failed to refresh proxies: ${error.message}`);
-            return [];
-        }
+async function saveLogToDB(logEntry) {
+    if (!db) return false;
+    try {
+        await db.collection('logs').insertOne({
+            ...logEntry,
+            timestamp: new Date()
+        });
+        return true;
+    } catch (error) {
+        console.error('[MongoDB] Save log error:', error.message);
+        return false;
     }
+}
 
-    getNextProxy() {
-        if (this.workingProxies.length === 0) return null;
-        const proxy = this.workingProxies[this.currentProxyIndex];
-        this.currentProxyIndex = (this.currentProxyIndex + 1) % this.workingProxies.length;
-        return proxy;
+async function getMetricsFromDB(limit = 100) {
+    if (!db) return [];
+    try {
+        return await db.collection('metrics')
+            .find({})
+            .sort({ timestamp: -1 })
+            .limit(limit)
+            .toArray();
+    } catch (error) {
+        console.error('[MongoDB] Get metrics error:', error.message);
+        return [];
     }
+}
 
-    getProxyUrl(proxy) {
-        if (!proxy) return null;
-        return `${proxy.protocol}://${proxy.ip}:${proxy.port}`;
+async function getAccountsFromDB(limit = 100) {
+    if (!db) return [];
+    try {
+        return await db.collection('accounts')
+            .find({})
+            .sort({ createdAt: -1 })
+            .limit(limit)
+            .toArray();
+    } catch (error) {
+        console.error('[MongoDB] Get accounts error:', error.message);
+        return [];
     }
+}
 
-    getStats() {
-        return {
-            totalProxies: this.proxies.length,
-            workingProxies: this.workingProxies.length,
-            requestsMade: this.requestCount,
-            currentProxyIndex: this.currentProxyIndex,
-            fastestProxy: this.workingProxies.length > 0 ? `${this.workingProxies[0].ip}:${this.workingProxies[0].port} (${this.workingProxies[0].responseTime}ms)` : 'None',
-            useProxy: ENV.USE_PROXY
-        };
+async function getTotalAccountsFromDB() {
+    if (!db) return 0;
+    try {
+        return await db.collection('accounts').countDocuments();
+    } catch (error) {
+        console.error('[MongoDB] Get total accounts error:', error.message);
+        return 0;
+    }
+}
+
+async function getTodayAccountsFromDB() {
+    if (!db) return 0;
+    try {
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        return await db.collection('accounts').countDocuments({
+            createdAt: { $gte: today }
+        });
+    } catch (error) {
+        console.error('[MongoDB] Get today accounts error:', error.message);
+        return 0;
     }
 }
 
@@ -203,10 +189,23 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 function log(step, message, type = 'info', instanceId = 'MAIN') {
     const timestamp = new Date().toLocaleTimeString();
     const prefix = `[${timestamp}] [${instanceId}] [${step}]`;
-    if (type === 'success') console.log(`${prefix} ✓ ${message}`);
-    else if (type === 'error') console.log(`${prefix} ✗ ${message}`);
-    else if (type === 'warn') console.log(`${prefix} ! ${message}`);
-    else console.log(`${prefix} ℹ ${message}`);
+    let coloredMessage = '';
+    if (type === 'success') {
+        coloredMessage = `✓ ${message}`;
+        console.log(`${prefix} ✓ ${message}`);
+    } else if (type === 'error') {
+        coloredMessage = `✗ ${message}`;
+        console.log(`${prefix} ✗ ${message}`);
+    } else if (type === 'warn') {
+        coloredMessage = `! ${message}`;
+        console.log(`${prefix} ! ${message}`);
+    } else {
+        coloredMessage = `ℹ ${message}`;
+        console.log(`${prefix} ℹ ${message}`);
+    }
+    
+    // Save to MongoDB (async, don't wait)
+    saveLogToDB({ step, message: coloredMessage, type, instanceId });
 }
 
 // Download file helper
@@ -276,9 +275,31 @@ async function installChromiumRuntime() {
     }
 }
 
+// ============ PROXY MANAGER CLASS ============
+class ProxyManager {
+    constructor() {
+        this.workingProxies = [];
+        this.currentProxyIndex = 0;
+    }
+
+    getNextProxy() {
+        if (this.workingProxies.length === 0) return null;
+        const proxy = this.workingProxies[this.currentProxyIndex];
+        this.currentProxyIndex = (this.currentProxyIndex + 1) % this.workingProxies.length;
+        return proxy;
+    }
+
+    getStats() {
+        return {
+            workingProxies: this.workingProxies.length,
+            useProxy: ENV.USE_PROXY
+        };
+    }
+}
+
 // ============ BOT CLASS ============
 class CleverCloudBot {
-    constructor(instanceId, maxConcurrent, password, startDelay = 0) {
+    constructor(instanceId, password, startDelay = 0) {
         this.instanceId = instanceId;
         this.browser = null;
         this.page = null;
@@ -286,7 +307,6 @@ class CleverCloudBot {
         this.realTempEmail = null;
         this.activeDockerProcesses = [];
         this.completedAccounts = [];
-        this.maxConcurrentDocker = maxConcurrent;
         this.password = password;
         this.startDelay = startDelay;
         this.isRunning = true;
@@ -296,28 +316,7 @@ class CleverCloudBot {
         this.chromePath = null;
         this.proxyManager = new ProxyManager();
         this.useProxy = ENV.USE_PROXY;
-    }
-
-    async getDockerProcessCount() {
-        try {
-            const { stdout } = await require('util').promisify(require('child_process').exec)(`ps aux | grep "bash /app/docker" | grep "${this.instanceId}" | grep -v grep | wc -l`);
-            const count = parseInt(stdout.trim());
-            return count;
-        } catch (error) {
-            return 0;
-        }
-    }
-
-    async waitForDockerSlot() {
-        while (this.isRunning) {
-            const currentCount = await this.getDockerProcessCount();
-            if (currentCount < this.maxConcurrentDocker) {
-                log('DOCKER', `Slot available (${currentCount}/${this.maxConcurrentDocker})`, 'success', this.instanceId);
-                break;
-            }
-            log('DOCKER', `Waiting for slot... (${currentCount}/${this.maxConcurrentDocker} running)`, 'warn', this.instanceId);
-            await sleep(10000);
-        }
+        this.startTime = new Date();
     }
 
     async initBrowser() {
@@ -329,22 +328,6 @@ class CleverCloudBot {
         
         if (!this.chromePath) {
             throw new Error('Could not install or find Chromium');
-        }
-        
-        let proxyServer = null;
-        if (this.useProxy) {
-            if (this.proxyManager.workingProxies.length === 0) {
-                log('PROXY', 'Refreshing proxy list...', 'info', this.instanceId);
-                await this.proxyManager.refreshProxies();
-            }
-            
-            const proxy = this.proxyManager.getNextProxy();
-            if (proxy) {
-                proxyServer = `${proxy.protocol}://${proxy.ip}:${proxy.port}`;
-                log('PROXY', `Using proxy: ${proxyServer}`, 'success', this.instanceId);
-            } else {
-                log('PROXY', 'No working proxies available, continuing without proxy', 'warn', this.instanceId);
-            }
         }
         
         const launchOptions = {
@@ -376,11 +359,7 @@ class CleverCloudBot {
             ]
         };
         
-        if (proxyServer) {
-            launchOptions.args.push(`--proxy-server=${proxyServer}`);
-        }
-        
-        log('SYSTEM', `Launching browser with: ${this.chromePath}`, 'success', this.instanceId);
+        log('SYSTEM', `Launching browser...`, 'success', this.instanceId);
         
         try {
             this.browser = await puppeteer.launch(launchOptions);
@@ -629,9 +608,15 @@ class CleverCloudBot {
             
             let dockerCompleted = false;
             let oauthHandled = false;
+            let deployedApps = [];
             
             const extractOAuthUrl = (output) => {
                 const match = output.match(/https:\/\/console\.clever-cloud\.com\/cli-oauth\?[^\s]+/);
+                return match ? match[0] : null;
+            };
+            
+            const extractAppUrl = (output) => {
+                const match = output.match(/https:\/\/[a-z0-9-]+\.osc-fr1\.scalingo\.io/);
                 return match ? match[0] : null;
             };
             
@@ -645,6 +630,18 @@ class CleverCloudBot {
                 fs.appendFileSync(logFile, output);
                 console.log(`[DOCKER] ${output.trim()}`);
                 
+                // Extract and save app URLs
+                const appUrl = extractAppUrl(output);
+                if (appUrl && !deployedApps.includes(appUrl)) {
+                    deployedApps.push(appUrl);
+                    await saveDeploymentToDB({
+                        appName: appUrl.split('//')[1].split('.')[0],
+                        url: appUrl,
+                        email: email,
+                        instanceId: this.instanceId
+                    });
+                }
+                
                 if (!oauthHandled && !dockerCompleted) {
                     const oauthUrl = extractOAuthUrl(output);
                     if (oauthUrl) {
@@ -656,9 +653,18 @@ class CleverCloudBot {
                 
                 if (!dockerCompleted && checkForSuccess(output)) {
                     dockerCompleted = true;
-                    this.completedAccounts.push({ email, password, completedAt: new Date() });
+                    const accountData = {
+                        email: email,
+                        password: password,
+                        completedAt: new Date(),
+                        instanceId: this.instanceId,
+                        deployedApps: deployedApps,
+                        loopCount: this.loopCount
+                    };
+                    this.completedAccounts.push(accountData);
+                    await saveAccountToDB(accountData);
                     fs.appendFileSync(`accounts_${this.instanceId}.csv`, `${email},${password},${new Date().toISOString()}\n`);
-                    resolve({ success: true, email });
+                    resolve({ success: true, email, deployedApps });
                 }
             });
             
@@ -668,19 +674,25 @@ class CleverCloudBot {
                 console.error(`[DOCKER ERR] ${err.trim()}`);
             });
             
-            dockerProcess.on('close', (code) => {
+            dockerProcess.on('close', async (code) => {
                 fs.appendFileSync(logFile, `\n--- EXITED WITH CODE ${code} ---\n`);
                 const index = this.activeDockerProcesses.findIndex(p => p.id === dockerId);
                 if (index !== -1) this.activeDockerProcesses.splice(index, 1);
                 
-                if (!dockerCompleted && oauthHandled) {
-                    this.completedAccounts.push({ email, password, completedAt: new Date() });
-                    fs.appendFileSync(`accounts_${this.instanceId}.csv`, `${email},${password},${new Date().toISOString()}\n`);
-                    resolve({ success: true, email, warning: 'OAuth completed but no success message' });
-                } else if (!dockerCompleted && code === 0) {
-                    this.completedAccounts.push({ email, password, completedAt: new Date() });
-                    fs.appendFileSync(`accounts_${this.instanceId}.csv`, `${email},${password},${new Date().toISOString()}\n`);
-                    resolve({ success: true, email });
+                if (!dockerCompleted && (oauthHandled || code === 0)) {
+                    const accountData = {
+                        email: email,
+                        password: password,
+                        completedAt: new Date(),
+                        instanceId: this.instanceId,
+                        deployedApps: deployedApps,
+                        loopCount: this.loopCount,
+                        warning: 'OAuth completed but no success message'
+                    };
+                    this.completedAccounts.push(accountData);
+                    await saveAccountToDB(accountData);
+                    fs.appendFileSync(`accounts_${this.instanceId}.csv`, `${email},${password},${new Date().toISOString()},WARNING\n`);
+                    resolve({ success: true, email, deployedApps });
                 } else if (!dockerCompleted) {
                     reject(new Error(`Docker exited with code ${code}`));
                 }
@@ -701,6 +713,58 @@ class CleverCloudBot {
         if (this.browser) await this.browser.close();
     }
 
+    async restartScalingoApp() {
+        log('SYSTEM', 'Restarting Scalingo app to get new IP...', 'info', this.instanceId);
+        
+        const apiToken = ENV.SCALINGO_API_TOKEN;
+        const appName = ENV.SCALINGO_APP_NAME;
+        
+        if (!apiToken) {
+            log('SYSTEM', 'SCALINGO_API_TOKEN not set, using self-restart', 'warn', this.instanceId);
+            return this.restartSelf();
+        }
+        
+        return new Promise((resolve) => {
+            const options = {
+                hostname: 'api.osc-fr1.scalingo.com',
+                path: `/v1/apps/${appName}/restart`,
+                method: 'POST',
+                headers: {
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${apiToken}`
+                }
+            };
+            
+            const req = https.request(options, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                    if (res.statusCode === 202) {
+                        log('SYSTEM', '✅ Restart initiated, new IP will be assigned', 'success', this.instanceId);
+                        resolve(true);
+                    } else {
+                        log('SYSTEM', `Restart failed: ${res.statusCode}`, 'error', this.instanceId);
+                        resolve(false);
+                    }
+                });
+            });
+            
+            req.on('error', (error) => {
+                log('SYSTEM', `Restart error: ${error.message}`, 'error', this.instanceId);
+                resolve(false);
+            });
+            
+            req.end();
+        });
+    }
+
+    async restartSelf() {
+        log('SYSTEM', 'Self-restarting container to get new IP...', 'info', this.instanceId);
+        await sleep(2000);
+        process.exit(0);
+    }
+
     async run() {
         if (this.startDelay > 0) {
             log('START', `Waiting ${this.startDelay} seconds...`, 'warn', this.instanceId);
@@ -713,7 +777,6 @@ class CleverCloudBot {
             this.loopCount++;
             
             try {
-                await this.waitForDockerSlot();
                 log('START', `=== Loop #${this.loopCount} ===`, 'info', this.instanceId);
                 await this.initBrowser();
                 
@@ -725,19 +788,44 @@ class CleverCloudBot {
                 await this.page.goto(verifyLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
                 await sleep(5000);
                 
-                await this.startDockerInBackground(email, this.password);
-                log('FINISH', `Account ${email} created successfully!`, 'success', this.instanceId);
+                const result = await this.startDockerInBackground(email, this.password);
+                log('FINISH', `Account ${email} created successfully! Deployed ${result.deployedApps?.length || 3} apps`, 'success', this.instanceId);
+                
+                // Save metrics to MongoDB
+                const totalAccounts = await getTotalAccountsFromDB();
+                const todayAccounts = await getTodayAccountsFromDB();
+                await saveMetricsToDB({
+                    totalAccounts: totalAccounts + 1,
+                    completedToday: todayAccounts + 1,
+                    loopCount: this.loopCount,
+                    failedAttempts: this.consecutiveFailures,
+                    uptime: process.uptime(),
+                    deployedApps: result.deployedApps || []
+                });
                 
                 await this.cleanup();
                 this.consecutiveFailures = 0;
                 
-                log('WAIT', `Waiting ${this.waitAfterDockerMinutes} minutes before next cycle...`, 'warn', this.instanceId);
-                await sleep(this.waitAfterDockerMinutes * 60 * 1000);
+                // RESTART THE APP AFTER EACH SUCCESSFUL ACCOUNT
+                log('RESTART', 'Account completed, restarting app for new IP...', 'info', this.instanceId);
+                this.isRunning = false;
+                await this.restartScalingoApp();
+                process.exit(0);
+                break;
                 
             } catch (e) {
                 this.consecutiveFailures++;
                 log('ERROR', `${e.message} (failure ${this.consecutiveFailures})`, 'error', this.instanceId);
                 await this.cleanup();
+                
+                // Save failure to MongoDB
+                await saveMetricsToDB({
+                    error: e.message,
+                    failureCount: this.consecutiveFailures,
+                    loopCount: this.loopCount,
+                    timestamp: new Date()
+                });
+                
                 const backoff = Math.min(60000, 10000 * Math.pow(2, this.consecutiveFailures));
                 await sleep(backoff);
             }
@@ -756,55 +844,14 @@ let metrics = {
     activeDockerProcesses: 0,
     completedToday: 0,
     failedAttempts: 0,
-    lastAccountCreated: null,
     currentLoopCount: 0,
     botStatus: 'starting',
     botInstance: null
 };
 
-function getTotalAccounts() {
-    try {
-        const files = fs.readdirSync('.');
-        let total = 0;
-        files.forEach(file => {
-            if (file.startsWith('accounts_') && file.endsWith('.csv')) {
-                const data = fs.readFileSync(file, 'utf8');
-                total += data.trim().split('\n').length;
-            }
-        });
-        return total;
-    } catch (error) {
-        return 0;
-    }
-}
-
-function getTodayAccounts() {
-    try {
-        const files = fs.readdirSync('.');
-        let today = 0;
-        const todayStr = new Date().toISOString().split('T')[0];
-        files.forEach(file => {
-            if (file.startsWith('accounts_') && file.endsWith('.csv')) {
-                const data = fs.readFileSync(file, 'utf8');
-                const lines = data.trim().split('\n');
-                lines.forEach(line => {
-                    if (line.includes(todayStr)) today++;
-                });
-            }
-        });
-        return today;
-    } catch (error) {
-        return 0;
-    }
-}
-
-function getDockerProcessCount() {
-    try {
-        const stdout = execSync('ps aux | grep "bash /app/docker" | grep -v grep | wc -l', { encoding: 'utf8' });
-        return parseInt(stdout.trim());
-    } catch (error) {
-        return 0;
-    }
+async function updateMetrics() {
+    metrics.totalAccounts = await getTotalAccountsFromDB();
+    metrics.completedToday = await getTodayAccountsFromDB();
 }
 
 function getSystemMetrics() {
@@ -829,15 +876,14 @@ function startBot() {
     }
     
     console.log('[SERVER] Starting bot...');
-    const bot = new CleverCloudBot('INSTANCE_1', ENV.BOT_MAX_CONCURRENT, ENV.BOT_PASSWORD, ENV.BOT_START_DELAY);
+    const bot = new CleverCloudBot('INSTANCE_1', ENV.BOT_PASSWORD, ENV.BOT_START_DELAY);
     metrics.botInstance = bot;
     metrics.botStatus = 'running';
     metrics.startTime = new Date();
     
-    const interval = setInterval(() => {
-        metrics.totalAccounts = getTotalAccounts();
-        metrics.completedToday = getTodayAccounts();
-        metrics.activeDockerProcesses = getDockerProcessCount();
+    const interval = setInterval(async () => {
+        await updateMetrics();
+        metrics.activeDockerProcesses = 0;
         metrics.currentLoopCount = bot.loopCount;
     }, 10000);
     
@@ -848,72 +894,44 @@ function startBot() {
 }
 
 // ============ EXPRESS ROUTES ============
-app.get('/api/metrics', (req, res) => {
+app.get('/api/metrics', async (req, res) => {
+    await updateMetrics();
     const systemMetrics = getSystemMetrics();
-    const proxyStats = metrics.botInstance ? metrics.botInstance.proxyManager.getStats() : null;
+    const historicalMetrics = await getMetricsFromDB(30);
     res.json({
-        ...metrics,
-        system: systemMetrics,
-        proxy: proxyStats,
-        useProxy: ENV.USE_PROXY,
+        current: {
+            ...metrics,
+            system: systemMetrics
+        },
+        historical: historicalMetrics,
         timestamp: new Date()
     });
 });
 
-app.get('/api/accounts', (req, res) => {
-    try {
-        const accounts = [];
-        const files = fs.readdirSync('.');
-        files.forEach(file => {
-            if (file.startsWith('accounts_') && file.endsWith('.csv')) {
-                const data = fs.readFileSync(file, 'utf8');
-                const lines = data.trim().split('\n');
-                lines.forEach(line => {
-                    const [email, password, date] = line.split(',');
-                    if (email && password) {
-                        accounts.push({ email, password, date, instance: file.replace('accounts_', '').replace('.csv', '') });
-                    }
-                });
-            }
-        });
-        res.json(accounts.reverse().slice(0, 100));
-    } catch (error) {
-        res.json([]);
-    }
+app.get('/api/accounts', async (req, res) => {
+    const accounts = await getAccountsFromDB(100);
+    res.json(accounts);
 });
 
-app.get('/api/proxy/stats', (req, res) => {
-    if (metrics.botInstance && metrics.botInstance.proxyManager) {
-        res.json(metrics.botInstance.proxyManager.getStats());
-    } else {
-        res.json({ error: 'Bot not initialized' });
-    }
+app.get('/api/stats', async (req, res) => {
+    const total = await getTotalAccountsFromDB();
+    const today = await getTodayAccountsFromDB();
+    const recentMetrics = await getMetricsFromDB(10);
+    res.json({
+        totalAccounts: total,
+        todayAccounts: today,
+        recentMetrics: recentMetrics,
+        uptime: process.uptime(),
+        memory: process.memoryUsage()
+    });
 });
 
-app.get('/api/proxy/refresh', async (req, res) => {
-    if (metrics.botInstance && metrics.botInstance.proxyManager) {
-        await metrics.botInstance.proxyManager.refreshProxies();
-        res.json({ success: true, stats: metrics.botInstance.proxyManager.getStats() });
-    } else {
-        res.json({ error: 'Bot not initialized' });
-    }
-});
-
-app.get('/api/logs', (req, res) => {
-    try {
-        const limit = parseInt(req.query.limit) || 50;
-        const files = fs.readdirSync('.');
-        const logFiles = files.filter(f => f.endsWith('.log')).sort().reverse();
-        let logs = [];
-        for (const file of logFiles.slice(0, 5)) {
-            const data = fs.readFileSync(file, 'utf8');
-            const lines = data.trim().split('\n').slice(-limit);
-            logs.push({ file, lines });
-        }
-        res.json(logs);
-    } catch (error) {
-        res.json([]);
-    }
+// Restart endpoint
+app.post('/api/restart', async (req, res) => {
+    res.json({ success: true, message: 'Restarting...' });
+    setTimeout(() => {
+        process.exit(0);
+    }, 1000);
 });
 
 // Dashboard HTML
@@ -925,7 +943,6 @@ app.get('/', (req, res) => {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Clever Cloud Bot Dashboard</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Inter', sans-serif; background: #f5f5f5; color: #1e1e2f; }
@@ -934,7 +951,7 @@ app.get('/', (req, res) => {
         h1 { font-size: 28px; font-weight: 600; color: #1a1a2e; margin-bottom: 8px; }
         .subtitle { color: #666; font-size: 14px; }
         .card { background: white; border-radius: 16px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); margin-bottom: 24px; }
-        .card-title { font-size: 16px; font-weight: 600; color: #333; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+        .card-title { font-size: 16px; font-weight: 600; color: #333; margin-bottom: 16px; }
         .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
         .metric-card { background: white; border-radius: 12px; padding: 20px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
         .metric-value { font-size: 32px; font-weight: 700; color: #1a73e8; margin-bottom: 8px; }
@@ -949,7 +966,6 @@ app.get('/', (req, res) => {
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
         .refresh-btn { background: #1a73e8; color: white; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 500; }
         .refresh-btn:hover { background: #1557b0; }
-        .log-entry { font-family: 'Monaco', monospace; font-size: 11px; padding: 4px 0; border-bottom: 1px solid #f0f0f0; color: #555; }
         @media (max-width: 768px) {
             .container { padding: 16px; }
             .metric-value { font-size: 24px; }
@@ -960,26 +976,35 @@ app.get('/', (req, res) => {
     <div class="container">
         <div class="header">
             <h1>🤖 Clever Cloud Bot Dashboard</h1>
-            <p class="subtitle">Real-time monitoring and metrics for your automation bot</p>
+            <p class="subtitle">Real-time monitoring - Data stored in MongoDB</p>
         </div>
         
         <div class="metrics-grid" id="metricsGrid">
             <div class="metric-card"><div class="metric-value" id="totalAccounts">0</div><div class="metric-label">Total Accounts</div></div>
             <div class="metric-card"><div class="metric-value" id="todayAccounts">0</div><div class="metric-label">Today's Accounts</div></div>
-            <div class="metric-card"><div class="metric-value" id="dockerProcesses">0</div><div class="metric-label">Active Docker Processes</div></div>
             <div class="metric-card"><div class="metric-value" id="loopCount">0</div><div class="metric-label">Loop Count</div></div>
             <div class="metric-card"><div class="metric-value" id="failedAttempts">0</div><div class="metric-label">Failed Attempts</div></div>
             <div class="metric-card"><div class="metric-value" id="cpuUsage">0%</div><div class="metric-label">CPU Usage</div></div>
+            <div class="metric-card"><div class="metric-value" id="memoryUsage">0%</div><div class="metric-label">Memory Usage</div></div>
         </div>
         
         <div class="card">
-            <div class="card-title">📊 System Status <div style="margin-left: auto;"><button class="refresh-btn" onclick="refreshData()">⟳ Refresh</button></div></div>
+            <div class="card-title">📊 System Status <button class="refresh-btn" onclick="refreshData()" style="margin-left: 10px;">⟳ Refresh</button></div>
             <div class="status"><span class="status-dot" id="statusDot"></span><span id="botStatus">Loading...</span><span style="margin-left: 20px;">Started: <span id="startTime">-</span></span><span style="margin-left: 20px;">Uptime: <span id="uptime">-</span></span></div>
-            <div id="proxyStats" style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #eee; font-size: 12px; color: #666;"></div>
+            <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #eee; font-size: 12px; color: #666;">
+                ✅ MongoDB Connected | Data persists across restarts
+            </div>
         </div>
         
-        <div class="card"><div class="card-title">📋 Recent Accounts</div><div class="table-responsive"><table id="accountsTable"><thead><tr><th>Email</th><th>Password</th><th>Date</th><th>Instance</th></tr></thead><tbody id="accountsBody"><tr><td colspan="4">Loading...</td></tr></tbody></table></div></div>
-        <div class="card"><div class="card-title">📄 Recent Logs</div><div id="logsContainer">Loading...</div></div>
+        <div class="card">
+            <div class="card-title">📋 Recent Accounts</div>
+            <div class="table-responsive">
+                <table id="accountsTable">
+                    <thead><tr><th>Email</th><th>Password</th><th>Date</th><th>Apps Deployed</th></thead>
+                    <tbody id="accountsBody"><tr><td colspan="4">Loading...</td></tr></tbody>
+                </table>
+            </div>
+        </div>
     </div>
     
     <script>
@@ -988,22 +1013,27 @@ app.get('/', (req, res) => {
                 const res = await fetch('/api/metrics');
                 const data = await res.json();
                 
-                document.getElementById('totalAccounts').textContent = data.totalAccounts || 0;
-                document.getElementById('todayAccounts').textContent = data.completedToday || 0;
-                document.getElementById('dockerProcesses').textContent = data.activeDockerProcesses || 0;
-                document.getElementById('loopCount').textContent = data.currentLoopCount || 0;
-                document.getElementById('failedAttempts').textContent = data.failedAttempts || 0;
-                document.getElementById('cpuUsage').textContent = (data.system?.cpuUsage || 0) + '%';
+                document.getElementById('totalAccounts').textContent = data.current?.totalAccounts || 0;
+                document.getElementById('todayAccounts').textContent = data.current?.completedToday || 0;
+                document.getElementById('loopCount').textContent = data.current?.currentLoopCount || 0;
+                document.getElementById('failedAttempts').textContent = data.current?.failedAttempts || 0;
+                document.getElementById('cpuUsage').textContent = (data.current?.system?.cpuUsage || 0) + '%';
+                document.getElementById('memoryUsage').textContent = (data.current?.system?.memoryUsage?.percentage || 0) + '%';
                 
                 const statusDot = document.getElementById('statusDot');
-                if (data.botStatus === 'running') { statusDot.className = 'status-dot'; document.getElementById('botStatus').textContent = 'Running'; }
-                else { statusDot.className = 'status-dot stopped'; document.getElementById('botStatus').textContent = 'Stopped'; }
+                if (data.current?.botStatus === 'running') { 
+                    statusDot.className = 'status-dot'; 
+                    document.getElementById('botStatus').textContent = 'Running'; 
+                } else { 
+                    statusDot.className = 'status-dot stopped'; 
+                    document.getElementById('botStatus').textContent = 'Stopped - Restarting for new IP'; 
+                }
                 
-                document.getElementById('startTime').textContent = new Date(data.startTime).toLocaleString();
-                if (data.system?.uptime) { const hours = Math.floor(data.system.uptime / 3600); const minutes = Math.floor((data.system.uptime % 3600) / 60); document.getElementById('uptime').textContent = hours + 'h ' + minutes + 'm'; }
-                
-                if (data.proxy) {
-                    document.getElementById('proxyStats').innerHTML = \`🔐 Proxy: \${data.useProxy ? 'Enabled' : 'Disabled'} | Working Proxies: \${data.proxy.workingProxies} | Fastest: \${data.proxy.fastestProxy}\`;
+                document.getElementById('startTime').textContent = new Date(data.current?.startTime).toLocaleString();
+                if (data.current?.system?.uptime) {
+                    const hours = Math.floor(data.current.system.uptime / 3600);
+                    const minutes = Math.floor((data.current.system.uptime % 3600) / 60);
+                    document.getElementById('uptime').textContent = hours + 'h ' + minutes + 'm';
                 }
             } catch(e) { console.error(e); }
         }
@@ -1014,22 +1044,18 @@ app.get('/', (req, res) => {
                 const accounts = await res.json();
                 const tbody = document.getElementById('accountsBody');
                 if (accounts.length === 0) { tbody.innerHTML = '<tr><td colspan="4">No accounts found</td></tr>'; return; }
-                tbody.innerHTML = accounts.slice(0, 20).map(acc => \`<tr><td>\${acc.email}</td><td>\${acc.password}</td><td>\${new Date(acc.date).toLocaleString()}</td><td>\${acc.instance || '-'}</td></tr>\`).join('');
+                tbody.innerHTML = accounts.slice(0, 20).map(acc => \`
+                    <tr>
+                        <td>\${acc.email}</td>
+                        <td>\${acc.password}</td>
+                        <td>\${new Date(acc.createdAt).toLocaleString()}</td>
+                        <td>\${acc.deployedApps?.length || 3}</td>
+                    </tr>
+                \`).join('');
             } catch(e) { console.error(e); }
         }
         
-        async function fetchLogs() {
-            try {
-                const res = await fetch('/api/logs');
-                const logs = await res.json();
-                const container = document.getElementById('logsContainer');
-                if (logs.length === 0) { container.innerHTML = '<div>No logs found</div>'; return; }
-                container.innerHTML = logs.map(log => \`<div style="margin-bottom: 16px;"><div style="font-weight: 600; margin-bottom: 8px;">📄 \${log.file}</div><div style="background: #f8f9fa; padding: 12px; border-radius: 8px; font-size: 11px; font-family: monospace; max-height: 200px; overflow-y: auto;">\${log.lines.map(line => '<div class="log-entry">' + escapeHtml(line.substring(0, 200)) + '</div>').join('')}</div></div>\`).join('');
-            } catch(e) { console.error(e); }
-        }
-        
-        function escapeHtml(text) { return text.replace(/[&<>]/g, function(m) { if (m === '&') return '&amp;'; if (m === '<') return '&lt;'; if (m === '>') return '&gt;'; return m; }); }
-        async function refreshData() { await Promise.all([fetchMetrics(), fetchAccounts(), fetchLogs()]); }
+        async function refreshData() { await Promise.all([fetchMetrics(), fetchAccounts()]); }
         refreshData();
         setInterval(refreshData, 10000);
     </script>
@@ -1039,36 +1065,49 @@ app.get('/', (req, res) => {
 });
 
 // ============ START SERVER ============
-console.log(`\n🚀 Clever Cloud Bot Dashboard Starting...\n`);
-console.log(`📊 Dashboard available at: http://localhost:${port}`);
-console.log(`📈 Metrics API: http://localhost:${port}/api/metrics`);
-console.log(`📋 Accounts API: http://localhost:${port}/api/accounts`);
-console.log(`🔐 Proxy Stats: http://localhost:${port}/api/proxy/stats`);
-console.log(`📄 Logs API: http://localhost:${port}/api/logs\n`);
-
-// Start the bot after 5 seconds
-setTimeout(() => {
-    startBot();
-}, 5000);
-
-// Start express server
-app.listen(port, '0.0.0.0', () => {
-    console.log(`✅ Dashboard server running on port ${port}`);
-});
+async function main() {
+    console.log(`\n🚀 Clever Cloud Bot Dashboard Starting...\n`);
+    console.log(`📊 Dashboard available at: http://localhost:${port}`);
+    console.log(`🔄 Bot will restart after each account for new IP`);
+    console.log(`💾 MongoDB: ${MONGODB_URI ? 'Configured' : 'Not configured'}\n`);
+    
+    // Connect to MongoDB
+    await connectMongoDB();
+    
+    // Start the bot after 5 seconds
+    setTimeout(() => {
+        startBot();
+    }, 5000);
+    
+    // Start express server
+    app.listen(port, '0.0.0.0', () => {
+        console.log(`✅ Dashboard server running on port ${port}`);
+    });
+}
 
 // Handle graceful shutdown
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
     console.log('\n🛑 Shutting down...');
+    if (dbClient) {
+        await dbClient.close();
+        console.log('[MongoDB] Connection closed');
+    }
     if (metrics.botInstance) {
         metrics.botInstance.stop();
     }
     process.exit(0);
 });
 
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
     console.log('\n🛑 Shutting down...');
+    if (dbClient) {
+        await dbClient.close();
+        console.log('[MongoDB] Connection closed');
+    }
     if (metrics.botInstance) {
         metrics.botInstance.stop();
     }
     process.exit(0);
 });
+
+main().catch(console.error);
