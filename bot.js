@@ -49,13 +49,13 @@ const ENV = {
 console.log('\n========================================');
 console.log('  BOT CONFIGURATION');
 console.log('========================================');
-console.log(`Bot Mode: Creates ONE account, then fails health check to trigger restart`);
+console.log(`Bot Mode: Creates ONE account, then exits for restart`);
 console.log(`MongoDB: ${MONGODB_URI ? 'Connected' : 'Not configured'}`);
 console.log('========================================\n');
 
 // ============ STATE VARIABLES ============
 let botStatus = {
-    state: 'starting', // starting, running, completed, failed
+    state: 'starting',
     accountCreated: false,
     accountEmail: null,
     startTime: new Date(),
@@ -149,7 +149,7 @@ class CleverCloudBot {
     }
 
     async fetchTempEmail() {
-        log('EMAIL', 'Getting temp email...', 'info', this.instanceId);
+        log('EMAIL', 'Getting temp email from 10MinuteMail...', 'info', this.instanceId);
         this.mailPage = await this.browser.newPage();
         await this.mailPage.goto('https://10minutemail.net/', { waitUntil: 'domcontentloaded' });
         await sleep(5000);
@@ -160,6 +160,10 @@ class CleverCloudBot {
             const span = document.querySelector('#mailAddress');
             return span ? span.textContent : null;
         });
+        
+        if (!this.realTempEmail) {
+            throw new Error('Could not extract email from 10MinuteMail');
+        }
         
         log('EMAIL', this.realTempEmail, 'success', this.instanceId);
         return this.realTempEmail;
@@ -186,6 +190,7 @@ class CleverCloudBot {
         });
         
         log('CAPTCHA', 'Waiting for solution...', 'info', this.instanceId);
+        let captchaSolved = false;
         for (let i = 0; i < 60; i++) {
             const solved = await this.page.evaluate(() => {
                 const input = document.querySelector('input[name="altcha"]');
@@ -193,9 +198,14 @@ class CleverCloudBot {
             });
             if (solved) {
                 log('CAPTCHA', 'Solved!', 'success', this.instanceId);
+                captchaSolved = true;
                 break;
             }
             await sleep(1000);
+        }
+        
+        if (!captchaSolved) {
+            log('CAPTCHA', 'Warning: CAPTCHA may not have solved', 'warn', this.instanceId);
         }
         
         await this.page.evaluate(() => {
@@ -203,44 +213,66 @@ class CleverCloudBot {
             if (btn) btn.click();
         });
         
-        await sleep(5000);
-        log('SIGNUP', 'Submitted', 'success', this.instanceId);
+        await sleep(8000);
+        log('SIGNUP', 'Form submitted', 'success', this.instanceId);
     }
 
     async getVerificationLink() {
-        log('VERIFY', 'Waiting for email...', 'info', this.instanceId);
+        log('VERIFY', 'Waiting for verification email (max 5 minutes)...', 'info', this.instanceId);
         const startTime = Date.now();
+        let emailFound = false;
         
-        while (Date.now() - startTime < 240000) {
-            const link = await this.mailPage.evaluate(() => {
+        while (Date.now() - startTime < 300000) {
+            // Check for verification link in current page
+            let link = await this.mailPage.evaluate(() => {
                 const regex = /https:\/\/api\.clever-cloud\.com\/v2\/self\/validate_email\?validationKey=[a-f0-9-]+/;
                 const match = document.documentElement.innerHTML.match(regex);
                 return match ? match[0] : null;
             });
             
-            if (link) return link;
-            
-            const clicked = await this.mailPage.evaluate(() => {
-                const rows = Array.from(document.querySelectorAll('#maillist tr'));
-                const cleverRow = rows.find(r => r.innerText.toLowerCase().includes('clever'));
-                if (cleverRow) {
-                    const a = cleverRow.querySelector('a');
-                    if (a) { a.click(); return true; }
-                }
-                return false;
-            });
-            
-            if (clicked) {
-                await sleep(5000);
-                continue;
+            if (link) {
+                log('VERIFY', 'Verification link found!', 'success', this.instanceId);
+                return link;
             }
+            
+            // Look for Clever Cloud email in inbox
+            if (!emailFound) {
+                const clicked = await this.mailPage.evaluate(() => {
+                    const rows = Array.from(document.querySelectorAll('#maillist tr'));
+                    for (const row of rows) {
+                        const text = (row.innerText || '').toLowerCase();
+                        if (text.includes('clever cloud') || text.includes('clever-cloud')) {
+                            const a = row.querySelector('a');
+                            if (a) {
+                                a.click();
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                });
+                
+                if (clicked) {
+                    emailFound = true;
+                    log('VERIFY', 'Email found, loading content...', 'success', this.instanceId);
+                    await sleep(8000);
+                    continue;
+                }
+            }
+            
+            // Refresh inbox periodically
+            const elapsed = Math.floor((Date.now() - startTime) / 1000);
+            process.stdout.write(`\r  Waiting for email... ${elapsed}s / 300s`);
+            
             await sleep(5000);
         }
-        throw new Error('No verification email');
+        
+        console.log(); // New line after progress
+        throw new Error('No verification email received after 5 minutes');
     }
 
     async handleOAuth(url, email, password) {
-        log('OAUTH', 'Processing...', 'info', this.instanceId);
+        log('OAUTH', 'Processing OAuth...', 'info', this.instanceId);
         
         const oauthPage = await this.browser.newPage();
         await oauthPage.goto(url, { waitUntil: 'networkidle2' });
@@ -266,6 +298,7 @@ class CleverCloudBot {
         
         await sleep(8000);
         await oauthPage.close();
+        log('OAUTH', 'OAuth completed', 'success', this.instanceId);
     }
 
     async startDockerInBackground(email, password) {
@@ -324,6 +357,9 @@ class CleverCloudBot {
             await this.page.goto(verifyLink, { waitUntil: 'domcontentloaded' });
             await sleep(5000);
             
+            // Handle OAuth if needed (this will come from docker script)
+            // await this.handleOAuth(oauthUrl, email, password);
+            
             const result = await this.startDockerInBackground(email, this.password);
             
             if (db) {
@@ -343,89 +379,35 @@ class CleverCloudBot {
             botStatus.state = 'completed';
             
             log('SUCCESS', `✓ Account ${email} created successfully!`, 'success', this.instanceId);
-            log('RESTART', '========================================', 'info', this.instanceId);
-            log('RESTART', 'Account creation complete!', 'info', this.instanceId);
-            log('RESTART', 'Health check will now fail to trigger restart', 'info', this.instanceId);
-            log('RESTART', 'Scalingo will restart container with NEW IP', 'info', this.instanceId);
-            log('RESTART', 'Next account will have a different IP', 'info', this.instanceId);
-            log('RESTART', '========================================', 'info', this.instanceId);
             
         } catch (error) {
             log('ERROR', error.message, 'error', this.instanceId);
             await this.cleanup();
             botStatus.state = 'failed';
             botStatus.completionTime = new Date();
-            
-            log('RESTART', '========================================', 'info', this.instanceId);
-            log('RESTART', 'Account creation failed!', 'error', this.instanceId);
-            log('RESTART', 'Health check will fail to trigger restart', 'info', this.instanceId);
-            log('RESTART', 'Scalingo will restart container to retry', 'info', this.instanceId);
-            log('RESTART', '========================================', 'info', this.instanceId);
+            log('FAILED', 'Account creation failed', 'error', this.instanceId);
         }
     }
 }
 
 // ============ HEALTH CHECK ENDPOINT ============
-// This endpoint controls when Scalingo restarts the container
-// - Returns 200 while bot is working (healthy)
-// - Returns 500 after bot completes (unhealthy -> triggers restart)
 app.get('/health', (req, res) => {
     const uptime = process.uptime();
+    console.log(`[HEALTH] State: ${botStatus.state}, Account: ${botStatus.accountCreated ? 'created' : 'not yet'}`);
     
-    console.log(`[HEALTH] State: ${botStatus.state}, Account: ${botStatus.accountCreated ? 'created' : 'not yet'}, Uptime: ${Math.floor(uptime)}s`);
-    
-    if (botStatus.state === 'starting') {
-        // Bot still starting up - healthy
-        res.status(200).json({ 
-            status: 'starting', 
-            healthy: true,
-            uptime: uptime,
-            message: 'Bot is starting up'
-        });
-    } 
-    else if (botStatus.state === 'running') {
-        // Bot is actively creating account - healthy
-        res.status(200).json({ 
-            status: 'running', 
-            healthy: true,
-            uptime: uptime,
-            message: 'Bot is creating account'
-        });
-    }
-    else if (botStatus.state === 'completed') {
-        // Bot completed successfully - return 500 to trigger restart for NEW IP
-        console.log('[HEALTH] Bot completed, returning 500 to trigger restart for new IP');
-        res.status(500).json({ 
-            status: 'completed', 
-            healthy: false,
-            uptime: uptime,
-            message: 'Account created, restarting for new IP',
-            accountCreated: botStatus.accountEmail
-        });
-    }
-    else if (botStatus.state === 'failed') {
-        // Bot failed - return 500 to trigger restart
-        console.log('[HEALTH] Bot failed, returning 500 to trigger restart');
-        res.status(500).json({ 
-            status: 'failed', 
-            healthy: false,
-            uptime: uptime,
-            message: 'Account creation failed, restarting to retry'
-        });
-    }
-    else {
-        // Unknown state - return 500 to be safe
-        res.status(500).json({ 
-            status: 'unknown', 
-            healthy: false,
-            uptime: uptime
-        });
+    if (botStatus.state === 'starting' || botStatus.state === 'running') {
+        // Bot is working - healthy
+        res.status(200).json({ status: 'healthy', state: botStatus.state });
+    } else {
+        // Bot completed or failed - trigger restart
+        console.log('[HEALTH] Bot completed/failed, returning 500 to trigger restart');
+        res.status(500).json({ status: 'unhealthy', state: botStatus.state, restart: true });
     }
 });
 
-// ============ READINESS CHECK ENDPOINT ============
+// ============ READINESS CHECK ============
 app.get('/ready', (req, res) => {
-    if (botStatus.state === 'running' || botStatus.state === 'starting') {
+    if (botStatus.state === 'running') {
         res.status(200).json({ ready: true });
     } else {
         res.status(503).json({ ready: false });
@@ -469,149 +451,74 @@ app.get('/api/status', (req, res) => {
         accountEmail: botStatus.accountEmail,
         startTime: botStatus.startTime,
         completionTime: botStatus.completionTime,
-        uptime: process.uptime(),
-        memory: process.memoryUsage(),
-        willRestart: botStatus.state === 'completed' || botStatus.state === 'failed'
+        uptime: process.uptime()
     });
 });
 
-// ============ DASHBOARD ============
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Clever Cloud Bot - Health Check Restart</title>
+    <title>Clever Cloud Bot</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; color: #1e1e2f; }
-        .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
-        h1 { font-size: 28px; font-weight: 600; margin-bottom: 8px; }
-        .subtitle { color: #666; margin-bottom: 24px; }
-        .card { background: white; border-radius: 12px; padding: 24px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        .card-title { font-size: 18px; font-weight: 600; margin-bottom: 16px; }
-        .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
-        .metric-card { background: white; border-radius: 12px; padding: 20px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        .metric-value { font-size: 32px; font-weight: 700; color: #1976d2; }
-        .metric-label { font-size: 13px; color: #666; margin-top: 8px; }
-        .status { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 8px; }
-        .status-starting { background: #ff9800; animation: pulse 1s infinite; }
-        .status-running { background: #4caf50; animation: pulse 2s infinite; }
+        body { font-family: Arial; margin: 20px; background: #f0f0f0; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .card { background: white; padding: 20px; margin-bottom: 20px; border-radius: 8px; }
+        .metric { display: inline-block; margin: 10px; padding: 15px; background: #e3f2fd; border-radius: 8px; }
+        .value { font-size: 28px; font-weight: bold; color: #1976d2; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 8px; border-bottom: 1px solid #ddd; }
+        .status { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; }
+        .status-running { background: #4caf50; animation: pulse 1s infinite; }
         .status-completed { background: #2196f3; }
         .status-failed { background: #f44336; }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #e0e0e0; }
-        th { background: #f8f9fa; font-weight: 600; }
-        .info-box { background: #e3f2fd; padding: 16px; border-radius: 8px; margin-top: 16px; }
-        .info-box h4 { margin-bottom: 8px; color: #1976d2; }
-        .info-box p { margin-bottom: 4px; font-size: 14px; color: #555; }
-        code { background: #f4f4f4; padding: 2px 6px; border-radius: 4px; font-family: monospace; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🤖 Clever Cloud Bot</h1>
-        <p class="subtitle">Creates ONE account, then health check triggers restart for NEW IP</p>
-        
-        <div class="metrics-grid" id="metrics">
-            <div class="metric-card"><div class="metric-value" id="totalAccounts">0</div><div class="metric-label">Total Accounts</div></div>
-            <div class="metric-card"><div class="metric-value" id="todayAccounts">0</div><div class="metric-label">Today</div></div>
-            <div class="metric-card"><div class="metric-value" id="uptime">0s</div><div class="metric-label">Uptime</div></div>
-            <div class="metric-card"><div class="metric-value" id="botState">-</div><div class="metric-label">Bot State</div></div>
-        </div>
-        
         <div class="card">
-            <div class="card-title">📊 System Status</div>
-            <div id="statusDetails"></div>
+            <h3>📊 Stats</h3>
+            <div id="stats"></div>
         </div>
-        
         <div class="card">
-            <div class="card-title">📋 Recent Accounts</div>
-            <div class="table-responsive">
-                <table id="accountsTable">
-                    <thead><tr><th>Email</th><th>Password</th><th>Date</th></tr></thead>
-                    <tbody id="accountsBody"><tr><td colspan="3">Loading...</td></tr></tbody>
-                </table>
-            </div>
+            <h3>📋 Recent Accounts</h3>
+            <div id="accounts"></div>
         </div>
-        
-        <div class="info-box">
-            <h4>🔄 How Restart Works</h4>
-            <p>1. Bot creates ONE Clever Cloud account</p>
-            <p>2. After completion, health check returns <code>500</code> (unhealthy)</p>
-            <p>3. Scalingo detects unhealthy container and restarts it</p>
-            <p>4. Container gets a <strong>NEW PUBLIC IP</strong> address</p>
-            <p>5. Bot starts again and creates another account</p>
-            <p>📡 Health check endpoint: <code>/health</code> | Every few seconds</p>
+        <div class="card">
+            <h3>ℹ️ Info</h3>
+            <p>Health check: <code>/health</code></p>
+            <p>Bot creates 1 account, then health check returns 500 → Scalingo restarts → New IP</p>
         </div>
     </div>
-    
     <script>
-        async function loadMetrics() {
-            try {
-                const res = await fetch('/api/metrics');
-                const data = await res.json();
-                document.getElementById('totalAccounts').textContent = data.totalAccounts || 0;
-                document.getElementById('todayAccounts').textContent = data.completedToday || 0;
-                document.getElementById('uptime').textContent = Math.floor(data.uptime) + 's';
-                
-                const stateSpan = document.getElementById('botState');
-                const state = data.botState || 'unknown';
-                stateSpan.innerHTML = \`<span class="status status-\${state}\"></span>\${state}\`;
-            } catch(e) { console.error(e); }
-        }
-        
-        async function loadStatus() {
-            try {
-                const res = await fetch('/api/status');
-                const data = await res.json();
-                const statusHtml = \`
-                    <p><strong>Bot State:</strong> <span class="status status-\${data.botState}\"></span> \${data.botState}</p>
-                    <p><strong>Account Created:</strong> \${data.accountCreated ? '✅ Yes' : '⏳ Not yet'}</p>
-                    <p><strong>Account Email:</strong> \${data.accountEmail || '-'}</p>
-                    <p><strong>Started:</strong> \${new Date(data.startTime).toLocaleString()}</p>
-                    <p><strong>Will Restart:</strong> \${data.willRestart ? '🔄 Yes (new IP coming)' : '❌ No'}</p>
-                    <p><strong>Memory Usage:</strong> \${Math.round(data.memory?.heapUsed / 1024 / 1024)} MB / \${Math.round(data.memory?.heapTotal / 1024 / 1024)} MB</p>
+        async function load() {
+            const stats = await fetch('/api/metrics').then(r => r.json());
+            document.getElementById('stats').innerHTML = \`
+                <div class="metric"><div class="value">\${stats.totalAccounts || 0}</div>Total Accounts</div>
+                <div class="metric"><div class="value">\${stats.completedToday || 0}</div>Today</div>
+                <div class="metric"><div class="value"><span class="status status-\${stats.botState}"></span>\${stats.botState}</div>State</div>
+            \`;
+            
+            const accounts = await fetch('/api/accounts').then(r => r.json());
+            if (accounts.length) {
+                document.getElementById('accounts').innerHTML = \`
+                    </table>
+                        <tr><th>Email</th><th>Password</th><th>Date</th></tr>
+                        \${accounts.map(a => \`<tr><td>\${a.email}</td><td>\${a.password}</td><td>\${new Date(a.createdAt).toLocaleString()}</td></tr>\`).join('')}
+                    20点
                 \`;
-                document.getElementById('statusDetails').innerHTML = statusHtml;
-            } catch(e) { console.error(e); }
+            }
         }
-        
-        async function loadAccounts() {
-            try {
-                const res = await fetch('/api/accounts');
-                const accounts = await res.json();
-                const tbody = document.getElementById('accountsBody');
-                if (!accounts || accounts.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="3">No accounts yet</td></tr>';
-                    return;
-                }
-                tbody.innerHTML = accounts.map(acc => \`
-                    <tr>
-                        <td>\${acc.email}</td>
-                        <td>\${acc.password}</td>
-                        <td>\${new Date(acc.createdAt).toLocaleString()}</td>
-                    </tr>
-                \`).join('');
-            } catch(e) { console.error(e); }
-        }
-        
-        function refresh() {
-            loadMetrics();
-            loadStatus();
-            loadAccounts();
-        }
-        
-        refresh();
-        setInterval(refresh, 5000);
+        load();
+        setInterval(load, 5000);
     </script>
 </body>
 </html>`);
 });
 
-// ============ START THE BOT ============
+// ============ START ============
 async function main() {
     console.log(`\n🚀 Clever Cloud Bot Starting...`);
     console.log(`📊 Dashboard: http://localhost:${port}`);
@@ -621,41 +528,34 @@ async function main() {
     
     await connectMongoDB();
     
-    // Start the Express server first
+    // Start server
     app.listen(port, '0.0.0.0', () => {
         console.log(`✅ Dashboard server running on port ${port}`);
-        console.log(`\n📡 Health check endpoint: /health`);
-        console.log(`   - Returns 200 while bot is working`);
-        console.log(`   - Returns 500 after account created → triggers restart`);
-        console.log(`   - Container restarts with NEW IP address\n`);
     });
     
-    // Wait a moment for server to start
+    // Wait for server to start
     await sleep(2000);
     
-    // Run the bot
+    // Run bot
     const bot = new CleverCloudBot('INSTANCE_1', ENV.BOT_PASSWORD, ENV.BOT_START_DELAY);
     await bot.run();
     
     // Keep process alive for health checks
-    console.log('[MAIN] Bot completed, keeping process alive for health checks...');
-    console.log('[MAIN] Health check will now return 500, triggering restart for new IP');
+    console.log('\n[MAIN] Bot finished, keeping alive for health checks...');
+    console.log('[MAIN] Health check will return 500, triggering restart for new IP\n');
     
-    // Keep the process running indefinitely (health checks will trigger restart)
-    setInterval(() => {
-        // Just keep alive
-    }, 1000);
+    // Keep alive
+    setInterval(() => {}, 1000);
 }
 
-// Graceful shutdown
 process.on('SIGINT', () => {
-    console.log('\n🛑 Received SIGINT, shutting down...');
+    console.log('\n🛑 Shutting down...');
     if (dbClient) dbClient.close();
     process.exit(0);
 });
 
 process.on('SIGTERM', () => {
-    console.log('\n🛑 Received SIGTERM, shutting down...');
+    console.log('\n🛑 Shutting down...');
     if (dbClient) dbClient.close();
     process.exit(0);
 });
