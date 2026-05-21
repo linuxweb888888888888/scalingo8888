@@ -45,6 +45,7 @@ const ENV = {
     HEADLESS_MODE: process.env.HEADLESS_MODE !== 'false',
     CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome',
     CLEVER_TOKEN: process.env.CLEVER_TOKEN || '',
+    SCALINGO_API_TOKEN: process.env.SCALINGO_API_TOKEN || '',
     SCALINGO_APP_NAME: process.env.SCALINGO_APP_NAME || ''
 };
 
@@ -55,6 +56,7 @@ console.log(`Bot Mode: Creates ONE account, then CLI RESTART for NEW IP`);
 console.log(`MongoDB: ${MONGODB_URI ? 'Connected' : 'Not configured'}`);
 console.log(`Clever Token: ${ENV.CLEVER_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
 console.log(`Scalingo App: ${ENV.SCALINGO_APP_NAME || 'Not set'}`);
+console.log(`Scalingo Token: ${ENV.SCALINGO_API_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
 console.log('========================================\n');
 
 // ============ STATE VARIABLES ============
@@ -123,29 +125,85 @@ async function installChromiumRuntime() {
     }
 }
 
-// ============ CLI RESTART FUNCTION ============
+// ============ INSTALL SCALINGO CLI ============
+async function installScalingoCLI() {
+    return new Promise((resolve) => {
+        log('CLI', 'Installing Scalingo CLI...', 'info', 'MAIN');
+        
+        const installCmd = `curl -fsSL https://cli.scalingo.com/install.sh | bash`;
+        
+        const child = spawn('bash', ['-c', installCmd], {
+            stdio: ['ignore', 'pipe', 'pipe']
+        });
+        
+        child.on('close', (code) => {
+            if (code === 0) {
+                log('CLI', 'Scalingo CLI installed successfully', 'success', 'MAIN');
+                
+                // Add to PATH
+                process.env.PATH = `/root/.local/share/scalingo/bin:${process.env.PATH}`;
+                resolve(true);
+            } else {
+                log('CLI', 'Failed to install Scalingo CLI', 'error', 'MAIN');
+                resolve(false);
+            }
+        });
+    });
+}
+
+// ============ LOGIN TO SCALINGO USING TOKEN ============
+async function loginToScalingo() {
+    const apiToken = ENV.SCALINGO_API_TOKEN;
+    
+    if (!apiToken) {
+        log('CLI', 'No API token found, cannot login', 'error', 'MAIN');
+        return false;
+    }
+    
+    log('CLI', 'Logging into Scalingo...', 'info', 'MAIN');
+    
+    return new Promise((resolve) => {
+        const loginCmd = `echo "${apiToken}" | scalingo login --api-token`;
+        
+        const child = spawn('bash', ['-c', loginCmd], {
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+        
+        child.stdout.on('data', (data) => {
+            console.log(`[CLI] ${data.toString().trim()}`);
+        });
+        
+        child.stderr.on('data', (data) => {
+            console.log(`[CLI ERR] ${data.toString().trim()}`);
+        });
+        
+        child.on('close', (code) => {
+            if (code === 0) {
+                log('CLI', 'Logged into Scalingo successfully', 'success', 'MAIN');
+                resolve(true);
+            } else {
+                log('CLI', 'Failed to login to Scalingo', 'error', 'MAIN');
+                resolve(false);
+            }
+        });
+    });
+}
+
+// ============ RESTART VIA CLI ============
 async function restartWithCLI() {
     const appName = ENV.SCALINGO_APP_NAME;
     
     if (!appName) {
-        log('RESTART', 'SCALINGO_APP_NAME not set, using exit restart', 'warn', 'MAIN');
+        log('RESTART', 'SCALINGO_APP_NAME not set', 'error', 'MAIN');
         return false;
     }
     
-    log('RESTART', `Restarting app via CLI: ${appName}`, 'info', 'MAIN');
+    log('RESTART', `Restarting ${appName} via CLI...`, 'info', 'MAIN');
     
     return new Promise((resolve) => {
-        // First, login to Scalingo (if needed)
-        const loginCmd = `scalingo login --api-token "${process.env.SCALINGO_API_TOKEN}" 2>/dev/null || scalingo login`;
-        
-        // Then restart the app
         const restartCmd = `scalingo --app ${appName} restart`;
         
-        // Combine commands
-        const fullCmd = `${loginCmd} && ${restartCmd}`;
-        
-        const child = spawn('bash', ['-c', fullCmd], {
-            detached: true,
+        const child = spawn('bash', ['-c', restartCmd], {
             stdio: ['ignore', 'pipe', 'pipe']
         });
         
@@ -162,12 +220,10 @@ async function restartWithCLI() {
                 log('RESTART', '✅ CLI restart initiated successfully!', 'success', 'MAIN');
                 resolve(true);
             } else {
-                log('RESTART', `CLI restart returned code ${code}`, 'error', 'MAIN');
+                log('RESTART', `CLI restart failed with code ${code}`, 'error', 'MAIN');
                 resolve(false);
             }
         });
-        
-        child.unref();
     });
 }
 
@@ -512,16 +568,20 @@ class CleverCloudBot {
             log('SUCCESS', `✓ Account ${email} created successfully!`, 'success', this.instanceId);
             log('RESTART', `This was account #${botStatus.restartCount}`, 'info', this.instanceId);
             log('RESTART', '========================================', 'info', this.instanceId);
-            log('RESTART', 'Restarting container via CLI for NEW IP...', 'info', this.instanceId);
+            log('RESTART', 'Installing Scalingo CLI and restarting...', 'info', this.instanceId);
             log('RESTART', '========================================', 'info', this.instanceId);
             
-            // Try CLI restart
-            const cliSuccess = await restartWithCLI();
+            // Install Scalingo CLI if not present
+            const cliInstalled = await installScalingoCLI();
             
-            if (!cliSuccess) {
-                log('RESTART', 'CLI restart failed, using exit restart', 'warn', this.instanceId);
+            if (cliInstalled) {
+                // Login with token
+                await loginToScalingo();
+                // Restart
+                await restartWithCLI();
             }
             
+            // Exit anyway
             await sleep(2000);
             process.exit(0);
             
@@ -626,10 +686,9 @@ app.get('/', (req, res) => {
         <\/div>
         
         <div class="info-box">
-            <p>✅ Bot creates ONE account → Calls Scalingo CLI → IMMEDIATE RESTART</p>
+            <p>✅ Bot creates ONE account → Installs Scalingo CLI → Logs in with token → Restarts</p>
             <p>🔄 Container restarts instantly with NEW IP address</p>
             <p>🔐 OAuth is automatically handled (fills email/password, clicks login)</p>
-            <p>🔑 CLI Method: No token needed if already logged in</p>
         <\/div>
     <\/div>
     
@@ -649,7 +708,7 @@ app.get('/', (req, res) => {
                 if (accounts && accounts.length) {
                     let html = '';
                     for (const acc of accounts) {
-                        html += '<tr>lakang' + acc.email + '<\/td><td>' + acc.password + '<\/td><td>' + new Date(acc.createdAt).toLocaleString() + '<\/td><\/tr>';
+                        html += '<tr><td>' + acc.email + '<\/td><td>' + acc.password + '<\/td><td>' + new Date(acc.createdAt).toLocaleString() + '<\/td><\/tr>';
                     }
                     tbody.innerHTML = html;
                 }
