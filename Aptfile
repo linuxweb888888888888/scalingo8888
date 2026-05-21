@@ -1,6 +1,8 @@
 git
 wget
 curl
+gnupg
+apt-transport-https
 ca-certificates
 unzip
 chromium-browser
