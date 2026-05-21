@@ -52,7 +52,8 @@ const ENV = {
     DOCKER_IMAGE: process.env.DOCKER_IMAGE || 'buyrunplace/webwebwebweb8888',
     DOCKER_APP_COUNT: parseInt(process.env.DOCKER_APP_COUNT) || 3,
     HEADLESS_MODE: process.env.HEADLESS_MODE !== 'false',
-    CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome'
+    CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome',
+    DEBUG_MODE: process.env.DEBUG_MODE === 'true' || true  // Enable debug mode
 };
 
 console.log('\n========================================');
@@ -60,6 +61,7 @@ console.log('  BOT CONFIGURATION');
 console.log('========================================');
 console.log(`Bot Settings: Password: ${ENV.BOT_PASSWORD}, Wait: ${ENV.BOT_WAIT_MINUTES}m`);
 console.log(`MongoDB: ${MONGODB_URI ? 'Configured' : 'Not configured'}`);
+console.log(`Debug Mode: ${ENV.DEBUG_MODE ? 'Enabled' : 'Disabled'}`);
 console.log('========================================\n');
 
 // ============ DATABASE OPERATIONS ============
@@ -103,7 +105,7 @@ async function saveDeploymentToDB(deployment) {
         console.log(`[MongoDB] Deployment saved: ${deployment.appName}`);
         return true;
     } catch (error) {
-        console.error('[MongoDB] Save deployment error:', error.message);
+        console.error('[MDB] Save deployment error:', error.message);
         return false;
     }
 }
@@ -340,6 +342,13 @@ class CleverCloudBot {
                 timeout: 60000 
             });
             await sleep(3000);
+            
+            // Take screenshot before filling (debug)
+            if (ENV.DEBUG_MODE) {
+                await this.page.screenshot({ path: `signup_before_${this.instanceId}_${Date.now()}.png` });
+                log('SIGNUP', 'Screenshot saved: signup_before', 'info', this.instanceId);
+            }
+            
             await this.page.waitForSelector('input[type="email"]', { timeout: 30000 });
             await this.page.type('input[type="email"]', email, { delay: 20 });
             await this.page.type('input[type="password"]', password, { delay: 20 });
@@ -371,22 +380,115 @@ class CleverCloudBot {
                     break; 
                 }
                 if (i % 10 === 0 && i > 0) {
-                    process.stdout.write(`\n  ${i}s `);
+                    process.stdout.write(`\n  ${i}s `.cyan);
                 } else {
-                    process.stdout.write('.');
+                    process.stdout.write('.'.cyan);
                 }
                 await sleep(1000);
             }
             console.log();
-
-            log('SIGNUP', 'Submitting form...', 'info', this.instanceId);
-            await this.page.evaluate(() => {
-                const b = Array.from(document.querySelectorAll('button')).find(x => x.innerText.toLowerCase().includes('sign up'));
-                if (b) b.click();
+            
+            if (!solved) {
+                log('CAPTCHA', 'WARNING: CAPTCHA may not have solved!', 'warn', this.instanceId);
+            }
+            
+            // Get any error messages on the page
+            const errorMessages = await this.page.evaluate(() => {
+                const errors = [];
+                const errorElements = document.querySelectorAll('.error, .alert, .alert-danger, .notification, .message, [role="alert"], .invalid-feedback');
+                errorElements.forEach(el => {
+                    if (el.innerText && el.innerText.trim()) errors.push(el.innerText.trim());
+                });
+                return errors;
             });
+            
+            if (errorMessages.length > 0) {
+                log('SIGNUP', `Page errors found: ${errorMessages.join(' | ')}`, 'warn', this.instanceId);
+            }
+            
+            // Listen for console errors
+            this.page.on('console', msg => {
+                if (msg.type() === 'error') {
+                    log('SIGNUP', `Console error: ${msg.text()}`, 'error', this.instanceId);
+                }
+            });
+            
+            // Take screenshot before submit
+            if (ENV.DEBUG_MODE) {
+                await this.page.screenshot({ path: `signup_before_submit_${this.instanceId}_${Date.now()}.png` });
+            }
+            
+            log('SIGNUP', 'Submitting form...', 'info', this.instanceId);
+            
+            // Click sign up button
+            const signupResult = await this.page.evaluate(() => {
+                const buttons = Array.from(document.querySelectorAll('button'));
+                const signupBtn = buttons.find(x => x.innerText.toLowerCase().includes('sign up') || x.innerText.toLowerCase().includes('create'));
+                if (signupBtn) {
+                    signupBtn.click();
+                    return 'clicked';
+                }
+                return 'not found';
+            });
+            
+            log('SIGNUP', `Signup button result: ${signupResult}`, 'info', this.instanceId);
+            
             await sleep(8000);
+            
+            // Check for success or error after submission
+            const pageContent = await this.page.content();
+            fs.writeFileSync(`signup_after_${this.instanceId}_${Date.now()}.html`, pageContent);
+            
+            // Check for success message
+            const successMessage = await this.page.evaluate(() => {
+                const successEl = document.querySelector('.success, .alert-success, .notification-success, [class*="success"]');
+                return successEl ? successEl.innerText : null;
+            });
+            
+            if (successMessage) {
+                log('SIGNUP', `Success message: ${successMessage}`, 'success', this.instanceId);
+            }
+            
+            // Check for error message
+            const errorMessage = await this.page.evaluate(() => {
+                const errorEl = document.querySelector('.error-message, .alert-danger, .error, [class*="error"], [class*="danger"]');
+                return errorEl ? errorEl.innerText : null;
+            });
+            
+            if (errorMessage) {
+                log('SIGNUP', `Error message from page: ${errorMessage}`, 'error', this.instanceId);
+                throw new Error(`Signup failed: ${errorMessage}`);
+            }
+            
+            // Take final screenshot
+            if (ENV.DEBUG_MODE) {
+                await this.page.screenshot({ path: `signup_after_${this.instanceId}_${Date.now()}.png` });
+                log('SIGNUP', 'Screenshot saved: signup_after', 'info', this.instanceId);
+            }
+            
+            // Check if we're redirected or if there's a verification message
+            const currentUrl = this.page.url();
+            log('SIGNUP', `Current URL after signup: ${currentUrl}`, 'info', this.instanceId);
+            
+            // Look for verification message
+            const verificationText = await this.page.evaluate(() => {
+                const bodyText = document.body.innerText;
+                if (bodyText.includes('verify') || bodyText.includes('confirmation')) {
+                    return bodyText.match(/verify|confirmation|email.*sent/gi);
+                }
+                return null;
+            });
+            
+            if (verificationText) {
+                log('SIGNUP', `Verification message: ${verificationText.join(', ')}`, 'info', this.instanceId);
+            }
+            
         } catch (error) {
             log('SIGNUP', `Failed: ${error.message}`, 'error', this.instanceId);
+            // Take error screenshot
+            try {
+                await this.page.screenshot({ path: `signup_error_${this.instanceId}_${Date.now()}.png` });
+            } catch(e) {}
             throw error;
         }
     }
@@ -395,11 +497,24 @@ class CleverCloudBot {
         log('VERIFY', 'Polling for email content (4m limit)...', 'info', this.instanceId);
         const startTime = Date.now();
         let emailFound = false;
+        let retryCount = 0;
+        
+        // Take screenshot of inbox
+        if (ENV.DEBUG_MODE) {
+            await this.mailPage.screenshot({ path: `inbox_${this.instanceId}_${Date.now()}.png` });
+        }
 
         while (true) {
-            if (Date.now() - startTime > 240000) throw new Error("RESTART_NEEDED");
+            if (Date.now() - startTime > 240000) {
+                // Save final state for debugging
+                await this.mailPage.screenshot({ path: `inbox_timeout_${this.instanceId}_${Date.now()}.png` });
+                const inboxHtml = await this.mailPage.content();
+                fs.writeFileSync(`inbox_timeout_${this.instanceId}_${Date.now()}.html`, inboxHtml);
+                throw new Error("RESTART_NEEDED - No verification email after 4 minutes");
+            }
 
             try {
+                // Check for verification link in HTML
                 let link = await this.mailPage.evaluate(() => {
                     const regex = /https:\/\/api\.clever-cloud\.com\/v2\/self\/validate_email\?validationKey=[a-f0-9-]+/;
                     const match = document.documentElement.innerHTML.match(regex);
@@ -411,33 +526,52 @@ class CleverCloudBot {
                     return link;
                 }
 
+                // Look for Clever Cloud email in the list
                 if (!emailFound) {
                     const rowClicked = await this.mailPage.evaluate(() => {
-                        const rows = Array.from(document.querySelectorAll('#maillist tr, .mail-list tr'));
-                        const cleverRow = rows.find(r => r.innerText.toLowerCase().includes('clever cloud'));
+                        const rows = Array.from(document.querySelectorAll('#maillist tr, .mail-list tr, .inbox tr, [class*="mail"] tr'));
+                        const cleverRow = rows.find(r => {
+                            const text = (r.innerText || '').toLowerCase();
+                            return text.includes('clever cloud') || text.includes('clever-cloud') || text.includes('clevercloud');
+                        });
                         if (cleverRow) {
                             const a = cleverRow.querySelector('a');
-                            if (a) { a.click(); return true; }
+                            if (a) { 
+                                a.click(); 
+                                return true; 
+                            }
                         }
                         return false;
                     });
+                    
                     if (rowClicked) { 
                         emailFound = true; 
                         log('VERIFY', 'Email found, extracting link...', 'success', this.instanceId);
-                        await sleep(5000); 
+                        await sleep(8000); 
                         continue; 
                     }
                 }
 
-                if ((Date.now() - startTime) % 30000 < 5000) {
+                // Reload inbox periodically to check for new emails
+                if (retryCount % 6 === 0 && retryCount > 0) {
+                    log('VERIFY', 'Refreshing inbox...', 'info', this.instanceId);
                     await this.mailPage.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+                    await sleep(3000);
+                    if (ENV.DEBUG_MODE) {
+                        await this.mailPage.screenshot({ path: `inbox_refresh_${this.instanceId}_${Date.now()}.png` });
+                    }
                 }
 
-                process.stdout.write('.');
+                const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                process.stdout.write(`\r  Waiting for email... ${elapsed}s / 240s `.cyan);
+                
                 await sleep(5000);
+                retryCount++;
                 
             } catch (error) {
+                log('VERIFY', `Polling error: ${error.message}`, 'warn', this.instanceId);
                 await sleep(5000);
+                retryCount++;
             }
         }
     }
@@ -694,6 +828,7 @@ class CleverCloudBot {
                 });
                 
                 const backoff = Math.min(60000, 10000 * Math.pow(2, this.consecutiveFailures));
+                log('RESTART', `Waiting ${backoff/1000}s before retry...`, 'warn', this.instanceId);
                 await sleep(backoff);
             }
         }
@@ -794,7 +929,7 @@ app.post('/api/restart', async (req, res) => {
     }, 1000);
 });
 
-// Dashboard HTML - Fixed syntax
+// Dashboard HTML
 app.get('/', (req, res) => {
     const html = `<!DOCTYPE html>
 <html lang="en">
@@ -933,7 +1068,8 @@ async function main() {
     console.log(`\n🚀 Clever Cloud Bot Dashboard Starting...\n`);
     console.log(`📊 Dashboard available at: http://localhost:${port}`);
     console.log(`🔄 Bot will restart after each account for new IP`);
-    console.log(`💾 MongoDB: ${MONGODB_URI ? 'Configured' : 'Not configured'}\n`);
+    console.log(`💾 MongoDB: ${MONGODB_URI ? 'Configured' : 'Not configured'}`);
+    console.log(`🐛 Debug mode: ${ENV.DEBUG_MODE ? 'Enabled - Screenshots will be saved' : 'Disabled'}\n`);
     
     await connectMongoDB();
     
