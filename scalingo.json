@@ -1,0 +1,10 @@
+{
+  "name": "clever-cloud-bot",
+  "health_check_path": "/health",
+  "formation": {
+    "web": {
+      "amount": 1,
+      "size": "M"
+    }
+  }
+}
