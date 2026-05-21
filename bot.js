@@ -52,8 +52,9 @@ const ENV = {
 console.log('\n========================================');
 console.log('  BOT CONFIGURATION');
 console.log('========================================');
-console.log(`Bot Mode: Creates ONE account, on failure CLI RESTART for NEW IP`);
+console.log(`Bot Mode: Creates ONE account, then CLI RESTART for NEW IP`);
 console.log(`MongoDB: ${MONGODB_URI ? 'Connected' : 'Not configured'}`);
+console.log(`Clever Token: ${ENV.CLEVER_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
 console.log(`Scalingo App: ${ENV.SCALINGO_APP_NAME || 'Not set'}`);
 console.log('========================================\n');
 
@@ -123,24 +124,30 @@ async function installChromiumRuntime() {
     }
 }
 
-// ============ INSTALL SCALINGO CLI ============
+// ============ INSTALL SCALINGO CLI (FIXED) ============
 async function installScalingoCLI() {
     return new Promise((resolve) => {
         log('CLI', 'Installing Scalingo CLI...', 'info', 'MAIN');
         
-        const installCmd = `curl -fsSL https://cli.scalingo.com/install.sh | bash`;
+        // Method 1: Try apt-get
+        const installCmd = `apt-get update && apt-get install -y scalingo-cli 2>/dev/null || curl -fsSL https://cli.scalingo.com/install.sh | bash`;
         
         const child = spawn('bash', ['-c', installCmd], {
             stdio: ['ignore', 'pipe', 'pipe']
         });
         
+        let output = '';
+        child.stdout.on('data', (data) => { output += data.toString(); });
+        child.stderr.on('data', (data) => { output += data.toString(); });
+        
         child.on('close', (code) => {
             if (code === 0) {
                 log('CLI', 'Scalingo CLI installed successfully', 'success', 'MAIN');
-                process.env.PATH = `/root/.local/share/scalingo/bin:${process.env.PATH}`;
+                // Add to PATH
+                process.env.PATH = `/usr/local/bin:/usr/bin:/bin:${process.env.PATH}`;
                 resolve(true);
             } else {
-                log('CLI', 'Failed to install Scalingo CLI', 'error', 'MAIN');
+                log('CLI', `Failed to install Scalingo CLI: ${output.substring(0, 200)}`, 'error', 'MAIN');
                 resolve(false);
             }
         });
@@ -152,14 +159,14 @@ async function loginToScalingo() {
     const apiToken = ENV.SCALINGO_API_TOKEN;
     
     if (!apiToken) {
-        log('CLI', 'No API token found, skipping login', 'warn', 'MAIN');
+        log('CLI', 'No API token found', 'warn', 'MAIN');
         return false;
     }
     
     log('CLI', 'Logging into Scalingo...', 'info', 'MAIN');
     
     return new Promise((resolve) => {
-        const loginCmd = `echo "${apiToken}" | scalingo login --api-token`;
+        const loginCmd = `scalingo login --api-token "${apiToken}"`;
         
         const child = spawn('bash', ['-c', loginCmd], {
             stdio: ['pipe', 'pipe', 'pipe']
@@ -182,7 +189,7 @@ async function restartWithCLI() {
     const appName = ENV.SCALINGO_APP_NAME;
     
     if (!appName) {
-        log('RESTART', 'SCALINGO_APP_NAME not set, cannot restart', 'error', 'MAIN');
+        log('RESTART', 'SCALINGO_APP_NAME not set', 'error', 'MAIN');
         return false;
     }
     
@@ -316,11 +323,11 @@ class CleverCloudBot {
     }
 
     async getVerificationLink() {
-        log('VERIFY', 'Waiting for verification email (max 5 min)...', 'info', this.instanceId);
+        log('VERIFY', 'Waiting for verification email (max 3 min)...', 'info', this.instanceId);
         const startTime = Date.now();
         let emailFound = false;
         
-        while (Date.now() - startTime < 300000) {
+        while (Date.now() - startTime < 180000) {
             let link = await this.mailPage.evaluate(() => {
                 const regex = /https:\/\/api\.clever-cloud\.com\/v2\/self\/validate_email\?validationKey=[a-f0-9-]+/;
                 const match = document.documentElement.innerHTML.match(regex);
@@ -357,12 +364,12 @@ class CleverCloudBot {
             }
             
             const elapsed = Math.floor((Date.now() - startTime) / 1000);
-            process.stdout.write(`\r  Waiting for email... ${elapsed}s / 300s`);
+            process.stdout.write(`\r  Waiting for email... ${elapsed}s / 180s`);
             await sleep(5000);
         }
         
         console.log();
-        throw new Error('No verification email received after 5 minutes');
+        throw new Error('No verification email received after 3 minutes');
     }
 
     async handleOAuth(url, email, password) {
@@ -576,9 +583,10 @@ class CleverCloudBot {
         if (cliInstalled) {
             await loginToScalingo();
             await restartWithCLI();
+        } else {
+            log('RESTART', 'CLI installation failed, using exit restart', 'warn', 'MAIN');
         }
         
-        // If CLI restart fails, exit anyway
         await sleep(2000);
         process.exit(0);
     }
@@ -652,7 +660,7 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <h1>🤖 Clever Cloud Bot Dashboard</h1>
-        <p class="subtitle">Creates ONE account OR fails - then CLI RESTART for NEW IP</p>
+        <p class="subtitle">Creates ONE account, then CLI RESTART for NEW IP</p>
         
         <div class="metrics-grid" id="metrics">
             <div class="metric-card"><div class="metric-value" id="totalAccounts">0</div><div class="metric-label">Total Accounts</div></div>
@@ -672,8 +680,7 @@ app.get('/', (req, res) => {
         <\/div>
         
         <div class="info-box">
-            <p>✅ Bot attempts to create ONE account</p>
-            <p>🔄 On SUCCESS or FAILURE → CLI RESTART → NEW IP</p>
+            <p>✅ Bot creates ONE account → Installs CLI → Restarts → NEW IP</p>
             <p>🔐 OAuth is automatically handled (fills email/password, clicks login)</p>
         <\/div>
     <\/div>
@@ -711,7 +718,7 @@ app.get('/', (req, res) => {
 async function main() {
     console.log(`\n🚀 Clever Cloud Bot Starting...`);
     console.log(`📊 Dashboard: http://localhost:${port}`);
-    console.log(`🔄 Mode: Creates ONE account, then CLI RESTART for NEW IP (even on failure)`);
+    console.log(`🔄 Mode: Creates ONE account, then CLI RESTART for NEW IP`);
     console.log(`\n`);
     
     await connectMongoDB();
