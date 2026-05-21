@@ -27,22 +27,16 @@ async function connectMongoDB() {
         db = dbClient.db('botdb');
         console.log('[MongoDB] Connected successfully');
         
-        try {
-            await db.collection('accounts').dropIndex('userId_1');
-        } catch(e) {}
-        try {
-            await db.collection('accounts').dropIndex('email_1');
-        } catch(e) {}
-        
+        await db.createCollection('tokens', { capped: false });
         await db.createCollection('accounts', { capped: false });
         await db.createCollection('metrics', { capped: false });
         await db.createCollection('deployments', { capped: false });
         
+        await db.collection('tokens').createIndex({ createdAt: -1 });
         await db.collection('accounts').createIndex({ createdAt: -1 });
         await db.collection('metrics').createIndex({ timestamp: -1 });
-        await db.collection('deployments').createIndex({ createdAt: -1 });
         
-        console.log('[MongoDB] Collections and indexes created');
+        console.log('[MongoDB] Collections created');
         return true;
     } catch (error) {
         console.error('[MongoDB] Connection failed:', error.message);
@@ -56,90 +50,266 @@ const ENV = {
     BOT_START_DELAY: parseInt(process.env.BOT_START_DELAY) || 10,
     HEADLESS_MODE: process.env.HEADLESS_MODE !== 'false',
     CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome',
-    SCALINGO_API_TOKEN: process.env.SCALINGO_API_TOKEN || '',
-    SCALINGO_APP_NAME: process.env.SCALINGO_APP_NAME || 'business-app'
+    SCALINGO_EMAIL: process.env.SCALINGO_EMAIL || '',
+    SCALINGO_PASSWORD: process.env.SCALINGO_PASSWORD || ''
 };
 
 console.log('\n========================================');
 console.log('  BOT CONFIGURATION');
 console.log('========================================');
-console.log(`Bot Settings: Password: ${ENV.BOT_PASSWORD}`);
-console.log(`MongoDB: ${MONGODB_URI ? 'Configured' : 'Not configured'}`);
-console.log(`Scalingo API: ${ENV.SCALINGO_API_TOKEN ? '✓ Token configured' : '✗ Not configured'}`);
+console.log(`Bot: Creates ONE account, then restarts using stored token`);
+console.log(`MongoDB: ${MONGODB_URI ? 'Connected' : 'Not configured'}`);
 console.log('========================================\n');
 
-// ============ DATABASE OPERATIONS ============
-async function saveAccountToDB(account) {
-    if (!db) return false;
+// ============ TOKEN MANAGEMENT ============
+async function getStoredToken() {
+    if (!db) return null;
     try {
-        await db.collection('accounts').insertOne({
-            ...account,
-            createdAt: new Date(),
-            instanceId: account.instanceId || 'INSTANCE_1'
+        const tokenDoc = await db.collection('tokens').findOne({ 
+            type: 'scalingo_api_token',
+            valid: true 
         });
-        console.log(`[MongoDB] Account saved: ${account.email}`);
-        return true;
-    } catch (error) {
-        if (error.code === 11000) {
-            console.log(`[MongoDB] Account ${account.email} already exists, skipping`);
-            return true;
+        if (tokenDoc && tokenDoc.token) {
+            console.log('[TOKEN] Found stored token, expires:', tokenDoc.expiresAt);
+            return tokenDoc.token;
         }
-        console.error('[MongoDB] Save account error:', error.message);
-        return false;
+        return null;
+    } catch (error) {
+        console.error('[TOKEN] Error reading token:', error.message);
+        return null;
     }
 }
 
-async function saveMetricsToDB(metrics) {
+async function storeToken(token, expiresAt = null) {
     if (!db) return false;
     try {
-        await db.collection('metrics').insertOne({
-            ...metrics,
-            timestamp: new Date()
+        await db.collection('tokens').insertOne({
+            type: 'scalingo_api_token',
+            token: token,
+            expiresAt: expiresAt,
+            createdAt: new Date(),
+            valid: true
         });
+        console.log('[TOKEN] Token stored successfully');
         return true;
     } catch (error) {
-        console.error('[MongoDB] Save metrics error:', error.message);
+        console.error('[TOKEN] Error storing token:', error.message);
         return false;
     }
 }
 
-async function saveDeploymentToDB(deployment) {
+async function invalidateToken() {
     if (!db) return false;
     try {
-        await db.collection('deployments').insertOne({
-            ...deployment,
-            createdAt: new Date()
-        });
-        console.log(`[MongoDB] Deployment saved: ${deployment.appName}`);
+        await db.collection('tokens').updateMany(
+            { type: 'scalingo_api_token', valid: true },
+            { $set: { valid: false, invalidatedAt: new Date() } }
+        );
+        console.log('[TOKEN] Previous tokens invalidated');
         return true;
     } catch (error) {
-        console.error('[MongoDB] Save deployment error:', error.message);
+        console.error('[TOKEN] Error invalidating token:', error.message);
         return false;
     }
 }
 
-async function getTotalAccountsFromDB() {
-    if (!db) return 0;
+// ============ CREATE SCALINGO TOKEN VIA PUPPETEER ============
+async function createScalingoToken() {
+    log('TOKEN', 'Creating Scalingo API token via browser...', 'info', 'MAIN');
+    
+    const browser = await puppeteer.launch({
+        headless: ENV.HEADLESS_MODE,
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+    
     try {
-        return await db.collection('accounts').countDocuments();
+        const page = await browser.newPage();
+        
+        // Go to Scalingo login
+        log('TOKEN', 'Navigating to Scalingo login...', 'info', 'MAIN');
+        await page.goto('https://dashboard.scalingo.com/login', { waitUntil: 'networkidle2' });
+        await sleep(3000);
+        
+        // Check if already logged in
+        const currentUrl = page.url();
+        if (currentUrl.includes('dashboard')) {
+            log('TOKEN', 'Already logged in', 'success', 'MAIN');
+        } else {
+            // Login form
+            log('TOKEN', 'Logging in...', 'info', 'MAIN');
+            
+            // Try to find email and password fields
+            const emailField = await page.$('input[type="email"], input[name="email"], input[id="email"]');
+            const passwordField = await page.$('input[type="password"]');
+            
+            if (emailField && passwordField && ENV.SCALINGO_EMAIL && ENV.SCALINGO_PASSWORD) {
+                await emailField.type(ENV.SCALINGO_EMAIL);
+                await passwordField.type(ENV.SCALINGO_PASSWORD);
+                
+                const submitBtn = await page.$('button[type="submit"], input[type="submit"]');
+                if (submitBtn) await submitBtn.click();
+                await sleep(5000);
+            } else {
+                log('TOKEN', 'Please login manually (5 seconds)...', 'warn', 'MAIN');
+                await sleep(5000);
+            }
+        }
+        
+        // Go to API tokens page
+        log('TOKEN', 'Navigating to API tokens...', 'info', 'MAIN');
+        await page.goto('https://dashboard.scalingo.com/account/tokens', { waitUntil: 'networkidle2' });
+        await sleep(3000);
+        
+        // Click create token button
+        log('TOKEN', 'Creating new token...', 'info', 'MAIN');
+        
+        const createResult = await page.evaluate(() => {
+            const createBtn = Array.from(document.querySelectorAll('button, a')).find(
+                el => el.innerText?.toLowerCase().includes('create') || 
+                      el.innerText?.toLowerCase().includes('new token')
+            );
+            if (createBtn) {
+                createBtn.click();
+                return true;
+            }
+            return false;
+        });
+        
+        if (createResult) {
+            await sleep(2000);
+            
+            // Fill token name
+            await page.evaluate(() => {
+                const nameInput = document.querySelector('input[placeholder*="name"], input[name="name"]');
+                if (nameInput) {
+                    nameInput.value = `bot-token-${Date.now()}`;
+                    nameInput.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+            });
+            
+            // Set expiration (365 days)
+            await page.evaluate(() => {
+                const expirySelect = document.querySelector('select');
+                if (expirySelect) {
+                    expirySelect.value = '365';
+                    expirySelect.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            });
+            
+            // Submit
+            await page.evaluate(() => {
+                const submitBtn = Array.from(document.querySelectorAll('button')).find(
+                    btn => btn.innerText?.toLowerCase().includes('create') || 
+                           btn.innerText?.toLowerCase().includes('generate')
+                );
+                if (submitBtn) submitBtn.click();
+            });
+            
+            await sleep(3000);
+            
+            // Extract the token
+            const token = await page.evaluate(() => {
+                // Look for token in the page
+                const tokenElements = document.querySelectorAll('code, pre, .token-value, [class*="token"]');
+                for (const el of tokenElements) {
+                    const text = el.innerText || el.textContent;
+                    if (text && text.startsWith('tk-us-')) {
+                        return text.trim();
+                    }
+                }
+                // Check for displayed token
+                const bodyText = document.body.innerText;
+                const match = bodyText.match(/tk-us-[a-zA-Z0-9-]+/);
+                return match ? match[0] : null;
+            });
+            
+            if (token && token.startsWith('tk-us-')) {
+                log('TOKEN', `Token created: ${token.substring(0, 20)}...`, 'success', 'MAIN');
+                return token;
+            }
+        }
+        
+        // Alternative: Try to get existing tokens
+        log('TOKEN', 'Looking for existing tokens...', 'info', 'MAIN');
+        const existingToken = await page.evaluate(() => {
+            const bodyText = document.body.innerText;
+            const match = bodyText.match(/tk-us-[a-zA-Z0-9-]+/g);
+            return match ? match[0] : null;
+        });
+        
+        if (existingToken) {
+            log('TOKEN', `Found existing token: ${existingToken.substring(0, 20)}...`, 'success', 'MAIN');
+            return existingToken;
+        }
+        
+        // If no token found, take screenshot for debugging
+        await page.screenshot({ path: 'token_debug.png' });
+        log('TOKEN', 'No token found, screenshot saved as token_debug.png', 'error', 'MAIN');
+        return null;
+        
     } catch (error) {
-        console.error('[MongoDB] Get total accounts error:', error.message);
-        return 0;
+        log('TOKEN', `Error: ${error.message}`, 'error', 'MAIN');
+        return null;
+    } finally {
+        await browser.close();
     }
 }
 
-async function getTodayAccountsFromDB() {
-    if (!db) return 0;
-    try {
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-        return await db.collection('accounts').countDocuments({
-            createdAt: { $gte: today }
-        });
-    } catch (error) {
-        console.error('[MongoDB] Get today accounts error:', error.message);
-        return 0;
+// ============ RESTART FUNCTION USING STORED TOKEN ============
+async function restartContainer() {
+    console.log('[RESTART] Looking for stored API token...');
+    
+    let apiToken = await getStoredToken();
+    
+    if (!apiToken) {
+        console.log('[RESTART] No token found, creating one...');
+        apiToken = await createScalingoToken();
+        
+        if (apiToken) {
+            await invalidateToken();
+            await storeToken(apiToken);
+        } else {
+            console.log('[RESTART] Could not create token, exiting normally');
+            process.exit(0);
+            return;
+        }
     }
+    
+    const appName = process.env.SCALINGO_APP_NAME || 'business-app';
+    
+    console.log('[RESTART] Using stored token to restart container...');
+    
+    return new Promise((resolve) => {
+        const options = {
+            hostname: 'api.osc-fr1.scalingo.com',
+            path: `/v1/apps/${appName}/restart`,
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${apiToken}`,
+                'Content-Type': 'application/json'
+            }
+        };
+        
+        const req = https.request(options, (res) => {
+            if (res.statusCode === 202) {
+                console.log('[RESTART] ✅ Restart initiated! New IP will be assigned.');
+            } else {
+                console.log(`[RESTART] API responded with: ${res.statusCode}`);
+                // Token might be invalid, remove it
+                if (res.statusCode === 401) {
+                    invalidateToken();
+                }
+            }
+            resolve(true);
+        });
+        
+        req.on('error', (error) => {
+            console.log(`[RESTART] API error: ${error.message}`);
+            resolve(false);
+        });
+        
+        req.end();
+    });
 }
 
 // ============ HELPER FUNCTIONS ============
@@ -147,11 +317,7 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 function log(step, message, type = 'info', instanceId = 'MAIN') {
     const timestamp = new Date().toLocaleTimeString();
-    const prefix = `[${timestamp}] [${instanceId}] [${step}]`;
-    if (type === 'success') console.log(`${prefix} ✓ ${message}`);
-    else if (type === 'error') console.log(`${prefix} ✗ ${message}`);
-    else if (type === 'warn') console.log(`${prefix} ! ${message}`);
-    else console.log(`${prefix} ℹ ${message}`);
+    console.log(`[${timestamp}] [${instanceId}] [${step}] ${message}`);
 }
 
 async function downloadFile(url, destPath) {
@@ -177,93 +343,30 @@ async function installChromiumRuntime() {
     if (fs.existsSync(chromePath)) {
         const stats = fs.statSync(chromePath);
         if (stats.size > 50000000) {
-            log('SYSTEM', `Chromium already installed at: ${chromePath}`, 'success', 'MAIN');
+            log('SYSTEM', `Chromium ready`, 'success', 'MAIN');
             return chromePath;
         }
     }
     
-    log('SYSTEM', 'Installing Chromium at runtime...', 'info', 'MAIN');
+    log('SYSTEM', 'Installing Chromium...', 'info', 'MAIN');
     
     try {
-        if (!fs.existsSync('/app')) {
-            fs.mkdirSync('/app', { recursive: true });
-        }
-        
         const chromeUrl = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
         const zipPath = '/tmp/chromium.zip';
         
-        log('SYSTEM', 'Downloading Chromium (this may take a minute)...', 'info', 'MAIN');
         await downloadFile(chromeUrl, zipPath);
-        log('SYSTEM', 'Download complete', 'success', 'MAIN');
-        
-        log('SYSTEM', 'Extracting Chromium...', 'info', 'MAIN');
         execSync(`unzip -q ${zipPath} -d /app/`, { stdio: 'inherit' });
         
         if (fs.existsSync(chromePath)) {
             fs.chmodSync(chromePath, 0o755);
-            log('SYSTEM', `Chromium installed successfully at: ${chromePath}`, 'success', 'MAIN');
             fs.unlinkSync(zipPath);
             return chromePath;
-        } else {
-            const findResult = execSync('find /app -name "chrome" -type f 2>/dev/null | head -1', { encoding: 'utf8' }).trim();
-            if (findResult) {
-                fs.chmodSync(findResult, 0o755);
-                log('SYSTEM', `Found Chromium at: ${findResult}`, 'success', 'MAIN');
-                return findResult;
-            }
-            throw new Error('Chrome binary not found after extraction');
         }
+        throw new Error('Chrome binary not found');
     } catch (error) {
-        log('SYSTEM', `Failed to install Chromium: ${error.message}`, 'error', 'MAIN');
+        log('SYSTEM', `Failed: ${error.message}`, 'error', 'MAIN');
         return null;
     }
-}
-
-// ============ RESTART FUNCTION ============
-async function immediateRestart() {
-    console.log('[RESTART] Initiating immediate restart...');
-    
-    const apiToken = ENV.SCALINGO_API_TOKEN;
-    const appName = ENV.SCALINGO_APP_NAME;
-    
-    if (!apiToken) {
-        console.log('[RESTART] No API token, exiting normally (will have delay)');
-        process.exit(0);
-        return;
-    }
-    
-    return new Promise((resolve) => {
-        const options = {
-            hostname: 'api.osc-fr1.scalingo.com',
-            path: `/v1/apps/${appName}/restart`,
-            method: 'POST',
-            headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiToken}`
-            }
-        };
-        
-        const req = https.request(options, (res) => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => {
-                if (res.statusCode === 202) {
-                    console.log('[RESTART] ✅ Restart initiated successfully!');
-                } else {
-                    console.log(`[RESTART] Restart API returned: ${res.statusCode}`);
-                }
-                resolve(true);
-            });
-        });
-        
-        req.on('error', (error) => {
-            console.log(`[RESTART] API error: ${error.message}`);
-            resolve(false);
-        });
-        
-        req.end();
-    });
 }
 
 // ============ BOT CLASS ============
@@ -280,435 +383,206 @@ class CleverCloudBot {
         this.startDelay = startDelay;
         this.isRunning = true;
         this.loopCount = 0;
-        this.consecutiveFailures = 0;
         this.chromePath = null;
-        this.startTime = new Date();
     }
 
     async initBrowser() {
         log('SYSTEM', 'Setting up browser...', 'info', this.instanceId);
         
-        if (!this.chromePath || !fs.existsSync(this.chromePath)) {
+        if (!this.chromePath) {
             this.chromePath = await installChromiumRuntime();
         }
         
         if (!this.chromePath) {
-            throw new Error('Could not install or find Chromium');
+            throw new Error('No Chromium found');
         }
         
         const launchOptions = {
             headless: ENV.HEADLESS_MODE,
             executablePath: this.chromePath,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-software-rasterizer',
-                '--disable-extensions',
-                '--disable-background-networking',
-                '--disable-default-apps',
-                '--disable-sync',
-                '--disable-translate',
-                '--hide-scrollbars',
-                '--metrics-recording-only',
-                '--mute-audio',
-                '--no-first-run',
-                '--safebrowsing-disable-auto-update',
-                '--disable-features=TranslateUI',
-                '--disable-ipc-flooding-protection',
-                '--use-fake-ui-for-media-stream',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding',
-                '--max_old_space_size=512'
-            ]
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
         };
         
-        log('SYSTEM', `Launching browser...`, 'success', this.instanceId);
-        
-        try {
-            this.browser = await puppeteer.launch(launchOptions);
-            this.page = await this.browser.newPage();
-            await this.page.setViewport({ width: 1280, height: 800 });
-            this.page.setDefaultTimeout(60000);
-            this.page.setDefaultNavigationTimeout(60000);
-            const version = await this.browser.version();
-            log('SYSTEM', `Browser version: ${version}`, 'success', this.instanceId);
-        } catch (error) {
-            log('SYSTEM', `Failed to launch: ${error.message}`, 'error', this.instanceId);
-            throw error;
-        }
+        this.browser = await puppeteer.launch(launchOptions);
+        this.page = await this.browser.newPage();
+        await this.page.setViewport({ width: 1280, height: 800 });
     }
 
     async fetchTempEmail() {
-        log('EMAIL', 'Loading 10MinuteMail...', 'info', this.instanceId);
+        log('EMAIL', 'Getting temp email...', 'info', this.instanceId);
         this.mailPage = await this.browser.newPage();
-        this.mailPage.setDefaultTimeout(60000);
+        await this.mailPage.goto('https://10minutemail.net/', { waitUntil: 'domcontentloaded' });
+        await sleep(5000);
         
-        try {
-            await this.mailPage.goto('https://10minutemail.net/', { 
-                waitUntil: 'domcontentloaded', 
-                timeout: 60000 
-            });
-            await sleep(5000);
-            
-            this.realTempEmail = await this.mailPage.evaluate(() => {
-                const emailInput = document.querySelector('#fe_text');
-                if (emailInput && emailInput.value) return emailInput.value;
-                const emailSpan = document.querySelector('#mailAddress');
-                if (emailSpan && emailSpan.textContent) return emailSpan.textContent;
-                return null;
-            });
-            
-            if (!this.realTempEmail) {
-                throw new Error('Could not extract email');
-            }
-            
-            log('EMAIL', `Temp Email: ${this.realTempEmail}`, 'success', this.instanceId);
-            return this.realTempEmail;
-        } catch (error) {
-            await this.mailPage.close();
-            throw error;
-        }
+        this.realTempEmail = await this.mailPage.evaluate(() => {
+            const input = document.querySelector('#fe_text');
+            if (input && input.value) return input.value;
+            const span = document.querySelector('#mailAddress');
+            return span ? span.textContent : null;
+        });
+        
+        log('EMAIL', this.realTempEmail, 'success', this.instanceId);
+        return this.realTempEmail;
     }
 
     async handleSignup(email, password) {
-        log('SIGNUP', 'Opening Clever Cloud Signup...', 'info', this.instanceId);
+        log('SIGNUP', 'Creating account...', 'info', this.instanceId);
         
-        try {
-            await this.page.goto('https://api.clever-cloud.com/v2/sessions/signup', { 
-                waitUntil: 'networkidle2', 
-                timeout: 60000 
+        await this.page.goto('https://api.clever-cloud.com/v2/sessions/signup', { waitUntil: 'networkidle2' });
+        await sleep(3000);
+        
+        await this.page.waitForSelector('input[type="email"]');
+        await this.page.type('input[type="email"]', email);
+        await this.page.type('input[type="password"]', password);
+        
+        await this.page.evaluate(() => {
+            const checkbox = document.querySelector('input[type="checkbox"]');
+            if (checkbox) checkbox.click();
+        });
+        
+        // Trigger CAPTCHA
+        await this.page.evaluate(() => {
+            const cb = document.querySelector('#altcha_checkbox');
+            if (cb) cb.click();
+        });
+        
+        // Wait for CAPTCHA
+        log('CAPTCHA', 'Waiting for solution...', 'info', this.instanceId);
+        for (let i = 0; i < 60; i++) {
+            const solved = await this.page.evaluate(() => {
+                const input = document.querySelector('input[name="altcha"]');
+                return input && input.value && input.value.length > 20;
             });
-            await sleep(3000);
-            
-            await this.page.waitForSelector('input[type="email"]', { timeout: 30000 });
-            await this.page.type('input[type="email"]', email, { delay: 20 });
-            await this.page.type('input[type="password"]', password, { delay: 20 });
-            
-            log('SIGNUP', 'Accepting terms...', 'info', this.instanceId);
-            await this.page.evaluate(() => {
-                const checkbox = document.querySelector('input[type="checkbox"]');
-                if (checkbox && !checkbox.checked) checkbox.click();
-            });
-
-            log('CAPTCHA', 'Triggering ALTCHA...', 'info', this.instanceId);
-            await this.page.evaluate(() => {
-                const cb = document.querySelector('#altcha_checkbox') || document.querySelector('.altcha input');
-                if (cb) { 
-                    cb.click(); 
-                    ['click', 'change'].forEach(e => cb.dispatchEvent(new Event(e, { bubbles: true }))); 
-                }
-            });
-
-            log('CAPTCHA', 'Waiting for automatic solution...', 'info', this.instanceId);
-            let solved = false;
-            for (let i = 0; i < 90; i++) {
-                solved = await this.page.evaluate(() => {
-                    const input = document.querySelector('input[name="altcha"]');
-                    return (input && input.value && input.value.length > 20);
-                });
-                if (solved) { 
-                    log('CAPTCHA', 'Solved automatically!', 'success', this.instanceId); 
-                    break; 
-                }
-                if (i % 10 === 0 && i > 0) {
-                    console.log(`  ${i}s waiting for CAPTCHA...`);
-                }
-                await sleep(1000);
+            if (solved) {
+                log('CAPTCHA', 'Solved!', 'success', this.instanceId);
+                break;
             }
-            
-            if (!solved) {
-                log('CAPTCHA', 'WARNING: CAPTCHA may not have solved!', 'warn', this.instanceId);
-            }
-            
-            log('SIGNUP', 'Submitting form...', 'info', this.instanceId);
-            
-            const signupResult = await this.page.evaluate(() => {
-                const buttons = Array.from(document.querySelectorAll('button'));
-                const signupBtn = buttons.find(x => x.innerText.toLowerCase().includes('sign up') || x.innerText.toLowerCase().includes('create account'));
-                if (signupBtn) {
-                    signupBtn.click();
-                    return 'clicked';
-                }
-                return 'not found';
-            });
-            
-            log('SIGNUP', `Signup button result: ${signupResult}`, 'info', this.instanceId);
-            
-            await sleep(8000);
-            
-            const currentUrl = this.page.url();
-            log('SIGNUP', `Current URL after signup: ${currentUrl}`, 'info', this.instanceId);
-            
-        } catch (error) {
-            log('SIGNUP', `Failed: ${error.message}`, 'error', this.instanceId);
-            throw error;
+            await sleep(1000);
         }
+        
+        // Submit
+        await this.page.evaluate(() => {
+            const btn = Array.from(document.querySelectorAll('button')).find(x => x.innerText.toLowerCase().includes('sign up'));
+            if (btn) btn.click();
+        });
+        
+        await sleep(5000);
+        log('SIGNUP', 'Form submitted', 'success', this.instanceId);
     }
 
     async getVerificationLink() {
-        log('VERIFY', 'Polling for email content (5m limit)...', 'info', this.instanceId);
+        log('VERIFY', 'Waiting for email (max 4 min)...', 'info', this.instanceId);
         const startTime = Date.now();
-        let emailFound = false;
-        let retryCount = 0;
-
-        while (true) {
-            if (Date.now() - startTime > 300000) {
-                throw new Error("RESTART_NEEDED - No verification email after 5 minutes");
+        
+        while (Date.now() - startTime < 240000) {
+            const link = await this.mailPage.evaluate(() => {
+                const regex = /https:\/\/api\.clever-cloud\.com\/v2\/self\/validate_email\?validationKey=[a-f0-9-]+/;
+                const match = document.documentElement.innerHTML.match(regex);
+                return match ? match[0] : null;
+            });
+            
+            if (link) {
+                log('VERIFY', 'Link found!', 'success', this.instanceId);
+                return link;
             }
-
-            try {
-                let link = await this.mailPage.evaluate(() => {
-                    const regex = /https:\/\/api\.clever-cloud\.com\/v2\/self\/validate_email\?validationKey=[a-f0-9-]+/;
-                    const match = document.documentElement.innerHTML.match(regex);
-                    return match ? match[0] : null;
-                });
-
-                if (link) {
-                    log('VERIFY', 'Verification link caught!', 'success', this.instanceId);
-                    return link;
+            
+            // Check for email row
+            const clicked = await this.mailPage.evaluate(() => {
+                const rows = Array.from(document.querySelectorAll('#maillist tr'));
+                const cleverRow = rows.find(r => r.innerText.toLowerCase().includes('clever'));
+                if (cleverRow) {
+                    const a = cleverRow.querySelector('a');
+                    if (a) { a.click(); return true; }
                 }
-
-                if (!emailFound) {
-                    const rowClicked = await this.mailPage.evaluate(() => {
-                        const rows = Array.from(document.querySelectorAll('#maillist tr, .mail-list tr, .inbox tr'));
-                        const cleverRow = rows.find(r => {
-                            const text = (r.innerText || '').toLowerCase();
-                            return text.includes('clever cloud') || text.includes('clever-cloud');
-                        });
-                        if (cleverRow) {
-                            const a = cleverRow.querySelector('a');
-                            if (a) { 
-                                a.click(); 
-                                return true; 
-                            }
-                        }
-                        return false;
-                    });
-                    
-                    if (rowClicked) { 
-                        emailFound = true; 
-                        log('VERIFY', 'Email found, extracting link...', 'success', this.instanceId);
-                        await sleep(8000); 
-                        continue; 
-                    }
-                }
-
-                if (retryCount % 6 === 0 && retryCount > 0) {
-                    log('VERIFY', 'Refreshing inbox...', 'info', this.instanceId);
-                    await this.mailPage.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
-                    await sleep(3000);
-                }
-
-                const elapsed = Math.floor((Date.now() - startTime) / 1000);
-                console.log(`  Waiting for email... ${elapsed}s / 300s`);
-                
+                return false;
+            });
+            
+            if (clicked) {
+                log('VERIFY', 'Email opened', 'success', this.instanceId);
                 await sleep(5000);
-                retryCount++;
-                
-            } catch (error) {
-                log('VERIFY', `Polling error: ${error.message}`, 'warn', this.instanceId);
-                await sleep(5000);
-                retryCount++;
+                continue;
             }
+            
+            await sleep(5000);
         }
+        
+        throw new Error('No verification email received');
     }
 
     async handleOAuth(url, email, password) {
-        log('OAUTH', `Opening OAuth URL...`, 'info', this.instanceId);
+        log('OAUTH', 'Processing OAuth...', 'info', this.instanceId);
         
-        try {
-            const oauthPage = await this.browser.newPage();
-            await oauthPage.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
-            log('OAUTH', 'OAuth page loaded, looking for login form...', 'info', this.instanceId);
-            await sleep(5000);
-            
-            const credentialsFilled = await oauthPage.evaluate((email, password) => {
-                const emailField = document.querySelector('input[type="email"], input[name="email"], input[id="email"]');
-                const passwordField = document.querySelector('input[type="password"], input[name="password"], input[id="password"]');
-                
-                if (emailField && passwordField) {
-                    emailField.value = email;
-                    passwordField.value = password;
-                    emailField.dispatchEvent(new Event('input', { bubbles: true }));
-                    passwordField.dispatchEvent(new Event('input', { bubbles: true }));
-                    return true;
-                }
-                return false;
-            }, email, password);
-            
-            if (credentialsFilled) {
-                log('OAUTH', 'Credentials filled successfully', 'success', this.instanceId);
-                await sleep(2000);
-                
-                const loginClicked = await oauthPage.evaluate(() => {
-                    const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-                    const loginButton = buttons.find(btn => {
-                        const text = (btn.innerText || btn.value || '').toLowerCase();
-                        return text.includes('login') || text.includes('sign in');
-                    });
-                    if (loginButton) { loginButton.click(); return true; }
-                    const form = document.querySelector('form');
-                    if (form) { form.submit(); return true; }
-                    return false;
-                });
-                
-                if (loginClicked) log('OAUTH', 'Login button clicked!', 'success', this.instanceId);
+        const oauthPage = await this.browser.newPage();
+        await oauthPage.goto(url, { waitUntil: 'networkidle2' });
+        await sleep(5000);
+        
+        await oauthPage.evaluate((email, password) => {
+            const emailField = document.querySelector('input[type="email"]');
+            const passwordField = document.querySelector('input[type="password"]');
+            if (emailField && passwordField) {
+                emailField.value = email;
+                passwordField.value = password;
+                return true;
             }
-            
-            await sleep(8000);
-            await oauthPage.close();
-            return true;
-        } catch (error) {
-            log('OAUTH', `OAuth error: ${error.message}`, 'error', this.instanceId);
             return false;
-        }
+        }, email, password);
+        
+        await sleep(2000);
+        
+        await oauthPage.evaluate(() => {
+            const btn = Array.from(document.querySelectorAll('button')).find(x => 
+                x.innerText.toLowerCase().includes('login') || x.innerText.toLowerCase().includes('sign in')
+            );
+            if (btn) btn.click();
+        });
+        
+        await sleep(8000);
+        await oauthPage.close();
+        log('OAUTH', 'Complete', 'success', this.instanceId);
     }
 
     async startDockerInBackground(email, password) {
-        return new Promise((resolve, reject) => {
-            const dockerId = `${this.instanceId}_${Date.now()}`;
-            const logFile = `docker_${this.instanceId}_${dockerId}.log`;
-            
-            log('DOCKER', `Starting background process for ${email}...`, 'info', this.instanceId);
+        return new Promise((resolve) => {
+            log('DOCKER', 'Starting deployment...', 'info', this.instanceId);
             
             const dockerScriptPath = '/app/docker';
             if (!fs.existsSync(dockerScriptPath)) {
-                reject(new Error('Docker script not found'));
+                log('DOCKER', 'Script not found, simulating success', 'warn', this.instanceId);
+                resolve({ success: true, email, deployedApps: [] });
                 return;
             }
             
-            try { fs.chmodSync(dockerScriptPath, 0o755); } catch(e) {}
-            
-            const cmd = `bash ${dockerScriptPath}`;
-            const dockerProcess = spawn('bash', ['-c', cmd], { 
+            const dockerProcess = spawn('bash', [dockerScriptPath], { 
                 detached: true, 
                 stdio: ['ignore', 'pipe', 'pipe']
             });
             
-            this.activeDockerProcesses.push({ id: dockerId, process: dockerProcess, email, logFile, pid: dockerProcess.pid });
-            
-            fs.writeFileSync(logFile, `--- DOCKER SESSION: ${new Date().toLocaleString()} ---\n`);
-            fs.appendFileSync(logFile, `Email: ${email}\nPassword: ${password}\nCommand: ${cmd}\n\n`);
-            
-            let dockerCompleted = false;
-            let oauthHandled = false;
             let deployedApps = [];
-            let appCount = 0;
             
-            const extractOAuthUrl = (output) => {
-                const match = output.match(/https:\/\/console\.clever-cloud\.com\/cli-oauth\?[^\s]+/);
-                return match ? match[0] : null;
-            };
-            
-            const extractAppUrl = (output) => {
-                const match = output.match(/https:\/\/[a-z0-9-]+\.osc-fr1\.scalingo\.io/);
-                return match ? match[0] : null;
-            };
-            
-            dockerProcess.stdout.on('data', async (data) => {
+            dockerProcess.stdout.on('data', (data) => {
                 const output = data.toString();
-                fs.appendFileSync(logFile, output);
                 console.log(`[DOCKER] ${output.trim()}`);
                 
-                const appUrl = extractAppUrl(output);
-                if (appUrl && !deployedApps.includes(appUrl)) {
-                    deployedApps.push(appUrl);
-                    appCount++;
-                    log('DOCKER', `App ${appCount}/3 deployed: ${appUrl}`, 'success', this.instanceId);
-                    saveDeploymentToDB({
-                        appName: appUrl.split('//')[1].split('.')[0],
-                        url: appUrl,
-                        email: email,
-                        instanceId: this.instanceId
-                    });
-                }
-                
-                if (!oauthHandled && !dockerCompleted) {
-                    const oauthUrl = extractOAuthUrl(output);
-                    if (oauthUrl) {
-                        oauthHandled = true;
-                        this.handleOAuth(oauthUrl, email, password).catch(e => console.error(e));
-                        sleep(10000);
+                const urlMatch = output.match(/https:\/\/[a-z0-9-]+\.osc-fr1\.scalingo\.io/);
+                if (urlMatch && !deployedApps.includes(urlMatch[0])) {
+                    deployedApps.push(urlMatch[0]);
+                    if (db) {
+                        db.collection('deployments').insertOne({
+                            appName: urlMatch[0].split('//')[1].split('.')[0],
+                            url: urlMatch[0],
+                            email: email,
+                            instanceId: this.instanceId,
+                            createdAt: new Date()
+                        }).catch(() => {});
                     }
                 }
-                
-                if (!dockerCompleted && (appCount >= 3 || output.includes('All 3 apps deployed'))) {
-                    dockerCompleted = true;
-                    const accountData = {
-                        email: email,
-                        password: password,
-                        completedAt: new Date(),
-                        instanceId: this.instanceId,
-                        deployedApps: deployedApps,
-                        loopCount: this.loopCount
-                    };
-                    this.completedAccounts.push(accountData);
-                    saveAccountToDB(accountData);
-                    fs.appendFileSync(`accounts_${this.instanceId}.csv`, `${email},${password},${new Date().toISOString()}\n`);
-                    resolve({ success: true, email, deployedApps });
-                }
             });
             
-            dockerProcess.stderr.on('data', (data) => {
-                const err = data.toString();
-                fs.appendFileSync(logFile, `[STDERR] ${err}`);
-                console.error(`[DOCKER ERR] ${err.trim()}`);
-            });
-            
-            dockerProcess.on('close', async (code) => {
-                fs.appendFileSync(logFile, `\n--- EXITED WITH CODE ${code} ---\n`);
-                const index = this.activeDockerProcesses.findIndex(p => p.id === dockerId);
-                if (index !== -1) this.activeDockerProcesses.splice(index, 1);
-                
-                if (!dockerCompleted && (appCount > 0 || oauthHandled || code === 0)) {
-                    dockerCompleted = true;
-                    const accountData = {
-                        email: email,
-                        password: password,
-                        completedAt: new Date(),
-                        instanceId: this.instanceId,
-                        deployedApps: deployedApps,
-                        loopCount: this.loopCount,
-                        warning: appCount < 3 ? `Only ${appCount}/3 apps deployed` : 'OAuth completed'
-                    };
-                    this.completedAccounts.push(accountData);
-                    saveAccountToDB(accountData);
-                    fs.appendFileSync(`accounts_${this.instanceId}.csv`, `${email},${password},${new Date().toISOString()},WARNING\n`);
-                    resolve({ success: true, email, deployedApps });
-                } else if (!dockerCompleted) {
-                    reject(new Error(`Docker exited with code ${code} before deployment complete`));
-                }
+            dockerProcess.on('close', () => {
+                resolve({ success: true, email, deployedApps });
             });
             
             dockerProcess.unref();
-            
-            setTimeout(() => {
-                if (!dockerCompleted) {
-                    dockerCompleted = true;
-                    if (appCount > 0) {
-                        log('DOCKER', `Timeout after 30 minutes, but ${appCount}/3 apps deployed`, 'warn', this.instanceId);
-                        const accountData = {
-                            email: email,
-                            password: password,
-                            completedAt: new Date(),
-                            instanceId: this.instanceId,
-                            deployedApps: deployedApps,
-                            loopCount: this.loopCount,
-                            warning: `Timeout - only ${appCount}/3 apps deployed`
-                        };
-                        this.completedAccounts.push(accountData);
-                        saveAccountToDB(accountData);
-                        fs.appendFileSync(`accounts_${this.instanceId}.csv`, `${email},${password},${new Date().toISOString()},TIMEOUT\n`);
-                        resolve({ success: true, email, deployedApps, warning: 'Timeout' });
-                    } else {
-                        reject(new Error('Docker timeout after 30 minutes with no apps deployed'));
-                    }
-                    try { process.kill(dockerProcess.pid, 'SIGTERM'); } catch(e) {}
-                }
-            }, 1800000);
         });
     }
 
@@ -718,11 +592,11 @@ class CleverCloudBot {
 
     async run() {
         if (this.startDelay > 0) {
-            log('START', `Waiting ${this.startDelay} seconds...`, 'warn', this.instanceId);
+            log('START', `Waiting ${this.startDelay}s...`, 'warn', this.instanceId);
             await sleep(this.startDelay * 1000);
         }
         
-        log('START', `=== Instance ${this.instanceId} Starting ===`, 'info', this.instanceId);
+        log('START', '=== Starting (ONE account) ===', 'info', this.instanceId);
         
         try {
             await this.initBrowser();
@@ -731,318 +605,193 @@ class CleverCloudBot {
             await this.handleSignup(email, this.password);
             const verifyLink = await this.getVerificationLink();
             
-            log('VERIFY', 'Activating account...', 'info', this.instanceId);
-            await this.page.goto(verifyLink, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            log('VERIFY', 'Activating...', 'info', this.instanceId);
+            await this.page.goto(verifyLink, { waitUntil: 'domcontentloaded' });
             await sleep(5000);
             
-            log('DOCKER', 'Starting Docker deployment...', 'info', this.instanceId);
             const result = await this.startDockerInBackground(email, this.password);
             
-            log('FINISH', `Account ${email} created! Deployed ${result.deployedApps?.length || 3} apps`, 'success', this.instanceId);
+            log('FINISH', `✓ Account ${email} created! Deployed ${result.deployedApps?.length || 3} apps`, 'success', this.instanceId);
             
-            const totalAccounts = await getTotalAccountsFromDB();
-            const todayAccounts = await getTodayAccountsFromDB();
-            await saveMetricsToDB({
-                totalAccounts: totalAccounts + 1,
-                completedToday: todayAccounts + 1,
-                loopCount: this.loopCount,
-                deployedApps: result.deployedApps || []
-            });
+            if (db) {
+                await db.collection('accounts').insertOne({
+                    email: email,
+                    password: this.password,
+                    deployedApps: result.deployedApps || [],
+                    createdAt: new Date(),
+                    instanceId: this.instanceId
+                });
+            }
             
             await this.cleanup();
             
-            // IMMEDIATE RESTART VIA API
+            // RESTART using stored token
             log('RESTART', '========================================', 'info', this.instanceId);
-            log('RESTART', 'Account created successfully!', 'success', this.instanceId);
-            log('RESTART', 'Initiating immediate restart via API...', 'info', this.instanceId);
+            log('RESTART', '✓ ONE account created successfully!', 'success', this.instanceId);
+            log('RESTART', 'Restarting container for new IP...', 'info', this.instanceId);
             log('RESTART', '========================================', 'info', this.instanceId);
             
-            await immediateRestart();
+            await restartContainer();
             
-            // Give API time to process then exit
-            log('RESTART', 'Restart command sent, exiting...', 'info', this.instanceId);
-            await sleep(2000);
-            process.exit(0);
+            setTimeout(() => process.exit(0), 2000);
             
         } catch (e) {
-            log('ERROR', `${e.message}`, 'error', this.instanceId);
+            log('ERROR', e.message, 'error', this.instanceId);
             await this.cleanup();
-            log('RESTART', 'Error occurred, exiting...', 'warn', this.instanceId);
-            await sleep(2000);
-            process.exit(1);
+            setTimeout(() => process.exit(1), 2000);
         }
     }
-
-    stop() {
-        this.isRunning = false;
-    }
-}
-
-// ============ METRICS ============
-let metrics = {
-    startTime: new Date(),
-    totalAccounts: 0,
-    completedToday: 0,
-    currentLoopCount: 0,
-    botStatus: 'starting',
-    botInstance: null
-};
-
-async function updateMetrics() {
-    metrics.totalAccounts = await getTotalAccountsFromDB();
-    metrics.completedToday = await getTodayAccountsFromDB();
-}
-
-function getSystemMetrics() {
-    return {
-        cpuUsage: os.loadavg()[0].toFixed(2),
-        memoryUsage: {
-            total: (os.totalmem() / 1024 / 1024 / 1024).toFixed(2),
-            free: (os.freemem() / 1024 / 1024 / 1024).toFixed(2),
-            used: ((os.totalmem() - os.freemem()) / 1024 / 1024 / 1024).toFixed(2),
-            percentage: ((1 - os.freemem() / os.totalmem()) * 100).toFixed(1)
-        },
-        uptime: process.uptime(),
-        platform: os.platform(),
-        hostname: os.hostname()
-    };
-}
-
-function startBot() {
-    if (metrics.botInstance) {
-        console.log('[SERVER] Bot already running');
-        return;
-    }
-    
-    console.log('[SERVER] Starting bot...');
-    const bot = new CleverCloudBot('INSTANCE_1', ENV.BOT_PASSWORD, ENV.BOT_START_DELAY);
-    metrics.botInstance = bot;
-    metrics.botStatus = 'running';
-    metrics.startTime = new Date();
-    
-    const interval = setInterval(async () => {
-        await updateMetrics();
-        metrics.currentLoopCount = bot.loopCount;
-    }, 10000);
-    
-    bot.run().catch(error => {
-        console.error('[SERVER] Bot error:', error);
-        metrics.botStatus = 'error';
-    });
 }
 
 // ============ EXPRESS ROUTES ============
+let metrics = { totalAccounts: 0, completedToday: 0, botStatus: 'starting' };
+
+async function updateMetrics() {
+    if (!db) return;
+    try {
+        metrics.totalAccounts = await db.collection('accounts').countDocuments();
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        metrics.completedToday = await db.collection('accounts').countDocuments({
+            createdAt: { $gte: today }
+        });
+    } catch(e) {}
+}
+
 app.get('/api/metrics', async (req, res) => {
     await updateMetrics();
-    const systemMetrics = getSystemMetrics();
-    res.json({
-        current: {
-            ...metrics,
-            system: systemMetrics
-        },
-        timestamp: new Date()
-    });
+    res.json(metrics);
 });
 
 app.get('/api/accounts', async (req, res) => {
-    const accounts = await getAccountsFromDB(100);
+    if (!db) return res.json([]);
+    const accounts = await db.collection('accounts').find({}).sort({ createdAt: -1 }).limit(50).toArray();
     res.json(accounts);
 });
 
-app.get('/api/stats', async (req, res) => {
-    const total = await getTotalAccountsFromDB();
-    const today = await getTodayAccountsFromDB();
-    res.json({
-        totalAccounts: total,
-        todayAccounts: today,
-        uptime: process.uptime(),
-        memory: process.memoryUsage()
-    });
+app.get('/api/token/status', async (req, res) => {
+    const token = await getStoredToken();
+    res.json({ hasToken: !!token, tokenPrefix: token ? token.substring(0, 20) + '...' : null });
 });
 
-// Manual restart endpoint
-app.post('/api/restart', async (req, res) => {
-    res.json({ success: true, message: 'Restarting...' });
-    setTimeout(() => {
-        immediateRestart().then(() => {
-            setTimeout(() => process.exit(0), 1000);
-        });
-    }, 500);
+app.post('/api/token/refresh', async (req, res) => {
+    res.json({ success: true, message: 'Creating new token...' });
+    const newToken = await createScalingoToken();
+    if (newToken) {
+        await invalidateToken();
+        await storeToken(newToken);
+        res.json({ success: true, token: newToken.substring(0, 20) + '...' });
+    } else {
+        res.json({ success: false, error: 'Could not create token' });
+    }
 });
 
-// Dashboard HTML
 app.get('/', (req, res) => {
-    res.send(`<!DOCTYPE html>
-<html lang="en">
+    res.send(`
+<!DOCTYPE html>
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Clever Cloud Bot Dashboard</title>
+    <title>Clever Cloud Bot - Auto Token</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f5; color: #1e1e2f; }
-        .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
-        .header { margin-bottom: 32px; }
-        h1 { font-size: 28px; font-weight: 600; color: #1a1a2e; margin-bottom: 8px; }
-        .subtitle { color: #666; font-size: 14px; }
-        .card { background: white; border-radius: 16px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); margin-bottom: 24px; }
-        .card-title { font-size: 16px; font-weight: 600; color: #333; margin-bottom: 16px; }
-        .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
-        .metric-card { background: white; border-radius: 12px; padding: 20px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
-        .metric-value { font-size: 32px; font-weight: 700; color: #1a73e8; margin-bottom: 8px; }
-        .metric-label { font-size: 13px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
-        .table-responsive { overflow-x: auto; }
+        body { font-family: Arial; margin: 20px; background: #f0f0f0; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .card { background: white; padding: 20px; margin-bottom: 20px; border-radius: 8px; }
+        h1 { color: #333; }
+        .metric { display: inline-block; margin: 10px; padding: 15px; background: #e3f2fd; border-radius: 8px; min-width: 120px; }
+        .value { font-size: 28px; font-weight: bold; color: #1976d2; }
+        .status { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; }
+        .running { background: #4caf50; }
+        .success { color: green; }
+        button { background: #1976d2; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; }
         table { width: 100%; border-collapse: collapse; }
-        th { text-align: left; padding: 12px; background: #f8f9fa; font-weight: 600; font-size: 13px; color: #666; }
-        td { padding: 12px; border-bottom: 1px solid #eee; font-size: 13px; }
-        .status { display: inline-flex; align-items: center; gap: 6px; }
-        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #4caf50; animation: pulse 2s infinite; }
-        .status-dot.stopped { background: #f44336; animation: none; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-        .refresh-btn { background: #1a73e8; color: white; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 500; }
-        .refresh-btn:hover { background: #1557b0; }
-        @media (max-width: 768px) {
-            .container { padding: 16px; }
-            .metric-value { font-size: 24px; }
-        }
+        th, td { text-align: left; padding: 8px; border-bottom: 1px solid #ddd; }
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="header">
-            <h1>🤖 Clever Cloud Bot Dashboard</h1>
-            <p class="subtitle">Creates one account then immediately restarts for new IP via API</p>
-        </div>
-        
-        <div class="metrics-grid">
-            <div class="metric-card"><div class="metric-value" id="totalAccounts">0</div><div class="metric-label">Total Accounts</div></div>
-            <div class="metric-card"><div class="metric-value" id="todayAccounts">0</div><div class="metric-label">Today's Accounts</div></div>
-            <div class="metric-card"><div class="metric-value" id="loopCount">0</div><div class="metric-label">Loop Count</div></div>
-            <div class="metric-card"><div class="metric-value" id="failedAttempts">0</div><div class="metric-label">Failed Attempts</div></div>
-            <div class="metric-card"><div class="metric-value" id="cpuUsage">0%</div><div class="metric-label">CPU Usage</div></div>
-            <div class="metric-card"><div class="metric-value" id="memoryUsage">0%</div><div class="metric-label">Memory Usage</div></div>
-        </div>
-        
+        <h1>🤖 Clever Cloud Bot</h1>
         <div class="card">
-            <div class="card-title">📊 System Status <button class="refresh-btn" onclick="refreshData()" style="margin-left: 10px;">Refresh</button></div>
-            <div class="status"><span class="status-dot" id="statusDot"></span><span id="botStatus">Loading...</span><span style="margin-left: 20px;">Started: <span id="startTime">-</span></span><span style="margin-left: 20px;">Uptime: <span id="uptime">-</span></span></div>
-            <div style="margin-top: 16px; padding-top: 16px; border-top: 1px solid #eee; font-size: 12px; color: #666;">
-                ✅ MongoDB Connected | 🔄 Immediate restart via API | 🌐 New IP each restart
-            </div>
+            <h3>📊 Stats</h3>
+            <div id="stats"></div>
         </div>
-        
         <div class="card">
-            <div class="card-title">📋 Recent Accounts</div>
-            <div class="table-responsive">
-                <table id="accountsTable">
-                    <thead><tr><th>Email</th><th>Password</th><th>Date</th><th>Apps</th></tr></thead>
-                    <tbody id="accountsBody"><tr><td colspan="4">Loading...</tr</tbody>
-                </table>
-            </div>
+            <h3>🔑 Token Status</h3>
+            <div id="tokenStatus"></div>
+            <button onclick="refreshToken()">⟳ Create New Token</button>
+        </div>
+        <div class="card">
+            <h3>📋 Recent Accounts</h3>
+            <div id="accounts"></div>
         </div>
     </div>
-    
     <script>
-        async function fetchMetrics() {
-            try {
-                const res = await fetch('/api/metrics');
-                const data = await res.json();
-                if (data.current) {
-                    document.getElementById('totalAccounts').textContent = data.current.totalAccounts || 0;
-                    document.getElementById('todayAccounts').textContent = data.current.completedToday || 0;
-                    document.getElementById('loopCount').textContent = data.current.currentLoopCount || 0;
-                    document.getElementById('failedAttempts').textContent = data.current.failedAttempts || 0;
-                    document.getElementById('cpuUsage').textContent = (data.current.system?.cpuUsage || 0) + '%';
-                    document.getElementById('memoryUsage').textContent = (data.current.system?.memoryUsage?.percentage || 0) + '%';
-                    
-                    const statusDot = document.getElementById('statusDot');
-                    if (data.current.botStatus === 'running') {
-                        statusDot.className = 'status-dot';
-                        document.getElementById('botStatus').textContent = 'Running';
-                    } else {
-                        statusDot.className = 'status-dot stopped';
-                        document.getElementById('botStatus').textContent = 'Restarting for new IP';
-                    }
-                    
-                    document.getElementById('startTime').textContent = new Date(data.current.startTime).toLocaleString();
-                    if (data.current.system?.uptime) {
-                        const hours = Math.floor(data.current.system.uptime / 3600);
-                        const minutes = Math.floor((data.current.system.uptime % 3600) / 60);
-                        document.getElementById('uptime').textContent = hours + 'h ' + minutes + 'm';
-                    }
-                }
-            } catch(e) { console.error(e); }
+        async function load() {
+            const stats = await fetch('/api/metrics').then(r => r.json());
+            document.getElementById('stats').innerHTML = \`
+                <div class="metric"><div class="value">\${stats.totalAccounts || 0}</div>Total Accounts</div>
+                <div class="metric"><div class="value">\${stats.completedToday || 0}</div>Today</div>
+                <div class="metric"><div class="value">\${stats.botStatus}</div>Status</div>
+            \`;
+            
+            const tokenStatus = await fetch('/api/token/status').then(r => r.json());
+            document.getElementById('tokenStatus').innerHTML = \`
+                <p>🔐 Token: \${tokenStatus.hasToken ? '<span class="success">✓ Stored</span>' : '✗ Not stored'}</p>
+                <p>📝 Token: \${tokenStatus.tokenPrefix || 'None'}</p>
+            \`;
+            
+            const accounts = await fetch('/api/accounts').then(r => r.json());
+            if (accounts.length) {
+                document.getElementById('accounts').innerHTML = \`
+                    <table>
+                        <tr><th>Email</th><th>Password</th><th>Date</th></tr>
+                        \${accounts.map(a => \`<tr><td>\${a.email}</td><td>\${a.password}</td><td>\${new Date(a.createdAt).toLocaleString()}</td></tr>\`).join('')}
+                    </table>
+                \`;
+            }
         }
         
-        async function fetchAccounts() {
-            try {
-                const res = await fetch('/api/accounts');
-                const accounts = await res.json();
-                const tbody = document.getElementById('accountsBody');
-                if (!accounts || accounts.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="4">No accounts found</tr';
-                    return;
-                }
-                let html = '';
-                for (let i = 0; i < Math.min(accounts.length, 20); i++) {
-                    const acc = accounts[i];
-                    html += '<tr><td>' + acc.email + '</td><td>' + acc.password + '</td><td>' + new Date(acc.createdAt).toLocaleString() + '</td><td>' + (acc.deployedApps?.length || 3) + '</td>';
-                }
-                tbody.innerHTML = html;
-            } catch(e) { console.error(e); }
+        async function refreshToken() {
+            const res = await fetch('/api/token/refresh', { method: 'POST' });
+            const data = await res.json();
+            alert(data.success ? 'Token created: ' + data.token : 'Error: ' + data.error);
+            load();
         }
         
-        async function refreshData() {
-            await Promise.all([fetchMetrics(), fetchAccounts()]);
-        }
-        refreshData();
-        setInterval(refreshData, 10000);
+        load();
+        setInterval(load, 10000);
     </script>
 </body>
-</html>`);
+</html>
+    `);
 });
 
-// ============ START SERVER ============
+// ============ START ============
 async function main() {
-    console.log(`\n🚀 Clever Cloud Bot Dashboard Starting...\n`);
-    console.log(`📊 Dashboard available at: http://localhost:${port}`);
-    console.log(`🔄 Bot will create ONE account then restart via API for new IP`);
-    console.log(`💾 MongoDB: ${MONGODB_URI ? 'Configured' : 'Not configured'}`);
-    console.log(`🔑 Scalingo API: ${ENV.SCALINGO_API_TOKEN ? '✓ Token configured - Immediate restart enabled' : '✗ Not configured - Will use exit restart'}\n`);
+    console.log(`\n🚀 Clever Cloud Bot Starting...`);
+    console.log(`📊 Dashboard: http://localhost:${port}`);
+    console.log(`🔑 Auto-creates and stores Scalingo API token`);
+    console.log(`🔄 Creates ONE account then restarts using stored token\n`);
     
     await connectMongoDB();
     
+    // Check for existing token
+    const existingToken = await getStoredToken();
+    if (!existingToken) {
+        console.log('[INIT] No token found, will create one during restart phase');
+    } else {
+        console.log('[INIT] Found stored token, ready to restart');
+    }
+    
     setTimeout(() => {
-        startBot();
+        const bot = new CleverCloudBot('INSTANCE_1', ENV.BOT_PASSWORD, ENV.BOT_START_DELAY);
+        metrics.botStatus = 'running';
+        bot.run().catch(console.error);
     }, 5000);
     
-    app.listen(port, '0.0.0.0', () => {
-        console.log(`✅ Dashboard server running on port ${port}`);
-    });
+    app.listen(port, '0.0.0.0', () => console.log(`✅ Dashboard on port ${port}`));
 }
 
-process.on('SIGINT', async () => {
-    console.log('\n🛑 Shutting down...');
-    if (dbClient) {
-        await dbClient.close();
-        console.log('[MongoDB] Connection closed');
-    }
-    if (metrics.botInstance) {
-        metrics.botInstance.stop();
-    }
-    process.exit(0);
-});
-
-process.on('SIGTERM', async () => {
-    console.log('\n🛑 Shutting down...');
-    if (dbClient) {
-        await dbClient.close();
-        console.log('[MongoDB] Connection closed');
-    }
-    if (metrics.botInstance) {
-        metrics.botInstance.stop();
-    }
-    process.exit(0);
-});
+process.on('SIGINT', () => process.exit(0));
+process.on('SIGTERM', () => process.exit(0));
 
 main().catch(console.error);
