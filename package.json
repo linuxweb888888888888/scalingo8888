@@ -4,7 +4,6 @@
   "description": "Clever Cloud Automation Bot with Dashboard",
   "main": "bot.js",
   "scripts": {
-    "postinstall": "mkdir -p /app/bin && curl -L -o /tmp/scalingo.tar.gz https://github.com/Scalingo/cli/releases/download/1.44.1/scalingo_1.44.1_linux_amd64.tar.gz && cd /tmp && tar -xzf scalingo.tar.gz && cp /tmp/scalingo_1.44.1_linux_amd64/scalingo /app/bin/scalingo && chmod +x /app/bin/scalingo && rm -rf /tmp/scalingo_1.44.1_linux_amd64 /tmp/scalingo.tar.gz && echo 'Scalingo CLI installed successfully' || echo 'Scalingo CLI installation failed'",
     "start": "node bot.js"
   },
   "dependencies": {
