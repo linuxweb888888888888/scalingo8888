@@ -56,6 +56,7 @@ console.log(`Bot Mode: Creates ONE account, then CLI RESTART for NEW IP`);
 console.log(`MongoDB: ${MONGODB_URI ? 'Connected' : 'Not configured'}`);
 console.log(`Clever Token: ${ENV.CLEVER_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
 console.log(`Scalingo App: ${ENV.SCALINGO_APP_NAME || 'Not set'}`);
+console.log(`Scalingo API Token: ${ENV.SCALINGO_API_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
 console.log('========================================\n');
 
 // ============ STATE VARIABLES ============
@@ -124,26 +125,123 @@ async function installChromiumRuntime() {
     }
 }
 
-// ============ RESTART VIA CLI (NO INSTALLATION) ============
-async function restartWithCLI() {
-    const cliPath = '/app/bin/scalingo';
-    const appName = ENV.SCALINGO_APP_NAME;
-    const apiToken = ENV.SCALINGO_API_TOKEN;
+// ============ TEST SCALINGO CLI AT STARTUP ============
+async function testScalingoCLI() {
+    console.log('\n========================================');
+    console.log('  TESTING SCALINGO CLI');
+    console.log('========================================');
     
-    if (!fs.existsSync(cliPath)) {
-        log('RESTART', 'Scalingo CLI not found at /app/bin/scalingo', 'error', 'MAIN');
+    const cliPaths = [
+        '/app/bin/scalingo',
+        '/usr/local/bin/scalingo',
+        '/usr/bin/scalingo',
+        '/root/bin/scalingo'
+    ];
+    
+    let cliPath = null;
+    
+    // Find Scalingo CLI
+    for (const path of cliPaths) {
+        if (fs.existsSync(path)) {
+            cliPath = path;
+            console.log(`✅ Scalingo CLI found at: ${cliPath}`);
+            break;
+        }
+    }
+    
+    if (!cliPath) {
+        console.log('❌ Scalingo CLI not found');
+        console.log('Checking with which command...');
+        try {
+            const whichResult = execSync('which scalingo 2>/dev/null', { encoding: 'utf8' });
+            if (whichResult.trim()) {
+                cliPath = whichResult.trim();
+                console.log(`✅ Found via which: ${cliPath}`);
+            } else {
+                console.log('❌ Scalingo CLI not installed');
+                return false;
+            }
+        } catch(e) {
+            console.log('❌ Scalingo CLI not installed');
+            return false;
+        }
+    }
+    
+    // Test version
+    try {
+        const version = execSync(`${cliPath} version 2>/dev/null`, { encoding: 'utf8' });
+        console.log(`✅ Version: ${version.trim()}`);
+    } catch(e) {
+        console.log(`❌ Failed to get version: ${e.message}`);
+    }
+    
+    // Test login if token is set
+    if (ENV.SCALINGO_API_TOKEN) {
+        console.log('\n--- Testing Login ---');
+        try {
+            execSync(`${cliPath} login --api-token "${ENV.SCALINGO_API_TOKEN}" 2>/dev/null`, { encoding: 'utf8' });
+            console.log('✅ Login successful');
+        } catch(e) {
+            console.log(`❌ Login failed: ${e.message}`);
+        }
+    } else {
+        console.log('⚠️ SCALINGO_API_TOKEN not set, skipping login test');
+    }
+    
+    // Test restart if app name is set
+    if (ENV.SCALINGO_APP_NAME && ENV.SCALINGO_API_TOKEN) {
+        console.log('\n--- Testing Restart Command ---');
+        try {
+            const testCmd = `${cliPath} --app ${ENV.SCALINGO_APP_NAME} restart --help`;
+            execSync(testCmd, { stdio: 'ignore' });
+            console.log('✅ Restart command available');
+        } catch(e) {
+            console.log(`⚠️ Restart command check: ${e.message}`);
+        }
+    }
+    
+    console.log('========================================\n');
+    return true;
+}
+
+// ============ RESTART VIA CLI ============
+async function restartWithCLI() {
+    const cliPaths = [
+        '/app/bin/scalingo',
+        '/usr/local/bin/scalingo',
+        '/usr/bin/scalingo'
+    ];
+    
+    let cliPath = null;
+    for (const path of cliPaths) {
+        if (fs.existsSync(path)) {
+            cliPath = path;
+            break;
+        }
+    }
+    
+    if (!cliPath) {
+        log('RESTART', 'Scalingo CLI not found', 'error', 'MAIN');
         return false;
     }
+    
+    const appName = ENV.SCALINGO_APP_NAME;
+    const apiToken = ENV.SCALINGO_API_TOKEN;
     
     if (!appName) {
         log('RESTART', 'SCALINGO_APP_NAME not set', 'error', 'MAIN');
         return false;
     }
     
+    if (!apiToken) {
+        log('RESTART', 'SCALINGO_API_TOKEN not set', 'error', 'MAIN');
+        return false;
+    }
+    
     log('RESTART', `Restarting ${appName} via CLI...`, 'info', 'MAIN');
     
     return new Promise((resolve) => {
-        const cmd = `export PATH="/app/bin:$PATH" && ${cliPath} login --api-token "${apiToken}" && ${cliPath} --app ${appName} restart`;
+        const cmd = `${cliPath} login --api-token "${apiToken}" && ${cliPath} --app ${appName} restart`;
         
         const child = spawn('bash', ['-c', cmd]);
         
@@ -521,7 +619,7 @@ class CleverCloudBot {
         log('RESTART', `This was attempt #${botStatus.restartCount}`, 'info', this.instanceId);
         log('RESTART', `========================================`, 'info', this.instanceId);
         
-        // Try CLI restart (CLI already installed via postinstall)
+        // Try CLI restart
         const cliSuccess = await restartWithCLI();
         
         if (!cliSuccess) {
@@ -624,7 +722,7 @@ app.get('/', (req, res) => {
         <div class="info-box">
             <p>✅ Bot creates ONE account → Calls Scalingo CLI → Restarts → NEW IP</p>
             <p>🔐 OAuth is automatically handled (fills email/password, clicks login)</p>
-            <p>📦 Scalingo CLI installed via postinstall script</p>
+            <p>🔑 Scalingo CLI tested at startup</p>
         <\/div>
     <\/div>
     
@@ -663,6 +761,9 @@ async function main() {
     console.log(`📊 Dashboard: http://localhost:${port}`);
     console.log(`🔄 Mode: Creates ONE account, then CLI RESTART for NEW IP`);
     console.log(`\n`);
+    
+    // TEST SCALINGO CLI FIRST
+    await testScalingoCLI();
     
     await connectMongoDB();
     
