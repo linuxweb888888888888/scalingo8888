@@ -3,12 +3,19 @@
 
 set -e
 
+# Configure git globally (required for commits)
+git config --global user.email "bot@clevercloud.com"
+git config --global user.name "Clever Cloud Bot"
+git config --global init.defaultBranch "master"
+
+echo "🔐 Logging into Clever Cloud..."
 clever login
 
 for i in 1 2 3; do
     APP_NAME="webapp-$(date +%s)-${RANDOM}"
     APP_DIR="/app/deployments/$APP_NAME"
     
+    echo ""
     echo "[$i/3] Deploying $APP_NAME..."
     
     mkdir -p "$APP_DIR"
@@ -22,10 +29,13 @@ for i in 1 2 3; do
     # Git setup
     git init
     git add .
-    git commit -m "Initial commit"
+    git commit -m "Initial commit for $APP_NAME"
     
     # Create and deploy
+    echo "Creating app on Clever Cloud..."
     clever create --type docker "$APP_NAME"
+    
+    echo "Deploying $APP_NAME..."
     clever deploy --alias "$APP_NAME"
     
     echo "[$i/3] ✅ https://$APP_NAME.osc-fr1.scalingo.io"
@@ -33,7 +43,13 @@ for i in 1 2 3; do
     cd /app
     rm -rf "$APP_DIR"
     
-    [ $i -lt 3 ] && sleep 10
+    if [ $i -lt 3 ]; then
+        echo "Waiting 10 seconds before next deployment..."
+        sleep 10
+    fi
 done
 
-echo "✅ All 3 apps deployed!"
+echo ""
+echo "========================================="
+echo "✅ All 3 apps deployed successfully!"
+echo "========================================="
