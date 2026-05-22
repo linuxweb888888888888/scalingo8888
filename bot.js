@@ -40,7 +40,7 @@ async function connectMongoDB() {
 
 // ============ ENVIRONMENT VARIABLES ============
 const ENV = {
-    BOT_PASSWORD: process.env.BOT_PASSWORD || 'Linuxdistro&84',
+    BOT_PASSWORD: process.env.BOT_PASSWORD || 'Linuxdistro&84', // Fallback only
     BOT_START_DELAY: parseInt(process.env.BOT_START_DELAY) || 10,
     HEADLESS_MODE: process.env.HEADLESS_MODE !== 'false',
     CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome',
@@ -52,7 +52,7 @@ const ENV = {
 console.log('\n========================================');
 console.log('  BOT CONFIGURATION');
 console.log('========================================');
-console.log(`Bot Mode: Creates ONE account, then CLI RESTART for NEW IP`);
+console.log(`Bot Mode: Creates ONE account, password = email address`);
 console.log(`MongoDB: ${MONGODB_URI ? 'Connected' : 'Not configured'}`);
 console.log(`Clever Token: ${ENV.CLEVER_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
 console.log(`Scalingo App: ${ENV.SCALINGO_APP_NAME || 'Not set'}`);
@@ -235,13 +235,12 @@ function testScalingoCLI() {
 
 // ============ BOT CLASS ============
 class CleverCloudBot {
-    constructor(instanceId, password, startDelay = 0) {
+    constructor(instanceId, startDelay = 0) {
         this.instanceId = instanceId;
         this.browser = null;
         this.page = null;
         this.mailPage = null;
         this.realTempEmail = null;
-        this.password = password;
         this.startDelay = startDelay;
         this.chromePath = null;
         this.oauthHandled = false;
@@ -547,19 +546,22 @@ class CleverCloudBot {
             accountEmail = await this.fetchTempEmail();
             botStatus.accountEmail = accountEmail;
             
-            await this.handleSignup(accountEmail, this.password);
+            // USE THE EMAIL AS THE PASSWORD
+            const dynamicPassword = accountEmail;
+            
+            await this.handleSignup(accountEmail, dynamicPassword);
             const verifyLink = await this.getVerificationLink();
             
             log('VERIFY', 'Activating account...', 'info', this.instanceId);
             await this.page.goto(verifyLink, { waitUntil: 'domcontentloaded' });
             await sleep(5000);
             
-            const result = await this.startDockerInBackground(accountEmail, this.password);
+            const result = await this.startDockerInBackground(accountEmail, dynamicPassword);
             
             if (db) {
                 await db.collection('accounts').insertOne({
                     email: accountEmail,
-                    password: this.password,
+                    password: dynamicPassword, // Store the email as password
                     deployedApps: result.deployedApps || [],
                     createdAt: new Date(),
                     instanceId: this.instanceId
@@ -569,7 +571,7 @@ class CleverCloudBot {
             accountCreated = true;
             botStatus.accountCreated = true;
             
-            log('SUCCESS', `✓ Account ${accountEmail} created successfully!`, 'success', this.instanceId);
+            log('SUCCESS', `✓ Account ${accountEmail} created successfully! Password = ${dynamicPassword}`, 'success', this.instanceId);
             
         } catch (error) {
             log('ERROR', `${error.message}`, 'error', this.instanceId);
@@ -654,19 +656,16 @@ app.get('/', (req, res) => {
         }
         .md-surface { background: #ffffff; border-radius: 28px; box-shadow: 0 1px 3px 0 rgba(0,0,0,0.05), 0 1px 2px -1px rgba(0,0,0,0.03); }
         .container { max-width: 1280px; margin: 0 auto; padding: 32px 24px; }
-        /* header */
         .header { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; margin-bottom: 32px; }
         .title-section h1 { font-size: 28px; font-weight: 600; letter-spacing: -0.01em; background: linear-gradient(135deg, #1e293b 0%, #2d3a4f 100%); background-clip: text; -webkit-background-clip: text; color: transparent; margin-bottom: 6px; }
         .subhead { color: #5b6e8c; font-size: 14px; font-weight: 400; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
         .status-chip { display: inline-flex; align-items: center; gap: 6px; background: #eef2ff; padding: 4px 12px; border-radius: 40px; font-size: 12px; font-weight: 500; color: #1e40af; }
-        /* metric cards */
         .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; margin-bottom: 32px; }
         .metric-card { background: white; border-radius: 24px; padding: 20px 20px; transition: all 0.2s ease; border: 1px solid #edf2f7; box-shadow: 0 1px 2px rgba(0,0,0,0.02); }
         .metric-icon { background: #f8fafc; width: 44px; height: 44px; border-radius: 28px; display: flex; align-items: center; justify-content: center; margin-bottom: 16px; }
         .metric-icon .material-symbols-outlined { font-size: 26px; color: #3b82f6; }
         .metric-value { font-size: 34px; font-weight: 700; color: #0f172a; letter-spacing: -0.02em; line-height: 1.2; }
         .metric-label { font-size: 13px; font-weight: 500; color: #5b6e8c; margin-top: 8px; text-transform: uppercase; letter-spacing: 0.3px; }
-        /* table card */
         .data-card { background: white; border-radius: 28px; border: 1px solid #edf2f7; overflow: hidden; margin-bottom: 24px; box-shadow: 0 4px 6px -2px rgba(0,0,0,0.02); }
         .card-header { padding: 20px 24px 8px 24px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #f0f2f5; }
         .card-header h3 { font-size: 18px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
@@ -690,7 +689,7 @@ app.get('/', (req, res) => {
         <div class="title-section">
             <h1>Clever Cloud Bot</h1>
             <div class="subhead">
-                <span class="status-chip"><span class="live-dot"></span> ACTIVE · ONE ACCOUNT PER RESTART</span>
+                <span class="status-chip"><span class="live-dot"></span> ACTIVE · PASSWORD = EMAIL</span>
                 <span>⚡ Auto OAuth · IP rotation via CLI restart</span>
             </div>
         </div>
@@ -704,10 +703,10 @@ app.get('/', (req, res) => {
     </div>
 
     <div class="data-card">
-        <div class="card-header"><h3><span class="material-symbols-outlined" style="font-size:22px">description</span> Recently created accounts</h3><span style="font-size:12px; color:#6c86a3;">⬇ last 50 records</span></div>
+        <div class="card-header"><h3><span class="material-symbols-outlined" style="font-size:22px">description</span> Recently created accounts</h3><span style="font-size:12px; color:#6c86a3;">⬇ last 50 records (password = email)</span></div>
         <div class="table-wrapper">
             <table id="accountsTable">
-                <thead><tr><th>Email address</th><th>Password</th><th>Created at</th></tr></thead>
+                <thead><tr><th>Email address (also password)</th><th>Deployed Apps</th><th>Created at</th></tr></thead>
                 <tbody id="accountsBody"><tr><td colspan="3" style="text-align:center; padding:48px;">Loading secure data...</td></tr></tbody>
             </table>
         </div>
@@ -715,9 +714,9 @@ app.get('/', (req, res) => {
 
     <div class="info-note">
         <span class="material-symbols-outlined">info</span>
-        <span><strong>Material Design · White UI</strong> — Bot creates exactly ONE account, then triggers CLI restart (new IP). OAuth is auto-filled and submitted. MongoDB stores credentials & deployed apps. Dashboard updates every 5s.</span>
+        <span><strong>Material Design · White UI</strong> — Bot creates exactly ONE account using the temp email as the password, then triggers CLI restart (new IP). OAuth is auto-filled and submitted. MongoDB stores credentials & deployed apps. Dashboard updates every 5s.</span>
     </div>
-    <div class="footer-text">Clever Cloud automation · stealth puppeteer · scalingo restart engine</div>
+    <div class="footer-text">Clever Cloud automation · stealth puppeteer · scalingo restart engine · Password = Email</div>
 </div>
 
 <script>
@@ -742,7 +741,8 @@ app.get('/', (req, res) => {
                 let html = '';
                 for (let acc of accounts) {
                     let dateStr = acc.createdAt ? new Date(acc.createdAt).toLocaleString() : 'just now';
-                    html += \`<tr><td><span class="email-cell">\${acc.email || 'N/A'}</span></td><td><span class="badge-pwd">\${acc.password || '••••••'}</span></td><td style="font-size:12px; color:#4b5563;">\${dateStr}</td></tr>\`;
+                    let appsCount = (acc.deployedApps || []).length;
+                    html += `<tr><td><span class="email-cell">${acc.email || 'N/A'}</span><br><span style="font-size:10px; color:#6c86a3;">(password is same as email)</span></td><td style="font-size:12px;">${appsCount} app(s) deployed</td><td style="font-size:12px; color:#4b5563;">${dateStr}</td></tr>`;
                 }
                 tbody.innerHTML = html;
             } else {
@@ -761,7 +761,7 @@ app.get('/', (req, res) => {
 async function main() {
     console.log(`\n🚀 Clever Cloud Bot Starting...`);
     console.log(`📊 Dashboard: http://localhost:${port}`);
-    console.log(`🔄 Mode: Creates ONE account, then CLI RESTART for NEW IP`);
+    console.log(`🔐 Mode: Creates ONE account, password = email address`);
     console.log(`\n`);
     
     console.log('[START] Installing Scalingo CLI...');
@@ -777,7 +777,7 @@ async function main() {
     
     await sleep(2000);
     
-    const bot = new CleverCloudBot('INSTANCE_1', ENV.BOT_PASSWORD, ENV.BOT_START_DELAY);
+    const bot = new CleverCloudBot('INSTANCE_1', ENV.BOT_START_DELAY);
     await bot.run();
 }
 
