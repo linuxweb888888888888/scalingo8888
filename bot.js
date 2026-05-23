@@ -395,7 +395,6 @@ class CleverCloudBot {
             
             await sleep(3000);
             
-            // Check if already logged in
             const alreadyLoggedIn = await oauthPage.evaluate(() => {
                 const body = document.body.innerText || '';
                 return body.includes('already logged in') || body.includes('redirecting') || body.includes('You are already logged in');
@@ -408,18 +407,9 @@ class CleverCloudBot {
                 return true;
             }
             
-            // Try multiple selectors for email field
             const emailSelectors = [
-                'input[type="email"]',
-                'input[name="email"]', 
-                'input[id="email"]',
-                'input[placeholder*="email" i]',
-                'input[placeholder*="Email" i]',
-                '#username',
-                '#login_email',
-                'input[name="username"]',
-                '.email-input',
-                '#email-input'
+                'input[type="email"]', 'input[name="email"]', 'input[id="email"]',
+                'input[placeholder*="email" i]', '#username', '#login_email'
             ];
             
             let emailField = null;
@@ -427,22 +417,15 @@ class CleverCloudBot {
                 try {
                     emailField = await oauthPage.$(selector);
                     if (emailField) {
-                        log('OAUTH', `Found email field with selector: ${selector}`, 'info', this.instanceId);
+                        log('OAUTH', `Found email field`, 'info', this.instanceId);
                         break;
                     }
                 } catch(e) {}
             }
             
-            // Try multiple selectors for password field
             const passwordSelectors = [
-                'input[type="password"]',
-                'input[name="password"]',
-                'input[id="password"]',
-                'input[placeholder*="password" i]',
-                '#password',
-                '#login_password',
-                '.password-input',
-                '#password-input'
+                'input[type="password"]', 'input[name="password"]', 'input[id="password"]',
+                'input[placeholder*="password" i]', '#password', '#login_password'
             ];
             
             let passwordField = null;
@@ -450,42 +433,28 @@ class CleverCloudBot {
                 try {
                     passwordField = await oauthPage.$(selector);
                     if (passwordField) {
-                        log('OAUTH', `Found password field with selector: ${selector}`, 'info', this.instanceId);
+                        log('OAUTH', `Found password field`, 'info', this.instanceId);
                         break;
                     }
                 } catch(e) {}
             }
             
             if (emailField && passwordField) {
-                // Clear and fill email
                 await emailField.click({ clickCount: 3 });
-                await emailField.press('Backspace');
                 await emailField.type(email, { delay: 100 });
-                log('OAUTH', 'Email filled successfully', 'success', this.instanceId);
+                log('OAUTH', 'Email filled', 'success', this.instanceId);
                 
-                // Clear and fill password
                 await passwordField.click({ clickCount: 3 });
-                await passwordField.press('Backspace');
                 await passwordField.type(password, { delay: 100 });
-                log('OAUTH', 'Password filled successfully', 'success', this.instanceId);
+                log('OAUTH', 'Password filled', 'success', this.instanceId);
                 
                 await sleep(1000);
                 
-                // Try multiple ways to submit the form
                 let loginClicked = false;
                 
-                // Method 1: Try common button selectors
                 const buttonSelectors = [
-                    'button[type="submit"]',
-                    'input[type="submit"]',
-                    '.login-button',
-                    '#login-button',
-                    'button.btn-primary',
-                    'button.btn',
-                    'button[class*="login"]',
-                    'button[class*="submit"]',
-                    '.submit-button',
-                    '#submit-button'
+                    'button[type="submit"]', 'input[type="submit"]',
+                    '.login-button', '#login-button', 'button.btn-primary'
                 ];
                 
                 for (const selector of buttonSelectors) {
@@ -493,69 +462,42 @@ class CleverCloudBot {
                         const button = await oauthPage.$(selector);
                         if (button) {
                             await button.click();
-                            log('OAUTH', `Clicked login button: ${selector}`, 'success', this.instanceId);
+                            log('OAUTH', `Clicked login button`, 'success', this.instanceId);
                             loginClicked = true;
                             break;
                         }
                     } catch(e) {}
                 }
                 
-                // Method 2: Try to find any button with login text
                 if (!loginClicked) {
                     loginClicked = await oauthPage.evaluate(() => {
-                        const buttons = Array.from(document.querySelectorAll('button, input[type="submit"], a[role="button"]'));
+                        const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
                         for (const btn of buttons) {
                             const text = (btn.innerText || btn.value || '').toLowerCase();
-                            if (text.includes('login') || text.includes('sign in') || text.includes('log in') || text.includes('submit')) {
+                            if (text.includes('login') || text.includes('sign in')) {
                                 btn.click();
                                 return true;
                             }
                         }
+                        const form = document.querySelector('form');
+                        if (form) {
+                            form.submit();
+                            return true;
+                        }
                         return false;
                     });
-                    if (loginClicked) {
-                        log('OAUTH', 'Clicked login button by text search', 'success', this.instanceId);
-                    }
+                    if (loginClicked) log('OAUTH', 'Submitted login', 'success', this.instanceId);
                 }
                 
-                // Method 3: Submit the form directly
-                if (!loginClicked) {
-                    const form = await oauthPage.$('form');
-                    if (form) {
-                        await form.evaluate(form => form.submit());
-                        log('OAUTH', 'Submitted form directly', 'success', this.instanceId);
-                        loginClicked = true;
-                    }
-                }
-                
-                // Method 4: Press Enter on password field
                 if (!loginClicked) {
                     await passwordField.press('Enter');
-                    log('OAUTH', 'Pressed Enter on password field', 'success', this.instanceId);
-                    loginClicked = true;
+                    log('OAUTH', 'Pressed Enter', 'success', this.instanceId);
                 }
-                
-                if (!loginClicked) {
-                    log('OAUTH', 'Could not find login button or form', 'warn', this.instanceId);
-                } else {
-                    log('OAUTH', 'Login submitted successfully', 'success', this.instanceId);
-                }
-                
             } else {
                 log('OAUTH', 'Could not find email/password fields', 'error', this.instanceId);
-                const pageContent = await oauthPage.content();
-                console.log('[OAUTH DEBUG] Page HTML preview:', pageContent.substring(0, 500));
             }
             
-            // Wait for login to process
-            log('OAUTH', 'Waiting for login to complete...', 'info', this.instanceId);
             await sleep(8000);
-            
-            const finalUrl = oauthPage.url();
-            if (!finalUrl.includes('cli-oauth')) {
-                log('OAUTH', 'Login successful - redirect detected', 'success', this.instanceId);
-            }
-            
             await oauthPage.close();
             log('OAUTH', 'OAuth flow completed', 'success', this.instanceId);
             log('OAUTH', '========================================', 'info', this.instanceId);
@@ -564,9 +506,7 @@ class CleverCloudBot {
         } catch (error) {
             log('OAUTH', `OAuth error: ${error.message}`, 'error', this.instanceId);
             if (oauthPage && !oauthPage.isClosed()) {
-                try {
-                    await oauthPage.close();
-                } catch(e) {}
+                try { await oauthPage.close(); } catch(e) {}
             }
             return false;
         }
@@ -574,8 +514,6 @@ class CleverCloudBot {
 
     async startDockerInBackground(email, password) {
         return new Promise((resolve, reject) => {
-            const dockerId = `${this.instanceId}_${Date.now()}`;
-            
             log('DOCKER', 'Starting Docker deployment...', 'info', this.instanceId);
             
             const dockerScriptPath = '/app/docker';
@@ -763,7 +701,7 @@ app.get('/api/accounts', async (req, res) => {
     res.json(accounts);
 });
 
-// ============ MATERIAL DESIGN WHITE DASHBOARD ============
+// ============ DASHBOARD ============
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -775,39 +713,30 @@ app.get('/', (req, res) => {
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0,200" />
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            background: #f5f7fb;
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            color: #1e293b;
-            line-height: 1.5;
-        }
-        .md-surface { background: #ffffff; border-radius: 28px; box-shadow: 0 1px 3px 0 rgba(0,0,0,0.05), 0 1px 2px -1px rgba(0,0,0,0.03); }
+        body { background: #f5f7fb; font-family: 'Inter', sans-serif; color: #1e293b; line-height: 1.5; }
         .container { max-width: 1280px; margin: 0 auto; padding: 32px 24px; }
         .header { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; margin-bottom: 32px; }
-        .title-section h1 { font-size: 28px; font-weight: 600; letter-spacing: -0.01em; background: linear-gradient(135deg, #1e293b 0%, #2d3a4f 100%); background-clip: text; -webkit-background-clip: text; color: transparent; margin-bottom: 6px; }
-        .subhead { color: #5b6e8c; font-size: 14px; font-weight: 400; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .title-section h1 { font-size: 28px; font-weight: 600; background: linear-gradient(135deg, #1e293b 0%, #2d3a4f 100%); background-clip: text; -webkit-background-clip: text; color: transparent; margin-bottom: 6px; }
+        .subhead { color: #5b6e8c; font-size: 14px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
         .status-chip { display: inline-flex; align-items: center; gap: 6px; background: #eef2ff; padding: 4px 12px; border-radius: 40px; font-size: 12px; font-weight: 500; color: #1e40af; }
         .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; margin-bottom: 32px; }
-        .metric-card { background: white; border-radius: 24px; padding: 20px 20px; transition: all 0.2s ease; border: 1px solid #edf2f7; box-shadow: 0 1px 2px rgba(0,0,0,0.02); }
+        .metric-card { background: white; border-radius: 24px; padding: 20px; border: 1px solid #edf2f7; }
         .metric-icon { background: #f8fafc; width: 44px; height: 44px; border-radius: 28px; display: flex; align-items: center; justify-content: center; margin-bottom: 16px; }
         .metric-icon .material-symbols-outlined { font-size: 26px; color: #3b82f6; }
-        .metric-value { font-size: 34px; font-weight: 700; color: #0f172a; letter-spacing: -0.02em; line-height: 1.2; }
-        .metric-label { font-size: 13px; font-weight: 500; color: #5b6e8c; margin-top: 8px; text-transform: uppercase; letter-spacing: 0.3px; }
-        .data-card { background: white; border-radius: 28px; border: 1px solid #edf2f7; overflow: hidden; margin-bottom: 24px; box-shadow: 0 4px 6px -2px rgba(0,0,0,0.02); }
-        .card-header { padding: 20px 24px 8px 24px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #f0f2f5; }
+        .metric-value { font-size: 34px; font-weight: 700; color: #0f172a; }
+        .metric-label { font-size: 13px; font-weight: 500; color: #5b6e8c; margin-top: 8px; text-transform: uppercase; }
+        .data-card { background: white; border-radius: 28px; border: 1px solid #edf2f7; overflow: hidden; margin-bottom: 24px; }
+        .card-header { padding: 20px 24px 8px 24px; display: flex; justify-content: space-between; border-bottom: 1px solid #f0f2f5; }
         .card-header h3 { font-size: 18px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
         .table-wrapper { overflow-x: auto; padding: 0 4px; }
         table { width: 100%; border-collapse: collapse; font-size: 14px; }
         th { text-align: left; padding: 16px 20px; background: #fefefe; font-weight: 600; color: #475569; border-bottom: 1px solid #eef2f6; }
         td { padding: 14px 20px; border-bottom: 1px solid #f1f5f9; color: #1e293b; }
-        tr:last-child td { border-bottom: none; }
         .email-cell { font-family: monospace; font-weight: 500; background: #f8fafc; padding: 4px 10px; border-radius: 40px; display: inline-block; font-size: 12px; }
-        .badge-pwd { font-family: monospace; background: #fef9e3; padding: 4px 10px; border-radius: 40px; font-size: 12px; color: #b45309; }
         .info-note { background: #f8fafc; border-radius: 20px; padding: 16px 24px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; border: 1px solid #eef2ff; margin-top: 16px; }
-        .info-note .material-symbols-outlined { color: #3b82f6; }
         .footer-text { font-size: 12px; color: #7e8aa2; text-align: center; margin-top: 32px; }
+        .live-dot { width: 10px; height: 10px; background: #22c55e; border-radius: 50%; display: inline-block; animation: pulse-ring 1.2s infinite; margin-right: 6px; }
         @keyframes pulse-ring { 0% { opacity: 0.6; } 100% { opacity: 1; } }
-        .live-dot { width: 10px; height: 10px; background: #22c55e; border-radius: 50%; display: inline-block; box-shadow: 0 0 0 0 rgba(34,197,94,0.4); animation: pulse-ring 1.2s infinite; margin-right: 6px; }
     </style>
 </head>
 <body>
@@ -830,18 +759,18 @@ app.get('/', (req, res) => {
     </div>
 
     <div class="data-card">
-        <div class="card-header"><h3><span class="material-symbols-outlined" style="font-size:22px">description</span> Recently created accounts</h3><span style="font-size:12px; color:#6c86a3;">⬇ last 50 records (password = email)</span></div>
+        <div class="card-header"><h3><span class="material-symbols-outlined">description</span> Recently created accounts</h3><span style="font-size:12px;">⬇ last 50 records (password = email)</span></div>
         <div class="table-wrapper">
             <table id="accountsTable">
                 <thead><tr><th>Email address (also password)</th><th>Deployed Apps</th><th>Created at</th></tr></thead>
-                <tbody id="accountsBody"><tr><td colspan="3" style="text-align:center; padding:48px;">Loading secure data......</td></tr></tbody>
-            瞿
+                <tbody id="accountsBody"><tr><td colspan="3" style="text-align:center; padding:48px;">Loading secure data...</td></tr></tbody>
+            </table>
         </div>
     </div>
 
     <div class="info-note">
         <span class="material-symbols-outlined">info</span>
-        <span><strong>Material Design · White UI</strong> — Bot creates exactly ONE account using the temp email as the password, then triggers CLI restart (new IP). OAuth is auto-filled and submitted. MongoDB stores credentials & deployed apps. Dashboard updates every 5s.</span>
+        <span>Bot creates exactly ONE account using the temp email as the password, then triggers CLI restart (new IP). OAuth is auto-filled and submitted.</span>
     </div>
     <div class="footer-text">Clever Cloud automation · stealth puppeteer · scalingo restart engine · Password = Email</div>
 </div>
@@ -869,7 +798,11 @@ app.get('/', (req, res) => {
                 for (let acc of accounts) {
                     let dateStr = acc.createdAt ? new Date(acc.createdAt).toLocaleString() : 'just now';
                     let appsCount = (acc.deployedApps || []).length;
-                    html += `<tr><td><span class="email-cell">${acc.email || 'N/A'}</span><br><span style="font-size:10px; color:#6c86a3;">(password is same as email)</span></td><td style="font-size:12px;">${appsCount} app(s) deployed</td><td style="font-size:12px; color:#4b5563;">${dateStr}</td></tr>`;
+                    html += '<tr>' +
+                        '<td><span class="email-cell">' + (acc.email || 'N/A') + '</span><br><span style="font-size:10px; color:#6c86a3;">(password is same as email)</span></td>' +
+                        '<td style="font-size:12px;">' + appsCount + ' app(s) deployed</td>' +
+                        '<td style="font-size:12px; color:#4b5563;">' + dateStr + '</td>' +
+                    '</tr>';
                 }
                 tbody.innerHTML = html;
             } else {
