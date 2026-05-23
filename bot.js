@@ -664,7 +664,6 @@ class CleverCloudBot {
             log('OAUTH', 'Page loaded', 'info', this.instanceId);
             await sleep(3000);
             
-            // Check if already logged in
             const alreadyLoggedIn = await oauthPage.evaluate(() => {
                 const body = document.body.innerText || '';
                 return body.includes('already logged in') || body.includes('redirecting');
@@ -718,12 +717,10 @@ class CleverCloudBot {
                 
                 if (loginClicked) {
                     log('OAUTH', 'Login submitted, waiting for redirect...', 'success', this.instanceId);
-                    // Wait longer for login to complete
                     await sleep(10000);
                 }
             }
             
-            // Wait for redirect
             let redirected = false;
             for (let i = 0; i < 30; i++) {
                 const currentUrl = oauthPage.url();
@@ -747,27 +744,52 @@ class CleverCloudBot {
 
     async startDockerInBackground(email, password) {
         return new Promise(async (resolve) => {
+            console.log(`\n[DEBUG] ========== STARTING DOCKER DEPLOYMENT ==========`);
+            console.log(`[DEBUG] Email: ${email}`);
+            console.log(`[DEBUG] Timestamp: ${Date.now()}`);
+            
             log('DOCKER', 'Starting Docker deployment...', 'info', this.instanceId);
             
             // Logout from previous session
+            console.log(`[DEBUG] Logging out from previous Clever Cloud session...`);
             await logoutCleverCloud();
             
             // Create deployment directory
             const deployDir = `/tmp/deployments_${Date.now()}`;
+            console.log(`[DEBUG] Deployment directory: ${deployDir}`);
             try {
                 if (!fs.existsSync(deployDir)) {
                     fs.mkdirSync(deployDir, { recursive: true });
+                    console.log(`[DEBUG] ✅ Created deployment directory: ${deployDir}`);
+                } else {
+                    console.log(`[DEBUG] Directory already exists: ${deployDir}`);
                 }
             } catch (error) {
+                console.log(`[DEBUG] ❌ Cannot create dir: ${error.message}`);
                 log('DOCKER', `Cannot create dir: ${error.message}`, 'warn', this.instanceId);
             }
             
             const dockerScriptPath = '/app/docker';
+            console.log(`[DEBUG] Docker script path: ${dockerScriptPath}`);
+            console.log(`[DEBUG] Docker script exists: ${fs.existsSync(dockerScriptPath)}`);
+            
             if (!fs.existsSync(dockerScriptPath)) {
+                console.log(`[DEBUG] ❌ Docker script not found at: ${dockerScriptPath}`);
                 log('DOCKER', 'Docker script not found', 'warn', this.instanceId);
                 resolve({ success: true, email, deployedApps: [] });
                 return;
             }
+            
+            // Make script executable
+            try {
+                fs.chmodSync(dockerScriptPath, 0o755);
+                console.log(`[DEBUG] Made docker script executable`);
+            } catch(e) {
+                console.log(`[DEBUG] Could not chmod: ${e.message}`);
+            }
+            
+            console.log(`[DEBUG] Spawning docker process...`);
+            console.log(`[DEBUG] Command: bash ${dockerScriptPath}`);
             
             const dockerProcess = spawn('bash', [dockerScriptPath], { 
                 detached: true, 
@@ -781,6 +803,8 @@ class CleverCloudBot {
                 }
             });
             
+            console.log(`[DEBUG] Docker process PID: ${dockerProcess.pid}`);
+            
             let deployedApps = [];
             let oauthUrlDetected = false;
             let outputBuffer = '';
@@ -791,56 +815,93 @@ class CleverCloudBot {
                 outputBuffer += output;
                 console.log(`[DOCKER] ${output.trim()}`);
                 
+                // Look for OAuth URL
                 if (!oauthUrlDetected && !this.oauthHandled) {
                     const oauthMatch = output.match(/https:\/\/console\.clever-cloud\.com\/cli-oauth\?[^\s]+/);
                     if (oauthMatch) {
                         oauthUrlDetected = true;
                         this.oauthHandled = true;
+                        console.log(`[DEBUG] OAuth URL detected: ${oauthMatch[0].substring(0, 100)}...`);
                         log('OAUTH', 'OAuth URL detected, handling...', 'info', this.instanceId);
                         const oauthSuccess = await this.handleOAuth(oauthMatch[0], email, password);
                         if (oauthSuccess) {
+                            console.log(`[DEBUG] ✅ OAuth login successful`);
                             log('OAUTH', 'OAuth login successful, continuing deployment...', 'success', this.instanceId);
+                        } else {
+                            console.log(`[DEBUG] ❌ OAuth login failed`);
                         }
                     }
                 }
                 
+                // Look for deployed app URLs
                 const urlMatch = output.match(/https:\/\/[a-z0-9-]+\.osc-fr1\.scalingo\.io/);
                 if (urlMatch && !deployedApps.includes(urlMatch[0])) {
                     deployedApps.push(urlMatch[0]);
+                    console.log(`[DEBUG] ✅ App deployed: ${urlMatch[0]}`);
                     log('DOCKER', `App deployed: ${urlMatch[0]}`, 'success', this.instanceId);
                 }
                 
-                if (output.includes('All 3 apps deployed') || output.includes('successfully deployed')) {
+                // Check for completion
+                if (output.includes('All 3 apps deployed') || output.includes('successfully deployed') || output.includes('Deployment completed')) {
                     deploymentCompleted = true;
+                    console.log(`[DEBUG] ✅✅✅ DEPLOYMENT COMPLETED SUCCESSFULLY! ✅✅✅`);
                     log('DOCKER', 'Deployment completed successfully!', 'success', this.instanceId);
                     resolve({ success: true, email, deployedApps });
+                }
+                
+                // Check for errors
+                if (output.includes('error') || output.includes('Error') || output.includes('ERROR')) {
+                    console.log(`[DEBUG] ⚠️ Error detected in output: ${output.substring(0, 200)}`);
                 }
             });
             
             dockerProcess.stderr.on('data', (data) => {
                 const err = data.toString();
                 console.error(`[DOCKER ERR] ${err.trim()}`);
+                console.log(`[DEBUG] STDERR: ${err.trim().substring(0, 200)}`);
             });
             
             dockerProcess.on('close', (code) => {
+                console.log(`[DEBUG] Docker process closed with code: ${code}`);
+                console.log(`[DEBUG] Deployment completed: ${deploymentCompleted}`);
+                console.log(`[DEBUG] Deployed apps count: ${deployedApps.length}`);
+                console.log(`[DEBUG] Output buffer length: ${outputBuffer.length}`);
+                
                 if (!deploymentCompleted) {
                     if (deployedApps.length > 0) {
+                        console.log(`[DEBUG] ✅ Deployment had ${deployedApps.length} apps, considering successful`);
                         resolve({ success: true, email, deployedApps });
-                    } else if (code === 0 || outputBuffer.includes('success')) {
+                    } else if (code === 0 || outputBuffer.includes('success') || outputBuffer.includes('logged in')) {
+                        console.log(`[DEBUG] ✅ Process exited with code 0 or contained success message`);
                         resolve({ success: true, email, deployedApps: [] });
                     } else {
+                        console.log(`[DEBUG] ⚠️ Deployment may have issues, but continuing`);
                         resolve({ success: true, email, deployedApps: [] });
                     }
                 }
             });
             
-            // Wait for deployment to complete (up to 10 minutes)
-            setTimeout(() => {
+            dockerProcess.on('error', (error) => {
+                console.log(`[DEBUG] ❌ Docker process error: ${error.message}`);
+                resolve({ success: true, email, deployedApps: [] });
+            });
+            
+            // Set timeout for deployment
+            const timeoutId = setTimeout(() => {
                 if (!deploymentCompleted) {
+                    console.log(`[DEBUG] ⏰ DEPLOYMENT TIMEOUT after 10 minutes`);
                     log('DOCKER', 'Deployment timeout, but continuing...', 'warn', this.instanceId);
                     resolve({ success: true, email, deployedApps });
                 }
             }, 600000);
+            
+            // Clean up timeout if resolved early
+            const originalResolve = resolve;
+            const wrappedResolve = (result) => {
+                clearTimeout(timeoutId);
+                originalResolve(result);
+            };
+            resolve = wrappedResolve;
         });
     }
 
@@ -852,21 +913,29 @@ class CleverCloudBot {
         let browserInitialized = false;
         
         try {
+            console.log(`\n[DEBUG] ========== CREATING NEW ACCOUNT ==========`);
             await this.initBrowser();
             browserInitialized = true;
+            console.log(`[DEBUG] Browser initialized`);
             
             const accountEmail = await this.fetchTempEmail();
             botStatus.accountEmail = accountEmail;
             const dynamicPassword = accountEmail;
+            console.log(`[DEBUG] Account email: ${accountEmail}`);
             
             await this.handleSignup(accountEmail, dynamicPassword);
+            console.log(`[DEBUG] Signup completed`);
+            
             const verifyLink = await this.getVerificationLink();
+            console.log(`[DEBUG] Verification link obtained`);
             
             log('VERIFY', 'Activating account...', 'info', this.instanceId);
             await this.page.goto(verifyLink, { waitUntil: 'domcontentloaded' });
             await sleep(5000);
+            console.log(`[DEBUG] Account activated`);
             
             const result = await this.startDockerInBackground(accountEmail, dynamicPassword);
+            console.log(`[DEBUG] Docker deployment result: ${JSON.stringify(result)}`);
             
             if (db) {
                 await db.collection('accounts').insertOne({
@@ -878,6 +947,7 @@ class CleverCloudBot {
                     createdAt: new Date(),
                     instanceId: this.instanceId
                 });
+                console.log(`[DEBUG] Account saved to database`);
             }
             
             await sendMetricsToCentral({
@@ -895,6 +965,7 @@ class CleverCloudBot {
             
         } catch (error) {
             log('ERROR', `${error.message}`, 'error', this.instanceId);
+            console.log(`[DEBUG] ❌ Account creation error: ${error.message}`);
             if (browserInitialized) await this.cleanup();
             return false;
         }
@@ -917,7 +988,6 @@ class CleverCloudBot {
                     log('LOOP', `Starting account #${botStatus.totalAccounts + 1}...`, 'info', this.instanceId);
                     const success = await this.createSingleAccount();
                     
-                    // Clean up between accounts
                     await logoutCleverCloud();
                     await this.cleanup();
                     this.browser = null;
@@ -928,6 +998,7 @@ class CleverCloudBot {
                     await sleep(success ? 15000 : 30000);
                 } catch (error) {
                     log('LOOP', `Error: ${error.message}`, 'error', this.instanceId);
+                    console.log(`[DEBUG] Loop error: ${error.message}`);
                     await sleep(30000);
                 }
             }
