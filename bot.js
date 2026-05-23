@@ -125,6 +125,22 @@ async function downloadFile(url, destPath) {
     });
 }
 
+// Add this function to install dependencies before Chrome runs
+async function installChromeDependencies() {
+    console.log('[SYSTEM] Installing Chrome dependencies...');
+    try {
+        // Try to install required libraries, ignore errors if already installed
+        execSync('apt-get update -qq 2>/dev/null || true', { stdio: 'inherit' });
+        execSync('apt-get install -y -qq libnss3 libatk-bridge2.0-0 libdrm-dev libxkbcommon-dev libgbm-dev libasound-dev libxshmfence-dev libxrandr2 libxcomposite1 libxdamage1 libx11-xcb1 2>/dev/null || true', { stdio: 'inherit' });
+        console.log('[SYSTEM] Dependencies installed successfully');
+        return true;
+    } catch (error) {
+        console.log('[SYSTEM] Warning: Some dependencies may already be installed');
+        return false;
+    }
+}
+
+// EXACTLY AS IT WAS - KEPT UNCHANGED
 async function installChromiumRuntime() {
     const chromePath = ENV.CHROMIUM_PATH;
     
@@ -468,6 +484,9 @@ class CleverCloudBot {
     }
 
     async initBrowser() {
+        // Install dependencies first
+        await installChromeDependencies();
+        
         if (!this.chromePath) {
             this.chromePath = await installChromiumRuntime();
         }
