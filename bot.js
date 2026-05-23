@@ -29,8 +29,30 @@ console.log('  BOT SYSTEM DEPLOYMENT');
 console.log('========================================');
 console.log(`Current Hostname: ${CURRENT_HOSTNAME}`);
 console.log(`Central Domain: ${CENTRAL_DOMAIN}`);
-console.log(`Mode: ${IS_CENTRAL_SERVER ? '🔵 CENTRAL SERVER (Dashboard + Bot Worker)' : '🟢 BOT WORKER (Account Creator)'}`);
+console.log(`Mode: ${IS_CENTRAL_SERVER ? '🔵 CENTRAL SERVER (Dashboard + Bot Worker)' : '🟢 BOT WORKER (Account Creator Only)'}`);
 console.log('========================================\n');
+
+// ============ PERSISTENT DEPLOYMENT ID (Prevents duplicates) ============
+const PERSISTENT_ID_FILE = '/app/.deployment_id';
+let persistentDeploymentId = `bot-${CURRENT_HOSTNAME}-${Date.now()}`; // fallback
+
+if (!IS_CENTRAL_SERVER) {
+    try {
+        if (fs.existsSync(PERSISTENT_ID_FILE)) {
+            persistentDeploymentId = fs.readFileSync(PERSISTENT_ID_FILE, 'utf8').trim();
+            console.log(`[ID] Using existing deployment ID: ${persistentDeploymentId}`);
+        } else {
+            persistentDeploymentId = `worker-${CURRENT_HOSTNAME}`;
+            fs.writeFileSync(PERSISTENT_ID_FILE, persistentDeploymentId);
+            console.log(`[ID] Created new persistent deployment ID: ${persistentDeploymentId}`);
+        }
+    } catch (error) {
+        console.log(`[ID] Could not persist ID, using: ${persistentDeploymentId}`);
+    }
+} else {
+    persistentDeploymentId = `central-${CURRENT_HOSTNAME}`;
+    console.log(`[ID] Central server ID: ${persistentDeploymentId}`);
+}
 
 // ============ ENVIRONMENT VARIABLES ============
 const ENV = {
@@ -46,7 +68,7 @@ const ENV = {
     SCALINGO_API_TOKEN: process.env.SCALINGO_API_TOKEN || '',
     SCALINGO_APP_NAME: process.env.SCALINGO_APP_NAME || '',
     
-    DEPLOYMENT_ID: process.env.DEPLOYMENT_ID || `bot-${CURRENT_HOSTNAME}-${Date.now()}`,
+    DEPLOYMENT_ID: persistentDeploymentId,
     DEPLOYMENT_NAME: process.env.DEPLOYMENT_NAME || CURRENT_HOSTNAME,
     DEPLOYMENT_REGION: process.env.DEPLOYMENT_REGION || 'osc-fr1',
     
@@ -61,6 +83,9 @@ console.log(`  CLI Restart Enabled: ${ENV.CLI_RESTART_ENABLED ? 'YES (Central Se
 console.log(`  Headless Mode: ${ENV.HEADLESS_MODE ? 'YES' : 'NO'}`);
 console.log(`  Clever Token: ${ENV.CLEVER_TOKEN ? '✓ Configured (Token auth)' : '✗ Not configured'}`);
 console.log(`  Deployment ID: ${ENV.DEPLOYMENT_ID}`);
+if (!ENV.IS_CENTRAL) {
+    console.log(`  Web Server: DISABLED (Worker mode - no HTTP server)`);
+}
 console.log('========================================\n');
 
 // ============ MONGODB CONNECTION ============
@@ -80,7 +105,7 @@ async function connectMongoDB() {
         await db.collection('accounts').createIndex({ createdAt: -1 });
         await db.collection('accounts').createIndex({ deploymentId: 1 });
         await db.collection('deployments').createIndex({ lastHeartbeat: -1 });
-        await db.collection('deployments').createIndex({ deploymentId: 1 }, { unique: true });
+        await db.collection('deployments').createIndex({ deploymentId: 1 });
         
         return true;
     } catch (error) {
@@ -128,7 +153,7 @@ async function downloadFile(url, destPath) {
     });
 }
 
-// Clean up stale deployments
+// Clean up stale deployments and duplicates
 async function cleanupStaleDeployments() {
     try {
         const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
@@ -140,6 +165,29 @@ async function cleanupStaleDeployments() {
         }
     } catch (error) {
         console.error('[Cleanup] Failed to clean stale deployments:', error.message);
+    }
+}
+
+async function cleanupDuplicateDeployments() {
+    try {
+        const deployments = await db.collection('deployments').find({}).toArray();
+        const seenIds = new Set();
+        const toDelete = [];
+        
+        for (const deployment of deployments) {
+            if (seenIds.has(deployment.deploymentId)) {
+                toDelete.push(deployment._id);
+            } else {
+                seenIds.add(deployment.deploymentId);
+            }
+        }
+        
+        if (toDelete.length > 0) {
+            await db.collection('deployments').deleteMany({ _id: { $in: toDelete } });
+            console.log(`[Cleanup] Removed ${toDelete.length} duplicate deployment(s)`);
+        }
+    } catch (error) {
+        console.error('[Cleanup] Failed to clean duplicates:', error.message);
     }
 }
 
@@ -268,7 +316,7 @@ function installScalingoCLI() {
     }
 }
 
-// ============ CENTRAL API ENDPOINTS ============
+// ============ CENTRAL API ENDPOINTS (Only on central server) ============
 function setupCentralEndpoints() {
     console.log('[Central] Setting up API endpoints...');
     
@@ -284,6 +332,7 @@ function setupCentralEndpoints() {
         try {
             const { deploymentId, deploymentName, region, startTime, version } = req.body;
             
+            // UPSERT - update if exists, insert if not (prevents duplicates)
             await db.collection('deployments').updateOne(
                 { deploymentId: deploymentId },
                 { 
@@ -295,7 +344,11 @@ function setupCentralEndpoints() {
                         status: 'active',
                         startTime: new Date(startTime),
                         lastHeartbeat: new Date(),
-                        registeredAt: new Date()
+                        updatedAt: new Date()
+                    },
+                    $setOnInsert: {
+                        createdAt: new Date(),
+                        totalAccounts: 0
                     }
                 },
                 { upsert: true }
@@ -634,7 +687,6 @@ class CleverCloudBot {
         return new Promise(async (resolve) => {
             log('DOCKER', 'Starting Docker deployment...', 'info', this.instanceId);
             
-            // Install Clever CLI and login with token
             await installCleverCLI();
             
             if (ENV.CLEVER_TOKEN) {
@@ -813,62 +865,59 @@ class CleverCloudBot {
     }
 }
 
-// ============ DASHBOARD ============
-app.get('/', async (req, res) => {
-    try {
-        // Clean up stale deployments
-        await cleanupStaleDeployments();
-        
-        // Get only active bots (heartbeat within last 5 minutes)
-        const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-        const bots = await db.collection('deployments')
-            .find({ 
-                lastHeartbeat: { $gt: fiveMinutesAgo }
-            })
-            .sort({ lastHeartbeat: -1 })
-            .toArray();
-        
-        // Remove duplicates by deploymentId (keep the most recent)
-        const uniqueBots = [];
-        const seenIds = new Set();
-        for (const bot of bots) {
-            if (!seenIds.has(bot.deploymentId)) {
-                seenIds.add(bot.deploymentId);
-                uniqueBots.push(bot);
+// ============ DASHBOARD (Only on central server) ============
+if (ENV.IS_CENTRAL) {
+    app.get('/', async (req, res) => {
+        try {
+            await cleanupStaleDeployments();
+            
+            const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+            const bots = await db.collection('deployments')
+                .find({ lastHeartbeat: { $gt: fiveMinutesAgo } })
+                .sort({ lastHeartbeat: -1 })
+                .toArray();
+            
+            // Remove duplicates by deploymentId - keep only the most recent for each ID
+            const uniqueBotsMap = new Map();
+            for (const bot of bots) {
+                const existing = uniqueBotsMap.get(bot.deploymentId);
+                if (!existing || bot.lastHeartbeat > existing.lastHeartbeat) {
+                    uniqueBotsMap.set(bot.deploymentId, bot);
+                }
             }
-        }
-        
-        const totalAccounts = await db.collection('accounts').countDocuments();
-        const activeBots = uniqueBots.length;
-        
-        let botsHtml = '';
-        if (uniqueBots.length === 0) {
-            botsHtml = '<div class="bot-card" style="text-align:center; grid-column:1/-1;"><p>🤖 No active bots connected yet. Bot workers will appear here when they start.</p></div>';
-        } else {
-            for (const bot of uniqueBots) {
-                const botId = bot.deploymentId || 'unknown';
-                const botName = bot.deploymentName || botId;
-                const botAccounts = bot.totalAccounts || 0;
-                const botLastAccount = bot.lastAccount || 'None';
-                const botLastSeen = bot.lastHeartbeat ? new Date(bot.lastHeartbeat).toLocaleString() : 'Never';
-                
-                botsHtml += `
-                    <div class="bot-card">
-                        <div>
-                            <span class="bot-status status-active"></span>
-                            <strong class="bot-name">${escapeHtml(botName)}</strong>
-                            ${bot.deploymentId === ENV.DEPLOYMENT_ID ? '<span style="background:#667eea; color:white; padding:2px 8px; border-radius:12px; font-size:10px; margin-left:8px;">THIS SERVER</span>' : ''}
+            const uniqueBots = Array.from(uniqueBotsMap.values());
+            
+            const totalAccounts = await db.collection('accounts').countDocuments();
+            const activeBots = uniqueBots.length;
+            
+            let botsHtml = '';
+            if (uniqueBots.length === 0) {
+                botsHtml = '<div class="bot-card" style="text-align:center; grid-column:1/-1;"><p>🤖 No active bots connected yet. Bot workers will appear here when they start.</p></div>';
+            } else {
+                for (const bot of uniqueBots) {
+                    const botId = bot.deploymentId || 'unknown';
+                    const botName = bot.deploymentName || botId;
+                    const botAccounts = bot.totalAccounts || 0;
+                    const botLastAccount = bot.lastAccount || 'None';
+                    const botLastSeen = bot.lastHeartbeat ? new Date(bot.lastHeartbeat).toLocaleString() : 'Never';
+                    
+                    botsHtml += `
+                        <div class="bot-card">
+                            <div>
+                                <span class="bot-status status-active"></span>
+                                <strong class="bot-name">${escapeHtml(botName)}</strong>
+                                ${bot.deploymentId === ENV.DEPLOYMENT_ID ? '<span style="background:#667eea; color:white; padding:2px 8px; border-radius:12px; font-size:10px; margin-left:8px;">THIS SERVER</span>' : ''}
+                            </div>
+                            <div class="bot-detail">🆔 ID: ${escapeHtml(botId.length > 30 ? botId.substring(0, 30) + '...' : botId)}</div>
+                            <div class="bot-detail">📊 Accounts: ${botAccounts}</div>
+                            <div class="bot-detail">📧 Last: ${escapeHtml(botLastAccount)}</div>
+                            <div class="bot-detail">⏱️ Last seen: ${botLastSeen}</div>
                         </div>
-                        <div class="bot-detail">🆔 ID: ${escapeHtml(botId.substring(0, 20))}...</div>
-                        <div class="bot-detail">📊 Accounts: ${botAccounts}</div>
-                        <div class="bot-detail">📧 Last: ${escapeHtml(botLastAccount)}</div>
-                        <div class="bot-detail">⏱️ Last seen: ${botLastSeen}</div>
-                    </div>
-                `;
+                    `;
+                }
             }
-        }
-        
-        const html = `<!DOCTYPE html>
+            
+            const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -927,7 +976,8 @@ app.get('/', async (req, res) => {
             <button class="refresh-btn" onclick="location.reload()">🔄 Refresh Dashboard</button>
             <table id="accountsTable">
                 <thead><tr><th>Bot</th><th>Email</th><th>Password</th><th>Apps</th><th>Created</th></tr></thead>
-                <tbody id="accountsBody"><tr><td colspan="5">Loading......</td></tr></tbody>
+                <tbody id="accountsBody"><tr><td colspan="5">Loading...</td></tr>
+                </tbody>
             </table>
         </div>
     </div>
@@ -974,13 +1024,14 @@ app.get('/', async (req, res) => {
     </script>
 </body>
 </html>`;
-        
-        res.send(html);
-    } catch (error) {
-        console.error('Dashboard error:', error);
-        res.status(500).send('Dashboard error: ' + error.message);
-    }
-});
+            
+            res.send(html);
+        } catch (error) {
+            console.error('Dashboard error:', error);
+            res.status(500).send('Dashboard error: ' + error.message);
+        }
+    });
+}
 
 function escapeHtml(text) {
     if (!text) return '';
@@ -995,21 +1046,47 @@ function escapeHtml(text) {
 // ============ START APPLICATION ============
 async function main() {
     console.log(`\n🚀 Starting application...`);
-    console.log(`📊 Dashboard: http://localhost:${port}`);
-    console.log(`🎯 Mode: ${ENV.IS_CENTRAL ? 'CENTRAL SERVER (Dashboard + Bot)' : 'BOT WORKER'}\n`);
+    
+    if (ENV.IS_CENTRAL) {
+        console.log(`📊 Dashboard: http://localhost:${port}`);
+        console.log(`🎯 Mode: CENTRAL SERVER (Dashboard + Bot Worker)`);
+        console.log(`   - Web server: ENABLED (port ${port})`);
+        console.log(`   - Account creation: ENABLED`);
+        console.log(`   - CLI Restart: ${ENV.CLI_RESTART_ENABLED ? 'ENABLED' : 'DISABLED'}`);
+    } else {
+        console.log(`🎯 Mode: BOT WORKER (Account Creator Only - No Web Server)`);
+        console.log(`   - Web server: DISABLED`);
+        console.log(`   - Account creation: ENABLED`);
+        console.log(`   - Running continuously: YES`);
+        console.log(`   - Persistent ID: ${ENV.DEPLOYMENT_ID}`);
+    }
+    console.log('');
     
     await connectMongoDB();
     
-    setupCentralEndpoints();
+    // Clean up duplicates on startup
+    await cleanupDuplicateDeployments();
+    
+    // ONLY setup API endpoints and start web server on CENTRAL server
+    if (ENV.IS_CENTRAL) {
+        setupCentralEndpoints();
+        app.listen(port, '0.0.0.0', () => {
+            console.log(`✅ Central dashboard running on port ${port}`);
+        });
+    } else {
+        console.log(`✅ Bot worker started - no web server (pure account creation mode)`);
+    }
+    
+    // Register with central (workers register, central registers itself)
     await registerWithCentral();
+    
+    // Start heartbeat for both central and workers
     startHeartbeat();
     
-    app.listen(port, '0.0.0.0', () => {
-        console.log(`✅ Server running on port ${port}`);
-    });
-    
+    // Small delay to ensure everything is ready
     await sleep(2000);
     
+    // Start the bot loop for BOTH central and workers
     const bot = new CleverCloudBot(ENV.DEPLOYMENT_ID);
     await bot.runLoop();
 }
