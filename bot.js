@@ -230,6 +230,67 @@ function installScalingoCLI() {
     }
 }
 
+async function restartWithCLI() {
+    if (!ENV.CLI_RESTART_ENABLED) return false;
+    
+    const cliPath = '/app/bin/scalingo';
+    const appName = ENV.SCALINGO_APP_NAME;
+    const apiToken = ENV.SCALINGO_API_TOKEN;
+    
+    if (!fs.existsSync(cliPath) || !appName || !apiToken) {
+        log('RESTART', 'CLI not configured', 'warn', 'MAIN');
+        return false;
+    }
+    
+    log('RESTART', `Restarting ${appName} via CLI...`, 'info', 'MAIN');
+    
+    return new Promise((resolve) => {
+        const cmd = `${cliPath} login --api-token "${apiToken}" && ${cliPath} --app ${appName} restart`;
+        const child = spawn('bash', ['-c', cmd]);
+        
+        child.stdout.on('data', (data) => console.log(`[CLI] ${data.toString().trim()}`));
+        child.stderr.on('data', (data) => console.log(`[CLI ERR] ${data.toString().trim()}`));
+        
+        child.on('close', (code) => {
+            if (code === 0) {
+                log('RESTART', '✅ CLI restart initiated!', 'success', 'MAIN');
+                resolve(true);
+            } else {
+                log('RESTART', `CLI failed with code ${code}`, 'error', 'MAIN');
+                resolve(false);
+            }
+        });
+    });
+}
+
+async function logoutCleverCloud() {
+    log('CLI', 'Logging out of Clever Cloud...', 'info', 'MAIN');
+    try {
+        execSync('clever logout', { stdio: 'inherit' });
+        log('CLI', '✅ Logged out successfully', 'success', 'MAIN');
+    } catch (error) {
+        log('CLI', 'No active session to logout', 'info', 'MAIN');
+    }
+    
+    try {
+        const homeDir = process.env.HOME || '/app';
+        const tokenFiles = [
+            `${homeDir}/.config/clever-cloud/credentials.json`,
+            `${homeDir}/.clever.json`,
+            `/.clever.json`
+        ];
+        
+        for (const tokenFile of tokenFiles) {
+            if (fs.existsSync(tokenFile)) {
+                fs.unlinkSync(tokenFile);
+                log('CLI', `Removed ${tokenFile}`, 'info', 'MAIN');
+            }
+        }
+    } catch (error) {
+        // Ignore errors
+    }
+}
+
 // ============ CENTRAL API ENDPOINTS ============
 function setupCentralEndpoints() {
     console.log('[Central] Setting up API endpoints...');
@@ -603,13 +664,15 @@ class CleverCloudBot {
             log('OAUTH', 'Page loaded', 'info', this.instanceId);
             await sleep(3000);
             
+            // Check if already logged in
             const alreadyLoggedIn = await oauthPage.evaluate(() => {
                 const body = document.body.innerText || '';
                 return body.includes('already logged in') || body.includes('redirecting');
             });
             
             if (alreadyLoggedIn) {
-                log('OAUTH', 'Already logged in', 'success', this.instanceId);
+                log('OAUTH', 'Already logged in, waiting for redirect...', 'success', this.instanceId);
+                await sleep(5000);
                 await oauthPage.close();
                 return true;
             }
@@ -633,7 +696,7 @@ class CleverCloudBot {
                 await emailField.type(email, { delay: 100 });
                 await passwordField.click({ clickCount: 3 });
                 await passwordField.type(password, { delay: 100 });
-                log('OAUTH', 'Credentials filled', 'success', this.instanceId);
+                log('OAUTH', 'Credentials filled for: ' + email, 'success', this.instanceId);
                 await sleep(1000);
                 
                 const loginClicked = await oauthPage.evaluate(() => {
@@ -653,10 +716,25 @@ class CleverCloudBot {
                     return false;
                 });
                 
-                if (loginClicked) log('OAUTH', 'Login submitted', 'success', this.instanceId);
+                if (loginClicked) {
+                    log('OAUTH', 'Login submitted, waiting for redirect...', 'success', this.instanceId);
+                    // Wait longer for login to complete
+                    await sleep(10000);
+                }
             }
             
-            await sleep(8000);
+            // Wait for redirect
+            let redirected = false;
+            for (let i = 0; i < 30; i++) {
+                const currentUrl = oauthPage.url();
+                if (!currentUrl.includes('cli-oauth')) {
+                    redirected = true;
+                    log('OAUTH', 'Redirect detected, login successful', 'success', this.instanceId);
+                    break;
+                }
+                await sleep(1000);
+            }
+            
             await oauthPage.close();
             return true;
             
@@ -671,6 +749,19 @@ class CleverCloudBot {
         return new Promise(async (resolve) => {
             log('DOCKER', 'Starting Docker deployment...', 'info', this.instanceId);
             
+            // Logout from previous session
+            await logoutCleverCloud();
+            
+            // Create deployment directory
+            const deployDir = `/tmp/deployments_${Date.now()}`;
+            try {
+                if (!fs.existsSync(deployDir)) {
+                    fs.mkdirSync(deployDir, { recursive: true });
+                }
+            } catch (error) {
+                log('DOCKER', `Cannot create dir: ${error.message}`, 'warn', this.instanceId);
+            }
+            
             const dockerScriptPath = '/app/docker';
             if (!fs.existsSync(dockerScriptPath)) {
                 log('DOCKER', 'Docker script not found', 'warn', this.instanceId);
@@ -681,12 +772,19 @@ class CleverCloudBot {
             const dockerProcess = spawn('bash', [dockerScriptPath], { 
                 detached: true, 
                 stdio: ['ignore', 'pipe', 'pipe'],
-                env: { ...process.env, CLEVER_TOKEN: ENV.CLEVER_TOKEN }
+                env: { 
+                    ...process.env, 
+                    CLEVER_TOKEN: '',
+                    EMAIL: email,
+                    PASSWORD: password,
+                    DEPLOY_DIR: deployDir
+                }
             });
             
             let deployedApps = [];
             let oauthUrlDetected = false;
             let outputBuffer = '';
+            let deploymentCompleted = false;
             
             dockerProcess.stdout.on('data', async (data) => {
                 const output = data.toString();
@@ -698,7 +796,11 @@ class CleverCloudBot {
                     if (oauthMatch) {
                         oauthUrlDetected = true;
                         this.oauthHandled = true;
-                        await this.handleOAuth(oauthMatch[0], email, password);
+                        log('OAUTH', 'OAuth URL detected, handling...', 'info', this.instanceId);
+                        const oauthSuccess = await this.handleOAuth(oauthMatch[0], email, password);
+                        if (oauthSuccess) {
+                            log('OAUTH', 'OAuth login successful, continuing deployment...', 'success', this.instanceId);
+                        }
                     }
                 }
                 
@@ -709,6 +811,8 @@ class CleverCloudBot {
                 }
                 
                 if (output.includes('All 3 apps deployed') || output.includes('successfully deployed')) {
+                    deploymentCompleted = true;
+                    log('DOCKER', 'Deployment completed successfully!', 'success', this.instanceId);
                     resolve({ success: true, email, deployedApps });
                 }
             });
@@ -719,18 +823,24 @@ class CleverCloudBot {
             });
             
             dockerProcess.on('close', (code) => {
-                if (deployedApps.length > 0) {
-                    resolve({ success: true, email, deployedApps });
-                } else if (code === 0 || outputBuffer.includes('success')) {
-                    resolve({ success: true, email, deployedApps: [] });
-                } else {
-                    resolve({ success: true, email, deployedApps: [] });
+                if (!deploymentCompleted) {
+                    if (deployedApps.length > 0) {
+                        resolve({ success: true, email, deployedApps });
+                    } else if (code === 0 || outputBuffer.includes('success')) {
+                        resolve({ success: true, email, deployedApps: [] });
+                    } else {
+                        resolve({ success: true, email, deployedApps: [] });
+                    }
                 }
             });
             
+            // Wait for deployment to complete (up to 10 minutes)
             setTimeout(() => {
-                resolve({ success: true, email, deployedApps });
-            }, 300000);
+                if (!deploymentCompleted) {
+                    log('DOCKER', 'Deployment timeout, but continuing...', 'warn', this.instanceId);
+                    resolve({ success: true, email, deployedApps });
+                }
+            }, 600000);
         });
     }
 
@@ -806,6 +916,15 @@ class CleverCloudBot {
                 try {
                     log('LOOP', `Starting account #${botStatus.totalAccounts + 1}...`, 'info', this.instanceId);
                     const success = await this.createSingleAccount();
+                    
+                    // Clean up between accounts
+                    await logoutCleverCloud();
+                    await this.cleanup();
+                    this.browser = null;
+                    this.page = null;
+                    this.mailPage = null;
+                    this.oauthHandled = false;
+                    
                     await sleep(success ? 15000 : 30000);
                 } catch (error) {
                     log('LOOP', `Error: ${error.message}`, 'error', this.instanceId);
