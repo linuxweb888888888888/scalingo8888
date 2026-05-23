@@ -59,7 +59,7 @@ const ENV = {
 console.log('Configuration:');
 console.log(`  CLI Restart Enabled: ${ENV.CLI_RESTART_ENABLED ? 'YES (Central Server Only)' : 'NO (Workers Run Continuously)'}`);
 console.log(`  Headless Mode: ${ENV.HEADLESS_MODE ? 'YES' : 'NO'}`);
-console.log(`  Clever Token: ${ENV.CLEVER_TOKEN ? '✓ Configured' : '✗ Not configured (will use OAuth)'}`);
+console.log(`  Clever Token: ${ENV.CLEVER_TOKEN ? '✓ Configured (Token auth)' : '✗ Not configured'}`);
 console.log(`  Deployment ID: ${ENV.DEPLOYMENT_ID}`);
 console.log('========================================\n');
 
@@ -169,13 +169,13 @@ async function installCleverCLI() {
     }
 }
 
-// Login to Clever Cloud
+// Login to Clever Cloud using token
 async function loginCleverCloud() {
-    console.log('[CLI] Logging into Clever Cloud...');
+    console.log('[CLI] Logging into Clever Cloud with token...');
     try {
         const token = ENV.CLEVER_TOKEN;
         if (!token) {
-            console.log('[CLI] No CLEVER_TOKEN found, will use OAuth');
+            console.error('[CLI] No CLEVER_TOKEN found in environment');
             return false;
         }
         
@@ -183,7 +183,7 @@ async function loginCleverCloud() {
         console.log('[CLI] ✅ Logged into Clever Cloud successfully');
         return true;
     } catch (error) {
-        console.log('[CLI] Token login failed, will use OAuth');
+        console.error('[CLI] Token login failed:', error.message);
         return false;
     }
 }
@@ -479,7 +479,6 @@ class CleverCloudBot {
         this.mailPage = null;
         this.realTempEmail = null;
         this.chromePath = null;
-        this.oauthHandled = false;
     }
 
     async initBrowser() {
@@ -605,156 +604,22 @@ class CleverCloudBot {
         throw new Error('No verification email received');
     }
 
-    async handleOAuth(url, email, password) {
-        log('OAUTH', 'Auto-login in progress...', 'info', this.instanceId);
-        try {
-            const oauthPage = await this.browser.newPage();
-            
-            await oauthPage.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
-            log('OAUTH', 'Page loaded, looking for login form...', 'info', this.instanceId);
-            
-            await sleep(5000);
-            
-            // Check if already logged in
-            const alreadyLoggedIn = await oauthPage.evaluate(() => {
-                const body = document.body.innerText;
-                return body.includes('already logged in') || body.includes('redirecting');
-            });
-            
-            if (alreadyLoggedIn) {
-                log('OAUTH', 'Already logged in, waiting for redirect...', 'info', this.instanceId);
-                await sleep(5000);
-                await oauthPage.close();
-                return true;
-            }
-            
-            // Try multiple selectors for email field
-            const emailSelectors = [
-                'input[type="email"]',
-                'input[name="email"]', 
-                'input[id="email"]',
-                'input[placeholder*="email" i]',
-                '#username',
-                '#login_email',
-                'input[name="username"]'
-            ];
-            
-            let emailField = null;
-            for (const selector of emailSelectors) {
-                try {
-                    emailField = await oauthPage.$(selector);
-                    if (emailField) {
-                        log('OAUTH', 'Found email field', 'info', this.instanceId);
-                        break;
-                    }
-                } catch(e) {}
-            }
-            
-            // Try multiple selectors for password field
-            const passwordSelectors = [
-                'input[type="password"]',
-                'input[name="password"]',
-                'input[id="password"]',
-                'input[placeholder*="password" i]',
-                '#password',
-                '#login_password'
-            ];
-            
-            let passwordField = null;
-            for (const selector of passwordSelectors) {
-                try {
-                    passwordField = await oauthPage.$(selector);
-                    if (passwordField) {
-                        log('OAUTH', 'Found password field', 'info', this.instanceId);
-                        break;
-                    }
-                } catch(e) {}
-            }
-            
-            if (emailField && passwordField) {
-                await emailField.click({ clickCount: 3 });
-                await emailField.press('Backspace');
-                await emailField.type(email, { delay: 100 });
-                log('OAUTH', 'Email filled', 'success', this.instanceId);
-                
-                await passwordField.click({ clickCount: 3 });
-                await passwordField.press('Backspace');
-                await passwordField.type(password, { delay: 100 });
-                log('OAUTH', 'Password filled', 'success', this.instanceId);
-                
-                await sleep(2000);
-                
-                let loginClicked = false;
-                
-                const buttonSelectors = [
-                    'button[type="submit"]',
-                    'input[type="submit"]',
-                    '.login-button',
-                    '#login-button',
-                    'button.btn-primary'
-                ];
-                
-                for (const selector of buttonSelectors) {
-                    try {
-                        const button = await oauthPage.$(selector);
-                        if (button) {
-                            await button.click();
-                            log('OAUTH', 'Clicked login button', 'success', this.instanceId);
-                            loginClicked = true;
-                            break;
-                        }
-                    } catch(e) {}
-                }
-                
-                if (!loginClicked) {
-                    loginClicked = await oauthPage.evaluate(() => {
-                        const btns = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-                        for (const btn of btns) {
-                            const text = (btn.innerText || btn.value || '').toLowerCase();
-                            if (text.includes('login') || text.includes('sign in')) {
-                                btn.click();
-                                return true;
-                            }
-                        }
-                        const form = document.querySelector('form');
-                        if (form) {
-                            form.submit();
-                            return true;
-                        }
-                        return false;
-                    });
-                    if (loginClicked) log('OAUTH', 'Submitted login', 'success', this.instanceId);
-                }
-                
-                if (!loginClicked) {
-                    await passwordField.press('Enter');
-                    log('OAUTH', 'Pressed Enter', 'success', this.instanceId);
-                }
-            } else {
-                log('OAUTH', 'Could not find email/password fields', 'error', this.instanceId);
-            }
-            
-            await sleep(8000);
-            await oauthPage.close();
-            log('OAUTH', 'OAuth flow completed', 'success', this.instanceId);
-            return true;
-            
-        } catch (error) {
-            log('OAUTH', `Error: ${error.message}`, 'error', this.instanceId);
-            return false;
-        }
-    }
-
     async startDockerInBackground(email, password) {
         return new Promise(async (resolve) => {
             log('DOCKER', 'Starting Docker deployment...', 'info', this.instanceId);
             
-            // Install and login to Clever Cloud
+            // Install Clever CLI and login with token
             await installCleverCLI();
-            const loggedIn = await loginCleverCloud();
             
-            if (!loggedIn && ENV.CLEVER_TOKEN) {
-                log('DOCKER', 'Token login failed, will try OAuth', 'warn', this.instanceId);
+            if (ENV.CLEVER_TOKEN) {
+                const loggedIn = await loginCleverCloud();
+                if (!loggedIn) {
+                    log('DOCKER', 'Token login failed, deployment may fail', 'warn', this.instanceId);
+                }
+            } else {
+                log('DOCKER', 'No CLEVER_TOKEN set, deployment will fail', 'error', this.instanceId);
+                resolve({ success: false, email, deployedApps: [] });
+                return;
             }
             
             const dockerScriptPath = '/app/docker';
@@ -777,23 +642,12 @@ class CleverCloudBot {
             });
             
             let deployedApps = [];
-            let oauthUrlDetected = false;
             let outputBuffer = '';
             
-            dockerProcess.stdout.on('data', async (data) => {
+            dockerProcess.stdout.on('data', (data) => {
                 const output = data.toString();
                 outputBuffer += output;
                 console.log(`[DOCKER] ${output.trim()}`);
-                
-                if (!oauthUrlDetected && !this.oauthHandled && !loggedIn) {
-                    const oauthMatch = output.match(/https:\/\/console\.clever-cloud\.com\/cli-oauth\?[^\s]+/);
-                    if (oauthMatch) {
-                        oauthUrlDetected = true;
-                        this.oauthHandled = true;
-                        log('OAUTH', 'OAuth URL detected, handling...', 'info', this.instanceId);
-                        await this.handleOAuth(oauthMatch[0], email, password);
-                    }
-                }
                 
                 const urlMatch = output.match(/https:\/\/[a-z0-9-]+\.osc-fr1\.scalingo\.io/);
                 if (urlMatch && !deployedApps.includes(urlMatch[0])) {
@@ -895,6 +749,10 @@ class CleverCloudBot {
     async runLoop() {
         log('START', '=== BOT STARTING ===', 'info', this.instanceId);
         log('START', `Mode: ${ENV.CLI_RESTART_ENABLED ? 'Central Server (restart after each account)' : 'Worker (continuous creation)'}`, 'info', this.instanceId);
+        
+        if (!ENV.CLEVER_TOKEN) {
+            log('START', '⚠️ WARNING: CLEVER_TOKEN not set! Deployment will fail!', 'error', this.instanceId);
+        }
         
         if (ENV.CLI_RESTART_ENABLED) {
             while (true) {
