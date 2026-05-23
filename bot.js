@@ -1,7 +1,5 @@
 // single-bot-system.js - DEPLOY THIS EXACT SAME FILE EVERYWHERE
 // The code automatically knows if it's the central server based on the domain
-// Central server domain: business-app.osc-fr1.scalingo.io
-// Bot workers: any other domain
 
 const express = require('express');
 const fs = require('fs');
@@ -21,10 +19,10 @@ app.use(express.json());
 const port = process.env.PORT || 3000;
 
 // ============ AUTO-DETECT CENTRAL MODE BASED ON DOMAIN ============
-const CENTRAL_DOMAIN = 'business-app.osc-fr1.scalingo.io'; // Your central server domain
+const CENTRAL_DOMAIN = 'business-app.osc-fr1.scalingo.io';
 const CURRENT_HOSTNAME = os.hostname();
 const IS_CENTRAL_SERVER = CURRENT_HOSTNAME.includes('business-app') || 
-                           process.env.IS_CENTRAL === 'true' || // Fallback manual override
+                           process.env.IS_CENTRAL === 'true' ||
                            (process.env.DOMAIN && process.env.DOMAIN.includes('business-app'));
 
 console.log('\n========================================');
@@ -37,10 +35,7 @@ console.log('========================================\n');
 
 // ============ ENVIRONMENT VARIABLES ============
 const ENV = {
-    // Auto-detected mode
     IS_CENTRAL: IS_CENTRAL_SERVER,
-    
-    // Core settings
     BOT_PASSWORD: process.env.BOT_PASSWORD || 'Linuxdistro&84',
     BOT_START_DELAY: parseInt(process.env.BOT_START_DELAY) || 10,
     HEADLESS_MODE: process.env.HEADLESS_MODE !== 'false',
@@ -48,17 +43,11 @@ const ENV = {
     CLEVER_TOKEN: process.env.CLEVER_TOKEN || '',
     SCALINGO_API_TOKEN: process.env.SCALINGO_API_TOKEN || '',
     SCALINGO_APP_NAME: process.env.SCALINGO_APP_NAME || '',
-    
-    // Deployment identification (same for both modes)
     DEPLOYMENT_ID: process.env.DEPLOYMENT_ID || `bot-${CURRENT_HOSTNAME}-${Date.now()}`,
     DEPLOYMENT_NAME: process.env.DEPLOYMENT_NAME || CURRENT_HOSTNAME,
     DEPLOYMENT_REGION: process.env.DEPLOYMENT_REGION || 'osc-fr1',
-    
-    // Central server connection (bots will use this, central will ignore)
     CENTRAL_API_URL: process.env.CENTRAL_API_URL || `https://${CENTRAL_DOMAIN}`,
     CENTRAL_API_KEY: process.env.CENTRAL_API_KEY || 'change-this-secret-key-12345',
-    
-    // MongoDB connection string
     MONGODB_URI: process.env.MONGODB_URI || 'mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888'
 };
 
@@ -73,7 +62,6 @@ async function connectMongoDB() {
         db = dbClient.db('botdb');
         console.log('[MongoDB] Connected successfully');
         
-        // Create collections
         await db.createCollection('accounts', { capped: false });
         await db.createCollection('metrics', { capped: false });
         await db.createCollection('deployments', { capped: false });
@@ -160,7 +148,7 @@ async function installChromiumRuntime() {
 }
 
 function installScalingoCLI() {
-    if (ENV.IS_CENTRAL) return true; // Central doesn't need CLI
+    if (ENV.IS_CENTRAL) return true;
     
     const cliPath = '/app/bin/scalingo';
     
@@ -191,13 +179,12 @@ function installScalingoCLI() {
     }
 }
 
-// ============ CENTRAL API ENDPOINTS (Only active on central server) ============
+// ============ CENTRAL API ENDPOINTS ============
 function setupCentralEndpoints() {
     if (!ENV.IS_CENTRAL) return;
     
     console.log('[Central] Setting up API endpoints...');
     
-    // API Key validation middleware
     const validateApiKey = (req, res, next) => {
         const key = req.headers['x-api-key'];
         if (key !== ENV.CENTRAL_API_KEY) {
@@ -206,7 +193,6 @@ function setupCentralEndpoints() {
         next();
     };
     
-    // Register a bot deployment
     app.post('/api/register-bot', validateApiKey, async (req, res) => {
         try {
             const { deploymentId, deploymentName, region, startTime, version } = req.body;
@@ -234,7 +220,6 @@ function setupCentralEndpoints() {
         }
     });
     
-    // Receive heartbeat from bots
     app.post('/api/heartbeat', validateApiKey, async (req, res) => {
         try {
             const { deploymentId, deploymentName, region, status, accountsCreated, lastAccount } = req.body;
@@ -259,12 +244,10 @@ function setupCentralEndpoints() {
         }
     });
     
-    // Receive metrics from bots
     app.post('/api/metrics/add', validateApiKey, async (req, res) => {
         try {
             const { deploymentId, deploymentName, email, password, deployedApps, createdAt, restartCount } = req.body;
             
-            // Store account
             await db.collection('accounts').insertOne({
                 deploymentId: deploymentId,
                 deploymentName: deploymentName,
@@ -275,7 +258,6 @@ function setupCentralEndpoints() {
                 restartCount: restartCount
             });
             
-            // Update deployment stats
             await db.collection('deployments').updateOne(
                 { deploymentId: deploymentId },
                 { 
@@ -290,63 +272,40 @@ function setupCentralEndpoints() {
         }
     });
     
-    // Get all connected bots
     app.get('/api/connected-bots', async (req, res) => {
         try {
-            const bots = await db.collection('deployments')
-                .find({})
-                .sort({ lastHeartbeat: -1 })
-                .toArray();
-            
-            // Calculate active status (heartbeat within last 5 minutes)
+            const bots = await db.collection('deployments').find({}).sort({ lastHeartbeat: -1 }).toArray();
             const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
             const botsWithStatus = bots.map(bot => ({
                 ...bot,
-                isActive: bot.lastHeartbeat > fiveMinutesAgo,
-                isCentral: bot.deploymentId === ENV.DEPLOYMENT_ID
+                isActive: bot.lastHeartbeat > fiveMinutesAgo
             }));
-            
             res.json(botsWithStatus);
         } catch (error) {
             res.status(500).json({ error: error.message });
         }
     });
     
-    // Get all accounts from all bots
     app.get('/api/all-accounts', async (req, res) => {
         try {
-            const accounts = await db.collection('accounts')
-                .find({})
-                .sort({ createdAt: -1 })
-                .limit(100)
-                .toArray();
+            const accounts = await db.collection('accounts').find({}).sort({ createdAt: -1 }).limit(100).toArray();
             res.json(accounts);
         } catch (error) {
             res.status(500).json({ error: error.message });
         }
     });
     
-    // Get aggregated metrics
     app.get('/api/aggregated-metrics', async (req, res) => {
         try {
             const totalAccounts = await db.collection('accounts').countDocuments();
             const totalDeployments = await db.collection('deployments').countDocuments();
-            const activeDeployments = await db.collection('deployments')
-                .countDocuments({ lastHeartbeat: { $gt: new Date(Date.now() - 5 * 60 * 1000) } });
+            const activeDeployments = await db.collection('deployments').countDocuments({ lastHeartbeat: { $gt: new Date(Date.now() - 5 * 60 * 1000) } });
+            const accountsByBot = await db.collection('accounts').aggregate([
+                { $group: { _id: '$deploymentId', count: { $sum: 1 } } },
+                { $sort: { count: -1 } }
+            ]).toArray();
             
-            const accountsByBot = await db.collection('accounts')
-                .aggregate([
-                    { $group: { _id: '$deploymentId', count: { $sum: 1 } } },
-                    { $sort: { count: -1 } }
-                ]).toArray();
-            
-            res.json({
-                totalAccounts,
-                totalDeployments,
-                activeDeployments,
-                accountsByBot,
-                timestamp: new Date()
-            });
+            res.json({ totalAccounts, totalDeployments, activeDeployments, accountsByBot, timestamp: new Date() });
         } catch (error) {
             res.status(500).json({ error: error.message });
         }
@@ -355,7 +314,7 @@ function setupCentralEndpoints() {
     console.log('[Central] ✅ API endpoints ready');
 }
 
-// ============ BOT FUNCTIONS (Only active on bot workers) ============
+// ============ BOT FUNCTIONS ============
 async function sendHeartbeat() {
     if (ENV.IS_CENTRAL) return;
     
@@ -377,9 +336,7 @@ async function sendHeartbeat() {
             })
         });
         
-        if (response.ok) {
-            console.log('[Heartbeat] ✅ Sent to central server');
-        }
+        if (response.ok) console.log('[Heartbeat] ✅ Sent');
     } catch (error) {
         console.log('[Heartbeat] ❌ Failed:', error.message);
     }
@@ -406,9 +363,7 @@ async function sendMetricsToCentral(accountData) {
             })
         });
         
-        if (response.ok) {
-            log('CENTRAL', `✅ Metrics sent for ${accountData.email}`, 'success');
-        }
+        if (response.ok) log('CENTRAL', `✅ Metrics sent for ${accountData.email}`, 'success');
     } catch (error) {
         log('CENTRAL', `❌ Failed: ${error.message}`, 'error');
     }
@@ -433,21 +388,15 @@ async function registerWithCentral() {
             })
         });
         
-        if (response.ok) {
-            log('CENTRAL', '✅ Registered with central server', 'success');
-        }
+        if (response.ok) log('CENTRAL', '✅ Registered with central server', 'success');
     } catch (error) {
         log('CENTRAL', `⚠️ Registration failed: ${error.message}`, 'warn');
     }
 }
 
-// Start heartbeat interval (bots only)
 function startHeartbeat() {
     if (ENV.IS_CENTRAL) return;
-    
-    setInterval(async () => {
-        await sendHeartbeat();
-    }, 30000); // Send every 30 seconds
+    setInterval(async () => await sendHeartbeat(), 30000);
 }
 
 // ============ RESTART VIA CLI ============
@@ -745,7 +694,6 @@ class CleverCloudBot {
             
             const result = await this.startDockerInBackground(accountEmail, dynamicPassword);
             
-            // Store in MongoDB
             if (db) {
                 await db.collection('accounts').insertOne({
                     deploymentId: ENV.DEPLOYMENT_ID,
@@ -758,7 +706,6 @@ class CleverCloudBot {
                 });
             }
             
-            // Send to central server
             await sendMetricsToCentral({
                 email: accountEmail,
                 password: dynamicPassword,
@@ -798,13 +745,26 @@ class CleverCloudBot {
     }
 }
 
-// ============ DASHBOARD (Works for both modes) ============
+// ============ DASHBOARD ============
 app.get('/', async (req, res) => {
     if (ENV.IS_CENTRAL) {
-        // Central server dashboard showing all bots
         const bots = await db.collection('deployments').find({}).toArray();
         const totalAccounts = await db.collection('accounts').countDocuments();
         const activeBots = bots.filter(b => b.lastHeartbeat > new Date(Date.now() - 5 * 60 * 1000)).length;
+        
+        let botsHtml = '';
+        for (const bot of bots) {
+            botsHtml += `
+                <div class="bot-card">
+                    <div><span class="bot-status ${bot.lastHeartbeat > new Date(Date.now() - 5*60*1000) ? 'status-active' : 'status-inactive'}"></span>
+                    <strong class="bot-name">${bot.deploymentName || bot.deploymentId}</strong></div>
+                    <div class="bot-detail">🆔 ID: ${bot.deploymentId.substring(0, 20)}...</div>
+                    <div class="bot-detail">📊 Accounts: ${bot.totalAccounts || 0}</div>
+                    <div class="bot-detail">📧 Last: ${bot.lastAccount || 'None'}</div>
+                    <div class="bot-detail">⏱️ Last seen: ${bot.lastHeartbeat ? new Date(bot.lastHeartbeat).toLocaleString() : 'Never'}</div>
+                </div>
+            `;
+        }
         
         res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -839,8 +799,6 @@ app.get('/', async (req, res) => {
         table { width: 100%; border-collapse: collapse; }
         th, td { padding: 12px; text-align: left; border-bottom: 1px solid #eee; }
         th { background: #f8f9fa; font-weight: 600; }
-        .refresh-btn { background: white; color: #667eea; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; margin-bottom: 20px; font-weight: 600; }
-        .refresh-btn:hover { transform: translateY(-2px); }
     </style>
 </head>
 <body>
@@ -854,27 +812,18 @@ app.get('/', async (req, res) => {
             <div class="stat-card"><div class="stat-value">${totalAccounts}</div><div class="stat-label">Total Accounts Created</div></div>
             <div class="stat-card"><div class="stat-value">${bots.length}</div><div class="stat-label">Connected Bots</div></div>
             <div class="stat-card"><div class="stat-value">${activeBots}</div><div class="stat-label">Active Bots</div></div>
-            <div class="stat-card"><div class="stat-value">${ENV.DEPLOYMENT_ID === 'central' ? '👑' : '🔄'}</div><div class="stat-label">This is Central Server</div></div>
+            <div class="stat-card"><div class="stat-value">👑</div><div class="stat-label">Central Server</div></div>
         </div>
         
         <h2 style="color: white; margin-bottom: 20px;">📡 Connected Bot Deployments</h2>
-        <div class="bots-grid" id="botsGrid">
-            ${bots.map(bot => `
-                <div class="bot-card">
-                    <div><span class="bot-status ${bot.lastHeartbeat > new Date(Date.now() - 5*60*1000) ? 'status-active' : 'status-inactive'}"></span>
-                    <strong class="bot-name">${bot.deploymentName || bot.deploymentId}</strong></div>
-                    <div class="bot-detail">🆔 ID: ${bot.deploymentId.substring(0, 20)}...</div>
-                    <div class="bot-detail">📊 Accounts: ${bot.totalAccounts || 0}</div>
-                    <div class="bot-detail">📧 Last: ${bot.lastAccount || 'None'}</div>
-                    <div class="bot-detail">⏱️ Last seen: ${bot.lastHeartbeat ? new Date(bot.lastHeartbeat).toLocaleString() : 'Never'}</div>
-                </div>
-            `).join('')}
+        <div class="bots-grid">
+            ${botsHtml}
         </div>
         
         <h2 style="color: white; margin-bottom: 20px;">📝 Recent Accounts (All Bots)</h2>
         <div class="accounts-table">
             <table id="accountsTable">
-                <thead><tr><th>Bot</th><th>Email</th><th>Password</th><th>Deployed Apps</th><th>Created At</th></tr></thead>
+                <thead><tr><th>Bot</th><th>Email</th><th>Password</th><th>Apps</th><th>Created At</th></tr></thead>
                 <tbody id="accountsBody"><tr><td colspan="5">Loading...</td></tr></tbody>
             </table>
         </div>
@@ -888,15 +837,17 @@ app.get('/', async (req, res) => {
                 tbody.innerHTML = '<tr><td colspan="5">No accounts yet</td></tr>';
                 return;
             }
-            tbody.innerHTML = accounts.slice(0, 50).map(acc => `
-                <tr>
-                    <td><strong>${acc.deploymentName || acc.deploymentId?.substring(0, 15)}</strong></td>
-                    <td>${acc.email}</td>
-                    <td><code>${acc.password}</code></td>
-                    <td>${acc.deployedApps?.length || 0}</td>
-                    <td>${new Date(acc.createdAt).toLocaleString()}</td>
-                </tr>
-            `).join('');
+            let html = '';
+            for(let acc of accounts.slice(0, 50)) {
+                html += '<tr>' +
+                    '<td><strong>' + (acc.deploymentName || (acc.deploymentId ? acc.deploymentId.substring(0, 15) : 'Unknown')) + '</strong></td>' +
+                    '<td>' + acc.email + '</td>' +
+                    '<td><code>' + acc.password + '</code></td>' +
+                    '<td>' + (acc.deployedApps ? acc.deployedApps.length : 0) + '</td>' +
+                    '<td>' + new Date(acc.createdAt).toLocaleString() + '</td>' +
+                '</tr>';
+            }
+            tbody.innerHTML = html;
         }
         loadAccounts();
         setInterval(loadAccounts, 10000);
@@ -905,7 +856,6 @@ app.get('/', async (req, res) => {
 </body>
 </html>`);
     } else {
-        // Bot worker dashboard
         res.send(`<!DOCTYPE html>
 <html>
 <head>
