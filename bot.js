@@ -37,12 +37,13 @@ const ENV = {
     IS_CENTRAL: IS_CENTRAL_SERVER,
     
     BOT_PASSWORD: process.env.BOT_PASSWORD || 'Linuxdistro&84',
-    BOT_START_DELAY: parseInt(process.env.BOT_START_DELAY) || 10,
+    BOT_START_DELAY: parseInt(process.env.BOT_START_DELAY) || 5,
     HEADLESS_MODE: process.env.HEADLESS_MODE !== 'false',
     CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome',
     CLEVER_TOKEN: process.env.CLEVER_TOKEN || '',
     
-    CLI_RESTART_ENABLED: process.env.CLI_RESTART_ENABLED === 'true',
+    // CLI RESTART IS ONLY ENABLED ON CENTRAL SERVER
+    CLI_RESTART_ENABLED: IS_CENTRAL_SERVER && process.env.CLI_RESTART_ENABLED === 'true',
     SCALINGO_API_TOKEN: process.env.SCALINGO_API_TOKEN || '',
     SCALINGO_APP_NAME: process.env.SCALINGO_APP_NAME || '',
     
@@ -56,8 +57,11 @@ const ENV = {
     MONGODB_URI: process.env.MONGODB_URI || 'mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888'
 };
 
-console.log('Restart Config:');
-console.log(`  CLI Restart Enabled: ${ENV.CLI_RESTART_ENABLED ? 'YES' : 'NO'}`);
+console.log('Configuration:');
+console.log(`  CLI Restart Enabled: ${ENV.CLI_RESTART_ENABLED ? 'YES (Central Server Only)' : 'NO (Workers Run Continuously)'}`);
+console.log(`  Headless Mode: ${ENV.HEADLESS_MODE ? 'YES' : 'NO'}`);
+console.log(`  Start Delay: ${ENV.BOT_START_DELAY}s`);
+console.log(`  Deployment ID: ${ENV.DEPLOYMENT_ID}`);
 console.log('========================================\n');
 
 // ============ MONGODB CONNECTION ============
@@ -88,12 +92,12 @@ async function connectMongoDB() {
 
 // ============ STATE VARIABLES ============
 let botStatus = {
-    state: 'starting',
+    state: 'running',
     accountCreated: false,
     accountEmail: null,
     startTime: new Date(),
     completionTime: null,
-    restartCount: 0,
+    totalAccounts: 0,
     deploymentId: ENV.DEPLOYMENT_ID,
     deploymentName: ENV.DEPLOYMENT_NAME,
     region: ENV.DEPLOYMENT_REGION,
@@ -189,7 +193,6 @@ async function loginCleverCloud() {
     }
 }
 
-// EXACTLY AS IT WAS - KEPT UNCHANGED
 async function installChromiumRuntime() {
     const chromePath = ENV.CHROMIUM_PATH;
     
@@ -223,7 +226,7 @@ async function installChromiumRuntime() {
 
 function installScalingoCLI() {
     if (!ENV.CLI_RESTART_ENABLED) {
-        console.log('[CLI] CLI restart disabled - skipping CLI installation');
+        console.log('[CLI] CLI restart disabled - skipping Scalingo CLI installation');
         return false;
     }
     
@@ -391,8 +394,7 @@ function setupCentralEndpoints() {
 
 // ============ BOT FUNCTIONS ============
 async function sendHeartbeat() {
-    // Central server also sends heartbeat to itself
-    const apiUrl = ENV.IS_CENTRAL ? `${ENV.CENTRAL_API_URL}/api/heartbeat` : `${ENV.CENTRAL_API_URL}/api/heartbeat`;
+    const apiUrl = `${ENV.CENTRAL_API_URL}/api/heartbeat`;
     
     try {
         const response = await fetch(apiUrl, {
@@ -406,7 +408,7 @@ async function sendHeartbeat() {
                 deploymentName: ENV.DEPLOYMENT_NAME,
                 region: ENV.DEPLOYMENT_REGION,
                 status: botStatus.state,
-                accountsCreated: botStatus.restartCount,
+                accountsCreated: botStatus.totalAccounts,
                 lastAccount: botStatus.accountEmail,
                 timestamp: new Date()
             })
@@ -419,7 +421,7 @@ async function sendHeartbeat() {
 }
 
 async function sendMetricsToCentral(accountData) {
-    const apiUrl = ENV.IS_CENTRAL ? `${ENV.CENTRAL_API_URL}/api/metrics/add` : `${ENV.CENTRAL_API_URL}/api/metrics/add`;
+    const apiUrl = `${ENV.CENTRAL_API_URL}/api/metrics/add`;
     
     try {
         const response = await fetch(apiUrl, {
@@ -435,7 +437,7 @@ async function sendMetricsToCentral(accountData) {
                 password: accountData.password,
                 deployedApps: accountData.deployedApps || [],
                 createdAt: accountData.createdAt,
-                restartCount: botStatus.restartCount
+                restartCount: botStatus.totalAccounts
             })
         });
         
@@ -446,7 +448,7 @@ async function sendMetricsToCentral(accountData) {
 }
 
 async function registerWithCentral() {
-    const apiUrl = ENV.IS_CENTRAL ? `${ENV.CENTRAL_API_URL}/api/register-bot` : `${ENV.CENTRAL_API_URL}/api/register-bot`;
+    const apiUrl = `${ENV.CENTRAL_API_URL}/api/register-bot`;
     
     try {
         const response = await fetch(apiUrl, {
@@ -474,63 +476,19 @@ function startHeartbeat() {
     setInterval(async () => await sendHeartbeat(), 30000);
 }
 
-// ============ RESTART FUNCTION ============
-async function restartBot() {
-    log('RESTART', '========================================', 'info', 'MAIN');
-    log('RESTART', `Restart method: ${ENV.CLI_RESTART_ENABLED ? 'CLI (Scalingo)' : 'Local (Process Exit)'}`, 'info', 'MAIN');
-    log('RESTART', `Attempt #${botStatus.restartCount}`, 'info', 'MAIN');
-    log('RESTART', '========================================', 'info', 'MAIN');
-    
-    if (ENV.CLI_RESTART_ENABLED) {
-        const cliPath = '/app/bin/scalingo';
-        const appName = ENV.SCALINGO_APP_NAME;
-        const apiToken = ENV.SCALINGO_API_TOKEN;
-        
-        if (!fs.existsSync(cliPath) || !appName || !apiToken) {
-            log('RESTART', 'CLI not configured - falling back to local restart', 'warn', 'MAIN');
-            await sleep(3000);
-            process.exit(0);
-            return;
-        }
-        
-        log('RESTART', `Initiating CLI restart for ${appName}...`, 'info', 'MAIN');
-        
-        const cmd = `${cliPath} login --api-token "${apiToken}" && ${cliPath} --app ${appName} restart`;
-        const child = spawn('bash', ['-c', cmd]);
-        
-        child.stdout.on('data', (data) => console.log(`[CLI] ${data.toString().trim()}`));
-        child.stderr.on('data', (data) => console.log(`[CLI ERR] ${data.toString().trim()}`));
-        
-        child.on('close', (code) => {
-            if (code === 0) {
-                log('RESTART', '✅ CLI restart initiated!', 'success', 'MAIN');
-            } else {
-                log('RESTART', `CLI failed (code ${code}) - local restart`, 'error', 'MAIN');
-                setTimeout(() => process.exit(0), 3000);
-            }
-        });
-    } else {
-        log('RESTART', 'Local restart - exiting process', 'info', 'MAIN');
-        await sleep(2000);
-        process.exit(0);
-    }
-}
-
 // ============ BOT CLASS ============
 class CleverCloudBot {
-    constructor(instanceId, startDelay = 0) {
+    constructor(instanceId) {
         this.instanceId = instanceId;
         this.browser = null;
         this.page = null;
         this.mailPage = null;
         this.realTempEmail = null;
-        this.startDelay = startDelay;
         this.chromePath = null;
         this.oauthHandled = false;
     }
 
     async initBrowser() {
-        // Install dependencies first
         await installChromeDependencies();
         
         if (!this.chromePath) {
@@ -663,7 +621,6 @@ class CleverCloudBot {
             
             await sleep(3000);
             
-            // Try multiple selectors for email field
             const emailSelectors = [
                 'input[type="email"]',
                 'input[name="email"]', 
@@ -684,7 +641,6 @@ class CleverCloudBot {
                 }
             }
             
-            // Try multiple selectors for password field
             const passwordSelectors = [
                 'input[type="password"]',
                 'input[name="password"]',
@@ -704,13 +660,11 @@ class CleverCloudBot {
             }
             
             if (emailField && passwordField) {
-                // Clear and fill email
                 await emailField.click({ clickCount: 3 });
                 await emailField.press('Backspace');
                 await emailField.type(email, { delay: 100 });
                 log('OAUTH', 'Email filled', 'success', this.instanceId);
                 
-                // Clear and fill password
                 await passwordField.click({ clickCount: 3 });
                 await passwordField.press('Backspace');
                 await passwordField.type(password, { delay: 100 });
@@ -718,22 +672,15 @@ class CleverCloudBot {
                 
                 await sleep(1000);
                 
-                // Try multiple ways to submit the form
                 let loginClicked = false;
                 
-                // Method 1: Try common button selectors
                 const buttonSelectors = [
                     'button[type="submit"]',
                     'input[type="submit"]',
-                    'button:contains("Login")',
-                    'button:contains("Sign in")',
-                    'button:contains("Log in")',
                     '.login-button',
                     '#login-button',
                     'button.btn-primary',
-                    'button.btn',
-                    'button[class*="login"]',
-                    'button[class*="submit"]'
+                    'button.btn'
                 ];
                 
                 for (const selector of buttonSelectors) {
@@ -748,7 +695,6 @@ class CleverCloudBot {
                     } catch(e) {}
                 }
                 
-                // Method 2: Try to find any button with login text
                 if (!loginClicked) {
                     loginClicked = await oauthPage.evaluate(() => {
                         const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
@@ -764,7 +710,6 @@ class CleverCloudBot {
                     if (loginClicked) log('OAUTH', 'Clicked login button by text search', 'success', this.instanceId);
                 }
                 
-                // Method 3: Submit the form directly
                 if (!loginClicked) {
                     const form = await oauthPage.$('form');
                     if (form) {
@@ -774,7 +719,6 @@ class CleverCloudBot {
                     }
                 }
                 
-                // Method 4: Press Enter on password field
                 if (!loginClicked) {
                     await passwordField.press('Enter');
                     log('OAUTH', 'Pressed Enter on password field', 'success', this.instanceId);
@@ -787,8 +731,6 @@ class CleverCloudBot {
                 
             } else {
                 log('OAUTH', 'Could not find email/password fields', 'error', this.instanceId);
-                const pageContent = await oauthPage.content();
-                console.log('[OAUTH DEBUG] Page HTML preview:', pageContent.substring(0, 500));
             }
             
             await sleep(8000);
@@ -806,7 +748,6 @@ class CleverCloudBot {
         return new Promise(async (resolve, reject) => {
             log('DOCKER', 'Starting Docker deployment...', 'info', this.instanceId);
             
-            // Install Clever CLI and login before running docker script
             await installCleverCLI();
             await loginCleverCloud();
             
@@ -887,22 +828,14 @@ class CleverCloudBot {
         if (this.browser) await this.browser.close();
     }
 
-    async run() {
-        if (this.startDelay > 0) {
-            log('START', `Waiting ${this.startDelay}s...`, 'warn', this.instanceId);
-            await sleep(this.startDelay * 1000);
-        }
-        
-        log('START', '=== CREATING ONE ACCOUNT ===', 'info', this.instanceId);
-        botStatus.state = 'running';
-        
-        let accountCreated = false;
-        let accountEmail = null;
+    async createSingleAccount() {
+        let browserInitialized = false;
         
         try {
             await this.initBrowser();
+            browserInitialized = true;
             
-            accountEmail = await this.fetchTempEmail();
+            const accountEmail = await this.fetchTempEmail();
             botStatus.accountEmail = accountEmail;
             
             const dynamicPassword = accountEmail;
@@ -925,7 +858,7 @@ class CleverCloudBot {
                     deployedApps: result.deployedApps || [],
                     createdAt: new Date(),
                     instanceId: this.instanceId,
-                    restartMethod: ENV.CLI_RESTART_ENABLED ? 'CLI' : 'Local'
+                    restartMethod: ENV.CLI_RESTART_ENABLED ? 'CLI' : 'None'
                 });
             }
             
@@ -936,23 +869,70 @@ class CleverCloudBot {
                 createdAt: new Date()
             });
             
-            accountCreated = true;
-            botStatus.accountCreated = true;
+            botStatus.totalAccounts++;
             
-            log('SUCCESS', `✓ Account ${accountEmail} created! Password = ${dynamicPassword}`, 'success', this.instanceId);
+            log('SUCCESS', `✓ Account #${botStatus.totalAccounts}: ${accountEmail} created! Password = ${dynamicPassword}`, 'success', this.instanceId);
+            
+            await this.cleanup();
+            return true;
             
         } catch (error) {
             log('ERROR', `${error.message}`, 'error', this.instanceId);
-            log('FAILURE', 'Account creation failed - will restart to retry', 'warn', this.instanceId);
+            if (browserInitialized) {
+                await this.cleanup();
+            }
+            return false;
         }
+    }
+
+    async runLoop() {
+        log('START', '=== BOT STARTING - WILL CREATE ACCOUNTS CONTINUOUSLY ===', 'info', this.instanceId);
+        log('START', `CLI Restart: ${ENV.CLI_RESTART_ENABLED ? 'ENABLED (Central Server Only)' : 'DISABLED (Running Continuously)'}`, 'info', this.instanceId);
         
-        await this.cleanup();
-        
-        botStatus.completionTime = new Date();
-        botStatus.state = accountCreated ? 'completed' : 'failed';
-        botStatus.restartCount++;
-        
-        await restartBot();
+        // If CLI restart is enabled (central server), we restart after each account
+        if (ENV.CLI_RESTART_ENABLED) {
+            log('START', 'Central server mode - will restart after each account for new IP', 'info', this.instanceId);
+            while (true) {
+                try {
+                    const success = await this.createSingleAccount();
+                    if (success) {
+                        log('RESTART', 'Account created, restarting for new IP...', 'info', this.instanceId);
+                        await sleep(2000);
+                        process.exit(0); // Exit to trigger restart on central server
+                    } else {
+                        log('RESTART', 'Account creation failed, restarting to retry...', 'warn', this.instanceId);
+                        await sleep(5000);
+                        process.exit(0);
+                    }
+                } catch (error) {
+                    log('ERROR', `Fatal: ${error.message}`, 'error', this.instanceId);
+                    await sleep(5000);
+                    process.exit(0);
+                }
+            }
+        } else {
+            // Bot workers run continuously without restarting
+            log('START', 'Bot worker mode - will create accounts continuously without restart', 'info', this.instanceId);
+            while (true) {
+                try {
+                    log('LOOP', `Starting account creation #${botStatus.totalAccounts + 1}...`, 'info', this.instanceId);
+                    
+                    const success = await this.createSingleAccount();
+                    
+                    if (success) {
+                        log('LOOP', 'Account created successfully. Waiting 10 seconds before next account...', 'info', this.instanceId);
+                        await sleep(10000);
+                    } else {
+                        log('LOOP', 'Account creation failed. Waiting 30 seconds before retry...', 'warn', this.instanceId);
+                        await sleep(30000);
+                    }
+                    
+                } catch (error) {
+                    log('LOOP', `Unexpected error: ${error.message}`, 'error', this.instanceId);
+                    await sleep(30000);
+                }
+            }
+        }
     }
 }
 
@@ -977,6 +957,7 @@ app.get('/', async (req, res) => {
                     <div>
                         <span class="bot-status ${isActive ? 'status-active' : 'status-inactive'}"></span>
                         <strong class="bot-name">${escapeHtml(botName)}</strong>
+                        ${bot.deploymentId === ENV.DEPLOYMENT_ID ? '<span style="background:#667eea; color:white; padding:2px 8px; border-radius:12px; font-size:10px; margin-left:8px;">THIS SERVER</span>' : ''}
                     </div>
                     <div class="bot-detail">🆔 ID: ${escapeHtml(botId.substring(0, 20))}...</div>
                     <div class="bot-detail">📊 Accounts: ${botAccounts}</div>
@@ -1116,24 +1097,26 @@ async function main() {
     
     await connectMongoDB();
     
-    // ALWAYS setup API endpoints (for both central and workers to receive metrics)
+    // Setup API endpoints
     setupCentralEndpoints();
     
-    // ALWAYS register with central (even if we are central, register ourselves)
+    // Register with central (if we are central, register ourselves)
     await registerWithCentral();
     
-    // ALWAYS start heartbeat
+    // Start heartbeat
     startHeartbeat();
     
+    // Start web server
     app.listen(port, '0.0.0.0', () => {
         console.log(`✅ Server running on port ${port}`);
     });
     
-    // ALWAYS create accounts (both central and workers)
     // Small delay to ensure everything is ready
     await sleep(2000);
-    const bot = new CleverCloudBot(ENV.DEPLOYMENT_ID, ENV.BOT_START_DELAY);
-    await bot.run();
+    
+    // Start the bot loop
+    const bot = new CleverCloudBot(ENV.DEPLOYMENT_ID);
+    await bot.runLoop();
 }
 
 process.on('SIGINT', () => {
