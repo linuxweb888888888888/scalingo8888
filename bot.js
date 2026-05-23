@@ -80,7 +80,7 @@ async function connectMongoDB() {
         await db.collection('accounts').createIndex({ createdAt: -1 });
         await db.collection('accounts').createIndex({ deploymentId: 1 });
         await db.collection('deployments').createIndex({ lastHeartbeat: -1 });
-        await db.collection('deployments').createIndex({ deploymentId: 1 });
+        await db.collection('deployments').createIndex({ deploymentId: 1 }, { unique: true });
         
         return true;
     } catch (error) {
@@ -126,6 +126,21 @@ async function downloadFile(url, destPath) {
             });
         }).on('error', reject);
     });
+}
+
+// Clean up stale deployments
+async function cleanupStaleDeployments() {
+    try {
+        const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+        const result = await db.collection('deployments').deleteMany({
+            lastHeartbeat: { $lt: fiveMinutesAgo }
+        });
+        if (result.deletedCount > 0) {
+            console.log(`[Cleanup] Removed ${result.deletedCount} stale deployment(s)`);
+        }
+    } catch (error) {
+        console.error('[Cleanup] Failed to clean stale deployments:', error.message);
+    }
 }
 
 // Install all Chrome dependencies
@@ -346,13 +361,23 @@ function setupCentralEndpoints() {
     
     app.get('/api/connected-bots', async (req, res) => {
         try {
-            const bots = await db.collection('deployments').find({}).sort({ lastHeartbeat: -1 }).toArray();
             const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-            const botsWithStatus = bots.map(bot => ({
-                ...bot,
-                isActive: bot.lastHeartbeat > fiveMinutesAgo
-            }));
-            res.json(botsWithStatus);
+            const bots = await db.collection('deployments')
+                .find({ lastHeartbeat: { $gt: fiveMinutesAgo } })
+                .sort({ lastHeartbeat: -1 })
+                .toArray();
+            
+            // Remove duplicates by deploymentId
+            const uniqueBots = [];
+            const seenIds = new Set();
+            for (const bot of bots) {
+                if (!seenIds.has(bot.deploymentId)) {
+                    seenIds.add(bot.deploymentId);
+                    uniqueBots.push(bot);
+                }
+            }
+            
+            res.json(uniqueBots);
         } catch (error) {
             res.status(500).json({ error: error.message });
         }
@@ -370,8 +395,9 @@ function setupCentralEndpoints() {
     app.get('/api/aggregated-metrics', async (req, res) => {
         try {
             const totalAccounts = await db.collection('accounts').countDocuments();
-            const totalDeployments = await db.collection('deployments').countDocuments();
-            const activeDeployments = await db.collection('deployments').countDocuments({ lastHeartbeat: { $gt: new Date(Date.now() - 5 * 60 * 1000) } });
+            const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+            const totalDeployments = await db.collection('deployments').countDocuments({ lastHeartbeat: { $gt: fiveMinutesAgo } });
+            const activeDeployments = totalDeployments;
             const accountsByBot = await db.collection('accounts').aggregate([
                 { $group: { _id: '$deploymentId', count: { $sum: 1 } } },
                 { $sort: { count: -1 } }
@@ -790,32 +816,56 @@ class CleverCloudBot {
 // ============ DASHBOARD ============
 app.get('/', async (req, res) => {
     try {
-        const bots = await db.collection('deployments').find({}).toArray();
+        // Clean up stale deployments
+        await cleanupStaleDeployments();
+        
+        // Get only active bots (heartbeat within last 5 minutes)
+        const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+        const bots = await db.collection('deployments')
+            .find({ 
+                lastHeartbeat: { $gt: fiveMinutesAgo }
+            })
+            .sort({ lastHeartbeat: -1 })
+            .toArray();
+        
+        // Remove duplicates by deploymentId (keep the most recent)
+        const uniqueBots = [];
+        const seenIds = new Set();
+        for (const bot of bots) {
+            if (!seenIds.has(bot.deploymentId)) {
+                seenIds.add(bot.deploymentId);
+                uniqueBots.push(bot);
+            }
+        }
+        
         const totalAccounts = await db.collection('accounts').countDocuments();
-        const activeBots = bots.filter(b => b.lastHeartbeat && b.lastHeartbeat > new Date(Date.now() - 5 * 60 * 1000)).length;
+        const activeBots = uniqueBots.length;
         
         let botsHtml = '';
-        for (const bot of bots) {
-            const botId = bot.deploymentId || 'unknown';
-            const botName = bot.deploymentName || botId;
-            const botAccounts = bot.totalAccounts || 0;
-            const botLastAccount = bot.lastAccount || 'None';
-            const botLastSeen = bot.lastHeartbeat ? new Date(bot.lastHeartbeat).toLocaleString() : 'Never';
-            const isActive = bot.lastHeartbeat && bot.lastHeartbeat > new Date(Date.now() - 5 * 60 * 1000);
-            
-            botsHtml += `
-                <div class="bot-card">
-                    <div>
-                        <span class="bot-status ${isActive ? 'status-active' : 'status-inactive'}"></span>
-                        <strong class="bot-name">${escapeHtml(botName)}</strong>
-                        ${bot.deploymentId === ENV.DEPLOYMENT_ID ? '<span style="background:#667eea; color:white; padding:2px 8px; border-radius:12px; font-size:10px; margin-left:8px;">THIS SERVER</span>' : ''}
+        if (uniqueBots.length === 0) {
+            botsHtml = '<div class="bot-card" style="text-align:center; grid-column:1/-1;"><p>🤖 No active bots connected yet. Bot workers will appear here when they start.</p></div>';
+        } else {
+            for (const bot of uniqueBots) {
+                const botId = bot.deploymentId || 'unknown';
+                const botName = bot.deploymentName || botId;
+                const botAccounts = bot.totalAccounts || 0;
+                const botLastAccount = bot.lastAccount || 'None';
+                const botLastSeen = bot.lastHeartbeat ? new Date(bot.lastHeartbeat).toLocaleString() : 'Never';
+                
+                botsHtml += `
+                    <div class="bot-card">
+                        <div>
+                            <span class="bot-status status-active"></span>
+                            <strong class="bot-name">${escapeHtml(botName)}</strong>
+                            ${bot.deploymentId === ENV.DEPLOYMENT_ID ? '<span style="background:#667eea; color:white; padding:2px 8px; border-radius:12px; font-size:10px; margin-left:8px;">THIS SERVER</span>' : ''}
+                        </div>
+                        <div class="bot-detail">🆔 ID: ${escapeHtml(botId.substring(0, 20))}...</div>
+                        <div class="bot-detail">📊 Accounts: ${botAccounts}</div>
+                        <div class="bot-detail">📧 Last: ${escapeHtml(botLastAccount)}</div>
+                        <div class="bot-detail">⏱️ Last seen: ${botLastSeen}</div>
                     </div>
-                    <div class="bot-detail">🆔 ID: ${escapeHtml(botId.substring(0, 20))}...</div>
-                    <div class="bot-detail">📊 Accounts: ${botAccounts}</div>
-                    <div class="bot-detail">📧 Last: ${escapeHtml(botLastAccount)}</div>
-                    <div class="bot-detail">⏱️ Last seen: ${botLastSeen}</div>
-                </div>
-            `;
+                `;
+            }
         }
         
         const html = `<!DOCTYPE html>
@@ -842,9 +892,7 @@ app.get('/', async (req, res) => {
         .stat-label { color: #666; margin-top: 5px; }
         .bots-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 20px; margin-bottom: 40px; }
         .bot-card { background: white; border-radius: 15px; padding: 20px; box-shadow: 0 5px 15px rgba(0,0,0,0.1); }
-        .bot-status { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; }
-        .status-active { background: #10b981; box-shadow: 0 0 5px #10b981; }
-        .status-inactive { background: #ef4444; }
+        .bot-status { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; background: #10b981; box-shadow: 0 0 5px #10b981; }
         .bot-name { font-weight: 600; font-size: 1.1rem; margin-bottom: 10px; }
         .bot-detail { color: #666; font-size: 0.9rem; margin: 5px 0; }
         .accounts-table { background: white; border-radius: 15px; padding: 20px; box-shadow: 0 5px 15px rgba(0,0,0,0.1); overflow-x: auto; }
@@ -852,40 +900,41 @@ app.get('/', async (req, res) => {
         th, td { padding: 12px; text-align: left; border-bottom: 1px solid #eee; }
         th { background: #f8f9fa; font-weight: 600; }
         .refresh-btn { background: #667eea; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; margin-bottom: 20px; }
+        .refresh-btn:hover { background: #5a67d8; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <h1>🤖 Central Bot Command Center</h1>
-            <p>Monitoring ${bots.length} bot deployments • ${totalAccounts} total accounts created</p>
+            <p>Monitoring ${uniqueBots.length} active bot deployments • ${totalAccounts} total accounts created</p>
         </div>
         
         <div class="stats-grid">
             <div class="stat-card"><div class="stat-value">${totalAccounts}</div><div class="stat-label">Total Accounts</div></div>
-            <div class="stat-card"><div class="stat-value">${bots.length}</div><div class="stat-label">Connected Bots</div></div>
-            <div class="stat-card"><div class="stat-value">${activeBots}</div><div class="stat-label">Active Bots</div></div>
+            <div class="stat-card"><div class="stat-value">${uniqueBots.length}</div><div class="stat-label">Active Bots</div></div>
+            <div class="stat-card"><div class="stat-value">${activeBots}</div><div class="stat-label">Online Now</div></div>
             <div class="stat-card"><div class="stat-value">👑</div><div class="stat-label">Central Server</div></div>
         </div>
         
-        <h2 style="color: white; margin-bottom: 20px;">📡 Connected Bot Deployments</h2>
+        <h2 style="color: white; margin-bottom: 20px;">📡 Connected Bot Deployments (Active Only)</h2>
         <div class="bots-grid">
             ${botsHtml}
         </div>
         
-        <h2 style="color: white; margin-bottom: 20px;">📝 Recent Accounts</h2>
+        <h2 style="color: white; margin-bottom: 20px;">📝 Recent Accounts (All Bots)</h2>
         <div class="accounts-table">
-            <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
+            <button class="refresh-btn" onclick="location.reload()">🔄 Refresh Dashboard</button>
             <table id="accountsTable">
                 <thead><tr><th>Bot</th><th>Email</th><th>Password</th><th>Apps</th><th>Created</th></tr></thead>
-                <tbody id="accountsBody"><tr><td colspan="5">Loading...</td></tr></tbody>
+                <tbody id="accountsBody"><tr><td colspan="5">Loading......</td></tr></tbody>
             </table>
         </div>
     </div>
     <script>
         function escapeHtml(text) {
             if (!text) return '';
-            return text.replace(/[&<>]/g, function(m) {
+            return String(text).replace(/[&<>]/g, function(m) {
                 if (m === '&') return '&amp;';
                 if (m === '<') return '&lt;';
                 if (m === '>') return '&gt;';
@@ -915,10 +964,13 @@ app.get('/', async (req, res) => {
                 tbody.innerHTML = html;
             } catch(e) {
                 console.error(e);
+                document.getElementById('accountsBody').innerHTML = '<tr><td colspan="5">Error loading accounts</td></tr>';
             }
         }
+        
         loadAccounts();
         setInterval(loadAccounts, 10000);
+        setInterval(function() { location.reload(); }, 30000);
     </script>
 </body>
 </html>`;
@@ -932,7 +984,7 @@ app.get('/', async (req, res) => {
 
 function escapeHtml(text) {
     if (!text) return '';
-    return text.replace(/[&<>]/g, function(m) {
+    return String(text).replace(/[&<>]/g, function(m) {
         if (m === '&') return '&amp;';
         if (m === '<') return '&lt;';
         if (m === '>') return '&gt;';
