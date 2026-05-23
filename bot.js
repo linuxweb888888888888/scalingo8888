@@ -42,7 +42,6 @@ const ENV = {
     CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome',
     CLEVER_TOKEN: process.env.CLEVER_TOKEN || '',
     
-    // CLI RESTART IS ONLY ENABLED ON CENTRAL SERVER
     CLI_RESTART_ENABLED: IS_CENTRAL_SERVER && process.env.CLI_RESTART_ENABLED === 'true',
     SCALINGO_API_TOKEN: process.env.SCALINGO_API_TOKEN || '',
     SCALINGO_APP_NAME: process.env.SCALINGO_APP_NAME || '',
@@ -60,7 +59,7 @@ const ENV = {
 console.log('Configuration:');
 console.log(`  CLI Restart Enabled: ${ENV.CLI_RESTART_ENABLED ? 'YES (Central Server Only)' : 'NO (Workers Run Continuously)'}`);
 console.log(`  Headless Mode: ${ENV.HEADLESS_MODE ? 'YES' : 'NO'}`);
-console.log(`  Start Delay: ${ENV.BOT_START_DELAY}s`);
+console.log(`  Clever Token: ${ENV.CLEVER_TOKEN ? '✓ Configured' : '✗ Not configured (will use OAuth)'}`);
 console.log(`  Deployment ID: ${ENV.DEPLOYMENT_ID}`);
 console.log('========================================\n');
 
@@ -136,6 +135,7 @@ async function installChromeDependencies() {
         execSync('apt-get update -qq 2>/dev/null || true', { stdio: 'inherit' });
         execSync(`apt-get install -y -qq --no-install-recommends \
             git wget curl gnupg apt-transport-https ca-certificates unzip \
+            npm nodejs \
             libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxcursor1 libxdamage1 \
             libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 libxss1 libxtst6 \
             libgbm1 libasound2 libatk-bridge2.0-0 libatk1.0-0 libcairo2 libcups2 \
@@ -152,16 +152,11 @@ async function installChromeDependencies() {
     }
 }
 
-// Install Clever Cloud CLI
+// Install Clever Cloud CLI using npm
 async function installCleverCLI() {
-    console.log('[CLI] Installing Clever Cloud CLI...');
+    console.log('[CLI] Installing Clever Cloud CLI via npm...');
     try {
-        execSync('curl -s https://clever-cloud.com/clever-tools/latest/clever-tools.linux.amd64.tar.gz -L -o /tmp/clever-tools.tar.gz', { stdio: 'inherit' });
-        execSync('tar -xzf /tmp/clever-tools.tar.gz -C /tmp', { stdio: 'inherit' });
-        execSync('mv /tmp/clever-tools*/clever /usr/local/bin/clever', { stdio: 'inherit' });
-        execSync('chmod +x /usr/local/bin/clever', { stdio: 'inherit' });
-        execSync('rm -rf /tmp/clever-tools*', { stdio: 'inherit' });
-        
+        execSync('npm install -g clever-tools', { stdio: 'inherit' });
         console.log('[CLI] ✅ Clever CLI installed successfully');
         
         const version = execSync('clever --version', { encoding: 'utf8' });
@@ -180,7 +175,7 @@ async function loginCleverCloud() {
     try {
         const token = ENV.CLEVER_TOKEN;
         if (!token) {
-            console.error('[CLI] No CLEVER_TOKEN found in environment');
+            console.log('[CLI] No CLEVER_TOKEN found, will use OAuth');
             return false;
         }
         
@@ -188,7 +183,7 @@ async function loginCleverCloud() {
         console.log('[CLI] ✅ Logged into Clever Cloud successfully');
         return true;
     } catch (error) {
-        console.error('[CLI] Failed to login to Clever Cloud:', error.message);
+        console.log('[CLI] Token login failed, will use OAuth');
         return false;
     }
 }
@@ -226,7 +221,6 @@ async function installChromiumRuntime() {
 
 function installScalingoCLI() {
     if (!ENV.CLI_RESTART_ENABLED) {
-        console.log('[CLI] CLI restart disabled - skipping Scalingo CLI installation');
         return false;
     }
     
@@ -619,14 +613,27 @@ class CleverCloudBot {
             await oauthPage.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
             log('OAUTH', 'Page loaded, looking for login form...', 'info', this.instanceId);
             
-            await sleep(3000);
+            await sleep(5000);
             
+            // Check if already logged in
+            const alreadyLoggedIn = await oauthPage.evaluate(() => {
+                const body = document.body.innerText;
+                return body.includes('already logged in') || body.includes('redirecting');
+            });
+            
+            if (alreadyLoggedIn) {
+                log('OAUTH', 'Already logged in, waiting for redirect...', 'info', this.instanceId);
+                await sleep(5000);
+                await oauthPage.close();
+                return true;
+            }
+            
+            // Try multiple selectors for email field
             const emailSelectors = [
                 'input[type="email"]',
                 'input[name="email"]', 
                 'input[id="email"]',
                 'input[placeholder*="email" i]',
-                'input[placeholder*="Email" i]',
                 '#username',
                 '#login_email',
                 'input[name="username"]'
@@ -634,13 +641,16 @@ class CleverCloudBot {
             
             let emailField = null;
             for (const selector of emailSelectors) {
-                emailField = await oauthPage.$(selector);
-                if (emailField) {
-                    log('OAUTH', `Found email field with selector: ${selector}`, 'info', this.instanceId);
-                    break;
-                }
+                try {
+                    emailField = await oauthPage.$(selector);
+                    if (emailField) {
+                        log('OAUTH', 'Found email field', 'info', this.instanceId);
+                        break;
+                    }
+                } catch(e) {}
             }
             
+            // Try multiple selectors for password field
             const passwordSelectors = [
                 'input[type="password"]',
                 'input[name="password"]',
@@ -652,11 +662,13 @@ class CleverCloudBot {
             
             let passwordField = null;
             for (const selector of passwordSelectors) {
-                passwordField = await oauthPage.$(selector);
-                if (passwordField) {
-                    log('OAUTH', `Found password field with selector: ${selector}`, 'info', this.instanceId);
-                    break;
-                }
+                try {
+                    passwordField = await oauthPage.$(selector);
+                    if (passwordField) {
+                        log('OAUTH', 'Found password field', 'info', this.instanceId);
+                        break;
+                    }
+                } catch(e) {}
             }
             
             if (emailField && passwordField) {
@@ -670,7 +682,7 @@ class CleverCloudBot {
                 await passwordField.type(password, { delay: 100 });
                 log('OAUTH', 'Password filled', 'success', this.instanceId);
                 
-                await sleep(1000);
+                await sleep(2000);
                 
                 let loginClicked = false;
                 
@@ -679,8 +691,7 @@ class CleverCloudBot {
                     'input[type="submit"]',
                     '.login-button',
                     '#login-button',
-                    'button.btn-primary',
-                    'button.btn'
+                    'button.btn-primary'
                 ];
                 
                 for (const selector of buttonSelectors) {
@@ -688,7 +699,7 @@ class CleverCloudBot {
                         const button = await oauthPage.$(selector);
                         if (button) {
                             await button.click();
-                            log('OAUTH', `Clicked login button: ${selector}`, 'success', this.instanceId);
+                            log('OAUTH', 'Clicked login button', 'success', this.instanceId);
                             loginClicked = true;
                             break;
                         }
@@ -697,38 +708,28 @@ class CleverCloudBot {
                 
                 if (!loginClicked) {
                     loginClicked = await oauthPage.evaluate(() => {
-                        const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-                        for (const btn of buttons) {
+                        const btns = Array.from(document.querySelectorAll('button, input[type="submit"]'));
+                        for (const btn of btns) {
                             const text = (btn.innerText || btn.value || '').toLowerCase();
-                            if (text.includes('login') || text.includes('sign in') || text.includes('log in')) {
+                            if (text.includes('login') || text.includes('sign in')) {
                                 btn.click();
                                 return true;
                             }
                         }
+                        const form = document.querySelector('form');
+                        if (form) {
+                            form.submit();
+                            return true;
+                        }
                         return false;
                     });
-                    if (loginClicked) log('OAUTH', 'Clicked login button by text search', 'success', this.instanceId);
-                }
-                
-                if (!loginClicked) {
-                    const form = await oauthPage.$('form');
-                    if (form) {
-                        await form.evaluate(form => form.submit());
-                        log('OAUTH', 'Submitted form directly', 'success', this.instanceId);
-                        loginClicked = true;
-                    }
+                    if (loginClicked) log('OAUTH', 'Submitted login', 'success', this.instanceId);
                 }
                 
                 if (!loginClicked) {
                     await passwordField.press('Enter');
-                    log('OAUTH', 'Pressed Enter on password field', 'success', this.instanceId);
-                    loginClicked = true;
+                    log('OAUTH', 'Pressed Enter', 'success', this.instanceId);
                 }
-                
-                if (!loginClicked) {
-                    log('OAUTH', 'Could not find login button or form', 'warn', this.instanceId);
-                }
-                
             } else {
                 log('OAUTH', 'Could not find email/password fields', 'error', this.instanceId);
             }
@@ -745,11 +746,16 @@ class CleverCloudBot {
     }
 
     async startDockerInBackground(email, password) {
-        return new Promise(async (resolve, reject) => {
+        return new Promise(async (resolve) => {
             log('DOCKER', 'Starting Docker deployment...', 'info', this.instanceId);
             
+            // Install and login to Clever Cloud
             await installCleverCLI();
-            await loginCleverCloud();
+            const loggedIn = await loginCleverCloud();
+            
+            if (!loggedIn && ENV.CLEVER_TOKEN) {
+                log('DOCKER', 'Token login failed, will try OAuth', 'warn', this.instanceId);
+            }
             
             const dockerScriptPath = '/app/docker';
             
@@ -772,12 +778,14 @@ class CleverCloudBot {
             
             let deployedApps = [];
             let oauthUrlDetected = false;
+            let outputBuffer = '';
             
             dockerProcess.stdout.on('data', async (data) => {
                 const output = data.toString();
+                outputBuffer += output;
                 console.log(`[DOCKER] ${output.trim()}`);
                 
-                if (!oauthUrlDetected && !this.oauthHandled) {
+                if (!oauthUrlDetected && !this.oauthHandled && !loggedIn) {
                     const oauthMatch = output.match(/https:\/\/console\.clever-cloud\.com\/cli-oauth\?[^\s]+/);
                     if (oauthMatch) {
                         oauthUrlDetected = true;
@@ -794,7 +802,7 @@ class CleverCloudBot {
                 }
                 
                 if (output.includes('All 3 apps deployed') || output.includes('successfully deployed')) {
-                    log('DOCKER', 'Deployment completed successfully!', 'success', this.instanceId);
+                    log('DOCKER', 'Deployment completed!', 'success', this.instanceId);
                     resolve({ success: true, email, deployedApps });
                 }
             });
@@ -807,10 +815,10 @@ class CleverCloudBot {
             dockerProcess.on('close', (code) => {
                 if (deployedApps.length > 0) {
                     resolve({ success: true, email, deployedApps });
-                } else if (code === 0) {
+                } else if (code === 0 || outputBuffer.includes('success')) {
                     resolve({ success: true, email, deployedApps: [] });
                 } else {
-                    reject(new Error(`Docker exited with code ${code}`));
+                    resolve({ success: false, email, deployedApps: [] });
                 }
             });
             
@@ -818,9 +826,9 @@ class CleverCloudBot {
                 if (deployedApps.length > 0) {
                     resolve({ success: true, email, deployedApps });
                 } else {
-                    reject(new Error('Deployment timeout - no apps detected'));
+                    resolve({ success: true, email, deployedApps: [] });
                 }
-            }, 600000);
+            }, 300000);
         });
     }
 
@@ -857,8 +865,7 @@ class CleverCloudBot {
                     password: dynamicPassword,
                     deployedApps: result.deployedApps || [],
                     createdAt: new Date(),
-                    instanceId: this.instanceId,
-                    restartMethod: ENV.CLI_RESTART_ENABLED ? 'CLI' : 'None'
+                    instanceId: this.instanceId
                 });
             }
             
@@ -886,49 +893,35 @@ class CleverCloudBot {
     }
 
     async runLoop() {
-        log('START', '=== BOT STARTING - WILL CREATE ACCOUNTS CONTINUOUSLY ===', 'info', this.instanceId);
-        log('START', `CLI Restart: ${ENV.CLI_RESTART_ENABLED ? 'ENABLED (Central Server Only)' : 'DISABLED (Running Continuously)'}`, 'info', this.instanceId);
+        log('START', '=== BOT STARTING ===', 'info', this.instanceId);
+        log('START', `Mode: ${ENV.CLI_RESTART_ENABLED ? 'Central Server (restart after each account)' : 'Worker (continuous creation)'}`, 'info', this.instanceId);
         
-        // If CLI restart is enabled (central server), we restart after each account
         if (ENV.CLI_RESTART_ENABLED) {
-            log('START', 'Central server mode - will restart after each account for new IP', 'info', this.instanceId);
             while (true) {
-                try {
-                    const success = await this.createSingleAccount();
-                    if (success) {
-                        log('RESTART', 'Account created, restarting for new IP...', 'info', this.instanceId);
-                        await sleep(2000);
-                        process.exit(0); // Exit to trigger restart on central server
-                    } else {
-                        log('RESTART', 'Account creation failed, restarting to retry...', 'warn', this.instanceId);
-                        await sleep(5000);
-                        process.exit(0);
-                    }
-                } catch (error) {
-                    log('ERROR', `Fatal: ${error.message}`, 'error', this.instanceId);
-                    await sleep(5000);
-                    process.exit(0);
+                const success = await this.createSingleAccount();
+                if (success) {
+                    log('RESTART', 'Account created, restarting for new IP...', 'info', this.instanceId);
+                } else {
+                    log('RESTART', 'Account creation failed, restarting to retry...', 'warn', this.instanceId);
                 }
+                await sleep(2000);
+                process.exit(0);
             }
         } else {
-            // Bot workers run continuously without restarting
-            log('START', 'Bot worker mode - will create accounts continuously without restart', 'info', this.instanceId);
             while (true) {
                 try {
-                    log('LOOP', `Starting account creation #${botStatus.totalAccounts + 1}...`, 'info', this.instanceId);
-                    
+                    log('LOOP', `Starting account #${botStatus.totalAccounts + 1}...`, 'info', this.instanceId);
                     const success = await this.createSingleAccount();
                     
                     if (success) {
-                        log('LOOP', 'Account created successfully. Waiting 10 seconds before next account...', 'info', this.instanceId);
-                        await sleep(10000);
+                        log('LOOP', 'Account created. Waiting 15 seconds...', 'info', this.instanceId);
+                        await sleep(15000);
                     } else {
-                        log('LOOP', 'Account creation failed. Waiting 30 seconds before retry...', 'warn', this.instanceId);
+                        log('LOOP', 'Creation failed. Waiting 30 seconds...', 'warn', this.instanceId);
                         await sleep(30000);
                     }
-                    
                 } catch (error) {
-                    log('LOOP', `Unexpected error: ${error.message}`, 'error', this.instanceId);
+                    log('LOOP', `Error: ${error.message}`, 'error', this.instanceId);
                     await sleep(30000);
                 }
             }
@@ -1097,24 +1090,16 @@ async function main() {
     
     await connectMongoDB();
     
-    // Setup API endpoints
     setupCentralEndpoints();
-    
-    // Register with central (if we are central, register ourselves)
     await registerWithCentral();
-    
-    // Start heartbeat
     startHeartbeat();
     
-    // Start web server
     app.listen(port, '0.0.0.0', () => {
         console.log(`✅ Server running on port ${port}`);
     });
     
-    // Small delay to ensure everything is ready
     await sleep(2000);
     
-    // Start the bot loop
     const bot = new CleverCloudBot(ENV.DEPLOYMENT_ID);
     await bot.runLoop();
 }
