@@ -1,5 +1,4 @@
 // single-bot-system.js - DEPLOY THIS EXACT SAME FILE EVERYWHERE
-// The code automatically knows if it's the central server based on the domain
 
 const express = require('express');
 const fs = require('fs');
@@ -18,7 +17,7 @@ const app = express();
 app.use(express.json());
 const port = process.env.PORT || 3000;
 
-// ============ AUTO-DETECT CENTRAL MODE BASED ON DOMAIN ============
+// ============ AUTO-DETECT CENTRAL MODE ============
 const CENTRAL_DOMAIN = 'business-app.osc-fr1.scalingo.io';
 const CURRENT_HOSTNAME = os.hostname();
 const IS_CENTRAL_SERVER = CURRENT_HOSTNAME.includes('business-app') || 
@@ -30,26 +29,36 @@ console.log('  BOT SYSTEM DEPLOYMENT');
 console.log('========================================');
 console.log(`Current Hostname: ${CURRENT_HOSTNAME}`);
 console.log(`Central Domain: ${CENTRAL_DOMAIN}`);
-console.log(`Mode: ${IS_CENTRAL_SERVER ? '🔵 CENTRAL SERVER (Dashboard & API)' : '🟢 BOT WORKER (Account Creator)'}`);
+console.log(`Mode: ${IS_CENTRAL_SERVER ? '🔵 CENTRAL SERVER' : '🟢 BOT WORKER'}`);
 console.log('========================================\n');
 
 // ============ ENVIRONMENT VARIABLES ============
 const ENV = {
     IS_CENTRAL: IS_CENTRAL_SERVER,
+    
     BOT_PASSWORD: process.env.BOT_PASSWORD || 'Linuxdistro&84',
     BOT_START_DELAY: parseInt(process.env.BOT_START_DELAY) || 10,
     HEADLESS_MODE: process.env.HEADLESS_MODE !== 'false',
     CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome',
     CLEVER_TOKEN: process.env.CLEVER_TOKEN || '',
+    
+    CLI_RESTART_ENABLED: process.env.CLI_RESTART_ENABLED === 'true',
     SCALINGO_API_TOKEN: process.env.SCALINGO_API_TOKEN || '',
     SCALINGO_APP_NAME: process.env.SCALINGO_APP_NAME || '',
+    
     DEPLOYMENT_ID: process.env.DEPLOYMENT_ID || `bot-${CURRENT_HOSTNAME}-${Date.now()}`,
     DEPLOYMENT_NAME: process.env.DEPLOYMENT_NAME || CURRENT_HOSTNAME,
     DEPLOYMENT_REGION: process.env.DEPLOYMENT_REGION || 'osc-fr1',
+    
     CENTRAL_API_URL: process.env.CENTRAL_API_URL || `https://${CENTRAL_DOMAIN}`,
     CENTRAL_API_KEY: process.env.CENTRAL_API_KEY || 'change-this-secret-key-12345',
+    
     MONGODB_URI: process.env.MONGODB_URI || 'mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888'
 };
+
+console.log('Restart Config:');
+console.log(`  CLI Restart Enabled: ${ENV.CLI_RESTART_ENABLED ? 'YES' : 'NO'}`);
+console.log('========================================\n');
 
 // ============ MONGODB CONNECTION ============
 let dbClient = null;
@@ -149,6 +158,10 @@ async function installChromiumRuntime() {
 
 function installScalingoCLI() {
     if (ENV.IS_CENTRAL) return true;
+    if (!ENV.CLI_RESTART_ENABLED) {
+        console.log('[CLI] CLI restart disabled - skipping CLI installation');
+        return false;
+    }
     
     const cliPath = '/app/bin/scalingo';
     
@@ -399,22 +412,27 @@ function startHeartbeat() {
     setInterval(async () => await sendHeartbeat(), 30000);
 }
 
-// ============ RESTART VIA CLI ============
-async function restartWithCLI() {
-    if (ENV.IS_CENTRAL) return false;
+// ============ RESTART FUNCTION ============
+async function restartBot() {
+    log('RESTART', '========================================', 'info', 'MAIN');
+    log('RESTART', `Restart method: ${ENV.CLI_RESTART_ENABLED ? 'CLI (Scalingo)' : 'Local (Process Exit)'}`, 'info', 'MAIN');
+    log('RESTART', `Attempt #${botStatus.restartCount}`, 'info', 'MAIN');
+    log('RESTART', '========================================', 'info', 'MAIN');
     
-    const cliPath = '/app/bin/scalingo';
-    const appName = ENV.SCALINGO_APP_NAME;
-    const apiToken = ENV.SCALINGO_API_TOKEN;
-    
-    if (!fs.existsSync(cliPath) || !appName || !apiToken) {
-        log('RESTART', 'CLI not configured', 'warn', 'MAIN');
-        return false;
-    }
-    
-    log('RESTART', `Restarting ${appName} via CLI...`, 'info', 'MAIN');
-    
-    return new Promise((resolve) => {
+    if (ENV.CLI_RESTART_ENABLED) {
+        const cliPath = '/app/bin/scalingo';
+        const appName = ENV.SCALINGO_APP_NAME;
+        const apiToken = ENV.SCALINGO_API_TOKEN;
+        
+        if (!fs.existsSync(cliPath) || !appName || !apiToken) {
+            log('RESTART', 'CLI not configured - falling back to local restart', 'warn', 'MAIN');
+            await sleep(3000);
+            process.exit(0);
+            return;
+        }
+        
+        log('RESTART', `Initiating CLI restart for ${appName}...`, 'info', 'MAIN');
+        
         const cmd = `${cliPath} login --api-token "${apiToken}" && ${cliPath} --app ${appName} restart`;
         const child = spawn('bash', ['-c', cmd]);
         
@@ -423,14 +441,17 @@ async function restartWithCLI() {
         
         child.on('close', (code) => {
             if (code === 0) {
-                log('RESTART', '✅ Restart initiated!', 'success', 'MAIN');
-                resolve(true);
+                log('RESTART', '✅ CLI restart initiated!', 'success', 'MAIN');
             } else {
-                log('RESTART', `Failed with code ${code}`, 'error', 'MAIN');
-                resolve(false);
+                log('RESTART', `CLI failed (code ${code}) - local restart`, 'error', 'MAIN');
+                setTimeout(() => process.exit(0), 3000);
             }
         });
-    });
+    } else {
+        log('RESTART', 'Local restart - exiting process', 'info', 'MAIN');
+        await sleep(2000);
+        process.exit(0);
+    }
 }
 
 // ============ BOT CLASS ============
@@ -702,7 +723,8 @@ class CleverCloudBot {
                     password: dynamicPassword,
                     deployedApps: result.deployedApps || [],
                     createdAt: new Date(),
-                    instanceId: this.instanceId
+                    instanceId: this.instanceId,
+                    restartMethod: ENV.CLI_RESTART_ENABLED ? 'CLI' : 'Local'
                 });
             }
             
@@ -729,49 +751,47 @@ class CleverCloudBot {
         botStatus.state = accountCreated ? 'completed' : 'failed';
         botStatus.restartCount++;
         
-        log('RESTART', `========================================`, 'info', this.instanceId);
-        log('RESTART', `${accountCreated ? 'Account created' : 'Account creation failed'} - Restarting for NEW IP`, 'info', this.instanceId);
-        log('RESTART', `This was attempt #${botStatus.restartCount}`, 'info', this.instanceId);
-        log('RESTART', `========================================`, 'info', this.instanceId);
-        
-        const cliSuccess = await restartWithCLI();
-        
-        if (!cliSuccess) {
-            log('RESTART', 'CLI restart failed, using exit restart', 'warn', 'MAIN');
-        }
-        
-        await sleep(2000);
-        process.exit(0);
+        await restartBot();
     }
 }
 
 // ============ DASHBOARD ============
 app.get('/', async (req, res) => {
     if (ENV.IS_CENTRAL) {
-        const bots = await db.collection('deployments').find({}).toArray();
-        const totalAccounts = await db.collection('accounts').countDocuments();
-        const activeBots = bots.filter(b => b.lastHeartbeat > new Date(Date.now() - 5 * 60 * 1000)).length;
-        
-        let botsHtml = '';
-        for (const bot of bots) {
-            botsHtml += `
-                <div class="bot-card">
-                    <div><span class="bot-status ${bot.lastHeartbeat > new Date(Date.now() - 5*60*1000) ? 'status-active' : 'status-inactive'}"></span>
-                    <strong class="bot-name">${bot.deploymentName || bot.deploymentId}</strong></div>
-                    <div class="bot-detail">🆔 ID: ${bot.deploymentId.substring(0, 20)}...</div>
-                    <div class="bot-detail">📊 Accounts: ${bot.totalAccounts || 0}</div>
-                    <div class="bot-detail">📧 Last: ${bot.lastAccount || 'None'}</div>
-                    <div class="bot-detail">⏱️ Last seen: ${bot.lastHeartbeat ? new Date(bot.lastHeartbeat).toLocaleString() : 'Never'}</div>
-                </div>
-            `;
-        }
-        
-        res.send(`<!DOCTYPE html>
+        try {
+            const bots = await db.collection('deployments').find({}).toArray();
+            const totalAccounts = await db.collection('accounts').countDocuments();
+            const activeBots = bots.filter(b => b.lastHeartbeat && b.lastHeartbeat > new Date(Date.now() - 5 * 60 * 1000)).length;
+            
+            let botsHtml = '';
+            for (const bot of bots) {
+                const botId = bot.deploymentId || 'unknown';
+                const botName = bot.deploymentName || botId;
+                const botAccounts = bot.totalAccounts || 0;
+                const botLastAccount = bot.lastAccount || 'None';
+                const botLastSeen = bot.lastHeartbeat ? new Date(bot.lastHeartbeat).toLocaleString() : 'Never';
+                const isActive = bot.lastHeartbeat && bot.lastHeartbeat > new Date(Date.now() - 5 * 60 * 1000);
+                
+                botsHtml += `
+                    <div class="bot-card">
+                        <div>
+                            <span class="bot-status ${isActive ? 'status-active' : 'status-inactive'}"></span>
+                            <strong class="bot-name">${escapeHtml(botName)}</strong>
+                        </div>
+                        <div class="bot-detail">🆔 ID: ${escapeHtml(botId.substring(0, 20))}...</div>
+                        <div class="bot-detail">📊 Accounts: ${botAccounts}</div>
+                        <div class="bot-detail">📧 Last: ${escapeHtml(botLastAccount)}</div>
+                        <div class="bot-detail">⏱️ Last seen: ${botLastSeen}</div>
+                    </div>
+                `;
+            }
+            
+            const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Central Bot Dashboard • All Deployments</title>
+    <title>Central Bot Dashboard</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -799,6 +819,7 @@ app.get('/', async (req, res) => {
         table { width: 100%; border-collapse: collapse; }
         th, td { padding: 12px; text-align: left; border-bottom: 1px solid #eee; }
         th { background: #f8f9fa; font-weight: 600; }
+        .refresh-btn { background: #667eea; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; margin-bottom: 20px; }
     </style>
 </head>
 <body>
@@ -809,7 +830,7 @@ app.get('/', async (req, res) => {
         </div>
         
         <div class="stats-grid">
-            <div class="stat-card"><div class="stat-value">${totalAccounts}</div><div class="stat-label">Total Accounts Created</div></div>
+            <div class="stat-card"><div class="stat-value">${totalAccounts}</div><div class="stat-label">Total Accounts</div></div>
             <div class="stat-card"><div class="stat-value">${bots.length}</div><div class="stat-label">Connected Bots</div></div>
             <div class="stat-card"><div class="stat-value">${activeBots}</div><div class="stat-label">Active Bots</div></div>
             <div class="stat-card"><div class="stat-value">👑</div><div class="stat-label">Central Server</div></div>
@@ -820,41 +841,61 @@ app.get('/', async (req, res) => {
             ${botsHtml}
         </div>
         
-        <h2 style="color: white; margin-bottom: 20px;">📝 Recent Accounts (All Bots)</h2>
+        <h2 style="color: white; margin-bottom: 20px;">📝 Recent Accounts</h2>
         <div class="accounts-table">
+            <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
             <table id="accountsTable">
-                <thead><tr><th>Bot</th><th>Email</th><th>Password</th><th>Apps</th><th>Created At</th></tr></thead>
+                <thead><tr><th>Bot</th><th>Email</th><th>Password</th><th>Apps</th><th>Created</th></tr></thead>
                 <tbody id="accountsBody"><tr><td colspan="5">Loading...</td></tr></tbody>
             </table>
         </div>
     </div>
     <script>
+        function escapeHtml(text) {
+            if (!text) return '';
+            return text.replace(/[&<>]/g, function(m) {
+                if (m === '&') return '&amp;';
+                if (m === '<') return '&lt;';
+                if (m === '>') return '&gt;';
+                return m;
+            });
+        }
+        
         async function loadAccounts() {
-            const res = await fetch('/api/all-accounts');
-            const accounts = await res.json();
-            const tbody = document.getElementById('accountsBody');
-            if(accounts.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5">No accounts yet</td></tr>';
-                return;
+            try {
+                const res = await fetch('/api/all-accounts');
+                const accounts = await res.json();
+                const tbody = document.getElementById('accountsBody');
+                if(!accounts || accounts.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5">No accounts yet</td></tr>';
+                    return;
+                }
+                let html = '';
+                for(let acc of accounts.slice(0, 50)) {
+                    html += '<tr>' +
+                        '<td>' + escapeHtml(acc.deploymentName || (acc.deploymentId ? acc.deploymentId.substring(0, 15) : 'Unknown')) + '</td>' +
+                        '<td>' + escapeHtml(acc.email) + '</td>' +
+                        '<td><code>' + escapeHtml(acc.password) + '</code></td>' +
+                        '<td>' + (acc.deployedApps ? acc.deployedApps.length : 0) + '</td>' +
+                        '<td>' + new Date(acc.createdAt).toLocaleString() + '</td>' +
+                    '</tr>';
+                }
+                tbody.innerHTML = html;
+            } catch(e) {
+                console.error(e);
             }
-            let html = '';
-            for(let acc of accounts.slice(0, 50)) {
-                html += '<tr>' +
-                    '<td><strong>' + (acc.deploymentName || (acc.deploymentId ? acc.deploymentId.substring(0, 15) : 'Unknown')) + '</strong></td>' +
-                    '<td>' + acc.email + '</td>' +
-                    '<td><code>' + acc.password + '</code></td>' +
-                    '<td>' + (acc.deployedApps ? acc.deployedApps.length : 0) + '</td>' +
-                    '<td>' + new Date(acc.createdAt).toLocaleString() + '</td>' +
-                '</tr>';
-            }
-            tbody.innerHTML = html;
         }
         loadAccounts();
         setInterval(loadAccounts, 10000);
-        setInterval(() => location.reload(), 30000);
     </script>
 </body>
-</html>`);
+</html>`;
+            
+            res.send(html);
+        } catch (error) {
+            console.error('Dashboard error:', error);
+            res.status(500).send('Dashboard error: ' + error.message);
+        }
     } else {
         res.send(`<!DOCTYPE html>
 <html>
@@ -874,18 +915,27 @@ app.get('/', async (req, res) => {
         <div class="status">
             <p>📡 Status: <span class="online">● ONLINE</span></p>
             <p>🆔 ID: ${ENV.DEPLOYMENT_ID}</p>
-            <p>🎯 Mode: Bot Worker (Creating Accounts)</p>
+            <p>🎯 Mode: Bot Worker</p>
             <p>📊 Accounts Created: ${botStatus.restartCount}</p>
-            <p>📧 Last Account: ${botStatus.accountEmail || 'None yet'}</p>
-            <p>🔄 Connected to Central: ${ENV.CENTRAL_API_URL}</p>
+            <p>📧 Last Account: ${botStatus.accountEmail || 'None'}</p>
+            <p>🔄 Restart Method: ${ENV.CLI_RESTART_ENABLED ? 'CLI' : 'Local'}</p>
         </div>
-        <p>This bot is automatically creating accounts and reporting to the central dashboard.</p>
-        <p>📊 View all bots at: <a href="${ENV.CENTRAL_API_URL}" style="color:#00ff88">${ENV.CENTRAL_API_URL}</a></p>
+        <p>📊 <a href="${ENV.CENTRAL_API_URL}" style="color:#00ff88">View Central Dashboard</a></p>
     </div>
 </body>
 </html>`);
     }
 });
+
+function escapeHtml(text) {
+    if (!text) return '';
+    return text.replace(/[&<>]/g, function(m) {
+        if (m === '&') return '&amp;';
+        if (m === '<') return '&lt;';
+        if (m === '>') return '&gt;';
+        return m;
+    });
+}
 
 // ============ START APPLICATION ============
 async function main() {
