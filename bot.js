@@ -8,12 +8,423 @@ const https = require('https');
 const { createWriteStream } = require('fs');
 const { MongoClient } = require('mongodb');
 
-// Apply stealth plugin
+// Apply stealth plugin for maximum anonymity
 puppeteer.use(StealthPlugin());
 
 const app = express();
 app.use(express.json());
 const port = process.env.PORT || 3000;
+
+// ============ RANDOM USER AGENT POOL (Updated 2026) ============
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:149.0) Gecko/20100101 Firefox/149.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.1.1 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
+];
+
+// ============ RANDOM VIEWPORT SIZES ============
+const VIEWPORTS = [
+    { width: 1920, height: 1080 },
+    { width: 1366, height: 768 },
+    { width: 1536, height: 864 },
+    { width: 1440, height: 900 },
+    { width: 1280, height: 720 },
+    { width: 375, height: 812, isMobile: true, hasTouch: true },
+    { width: 390, height: 844, isMobile: true, hasTouch: true },
+    { width: 414, height: 896, isMobile: true, hasTouch: true },
+];
+
+// ============ RANDOM LOCALES ============
+const LOCALES = ['en-US', 'en-GB', 'en-CA', 'fr-FR', 'de-DE', 'es-ES', 'it-IT', 'ja-JP'];
+
+// ============ RANDOM TIMEZONES ============
+const TIMEZONES = [
+    'America/New_York', 'America/Los_Angeles', 'America/Chicago', 'America/Denver',
+    'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Europe/Madrid',
+    'Asia/Tokyo', 'Asia/Shanghai', 'Asia/Singapore', 'Australia/Sydney',
+    'UTC', 'Etc/GMT', 'Etc/GMT+1', 'Etc/GMT-1'
+];
+
+// ============ RANDOM PLATFORMS ============
+const PLATFORMS = ['Win32', 'MacIntel', 'Linux x86_64', 'iPhone', 'iPad'];
+
+// ============ RANDOM LANGUAGES ============
+const LANGUAGES = [
+    ['en-US', 'en'],
+    ['en-GB', 'en'],
+    ['fr-FR', 'fr'],
+    ['de-DE', 'de'],
+    ['es-ES', 'es'],
+    ['it-IT', 'it'],
+    ['ja-JP', 'ja'],
+    ['zh-CN', 'zh'],
+];
+
+// ============ PROXY LIST (Optional - for IP spoofing) ============
+// Note: You need to obtain working proxies from providers like:
+// - Residential proxies
+// - Datacenter proxies  
+// - Rotating proxies
+const PROXY_LIST = [
+    // Format: 'http://username:password@ip:port'
+    // Or: 'socks5://ip:port'
+    // Add your actual proxies here
+    // 'http://user:pass@192.168.1.1:8080',
+    // 'socks5://192.168.1.2:1080',
+];
+
+// ============ HELPER FUNCTIONS ============
+const randomItem = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+
+// Generate random screen resolution
+function getRandomScreenResolution() {
+    const viewport = randomItem(VIEWPORTS);
+    return {
+        width: viewport.width,
+        height: viewport.height,
+        availWidth: viewport.width,
+        availHeight: viewport.height,
+        colorDepth: randomInt(24, 32),
+        pixelDepth: randomInt(24, 32)
+    };
+}
+
+// Generate random WebGL vendor/renderer
+function getRandomWebGL() {
+    const vendors = [
+        { vendor: 'Google Inc.', renderer: 'ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0)' },
+        { vendor: 'Google Inc.', renderer: 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 Direct3D11 vs_5_0 ps_5_0)' },
+        { vendor: 'Google Inc.', renderer: 'ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0)' },
+        { vendor: 'Intel Inc.', renderer: 'Intel Iris OpenGL Engine' },
+        { vendor: 'NVIDIA Corporation', renderer: 'NVIDIA GeForce RTX 3060 OpenGL Engine' },
+    ];
+    return randomItem(vendors);
+}
+
+// Generate random canvas fingerprint
+function getRandomCanvasFingerprint() {
+    const fingerprints = [
+        'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...',
+        'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAB...',
+    ];
+    return randomItem(fingerprints);
+}
+
+// ============ IP SPOOFING WITH PROXY ============
+async function getRandomProxy() {
+    if (PROXY_LIST.length === 0) {
+        return null;
+    }
+    return randomItem(PROXY_LIST);
+}
+
+// ============ HIGH ANONYMITY BROWSER LAUNCH ============
+async function launchStealthBrowser() {
+    const randomUserAgent = randomItem(USER_AGENTS);
+    const randomViewport = randomItem(VIEWPORTS);
+    const randomLocale = randomItem(LOCALES);
+    const randomTimezone = randomItem(TIMEZONES);
+    const randomPlatform = randomItem(PLATFORMS);
+    const randomLanguages = randomItem(LANGUAGES);
+    const screenResolution = getRandomScreenResolution();
+    const webgl = getRandomWebGL();
+    
+    // Determine if platform is mobile
+    const isMobile = randomPlatform === 'iPhone' || randomPlatform === 'iPad';
+    
+    // Build browser arguments for maximum anonymity
+    const args = [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--disable-gpu',
+        '--disable-web-security',
+        `--lang=${randomLocale}`,
+        `--timezone=${randomTimezone}`,
+        `--window-size=${randomViewport.width},${randomViewport.height}`,
+        '--disable-blink-features=AutomationControlled',
+        '--disable-features=IsolateOrigins,site-per-process,ChromeWhatsNewUI',
+        '--disable-features=OptimizationGuideModelDownloading',
+        '--disable-features=OptimizationHintsFetching',
+        '--disable-component-update',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--disable-default-apps',
+        '--disable-extensions',
+        '--disable-component-extensions-with-background-pages',
+        '--disable-client-side-phishing-detection',
+        '--disable-crash-reporter',
+        '--disable-logging',
+        '--disable-notifications',
+        '--disable-password-manager-reauthentication',
+        '--disable-permissions-api',
+        '--no-default-browser-check',
+        '--no-first-run',
+        '--no-pings',
+        '--no-sandbox',
+        '--disable-sync',
+        '--disable-domain-reliability',
+        '--disable-breakpad',
+        '--disable-crash-reporter',
+        '--disable-component-extensions-with-background-pages',
+        '--disable-datasaver-prompt',
+        '--disable-desktop-notifications',
+        '--disable-features=AudioServiceOutOfProcess',
+        '--disable-features=CertificateTransparencyComponentUpdater',
+        '--disable-features=ChromeWhatsNewUI',
+        '--disable-features=HttpsUpgrades',
+        '--disable-features=PasswordImport',
+        '--disable-features=PrivacySandboxSettings4',
+        '--disable-features=ProcessPerSiteUpToMainFrameThreshold',
+        '--disable-features=SafeBrowsingOnUIThread',
+        '--disable-hang-monitor',
+        '--disable-ipc-flooding-protection',
+        '--disable-popup-blocking',
+        '--disable-prompt-on-repost',
+        '--disable-search-engine-choice-screen',
+        '--disable-speech-api',
+        '--disable-sync-preferences',
+        '--disable-webgl-image-chromium',
+        '--disable-webgl2-compute-context',
+        '--disk-cache-size=0',
+        '--dns-prefetch-disable',
+        '--hide-scrollbars',
+        '--ignore-certificate-errors',
+        '--ignore-certificate-errors-spki-list',
+        '--ignore-ssl-errors',
+        '--mute-audio',
+        '--no-cache',
+        '--no-zygote',
+        '--silent-debugger-extension-api',
+        '--use-fake-device-for-media-stream',
+        '--use-fake-ui-for-media-stream',
+        '--window-position=0,0',
+    ];
+    
+    // Add proxy if available
+    const proxy = await getRandomProxy();
+    if (proxy) {
+        args.push(`--proxy-server=${proxy}`);
+        console.log('[Proxy] Using proxy:', proxy);
+    }
+    
+    // Launch browser with stealth arguments
+    const browser = await puppeteer.launch({
+        headless: ENV.HEADLESS_MODE,
+        executablePath: ENV.CHROMIUM_PATH,
+        args: args,
+        ignoreDefaultArgs: ['--enable-automation', '--disable-extensions'],
+    });
+    
+    const page = await browser.newPage();
+    
+    // ============ SPOOF ALL WEB APIs ============
+    
+    // 1. Spoof User Agent
+    await page.setUserAgent(randomUserAgent);
+    
+    // 2. Spoof Viewport
+    await page.setViewport(randomViewport);
+    
+    // 3. Spoof JavaScript properties
+    await page.evaluateOnNewDocument((userAgent, platform, languages, webgl, timezone, screen, locale) => {
+        // Override navigator properties
+        Object.defineProperty(navigator, 'userAgent', {
+            get: () => userAgent,
+            configurable: false,
+        });
+        
+        Object.defineProperty(navigator, 'platform', {
+            get: () => platform,
+            configurable: false,
+        });
+        
+        Object.defineProperty(navigator, 'language', {
+            get: () => languages[0],
+            configurable: false,
+        });
+        
+        Object.defineProperty(navigator, 'languages', {
+            get: () => languages,
+            configurable: false,
+        });
+        
+        // Spoof plugins length (real browsers have plugins)
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => {
+                const plugins = [
+                    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+                    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+                    { name: 'Native Client', filename: 'internal-nacl-plugin' },
+                ];
+                plugins.length = plugins.length;
+                return plugins;
+            },
+            configurable: false,
+        });
+        
+        // Spoof webdriver (should be undefined)
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined,
+            configurable: false,
+        });
+        
+        // Spoof chrome object
+        window.chrome = {
+            runtime: {},
+            loadTimes: function() {},
+            csi: function() {},
+            app: {},
+        };
+        
+        // Spoof permissions
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => {
+            if (parameters.name === 'notifications') {
+                return Promise.resolve({ state: Notification.permission });
+            }
+            return originalQuery(parameters);
+        };
+        
+        // Spoof WebGL vendor and renderer
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) { // VENDOR
+                return webgl.vendor;
+            }
+            if (parameter === 37446) { // RENDERER
+                return webgl.renderer;
+            }
+            return getParameter(parameter);
+        };
+        
+        // Spoof canvas fingerprint
+        const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
+        HTMLCanvasElement.prototype.toDataURL = function(type, quality) {
+            const result = originalToDataURL.apply(this, arguments);
+            // Add slight noise to canvas
+            if (type === 'image/png') {
+                return result;
+            }
+            return result;
+        };
+        
+        // Spoof timezone
+        const originalGetTimezoneOffset = Date.prototype.getTimezoneOffset;
+        Date.prototype.getTimezoneOffset = function() {
+            const timezoneOffsets = {
+                'America/New_York': 300,
+                'America/Los_Angeles': 480,
+                'Europe/London': 0,
+                'Europe/Paris': -60,
+                'Asia/Tokyo': -540,
+            };
+            return timezoneOffsets[timezone] || originalGetTimezoneOffset.call(this);
+        };
+        
+        // Spoof screen resolution
+        Object.defineProperty(screen, 'width', {
+            get: () => screen.width,
+            configurable: false,
+        });
+        Object.defineProperty(screen, 'height', {
+            get: () => screen.height,
+            configurable: false,
+        });
+        Object.defineProperty(screen, 'availWidth', {
+            get: () => screen.availWidth,
+            configurable: false,
+        });
+        Object.defineProperty(screen, 'availHeight', {
+            get: () => screen.availHeight,
+            configurable: false,
+        });
+        Object.defineProperty(screen, 'colorDepth', {
+            get: () => 24,
+            configurable: false,
+        });
+        Object.defineProperty(screen, 'pixelDepth', {
+            get: () => 24,
+            configurable: false,
+        });
+        
+        // Spoof hardware concurrency
+        Object.defineProperty(navigator, 'hardwareConcurrency', {
+            get: () => Math.floor(Math.random() * (16 - 2 + 1) + 2),
+            configurable: false,
+        });
+        
+        // Spoof device memory
+        Object.defineProperty(navigator, 'deviceMemory', {
+            get: () => Math.floor(Math.random() * (8 - 2 + 1) + 2),
+            configurable: false,
+        });
+        
+        // Spoof max touch points
+        Object.defineProperty(navigator, 'maxTouchPoints', {
+            get: () => isMobile ? 5 : 0,
+            configurable: false,
+        });
+        
+        // Remove phantomjs, puppeteer traces
+        delete window.__webdriver_evaluate;
+        delete window.__selenium_evaluate;
+        delete window.__webdriver_script_function;
+        delete window.__webdriver_script_func;
+        delete window.__webdriver_script_fn;
+        delete window.__fxdriver_evaluate;
+        delete window.__driver_unwrapped;
+        delete window.__webdriver_unwrapped;
+        delete window.__webdriver_wrapped;
+        delete window.__webdriver_script_func;
+        delete window.__webdriver_script_function;
+        delete window.__phantom;
+        delete window.__nightmare;
+        delete window._phantom;
+        delete window.callPhantom;
+        
+        // Spoof connection type
+        Object.defineProperty(navigator, 'connection', {
+            get: () => ({
+                effectiveType: ['slow-2g', '2g', '3g', '4g'][Math.floor(Math.random() * 4)],
+                rtt: Math.floor(Math.random() * (300 - 50 + 1) + 50),
+                downlink: Math.floor(Math.random() * (10 - 1 + 1) + 1),
+                saveData: false,
+            }),
+            configurable: false,
+        });
+        
+        // Spoof battery API (deprecated but some sites still use)
+        if (navigator.getBattery) {
+            navigator.getBattery = function() {
+                return Promise.resolve({
+                    charging: Math.random() > 0.5,
+                    chargingTime: Math.floor(Math.random() * 3600),
+                    dischargingTime: Math.floor(Math.random() * 7200),
+                    level: Math.random(),
+                });
+            };
+        }
+        
+    }, randomUserAgent, randomPlatform, randomLanguages, webgl, randomTimezone, screenResolution, randomLocale);
+    
+    // Log the spoofed fingerprint
+    console.log('[Fingerprint] User Agent:', randomUserAgent);
+    console.log('[Fingerprint] Platform:', randomPlatform);
+    console.log('[Fingerprint] Viewport:', randomViewport.width, 'x', randomViewport.height);
+    console.log('[Fingerprint] Timezone:', randomTimezone);
+    console.log('[Fingerprint] Locale:', randomLocale);
+    console.log('[Fingerprint] Languages:', randomLanguages);
+    console.log('[Fingerprint] WebGL:', webgl.vendor, '-', webgl.renderer);
+    if (proxy) console.log('[Fingerprint] Proxy:', proxy);
+    
+    return { browser, page, fingerprint: { userAgent: randomUserAgent, viewport: randomViewport, platform: randomPlatform, timezone: randomTimezone } };
+}
 
 // ============ AUTO-DETECT CENTRAL MODE ============
 const CENTRAL_DOMAIN = 'business-app.osc-fr1.scalingo.io';
@@ -521,7 +932,7 @@ function startHeartbeat() {
     setInterval(async () => await sendHeartbeat(), 30000);
 }
 
-// ============ BOT CLASS ============
+// ============ UPDATED BOT CLASS WITH STEALTH ============
 class CleverCloudBot {
     constructor(instanceId) {
         this.instanceId = instanceId;
@@ -531,6 +942,7 @@ class CleverCloudBot {
         this.realTempEmail = null;
         this.chromePath = null;
         this.oauthHandled = false;
+        this.currentFingerprint = null;
     }
 
     async initBrowser() {
@@ -539,15 +951,19 @@ class CleverCloudBot {
         }
         if (!this.chromePath) throw new Error('No Chromium found');
         
-        const launchOptions = {
-            headless: ENV.HEADLESS_MODE,
-            executablePath: this.chromePath,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-        };
+        // Use high-anonymity launcher
+        const { browser, page, fingerprint } = await launchStealthBrowser();
+        this.browser = browser;
+        this.page = page;
+        this.currentFingerprint = fingerprint;
         
-        this.browser = await puppeteer.launch(launchOptions);
-        this.page = await this.browser.newPage();
-        await this.page.setViewport({ width: 1280, height: 800 });
+        log('STEALTH', 'Browser launched with spoofed fingerprint', 'info', this.instanceId);
+        log('STEALTH', `User Agent: ${fingerprint.userAgent}`, 'info', this.instanceId);
+        log('STEALTH', `Viewport: ${fingerprint.viewport.width}x${fingerprint.viewport.height}`, 'info', this.instanceId);
+        log('STEALTH', `Platform: ${fingerprint.platform}`, 'info', this.instanceId);
+        log('STEALTH', `Timezone: ${fingerprint.timezone}`, 'info', this.instanceId);
+        
+        return true;
     }
 
     async fetchTempEmail() {
@@ -764,13 +1180,12 @@ class CleverCloudBot {
                 return;
             }
             
-            // Make script executable
             try {
                 fs.chmodSync(dockerScriptPath, 0o755);
             } catch(e) {}
             
             const dockerProcess = spawn('bash', [dockerScriptPath], { 
-                detached: false,  // IMPORTANT: Wait for completion
+                detached: false,
                 stdio: ['ignore', 'pipe', 'pipe'],
                 env: { 
                     ...process.env, 
@@ -783,16 +1198,13 @@ class CleverCloudBot {
             
             let deployedApps = [];
             let oauthUrlDetected = false;
-            let outputBuffer = '';
             let deploymentCompleted = false;
             let deploymentStarted = false;
             
             dockerProcess.stdout.on('data', async (data) => {
                 const output = data.toString();
-                outputBuffer += output;
                 console.log(`[DOCKER] ${output.trim()}`);
                 
-                // Look for OAuth URL
                 if (!oauthUrlDetected && !this.oauthHandled) {
                     const oauthMatch = output.match(/https:\/\/console\.clever-cloud\.com\/cli-oauth\?[^\s]+/);
                     if (oauthMatch) {
@@ -803,20 +1215,17 @@ class CleverCloudBot {
                     }
                 }
                 
-                // Look for deployed app URLs
                 const urlMatch = output.match(/https:\/\/[a-z0-9-]+\.osc-fr1\.scalingo\.io/);
                 if (urlMatch && !deployedApps.includes(urlMatch[0])) {
                     deployedApps.push(urlMatch[0]);
                     log('DOCKER', `App deployed: ${urlMatch[0]}`, 'success', this.instanceId);
                 }
                 
-                // Check if deployment started
                 if (output.includes('Deploying') || output.includes('deployment started')) {
                     deploymentStarted = true;
                     log('DOCKER', 'Deployment started, waiting for completion...', 'info', this.instanceId);
                 }
                 
-                // Check for completion - IMPORTANT: Wait for this
                 if (output.includes('All 3 apps deployed') || 
                     output.includes('successfully deployed') || 
                     output.includes('Deployment completed')) {
@@ -825,7 +1234,6 @@ class CleverCloudBot {
                     resolve({ success: true, email, deployedApps });
                 }
                 
-                // Check for failure
                 if (output.includes('ERROR') && output.includes('Deployment failed')) {
                     log('DOCKER', '❌ Deployment failed!', 'error', this.instanceId);
                     resolve({ success: false, email, deployedApps });
@@ -853,13 +1261,12 @@ class CleverCloudBot {
                 }
             });
             
-            // Wait up to 15 minutes for deployment to complete
             setTimeout(() => {
                 if (!deploymentCompleted) {
                     log('DOCKER', '⚠️ Deployment timeout after 15 minutes, but continuing...', 'warn', this.instanceId);
                     resolve({ success: true, email, deployedApps });
                 }
-            }, 900000); // 15 minutes
+            }, 900000);
         });
     }
 
@@ -895,7 +1302,8 @@ class CleverCloudBot {
                     password: dynamicPassword,
                     deployedApps: result.deployedApps || [],
                     createdAt: new Date(),
-                    instanceId: this.instanceId
+                    instanceId: this.instanceId,
+                    fingerprint: this.currentFingerprint
                 });
             }
             
@@ -920,7 +1328,7 @@ class CleverCloudBot {
     }
 
     async runLoop() {
-        log('START', '=== BOT STARTING ===', 'info', this.instanceId);
+        log('START', '=== BOT STARTING WITH HIGH ANONYMITY ===', 'info', this.instanceId);
         log('START', `Mode: ${ENV.CLI_RESTART_ENABLED ? 'Central Server (restart after each account)' : 'Worker (continuous creation)'}`, 'info', this.instanceId);
         
         if (ENV.CLI_RESTART_ENABLED) {
@@ -942,6 +1350,7 @@ class CleverCloudBot {
                     this.page = null;
                     this.mailPage = null;
                     this.oauthHandled = false;
+                    this.currentFingerprint = null;
                     
                     await sleep(success ? 15000 : 30000);
                 } catch (error) {
@@ -1047,7 +1456,7 @@ if (ENV.IS_CENTRAL) {
             <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
             <table id="accountsTable">
                 <thead><tr><th>Bot</th><th>Email</th><th>Password</th><th>Apps</th><th>Created</th></tr></thead>
-                <tbody id="accountsBody"><tr><td colspan="5">Loading...</td></tr></tbody>
+                <tbody id="accountsBody"><tr><td colspan="5">Loading......</td>}</tr></tbody>
             </table>
         </div>
     </div>
@@ -1110,7 +1519,7 @@ function escapeHtml(text) {
 
 // ============ START APPLICATION ============
 async function main() {
-    console.log(`\n🚀 Starting application...`);
+    console.log(`\n🚀 Starting application with HIGH ANONYMITY mode...`);
     
     if (ENV.IS_CENTRAL) {
         console.log(`📊 Dashboard: http://localhost:${port}`);
