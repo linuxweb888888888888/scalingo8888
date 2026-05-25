@@ -11,10 +11,7 @@ app.use(express.json());
 
 // ==================== MONGODB SETUP ====================
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
-
-mongoose.connect(MONGO_URI)
-    .then(() => console.log("📦 MongoDB Connected Successfully"))
-    .catch(err => console.error("❌ MongoDB Connection Error:", err));
+mongoose.connect(MONGO_URI).then(() => console.log("📦 MongoDB Connected"));
 
 const BotSchema = new mongoose.Schema({
     id: { type: String, default: "htx_martingale" },
@@ -29,7 +26,7 @@ const BotSchema = new mongoose.Schema({
         maxSteps: Number
     }
 });
-const BotModel = mongoose.model('BotConfig_V21', BotSchema);
+const BotModel = mongoose.model('BotConfig_V22', BotSchema);
 
 // ==================== CONFIGURATION ====================
 const config = {
@@ -42,9 +39,8 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws'
 };
 
-// ==================== BOT STATE ====================
 let botState = {
-    isRunning: true, // AUTO-START ENABLED
+    isRunning: true,
     isTrading: false,
     currentPrice: 0,
     avgPrice: 0,
@@ -61,86 +57,12 @@ let botState = {
     settings: {
         baseOrder: 6000,
         autoScale: true,
-        priceDrop: 0.1,      // FORCED SETTING
-        volumeMult: 1.2,     // FORCED SETTING
-        takeProfit: 1.0,     // FORCED SETTING
+        priceDrop: 0.1,      
+        volumeMult: 1.2,     
+        takeProfit: 1.0,    
         maxSteps: 10
     }
 };
-
-// ==================== DATABASE ACTIONS ====================
-async function loadFromDb() {
-    try {
-        const data = await BotModel.findOne({ id: "htx_martingale" });
-        
-        // Always force Auto-Start on Boot
-        botState.isRunning = true;
-
-        if (data) {
-            botState.initialBalance = data.initialBalance;
-            // Overwrite database settings with forced values to ensure 1% and 0.1% are active
-            botState.settings = {
-                ...data.settings,
-                priceDrop: 0.1,
-                volumeMult: 1.2,
-                takeProfit: 1.0
-            };
-            console.log("⚠️ Settings synchronized with code requirements (1.0% TP, 0.1% Drop).");
-            await saveToDb(); 
-        } else {
-            await BotModel.create({ id: "htx_martingale", isRunning: true, settings: botState.settings });
-        }
-        console.log("✅ Bot Initialized & Auto-Started.");
-    } catch (e) { console.error("DB Load Error"); }
-}
-
-async function saveToDb() {
-    try {
-        await BotModel.updateOne({ id: "htx_martingale" }, {
-            isRunning: botState.isRunning,
-            initialBalance: botState.initialBalance,
-            settings: botState.settings
-        }, { upsert: true });
-    } catch (e) {}
-}
-
-// ==================== MATH: MAX BASE ====================
-function calculateMaxBase() {
-    if (botState.currentPrice <= 0 || botState.walletBalance <= 0) return;
-    try {
-        const m = botState.settings.volumeMult || 1.2;
-        const n = botState.settings.maxSteps || 10;
-        const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
-        const totalUsdtCapacity = botState.walletBalance * config.leverage;
-        const rawBase = totalUsdtCapacity / (multiplierSum * botState.currentPrice * 1000);
-        botState.maxSafeBase = Math.floor(rawBase * 0.80); 
-        if (botState.settings.autoScale) botState.settings.baseOrder = botState.maxSafeBase;
-    } catch (e) {}
-}
-
-// ==================== WEBSOCKET ====================
-function initWebSocket() {
-    const ws = new WebSocket(config.wsHost);
-    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' })));
-    ws.on('message', (data) => {
-        const now = Date.now();
-        zlib.gunzip(data, (err, dezipped) => {
-            if (err) return;
-            try {
-                const msg = JSON.parse(dezipped.toString());
-                if (msg.ping) return ws.send(JSON.stringify({ pong: msg.ping }));
-                if (msg.tick && msg.tick.close) {
-                    botState.currentPrice = msg.tick.close;
-                    if (now - botState.lastWsUpdate > 500) {
-                        botState.lastWsUpdate = now;
-                        calculateMaxBase();
-                    }
-                }
-            } catch (e) {}
-        });
-    });
-    ws.on('close', () => setTimeout(initWebSocket, 5000));
-}
 
 // ==================== API HANDLER ====================
 async function htxRequest(method, path, data = {}) {
@@ -150,74 +72,147 @@ async function htxRequest(method, path, data = {}) {
     const payload = [method.toUpperCase(), config.restHost, path, query].join('\n');
     const signature = crypto.createHmac('sha256', config.secretKey).update(payload).digest('base64');
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
+    
     try {
-        const res = await axios({ method, url, data: method === 'POST' ? data : null, timeout: 5000 });
+        const res = await axios({ 
+            method, url, data: method === 'POST' ? data : null, 
+            headers: { 'Content-Type': 'application/json' },
+            timeout: 8000 
+        });
         return res.data;
-    } catch (e) { return null; }
+    } catch (e) {
+        console.error(`❌ API Error (${path}):`, e.response?.data || e.message);
+        return null;
+    }
+}
+
+// ==================== HELPERS ====================
+async function syncPrice() {
+    // Fallback REST price fetch if WebSocket is silent
+    const res = await htxRequest('GET', '/linear-swap-ex/market/trade', { symbol: config.symbol });
+    if (res?.tick?.data?.[0]?.price) {
+        botState.currentPrice = parseFloat(res.tick.data[0].price);
+    }
+}
+
+function calculateMaxBase() {
+    if (botState.currentPrice <= 0 || botState.walletBalance <= 0) return;
+    const m = botState.settings.volumeMult;
+    const n = botState.settings.maxSteps;
+    const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
+    const totalUsdtCapacity = botState.walletBalance * config.leverage;
+    const rawBase = totalUsdtCapacity / (multiplierSum * botState.currentPrice * 1000);
+    botState.maxSafeBase = Math.floor(rawBase * 0.75); 
+    if (botState.settings.autoScale) botState.settings.baseOrder = botState.maxSafeBase;
 }
 
 // ==================== TRADING LOGIC ====================
 async function runLogic() {
-    if (!botState.isRunning || botState.isTrading || botState.currentPrice <= 0) return;
+    if (!botState.isRunning || botState.isTrading) return;
+    if (botState.currentPrice <= 0) { await syncPrice(); return; }
+    
     botState.isTrading = true;
     try {
-        const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
-        const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
+        // 1. Sync Balance and Position
+        const [posRes, accRes] = await Promise.all([
+            htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol }),
+            htxRequest('POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' })
+        ]);
 
-        const balRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_account_info', {});
-        if (balRes?.data) {
-            const acc = balRes.data.find(a => a.margin_asset === 'USDT');
-            const equity = parseFloat(acc.margin_balance);
-            const unrealized = pos ? parseFloat(pos.unrealized_pnl) : 0;
-            botState.walletBalance = equity - unrealized;
-            if (botState.initialBalance === 0) { botState.initialBalance = botState.walletBalance; await saveToDb(); }
-            botState.realizedProfit = botState.walletBalance - botState.initialBalance;
-            botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
+        const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
+        
+        if (accRes?.data) {
+            const acc = accRes.data.find(a => a.margin_asset === 'USDT');
+            if (acc) {
+                const equity = parseFloat(acc.margin_balance);
+                const unrealized = pos ? parseFloat(pos.unrealized_pnl) : 0;
+                botState.walletBalance = equity - unrealized;
+                
+                if (botState.initialBalance <= 0) {
+                    botState.initialBalance = botState.walletBalance;
+                    await BotModel.updateOne({ id: "htx_martingale" }, { initialBalance: botState.initialBalance });
+                }
+                botState.realizedProfit = botState.walletBalance - botState.initialBalance;
+                botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
+            }
         }
 
         if (pos) {
             botState.avgPrice = parseFloat(pos.cost_hold);
             botState.totalContracts = parseFloat(pos.volume);
-            
-            // MATH FIX: Check actual price movement %
             const priceMovePct = ((botState.currentPrice - botState.avgPrice) / botState.avgPrice) * 100;
-            botState.roi = priceMovePct * config.leverage; 
+            botState.roi = priceMovePct * config.leverage;
             botState.pnl = parseFloat(pos.unrealized_pnl);
 
-            // Take Profit check
             if (priceMovePct >= botState.settings.takeProfit) {
+                console.log("🎯 TP Reached. Closing.");
                 await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: botState.totalContracts,
                     direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
                 botState.safetyOrdersFilled = 0;
             } else {
-                // Safety Order Check
                 const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
                 if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
                     botState.safetyOrdersFilled++;
                     const vol = Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled));
+                    console.log(`📉 Buying Safety Order #${botState.safetyOrdersFilled}`);
                     await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                         contract_code: config.symbol, volume: vol,
                         direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
                     });
                 }
             }
-        } else {
-            // Open Initial Position
+        } else if (botState.settings.baseOrder > 0) {
+            console.log("🚀 Opening Base Order.");
             await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: botState.settings.baseOrder,
                 direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
             botState.safetyOrdersFilled = 0;
         }
-    } catch (e) {}
+    } catch (e) { console.error("Logic Loop Error:", e); }
     botState.isTrading = false;
 }
 
-function logicLoop() { runLogic().finally(() => setTimeout(logicLoop, 3000)); }
+// ==================== WEBSOCKET ====================
+function initWebSocket() {
+    const ws = new WebSocket(config.wsHost);
+    ws.on('open', () => {
+        console.log("🌐 WS Connected");
+        ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' }));
+    });
+    ws.on('message', (data) => {
+        zlib.gunzip(data, (err, dezipped) => {
+            if (err) return;
+            try {
+                const msg = JSON.parse(dezipped.toString());
+                if (msg.ping) return ws.send(JSON.stringify({ pong: msg.ping }));
+                if (msg.tick && msg.tick.close) {
+                    botState.currentPrice = parseFloat(msg.tick.close);
+                    calculateMaxBase();
+                }
+            } catch (e) {}
+        });
+    });
+    ws.on('close', () => setTimeout(initWebSocket, 5000));
+    ws.on('error', (e) => console.error("WS Error:", e.message));
+}
 
-// ==================== UI (ORIGINAL DESIGN) ====================
+// ==================== STARTUP ====================
+async function start() {
+    const data = await BotModel.findOne({ id: "htx_martingale" });
+    if (data) {
+        botState.initialBalance = data.initialBalance;
+        // FORCE the settings you requested
+        botState.settings = { ...botState.settings, priceDrop: 0.1, volumeMult: 1.2, takeProfit: 1.0 };
+    }
+    botState.isRunning = true;
+    initWebSocket();
+    setInterval(runLogic, 3000);
+}
+
+// ==================== UI ====================
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
@@ -260,8 +255,8 @@ app.get('/', (req, res) => {
         <div class="ui-card text-center py-12">
             <p class="text-gray-400 text-xs font-bold uppercase mb-2">Max Safe Base Order</p>
             <p id="maxBase" class="text-6xl font-mono font-bold">0</p>
-            <div class="mt-4 text-sm font-bold text-blue-500">
-                TP: <span id="tp_val">1.0</span>% | Drop: <span id="pd_val">0.1</span>% | Mult: <span id="vm_val">1.2</span>x
+            <div class="mt-4 text-xs font-bold text-blue-500 uppercase">
+                Price: <span id="curPrice">0.00</span> | TP: 1.0% | Drop: 0.1% | Mult: 1.2
             </div>
             <button onclick="resetStats()" class="mt-8 text-xs text-red-500 font-bold border border-red-200 px-4 py-1 rounded-full">RESET PROFIT HISTORY</button>
         </div>
@@ -278,9 +273,7 @@ app.get('/', (req, res) => {
                 document.getElementById('roi').className = 'text-xl font-mono ' + (d.roi >= 0 ? 'text-green-500' : 'text-red-500');
                 document.getElementById('bal').innerText = '$' + d.walletBalance.toFixed(4);
                 document.getElementById('maxBase').innerText = d.maxSafeBase.toLocaleString();
-                document.getElementById('tp_val').innerText = d.settings.takeProfit;
-                document.getElementById('pd_val').innerText = d.settings.priceDrop;
-                document.getElementById('vm_val').innerText = d.settings.volumeMult;
+                document.getElementById('curPrice').innerText = d.currentPrice.toFixed(6);
                 document.getElementById('btn').innerText = d.isRunning ? 'STOP BOT' : 'START BOT';
                 document.getElementById('btn').className = d.isRunning ? 'bg-red-600 text-white px-8 py-3 rounded-lg font-bold' : 'bg-black text-white px-8 py-3 rounded-lg font-bold';
             } catch (e) {}
@@ -295,11 +288,11 @@ app.get('/', (req, res) => {
 });
 
 app.get('/api/status', (req, res) => res.json(botState));
-app.post('/api/toggle', async (req, res) => { botState.isRunning = !botState.isRunning; await saveToDb(); res.sendStatus(200); });
-app.post('/api/reset-stats', async (req, res) => { botState.initialBalance = botState.walletBalance; botState.realizedProfit = 0; botState.profitPct = 0; await saveToDb(); res.sendStatus(200); });
-
-app.listen(config.port, async () => {
-    await loadFromDb();
-    initWebSocket();
-    logicLoop();
+app.post('/api/toggle', async (req, res) => { botState.isRunning = !botState.isRunning; res.sendStatus(200); });
+app.post('/api/reset-stats', async (req, res) => { 
+    botState.initialBalance = botState.walletBalance; 
+    await BotModel.updateOne({ id: "htx_martingale" }, { initialBalance: botState.initialBalance });
+    res.sendStatus(200); 
 });
+
+app.listen(config.port, start);
