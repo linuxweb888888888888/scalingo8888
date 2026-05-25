@@ -11,7 +11,10 @@ app.use(express.json());
 
 // ==================== MONGODB SETUP ====================
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
-mongoose.connect(MONGO_URI).then(() => console.log("📦 MongoDB Connected"));
+
+mongoose.connect(MONGO_URI)
+    .then(() => console.log("📦 MongoDB Connected Successfully"))
+    .catch(err => console.error("❌ MongoDB Connection Error:", err));
 
 const BotSchema = new mongoose.Schema({
     id: { type: String, default: "htx_martingale" },
@@ -26,7 +29,7 @@ const BotSchema = new mongoose.Schema({
         maxSteps: Number
     }
 });
-const BotModel = mongoose.model('BotConfig_V19', BotSchema);
+const BotModel = mongoose.model('BotConfig_V21', BotSchema);
 
 // ==================== CONFIGURATION ====================
 const config = {
@@ -41,7 +44,7 @@ const config = {
 
 // ==================== BOT STATE ====================
 let botState = {
-    isRunning: false,
+    isRunning: true, // AUTO-START ENABLED
     isTrading: false,
     currentPrice: 0,
     avgPrice: 0,
@@ -58,9 +61,9 @@ let botState = {
     settings: {
         baseOrder: 6000,
         autoScale: true,
-        priceDrop: 0.8,      
-        volumeMult: 1.2,     
-        takeProfit: 1.0,    // Forced to 1%
+        priceDrop: 0.1,      // FORCED SETTING
+        volumeMult: 1.2,     // FORCED SETTING
+        takeProfit: 1.0,     // FORCED SETTING
         maxSteps: 10
     }
 };
@@ -69,20 +72,25 @@ let botState = {
 async function loadFromDb() {
     try {
         const data = await BotModel.findOne({ id: "htx_martingale" });
+        
+        // Always force Auto-Start on Boot
+        botState.isRunning = true;
+
         if (data) {
-            botState.isRunning = data.isRunning;
             botState.initialBalance = data.initialBalance;
-            botState.settings = data.settings;
-            
-            // FORCE UPDATE: Fix the 0.15% issue if it exists in DB
-            if (botState.settings.takeProfit < 1.0) {
-                console.log("⚠️ DB had low TP. Forcing to 1.0%");
-                botState.settings.takeProfit = 1.0;
-                await saveToDb();
-            }
+            // Overwrite database settings with forced values to ensure 1% and 0.1% are active
+            botState.settings = {
+                ...data.settings,
+                priceDrop: 0.1,
+                volumeMult: 1.2,
+                takeProfit: 1.0
+            };
+            console.log("⚠️ Settings synchronized with code requirements (1.0% TP, 0.1% Drop).");
+            await saveToDb(); 
         } else {
-            await BotModel.create({ id: "htx_martingale", isRunning: false, settings: botState.settings });
+            await BotModel.create({ id: "htx_martingale", isRunning: true, settings: botState.settings });
         }
+        console.log("✅ Bot Initialized & Auto-Started.");
     } catch (e) { console.error("DB Load Error"); }
 }
 
@@ -171,12 +179,12 @@ async function runLogic() {
             botState.avgPrice = parseFloat(pos.cost_hold);
             botState.totalContracts = parseFloat(pos.volume);
             
-            // CORRECTED LOGIC: Check actual price movement %
+            // MATH FIX: Check actual price movement %
             const priceMovePct = ((botState.currentPrice - botState.avgPrice) / botState.avgPrice) * 100;
-            botState.roi = priceMovePct * config.leverage;
+            botState.roi = priceMovePct * config.leverage; 
             botState.pnl = parseFloat(pos.unrealized_pnl);
 
-            // Close if price increase hits target %
+            // Take Profit check
             if (priceMovePct >= botState.settings.takeProfit) {
                 await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: botState.totalContracts,
@@ -184,6 +192,7 @@ async function runLogic() {
                 });
                 botState.safetyOrdersFilled = 0;
             } else {
+                // Safety Order Check
                 const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
                 if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
                     botState.safetyOrdersFilled++;
@@ -195,6 +204,7 @@ async function runLogic() {
                 }
             }
         } else {
+            // Open Initial Position
             await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: botState.settings.baseOrder,
                 direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
@@ -250,7 +260,9 @@ app.get('/', (req, res) => {
         <div class="ui-card text-center py-12">
             <p class="text-gray-400 text-xs font-bold uppercase mb-2">Max Safe Base Order</p>
             <p id="maxBase" class="text-6xl font-mono font-bold">0</p>
-            <div class="mt-4 text-xs text-gray-400">Current Take Profit Trigger: <span id="tp_val">1.0</span>% price move</div>
+            <div class="mt-4 text-sm font-bold text-blue-500">
+                TP: <span id="tp_val">1.0</span>% | Drop: <span id="pd_val">0.1</span>% | Mult: <span id="vm_val">1.2</span>x
+            </div>
             <button onclick="resetStats()" class="mt-8 text-xs text-red-500 font-bold border border-red-200 px-4 py-1 rounded-full">RESET PROFIT HISTORY</button>
         </div>
     </div>
@@ -267,6 +279,8 @@ app.get('/', (req, res) => {
                 document.getElementById('bal').innerText = '$' + d.walletBalance.toFixed(4);
                 document.getElementById('maxBase').innerText = d.maxSafeBase.toLocaleString();
                 document.getElementById('tp_val').innerText = d.settings.takeProfit;
+                document.getElementById('pd_val').innerText = d.settings.priceDrop;
+                document.getElementById('vm_val').innerText = d.settings.volumeMult;
                 document.getElementById('btn').innerText = d.isRunning ? 'STOP BOT' : 'START BOT';
                 document.getElementById('btn').className = d.isRunning ? 'bg-red-600 text-white px-8 py-3 rounded-lg font-bold' : 'bg-black text-white px-8 py-3 rounded-lg font-bold';
             } catch (e) {}
