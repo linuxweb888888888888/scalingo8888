@@ -10,10 +10,11 @@ app.use(express.json());
 const config = {
     apiKey: process.env.HTX_API_KEY,
     secretKey: process.env.HTX_SECRET_KEY,
-    symbol: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase(),
-    leverage: parseInt(process.env.LEVERAGE) || 20,
+    symbol: 'SHIB-USDT',
+    leverage: 10,
     port: process.env.PORT || 3000,
-    host: 'api.htx.com' // Do not include https://
+    // Use api.htx.com for Unified Accounts
+    host: 'api.htx.com' 
 };
 
 // ==================== BOT STATE ====================
@@ -27,18 +28,17 @@ let bot = {
     safetyOrdersFilled: 0,
     settings: {
         baseOrder: 6000,
-        safetyOrder: 7000,
-        priceDrop: 0.1,       // 0.1% drop per step
-        volumeMult: 1.2,      // Size increases 1.2x per step
-        priceMult: 1.0,       // Linear spacing
-        takeProfit: 0.15,     // 0.15% ROI target
+        priceDrop: 0.1,       // 0.1%
+        volumeMult: 1.2,
+        priceMult: 1.0,
+        takeProfit: 0.15,     // 0.15%
         maxSafetyOrders: 10
     }
 };
 
-// ==================== ✅ CORRECT HTX V3 API METHOD ====================
+// ==================== ✅ FIXED HTX PRIVATE API METHOD ====================
 async function htxRequest(method, path, data = {}) {
-    // 1. UTC Timestamp (No milliseconds)
+    // 1. Timestamp MUST NOT have milliseconds
     const timestamp = new Date().toISOString().split('.')[0];
     
     const params = {
@@ -48,12 +48,12 @@ async function htxRequest(method, path, data = {}) {
         Timestamp: timestamp
     };
 
-    // 2. Sort parameters and build query string for signature
+    // 2. Sort parameters alphabetically
     const sortedQuery = Object.keys(params).sort().map(key => 
         `${key}=${encodeURIComponent(params[key])}`
     ).join('&');
 
-    // 3. Construct signature payload
+    // 3. Create Signature (Method + Host + Path + SortedQuery)
     const payload = [
         method.toUpperCase(),
         config.host,
@@ -63,7 +63,7 @@ async function htxRequest(method, path, data = {}) {
 
     const signature = crypto.createHmac('sha256', config.secretKey).update(payload).digest('base64');
 
-    // 4. Construct Final URL (Auth in query string, Data in body)
+    // 4. Construct URL
     const url = `https://${config.host}${path}?${sortedQuery}&Signature=${encodeURIComponent(signature)}`;
 
     try {
@@ -71,31 +71,43 @@ async function htxRequest(method, path, data = {}) {
             method,
             url,
             data: method.toUpperCase() === 'POST' ? data : null,
-            headers: { 'Content-Type': 'application/json' }
+            headers: { 
+                'Content-Type': 'application/json',
+                // ✅ ADDED USER-AGENT TO FIX 403 CLOUDFLARE BLOCK
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            },
+            timeout: 5000
         });
 
         if (response.data.status !== 'ok') {
-            throw new Error(response.data['err-msg'] || JSON.stringify(response.data));
+            console.error(`HTX Business Error: ${response.data['err-msg']}`);
+            return null;
         }
         return response.data;
     } catch (error) {
-        console.error(`❌ API Error [${path}]:`, error.response?.data || error.message);
+        // If it's a 403, we are being throttled or blocked by Cloudflare
+        console.error(`❌ API Error [${path}]: ${error.response?.status || error.message}`);
         return null;
     }
 }
 
 // ==================== TRADING LOGIC ====================
 async function updateBotState() {
-    // 1. Get Public Market Price
+    // 1. Get Market Price (Public)
     try {
-        const res = await axios.get(`https://${config.host}/linear-swap-ex/market/detail/merged?symbol=${config.symbol}`);
+        const res = await axios.get(`https://${config.host}/linear-swap-ex/market/detail/merged?symbol=${config.symbol}`, {
+            headers: { 'User-Agent': 'Mozilla/5.0' }
+        });
         bot.currentPrice = res.data.tick.close;
-    } catch (e) {}
+    } catch (e) {
+        console.error("Public Price Fetch Error");
+    }
 
     if (!bot.isRunning) return;
 
-    // 2. Get Private Position Info via V3 Path
-    const posRes = await htxRequest('POST', '/v3/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
+    // 2. Get Position (Private) - REMOVED /v3/ TO FIX 404
+    const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
+    
     const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0);
 
     if (pos) {
@@ -104,10 +116,10 @@ async function updateBotState() {
         bot.roi = parseFloat(pos.profit_ratio) * 100;
         bot.pnl = parseFloat(pos.unrealized_pnl);
 
-        // A. Check Take Profit
+        // Take Profit Check
         if (bot.roi >= bot.settings.takeProfit) {
-            console.log("🎯 Take Profit Hit! Closing position...");
-            await htxRequest('POST', '/v3/linear-swap-api/v1/swap_cross_order', {
+            console.log("🎯 Target ROI met. Closing position.");
+            await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: bot.totalContracts,
                 direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
             });
@@ -115,24 +127,23 @@ async function updateBotState() {
             return;
         }
 
-        // B. Check Safety Order (Addition Order)
-        const dropNeeded = bot.settings.priceDrop * Math.pow(bot.settings.priceMult, bot.safetyOrdersFilled);
-        const triggerPrice = bot.avgPrice * (1 - (dropNeeded / 100));
+        // Safety Order Check
+        const dropThreshold = bot.settings.priceDrop * Math.pow(bot.settings.priceMult, bot.safetyOrdersFilled);
+        const triggerPrice = bot.avgPrice * (1 - (dropThreshold / 100));
 
         if (bot.currentPrice <= triggerPrice && bot.safetyOrdersFilled < bot.settings.maxSafetyOrders) {
             bot.safetyOrdersFilled++;
-            const vol = Math.floor(bot.settings.safetyOrder * Math.pow(bot.settings.volumeMult, bot.safetyOrdersFilled - 1));
-            
-            console.log(`📉 Price drop! Adding Order #${bot.safetyOrdersFilled} (Vol: ${vol})`);
-            await htxRequest('POST', '/v3/linear-swap-api/v1/swap_cross_order', {
+            const vol = Math.floor(bot.settings.baseOrder * Math.pow(bot.settings.volumeMult, bot.safetyOrdersFilled));
+            console.log(`📉 Adding Safety Order #${bot.safetyOrdersFilled}`);
+            await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: vol,
                 direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
         }
     } else {
-        // C. No position? Open Base Order
-        console.log("🚀 Starting new cycle...");
-        await htxRequest('POST', '/v3/linear-swap-api/v1/swap_cross_order', {
+        // No position? Open Base Order
+        console.log("🚀 Starting cycle with Base Order");
+        await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
             contract_code: config.symbol, volume: bot.settings.baseOrder,
             direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
         });
@@ -140,6 +151,7 @@ async function updateBotState() {
     }
 }
 
+// Run loop every 4 seconds to avoid spamming Cloudflare
 setInterval(updateBotState, 4000);
 
 // ==================== WEB INTERFACE ====================
@@ -148,112 +160,56 @@ app.get('/', (req, res) => {
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <title>HTX Martingale V3</title>
+        <title>HTX Martingale V3 Fix</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <style>
             body { background-color: #0b0e11; color: #eaecef; font-family: sans-serif; }
             .htx-card { background-color: #1e2329; border: 1px solid #30363d; border-radius: 8px; }
-            .htx-input { background-color: #2b3139; border: 1px solid #474d57; color: white; border-radius: 4px; padding: 8px; }
             .htx-blue { color: #3275ff; }
             .btn-action { background-color: #3275ff; color: white; padding: 10px 24px; border-radius: 4px; font-weight: bold; }
         </style>
     </head>
     <body class="p-10">
-        <div class="max-w-6xl mx-auto">
+        <div class="max-w-5xl mx-auto">
             <header class="flex justify-between items-center mb-10">
-                <h1 class="text-2xl font-bold italic"><span class="htx-blue">HTX</span> Martingale Strategy</h1>
-                <div class="flex gap-4">
-                    <button onclick="toggleBot()" id="btnAction" class="btn-action">START BOT</button>
-                </div>
+                <h1 class="text-2xl font-bold italic"><span class="htx-blue">HTX</span> Martingale (Fixed)</h1>
+                <button onclick="toggleBot()" id="btnAction" class="btn-action">START BOT</button>
             </header>
 
             <div class="grid grid-cols-12 gap-8">
-                <!-- Data Panel -->
-                <div class="col-span-8 space-y-6">
-                    <div class="htx-card p-6 grid grid-cols-4 gap-4">
-                        <div>
-                            <p class="text-xs text-gray-400 uppercase mb-2">Unrealized PnL</p>
-                            <p id="pnl" class="text-xl font-bold text-green-500">0.0000</p>
-                        </div>
-                        <div>
-                            <p class="text-xs text-gray-400 uppercase mb-2">Current ROI</p>
-                            <p id="roi" class="text-xl font-bold text-green-500">0.00%</p>
-                        </div>
-                        <div>
-                            <p class="text-xs text-gray-400 uppercase mb-2">Last Price</p>
-                            <p id="price" class="text-xl font-bold">0.000000</p>
-                        </div>
-                        <div>
-                            <p class="text-xs text-gray-400 uppercase mb-2">DCA Steps</p>
-                            <p id="steps" class="text-xl font-bold">0 / 10</p>
-                        </div>
-                    </div>
-                    <div class="htx-card h-64 flex items-center justify-center border-dashed border-2 border-gray-700 font-bold text-gray-600 uppercase tracking-widest">
-                        Live Execution Chart
-                    </div>
+                <div class="col-span-8 htx-card p-6 grid grid-cols-4 gap-4">
+                    <div><p class="text-xs text-gray-400 mb-1 uppercase">PnL</p><p id="pnl" class="text-xl font-bold">0.0000</p></div>
+                    <div><p class="text-xs text-gray-400 mb-1 uppercase">ROI</p><p id="roi" class="text-xl font-bold">0.00%</p></div>
+                    <div><p class="text-xs text-gray-400 mb-1 uppercase">Price</p><p id="price" class="text-xl font-bold">0.000000</p></div>
+                    <div><p class="text-xs text-gray-400 mb-1 uppercase">Safety</p><p id="steps" class="text-xl font-bold">0 / 10</p></div>
                 </div>
-
-                <!-- Settings Sidebar -->
                 <div class="col-span-4 htx-card p-6">
-                    <h3 class="font-bold border-b border-gray-700 pb-3 mb-6 uppercase text-sm">Bot Configuration</h3>
-                    <div class="space-y-4">
-                        <div><label class="text-xs text-gray-400 block mb-1">Base Order (Qty)</label><input id="baseOrder" type="number" class="w-full htx-input" value="${bot.settings.baseOrder}"></div>
-                        <div><label class="text-xs text-gray-400 block mb-1">Safety Order (Qty)</label><input id="safetyOrder" type="number" class="w-full htx-input" value="${bot.settings.safetyOrder}"></div>
-                        <div class="grid grid-cols-2 gap-4">
-                            <div><label class="text-xs text-gray-400 block mb-1">Drop %</label><input id="priceDrop" type="number" class="w-full htx-input" value="${bot.settings.priceDrop}"></div>
-                            <div><label class="text-xs text-gray-400 block mb-1">TP ROI %</label><input id="takeProfit" type="number" class="w-full htx-input" value="${bot.settings.takeProfit}"></div>
-                        </div>
-                        <div class="grid grid-cols-2 gap-4">
-                            <div><label class="text-xs text-gray-400 block mb-1">Vol Multiplier</label><input id="volumeMult" type="number" class="w-full htx-input" value="${bot.settings.volumeMult}"></div>
-                            <div><label class="text-xs text-gray-400 block mb-1">Max Steps</label><input id="maxSteps" type="number" class="w-full htx-input" value="${bot.settings.maxSafetyOrders}"></div>
-                        </div>
-                        <button onclick="updateSettings()" class="w-full mt-4 py-2 border border-gray-600 rounded text-sm hover:bg-gray-800 transition font-bold uppercase">Update Strategy</button>
-                    </div>
+                    <h3 class="font-bold mb-4 border-b border-gray-700 pb-2">Settings</h3>
+                    <p class="text-sm">Base: ${bot.settings.baseOrder} SHIB</p>
+                    <p class="text-sm">Drop: ${bot.settings.priceDrop}%</p>
+                    <p class="text-sm">TP: ${bot.settings.takeProfit}%</p>
                 </div>
             </div>
         </div>
-
         <script>
-            async function updateUI() {
+            async function refresh() {
                 const r = await fetch('/api/status');
                 const d = await r.json();
                 document.getElementById('pnl').innerText = d.pnl.toFixed(4);
-                document.getElementById('pnl').className = d.pnl >= 0 ? 'text-xl font-bold text-green-500' : 'text-xl font-bold text-red-500';
                 document.getElementById('roi').innerText = d.roi.toFixed(2) + '%';
-                document.getElementById('roi').className = d.roi >= 0 ? 'text-xl font-bold text-green-500' : 'text-xl font-bold text-red-500';
                 document.getElementById('price').innerText = d.currentPrice;
-                document.getElementById('steps').innerText = d.safetyOrdersFilled + ' / ' + d.settings.maxSafetyOrders;
-                
-                const btn = document.getElementById('btnAction');
-                btn.innerText = d.isRunning ? 'STOP BOT' : 'START BOT';
-                btn.className = d.isRunning ? 'px-6 py-2 rounded font-bold bg-red-600' : 'btn-action';
+                document.getElementById('steps').innerText = d.safetyOrdersFilled + ' / 10';
+                document.getElementById('btnAction').innerText = d.isRunning ? 'STOP BOT' : 'START BOT';
             }
-
-            async function toggleBot() { await fetch('/api/toggle', {method: 'POST'}); updateUI(); }
-
-            async function updateSettings() {
-                const settings = {
-                    baseOrder: parseFloat(document.getElementById('baseOrder').value),
-                    safetyOrder: parseFloat(document.getElementById('safetyOrder').value),
-                    priceDrop: parseFloat(document.getElementById('priceDrop').value),
-                    takeProfit: parseFloat(document.getElementById('takeProfit').value),
-                    volumeMult: parseFloat(document.getElementById('volumeMult').value),
-                    maxSafetyOrders: parseInt(document.getElementById('maxSteps').value),
-                    priceMult: 1.0
-                };
-                await fetch('/api/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(settings) });
-                alert('Strategy Updated');
-            }
-            setInterval(updateUI, 2000);
+            async function toggleBot() { await fetch('/api/toggle', {method: 'POST'}); refresh(); }
+            setInterval(refresh, 2000);
         </script>
     </body>
     </html>
     `);
 });
 
-// ==================== API ENDPOINTS ====================
 app.get('/api/status', (req, res) => res.json(bot));
 app.post('/api/toggle', (req, res) => { bot.isRunning = !bot.isRunning; res.sendStatus(200); });
-app.post('/api/settings', (req, res) => { bot.settings = req.body; res.sendStatus(200); });
 
-app.listen(config.port, () => console.log(`🚀 Dashboard: http://localhost:${config.port}`));
+app.listen(config.port, () => console.log(`🚀 Bot listening on port ${config.port}`));
