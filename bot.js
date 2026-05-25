@@ -11,7 +11,7 @@ app.use(express.json());
 
 // ==================== MONGODB SETUP ====================
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
-mongoose.connect(MONGO_URI).then(() => console.log("📦 MongoDB Connected"));
+mongoose.connect(MONGO_URI).then(() => console.log("📦 MongoDB Connected Successfully"));
 
 const BotSchema = new mongoose.Schema({
     id: { type: String, default: "htx_martingale" },
@@ -26,7 +26,7 @@ const BotSchema = new mongoose.Schema({
         maxSteps: Number
     }
 });
-const BotModel = mongoose.model('BotConfig_V4', BotSchema);
+const BotModel = mongoose.model('BotConfig_V5', BotSchema);
 
 // ==================== CONFIGURATION ====================
 const config = {
@@ -47,10 +47,10 @@ let botState = {
     currentPrice: 0,
     avgPrice: 0,
     totalContracts: 0,
-    roi: 0, // Unrealized ROI
-    pnl: 0, // Unrealized PnL
-    realizedProfit: 0, // Current - Initial
-    profitPct: 0, // % growth
+    roi: 0,
+    pnl: 0,
+    realizedProfit: 0, 
+    profitPct: 0,
     safetyOrdersFilled: 0,
     walletBalance: 0,
     initialBalance: 0,
@@ -65,7 +65,7 @@ let botState = {
     }
 };
 
-// ==================== DATABASE & MATH ====================
+// ==================== DATABASE ACTIONS ====================
 async function loadFromDb() {
     const data = await BotModel.findOne({ id: "htx_martingale" });
     if (data) {
@@ -85,18 +85,21 @@ async function saveToDb() {
     });
 }
 
+// ==================== MATH: GEOMETRIC MAX BASE ====================
 function calculateMaxBase() {
     if (botState.currentPrice <= 0 || botState.walletBalance <= 0) return;
-    const m = botState.settings.volumeMult;
-    const n = botState.settings.maxSteps;
-    const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
-    const totalUsdtCapacity = botState.walletBalance * config.leverage;
-    const rawBase = totalUsdtCapacity / (multiplierSum * botState.currentPrice * 1000);
-    botState.maxSafeBase = Math.floor(rawBase * 0.80); 
-    if (botState.settings.autoScale) botState.settings.baseOrder = botState.maxSafeBase;
+    try {
+        const m = botState.settings.volumeMult;
+        const n = botState.settings.maxSteps;
+        const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
+        const totalUsdtCapacity = botState.walletBalance * config.leverage;
+        const rawBase = totalUsdtCapacity / (multiplierSum * botState.currentPrice * 1000);
+        botState.maxSafeBase = Math.floor(rawBase * 0.85); 
+        if (botState.settings.autoScale) botState.settings.baseOrder = botState.maxSafeBase;
+    } catch (e) {}
 }
 
-// ==================== WEBSOCKET & API ====================
+// ==================== WEBSOCKET PRICE ENGINE ====================
 function initWebSocket() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' })));
@@ -116,6 +119,7 @@ function initWebSocket() {
     ws.on('close', () => setTimeout(initWebSocket, 5000));
 }
 
+// ==================== API REQUEST HANDLER ====================
 async function htxRequest(method, path, data = {}) {
     const timestamp = new Date().toISOString().split('.')[0];
     const params = { AccessKeyId: config.apiKey, SignatureMethod: 'HmacSHA256', SignatureVersion: '2', Timestamp: timestamp };
@@ -123,8 +127,13 @@ async function htxRequest(method, path, data = {}) {
     const payload = [method.toUpperCase(), config.restHost, path, query].join('\n');
     const signature = crypto.createHmac('sha256', config.secretKey).update(payload).digest('base64');
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
+
     try {
-        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' }, timeout: 8000 });
+        const res = await axios({
+            method, url, data: method === 'POST' ? data : null,
+            headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
+            timeout: 10000 
+        });
         return res.data;
     } catch (e) { return null; }
 }
@@ -138,13 +147,11 @@ async function runLogic() {
         if (balRes) {
             botState.walletBalance = parseFloat(balRes.data?.find(a => a.margin_asset === 'USDT')?.margin_balance || 0);
             
-            // Set Initial Balance on first run
+            // First time lock for initial balance
             if (botState.initialBalance === 0 && botState.walletBalance > 0) {
                 botState.initialBalance = botState.walletBalance;
                 await saveToDb();
             }
-
-            // Profit Calculation
             botState.realizedProfit = botState.walletBalance - botState.initialBalance;
             botState.profitPct = botState.initialBalance > 0 ? (botState.realizedProfit / botState.initialBalance) * 100 : 0;
         }
@@ -155,7 +162,7 @@ async function runLogic() {
         if (pos) {
             botState.avgPrice = parseFloat(pos.cost_hold);
             botState.totalContracts = parseFloat(pos.volume);
-            botState.roi = (botState.currentPrice - botState.avgPrice) / botState.avgPrice * 100 * config.leverage;
+            botState.roi = ((botState.currentPrice - botState.avgPrice) / botState.avgPrice) * 100 * config.leverage;
             botState.pnl = parseFloat(pos.unrealized_pnl);
 
             if (botState.roi >= botState.settings.takeProfit) {
@@ -186,7 +193,7 @@ async function runLogic() {
     botState.isTrading = false;
 }
 
-function logicLoop() { runLogic().finally(() => setTimeout(logicLoop, 4000)); }
+function logicLoop() { runLogic().finally(() => setTimeout(logicLoop, 5000)); }
 
 // ==================== DASHBOARD UI ====================
 app.get('/', (req, res) => {
@@ -195,7 +202,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>TradeBot | Smart Martingale</title>
+    <title>TradeBot | Professional Martingale</title>
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&family=Roboto+Mono:wght@400;700&display=swap" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined" rel="stylesheet" />
     <script src="https://cdn.tailwindcss.com"></script>
@@ -227,34 +234,32 @@ app.get('/', (req, res) => {
     <main class="max-w-7xl mx-auto w-full px-6 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
         <div class="lg:col-span-8 space-y-8">
             <div class="grid grid-cols-2 md:grid-cols-4 gap-6">
-                <!-- PROFIT USDT -->
+                <!-- REALIZED PROFIT USDT -->
                 <div class="ui-card p-6">
-                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Realized Profit ($)</p>
+                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Realized Profit (USDT)</p>
                     <p id="realProfit" class="text-2xl font-mono font-bold text-green-500">$0.0000</p>
+                </div>
+                <!-- SESSION PERCENTAGE -->
+                <div class="ui-card p-6">
+                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Session Profit (%)</p>
+                    <p id="profitPct" class="text-2xl font-mono font-bold text-blue-600">0.0000%</p>
                 </div>
                 <!-- UNREALIZED ROI -->
                 <div class="ui-card p-6">
                     <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Unrealized ROI</p>
-                    <p id="roi" class="text-2xl font-mono font-bold text-blue-600">0.00%</p>
+                    <p id="roi" class="text-2xl font-mono font-bold">0.00%</p>
                 </div>
-                <!-- SESSION GROWTH % -->
+                <!-- CURRENT BALANCE -->
                 <div class="ui-card p-6">
-                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Session Profit (%)</p>
-                    <p id="profitPct" class="text-2xl font-mono font-bold text-green-600">0.00%</p>
-                </div>
-                <!-- BALANCE -->
-                <div class="ui-card p-6">
-                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Wallet Total</p>
+                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Current Wallet</p>
                     <p id="balance" class="text-2xl font-mono font-bold text-gray-800">$0.00</p>
                 </div>
             </div>
 
             <div class="ui-card p-8 h-64 flex flex-col items-center justify-center border-2 border-dashed border-gray-200">
-                 <p class="text-gray-400 font-bold uppercase tracking-widest text-[10px] mb-2">Safe Base Order Recommendation</p>
+                 <p class="text-gray-400 font-bold uppercase tracking-widest text-[10px] mb-2">Maximum Safe Base Order (10 Steps)</p>
                  <p id="recBaseDisplay" class="text-5xl font-mono font-bold text-black">0</p>
-                 <div class="flex gap-4 mt-6">
-                    <button onclick="resetProfit()" class="text-[10px] bg-red-50 text-red-500 font-bold px-4 py-2 rounded-full uppercase border border-red-100 hover:bg-red-100">Reset Initial Balance</button>
-                 </div>
+                 <button onclick="resetProfit()" class="mt-6 text-[10px] bg-red-50 text-red-500 font-bold px-4 py-2 rounded-full uppercase border border-red-100 hover:bg-red-200 transition">Reset Profit History</button>
             </div>
         </div>
 
@@ -263,18 +268,14 @@ app.get('/', (req, res) => {
                 <h3 class="font-bold mb-6 flex items-center gap-2 pb-2 border-b border-gray-50 uppercase text-xs tracking-widest text-gray-400">Settings</h3>
                 <div class="space-y-4">
                     <div class="flex items-center justify-between p-3 bg-blue-50 rounded-lg">
-                        <span class="text-[10px] font-bold text-blue-700 uppercase">Auto-Scale Base Order</span>
+                        <span class="text-[10px] font-bold text-blue-700 uppercase">Auto-Scale</span>
                         <input type="checkbox" id="autoScale" onchange="toggleAuto()">
                     </div>
-                    <div>
-                        <label class="text-xs font-bold text-gray-500 mb-1 block">Base Order (Qty)</label>
-                        <input id="baseOrder" type="number" class="input-minimal font-mono">
-                    </div>
+                    <div><label class="text-xs font-bold text-gray-500 mb-1 block">Base Qty</label><input id="baseOrder" type="number" class="input-minimal font-mono"></div>
                     <div class="grid grid-cols-2 gap-4">
-                        <div><label class="text-xs font-bold text-gray-500 mb-1 block">Drop (%)</label><input id="priceDrop" type="number" class="input-minimal font-mono"></div>
-                        <div><label class="text-xs font-bold text-gray-500 mb-1 block">TP (%)</label><input id="takeProfit" type="number" class="input-minimal font-mono"></div>
+                        <div><label class="text-xs font-bold text-gray-500 mb-1 block">Drop %</label><input id="priceDrop" type="number" class="input-minimal font-mono"></div>
+                        <div><label class="text-xs font-bold text-gray-500 mb-1 block">TP %</label><input id="takeProfit" type="number" class="input-minimal font-mono"></div>
                     </div>
-                    <div><label class="text-xs font-bold text-gray-500 mb-1 block">Volume Multiplier</label><input id="volumeMult" type="number" class="input-minimal font-mono"></div>
                     <button onclick="saveSettings()" class="btn-primary w-full mt-4 font-bold text-xs uppercase tracking-widest">Update Strategy</button>
                 </div>
             </div>
@@ -291,11 +292,11 @@ app.get('/', (req, res) => {
                 document.getElementById('realProfit').innerText = '$' + d.realizedProfit.toFixed(4);
                 document.getElementById('realProfit').className = 'text-2xl font-mono font-bold ' + (d.realizedProfit >= 0 ? 'text-green-500' : 'text-red-500');
                 
+                document.getElementById('profitPct').innerText = d.profitPct.toFixed(4) + '%';
+                document.getElementById('profitPct').className = 'text-2xl font-mono font-bold ' + (d.profitPct >= 0 ? 'text-green-500' : 'text-red-500');
+                
                 document.getElementById('roi').innerText = d.roi.toFixed(2) + '%';
                 document.getElementById('roi').className = 'text-2xl font-mono font-bold ' + (d.roi >= 0 ? 'text-green-500' : 'text-red-500');
-
-                document.getElementById('profitPct').innerText = d.profitPct.toFixed(2) + '%';
-                document.getElementById('profitPct').className = 'text-2xl font-mono font-bold ' + (d.profitPct >= 0 ? 'text-green-500' : 'text-red-500');
 
                 document.getElementById('balance').innerText = '$' + parseFloat(d.walletBalance).toFixed(2);
                 document.getElementById('recBaseDisplay').innerText = d.maxSafeBase.toLocaleString();
@@ -305,7 +306,6 @@ app.get('/', (req, res) => {
                     document.getElementById('baseOrder').value = d.settings.baseOrder;
                     document.getElementById('priceDrop').value = d.settings.priceDrop;
                     document.getElementById('takeProfit').value = d.settings.takeProfit;
-                    document.getElementById('volumeMult').value = d.settings.volumeMult;
                     toggleAutoUI(d.settings.autoScale);
                     isFirstLoad = false;
                 }
@@ -330,7 +330,7 @@ app.get('/', (req, res) => {
         }
 
         async function toggleBot() { await fetch('/api/toggle', {method: 'POST'}); refresh(); }
-        async function resetProfit() { if(confirm("Set current balance as new starting point?")) await fetch('/api/reset-profit', {method: 'POST'}); }
+        async function resetProfit() { if(confirm("This will reset your initial balance to current. Continue?")) await fetch('/api/reset-profit', {method: 'POST'}); }
         
         async function saveSettings() {
             const body = {
@@ -338,7 +338,8 @@ app.get('/', (req, res) => {
                 baseOrder: parseFloat(document.getElementById('baseOrder').value),
                 priceDrop: parseFloat(document.getElementById('priceDrop').value),
                 takeProfit: parseFloat(document.getElementById('takeProfit').value),
-                volumeMult: parseFloat(document.getElementById('volumeMult').value)
+                volumeMult: 1.2,
+                maxSteps: 10
             };
             await fetch('/api/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
         }
