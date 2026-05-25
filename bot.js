@@ -11,7 +11,7 @@ app.use(express.json());
 
 // ==================== MONGODB SETUP ====================
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
-mongoose.connect(MONGO_URI).then(() => console.log("📦 MongoDB Connected - Locked Static Logic"));
+mongoose.connect(MONGO_URI).then(() => console.log("📦 MongoDB Connected - Using Static Balance Logic"));
 
 const BotSchema = new mongoose.Schema({
     id: { type: String, default: "htx_martingale" },
@@ -26,7 +26,7 @@ const BotSchema = new mongoose.Schema({
         maxSteps: Number
     }
 });
-const BotModel = mongoose.model('BotConfig_V12', BotSchema);
+const BotModel = mongoose.model('BotConfig_V15', BotSchema);
 
 // ==================== CONFIGURATION ====================
 const config = {
@@ -52,7 +52,7 @@ let botState = {
     realizedProfit: 0, 
     profitPct: 0,
     safetyOrdersFilled: 0,
-    walletBalance: 0, // STAYS STILL DURING TRADES
+    walletBalance: 0, // THIS IS THE STATIC BALANCE
     initialBalance: 0,
     maxSafeBase: 0,
     settings: {
@@ -70,7 +70,7 @@ async function loadFromDb() {
     const data = await BotModel.findOne({ id: "htx_martingale" });
     if (data) {
         botState.isRunning = data.isRunning;
-        botState.initialBalance = data.initialBalance || 0;
+        botState.initialBalance = data.initialBalance;
         botState.settings = data.settings;
     } else {
         await BotModel.create({ id: "htx_martingale", isRunning: false, settings: botState.settings });
@@ -94,7 +94,7 @@ function calculateMaxBase() {
         const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
         const totalUsdtCapacity = botState.walletBalance * config.leverage;
         const rawBase = totalUsdtCapacity / (multiplierSum * botState.currentPrice * 1000);
-        botState.maxSafeBase = Math.floor(rawBase * 0.82); // 18% buffer
+        botState.maxSafeBase = Math.floor(rawBase * 0.80); 
         if (botState.settings.autoScale) botState.settings.baseOrder = botState.maxSafeBase;
     } catch (e) {}
 }
@@ -119,7 +119,7 @@ function initWebSocket() {
     ws.on('close', () => setTimeout(initWebSocket, 5000));
 }
 
-// ==================== ✅ EXTRACTED V3 API METHOD ====================
+// ==================== API ====================
 async function htxRequest(method, path, data = {}) {
     const timestamp = new Date().toISOString().split('.')[0];
     const params = { AccessKeyId: config.apiKey, SignatureMethod: 'HmacSHA256', SignatureVersion: '2', Timestamp: timestamp };
@@ -138,24 +138,22 @@ async function runLogic() {
     if (!botState.isRunning || botState.isTrading || botState.currentPrice <= 0) return;
     botState.isTrading = true;
     try {
-        // 1. Sync Strictly Static Wallet Balance
+        // 1. Sync Static Wallet Balance (Only updates on close)
         const balRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_account_info', {});
         if (balRes && balRes.data) {
             const usdtAccount = balRes.data.find(a => a.margin_asset === 'USDT');
             
-            // USE static_balance (Actual Cash). Fallback to margin_balance only if static is undefined.
+            // ✅ USING STATIC_BALANCE (Accumulates on close, stands still during trade)
             const currentStatic = parseFloat(usdtAccount.static_balance || usdtAccount.margin_balance || 0);
             
             if (currentStatic > 0) {
                 botState.walletBalance = currentStatic;
                 
-                // If it's the first run, lock the initial balance
                 if (botState.initialBalance === 0) {
                     botState.initialBalance = currentStatic;
                     await saveToDb();
                 }
 
-                // Profit calculation (Locked to Static)
                 botState.realizedProfit = botState.walletBalance - botState.initialBalance;
                 botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
             }
@@ -169,7 +167,7 @@ async function runLogic() {
             botState.avgPrice = parseFloat(pos.cost_hold);
             botState.totalContracts = parseFloat(pos.volume);
             
-            // ROI and PnL (Floating data for the UI boxes - this correctly moves)
+            // ROI and PnL (These move with the price)
             botState.roi = ((botState.currentPrice - botState.avgPrice) / botState.avgPrice) * 100 * config.leverage;
             botState.pnl = parseFloat(pos.unrealized_pnl);
 
@@ -191,7 +189,7 @@ async function runLogic() {
                 }
             }
         } else {
-            // OPEN INITIAL ORDER
+            // No position? Start with Base
             await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: botState.settings.baseOrder,
                 direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
@@ -204,14 +202,14 @@ async function runLogic() {
 
 function logicLoop() { runLogic().finally(() => setTimeout(logicLoop, 4000)); }
 
-// ==================== DASHBOARD UI ====================
+// ==================== UI DASHBOARD ====================
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>TradeBot | Static Balance Engine</title>
+    <title>TradeBot | Smart Martingale</title>
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&family=Roboto+Mono:wght@400;700&display=swap" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined" rel="stylesheet" />
     <script src="https://cdn.tailwindcss.com"></script>
@@ -231,7 +229,7 @@ app.get('/', (req, res) => {
                 <div class="w-9 h-9 rounded-full bg-gray-700 flex items-center justify-center shadow-md relative overflow-hidden">
                     <span class="material-symbols-outlined text-white text-[20px]">api</span>
                 </div>
-                <span class="font-bold tracking-tight text-lg">TradeBot<span class="text-blue-600">StaticV2</span></span>
+                <span class="font-bold tracking-tight text-lg">TradeBot<span class="text-blue-600">PureStatic</span></span>
             </div>
             <div class="flex items-center gap-4">
                 <span id="statusBadge" class="text-[10px] bg-gray-100 px-3 py-1 rounded-full uppercase font-bold tracking-wide">Ready</span>
@@ -243,34 +241,30 @@ app.get('/', (req, res) => {
     <main class="max-w-7xl mx-auto w-full px-6 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
         <div class="lg:col-span-8 space-y-8">
             <div class="grid grid-cols-2 md:grid-cols-4 gap-6">
-                <!-- REALIZED PROFIT USDT -->
                 <div class="ui-card p-6">
                     <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Realized Profit (USDT)</p>
                     <p id="realProfit" class="text-2xl font-mono font-bold text-green-500">$0.0000</p>
                 </div>
-                <!-- SESSION PERCENTAGE -->
                 <div class="ui-card p-6">
                     <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Session Profit (%)</p>
                     <p id="profitPct" class="text-2xl font-mono font-bold text-blue-600">0.0000%</p>
                 </div>
-                <!-- UNREALIZED ROI -->
                 <div class="ui-card p-6">
-                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Unrealized ROI</p>
+                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Floating ROI</p>
                     <p id="roi" class="text-2xl font-mono font-bold text-gray-400">0.00%</p>
                 </div>
-                <!-- WALLET BALANCE -->
                 <div class="ui-card p-6">
-                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Wallet Balance</p>
+                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Wallet Cash</p>
                     <p id="balance" class="text-2xl font-mono font-bold text-gray-800">$0.0000</p>
                 </div>
             </div>
 
             <div class="ui-card p-8 h-64 flex flex-col items-center justify-center border-2 border-dashed border-gray-200">
-                 <p class="text-gray-400 font-bold uppercase tracking-widest text-[10px] mb-2">Maximum Safe Base Order (10 Steps)</p>
+                 <p class="text-gray-400 font-bold uppercase tracking-widest text-[10px] mb-2">Calculated Max Safe Base (10 Steps)</p>
                  <p id="recBaseDisplay" class="text-5xl font-mono font-bold text-black">0</p>
                  <div class="flex gap-4 mt-6">
                     <button onclick="resetStats()" class="text-[10px] bg-red-500 text-white font-bold px-6 py-2 rounded-full uppercase shadow-lg shadow-red-200 hover:bg-red-600 transition flex items-center gap-2">
-                        <span class="material-symbols-outlined text-sm">refresh</span> Reset Statistics
+                        <span class="material-symbols-outlined text-sm">refresh</span> Reset Session Stats
                     </button>
                  </div>
             </div>
@@ -343,7 +337,7 @@ app.get('/', (req, res) => {
         }
 
         async function toggleBot() { await fetch('/api/toggle', {method: 'POST'}); refresh(); }
-        async function resetStats() { if(confirm("Reset session? Stats will update on next trade close.")) { await fetch('/api/reset-stats', {method: 'POST'}); refresh(); } }
+        async function resetStats() { if(confirm("Reset statistics?")) { await fetch('/api/reset-stats', {method: 'POST'}); refresh(); } }
         
         async function saveSettings() {
             const body = {
@@ -365,13 +359,7 @@ app.get('/', (req, res) => {
 
 app.get('/api/status', (req, res) => res.json(botState));
 app.post('/api/toggle', async (req, res) => { botState.isRunning = !botState.isRunning; await saveToDb(); res.sendStatus(200); });
-app.post('/api/reset-stats', async (req, res) => { 
-    botState.initialBalance = botState.walletBalance; 
-    botState.realizedProfit = 0; 
-    botState.profitPct = 0; 
-    await saveToDb(); 
-    res.sendStatus(200); 
-});
+app.post('/api/reset-stats', async (req, res) => { botState.initialBalance = botState.walletBalance; botState.realizedProfit = 0; botState.profitPct = 0; await saveToDb(); res.sendStatus(200); });
 app.post('/api/settings', async (req, res) => { botState.settings = { ...botState.settings, ...req.body }; await saveToDb(); res.sendStatus(200); });
 
 app.listen(config.port, async () => {
