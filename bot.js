@@ -51,7 +51,7 @@ let botState = {
         autoScale: true,
         priceDrop: 0.1,      
         volumeMult: 1.2,     
-        takeProfit: 1.5, // UPDATED: Changed from 1.0 to 1.5% ROI
+        takeProfit: 1.5, // 1.5% ROI
         maxSteps: 10
     }
 };
@@ -105,6 +105,7 @@ async function runLogic() {
             }
         }
 
+        // MATH FOR BASE ORDER
         if (botState.currentPrice > 0 && botState.walletBalance > 0) {
             const m = botState.settings.volumeMult, n = botState.settings.maxSteps;
             const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
@@ -116,11 +117,12 @@ async function runLogic() {
         if (pos) {
             botState.avgPrice = parseFloat(pos.cost_hold);
             botState.totalContracts = parseFloat(pos.volume);
-            const priceMovePct = ((botState.currentPrice - botState.avgPrice) / botState.avgPrice) * 100;
-            botState.roi = priceMovePct * config.leverage;
             botState.pnl = parseFloat(pos.unrealized_pnl);
+            
+            // UPDATED: Get ROI directly from HTX (profit_rate is a decimal, so 0.015 = 1.5%)
+            botState.roi = parseFloat(pos.profit_rate) * 100;
 
-            // Logic uses botState.settings.takeProfit (now 1.5)
+            // CLOSE AT 1.5% ROI (Directly from Exchange data)
             if (botState.roi >= botState.settings.takeProfit) {
                 const closeRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: botState.totalContracts,
@@ -141,6 +143,7 @@ async function runLogic() {
                     botState.safetyOrdersFilled = 0;
                 }
             } else {
+                // Safety logic (still based on price drop relative to average price)
                 const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
                 if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
                     botState.safetyOrdersFilled++;
@@ -192,7 +195,7 @@ app.get('/', (req, res) => {
 <!DOCTYPE html>
 <html>
 <head>
-    <title>TradeBot | 1.5% TP</title>
+    <title>TradeBot | 1.5% Direct ROI</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@700&display=swap" rel="stylesheet">
     <style>.ui-card { background: white; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); padding: 20px; }</style>
@@ -206,13 +209,12 @@ app.get('/', (req, res) => {
         <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
             <div class="ui-card"><p class="text-xs font-bold text-gray-400 mb-2 uppercase">Static Profit</p><p id="p1" class="text-2xl font-mono text-green-600 tracking-tighter">$0.0000</p></div>
             <div class="ui-card"><p class="text-xs font-bold text-gray-400 mb-2 uppercase">Gain %</p><p id="p2" class="text-2xl font-mono text-green-600 tracking-tighter">0.00%</p></div>
-            <div class="ui-card"><p class="text-xs font-bold text-gray-400 mb-2 uppercase">Live ROI</p><p id="roi" class="text-2xl font-mono text-gray-400 tracking-tighter">0.00%</p></div>
+            <div class="ui-card"><p class="text-xs font-bold text-gray-400 mb-2 uppercase">Live ROI (HTX)</p><p id="roi" class="text-2xl font-mono text-gray-400 tracking-tighter">0.00%</p></div>
             <div class="ui-card"><p class="text-xs font-bold text-gray-400 mb-2 uppercase">Wallet (Static)</p><p id="bal" class="text-2xl font-mono text-gray-800 tracking-tighter">$0.0000</p></div>
         </div>
         <div class="ui-card text-center py-12">
             <p class="text-gray-400 text-xs font-bold uppercase mb-2">Safe Base Order</p>
             <p id="maxBase" class="text-7xl font-mono font-bold tracking-tighter">0</p>
-            <!-- UI UPDATED TO SHOW 1.5% -->
             <div class="mt-4 text-xs font-bold text-blue-500 uppercase">Price: <span id="curPrice">0.00</span> | TP: 1.5% ROI | Drop: 0.1% | Mult: 1.2</div>
             <button onclick="resetStats()" class="mt-8 text-xs text-red-500 font-bold border border-red-200 px-4 py-1 rounded-full">RESET ALL</button>
         </div>
