@@ -26,7 +26,7 @@ const BotSchema = new mongoose.Schema({
         maxSteps: Number
     }
 });
-const BotModel = mongoose.model('BotConfig_V22', BotSchema);
+const BotModel = mongoose.model('BotConfig_V23', BotSchema);
 
 // ==================== CONFIGURATION ====================
 const config = {
@@ -40,7 +40,7 @@ const config = {
 };
 
 let botState = {
-    isRunning: true,
+    isRunning: true, // AUTO-START
     isTrading: false,
     currentPrice: 0,
     avgPrice: 0,
@@ -53,7 +53,6 @@ let botState = {
     walletBalance: 0, 
     initialBalance: 0,
     maxSafeBase: 0,
-    lastWsUpdate: 0,
     settings: {
         baseOrder: 6000,
         autoScale: true,
@@ -72,48 +71,17 @@ async function htxRequest(method, path, data = {}) {
     const payload = [method.toUpperCase(), config.restHost, path, query].join('\n');
     const signature = crypto.createHmac('sha256', config.secretKey).update(payload).digest('base64');
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
-    
     try {
-        const res = await axios({ 
-            method, url, data: method === 'POST' ? data : null, 
-            headers: { 'Content-Type': 'application/json' },
-            timeout: 8000 
-        });
+        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 8000 });
         return res.data;
-    } catch (e) {
-        console.error(`❌ API Error (${path}):`, e.response?.data || e.message);
-        return null;
-    }
-}
-
-// ==================== HELPERS ====================
-async function syncPrice() {
-    // Fallback REST price fetch if WebSocket is silent
-    const res = await htxRequest('GET', '/linear-swap-ex/market/trade', { symbol: config.symbol });
-    if (res?.tick?.data?.[0]?.price) {
-        botState.currentPrice = parseFloat(res.tick.data[0].price);
-    }
-}
-
-function calculateMaxBase() {
-    if (botState.currentPrice <= 0 || botState.walletBalance <= 0) return;
-    const m = botState.settings.volumeMult;
-    const n = botState.settings.maxSteps;
-    const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
-    const totalUsdtCapacity = botState.walletBalance * config.leverage;
-    const rawBase = totalUsdtCapacity / (multiplierSum * botState.currentPrice * 1000);
-    botState.maxSafeBase = Math.floor(rawBase * 0.75); 
-    if (botState.settings.autoScale) botState.settings.baseOrder = botState.maxSafeBase;
+    } catch (e) { return null; }
 }
 
 // ==================== TRADING LOGIC ====================
 async function runLogic() {
-    if (!botState.isRunning || botState.isTrading) return;
-    if (botState.currentPrice <= 0) { await syncPrice(); return; }
-    
+    if (!botState.isRunning || botState.isTrading || botState.currentPrice <= 0) return;
     botState.isTrading = true;
     try {
-        // 1. Sync Balance and Position
         const [posRes, accRes] = await Promise.all([
             htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol }),
             htxRequest('POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' })
@@ -124,16 +92,20 @@ async function runLogic() {
         if (accRes?.data) {
             const acc = accRes.data.find(a => a.margin_asset === 'USDT');
             if (acc) {
-                const equity = parseFloat(acc.margin_balance);
-                const unrealized = pos ? parseFloat(pos.unrealized_pnl) : 0;
-                botState.walletBalance = equity - unrealized;
-                
-                if (botState.initialBalance <= 0) {
-                    botState.initialBalance = botState.walletBalance;
-                    await BotModel.updateOne({ id: "htx_martingale" }, { initialBalance: botState.initialBalance });
+                const equity = parseFloat(acc.margin_balance) || 0;
+                const unrealized = pos ? (parseFloat(pos.unrealized_pnl) || 0) : 0;
+                const currentWallet = equity - unrealized;
+
+                if (!isNaN(currentWallet) && currentWallet > 0) {
+                    botState.walletBalance = currentWallet;
+                    // FIX: Only save initialBalance if it's a valid number and not already set
+                    if (botState.initialBalance <= 0 || isNaN(botState.initialBalance)) {
+                        botState.initialBalance = currentWallet;
+                        await BotModel.updateOne({ id: "htx_martingale" }, { initialBalance: botState.initialBalance }, { upsert: true });
+                    }
+                    botState.realizedProfit = botState.walletBalance - botState.initialBalance;
+                    botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
                 }
-                botState.realizedProfit = botState.walletBalance - botState.initialBalance;
-                botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
             }
         }
 
@@ -145,7 +117,7 @@ async function runLogic() {
             botState.pnl = parseFloat(pos.unrealized_pnl);
 
             if (priceMovePct >= botState.settings.takeProfit) {
-                console.log("🎯 TP Reached. Closing.");
+                console.log("🎯 Take Profit Hit. Closing.");
                 await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: botState.totalContracts,
                     direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
@@ -163,7 +135,7 @@ async function runLogic() {
                     });
                 }
             }
-        } else if (botState.settings.baseOrder > 0) {
+        } else if (botState.maxSafeBase > 0) {
             console.log("🚀 Opening Base Order.");
             await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: botState.settings.baseOrder,
@@ -171,11 +143,22 @@ async function runLogic() {
             });
             botState.safetyOrdersFilled = 0;
         }
-    } catch (e) { console.error("Logic Loop Error:", e); }
+    } catch (e) {}
     botState.isTrading = false;
 }
 
-// ==================== WEBSOCKET ====================
+// ==================== WEBSOCKET & MATH ====================
+function calculateMaxBase() {
+    if (botState.currentPrice <= 0 || botState.walletBalance <= 0) return;
+    const m = botState.settings.volumeMult;
+    const n = botState.settings.maxSteps;
+    const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
+    const totalUsdtCapacity = botState.walletBalance * config.leverage;
+    const rawBase = totalUsdtCapacity / (multiplierSum * botState.currentPrice * 1000);
+    botState.maxSafeBase = Math.floor(rawBase * 0.75); 
+    if (botState.settings.autoScale) botState.settings.baseOrder = botState.maxSafeBase;
+}
+
 function initWebSocket() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => {
@@ -196,20 +179,20 @@ function initWebSocket() {
         });
     });
     ws.on('close', () => setTimeout(initWebSocket, 5000));
-    ws.on('error', (e) => console.error("WS Error:", e.message));
 }
 
 // ==================== STARTUP ====================
-async function start() {
+async function boot() {
     const data = await BotModel.findOne({ id: "htx_martingale" });
     if (data) {
-        botState.initialBalance = data.initialBalance;
-        // FORCE the settings you requested
-        botState.settings = { ...botState.settings, priceDrop: 0.1, volumeMult: 1.2, takeProfit: 1.0 };
+        botState.initialBalance = parseFloat(data.initialBalance) || 0;
     }
+    // Force 1% TP, 0.1% Drop, 1.2x Mult
+    botState.settings = { ...botState.settings, priceDrop: 0.1, volumeMult: 1.2, takeProfit: 1.0 };
     botState.isRunning = true;
     initWebSocket();
     setInterval(runLogic, 3000);
+    console.log("✅ Bot Started. Settings: 1% TP, 0.1% Drop.");
 }
 
 // ==================== UI ====================
@@ -232,41 +215,23 @@ app.get('/', (req, res) => {
             <h1 class="text-2xl font-bold">🤖 HTX Martingale V3</h1>
             <button onclick="toggleBot()" id="btn" class="bg-black text-white px-8 py-3 rounded-lg font-bold">START BOT</button>
         </div>
-
         <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
-            <div class="ui-card">
-                <p class="text-xs font-bold text-gray-400 uppercase">Realized Profit</p>
-                <p id="p1" class="text-xl font-mono text-green-600">$0.0000</p>
-            </div>
-            <div class="ui-card">
-                <p class="text-xs font-bold text-gray-400 uppercase">Session Profit</p>
-                <p id="p2" class="text-xl font-mono text-green-600">0.0000%</p>
-            </div>
-            <div class="ui-card">
-                <p class="text-xs font-bold text-gray-400 uppercase">Unrealized ROI</p>
-                <p id="roi" class="text-xl font-mono text-gray-400">0.00%</p>
-            </div>
-            <div class="ui-card">
-                <p class="text-xs font-bold text-gray-400 uppercase">Wallet Balance</p>
-                <p id="bal" class="text-xl font-mono text-gray-800">$0.0000</p>
-            </div>
+            <div class="ui-card"><p class="text-xs font-bold text-gray-400 uppercase">Realized Profit</p><p id="p1" class="text-xl font-mono text-green-600">$0.0000</p></div>
+            <div class="ui-card"><p class="text-xs font-bold text-gray-400 uppercase">Session Profit</p><p id="p2" class="text-xl font-mono text-green-600">0.0000%</p></div>
+            <div class="ui-card"><p class="text-xs font-bold text-gray-400 uppercase">Unrealized ROI</p><p id="roi" class="text-xl font-mono text-gray-400">0.00%</p></div>
+            <div class="ui-card"><p class="text-xs font-bold text-gray-400 uppercase">Wallet Balance</p><p id="bal" class="text-xl font-mono text-gray-800">$0.0000</p></div>
         </div>
-
         <div class="ui-card text-center py-12">
             <p class="text-gray-400 text-xs font-bold uppercase mb-2">Max Safe Base Order</p>
             <p id="maxBase" class="text-6xl font-mono font-bold">0</p>
-            <div class="mt-4 text-xs font-bold text-blue-500 uppercase">
-                Price: <span id="curPrice">0.00</span> | TP: 1.0% | Drop: 0.1% | Mult: 1.2
-            </div>
+            <div class="mt-4 text-xs font-bold text-blue-500 uppercase">Price: <span id="curPrice">0.00</span> | TP: 1.0% | Drop: 0.1% | Mult: 1.2</div>
             <button onclick="resetStats()" class="mt-8 text-xs text-red-500 font-bold border border-red-200 px-4 py-1 rounded-full">RESET PROFIT HISTORY</button>
         </div>
     </div>
-
     <script>
         async function update() {
             try {
-                const r = await fetch('/api/status');
-                const d = await r.json();
+                const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('p1').innerText = '$' + d.realizedProfit.toFixed(4);
                 document.getElementById('p2').innerText = d.profitPct.toFixed(4) + '%';
                 document.getElementById('roi').innerText = d.roi.toFixed(2) + '%';
@@ -280,7 +245,7 @@ app.get('/', (req, res) => {
         }
         async function toggleBot() { await fetch('/api/toggle', {method:'POST'}); update(); }
         async function resetStats() { if(confirm("Reset?")) await fetch('/api/reset-stats', {method:'POST'}); update(); }
-        setInterval(update, 1000);
+        setInterval(update, 1000); update();
     </script>
 </body>
 </html>
@@ -289,10 +254,6 @@ app.get('/', (req, res) => {
 
 app.get('/api/status', (req, res) => res.json(botState));
 app.post('/api/toggle', async (req, res) => { botState.isRunning = !botState.isRunning; res.sendStatus(200); });
-app.post('/api/reset-stats', async (req, res) => { 
-    botState.initialBalance = botState.walletBalance; 
-    await BotModel.updateOne({ id: "htx_martingale" }, { initialBalance: botState.initialBalance });
-    res.sendStatus(200); 
-});
+app.post('/api/reset-stats', async (req, res) => { botState.initialBalance = botState.walletBalance; await BotModel.updateOne({ id: "htx_martingale" }, { initialBalance: botState.initialBalance }); res.sendStatus(200); });
 
-app.listen(config.port, start);
+app.listen(config.port, boot);
