@@ -3,206 +3,261 @@ const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
 
-// ==================== CONFIGURATION ====================
+const app = express();
+app.use(express.json());
+
+// ==================== BOT CONFIGURATION ====================
 const config = {
     apiKey: process.env.HTX_API_KEY,
     secretKey: process.env.HTX_SECRET_KEY,
-    symbol: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase(),
-    
-    totalInvestment: parseFloat(process.env.TOTAL_INVESTMENT) || 100,
-    priceDecreasePercent: (parseFloat(process.env.PRICE_DECREASE_PERCENT) || 0.1) / 100,
-    takeProfitPercent: (parseFloat(process.env.TAKE_PROFIT_PERCENT) || 0.15) / 100,
-    maxSafetyOrders: parseInt(process.env.MAX_SAFETY_ORDERS) || 10,
-    leverage: parseInt(process.env.LEVERAGE) || 10,
-    volumeScale: parseFloat(process.env.VOLUME_SCALE) || 1.2,
-    initialAmount: parseInt(process.env.INITIAL_AMOUNT) || 6000,
-    
+    symbol: 'SHIB-USDT',
+    leverage: 20,
     port: process.env.PORT || 3000,
-    host: 'api.htx.com',
-    restEndpoint: 'https://api.htx.com'
+    host: 'api.htx.com'
 };
 
-// ✅ CORRECT V3 PRIVATE LINEAR ENDPOINTS
-const API = {
-    setLeverage: '/v3/linear-swap-api/v1/swap_cross_switch_lever_rate',
-    placeOrder: '/v3/linear-swap-api/v1/swap_cross_order',
-    getPosition: '/v3/linear-swap-api/v1/swap_cross_position_info',
-    // Market data remains on the public exchange path
-    marketDetail: '/linear-swap-ex/market/detail/merged' 
+// ==================== BOT STATE ====================
+let bot = {
+    isRunning: false,
+    currentPrice: 0,
+    avgPrice: 0,
+    totalContracts: 0,
+    roi: 0,
+    pnl: 0,
+    safetyOrdersFilled: 0,
+    // Martingale Params (Cloned from HTX)
+    settings: {
+        baseOrder: 5000,
+        safetyOrder: 5000,
+        priceDrop: 0.8,       // %
+        volumeMult: 1.5,
+        priceMult: 1.1,
+        takeProfit: 1.2,      // %
+        maxSafetyOrders: 10
+    }
 };
 
-// ==================== HTX SIGNATURE V2 (Still used for V3 paths) ====================
-function getSignature(method, path, params) {
-    const sortedKeys = Object.keys(params).sort();
-    const query = sortedKeys.map(key => `${key}=${encodeURIComponent(params[key])}`).join('&');
-    const payload = [method.toUpperCase(), config.host, path, query].join('\n');
-    return crypto.createHmac('sha256', config.secretKey).update(payload).digest('base64');
-}
-
-async function apiRequest(method, path, data = {}) {
-    // Note: HTX expects UTC time in ISO format without milliseconds
-    const timestamp = new Date().toISOString().split('.')[0]; 
-    
+// ==================== HTX V3 API INTERACTION ====================
+async function htxRequest(method, path, data = {}) {
+    const timestamp = new Date().toISOString().split('.')[0];
     const params = {
         AccessKeyId: config.apiKey,
         SignatureMethod: 'HmacSHA256',
         SignatureVersion: '2',
         Timestamp: timestamp
     };
-
-    const signature = getSignature(method, path, params);
-    params.Signature = signature;
-
-    const url = `${config.restEndpoint}${path}?${new URLSearchParams(params).toString()}`;
+    const query = Object.keys(params).sort().map(k => `${k}=${encodeURIComponent(params[k])}`).join('&');
+    const payload = [method.toUpperCase(), config.host, path, query].join('\n');
+    const signature = crypto.createHmac('sha256', config.secretKey).update(payload).digest('base64');
+    const url = `https://${config.host}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
 
     try {
-        const response = await axios({
-            method,
-            url,
-            data: method.toUpperCase() === 'POST' ? data : null,
-            headers: { 'Content-Type': 'application/json' }
-        });
-
-        if (response.data.status !== 'ok') {
-            throw new Error(`API Error: ${response.data['err-msg'] || JSON.stringify(response.data)}`);
-        }
-        return response.data;
-    } catch (error) {
-        const errorData = error.response?.data ? JSON.stringify(error.response.data) : error.message;
-        console.error(`❌ V3 Error [${path}]:`, errorData);
-        throw new Error(errorData);
-    }
-}
-
-// ==================== BOT STATE ====================
-let botState = {
-    isRunning: false,
-    currentPrice: 0,
-    averageEntryPrice: 0,
-    totalPositionSize: 0,
-    status: 'stopped',
-    additionOrders: []
-};
-
-// ==================== ACTIONS ====================
-async function getMarketPrice() {
-    try {
-        // Market Detail usually requires lowercase symbol for the query param on some HTX clusters
-        const url = `${config.restEndpoint}${API.marketDetail}?symbol=${config.symbol}`;
-        const res = await axios.get(url);
-        return res.data.tick.close;
+        const res = await axios({ method, url, data: method === 'POST' ? data : null });
+        return res.data;
     } catch (e) {
+        console.error(`HTX API Error: ${e.message}`);
         return null;
     }
 }
 
-async function startBot() {
-    console.log(`\n🚀 STARTING MARTINGALE (V3 PRIVATE): ${config.symbol}`);
+// ==================== TRADING LOGIC ====================
+async function updateBotState() {
+    // 1. Get Market Price
     try {
-        // 1. Set Leverage
-        console.log(`⚙️ [V3] Setting leverage to ${config.leverage}x...`);
-        await apiRequest('POST', API.setLeverage, { 
-            contract_code: config.symbol, 
-            lever_rate: config.leverage 
-        });
+        const res = await axios.get(`https://${config.host}/linear-swap-ex/market/detail/merged?symbol=${config.symbol}`);
+        bot.currentPrice = res.data.tick.close;
+    } catch (e) {}
 
-        // 2. Place Initial Order
-        console.log(`🛒 [V3] Placing initial order: ${config.initialAmount} contracts`);
-        await apiRequest('POST', API.placeOrder, {
-            contract_code: config.symbol,
-            volume: config.initialAmount,
-            direction: 'buy',
-            offset: 'open',
-            lever_rate: config.leverage,
-            order_price_type: 'opponent' // Market-like fill
-        });
+    if (!bot.isRunning) return;
 
-        botState.isRunning = true;
-        botState.status = 'running';
-        console.log("✅ V3 Bot is running!");
-    } catch (e) {
-        botState.status = 'error';
-        console.error("Critical Start Error:", e.message);
-    }
-}
+    // 2. Get Position via V3
+    const posRes = await htxRequest('POST', '/v3/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
+    const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0);
 
-async function monitor() {
-    if (!botState.isRunning) return;
+    if (pos) {
+        bot.avgPrice = parseFloat(pos.cost_hold);
+        bot.totalContracts = parseFloat(pos.volume);
+        bot.roi = parseFloat(pos.profit_ratio) * 100;
+        bot.pnl = parseFloat(pos.unrealized_pnl);
 
-    try {
-        const price = await getMarketPrice();
-        if (price) botState.currentPrice = price;
-
-        // Update Position via V3
-        const posRes = await apiRequest('POST', API.getPosition, { contract_code: config.symbol });
-        
-        if (posRes.data && posRes.data.length > 0) {
-            const pos = posRes.data[0];
-            botState.averageEntryPrice = parseFloat(pos.cost_hold);
-            botState.totalPositionSize = parseFloat(pos.volume);
-
-            // Take Profit
-            const tpPrice = botState.averageEntryPrice * (1 + config.takeProfitPercent);
-            if (botState.currentPrice >= tpPrice) {
-                console.log(`🎯 TP Hit at ${botState.currentPrice}! Closing via V3...`);
-                await apiRequest('POST', API.placeOrder, {
-                    contract_code: config.symbol,
-                    volume: botState.totalPositionSize,
-                    direction: 'sell',
-                    offset: 'close',
-                    lever_rate: config.leverage,
-                    order_price_type: 'opponent'
-                });
-                botState.additionOrders = [];
-                setTimeout(startBot, 10000);
-                return;
-            }
-
-            // Safety Order
-            const nextIdx = botState.additionOrders.length + 1;
-            const triggerPrice = botState.averageEntryPrice * (1 - (config.priceDecreasePercent * nextIdx));
-
-            if (botState.currentPrice <= triggerPrice && nextIdx <= config.maxSafetyOrders) {
-                const amount = Math.floor(config.initialAmount * Math.pow(config.volumeScale, nextIdx));
-                console.log(`📉 V3 Safety Order #${nextIdx} triggered at ${botState.currentPrice}`);
-                await apiRequest('POST', API.placeOrder, {
-                    contract_code: config.symbol,
-                    volume: amount,
-                    direction: 'buy',
-                    offset: 'open',
-                    lever_rate: config.leverage,
-                    order_price_type: 'opponent'
-                });
-                botState.additionOrders.push({ idx: nextIdx, amount });
-            }
+        // Take Profit Check
+        if (bot.roi >= bot.settings.takeProfit) {
+            await htxRequest('POST', '/v3/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: bot.totalContracts,
+                direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
+            });
+            bot.safetyOrdersFilled = 0;
         }
-    } catch (e) {
-        console.error("Monitor Loop Error:", e.message);
+
+        // DCA / Safety Order Check
+        const currentDropThreshold = bot.settings.priceDrop * Math.pow(bot.settings.priceMult, bot.safetyOrdersFilled);
+        const triggerPrice = bot.avgPrice * (1 - (currentDropThreshold / 100));
+
+        if (bot.currentPrice <= triggerPrice && bot.safetyOrdersFilled < bot.settings.maxSafetyOrders) {
+            bot.safetyOrdersFilled++;
+            const vol = Math.floor(bot.settings.safetyOrder * Math.pow(bot.settings.volumeMult, bot.safetyOrdersFilled - 1));
+            await htxRequest('POST', '/v3/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: vol,
+                direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+            });
+        }
+    } else {
+        // No position? Open Base Order
+        await htxRequest('POST', '/v3/linear-swap-api/v1/swap_cross_order', {
+            contract_code: config.symbol, volume: bot.settings.baseOrder,
+            direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+        });
     }
 }
 
-setInterval(monitor, 5000);
+setInterval(updateBotState, 3000);
 
-// ==================== EXPRESS DASHBOARD ====================
-const app = express();
+// ==================== WEB INTERFACE ====================
 app.get('/', (req, res) => {
     res.send(`
-        <body style="background:#0d1117; color:#c9d1d9; font-family: sans-serif; padding: 40px;">
-            <h2>HTX V3 Private Linear Bot [${config.symbol}]</h2>
-            <div style="background:#161b22; padding:20px; border-radius:8px;">
-                <p>Status: <b style="color:${botState.isRunning ? '#238636' : '#f85149'}">${botState.status.toUpperCase()}</b></p>
-                <p>Price: <b>${botState.currentPrice}</b></p>
-                <p>Avg Entry: <b>${botState.averageEntryPrice}</b></p>
-                <p>Size: <b>${botState.totalPositionSize} contracts</b></p>
-                <p>Safety Filled: <b>${botState.additionOrders.length} / ${config.maxSafetyOrders}</b></p>
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>HTX Martingale Clone</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+        <style>
+            body { font-family: 'Inter', sans-serif; background-color: #0b0e11; color: #eaecef; }
+            .htx-card { background-color: #1e2329; border: 1px solid #30363d; }
+            .htx-input { background-color: #2b3139; border: 1px solid #474d57; color: white; }
+            .htx-blue { color: #3275ff; }
+            .htx-btn-blue { background-color: #3275ff; }
+        </style>
+    </head>
+    <body class="p-8">
+        <div class="max-w-6xl mx-auto">
+            <!-- Header -->
+            <div class="flex justify-between items-center mb-8">
+                <h1 class="text-2xl font-bold flex items-center gap-2">
+                    <span class="htx-blue">HTX</span> Martingale Strategy
+                </h1>
+                <div class="flex gap-4">
+                    <button onclick="toggleBot()" id="btnAction" class="px-6 py-2 rounded font-bold htx-btn-blue">START BOT</button>
+                </div>
             </div>
-            <br>
-            <button onclick="fetch('/start',{method:'POST'})" style="padding:10px; background:#238636; color:white; border:0; cursor:pointer;">START</button>
-            <button onclick="fetch('/stop',{method:'POST'})" style="padding:10px; background:#da3633; color:white; border:0; cursor:pointer;">STOP</button>
-        </body>
+
+            <div class="grid grid-cols-12 gap-6">
+                <!-- Stats Panel -->
+                <div class="col-span-8 space-y-6">
+                    <div class="htx-card p-6 rounded-lg grid grid-cols-4 gap-4">
+                        <div>
+                            <p class="text-gray-400 text-xs mb-1">Total Profit (USDT)</p>
+                            <p id="pnl" class="text-xl font-bold text-green-500">0.0000</p>
+                        </div>
+                        <div>
+                            <p class="text-gray-400 text-xs mb-1">ROI</p>
+                            <p id="roi" class="text-xl font-bold text-green-500">0.00%</p>
+                        </div>
+                        <div>
+                            <p class="text-gray-400 text-xs mb-1">Last Price</p>
+                            <p id="lastPrice" class="text-xl font-bold">0.000000</p>
+                        </div>
+                        <div>
+                            <p class="text-gray-400 text-xs mb-1">Safety Orders</p>
+                            <p id="safetyFilled" class="text-xl font-bold">0 / 10</p>
+                        </div>
+                    </div>
+
+                    <div class="htx-card p-6 rounded-lg h-64 flex items-center justify-center border-dashed border-2 border-gray-700">
+                        <p class="text-gray-500">Real-time PnL Chart Area</p>
+                    </div>
+                </div>
+
+                <!-- Settings Sidebar -->
+                <div class="col-span-4 htx-card p-6 rounded-lg">
+                    <h3 class="font-bold mb-4 border-b border-gray-700 pb-2">Strategy Settings</h3>
+                    <div class="space-y-4">
+                        <div>
+                            <label class="text-xs text-gray-400">Base Order Size (Contracts)</label>
+                            <input id="baseOrder" type="number" class="w-full htx-input p-2 rounded mt-1" value="5000">
+                        </div>
+                        <div>
+                            <label class="text-xs text-gray-400">Safety Order Size</label>
+                            <input id="safetyOrder" type="number" class="w-full htx-input p-2 rounded mt-1" value="5000">
+                        </div>
+                        <div class="grid grid-cols-2 gap-2">
+                            <div>
+                                <label class="text-xs text-gray-400">Price Drop (%)</label>
+                                <input id="priceDrop" type="number" class="w-full htx-input p-2 rounded mt-1" value="0.8">
+                            </div>
+                            <div>
+                                <label class="text-xs text-gray-400">Take Profit (%)</label>
+                                <input id="takeProfit" type="number" class="w-full htx-input p-2 rounded mt-1" value="1.2">
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-2 gap-2">
+                            <div>
+                                <label class="text-xs text-gray-400">Volume Mult</label>
+                                <input id="volumeMult" type="number" class="w-full htx-input p-2 rounded mt-1" value="1.5">
+                            </div>
+                            <div>
+                                <label class="text-xs text-gray-400">Max Steps</label>
+                                <input id="maxSteps" type="number" class="w-full htx-input p-2 rounded mt-1" value="10">
+                            </div>
+                        </div>
+                        <button onclick="updateSettings()" class="w-full py-2 border border-gray-500 rounded text-sm hover:bg-gray-800 transition">SAVE SETTINGS</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            async function updateUI() {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                
+                document.getElementById('pnl').innerText = data.pnl.toFixed(4);
+                document.getElementById('roi').innerText = data.roi.toFixed(2) + '%';
+                document.getElementById('lastPrice').innerText = data.currentPrice;
+                document.getElementById('safetyFilled').innerText = data.safetyOrdersFilled + ' / ' + data.settings.maxSafetyOrders;
+                
+                const btn = document.getElementById('btnAction');
+                if (data.isRunning) {
+                    btn.innerText = 'STOP BOT';
+                    btn.className = 'px-6 py-2 rounded font-bold bg-red-600';
+                } else {
+                    btn.innerText = 'START BOT';
+                    btn.className = 'px-6 py-2 rounded font-bold htx-btn-blue';
+                }
+            }
+
+            async function toggleBot() {
+                await fetch('/api/toggle', {method: 'POST'});
+                updateUI();
+            }
+
+            async function updateSettings() {
+                const settings = {
+                    baseOrder: parseFloat(document.getElementById('baseOrder').value),
+                    safetyOrder: parseFloat(document.getElementById('safetyOrder').value),
+                    priceDrop: parseFloat(document.getElementById('priceDrop').value),
+                    takeProfit: parseFloat(document.getElementById('takeProfit').value),
+                    volumeMult: parseFloat(document.getElementById('volumeMult').value),
+                    maxSafetyOrders: parseInt(document.getElementById('maxSteps').value)
+                };
+                await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(settings)
+                });
+                alert('Settings Updated');
+            }
+
+            setInterval(updateUI, 2000);
+        </script>
+    </body>
+    </html>
     `);
 });
-app.post('/start', (req, res) => { startBot(); res.sendStatus(200); });
-app.post('/stop', (req, res) => { botState.isRunning = false; botState.status = 'stopped'; res.sendStatus(200); });
 
-app.listen(config.port, () => console.log(`🚀 V3 Dashboard: http://localhost:${config.port}`));
+// ==================== API ENDPOINTS ====================
+app.get('/api/status', (req, res) => res.json(bot));
+app.post('/api/toggle', (req, res) => { bot.isRunning = !bot.isRunning; res.sendStatus(200); });
+app.post('/api/settings', (req, res) => { bot.settings = req.body; res.sendStatus(200); });
+
+app.listen(config.port, () => console.log(`Dashboard: http://localhost:${config.port}`));
