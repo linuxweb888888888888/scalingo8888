@@ -42,13 +42,12 @@ let botState = {
     }
 };
 
-// ==================== DEBUG LOGGING ====================
 function debugLog(msg, data = "") {
     const ts = new Date().toISOString().replace('T', ' ').split('.')[0];
     console.log(`[${ts}] 🔍 DEBUG: ${msg}`, data ? JSON.stringify(data) : "");
 }
 
-// ==================== MATH: GEOMETRIC MAX BASE ====================
+// ==================== MATH: MAX BASE ====================
 function calculateMaxBase() {
     if (botState.currentPrice <= 0 || botState.walletBalance <= 0) return;
     try {
@@ -56,30 +55,18 @@ function calculateMaxBase() {
         const n = botState.settings.maxSteps;
         const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
         const totalUsdtCapacity = botState.walletBalance * config.leverage;
-        // SHIB Contract Size is 1000
+        // SHIB Face Value = 1000
         const rawBase = totalUsdtCapacity / (multiplierSum * botState.currentPrice * 1000);
-        botState.maxSafeBase = Math.floor(rawBase * 0.80); // 20% safety buffer
+        botState.maxSafeBase = Math.floor(rawBase * 0.80); 
         if (botState.settings.autoScale) botState.settings.baseOrder = botState.maxSafeBase;
-    } catch (e) {
-        debugLog("Math Calculation Error", e.message);
-    }
+    } catch (e) {}
 }
 
-// ==================== WEBSOCKET ENGINE (THROTTLED) ====================
-let lastWsProcess = 0;
+// ==================== WEBSOCKET ====================
 function initWebSocket() {
     const ws = new WebSocket(config.wsHost);
-    
-    ws.on('open', () => {
-        debugLog("WebSocket Link Opened");
-        ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' }));
-    });
-
+    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' })));
     ws.on('message', (data) => {
-        const now = Date.now();
-        // Throttling: Only decompress/process ticks every 500ms to save CPU
-        if (now - lastWsProcess < 500) return; 
-
         zlib.gunzip(data, (err, dezipped) => {
             if (err) return;
             try {
@@ -87,51 +74,27 @@ function initWebSocket() {
                 if (msg.ping) return ws.send(JSON.stringify({ pong: msg.ping }));
                 if (msg.tick && msg.tick.close) {
                     botState.currentPrice = msg.tick.close;
-                    lastWsProcess = now;
                     calculateMaxBase();
                 }
             } catch (e) {}
         });
     });
-
-    ws.on('close', () => {
-        debugLog("WebSocket Closed. Reconnecting...");
-        setTimeout(initWebSocket, 5000);
-    });
+    ws.on('close', () => setTimeout(initWebSocket, 5000));
 }
 
-// ==================== PRIVATE API REQUEST HANDLER ====================
+// ==================== API ====================
 async function htxRequest(method, path, data = {}) {
     const timestamp = new Date().toISOString().split('.')[0];
-    const params = { 
-        AccessKeyId: config.apiKey, 
-        SignatureMethod: 'HmacSHA256', 
-        SignatureVersion: '2', 
-        Timestamp: timestamp 
-    };
-
-    const sortedQuery = Object.keys(params).sort().map(k => `${k}=${encodeURIComponent(params[k])}`).join('&');
-    const payload = [method.toUpperCase(), config.restHost, path, sortedQuery].join('\n');
+    const params = { AccessKeyId: config.apiKey, SignatureMethod: 'HmacSHA256', SignatureVersion: '2', Timestamp: timestamp };
+    const query = Object.keys(params).sort().map(k => `${k}=${encodeURIComponent(params[k])}`).join('&');
+    const payload = [method.toUpperCase(), config.restHost, path, query].join('\n');
     const signature = crypto.createHmac('sha256', config.secretKey).update(payload).digest('base64');
-    const url = `https://${config.restHost}${path}?${sortedQuery}&Signature=${encodeURIComponent(signature)}`;
-
+    const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
-        debugLog(`Calling API: ${path}`);
-        const res = await axios({
-            method, url, data: method === 'POST' ? data : null,
-            headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
-            timeout: 8000 
-        });
-
-        if (res.data.status !== 'ok') {
-            botState.lastError = res.data['err-msg'] || "Business Logic Error";
-            debugLog(`API Error Response [${path}]`, res.data);
-            return null;
-        }
+        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' }, timeout: 8000 });
         return res.data;
     } catch (e) {
-        botState.lastError = e.response?.data?.['err-msg'] || e.message;
-        debugLog(`Network Error [${path}]`, botState.lastError);
+        botState.lastError = e.message;
         return null;
     }
 }
@@ -139,50 +102,36 @@ async function htxRequest(method, path, data = {}) {
 // ==================== TRADING LOGIC ====================
 async function runLogic() {
     if (!botState.isRunning || botState.isTrading || botState.currentPrice <= 0) return;
-
     botState.isTrading = true;
     try {
-        debugLog("--- Syncing Account State ---");
-        
-        // 1. Get Balance
         const balRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_account_info', {});
-        if (balRes) {
-            const usdtData = balRes.data?.find(a => a.margin_asset === 'USDT');
-            botState.walletBalance = usdtData ? parseFloat(usdtData.margin_balance) : 0;
-            debugLog(`Balance Synced: ${botState.walletBalance} USDT`);
-        }
+        if (balRes) botState.walletBalance = balRes.data?.find(a => a.margin_asset === 'USDT')?.margin_balance || 0;
 
-        // 2. Get Position
         const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
-        if (!posRes) throw new Error("Could not fetch position");
-
-        const pos = posRes.data?.find(p => parseFloat(p.volume) > 0);
+        const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0);
 
         if (pos) {
             botState.avgPrice = parseFloat(pos.cost_hold);
             botState.totalContracts = parseFloat(pos.volume);
-            botState.roi = parseFloat(pos.profit_ratio) * 100;
-            botState.pnl = parseFloat(pos.unrealized_pnl);
-            debugLog(`Active Position: ${botState.totalContracts} qty, ROI: ${botState.roi.toFixed(2)}%`);
+            
+            // ✅ FIX: Manual ROI Calculation to avoid NaN
+            const pnlPerCoin = botState.currentPrice - botState.avgPrice;
+            botState.roi = (pnlPerCoin / botState.avgPrice) * 100 * config.leverage;
+            botState.pnl = parseFloat(pos.unrealized_pnl) || (pnlPerCoin * botState.totalContracts * 1000);
 
-            // Take Profit
             if (botState.roi >= botState.settings.takeProfit) {
-                debugLog("🎯 EXIT: Take Profit Triggered");
+                debugLog("🎯 Closing Position: Take Profit");
                 await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: botState.totalContracts,
                     direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
                 botState.safetyOrdersFilled = 0;
-            } 
-            // Safety Order
-            else {
+            } else {
                 const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
-                debugLog(`Next DCA Trigger: ${triggerPrice.toFixed(8)} | Current: ${botState.currentPrice}`);
-                
                 if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
                     botState.safetyOrdersFilled++;
                     const vol = Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled));
-                    debugLog(`📉 DCA: Placing Safety Order #${botState.safetyOrdersFilled} for ${vol} qty`);
+                    debugLog(`📉 DCA Step #${botState.safetyOrdersFilled}`);
                     await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                         contract_code: config.symbol, volume: vol,
                         direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
@@ -190,37 +139,29 @@ async function runLogic() {
                 }
             }
         } else {
-            // OPEN BASE ORDER
-            debugLog(`🚀 ENTRY: Opening Initial Order ${botState.settings.baseOrder}`);
-            const openRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
+            debugLog("🚀 Opening Initial Order");
+            await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: botState.settings.baseOrder,
                 direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
-            if (openRes) botState.safetyOrdersFilled = 0;
+            botState.safetyOrdersFilled = 0;
         }
-    } catch (e) {
-        debugLog("Logic Exception", e.message);
-    } finally {
-        botState.isTrading = false;
-        debugLog("--- Loop Cycle Finished ---");
-    }
+    } catch (e) { debugLog("Logic Error", e.message); }
+    botState.isTrading = false;
 }
 
-// Recursive Timeout (prevents freezing)
 function logicLoop() {
-    runLogic().finally(() => {
-        setTimeout(logicLoop, 5000); // 5 second rest between cycles
-    });
+    runLogic().finally(() => setTimeout(logicLoop, 5000));
 }
 
-// ==================== DASHBOARD UI ====================
+// ==================== UI ====================
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>TradeBot | Debug Console</title>
+    <title>TradeBot | HTX AI Engine</title>
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&family=Roboto+Mono:wght@400;700&display=swap" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined" rel="stylesheet" />
     <script src="https://cdn.tailwindcss.com"></script>
@@ -229,14 +170,14 @@ app.get('/', (req, res) => {
         .ui-card { background-color: #ffffff; border-radius: 16px; box-shadow: 0 4px 24px -4px rgba(0,0,0,0.04); border: 1px solid #f1f1f1; }
         .input-minimal { width: 100%; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 14px; font-size: 14px; outline: none; background: #fafafa; }
         .input-disabled { background: #eeeeee !important; color: #888; cursor: not-allowed; }
-        .btn-primary { background: #000000; color: #ffffff; border-radius: 8px; padding: 12px 24px; font-size: 14px; font-weight: 500; transition: background 0.2s; }
+        .btn-primary { background: #000000; color: #ffffff; border-radius: 8px; padding: 12px 24px; font-size: 14px; font-weight: 500; transition: background 0.2s; cursor: pointer; }
     </style>
 </head>
 <body class="antialiased min-h-screen flex flex-col">
     <header class="bg-white/80 backdrop-blur-md shadow-sm sticky top-0 z-50 px-6 h-16 flex items-center justify-between">
         <div class="flex items-center gap-2">
             <div class="w-9 h-9 rounded-full bg-gray-700 flex items-center justify-center shadow-md"><span class="material-symbols-outlined text-white text-[20px]">api</span></div>
-            <span class="font-bold tracking-tight text-lg">TradeBot<span class="text-blue-600">Debug</span></span>
+            <span class="font-bold tracking-tight text-lg">TradeBot<span class="text-blue-600">Pille</span></span>
         </div>
         <div class="flex items-center gap-4">
             <span id="statusBadge" class="text-[10px] bg-gray-100 px-3 py-1 rounded-full uppercase font-bold tracking-wide">Ready</span>
@@ -247,16 +188,15 @@ app.get('/', (req, res) => {
     <main class="max-w-7xl mx-auto w-full px-6 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
         <div class="lg:col-span-8 space-y-8">
             <div class="grid grid-cols-2 md:grid-cols-4 gap-6">
-                <div class="ui-card p-6"><p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">PnL</p><p id="pnl" class="text-2xl font-mono font-bold">$0.0000</p></div>
-                <div class="ui-card p-6"><p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">ROI</p><p id="roi" class="text-2xl font-mono font-bold text-blue-600">0.00%</p></div>
-                <div class="ui-card p-6"><p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Price</p><p id="price" class="text-2xl font-mono font-bold">0.000000</p></div>
-                <div class="ui-card p-6"><p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Balance</p><p id="balance" class="text-2xl font-mono font-bold">$0.00</p></div>
+                <div class="ui-card p-6"><p class="text-[10px] font-bold text-gray-400 uppercase mb-2">Unrealized PnL</p><p id="pnl" class="text-2xl font-mono font-bold">$0.0000</p></div>
+                <div class="ui-card p-6"><p class="text-[10px] font-bold text-gray-400 uppercase mb-2">ROI</p><p id="roi" class="text-2xl font-mono font-bold text-blue-600">0.00%</p></div>
+                <div class="ui-card p-6"><p class="text-[10px] font-bold text-gray-400 uppercase mb-2">SHIB Price</p><p id="price" class="text-2xl font-mono font-bold">0.000000</p></div>
+                <div class="ui-card p-6"><p class="text-[10px] font-bold text-gray-400 uppercase mb-2">Balance</p><p id="balance" class="text-2xl font-mono font-bold text-gray-800">$0.00</p></div>
             </div>
-
             <div class="ui-card p-8 h-64 flex flex-col items-center justify-center border-2 border-dashed border-gray-200">
-                 <p class="text-gray-400 font-bold uppercase tracking-widest text-[10px] mb-2">Safe Threshold Calculation</p>
+                 <p class="text-gray-400 font-bold uppercase tracking-widest text-[10px] mb-2">Max Safe Base (10 Steps)</p>
                  <p id="recBase" class="text-5xl font-mono font-bold text-black">0</p>
-                 <p id="errorConsole" class="text-red-500 text-[10px] mt-6 font-bold uppercase bg-red-50 px-4 py-2 rounded border border-red-100">Status: OK</p>
+                 <p id="errorLog" class="text-red-500 text-[10px] mt-6 font-bold uppercase">System: OK</p>
             </div>
         </div>
 
@@ -273,7 +213,7 @@ app.get('/', (req, res) => {
                         <div><label class="text-xs font-bold text-gray-500 mb-1 block">Drop %</label><input id="priceDrop" type="number" class="input-minimal font-mono" value="${botState.settings.priceDrop}"></div>
                         <div><label class="text-xs font-bold text-gray-500 mb-1 block">TP %</label><input id="takeProfit" type="number" class="input-minimal font-mono" value="${botState.settings.takeProfit}"></div>
                     </div>
-                    <button onclick="saveSettings()" class="btn-primary w-full mt-4 font-bold text-[10px] uppercase tracking-widest">Apply Strategy</button>
+                    <button onclick="saveSettings()" class="btn-primary w-full mt-4 font-bold text-[10px] uppercase">Update Config</button>
                 </div>
             </div>
         </div>
@@ -285,12 +225,12 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status');
                 const d = await r.json();
                 document.getElementById('pnl').innerText = '$' + d.pnl.toFixed(4);
-                document.getElementById('pnl').className = 'text-2xl font-mono font-bold ' + (d.pnl >= 0 ? 'text-green-500' : 'text-red-500');
                 document.getElementById('roi').innerText = d.roi.toFixed(2) + '%';
                 document.getElementById('price').innerText = d.currentPrice;
                 document.getElementById('balance').innerText = '$' + parseFloat(d.walletBalance).toFixed(2);
                 document.getElementById('recBase').innerText = d.maxSafeBase.toLocaleString();
-                document.getElementById('errorConsole').innerText = 'Last Msg: ' + d.lastError;
+                document.getElementById('errorLog').innerText = 'Last Msg: ' + d.lastError;
+                
                 if(d.settings.autoScale) document.getElementById('baseOrder').value = d.maxSafeBase;
                 
                 const btn = document.getElementById('mainAction');
@@ -327,9 +267,6 @@ app.post('/api/toggle', (req, res) => { botState.isRunning = !botState.isRunning
 app.post('/api/settings', (req, res) => { botState.settings = { ...botState.settings, ...req.body }; res.sendStatus(200); });
 
 app.listen(config.port, async () => {
-    debugLog("Server Initializing...");
-    // Force Leverage 10 on start
-    await htxRequest('POST', '/linear-swap-api/v1/swap_cross_switch_lever_rate', { contract_code: config.symbol, lever_rate: config.leverage });
     initWebSocket();
     logicLoop();
 });
