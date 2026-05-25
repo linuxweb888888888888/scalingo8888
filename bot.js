@@ -19,7 +19,7 @@ const BotSchema = new mongoose.Schema({
     storedRealizedProfit: { type: Number, default: 0 },
     storedProfitPct: { type: Number, default: 0 }
 });
-const BotModel = mongoose.model('BotConfig_V28', BotSchema);
+const BotModel = mongoose.model('BotConfig_V29', BotSchema);
 
 // ==================== CONFIGURATION ====================
 const config = {
@@ -40,10 +40,10 @@ let botState = {
     totalContracts: 0,
     roi: 0, 
     pnl: 0, 
-    realizedProfit: 0, 
-    profitPct: 0,
-    walletBalance: 0, 
-    initialBalance: 0,
+    realizedProfit: 0, // Current static profit
+    profitPct: 0,      // Current gain %
+    walletBalance: 0,  // Static balance (Equity - Unrealized)
+    initialBalance: 0, // Starting point
     maxSafeBase: 0,
     safetyOrdersFilled: 0,
     settings: {
@@ -91,25 +91,28 @@ async function runLogic() {
 
         const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
         
+        // SYNC STATIC WALLET BALANCE (Equity - Unrealized)
         if (accRes?.data) {
             const acc = accRes.data.find(a => a.margin_asset === 'USDT');
             if (acc) {
                 const equity = parseFloat(acc.margin_balance) || 0;
                 const unrealized = pos ? (parseFloat(pos.unrealized_pnl) || 0) : 0;
-                botState.walletBalance = equity - unrealized;
                 
-                if (botState.initialBalance <= 0 && botState.walletBalance > 0) {
-                    botState.initialBalance = botState.walletBalance;
+                // This is your balance WITHOUT the trade fluctuations
+                const currentStaticBalance = equity - unrealized;
+                botState.walletBalance = currentStaticBalance;
+                
+                if (botState.initialBalance <= 0 && currentStaticBalance > 0) {
+                    botState.initialBalance = currentStaticBalance;
                     await BotModel.updateOne({ id: "htx_martingale" }, { initialBalance: botState.initialBalance }, { upsert: true });
                 }
             }
         }
 
-        // MATH FOR BASE ORDER (REVERTED TO WORKING VERSION)
+        // MATH FOR BASE ORDER
         if (botState.currentPrice > 0 && botState.walletBalance > 0) {
             const m = botState.settings.volumeMult, n = botState.settings.maxSteps;
             const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
-            // Reverting to the 1000 multiplier that gave you the "Right" numbers before
             const rawBase = (botState.walletBalance * config.leverage) / (multiplierSum * botState.currentPrice * 1000);
             botState.maxSafeBase = Math.floor(rawBase * 0.80);
             botState.settings.baseOrder = botState.maxSafeBase;
@@ -122,24 +125,29 @@ async function runLogic() {
             botState.roi = priceMovePct * config.leverage;
             botState.pnl = parseFloat(pos.unrealized_pnl);
 
-            // Trigger Close at 1% ROI
+            // CLOSE AT 1% ROI
             if (botState.roi >= botState.settings.takeProfit) {
                 const closeRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: botState.totalContracts,
                     direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
+                
                 if (closeRes?.status === 'ok') {
+                    // Update Profit only after close
                     setTimeout(async () => {
                         const finalAcc = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
-                        const newBal = parseFloat(finalAcc.data[0].margin_balance);
-                        botState.realizedProfit = newBal - botState.initialBalance;
+                        const newStaticBal = parseFloat(finalAcc.data[0].margin_balance);
+                        botState.realizedProfit = newStaticBal - botState.initialBalance;
                         botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
-                        await BotModel.updateOne({ id: "htx_martingale" }, { storedRealizedProfit: botState.realizedProfit, storedProfitPct: botState.profitPct });
+                        await BotModel.updateOne({ id: "htx_martingale" }, { 
+                            storedRealizedProfit: botState.realizedProfit, 
+                            storedProfitPct: botState.profitPct 
+                        });
                     }, 2000);
                     botState.safetyOrdersFilled = 0;
                 }
             } else {
-                // Safety Order Trigger
+                // Safety logic
                 const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
                 if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
                     botState.safetyOrdersFilled++;
@@ -151,13 +159,11 @@ async function runLogic() {
                 }
             }
         } else if (botState.maxSafeBase > 0) {
-            // Open Base Trade
             await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: botState.settings.baseOrder,
                 direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
             botState.safetyOrdersFilled = 0;
-            botState.roi = 0;
         }
     } catch (e) {}
     botState.isTrading = false;
@@ -187,13 +193,13 @@ async function boot() {
     setInterval(runLogic, 3000);
 }
 
-// ==================== UI (ORIGINAL DESIGN) ====================
+// ==================== UI ====================
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
 <html>
 <head>
-    <title>TradeBot | Stable ROI</title>
+    <title>TradeBot | Static Calculation</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@700&display=swap" rel="stylesheet">
     <style>.ui-card { background: white; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); padding: 20px; }</style>
@@ -208,7 +214,7 @@ app.get('/', (req, res) => {
             <div class="ui-card"><p class="text-xs font-bold text-gray-400 mb-2 uppercase">Static Profit</p><p id="p1" class="text-2xl font-mono text-green-600 tracking-tighter">$0.0000</p></div>
             <div class="ui-card"><p class="text-xs font-bold text-gray-400 mb-2 uppercase">Gain %</p><p id="p2" class="text-2xl font-mono text-green-600 tracking-tighter">0.00%</p></div>
             <div class="ui-card"><p class="text-xs font-bold text-gray-400 mb-2 uppercase">Live ROI</p><p id="roi" class="text-2xl font-mono text-gray-400 tracking-tighter">0.00%</p></div>
-            <div class="ui-card"><p class="text-xs font-bold text-gray-400 mb-2 uppercase">Equity</p><p id="bal" class="text-2xl font-mono text-gray-800 tracking-tighter">$0.0000</p></div>
+            <div class="ui-card"><p class="text-xs font-bold text-gray-400 mb-2 uppercase">Wallet (Static)</p><p id="bal" class="text-2xl font-mono text-gray-800 tracking-tighter">$0.0000</p></div>
         </div>
         <div class="ui-card text-center py-12">
             <p class="text-gray-400 text-xs font-bold uppercase mb-2">Safe Base Order</p>
