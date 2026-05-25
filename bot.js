@@ -26,7 +26,7 @@ const BotSchema = new mongoose.Schema({
         maxSteps: Number
     }
 });
-const BotModel = mongoose.model('BotConfig_V6', BotSchema);
+const BotModel = mongoose.model('BotConfig_V7', BotSchema);
 
 // ==================== CONFIGURATION ====================
 const config = {
@@ -52,7 +52,7 @@ let botState = {
     realizedProfit: 0, 
     profitPct: 0,
     safetyOrdersFilled: 0,
-    walletBalance: 0, // Static Balance
+    walletBalance: 0, 
     initialBalance: 0,
     maxSafeBase: 0,
     settings: {
@@ -65,7 +65,7 @@ let botState = {
     }
 };
 
-// ==================== DATABASE & MATH ====================
+// ==================== DATABASE ACTIONS ====================
 async function loadFromDb() {
     const data = await BotModel.findOne({ id: "htx_martingale" });
     if (data) {
@@ -85,6 +85,7 @@ async function saveToDb() {
     });
 }
 
+// ==================== MATH: GEOMETRIC MAX BASE ====================
 function calculateMaxBase() {
     if (botState.currentPrice <= 0 || botState.walletBalance <= 0) return;
     const m = botState.settings.volumeMult;
@@ -137,8 +138,6 @@ async function runLogic() {
         const balRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_account_info', {});
         if (balRes) {
             const usdtAccount = balRes.data?.find(a => a.margin_asset === 'USDT');
-            
-            // ✅ USE STATIC BALANCE (Wallet funds excluding unrealized PnL)
             botState.walletBalance = parseFloat(usdtAccount?.static_balance || usdtAccount?.margin_balance || 0);
             
             if (botState.initialBalance === 0 && botState.walletBalance > 0) {
@@ -146,7 +145,6 @@ async function runLogic() {
                 await saveToDb();
             }
 
-            // ✅ Realized Profit will stay still until a trade closes
             botState.realizedProfit = botState.walletBalance - botState.initialBalance;
             botState.profitPct = botState.initialBalance > 0 ? (botState.realizedProfit / botState.initialBalance) * 100 : 0;
         }
@@ -190,7 +188,7 @@ async function runLogic() {
 
 function logicLoop() { runLogic().finally(() => setTimeout(logicLoop, 4000)); }
 
-// ==================== UI DASHBOARD ====================
+// ==================== DASHBOARD UI ====================
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
@@ -229,18 +227,22 @@ app.get('/', (req, res) => {
     <main class="max-w-7xl mx-auto w-full px-6 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
         <div class="lg:col-span-8 space-y-8">
             <div class="grid grid-cols-2 md:grid-cols-4 gap-6">
+                <!-- REALIZED PROFIT USDT -->
                 <div class="ui-card p-6">
                     <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Realized Profit (USDT)</p>
                     <p id="realProfit" class="text-2xl font-mono font-bold text-green-500">$0.0000</p>
                 </div>
+                <!-- SESSION PERCENTAGE -->
                 <div class="ui-card p-6">
                     <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Session Profit (%)</p>
                     <p id="profitPct" class="text-2xl font-mono font-bold text-blue-600">0.0000%</p>
                 </div>
+                <!-- UNREALIZED ROI -->
                 <div class="ui-card p-6">
                     <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Unrealized ROI</p>
                     <p id="roi" class="text-2xl font-mono font-bold text-gray-400">0.00%</p>
                 </div>
+                <!-- CURRENT BALANCE -->
                 <div class="ui-card p-6">
                     <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Wallet Balance</p>
                     <p id="balance" class="text-2xl font-mono font-bold text-gray-800">$0.00</p>
@@ -251,7 +253,9 @@ app.get('/', (req, res) => {
                  <p class="text-gray-400 font-bold uppercase tracking-widest text-[10px] mb-2">Maximum Safe Base Order (10 Steps)</p>
                  <p id="recBaseDisplay" class="text-5xl font-mono font-bold text-black">0</p>
                  <div class="flex gap-4 mt-6">
-                    <button onclick="resetProfit()" class="text-[10px] bg-red-50 text-red-500 font-bold px-4 py-2 rounded-full uppercase border border-red-100 hover:bg-red-200 transition">Reset Profit History</button>
+                    <button onclick="resetStats()" class="text-[10px] bg-red-500 text-white font-bold px-6 py-2 rounded-full uppercase shadow-lg shadow-red-200 hover:bg-red-600 transition flex items-center gap-2">
+                        <span class="material-symbols-outlined text-sm">refresh</span> Reset Session Profit
+                    </button>
                  </div>
             </div>
         </div>
@@ -323,14 +327,21 @@ app.get('/', (req, res) => {
         }
 
         async function toggleBot() { await fetch('/api/toggle', {method: 'POST'}); refresh(); }
-        async function resetProfit() { if(confirm("Set current balance as starting point?")) await fetch('/api/reset-profit', {method: 'POST'}); }
+        
+        async function resetStats() { 
+            if(confirm("Reset profit session? This will set your current balance as the new starting point.")) {
+                await fetch('/api/reset-stats', {method: 'POST'}); 
+                refresh();
+            } 
+        }
         
         async function saveSettings() {
             const body = {
                 autoScale: document.getElementById('autoScale').checked,
                 baseOrder: parseFloat(document.getElementById('baseOrder').value),
                 priceDrop: parseFloat(document.getElementById('priceDrop').value),
-                takeProfit: parseFloat(document.getElementById('takeProfit').value)
+                takeProfit: parseFloat(document.getElementById('takeProfit').value),
+                volumeMult: 1.2
             };
             await fetch('/api/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
         }
@@ -343,9 +354,18 @@ app.get('/', (req, res) => {
 
 app.get('/api/status', (req, res) => res.json(botState));
 app.post('/api/toggle', async (req, res) => { botState.isRunning = !botState.isRunning; await saveToDb(); res.sendStatus(200); });
-app.post('/api/reset-profit', async (req, res) => { botState.initialBalance = botState.walletBalance; await saveToDb(); res.sendStatus(200); });
+
+app.post('/api/reset-stats', async (req, res) => { 
+    botState.initialBalance = botState.walletBalance; 
+    botState.realizedProfit = 0;
+    botState.profitPct = 0;
+    await saveToDb(); 
+    res.sendStatus(200); 
+});
+
 app.post('/api/settings', async (req, res) => { botState.settings = { ...botState.settings, ...req.body }; await saveToDb(); res.sendStatus(200); });
 
+// ==================== START ====================
 app.listen(config.port, async () => {
     await loadFromDb();
     initWebSocket();
