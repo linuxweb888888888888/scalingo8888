@@ -51,10 +51,10 @@ let botState = {
     totalContracts: 0,
     roi: 0, 
     pnl: 0, 
-    realizedProfit: 0,      // ONLY updates on closed trades (STATIC)
-    profitPct: 0,           // ONLY updates on closed trades (STATIC)
+    realizedProfit: 0,
+    profitPct: 0,
     safetyOrdersFilled: 0,
-    walletBalance: 0,        // Current static cash balance
+    walletBalance: 0,
     initialBalance: 0,
     maxSafeBase: 0,
     settings: {
@@ -76,6 +76,7 @@ async function loadFromDb() {
         botState.realizedProfit = data.realizedProfit || 0;
         botState.profitPct = data.profitPct || 0;
         botState.settings = data.settings;
+        console.log("📀 Loaded from DB:", { isRunning: botState.isRunning, realizedProfit: botState.realizedProfit });
     } else {
         await BotModel.create({ 
             id: "htx_martingale", 
@@ -107,64 +108,152 @@ function calculateMaxBase() {
         const totalUsdtCapacity = botState.walletBalance * config.leverage;
         const rawBase = totalUsdtCapacity / (multiplierSum * botState.currentPrice * 1000);
         botState.maxSafeBase = Math.floor(rawBase * 0.80); 
-        if (botState.settings.autoScale) botState.settings.baseOrder = botState.maxSafeBase;
-    } catch (e) {}
+        if (botState.settings.autoScale && botState.maxSafeBase > 0) {
+            botState.settings.baseOrder = botState.maxSafeBase;
+        }
+    } catch (e) {
+        console.error("Max base calculation error:", e);
+    }
 }
 
-// ==================== WEBSOCKET ====================
+// ==================== WEBSOCKET WITH BETTER HANDLING ====================
+let ws = null;
+let wsReconnectTimer = null;
+
 function initWebSocket() {
-    const ws = new WebSocket(config.wsHost);
-    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' })));
+    if (ws) {
+        try { ws.terminate(); } catch(e) {}
+    }
+    
+    console.log("🔌 Connecting to WebSocket...");
+    ws = new WebSocket(config.wsHost);
+    
+    ws.on('open', () => {
+        console.log("✅ WebSocket connected");
+        const subscribeMsg = JSON.stringify({ 
+            sub: `market.${config.symbol}.detail`, 
+            id: Date.now().toString() 
+        });
+        ws.send(subscribeMsg);
+        console.log(`📡 Subscribed to ${config.symbol}`);
+        
+        // Send ping every 30 seconds to keep connection alive
+        if (ws.pingInterval) clearInterval(ws.pingInterval);
+        ws.pingInterval = setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.ping();
+            }
+        }, 30000);
+    });
+    
     ws.on('message', (data) => {
         zlib.gunzip(data, (err, dezipped) => {
             if (err) return;
             try {
                 const msg = JSON.parse(dezipped.toString());
-                if (msg.ping) return ws.send(JSON.stringify({ pong: msg.ping }));
-                if (msg.tick && msg.tick.close) {
-                    botState.currentPrice = msg.tick.close;
-                    calculateMaxBase();
+                
+                // Handle ping/pong
+                if (msg.ping) {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ pong: msg.ping }));
+                    }
+                    return;
                 }
-            } catch (e) {}
+                
+                // Handle price updates
+                if (msg.tick && msg.tick.close) {
+                    const newPrice = msg.tick.close;
+                    if (newPrice !== botState.currentPrice) {
+                        botState.currentPrice = newPrice;
+                        calculateMaxBase();
+                        // console.log(`💰 Price updated: ${botState.currentPrice}`);
+                    }
+                }
+                
+                // Handle subscription response
+                if (msg.id && msg.status === 'ok') {
+                    console.log("✅ Subscription confirmed");
+                }
+            } catch (e) {
+                // Silent fail for parse errors
+            }
         });
     });
-    ws.on('close', () => setTimeout(initWebSocket, 5000));
+    
+    ws.on('error', (error) => {
+        console.error("WebSocket error:", error.message);
+    });
+    
+    ws.on('close', (code, reason) => {
+        console.log(`WebSocket closed: ${code} - ${reason || 'No reason'}`);
+        if (ws.pingInterval) clearInterval(ws.pingInterval);
+        
+        // Reconnect after 5 seconds
+        if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+        wsReconnectTimer = setTimeout(() => {
+            console.log("🔄 Reconnecting WebSocket...");
+            initWebSocket();
+        }, 5000);
+    });
 }
 
 // ==================== API HANDLER ====================
 async function htxRequest(method, path, data = {}) {
     const timestamp = new Date().toISOString().split('.')[0];
-    const params = { AccessKeyId: config.apiKey, SignatureMethod: 'HmacSHA256', SignatureVersion: '2', Timestamp: timestamp };
+    const params = { 
+        AccessKeyId: config.apiKey, 
+        SignatureMethod: 'HmacSHA256', 
+        SignatureVersion: '2', 
+        Timestamp: timestamp 
+    };
     const query = Object.keys(params).sort().map(k => `${k}=${encodeURIComponent(params[k])}`).join('&');
     const payload = [method.toUpperCase(), config.restHost, path, query].join('\n');
     const signature = crypto.createHmac('sha256', config.secretKey).update(payload).digest('base64');
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
-        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' }, timeout: 8000 });
+        const res = await axios({ 
+            method, 
+            url, 
+            data: method === 'POST' ? data : null, 
+            headers: { 
+                'Content-Type': 'application/json', 
+                'User-Agent': 'Mozilla/5.0' 
+            }, 
+            timeout: 10000 
+        });
         return res.data;
-    } catch (e) { return null; }
+    } catch (e) { 
+        console.error(`API Error (${path}):`, e.response?.data || e.message);
+        return null; 
+    }
 }
 
 // ==================== TRADING LOGIC ====================
 async function runLogic() {
-    if (!botState.isRunning || botState.isTrading || botState.currentPrice <= 0) return;
+    if (!botState.isRunning || botState.isTrading || botState.currentPrice <= 0) {
+        if (botState.isRunning && botState.currentPrice <= 0) {
+            console.log("⏳ Waiting for price data...");
+        }
+        return;
+    }
+    
     botState.isTrading = true;
     try {
-        // 1. Sync Balances & Position simultaneously
+        // Get account and position info
         const [balRes, posRes] = await Promise.all([
             htxRequest('POST', '/linear-swap-api/v1/swap_cross_account_info', {}),
             htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol })
         ]);
 
-        if (balRes && balRes.data) {
-            const usdtAccount = balRes.data.find(a => a.margin_asset === 'USDT' || a.symbol === 'USDT');
+        if (balRes && balRes.data && balRes.data.length > 0) {
+            const usdtAccount = balRes.data.find(a => a.margin_asset === 'USDT');
             
             if (usdtAccount) {
                 const marginBalance = parseFloat(usdtAccount.margin_balance || 0);
                 
                 let totalUnrealized = 0;
                 if (posRes && posRes.data) {
-                    posRes.data.forEach(p => totalUnrealized += parseFloat(p.unrealized_pnl || 0));
+                    totalUnrealized = posRes.data.reduce((sum, p) => sum + parseFloat(p.unrealized_pnl || 0), 0);
                 }
                 
                 const currentStaticBalance = marginBalance - totalUnrealized;
@@ -174,6 +263,7 @@ async function runLogic() {
                 if (botState.initialBalance === 0 && botState.walletBalance > 0) {
                     botState.initialBalance = botState.walletBalance;
                     await saveToDb();
+                    console.log(`🎯 Initial balance set: ${botState.initialBalance} USDT`);
                 }
             }
         }
@@ -181,15 +271,15 @@ async function runLogic() {
         const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0);
         
         if (pos) {
-            const previousContracts = botState.totalContracts;
             botState.avgPrice = parseFloat(pos.cost_hold);
             botState.totalContracts = parseFloat(pos.volume);
             botState.roi = ((botState.currentPrice - botState.avgPrice) / botState.avgPrice) * 100 * config.leverage;
             botState.pnl = parseFloat(pos.unrealized_pnl);
 
-            // CHECK TAKE PROFIT CONDITION
+            // Check take profit
             if (botState.roi >= botState.settings.takeProfit) {
-                // Execute closing order
+                console.log(`🎯 Take profit triggered! ROI: ${botState.roi.toFixed(2)}%`);
+                
                 const closeResult = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, 
                     volume: Math.abs(botState.totalContracts),
@@ -199,34 +289,32 @@ async function runLogic() {
                     order_price_type: 'opponent'
                 });
                 
-                // ✅ Calculate realized profit from this closed trade (STATIC UPDATE)
-                if (closeResult && closeResult.data && closeResult.data.order_id) {
-                    const closePrice = botState.currentPrice;
-                    const realizedPnL = botState.totalContracts * 1000 * (closePrice - botState.avgPrice) * config.leverage;
+                if (closeResult && (closeResult.status === 'ok' || closeResult.data)) {
+                    const realizedPnL = botState.totalContracts * 1000 * (botState.currentPrice - botState.avgPrice) * config.leverage;
                     
-                    // Add to static realized profit (this persists)
                     botState.realizedProfit += realizedPnL;
-                    
-                    // Update profit percentage based on initial balance
                     if (botState.initialBalance > 0) {
                         botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
                     }
                     
-                    console.log(`✅ Trade closed! Realized PnL: ${realizedPnL.toFixed(4)} USDT | Total Realized: ${botState.realizedProfit.toFixed(4)} USDT | Profit: ${botState.profitPct.toFixed(2)}%`);
-                    
-                    // Save to database immediately
+                    console.log(`✅ Trade closed! PnL: ${realizedPnL.toFixed(4)} USDT | Total: ${botState.realizedProfit.toFixed(4)} USDT (${botState.profitPct.toFixed(2)}%)`);
                     await saveToDb();
                 }
                 
                 botState.safetyOrdersFilled = 0;
                 botState.totalContracts = 0;
             } 
-            // CHECK FOR PRICE DROP TO ADD SAFETY ORDERS
+            // Check for safety order
             else {
-                const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
+                const dropAmount = botState.settings.priceDrop / 100;
+                const triggerPrice = botState.avgPrice * (1 - dropAmount);
+                
                 if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
                     botState.safetyOrdersFilled++;
                     const vol = Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled));
+                    
+                    console.log(`📈 Safety Order #${botState.safetyOrdersFilled}: ${vol} contracts at ${botState.currentPrice}`);
+                    
                     await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                         contract_code: config.symbol, 
                         volume: vol,
@@ -235,38 +323,35 @@ async function runLogic() {
                         lever_rate: config.leverage, 
                         order_price_type: 'opponent'
                     });
-                    console.log(`📈 Safety Order #${botState.safetyOrdersFilled} placed: ${vol} contracts`);
                 }
             }
         } 
-        // NO POSITION - OPEN NEW TRADE
-        else {
-            // Only open if we have no position and bot is running
-            if (botState.totalContracts === 0) {
-                await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol, 
-                    volume: botState.settings.baseOrder,
-                    direction: 'buy', 
-                    offset: 'open', 
-                    lever_rate: config.leverage, 
-                    order_price_type: 'opponent'
-                });
-                botState.safetyOrdersFilled = 0;
-                console.log(`🚀 New position opened: ${botState.settings.baseOrder} contracts at ${botState.currentPrice}`);
-            }
+        // No position - open new trade
+        else if (botState.totalContracts === 0 && botState.walletBalance > 0) {
+            console.log(`🚀 Opening new position: ${botState.settings.baseOrder} contracts at ${botState.currentPrice}`);
+            
+            await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, 
+                volume: botState.settings.baseOrder,
+                direction: 'buy', 
+                offset: 'open', 
+                lever_rate: config.leverage, 
+                order_price_type: 'opponent'
+            });
+            botState.safetyOrdersFilled = 0;
         }
     } catch (e) {
-        console.error("Trading error:", e);
+        console.error("Trading error:", e.message);
         botState.lastError = e.message;
     }
     botState.isTrading = false;
 }
 
 function logicLoop() { 
-    runLogic().finally(() => setTimeout(logicLoop, 4000)); 
+    runLogic().catch(console.error).finally(() => setTimeout(logicLoop, 3000)); 
 }
 
-// ==================== RESET STATS FUNCTION ====================
+// ==================== RESET STATS ====================
 async function resetStats() {
     botState.initialBalance = botState.walletBalance;
     botState.realizedProfit = 0;
@@ -282,203 +367,215 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>TradeBot | Smart Martingale - Static Profit Tracker</title>
-    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&family=Roboto+Mono:wght@400;700&display=swap" rel="stylesheet">
-    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined" rel="stylesheet" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TradeBot | Martingale Static Profit</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body { font-family: 'Roboto', sans-serif; background-color: #fafafa; color: #111827; }
-        .ui-card { background-color: #ffffff; border-radius: 16px; box-shadow: 0 4px 24px -4px rgba(0,0,0,0.04); border: 1px solid #f1f1f1; }
-        .input-minimal { width: 100%; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 14px; font-size: 14px; outline: none; background: #fafafa; transition: all 0.2s; }
-        .input-disabled { background: #eeeeee !important; color: #888; cursor: not-allowed; }
-        .btn-primary { background: #000000; color: #ffffff; border-radius: 8px; padding: 12px 24px; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.2s; }
+        .card { background: white; border-radius: 1rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); padding: 1.5rem; }
+        .stat-value { font-size: 1.875rem; font-weight: 700; font-family: monospace; }
+        .btn { padding: 0.5rem 1.5rem; border-radius: 0.5rem; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+        .btn-primary { background: #000; color: white; }
         .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
-        .stat-card { transition: all 0.3s ease; }
-        .profit-positive { color: #10b981; }
-        .profit-negative { color: #ef4444; }
+        .btn-danger { background: #dc2626; color: white; }
+        .positive { color: #10b981; }
+        .negative { color: #ef4444; }
+        .input-field { width: 100%; padding: 0.5rem; border: 1px solid #e5e7eb; border-radius: 0.5rem; font-family: monospace; }
+        .status-badge { padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 700; text-transform: uppercase; }
+        .status-running { background: #d1fae5; color: #065f46; }
+        .status-stopped { background: #f3f4f6; color: #374151; }
     </style>
 </head>
-<body class="antialiased min-h-screen flex flex-col">
-
-    <header class="bg-white/80 backdrop-blur-md shadow-sm sticky top-0 z-50">
-        <div class="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
-            <div class="flex items-center gap-2">
-                <div class="w-9 h-9 rounded-full bg-gray-700 flex items-center justify-center shadow-md relative overflow-hidden">
-                    <span class="material-symbols-outlined text-white text-[20px]">api</span>
-                </div>
-                <span class="font-bold tracking-tight text-lg">TradeBot<span class="text-blue-600">StaticProfit</span></span>
+<body class="bg-gray-50 min-h-screen">
+    <div class="max-w-7xl mx-auto px-4 py-8">
+        <!-- Header -->
+        <div class="flex justify-between items-center mb-8">
+            <div>
+                <h1 class="text-2xl font-bold">🤖 Martingale TradeBot</h1>
+                <p class="text-gray-500 text-sm">Static Profit Tracker | Only closed trades count</p>
             </div>
             <div class="flex items-center gap-4">
-                <span id="statusBadge" class="text-[10px] bg-gray-100 px-3 py-1 rounded-full uppercase font-bold tracking-wide">Ready</span>
-                <button onclick="toggleBot()" id="mainAction" class="btn-primary py-2 px-6">START ENGINE</button>
-            </div>
-        </div>
-    </header>
-
-    <main class="max-w-7xl mx-auto w-full px-6 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
-        <div class="lg:col-span-8 space-y-8">
-            <div class="grid grid-cols-2 md:grid-cols-4 gap-6">
-                <!-- REALIZED PROFIT USDT (STATIC - ONLY UPDATES ON CLOSE) -->
-                <div class="ui-card p-6 stat-card">
-                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">💰 Realized Profit (USDT)</p>
-                    <p id="realProfit" class="text-2xl font-mono font-bold text-green-500">$0.0000</p>
-                    <p class="text-[9px] text-gray-400 mt-2">↑ Only updates when trades close</p>
-                </div>
-                
-                <!-- SESSION PERCENTAGE (STATIC - ONLY UPDATES ON CLOSE) -->
-                <div class="ui-card p-6 stat-card">
-                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">📊 Session Profit (%)</p>
-                    <p id="profitPct" class="text-2xl font-mono font-bold text-blue-600">0.0000%</p>
-                    <p class="text-[9px] text-gray-400 mt-2">↑ Based on closed trades only</p>
-                </div>
-                
-                <!-- UNREALIZED ROI (MOVES WITH MARKET) -->
-                <div class="ui-card p-6 stat-card">
-                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">📈 Unrealized ROI</p>
-                    <p id="roi" class="text-2xl font-mono font-bold text-gray-400">0.00%</p>
-                    <p class="text-[9px] text-gray-400 mt-2">↺ Current position PnL</p>
-                </div>
-                
-                <!-- WALLET BALANCE (STATIC CASH) -->
-                <div class="ui-card p-6 stat-card">
-                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">💵 Wallet Cash</p>
-                    <p id="balance" class="text-2xl font-mono font-bold text-gray-800">$0.0000</p>
-                    <p class="text-[9px] text-gray-400 mt-2">↺ Static balance (excludes unrealized)</p>
-                </div>
-            </div>
-
-            <div class="ui-card p-8 h-64 flex flex-col items-center justify-center border-2 border-dashed border-gray-200 text-center">
-                 <p class="text-gray-400 font-bold uppercase tracking-widest text-[10px] mb-2">🎯 Calculated Max Safe Base (10 Steps)</p>
-                 <p id="recBaseDisplay" class="text-5xl font-mono font-bold text-black">0</p>
-                 <div class="flex gap-4 mt-6">
-                    <button onclick="resetStats()" class="text-[10px] bg-red-500 text-white font-bold px-6 py-2 rounded-full uppercase shadow-lg shadow-red-200 hover:bg-red-600 transition flex items-center gap-2 mx-auto">
-                        <span class="material-symbols-outlined text-sm">refresh</span> Reset Session Stats
-                    </button>
-                 </div>
-                 <p class="text-[10px] text-gray-400 mt-4">⚠️ Reset will set current balance as new starting point</p>
+                <span id="statusBadge" class="status-badge status-stopped">STOPPED</span>
+                <button id="toggleBtn" class="btn btn-primary" onclick="toggleBot()">START ENGINE</button>
             </div>
         </div>
 
-        <div class="lg:col-span-4 space-y-6">
-            <div class="ui-card p-6">
-                <h3 class="font-bold mb-6 flex items-center gap-2 pb-2 border-b border-gray-50 uppercase text-xs tracking-widest text-gray-400">⚙️ Strategy Settings</h3>
-                <div class="space-y-4">
-                    <div class="flex items-center justify-between p-3 bg-blue-50 rounded-lg">
-                        <span class="text-[10px] font-bold text-blue-700 uppercase">Auto-Scale Position</span>
-                        <input type="checkbox" id="autoScale" onchange="toggleAuto()">
+        <!-- Stats Grid -->
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
+            <div class="card">
+                <p class="text-gray-500 text-xs uppercase font-bold mb-1">💰 Realized Profit</p>
+                <p id="realProfit" class="stat-value positive">0.0000 USDT</p>
+                <p class="text-gray-400 text-xs mt-2">↑ Only updates on trade close</p>
+            </div>
+            <div class="card">
+                <p class="text-gray-500 text-xs uppercase font-bold mb-1">📊 Session Profit</p>
+                <p id="profitPct" class="stat-value positive">0.00%</p>
+                <p class="text-gray-400 text-xs mt-2">↑ Based on closed trades</p>
+            </div>
+            <div class="card">
+                <p class="text-gray-500 text-xs uppercase font-bold mb-1">📈 Unrealized ROI</p>
+                <p id="roi" class="stat-value">0.00%</p>
+                <p class="text-gray-400 text-xs mt-2">↺ Current position</p>
+            </div>
+            <div class="card">
+                <p class="text-gray-500 text-xs uppercase font-bold mb-1">💵 Wallet Cash</p>
+                <p id="balance" class="stat-value">0.0000 USDT</p>
+                <p class="text-gray-400 text-xs mt-2">↺ Static balance</p>
+            </div>
+        </div>
+
+        <!-- Live Info -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
+            <div class="card">
+                <p class="text-gray-500 text-xs uppercase font-bold mb-3">📡 Live Market Data</p>
+                <div class="space-y-2">
+                    <div class="flex justify-between">
+                        <span class="text-gray-600">Symbol:</span>
+                        <span class="font-mono font-bold">${config.symbol}</span>
                     </div>
-                    <div>
-                        <label class="text-xs font-bold text-gray-500 mb-1 block">Base Order Quantity</label>
-                        <input id="baseOrder" type="number" class="input-minimal font-mono">
-                        <p class="text-[9px] text-gray-400 mt-1">Auto-scale will override this</p>
+                    <div class="flex justify-between">
+                        <span class="text-gray-600">Current Price:</span>
+                        <span id="currentPrice" class="font-mono font-bold">0.00000000</span>
                     </div>
-                    <div class="grid grid-cols-2 gap-4">
-                        <div>
-                            <label class="text-xs font-bold text-gray-500 mb-1 block">Price Drop %</label>
-                            <input id="priceDrop" type="number" step="0.1" class="input-minimal font-mono">
-                            <p class="text-[9px] text-gray-400 mt-1">Trigger for safety orders</p>
-                        </div>
-                        <div>
-                            <label class="text-xs font-bold text-gray-500 mb-1 block">Take Profit %</label>
-                            <input id="takeProfit" type="number" step="0.1" class="input-minimal font-mono">
-                            <p class="text-[9px] text-gray-400 mt-1">Target profit to close</p>
-                        </div>
+                    <div class="flex justify-between">
+                        <span class="text-gray-600">Leverage:</span>
+                        <span class="font-mono">${config.leverage}x</span>
                     </div>
-                    <button onclick="saveSettings()" class="btn-primary w-full mt-4 font-bold text-xs uppercase tracking-widest">💾 Update Strategy</button>
                 </div>
             </div>
-            
-            <div class="ui-card p-6 bg-gray-50">
-                <h3 class="font-bold mb-3 text-xs uppercase tracking-widest text-gray-500">📋 Live Status</h3>
-                <div class="space-y-2 text-xs font-mono">
-                    <div class="flex justify-between"><span class="text-gray-500">Symbol:</span><span class="font-bold">${config.symbol}</span></div>
-                    <div class="flex justify-between"><span class="text-gray-500">Leverage:</span><span class="font-bold">${config.leverage}x</span></div>
-                    <div class="flex justify-between"><span class="text-gray-500">Current Price:</span><span id="currentPrice" class="font-bold">0.0000</span></div>
-                    <div class="flex justify-between"><span class="text-gray-500">Safety Orders:</span><span id="safetyCount" class="font-bold">0</span></div>
-                    <div class="flex justify-between"><span class="text-gray-500">Position Size:</span><span id="positionSize" class="font-bold">0</span></div>
+            <div class="card">
+                <p class="text-gray-500 text-xs uppercase font-bold mb-3">🎯 Position Info</p>
+                <div class="space-y-2">
+                    <div class="flex justify-between">
+                        <span class="text-gray-600">Position Size:</span>
+                        <span id="positionSize" class="font-mono">0</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span class="text-gray-600">Avg Entry:</span>
+                        <span id="avgPrice" class="font-mono">0.00000000</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span class="text-gray-600">Safety Orders:</span>
+                        <span id="safetyCount" class="font-mono">0</span>
+                    </div>
+                </div>
+            </div>
+            <div class="card">
+                <p class="text-gray-500 text-xs uppercase font-bold mb-3">⚙️ Quick Actions</p>
+                <div class="space-y-3">
+                    <button onclick="resetStats()" class="btn btn-danger w-full text-sm">Reset Profit Stats</button>
+                    <p class="text-gray-400 text-xs text-center">Resets starting point to current balance</p>
                 </div>
             </div>
         </div>
-    </main>
+
+        <!-- Settings -->
+        <div class="card">
+            <h2 class="font-bold mb-4">⚙️ Strategy Settings</h2>
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Auto Scale</label>
+                    <input type="checkbox" id="autoScale" onchange="toggleAuto()" class="w-5 h-5">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Base Order</label>
+                    <input type="number" id="baseOrder" class="input-field">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Price Drop %</label>
+                    <input type="number" step="0.1" id="priceDrop" class="input-field">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Take Profit %</label>
+                    <input type="number" step="0.1" id="takeProfit" class="input-field">
+                </div>
+            </div>
+            <div class="mt-4">
+                <button onclick="saveSettings()" class="btn btn-primary w-full md:w-auto">💾 Save Settings</button>
+            </div>
+        </div>
+    </div>
 
     <script>
-        let isFirstLoad = true;
+        let autoRefresh = null;
         
         async function refresh() {
             try {
-                const r = await fetch('/api/status');
-                const d = await r.json();
+                const response = await fetch('/api/status');
+                const data = await response.json();
                 
-                // Realized Profit (STATIC)
+                // Update displays
                 const profitElem = document.getElementById('realProfit');
-                profitElem.innerText = (d.realizedProfit >= 0 ? '+' : '') + d.realizedProfit.toFixed(4) + ' USDT';
-                profitElem.className = 'text-2xl font-mono font-bold ' + (d.realizedProfit >= 0 ? 'text-green-500' : 'text-red-500');
+                profitElem.innerText = (data.realizedProfit >= 0 ? '+' : '') + data.realizedProfit.toFixed(4) + ' USDT';
+                profitElem.className = 'stat-value ' + (data.realizedProfit >= 0 ? 'positive' : 'negative');
                 
-                // Profit Percentage (STATIC)
                 const pctElem = document.getElementById('profitPct');
-                pctElem.innerText = (d.profitPct >= 0 ? '+' : '') + d.profitPct.toFixed(4) + '%';
-                pctElem.className = 'text-2xl font-mono font-bold ' + (d.profitPct >= 0 ? 'text-green-500' : 'text-red-500');
+                pctElem.innerText = (data.profitPct >= 0 ? '+' : '') + data.profitPct.toFixed(2) + '%';
+                pctElem.className = 'stat-value ' + (data.profitPct >= 0 ? 'positive' : 'negative');
                 
-                // Unrealized ROI (MOVING)
                 const roiElem = document.getElementById('roi');
-                roiElem.innerText = (d.roi >= 0 ? '+' : '') + d.roi.toFixed(2) + '%';
-                roiElem.className = 'text-2xl font-mono font-bold ' + (d.roi >= 0 ? 'text-green-500' : 'text-red-500');
+                roiElem.innerText = (data.roi >= 0 ? '+' : '') + data.roi.toFixed(2) + '%';
+                roiElem.className = 'stat-value ' + (data.roi >= 0 ? 'positive' : 'negative');
                 
-                // Wallet Balance
-                document.getElementById('balance').innerText = d.walletBalance.toFixed(4) + ' USDT';
-                document.getElementById('recBaseDisplay').innerText = d.maxSafeBase.toLocaleString();
-                document.getElementById('currentPrice').innerText = d.currentPrice.toFixed(8);
-                document.getElementById('safetyCount').innerText = d.safetyOrdersFilled;
-                document.getElementById('positionSize').innerText = d.totalContracts;
+                document.getElementById('balance').innerText = data.walletBalance.toFixed(4) + ' USDT';
+                document.getElementById('currentPrice').innerText = data.currentPrice.toFixed(8);
+                document.getElementById('positionSize').innerText = data.totalContracts;
+                document.getElementById('avgPrice').innerText = data.avgPrice.toFixed(8);
+                document.getElementById('safetyCount').innerText = data.safetyOrdersFilled;
                 
-                if(isFirstLoad) {
-                    document.getElementById('autoScale').checked = d.settings.autoScale;
-                    document.getElementById('baseOrder').value = d.settings.baseOrder;
-                    document.getElementById('priceDrop').value = d.settings.priceDrop;
-                    document.getElementById('takeProfit').value = d.settings.takeProfit;
-                    toggleAutoUI(d.settings.autoScale);
-                    isFirstLoad = false;
+                // Update form
+                if (!window.isFirstLoad) {
+                    document.getElementById('autoScale').checked = data.settings.autoScale;
+                    document.getElementById('baseOrder').value = data.settings.baseOrder;
+                    document.getElementById('priceDrop').value = data.settings.priceDrop;
+                    document.getElementById('takeProfit').value = data.settings.takeProfit;
+                    toggleAutoUI(data.settings.autoScale);
+                    window.isFirstLoad = true;
                 }
                 
-                if(d.settings.autoScale) {
-                    document.getElementById('baseOrder').value = d.maxSafeBase;
+                if (data.settings.autoScale) {
+                    document.getElementById('baseOrder').value = data.maxSafeBase;
                 }
                 
-                const btn = document.getElementById('mainAction');
-                btn.innerText = d.isRunning ? '🛑 STOP ENGINE' : '▶️ START ENGINE';
-                btn.className = d.isRunning ? 'btn-primary bg-red-600 py-2 px-6' : 'btn-primary py-2 px-6';
-                document.getElementById('statusBadge').innerText = d.isRunning ? '🟢 Running' : '⏹️ Stopped';
-                document.getElementById('statusBadge').className = 'text-[10px] px-3 py-1 rounded-full uppercase font-bold tracking-wide ' + (d.isRunning ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-700');
-            } catch (e) {
-                console.error('Refresh error:', e);
+                // Update button and badge
+                const toggleBtn = document.getElementById('toggleBtn');
+                toggleBtn.textContent = data.isRunning ? '🛑 STOP ENGINE' : '▶️ START ENGINE';
+                toggleBtn.className = data.isRunning ? 'btn btn-danger' : 'btn btn-primary';
+                
+                const badge = document.getElementById('statusBadge');
+                badge.textContent = data.isRunning ? 'RUNNING' : 'STOPPED';
+                badge.className = 'status-badge ' + (data.isRunning ? 'status-running' : 'status-stopped');
+                
+            } catch (error) {
+                console.error('Refresh error:', error);
             }
         }
         
         function toggleAutoUI(checked) {
             const input = document.getElementById('baseOrder');
             input.disabled = checked;
-            input.classList.toggle('input-disabled', checked);
+            input.style.backgroundColor = checked ? '#f3f4f6' : 'white';
         }
         
         async function toggleAuto() {
-            toggleAutoUI(document.getElementById('autoScale').checked);
+            const autoScale = document.getElementById('autoScale').checked;
+            toggleAutoUI(autoScale);
             await saveSettings();
         }
         
-        async function toggleBot() { 
-            await fetch('/api/toggle', {method: 'POST'}); 
-            refresh(); 
+        async function toggleBot() {
+            await fetch('/api/toggle', { method: 'POST' });
+            refresh();
         }
         
-        async function resetStats() { 
-            if(confirm("⚠️ Reset all profit statistics? Current balance will become the new starting point.\n\nRealized Profit and Profit % will be reset to 0.")) { 
-                await fetch('/api/reset-stats', {method: 'POST'}); 
+        async function resetStats() {
+            if (confirm('⚠️ Reset all profit statistics? Current balance will become the new starting point.\n\nRealized Profit and Profit % will be reset to 0.')) {
+                await fetch('/api/reset-stats', { method: 'POST' });
                 setTimeout(refresh, 500);
-            } 
+            }
         }
         
         async function saveSettings() {
-            const body = {
+            const settings = {
                 autoScale: document.getElementById('autoScale').checked,
                 baseOrder: parseFloat(document.getElementById('baseOrder').value),
                 priceDrop: parseFloat(document.getElementById('priceDrop').value),
@@ -486,14 +583,15 @@ app.get('/', (req, res) => {
                 volumeMult: 1.2,
                 maxSteps: 10
             };
-            await fetch('/api/settings', { 
-                method: 'POST', 
-                headers: {'Content-Type': 'application/json'}, 
-                body: JSON.stringify(body) 
+            await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(settings)
             });
             setTimeout(refresh, 200);
         }
         
+        window.isFirstLoad = false;
         setInterval(refresh, 1000);
         refresh();
     </script>
@@ -503,12 +601,29 @@ app.get('/', (req, res) => {
 });
 
 // ==================== API ENDPOINTS ====================
-app.get('/api/status', (req, res) => res.json(botState));
+app.get('/api/status', (req, res) => {
+    res.json({
+        isRunning: botState.isRunning,
+        currentPrice: botState.currentPrice,
+        avgPrice: botState.avgPrice,
+        totalContracts: botState.totalContracts,
+        roi: botState.roi,
+        pnl: botState.pnl,
+        realizedProfit: botState.realizedProfit,
+        profitPct: botState.profitPct,
+        safetyOrdersFilled: botState.safetyOrdersFilled,
+        walletBalance: botState.walletBalance,
+        initialBalance: botState.initialBalance,
+        maxSafeBase: botState.maxSafeBase,
+        settings: botState.settings,
+        lastError: botState.lastError
+    });
+});
 
 app.post('/api/toggle', async (req, res) => { 
     botState.isRunning = !botState.isRunning; 
     await saveToDb(); 
-    console.log(`Bot ${botState.isRunning ? 'STARTED' : 'STOPPED'}`);
+    console.log(`🔄 Bot ${botState.isRunning ? 'STARTED' : 'STOPPED'} by user`);
     res.sendStatus(200); 
 });
 
@@ -523,7 +638,7 @@ app.post('/api/settings', async (req, res) => {
         botState.settings.baseOrder = req.body.baseOrder;
     }
     await saveToDb(); 
-    console.log('Settings updated:', botState.settings);
+    console.log('⚙️ Settings updated:', botState.settings);
     res.sendStatus(200); 
 });
 
