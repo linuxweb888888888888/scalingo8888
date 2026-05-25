@@ -19,7 +19,7 @@ const BotSchema = new mongoose.Schema({
     storedRealizedProfit: { type: Number, default: 0 },
     storedProfitPct: { type: Number, default: 0 }
 });
-const BotModel = mongoose.model('BotConfig_V27', BotSchema);
+const BotModel = mongoose.model('BotConfig_V28', BotSchema);
 
 // ==================== CONFIGURATION ====================
 const config = {
@@ -47,7 +47,7 @@ let botState = {
     maxSafeBase: 0,
     safetyOrdersFilled: 0,
     settings: {
-        baseOrder: 1, 
+        baseOrder: 0, 
         autoScale: true,
         priceDrop: 0.1,      
         volumeMult: 1.2,     
@@ -76,7 +76,7 @@ async function runLogic() {
     botState.isTrading = true;
 
     try {
-        // 1. FALLBACK PRICE FETCH (If WebSocket is 0)
+        // Price Sync Fallback
         if (botState.currentPrice <= 0) {
             const priceRes = await axios.get(`https://${config.restHost}/linear-swap-ex/market/trade?symbol=${config.symbol}`);
             if (priceRes.data?.tick?.data?.[0]?.price) {
@@ -84,7 +84,6 @@ async function runLogic() {
             }
         }
 
-        // 2. SYNC POSITION & ACCOUNT
         const [posRes, accRes] = await Promise.all([
             htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol }),
             htxRequest('POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' })
@@ -106,17 +105,16 @@ async function runLogic() {
             }
         }
 
-        // 3. MATH FOR BASE ORDER (Update every loop)
+        // MATH FOR BASE ORDER (REVERTED TO WORKING VERSION)
         if (botState.currentPrice > 0 && botState.walletBalance > 0) {
-            const contractFaceValue = 1000000; // SHIB
             const m = botState.settings.volumeMult, n = botState.settings.maxSteps;
             const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
-            const rawBase = (botState.walletBalance * config.leverage) / (multiplierSum * botState.currentPrice * contractFaceValue);
-            botState.maxSafeBase = Math.max(1, Math.floor(rawBase * 0.70));
+            // Reverting to the 1000 multiplier that gave you the "Right" numbers before
+            const rawBase = (botState.walletBalance * config.leverage) / (multiplierSum * botState.currentPrice * 1000);
+            botState.maxSafeBase = Math.floor(rawBase * 0.80);
             botState.settings.baseOrder = botState.maxSafeBase;
         }
 
-        // 4. TRADE EXECUTION
         if (pos) {
             botState.avgPrice = parseFloat(pos.cost_hold);
             botState.totalContracts = parseFloat(pos.volume);
@@ -124,13 +122,13 @@ async function runLogic() {
             botState.roi = priceMovePct * config.leverage;
             botState.pnl = parseFloat(pos.unrealized_pnl);
 
+            // Trigger Close at 1% ROI
             if (botState.roi >= botState.settings.takeProfit) {
                 const closeRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: botState.totalContracts,
                     direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
                 if (closeRes?.status === 'ok') {
-                    // Lock Profit Logic
                     setTimeout(async () => {
                         const finalAcc = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
                         const newBal = parseFloat(finalAcc.data[0].margin_balance);
@@ -141,6 +139,7 @@ async function runLogic() {
                     botState.safetyOrdersFilled = 0;
                 }
             } else {
+                // Safety Order Trigger
                 const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
                 if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
                     botState.safetyOrdersFilled++;
@@ -152,6 +151,7 @@ async function runLogic() {
                 }
             }
         } else if (botState.maxSafeBase > 0) {
+            // Open Base Trade
             await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: botState.settings.baseOrder,
                 direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
@@ -159,7 +159,7 @@ async function runLogic() {
             botState.safetyOrdersFilled = 0;
             botState.roi = 0;
         }
-    } catch (e) { console.log("Logic Error:", e.message); }
+    } catch (e) {}
     botState.isTrading = false;
 }
 
@@ -171,8 +171,6 @@ async function boot() {
         botState.realizedProfit = data.storedRealizedProfit || 0;
         botState.profitPct = data.storedProfitPct || 0;
     }
-    
-    // WebSocket Init
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' })));
     ws.on('message', (data) => {
@@ -186,7 +184,6 @@ async function boot() {
             }
         });
     });
-
     setInterval(runLogic, 3000);
 }
 
@@ -196,7 +193,7 @@ app.get('/', (req, res) => {
 <!DOCTYPE html>
 <html>
 <head>
-    <title>TradeBot | V27 Fixed</title>
+    <title>TradeBot | Stable ROI</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@700&display=swap" rel="stylesheet">
     <style>.ui-card { background: white; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); padding: 20px; }</style>
@@ -214,7 +211,7 @@ app.get('/', (req, res) => {
             <div class="ui-card"><p class="text-xs font-bold text-gray-400 mb-2 uppercase">Equity</p><p id="bal" class="text-2xl font-mono text-gray-800 tracking-tighter">$0.0000</p></div>
         </div>
         <div class="ui-card text-center py-12">
-            <p class="text-gray-400 text-xs font-bold uppercase mb-2">Safe Base Order (Contracts)</p>
+            <p class="text-gray-400 text-xs font-bold uppercase mb-2">Safe Base Order</p>
             <p id="maxBase" class="text-7xl font-mono font-bold tracking-tighter">0</p>
             <div class="mt-4 text-xs font-bold text-blue-500 uppercase">Price: <span id="curPrice">0.00</span> | TP: 1.0% ROI | Drop: 0.1% | Mult: 1.2</div>
             <button onclick="resetStats()" class="mt-8 text-xs text-red-500 font-bold border border-red-200 px-4 py-1 rounded-full">RESET ALL</button>
