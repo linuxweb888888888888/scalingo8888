@@ -40,10 +40,10 @@ let botState = {
     totalContracts: 0,
     roi: 0, 
     pnl: 0, 
-    realizedProfit: 0, // Current static profit
-    profitPct: 0,      // Current gain %
-    walletBalance: 0,  // Static balance (Equity - Unrealized)
-    initialBalance: 0, // Starting point
+    realizedProfit: 0,
+    profitPct: 0,      
+    walletBalance: 0,  
+    initialBalance: 0, 
     maxSafeBase: 0,
     safetyOrdersFilled: 0,
     settings: {
@@ -51,7 +51,7 @@ let botState = {
         autoScale: true,
         priceDrop: 0.1,      
         volumeMult: 1.2,     
-        takeProfit: 1.0, // 1% ROI
+        takeProfit: 1.5, // UPDATED: Changed from 1.0 to 1.5% ROI
         maxSteps: 10
     }
 };
@@ -76,7 +76,6 @@ async function runLogic() {
     botState.isTrading = true;
 
     try {
-        // Price Sync Fallback
         if (botState.currentPrice <= 0) {
             const priceRes = await axios.get(`https://${config.restHost}/linear-swap-ex/market/trade?symbol=${config.symbol}`);
             if (priceRes.data?.tick?.data?.[0]?.price) {
@@ -91,14 +90,11 @@ async function runLogic() {
 
         const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
         
-        // SYNC STATIC WALLET BALANCE (Equity - Unrealized)
         if (accRes?.data) {
             const acc = accRes.data.find(a => a.margin_asset === 'USDT');
             if (acc) {
                 const equity = parseFloat(acc.margin_balance) || 0;
                 const unrealized = pos ? (parseFloat(pos.unrealized_pnl) || 0) : 0;
-                
-                // This is your balance WITHOUT the trade fluctuations
                 const currentStaticBalance = equity - unrealized;
                 botState.walletBalance = currentStaticBalance;
                 
@@ -109,7 +105,6 @@ async function runLogic() {
             }
         }
 
-        // MATH FOR BASE ORDER
         if (botState.currentPrice > 0 && botState.walletBalance > 0) {
             const m = botState.settings.volumeMult, n = botState.settings.maxSteps;
             const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
@@ -125,7 +120,7 @@ async function runLogic() {
             botState.roi = priceMovePct * config.leverage;
             botState.pnl = parseFloat(pos.unrealized_pnl);
 
-            // CLOSE AT 1% ROI
+            // Logic uses botState.settings.takeProfit (now 1.5)
             if (botState.roi >= botState.settings.takeProfit) {
                 const closeRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: botState.totalContracts,
@@ -133,7 +128,6 @@ async function runLogic() {
                 });
                 
                 if (closeRes?.status === 'ok') {
-                    // Update Profit only after close
                     setTimeout(async () => {
                         const finalAcc = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
                         const newStaticBal = parseFloat(finalAcc.data[0].margin_balance);
@@ -147,7 +141,6 @@ async function runLogic() {
                     botState.safetyOrdersFilled = 0;
                 }
             } else {
-                // Safety logic
                 const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
                 if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
                     botState.safetyOrdersFilled++;
@@ -199,7 +192,7 @@ app.get('/', (req, res) => {
 <!DOCTYPE html>
 <html>
 <head>
-    <title>TradeBot | Static Calculation</title>
+    <title>TradeBot | 1.5% TP</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@700&display=swap" rel="stylesheet">
     <style>.ui-card { background: white; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); padding: 20px; }</style>
@@ -219,7 +212,8 @@ app.get('/', (req, res) => {
         <div class="ui-card text-center py-12">
             <p class="text-gray-400 text-xs font-bold uppercase mb-2">Safe Base Order</p>
             <p id="maxBase" class="text-7xl font-mono font-bold tracking-tighter">0</p>
-            <div class="mt-4 text-xs font-bold text-blue-500 uppercase">Price: <span id="curPrice">0.00</span> | TP: 1.0% ROI | Drop: 0.1% | Mult: 1.2</div>
+            <!-- UI UPDATED TO SHOW 1.5% -->
+            <div class="mt-4 text-xs font-bold text-blue-500 uppercase">Price: <span id="curPrice">0.00</span> | TP: 1.5% ROI | Drop: 0.1% | Mult: 1.2</div>
             <button onclick="resetStats()" class="mt-8 text-xs text-red-500 font-bold border border-red-200 px-4 py-1 rounded-full">RESET ALL</button>
         </div>
     </div>
