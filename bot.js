@@ -8,12 +8,13 @@ const zlib = require('zlib');
 const app = express();
 app.use(express.json());
 
-// ==================== CONFIGURATION ====================
+// ==================== BOT CONFIGURATION ====================
 const config = {
     apiKey: process.env.HTX_API_KEY,
     secretKey: process.env.HTX_SECRET_KEY,
     symbol: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase(),
     leverage: 10,
+    contractFaceValue: 1000, // HTX SHIB-USDT usually 1 contract = 1,000 or 1,000,000 SHIB
     port: process.env.PORT || 3000,
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws'
@@ -22,8 +23,6 @@ const config = {
 // ==================== BOT STATE ====================
 let botState = {
     isRunning: false,
-    isTrading: false,
-    lastError: "None",
     currentPrice: 0,
     avgPrice: 0,
     totalContracts: 0,
@@ -31,155 +30,114 @@ let botState = {
     pnl: 0,
     safetyOrdersFilled: 0,
     walletBalance: 0,
-    maxSafeBase: 0,
+    maxPossibleBase: 0, // Calculated automatically
     settings: {
-        baseOrder: 6000,
-        autoScale: true,
-        priceDrop: 0.1,      
-        volumeMult: 1.2,     
-        takeProfit: 0.15,    
+        baseOrder: 6000, 
+        autoScale: true,    // ✅ New: Auto-calculate base order
+        priceDrop: 0.1,     
+        volumeMult: 1.2,    
+        takeProfit: 0.15,   
         maxSteps: 10
     }
 };
 
-// ==================== MATH: GEOMETRIC MAX BASE ====================
-function calculateMaxBase() {
-    if (botState.currentPrice <= 0 || botState.walletBalance <= 0) return;
-    try {
-        const m = botState.settings.volumeMult;
-        const n = botState.settings.maxSteps;
-        const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
-        const totalUsdtCapacity = botState.walletBalance * config.leverage;
-        // SHIB Contract Size is 1000
-        const rawBase = totalUsdtCapacity / (multiplierSum * botState.currentPrice * 1000);
-        botState.maxSafeBase = Math.floor(rawBase * 0.85); // 15% safety buffer
-        if (botState.settings.autoScale) botState.settings.baseOrder = botState.maxSafeBase;
-    } catch (e) {
-        console.error("Math Error:", e.message);
-    }
+// ==================== ✅ MATH: MAX BASE ORDER CALCULATION ====================
+function calculateRecommendedBase() {
+    if (botState.currentPrice === 0 || botState.walletBalance === 0) return;
+
+    const m = botState.settings.volumeMult;
+    const n = botState.settings.maxSteps;
+    
+    // Sum of geometric series: 1 + m^1 + m^2 ... + m^n
+    const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
+    
+    // Total USDT value we can handle = Balance * Leverage
+    const maxTotalUsdtValue = botState.walletBalance * config.leverage;
+    
+    // Base Order = Total USDT / (Sum of Multipliers * Price * FaceValue)
+    const rawBase = maxTotalUsdtValue / (multiplierSum * botState.currentPrice * config.contractFaceValue);
+    
+    botState.maxPossibleBase = Math.floor(rawBase * 0.95); // 5% buffer for fees/slippage
 }
 
-// ==================== WEBSOCKET PRICE ENGINE ====================
+// ==================== WEBSOCKET & PRIVATE API ====================
 function initWebSocket() {
     const ws = new WebSocket(config.wsHost);
-    
     ws.on('open', () => {
-        console.log("🌐 WebSocket Connected");
-        ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' }));
+        ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'price_feed' }));
     });
-
     ws.on('message', (data) => {
         try {
-            // Safe decompression
-            zlib.gunzip(data, (err, dezipped) => {
-                if (err) return;
-                const msg = JSON.parse(dezipped.toString());
-                if (msg.ping) return ws.send(JSON.stringify({ pong: msg.ping }));
-                if (msg.tick && msg.tick.close) {
-                    botState.currentPrice = msg.tick.close;
-                    calculateMaxBase();
-                }
-            });
+            const payload = zlib.gunzipSync(data);
+            const msg = JSON.parse(payload.toString());
+            if (msg.ping) return ws.send(JSON.stringify({ pong: msg.ping }));
+            if (msg.tick && msg.tick.close) {
+                botState.currentPrice = msg.tick.close;
+                calculateRecommendedBase(); // Recalculate on price move
+            }
         } catch (e) {}
     });
-
-    ws.on('error', (e) => console.error("WS Error"));
-    ws.on('close', () => {
-        console.log("WS Closed, reconnecting...");
-        setTimeout(initWebSocket, 5000);
-    });
+    ws.on('close', () => setTimeout(initWebSocket, 2000));
 }
 
-// ==================== API REQUEST HANDLER ====================
 async function htxRequest(method, path, data = {}) {
     const timestamp = new Date().toISOString().split('.')[0];
     const params = { AccessKeyId: config.apiKey, SignatureMethod: 'HmacSHA256', SignatureVersion: '2', Timestamp: timestamp };
-    const sortedQuery = Object.keys(params).sort().map(k => `${k}=${encodeURIComponent(params[k])}`).join('&');
-    const payload = [method.toUpperCase(), config.restHost, path, sortedQuery].join('\n');
+    const query = Object.keys(params).sort().map(k => `${k}=${encodeURIComponent(params[k])}`).join('&');
+    const payload = [method.toUpperCase(), config.restHost, path, query].join('\n');
     const signature = crypto.createHmac('sha256', config.secretKey).update(payload).digest('base64');
-    const url = `https://${config.restHost}${path}?${sortedQuery}&Signature=${encodeURIComponent(signature)}`;
+    const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
 
     try {
-        const res = await axios({
-            method, url, data: method === 'POST' ? data : null,
-            headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
-            timeout: 10000 // 10 second timeout to prevent freezing
-        });
-        if (res.data.status !== 'ok') {
-            botState.lastError = res.data['err-msg'] || "API error";
-            return null;
-        }
+        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' } });
         return res.data;
-    } catch (e) {
-        botState.lastError = e.response?.data?.['err-msg'] || e.message;
-        return null;
-    }
+    } catch (e) { return null; }
 }
 
 // ==================== TRADING LOGIC ====================
-async function startCycle() {
-    if (botState.isTrading || botState.currentPrice <= 0) return;
-    botState.isTrading = true;
-    console.log(`🚀 Opening Base Order: ${botState.settings.baseOrder}`);
-    
-    await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-        contract_code: config.symbol, volume: botState.settings.baseOrder,
-        direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
-    });
-    
-    botState.isTrading = false;
-}
+async function logicLoop() {
+    if (!botState.isRunning || botState.currentPrice === 0) return;
 
-async function runLogic() {
-    if (!botState.isRunning || botState.isTrading) return;
+    // Sync Balance
+    const balRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_account_info', {});
+    botState.walletBalance = balRes?.data?.find(a => a.margin_asset === 'USDT')?.margin_balance || 0;
 
-    try {
-        const balRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_account_info', {});
-        if (balRes) botState.walletBalance = balRes.data?.find(a => a.margin_asset === 'USDT')?.margin_balance || 0;
+    const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
+    const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0);
 
-        const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
-        const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0);
+    // ✅ If Auto-Scale is ON, use the calculated base
+    const activeBase = botState.settings.autoScale ? botState.maxPossibleBase : botState.settings.baseOrder;
 
-        if (pos) {
-            botState.avgPrice = parseFloat(pos.cost_hold);
-            botState.totalContracts = parseFloat(pos.volume);
-            botState.roi = parseFloat(pos.profit_ratio) * 100;
-            botState.pnl = parseFloat(pos.unrealized_pnl);
+    if (pos) {
+        botState.avgPrice = parseFloat(pos.cost_hold);
+        botState.totalContracts = parseFloat(pos.volume);
+        botState.roi = parseFloat(pos.profit_ratio) * 100;
+        botState.pnl = parseFloat(pos.unrealized_pnl);
 
-            if (botState.roi >= botState.settings.takeProfit) {
-                botState.isTrading = true;
-                console.log("🎯 Taking Profit...");
-                await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol, volume: botState.totalContracts,
-                    direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
-                });
-                botState.safetyOrdersFilled = 0;
-                botState.isTrading = false;
-            } else {
-                const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
-                if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
-                    botState.isTrading = true;
-                    botState.safetyOrdersFilled++;
-                    const vol = Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled));
-                    console.log(`📉 Safety Order #${botState.safetyOrdersFilled}`);
-                    await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                        contract_code: config.symbol, volume: vol,
-                        direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
-                    });
-                    botState.isTrading = false;
-                }
-            }
-        } else {
-            await startCycle();
+        if (botState.roi >= botState.settings.takeProfit) {
+            await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: botState.totalContracts,
+                direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
+            });
+            botState.safetyOrdersFilled = 0;
         }
-    } catch (e) {}
-}
 
-// Recursive Timeout (Prevents freezing and piling up)
-function logicLoop() {
-    runLogic().finally(() => {
-        setTimeout(logicLoop, 4000);
-    });
+        const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
+        if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
+            botState.safetyOrdersFilled++;
+            const vol = Math.floor(activeBase * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled));
+            await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: vol,
+                direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+            });
+        }
+    } else {
+        await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
+            contract_code: config.symbol, volume: activeBase,
+            direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+        });
+        botState.safetyOrdersFilled = 0;
+    }
 }
 
 // ==================== UI DASHBOARD ====================
@@ -189,59 +147,57 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>TradeBot | HTX AI Engine</title>
-    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&family=Roboto+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <title>TradeBot | Smart Martingale</title>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&family=Roboto+Mono&display=swap" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined" rel="stylesheet" />
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body { font-family: 'Roboto', sans-serif; background-color: #fafafa; color: #111827; }
-        .ui-card { background-color: #ffffff; border-radius: 16px; box-shadow: 0 4px 24px -4px rgba(0,0,0,0.04); border: 1px solid #f1f1f1; }
-        .input-minimal { width: 100%; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 14px; font-size: 14px; outline: none; background: #fafafa; }
-        .input-disabled { background: #eeeeee !important; color: #888; cursor: not-allowed; }
-        .btn-primary { background: #000000; color: #ffffff; border-radius: 8px; padding: 12px 24px; font-size: 14px; font-weight: 500; }
+        body { font-family: 'Roboto', sans-serif; background-color: #fafafa; }
+        .ui-card { background: white; border-radius: 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); }
     </style>
 </head>
-<body class="antialiased min-h-screen flex flex-col">
+<body class="antialiased min-h-screen">
     <header class="bg-white/80 backdrop-blur-md shadow-sm sticky top-0 z-50 px-6 h-16 flex items-center justify-between">
         <div class="flex items-center gap-2">
-            <div class="w-9 h-9 rounded-full bg-gray-700 flex items-center justify-center shadow-md"><span class="material-symbols-outlined text-white text-[20px]">api</span></div>
-            <span class="font-bold tracking-tight text-lg">TradeBot<span class="text-blue-600">Pille</span></span>
+            <div class="w-9 h-9 rounded-full bg-gray-800 flex items-center justify-center shadow-lg"><span class="material-symbols-outlined text-white text-[20px]">bolt</span></div>
+            <span class="font-bold text-lg">TradeBot <span class="text-blue-600">SmartScale</span></span>
         </div>
         <div class="flex items-center gap-4">
             <span id="statusBadge" class="text-[10px] bg-gray-100 px-3 py-1 rounded-full uppercase font-bold tracking-wide">Ready</span>
-            <button onclick="toggleBot()" id="mainAction" class="btn-primary py-2 px-6">START ENGINE</button>
+            <button onclick="toggleBot()" id="mainAction" class="bg-black text-white rounded-lg py-2 px-6 font-medium">START ENGINE</button>
         </div>
     </header>
 
     <main class="max-w-7xl mx-auto w-full px-6 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
         <div class="lg:col-span-8 space-y-8">
             <div class="grid grid-cols-2 md:grid-cols-4 gap-6">
-                <div class="ui-card p-6"><p class="text-[10px] font-bold text-gray-400 uppercase mb-2">PnL</p><p id="pnl" class="text-2xl font-mono font-bold">$0.0000</p></div>
-                <div class="ui-card p-6"><p class="text-[10px] font-bold text-gray-400 uppercase mb-2">ROI</p><p id="roi" class="text-2xl font-mono font-bold text-blue-600">0.00%</p></div>
-                <div class="ui-card p-6"><p class="text-[10px] font-bold text-gray-400 uppercase mb-2">Price</p><p id="price" class="text-2xl font-mono font-bold">0.000000</p></div>
-                <div class="ui-card p-6"><p class="text-[10px] font-bold text-gray-400 uppercase mb-2">Balance</p><p id="balance" class="text-2xl font-mono font-bold text-gray-800">$0.00</p></div>
+                <div class="ui-card p-6"><p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1">Unrealized PnL</p><p id="pnl" class="text-2xl font-mono font-bold">$0.0000</p></div>
+                <div class="ui-card p-6"><p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1">ROI</p><p id="roi" class="text-2xl font-mono font-bold text-blue-600">0.00%</p></div>
+                <div class="ui-card p-6"><p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1">SHIB Price</p><p id="price" class="text-2xl font-mono font-bold">0.000000</p></div>
+                <div class="ui-card p-6"><p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1">Wallet (USDT)</p><p id="balance" class="text-2xl font-mono font-bold text-gray-800">$0.00</p></div>
             </div>
-            <div class="ui-card p-8 h-64 flex flex-col items-center justify-center border-2 border-dashed border-gray-200">
-                 <p class="text-gray-400 font-bold uppercase tracking-widest text-[10px] mb-2">Calculated Max Safe Base (10 Steps)</p>
-                 <p id="recBase" class="text-5xl font-mono font-bold text-black">0</p>
-                 <p id="errorMsg" class="text-red-500 text-[10px] mt-4 uppercase font-bold">System Status: Connected</p>
+
+            <div class="ui-card p-8 text-center border-2 border-dashed border-gray-200">
+                <p class="text-gray-400 uppercase text-xs font-bold mb-2">Maximum Safe Base Order (10 Steps)</p>
+                <p id="recBase" class="text-5xl font-mono font-bold text-gray-800">0</p>
+                <p class="text-gray-400 text-[10px] mt-2">Automatically calculated to utilize 100% margin at Step 10</p>
             </div>
         </div>
 
         <div class="lg:col-span-4 space-y-6">
             <div class="ui-card p-6">
-                <h3 class="font-bold mb-6 flex items-center gap-2 pb-2 border-b border-gray-50 uppercase text-xs tracking-widest text-gray-400">Config</h3>
+                <h3 class="font-bold mb-6 uppercase text-xs tracking-widest text-gray-400 border-b pb-2">Configuration</h3>
                 <div class="space-y-4">
                     <div class="flex items-center justify-between p-3 bg-blue-50 rounded-lg">
-                        <span class="text-[10px] font-bold text-blue-700 uppercase">Auto-Scale</span>
-                        <input type="checkbox" id="autoScale" ${botState.settings.autoScale ? 'checked' : ''} onchange="toggleAuto()">
+                        <label class="text-xs font-bold text-blue-800">Auto-Scale Base Order</label>
+                        <input type="checkbox" id="autoScale" ${botState.settings.autoScale ? 'checked' : ''} onchange="updateCheck()">
                     </div>
-                    <div><label class="text-xs font-bold text-gray-500 mb-1 block">Base Order</label><input id="baseOrder" type="number" class="input-minimal font-mono ${botState.settings.autoScale ? 'input-disabled' : ''}" ${botState.settings.autoScale ? 'disabled' : ''} value="${botState.settings.baseOrder}"></div>
+                    <div><label class="text-xs font-bold text-gray-500 mb-1 block">Manual Base Qty</label><input id="baseOrder" type="number" class="w-full bg-gray-50 border rounded-lg p-2 font-mono" value="${botState.settings.baseOrder}"></div>
                     <div class="grid grid-cols-2 gap-4">
-                        <div><label class="text-xs font-bold text-gray-500 mb-1 block">Drop %</label><input id="priceDrop" type="number" class="input-minimal font-mono" value="${botState.settings.priceDrop}"></div>
-                        <div><label class="text-xs font-bold text-gray-500 mb-1 block">TP %</label><input id="takeProfit" type="number" class="input-minimal font-mono" value="${botState.settings.takeProfit}"></div>
+                        <div><label class="text-xs font-bold text-gray-500 mb-1 block">Drop %</label><input id="priceDrop" type="number" class="w-full bg-gray-50 border rounded-lg p-2 font-mono" value="${botState.settings.priceDrop}"></div>
+                        <div><label class="text-xs font-bold text-gray-500 mb-1 block">TP %</label><input id="takeProfit" type="number" class="w-full bg-gray-50 border rounded-lg p-2 font-mono" value="${botState.settings.takeProfit}"></div>
                     </div>
-                    <button onclick="saveSettings()" class="btn-primary w-full mt-4 font-bold text-xs uppercase">Update Strategy</button>
+                    <button onclick="saveSettings()" class="w-full bg-black text-white rounded-lg py-3 font-bold text-xs uppercase tracking-widest">Update Strategy</button>
                 </div>
             </div>
         </div>
@@ -249,38 +205,33 @@ app.get('/', (req, res) => {
 
     <script>
         async function refresh() {
-            try {
-                const r = await fetch('/api/status');
-                const d = await r.json();
-                document.getElementById('pnl').innerText = '$' + d.pnl.toFixed(4);
-                document.getElementById('roi').innerText = d.roi.toFixed(2) + '%';
-                document.getElementById('price').innerText = d.currentPrice;
-                document.getElementById('balance').innerText = '$' + parseFloat(d.walletBalance).toFixed(2);
-                document.getElementById('recBase').innerText = d.maxSafeBase.toLocaleString();
-                document.getElementById('errorMsg').innerText = 'System Msg: ' + d.lastError;
-                if(d.settings.autoScale) document.getElementById('baseOrder').value = d.maxSafeBase;
-                
-                const btn = document.getElementById('mainAction');
-                btn.innerText = d.isRunning ? 'STOP ENGINE' : 'START ENGINE';
-                btn.className = d.isRunning ? 'btn-primary bg-red-600' : 'btn-primary';
-                document.getElementById('statusBadge').innerText = d.isRunning ? 'Running' : 'Stopped';
-            } catch (e) {}
+            const r = await fetch('/api/status');
+            const d = await r.json();
+            document.getElementById('pnl').innerText = '$' + d.pnl.toFixed(4);
+            document.getElementById('pnl').className = 'text-2xl font-mono font-bold ' + (d.pnl >= 0 ? 'text-green-500' : 'text-red-500');
+            document.getElementById('roi').innerText = d.roi.toFixed(2) + '%';
+            document.getElementById('price').innerText = d.currentPrice;
+            document.getElementById('balance').innerText = '$' + parseFloat(d.walletBalance).toFixed(2);
+            document.getElementById('recBase').innerText = d.maxPossibleBase.toLocaleString();
+
+            const btn = document.getElementById('mainAction');
+            if(d.isRunning) { btn.innerText = 'STOP ENGINE'; btn.className = 'bg-red-600 text-white rounded-lg py-2 px-6 font-medium'; }
+            else { btn.innerText = 'START ENGINE'; btn.className = 'bg-black text-white rounded-lg py-2 px-6 font-medium'; }
         }
         async function toggleBot() { await fetch('/api/toggle', {method: 'POST'}); refresh(); }
-        async function toggleAuto() {
-            const isChecked = document.getElementById('autoScale').checked;
-            document.getElementById('baseOrder').disabled = isChecked;
-            document.getElementById('baseOrder').classList.toggle('input-disabled', isChecked);
-            await saveSettings();
+        async function updateCheck() { 
+            const auto = document.getElementById('autoScale').checked;
+            await fetch('/api/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ autoScale: auto }) });
         }
         async function saveSettings() {
             const body = {
-                autoScale: document.getElementById('autoScale').checked,
                 baseOrder: parseFloat(document.getElementById('baseOrder').value),
                 priceDrop: parseFloat(document.getElementById('priceDrop').value),
-                takeProfit: parseFloat(document.getElementById('takeProfit').value)
+                takeProfit: parseFloat(document.getElementById('takeProfit').value),
+                autoScale: document.getElementById('autoScale').checked
             };
             await fetch('/api/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+            alert("Settings Updated");
         }
         setInterval(refresh, 1000);
     </script>
@@ -294,7 +245,6 @@ app.post('/api/toggle', (req, res) => { botState.isRunning = !botState.isRunning
 app.post('/api/settings', (req, res) => { botState.settings = { ...botState.settings, ...req.body }; res.sendStatus(200); });
 
 app.listen(config.port, async () => {
-    console.log("Server Live");
     initWebSocket();
-    logicLoop();
+    setInterval(logicLoop, 4000);
 });
