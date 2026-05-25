@@ -1,7 +1,7 @@
 {
   "name": "htx-martingale-bot",
-  "version": "1.1.0",
-  "description": "HTX Martingale Bot with WebSocket and MongoDB Profit Tracking",
+  "version": "1.2.0",
+  "description": "HTX Martingale Bot",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
@@ -10,7 +10,7 @@
     "axios": "^1.6.0",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
-    "mongoose": "^8.0.0",
+    "mongoose": "^8.4.1",
     "ws": "^8.14.2"
   },
   "engines": {
