@@ -2,7 +2,6 @@ require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
-const { URLSearchParams } = require('url');
 
 // ==================== CONFIGURATION ====================
 const config = {
@@ -14,42 +13,33 @@ const config = {
     priceDecreasePercent: (parseFloat(process.env.PRICE_DECREASE_PERCENT) || 0.1) / 100,
     takeProfitPercent: (parseFloat(process.env.TAKE_PROFIT_PERCENT) || 0.15) / 100,
     maxSafetyOrders: parseInt(process.env.MAX_SAFETY_ORDERS) || 10,
-    leverage: parseInt(process.env.LEVERAGE) || 1,
+    leverage: parseInt(process.env.LEVERAGE) || 10,
     volumeScale: parseFloat(process.env.VOLUME_SCALE) || 1.2,
-    initialAmount: parseFloat(process.env.INITIAL_AMOUNT) || 10, // Note: In Futures, this is 'Contracts'
+    initialAmount: parseInt(process.env.INITIAL_AMOUNT) || 6000, // SHIB contracts are integers
     
     port: process.env.PORT || 3000,
     host: 'api.htx.com',
     restEndpoint: 'https://api.htx.com'
 };
 
+// ✅ Verified Linear Swap CROSS Margin Endpoints
 const API = {
-    setLeverage: '/linear-swap-api/v1/swap_cross_swap_leverage',
-    placeOrder: '/linear-swap-api/v1/swap_order',
+    setLeverage: '/linear-swap-api/v1/swap_cross_switch_lever_rate',
+    placeOrder: '/linear-swap-api/v1/swap_cross_order',
     getPosition: '/linear-swap-api/v1/swap_cross_position_info',
-    marketDetail: '/linear-swap-api/market/detail'
+    marketDetail: '/linear-swap-ex/market/detail/merged' 
 };
 
-// ==================== ✅ FIXED HTX SIGNATURE V2 ====================
-function signHmac(method, path, params) {
-    const sortedParams = Object.keys(params).sort().map(key => 
-        `${key}=${encodeURIComponent(params[key])}`
-    ).join('&');
-
-    const payload = [
-        method.toUpperCase(),
-        config.host,
-        path,
-        sortedParams
-    ].join('\n');
-
-    return crypto.createHmac('sha256', config.secretKey)
-        .update(payload)
-        .digest('base64');
+// ==================== HTX SIGNATURE V2 ====================
+function getSignature(method, path, params) {
+    const sortedKeys = Object.keys(params).sort();
+    const query = sortedKeys.map(key => `${key}=${encodeURIComponent(params[key])}`).join('&');
+    const payload = [method.toUpperCase(), config.host, path, query].join('\n');
+    return crypto.createHmac('sha256', config.secretKey).update(payload).digest('base64');
 }
 
-async function apiRequest(method, path, data = null) {
-    const timestamp = new Date().toISOString().split('.')[0];
+async function apiRequest(method, path, data = {}) {
+    const timestamp = new Date().toISOString().split('.')[0]; // Format: 2023-10-25T10:00:00
     
     const params = {
         AccessKeyId: config.apiKey,
@@ -58,102 +48,80 @@ async function apiRequest(method, path, data = null) {
         Timestamp: timestamp
     };
 
-    const signature = signHmac(method, path, params);
+    // For GET requests, merge data into params for signing
+    if (method.toUpperCase() === 'GET') Object.assign(params, data);
+
+    const signature = getSignature(method, path, params);
     params.Signature = signature;
 
-    const queryString = new URLSearchParams(params).toString();
-    const url = `${config.restEndpoint}${path}?${queryString}`;
+    const url = `${config.restEndpoint}${path}?${new URLSearchParams(params).toString()}`;
 
     try {
         const response = await axios({
             method,
             url,
-            data: data,
+            data: method.toUpperCase() === 'POST' ? data : null,
             headers: { 'Content-Type': 'application/json' }
         });
 
         if (response.data.status !== 'ok') {
-            throw new Error(JSON.stringify(response.data));
+            throw new Error(response.data['err_msg'] || JSON.stringify(response.data));
         }
         return response.data;
     } catch (error) {
-        const errMsg = error.response?.data ? JSON.stringify(error.response.data) : error.message;
-        console.error(`❌ API Error [${path}]:`, errMsg);
-        throw new Error(errMsg);
+        console.error(`❌ API Error [${path}]:`, error.response?.data?.['err-msg'] || error.message);
+        throw error;
     }
 }
 
-// ==================== BOT LOGIC ====================
-
+// ==================== BOT STATE & LOGIC ====================
 let botState = {
     isRunning: false,
     currentPrice: 0,
     averageEntryPrice: 0,
     totalPositionSize: 0,
-    totalPnL: 0,
     status: 'stopped',
-    tpOrder: null,
-    additionOrders: [],
-    errors: []
+    additionOrders: []
 };
-
-// SHIB-USDT volume must be an integer (number of contracts)
-function calculateOrderAmount(orderIndex) {
-    const multiplier = Math.pow(config.volumeScale, orderIndex);
-    const amount = Math.floor(config.initialAmount * multiplier); 
-    return { amount: amount > 0 ? amount : 1, multiplier: multiplier.toFixed(2) };
-}
 
 async function getMarketPrice() {
     try {
-        const url = `${config.restEndpoint}${API.marketDetail}?contract_code=${config.symbol}`;
+        const url = `${config.restEndpoint}${API.marketDetail}?symbol=${config.symbol}`;
         const res = await axios.get(url);
         return res.data.tick.close;
-    } catch (e) { return null; }
-}
-
-async function updatePositionState() {
-    try {
-        const res = await apiRequest('POST', API.getPosition, { contract_code: config.symbol });
-        if (res.data && res.data.length > 0) {
-            const pos = res.data[0];
-            botState.averageEntryPrice = parseFloat(pos.cost_hold);
-            botState.totalPositionSize = parseFloat(pos.volume);
-            botState.currentPrice = parseFloat(pos.last_price);
-        } else {
-            botState.totalPositionSize = 0;
-        }
     } catch (e) {
-        console.error("Error updating position:", e.message);
+        console.error("Price Fetch Error:", e.message);
+        return null;
     }
 }
 
 async function startBot() {
-    console.log(`🚀 Starting Bot for ${config.symbol}...`);
+    console.log(`\n🚀 STARTING MARTINGALE: ${config.symbol}`);
     try {
-        // 1. Set Leverage
+        // 1. Set Leverage for Cross Margin
+        console.log(`⚙️ Setting leverage to ${config.leverage}x...`);
         await apiRequest('POST', API.setLeverage, { 
             contract_code: config.symbol, 
             lever_rate: config.leverage 
         });
 
-        // 2. Place Initial Market Buy
-        const { amount } = calculateOrderAmount(0);
+        // 2. Initial Order (Market/Opponent price)
+        console.log(`🛒 Placing initial order: ${config.initialAmount} contracts`);
         await apiRequest('POST', API.placeOrder, {
             contract_code: config.symbol,
-            volume: amount,
+            volume: config.initialAmount,
             direction: 'buy',
             offset: 'open',
             lever_rate: config.leverage,
-            order_price_type: 'opponent' // Market order
+            order_price_type: 'opponent'
         });
 
         botState.isRunning = true;
         botState.status = 'running';
-        console.log(`✅ Initial Order Placed: ${amount} contracts`);
+        console.log("✅ Bot is live!");
     } catch (e) {
         botState.status = 'error';
-        console.error("Start Failed:", e.message);
+        console.error("Critical Start Error:", e.message);
     }
 }
 
@@ -161,82 +129,78 @@ async function startBot() {
 async function monitor() {
     if (!botState.isRunning) return;
 
-    await updatePositionState();
+    try {
+        // Update price and position
+        const price = await getMarketPrice();
+        if (price) botState.currentPrice = price;
 
-    if (botState.totalPositionSize > 0) {
-        const tpPrice = botState.averageEntryPrice * (1 + config.takeProfitPercent);
-        
-        // Take Profit Check
-        if (botState.currentPrice >= tpPrice) {
-            console.log("🎯 TP Hit! Closing position...");
-            await apiRequest('POST', API.placeOrder, {
-                contract_code: config.symbol,
-                volume: botState.totalPositionSize,
-                direction: 'sell',
-                offset: 'close',
-                lever_rate: config.leverage,
-                order_price_type: 'opponent'
-            });
-            botState.additionOrders = [];
-            // Restart cycle
-            setTimeout(startBot, 5000);
-            return;
+        const posRes = await apiRequest('POST', API.getPosition, { contract_code: config.symbol });
+        if (posRes.data && posRes.data.length > 0) {
+            const pos = posRes.data[0];
+            botState.averageEntryPrice = parseFloat(pos.cost_hold);
+            botState.totalPositionSize = parseFloat(pos.volume);
+
+            // 🎯 TAKE PROFIT LOGIC
+            const tpPrice = botState.averageEntryPrice * (1 + config.takeProfitPercent);
+            if (botState.currentPrice >= tpPrice) {
+                console.log(`🎯 TP Hit at ${botState.currentPrice}! Closing...`);
+                await apiRequest('POST', API.placeOrder, {
+                    contract_code: config.symbol,
+                    volume: botState.totalPositionSize,
+                    direction: 'sell',
+                    offset: 'close',
+                    lever_rate: config.leverage,
+                    order_price_type: 'opponent'
+                });
+                botState.additionOrders = [];
+                setTimeout(startBot, 10000); // Restart after 10s
+                return;
+            }
+
+            // 📉 SAFETY ORDER LOGIC
+            const nextIdx = botState.additionOrders.length + 1;
+            const triggerPrice = botState.averageEntryPrice * (1 - (config.priceDecreasePercent * nextIdx));
+
+            if (botState.currentPrice <= triggerPrice && nextIdx <= config.maxSafetyOrders) {
+                const amount = Math.floor(config.initialAmount * Math.pow(config.volumeScale, nextIdx));
+                console.log(`📉 Price drop to ${botState.currentPrice}. Adding Safety Order #${nextIdx} (${amount} qty)`);
+                await apiRequest('POST', API.placeOrder, {
+                    contract_code: config.symbol,
+                    volume: amount,
+                    direction: 'buy',
+                    offset: 'open',
+                    lever_rate: config.leverage,
+                    order_price_type: 'opponent'
+                });
+                botState.additionOrders.push({ idx: nextIdx, amount });
+            }
         }
-
-        // Safety Order Check
-        const nextIdx = botState.additionOrders.length + 1;
-        const triggerPrice = botState.averageEntryPrice * (1 - (config.priceDecreasePercent * nextIdx));
-
-        if (botState.currentPrice <= triggerPrice && nextIdx <= config.maxSafetyOrders) {
-            console.log(`📉 Price drop! Placing Safety Order #${nextIdx}`);
-            const { amount } = calculateOrderAmount(nextIdx);
-            await apiRequest('POST', API.placeOrder, {
-                contract_code: config.symbol,
-                volume: amount,
-                direction: 'buy',
-                offset: 'open',
-                lever_rate: config.leverage,
-                order_price_type: 'opponent'
-            });
-            botState.additionOrders.push({ index: nextIdx, amount });
-        }
+    } catch (e) {
+        console.error("Monitor loop error:", e.message);
     }
 }
 
 setInterval(monitor, 5000);
 
-// ==================== WEB INTERFACE ====================
+// ==================== DASHBOARD ====================
 const app = express();
 app.get('/', (req, res) => {
     res.send(`
-        <body style="background:#111; color:#fff; font-family:sans-serif; padding:20px;">
-            <h1>HTX Martingale Bot: ${config.symbol}</h1>
-            <div style="border:1px solid #444; padding:15px;">
-                <p>Status: ${botState.status}</p>
-                <p>Current Price: ${botState.currentPrice}</p>
-                <p>Avg Entry: ${botState.averageEntryPrice}</p>
-                <p>Position Size: ${botState.totalPositionSize} contracts</p>
-                <p>Safety Orders: ${botState.additionOrders.length} / ${config.maxSafetyOrders}</p>
-            </div>
-            <br>
-            <button onclick="fetch('/start', {method:'POST'})">START</button>
-            <button onclick="fetch('/stop', {method:'POST'})">STOP</button>
-            <script>
-                async function action(path) { await fetch(path, {method:'POST'}); location.reload(); }
-            </script>
+        <body style="background:#0d1117; color:#c9d1d9; font-family: sans-serif; padding: 40px;">
+            <h1>HTX Martingale [${config.symbol}]</h1>
+            <hr border="0.1"/>
+            <p>Status: <b style="color:${botState.isRunning ? '#238636' : '#f85149'}">${botState.status.toUpperCase()}</b></p>
+            <p>Price: <b>${botState.currentPrice}</b></p>
+            <p>Avg Entry: <b>${botState.averageEntryPrice}</b></p>
+            <p>Size: <b>${botState.totalPositionSize} contracts</b></p>
+            <p>Safety Orders Filled: <b>${botState.additionOrders.length} / ${config.maxSafetyOrders}</b></p>
+            <button onclick="fetch('/start',{method:'POST'})" style="padding:10px 20px; background:#238636; color:white; border:0; border-radius:5px; cursor:pointer;">START BOT</button>
+            <button onclick="fetch('/stop',{method:'POST'})" style="padding:10px 20px; background:#da3633; color:white; border:0; border-radius:5px; cursor:pointer; margin-left:10px;">STOP BOT</button>
         </body>
     `);
 });
 
-app.post('/start', async (req, res) => {
-    await startBot();
-    res.sendStatus(200);
-});
+app.post('/start', (req, res) => { startBot(); res.sendStatus(200); });
+app.post('/stop', (req, res) => { botState.isRunning = false; botState.status = 'stopped'; res.sendStatus(200); });
 
-app.post('/stop', (req, res) => {
-    botState.isRunning = false;
-    botState.status = 'stopped';
-    res.sendStatus(200);
-});
-
-app.listen(config.port, () => console.log(`Dashboard: http://localhost:${config.port}`));
+app.listen(config.port, () => console.log(`🚀 Dashboard running at http://localhost:${config.port}`));
