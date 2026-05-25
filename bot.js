@@ -10,7 +10,7 @@ const app = express();
 app.use(express.json());
 
 // ==================== MONGODB SETUP ====================
-const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://your_connection_string";
+const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
 mongoose.connect(MONGO_URI).then(() => console.log("📦 MongoDB Connected"));
 
 const BotSchema = new mongoose.Schema({
@@ -26,7 +26,7 @@ const BotSchema = new mongoose.Schema({
         maxSteps: Number
     }
 });
-const BotModel = mongoose.model('BotConfig', BotSchema);
+const BotModel = mongoose.model('BotConfig_V4', BotSchema);
 
 // ==================== CONFIGURATION ====================
 const config = {
@@ -47,9 +47,10 @@ let botState = {
     currentPrice: 0,
     avgPrice: 0,
     totalContracts: 0,
-    roi: 0,
-    pnl: 0, // Unrealized
-    realizedProfit: 0, // Current Balance - Initial Balance
+    roi: 0, // Unrealized ROI
+    pnl: 0, // Unrealized PnL
+    realizedProfit: 0, // Current - Initial
+    profitPct: 0, // % growth
     safetyOrdersFilled: 0,
     walletBalance: 0,
     initialBalance: 0,
@@ -64,14 +65,13 @@ let botState = {
     }
 };
 
-// ==================== DATABASE ACTIONS ====================
+// ==================== DATABASE & MATH ====================
 async function loadFromDb() {
     const data = await BotModel.findOne({ id: "htx_martingale" });
     if (data) {
         botState.isRunning = data.isRunning;
         botState.initialBalance = data.initialBalance;
         botState.settings = data.settings;
-        console.log("✅ Settings loaded from Database");
     } else {
         await BotModel.create({ id: "htx_martingale", isRunning: false, settings: botState.settings });
     }
@@ -85,7 +85,6 @@ async function saveToDb() {
     });
 }
 
-// ==================== MATH: GEOMETRIC MAX BASE ====================
 function calculateMaxBase() {
     if (botState.currentPrice <= 0 || botState.walletBalance <= 0) return;
     const m = botState.settings.volumeMult;
@@ -137,15 +136,17 @@ async function runLogic() {
     try {
         const balRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_account_info', {});
         if (balRes) {
-            botState.walletBalance = balRes.data?.find(a => a.margin_asset === 'USDT')?.margin_balance || 0;
+            botState.walletBalance = parseFloat(balRes.data?.find(a => a.margin_asset === 'USDT')?.margin_balance || 0);
             
-            // Set Initial Balance if not set
-            if (botState.initialBalance === 0) {
+            // Set Initial Balance on first run
+            if (botState.initialBalance === 0 && botState.walletBalance > 0) {
                 botState.initialBalance = botState.walletBalance;
                 await saveToDb();
             }
-            // Calculate Profit
+
+            // Profit Calculation
             botState.realizedProfit = botState.walletBalance - botState.initialBalance;
+            botState.profitPct = botState.initialBalance > 0 ? (botState.realizedProfit / botState.initialBalance) * 100 : 0;
         }
 
         const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
@@ -185,9 +186,9 @@ async function runLogic() {
     botState.isTrading = false;
 }
 
-function logicLoop() { runLogic().finally(() => setTimeout(logicLoop, 5000)); }
+function logicLoop() { runLogic().finally(() => setTimeout(logicLoop, 4000)); }
 
-// ==================== UI DESIGN ====================
+// ==================== DASHBOARD UI ====================
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
@@ -202,7 +203,7 @@ app.get('/', (req, res) => {
         body { font-family: 'Roboto', sans-serif; background-color: #fafafa; color: #111827; }
         .ui-card { background-color: #ffffff; border-radius: 16px; box-shadow: 0 4px 24px -4px rgba(0,0,0,0.04); border: 1px solid #f1f1f1; }
         .input-minimal { width: 100%; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 14px; font-size: 14px; outline: none; background: #fafafa; transition: all 0.2s; }
-        .input-disabled { background: #eeeeee !important; color: #888; cursor: not-allowed; border-color: #ddd; }
+        .input-disabled { background: #eeeeee !important; color: #888; cursor: not-allowed; }
         .btn-primary { background: #000000; color: #ffffff; border-radius: 8px; padding: 12px 24px; font-size: 14px; font-weight: 500; cursor: pointer; }
     </style>
 </head>
@@ -211,7 +212,9 @@ app.get('/', (req, res) => {
     <header class="bg-white/80 backdrop-blur-md shadow-sm sticky top-0 z-50">
         <div class="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
             <div class="flex items-center gap-2">
-                <div class="w-9 h-9 rounded-full bg-gray-700 flex items-center justify-center shadow-md"><span class="material-symbols-outlined text-white text-[20px]">api</span></div>
+                <div class="w-9 h-9 rounded-full bg-gray-700 flex items-center justify-center shadow-md relative overflow-hidden">
+                    <span class="material-symbols-outlined text-white text-[20px]">api</span>
+                </div>
                 <span class="font-bold tracking-tight text-lg">TradeBot<span class="text-blue-600">SmartScale</span></span>
             </div>
             <div class="flex items-center gap-4">
@@ -224,28 +227,34 @@ app.get('/', (req, res) => {
     <main class="max-w-7xl mx-auto w-full px-6 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
         <div class="lg:col-span-8 space-y-8">
             <div class="grid grid-cols-2 md:grid-cols-4 gap-6">
+                <!-- PROFIT USDT -->
                 <div class="ui-card p-6">
-                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Total Realized Profit</p>
-                    <p id="realProfit" class="text-2xl font-mono font-bold">$0.0000</p>
+                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Realized Profit ($)</p>
+                    <p id="realProfit" class="text-2xl font-mono font-bold text-green-500">$0.0000</p>
                 </div>
+                <!-- UNREALIZED ROI -->
                 <div class="ui-card p-6">
-                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Live ROI</p>
+                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Unrealized ROI</p>
                     <p id="roi" class="text-2xl font-mono font-bold text-blue-600">0.00%</p>
                 </div>
+                <!-- SESSION GROWTH % -->
                 <div class="ui-card p-6">
-                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">SHIB Price</p>
-                    <p id="price" class="text-2xl font-mono font-bold">0.000000</p>
+                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Session Profit (%)</p>
+                    <p id="profitPct" class="text-2xl font-mono font-bold text-green-600">0.00%</p>
                 </div>
+                <!-- BALANCE -->
                 <div class="ui-card p-6">
-                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Wallet USDT</p>
+                    <p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">Wallet Total</p>
                     <p id="balance" class="text-2xl font-mono font-bold text-gray-800">$0.00</p>
                 </div>
             </div>
 
             <div class="ui-card p-8 h-64 flex flex-col items-center justify-center border-2 border-dashed border-gray-200">
-                 <p class="text-gray-400 font-bold uppercase tracking-widest text-[10px] mb-2">Calculated Max Safe Base (10 Steps)</p>
+                 <p class="text-gray-400 font-bold uppercase tracking-widest text-[10px] mb-2">Safe Base Order Recommendation</p>
                  <p id="recBaseDisplay" class="text-5xl font-mono font-bold text-black">0</p>
-                 <button onclick="resetProfit()" class="mt-4 text-[10px] bg-red-50 text-red-500 font-bold px-4 py-1 rounded-full uppercase border border-red-100">Reset Initial Balance</button>
+                 <div class="flex gap-4 mt-6">
+                    <button onclick="resetProfit()" class="text-[10px] bg-red-50 text-red-500 font-bold px-4 py-2 rounded-full uppercase border border-red-100 hover:bg-red-100">Reset Initial Balance</button>
+                 </div>
             </div>
         </div>
 
@@ -259,14 +268,14 @@ app.get('/', (req, res) => {
                     </div>
                     <div>
                         <label class="text-xs font-bold text-gray-500 mb-1 block">Base Order (Qty)</label>
-                        <input id="baseOrder" type="number" class="input-minimal font-mono" value="0">
+                        <input id="baseOrder" type="number" class="input-minimal font-mono">
                     </div>
                     <div class="grid grid-cols-2 gap-4">
                         <div><label class="text-xs font-bold text-gray-500 mb-1 block">Drop (%)</label><input id="priceDrop" type="number" class="input-minimal font-mono"></div>
                         <div><label class="text-xs font-bold text-gray-500 mb-1 block">TP (%)</label><input id="takeProfit" type="number" class="input-minimal font-mono"></div>
                     </div>
                     <div><label class="text-xs font-bold text-gray-500 mb-1 block">Volume Multiplier</label><input id="volumeMult" type="number" class="input-minimal font-mono"></div>
-                    <button onclick="saveSettings()" class="btn-primary w-full mt-4 font-bold text-xs uppercase tracking-widest">Update Strategy & Save</button>
+                    <button onclick="saveSettings()" class="btn-primary w-full mt-4 font-bold text-xs uppercase tracking-widest">Update Strategy</button>
                 </div>
             </div>
         </div>
@@ -274,7 +283,6 @@ app.get('/', (req, res) => {
 
     <script>
         let isFirstLoad = true;
-
         async function refresh() {
             try {
                 const r = await fetch('/api/status');
@@ -282,8 +290,13 @@ app.get('/', (req, res) => {
                 
                 document.getElementById('realProfit').innerText = '$' + d.realizedProfit.toFixed(4);
                 document.getElementById('realProfit').className = 'text-2xl font-mono font-bold ' + (d.realizedProfit >= 0 ? 'text-green-500' : 'text-red-500');
+                
                 document.getElementById('roi').innerText = d.roi.toFixed(2) + '%';
-                document.getElementById('price').innerText = d.currentPrice;
+                document.getElementById('roi').className = 'text-2xl font-mono font-bold ' + (d.roi >= 0 ? 'text-green-500' : 'text-red-500');
+
+                document.getElementById('profitPct').innerText = d.profitPct.toFixed(2) + '%';
+                document.getElementById('profitPct').className = 'text-2xl font-mono font-bold ' + (d.profitPct >= 0 ? 'text-green-500' : 'text-red-500');
+
                 document.getElementById('balance').innerText = '$' + parseFloat(d.walletBalance).toFixed(2);
                 document.getElementById('recBaseDisplay').innerText = d.maxSafeBase.toLocaleString();
                 
@@ -296,12 +309,11 @@ app.get('/', (req, res) => {
                     toggleAutoUI(d.settings.autoScale);
                     isFirstLoad = false;
                 }
-
                 if(d.settings.autoScale) document.getElementById('baseOrder').value = d.maxSafeBase;
 
                 const btn = document.getElementById('mainAction');
-                if(d.isRunning) { btn.innerText = 'STOP ENGINE'; btn.className = 'btn-primary bg-red-600 py-2 px-6'; }
-                else { btn.innerText = 'START ENGINE'; btn.className = 'btn-primary py-2 px-6'; }
+                btn.innerText = d.isRunning ? 'STOP ENGINE' : 'START ENGINE';
+                btn.className = d.isRunning ? 'btn-primary bg-red-600 py-2 px-6' : 'btn-primary py-2 px-6';
                 document.getElementById('statusBadge').innerText = d.isRunning ? 'Running' : 'Stopped';
             } catch (e) {}
         }
@@ -318,7 +330,7 @@ app.get('/', (req, res) => {
         }
 
         async function toggleBot() { await fetch('/api/toggle', {method: 'POST'}); refresh(); }
-        async function resetProfit() { if(confirm("This will reset your initial balance to current. Continue?")) await fetch('/api/reset-profit', {method: 'POST'}); }
+        async function resetProfit() { if(confirm("Set current balance as new starting point?")) await fetch('/api/reset-profit', {method: 'POST'}); }
         
         async function saveSettings() {
             const body = {
@@ -338,21 +350,9 @@ app.get('/', (req, res) => {
 });
 
 app.get('/api/status', (req, res) => res.json(botState));
-app.post('/api/toggle', async (req, res) => { 
-    botState.isRunning = !botState.isRunning; 
-    await saveToDb();
-    res.sendStatus(200); 
-});
-app.post('/api/reset-profit', async (req, res) => {
-    botState.initialBalance = botState.walletBalance;
-    await saveToDb();
-    res.sendStatus(200);
-});
-app.post('/api/settings', async (req, res) => { 
-    botState.settings = { ...botState.settings, ...req.body }; 
-    await saveToDb();
-    res.sendStatus(200); 
-});
+app.post('/api/toggle', async (req, res) => { botState.isRunning = !botState.isRunning; await saveToDb(); res.sendStatus(200); });
+app.post('/api/reset-profit', async (req, res) => { botState.initialBalance = botState.walletBalance; await saveToDb(); res.sendStatus(200); });
+app.post('/api/settings', async (req, res) => { botState.settings = { ...botState.settings, ...req.body }; await saveToDb(); res.sendStatus(200); });
 
 // ==================== START ====================
 app.listen(config.port, async () => {
