@@ -60,7 +60,7 @@ let botState = {
         autoScale: true,
         priceDrop: 0.1,      
         volumeMult: 1.2,     
-        takeProfit: 0.15,    
+        takeProfit: 1,    
         maxSteps: 10
     }
 };
