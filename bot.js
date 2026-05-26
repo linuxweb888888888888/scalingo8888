@@ -40,17 +40,18 @@ let botState = {
     roi: 0, 
     realizedProfit: 0,
     profitPct: 0,      
-    walletBalance: 0, // This is the STATIC balance
+    walletBalance: 0,  
     initialBalance: 0, 
     safetyOrdersFilled: 0,
     distToNext: 0,
     estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 }, 
     settings: {
         baseOrder: 0, 
-        priceDrop: 0.1,      
-        volumeMult: 1.2,     
-        takeProfit: 1.5, 
-        maxSteps: 10
+        priceDrop: 0.1,      // As requested
+        volumeMult: 1.2,     // As requested
+        takeProfit: 1.5,     // As requested
+        maxSteps: 10,
+        faceValue: 0.001
     }
 };
 
@@ -83,47 +84,47 @@ async function runLogic() {
         const acc = accRes?.data?.find(a => a.margin_asset === 'USDT');
 
         if (acc) {
-            const equity = parseFloat(acc.margin_balance);
-            const unrealized = pos ? parseFloat(pos.unrealized_pnl) : 0;
-            
-            // --- UPDATING STATIC BALANCE ---
-            // Only update when no position is open to keep it "Static" during trades.
-            if (!pos || botState.walletBalance === 0) {
-                botState.walletBalance = Number((equity - unrealized).toFixed(4));
+            // --- STRICT STATIC BALANCE LOCK ---
+            // Wallet and Base Order calculation only updates when NO trade is active
+            if (!pos) {
+                const equity = parseFloat(acc.margin_balance);
+                botState.walletBalance = Number(equity.toFixed(4));
                 
-                // --- DYNAMIC MATH: Targeting ~90 contracts for $1.80 ---
-                const m = botState.settings.volumeMult; // 1.2
-                const n = 10; // steps
-                const multiplierSum = (Math.pow(m, n + 1) - 1) / (m - 1); // 32.15
+                // DYNAMIC FIT MATH (Multiplier is always 1.2)
+                const m = botState.settings.volumeMult; 
+                const n = 10; 
+                const multiplierSum = (Math.pow(m, n + 1) - 1) / (m - 1); // ~32.15
                 
-                // We calculate the base so that 10 steps fit into your balance.
-                // For $1.80, this math ensures we open ~90 as a base.
-                const totalTargetValue = botState.walletBalance * 16; // Adjusted multiplier for SHIB notional
-                botState.settings.baseOrder = Math.max(1, Math.floor(totalTargetValue / multiplierSum * 160));
+                const totalAllowedMargin = botState.walletBalance * 0.85; 
+                const baseMargin = totalAllowedMargin / multiplierSum;
                 
-                if (botState.initialBalance <= 0 && botState.walletBalance > 0) {
+                // For $1.81, this results in ~450-480 contracts
+                botState.settings.baseOrder = Math.max(1, Math.floor((baseMargin * config.leverage) / botState.settings.faceValue));
+                
+                if (botState.initialBalance <= 0) {
                     botState.initialBalance = botState.walletBalance;
                     botState.startTime = Date.now();
                 }
             }
         }
 
-        // Static Gains
+        // Static Stats
         botState.realizedProfit = botState.walletBalance - botState.initialBalance;
         botState.profitPct = botState.initialBalance > 0 ? (botState.realizedProfit / botState.initialBalance) * 100 : 0;
 
-        // Compounding Estimates
+        // --- COMPOUNDING ESTIMATES ---
         const elapsedDays = (Date.now() - botState.startTime) / (1000 * 60 * 60 * 24);
-        if (elapsedDays > 0.0005 && botState.walletBalance > botState.initialBalance) {
+        if (elapsedDays > 0.0005) {
             const dgr = Math.pow((botState.walletBalance / botState.initialBalance), (1 / elapsedDays)) - 1;
-            botState.estimates.dgr = dgr * 100;
+            const safeDGR = dgr > 0 ? dgr : 0;
+            botState.estimates.dgr = safeDGR * 100;
             botState.estimates.hr = botState.realizedProfit / (elapsedDays * 24);
-            botState.estimates.day = botState.walletBalance * dgr;
-            botState.estimates.week = (botState.walletBalance * Math.pow((1 + dgr), 7)) - botState.walletBalance;
-            botState.estimates.month = (botState.walletBalance * Math.pow((1 + dgr), 30)) - botState.walletBalance;
+            botState.estimates.day = botState.walletBalance * safeDGR;
+            botState.estimates.week = (botState.walletBalance * Math.pow((1 + safeDGR), 7)) - botState.walletBalance;
+            botState.estimates.month = (botState.walletBalance * Math.pow((1 + safeDGR), 30)) - botState.walletBalance;
         }
 
-        // EXECUTION
+        // --- EXECUTION ---
         if (pos) {
             botState.avgPrice = parseFloat(pos.cost_hold);
             botState.roi = parseFloat(pos.profit_rate) * 100;
@@ -131,13 +132,14 @@ async function runLogic() {
             botState.distToNext = Math.max(0, ((botState.currentPrice - triggerPrice) / botState.currentPrice) * 100);
 
             if (botState.roi >= botState.settings.takeProfit) {
-                await htxRequest('POST', '/linear-swap-api/v1/swap_close_order', { // Adjusted endpoint
+                await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: pos.volume,
                     direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
                 botState.safetyOrdersFilled = 0;
             } else if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
                 botState.safetyOrdersFilled++;
+                // Multiplier 1.2 is used here: Base * 1.2^step
                 const nextVol = Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled));
                 await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: Math.max(1, nextVol),
@@ -197,7 +199,7 @@ app.get('/', (req, res) => {
         <div class="flex justify-between items-center mb-10">
             <div>
                 <h1 class="text-slate-900 text-2xl font-bold tracking-tighter uppercase">Static <span class="text-blue-600">Engine</span></h1>
-                <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">${config.symbol} | Fit Mode</p>
+                <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">${config.symbol} | 1.2x Multiplier | 1.5% TP</p>
             </div>
             <div class="text-right">
                 <p id="dgrText" class="text-blue-600 font-bold text-2xl">0.00% DGR</p>
@@ -227,7 +229,7 @@ app.get('/', (req, res) => {
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
             <div class="bg-blue-600 p-8 rounded-[2rem] shadow-xl shadow-blue-100 relative overflow-hidden text-white text-center">
                 <p id="estDay" class="text-4xl font-bold">$0.00</p>
-                <p class="text-[10px] opacity-70 font-bold uppercase mt-2">Next 24h Projection</p>
+                <p class="text-[10px] opacity-70 font-bold uppercase mt-2">Next 24h Compound</p>
             </div>
             <div class="glass p-8 rounded-[2rem] relative overflow-hidden text-center">
                 <p id="estWeek" class="text-4xl text-slate-900 font-bold">$0.00</p>
