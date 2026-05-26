@@ -20,6 +20,13 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws'
 };
 
+// Check for missing API keys
+if (!config.apiKey || !config.secretKey) {
+    console.error('❌ ERROR: Missing API Keys!');
+    console.error('Please set HTX_API_KEY and HTX_SECRET_KEY environment variables');
+    process.exit(1);
+}
+
 // ==================== BOT STATE (Memory Only) ====================
 let botState = {
     isRunning: true,
@@ -82,6 +89,44 @@ async function htxRequest(method, path, data = {}) {
     }
 }
 
+// ==================== UPDATE ESTIMATES ====================
+function updateEstimates() {
+    const now = Date.now();
+    const elapsedMs = now - botState.startTime;
+    const elapsedHours = elapsedMs / (1000 * 60 * 60);
+    const lockedProfit = botState.realizedProfit;
+    
+    if (lockedProfit !== 0 && botState.initialBalance > 0) {
+        const effectiveHours = Math.max(elapsedHours, 0.001);
+        const hourlyProfitRate = lockedProfit / effectiveHours;
+        
+        botState.estimates.hr = hourlyProfitRate;
+        botState.estimates.day = hourlyProfitRate * 24;
+        botState.estimates.week = hourlyProfitRate * 24 * 7;
+        botState.estimates.month = hourlyProfitRate * 24 * 30;
+        
+        if (effectiveHours >= 0.1) {
+            const totalReturn = (botState.initialBalance + lockedProfit) / botState.initialBalance;
+            const daysElapsed = effectiveHours / 24;
+            const dgr = Math.pow(totalReturn, (1 / daysElapsed)) - 1;
+            botState.estimates.dgr = dgr * 100;
+        } else {
+            botState.estimates.dgr = (hourlyProfitRate / botState.initialBalance) * 24 * 100;
+        }
+    }
+}
+
+// ==================== UPDATE DISTANCE (REAL-TIME) ====================
+function updateDistance() {
+    if (botState.openPosition && botState.openPosition.volume > 0 && botState.avgPrice > 0 && botState.currentPrice > 0) {
+        const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
+        const distance = ((botState.currentPrice - triggerPrice) / botState.currentPrice) * 100;
+        botState.distToNext = Math.max(0, distance);
+    } else {
+        botState.distToNext = 0;
+    }
+}
+
 // ==================== FAST UPDATE FUNCTIONS ====================
 async function fetchPositionAndROI() {
     try {
@@ -96,16 +141,12 @@ async function fetchPositionAndROI() {
                 direction: pos.direction,
                 costHold: parseFloat(pos.cost_hold)
             };
-            
-            // Calculate distance to next safety order
-            const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
-            botState.distToNext = Math.max(0, ((botState.currentPrice - triggerPrice) / botState.currentPrice) * 100);
+            updateDistance();
         } else {
             botState.openPosition = { volume: 0, direction: "", costHold: 0 };
-            if (botState.roi !== 0) botState.roi = 0;
+            botState.roi = 0;
+            botState.distToNext = 0;
         }
-        
-        console.log(`📊 ROI Updated: ${botState.roi}% | Price: ${botState.currentPrice}`);
     } catch (e) {
         console.error("Position fetch error:", e);
     }
@@ -118,7 +159,6 @@ async function fetchAccountAndBalance() {
         if (accRes?.data) {
             const acc = accRes.data.find(a => a.margin_asset === 'USDT');
             if (acc) {
-                // Also get position for unrealized PnL
                 const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
                 const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
                 
@@ -134,8 +174,6 @@ async function fetchAccountAndBalance() {
                     if (botState.displayBalance > (botState.allTimeHigh || 0)) {
                         botState.allTimeHigh = botState.displayBalance;
                     }
-                    
-                    console.log(`🎯 New Peak! Display: $${botState.displayBalance.toFixed(2)}`);
                 }
                 
                 botState.walletBalance = realBalance;
@@ -151,30 +189,12 @@ async function fetchAccountAndBalance() {
             }
         }
         
-        // Update locked profit calculations
+        const previousProfit = botState.realizedProfit;
         botState.realizedProfit = botState.displayBalance - botState.initialBalance;
         botState.profitPct = botState.initialBalance > 0 ? (botState.realizedProfit / botState.initialBalance) * 100 : 0;
         
-        // Update estimates based on locked profit
-        const elapsedHours = (Date.now() - botState.startTime) / (1000 * 60 * 60);
-        const elapsedDays = elapsedHours / 24;
-        const lockedProfit = botState.realizedProfit;
-        
-        if (elapsedHours > 0.1 && lockedProfit > 0 && botState.initialBalance > 0) {
-            const hourlyProfitRate = lockedProfit / elapsedHours;
-            
-            if (elapsedDays > 0.01) {
-                const growthFactor = (botState.initialBalance + lockedProfit) / botState.initialBalance;
-                const dgr = Math.pow(growthFactor, (1 / elapsedDays)) - 1;
-                botState.estimates.dgr = dgr * 100;
-            } else {
-                botState.estimates.dgr = (hourlyProfitRate / botState.initialBalance) * 24 * 100;
-            }
-            
-            botState.estimates.hr = hourlyProfitRate;
-            botState.estimates.day = hourlyProfitRate * 24;
-            botState.estimates.week = hourlyProfitRate * 24 * 7;
-            botState.estimates.month = hourlyProfitRate * 24 * 30;
+        if (botState.realizedProfit !== previousProfit) {
+            updateEstimates();
         }
         
     } catch (e) {
@@ -204,12 +224,12 @@ async function saveTradeHistory(type, volume, price, safetyLevel, roi, balanceAf
         balanceAfter
     });
     
-    // Keep only last 100 trades in memory
     if (tradeHistory.length > 100) tradeHistory.pop();
     
     if (type === 'take_profit') {
         botState.winningTrades = (botState.winningTrades || 0) + 1;
         if (roi > (botState.peakProfit || 0)) botState.peakProfit = roi;
+        updateEstimates();
     }
     botState.totalTrades = (botState.totalTrades || 0) + 1;
 }
@@ -219,7 +239,6 @@ async function checkAndExecuteTrades() {
     botState.isTrading = true;
 
     try {
-        // Get fresh position data
         const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
         const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
         
@@ -228,7 +247,6 @@ async function checkAndExecuteTrades() {
             const avgPrice = parseFloat(pos.cost_hold);
             const triggerPrice = avgPrice * (1 - (botState.settings.priceDrop / 100));
             
-            // Check take profit
             if (currentROI >= botState.settings.takeProfit) {
                 const result = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: pos.volume,
@@ -241,7 +259,6 @@ async function checkAndExecuteTrades() {
                     console.log(`✅ Take profit! ROI: ${currentROI}%`);
                 }
             }
-            // Check safety order
             else if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
                 botState.safetyOrdersFilled++;
                 const nextVol = Math.max(1, Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled)));
@@ -256,7 +273,6 @@ async function checkAndExecuteTrades() {
                 }
             }
         } 
-        // Open initial position
         else if (botState.maxSafeBase > 0 && botState.settings.baseOrder > 0) {
             const result = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: botState.settings.baseOrder,
@@ -284,6 +300,9 @@ function resetStats() {
     botState.realizedProfit = 0;
     botState.profitPct = 0;
     botState.estimates = { hr: 0, day: 0, week: 0, month: 0, dgr: 0 };
+    botState.totalTrades = 0;
+    botState.winningTrades = 0;
+    tradeHistory = [];
     console.log("📊 Stats reset!");
     return true;
 }
@@ -348,6 +367,8 @@ function fullReset() {
 
 // ==================== STARTUP ====================
 async function boot() {
+    console.log(`🤖 Bot started | ${config.symbol} | ${config.leverage}X`);
+    
     // WebSocket for real-time price
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' })));
@@ -357,7 +378,21 @@ async function boot() {
                 try {
                     const msg = JSON.parse(dezipped.toString());
                     if (msg.tick?.close) {
-                        botState.currentPrice = parseFloat(msg.tick.close);
+                        const newPrice = parseFloat(msg.tick.close);
+                        botState.currentPrice = newPrice;
+                        
+                        // REAL-TIME DISTANCE UPDATE ON EVERY PRICE CHANGE
+                        if (botState.openPosition && botState.openPosition.volume > 0 && botState.avgPrice > 0) {
+                            const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
+                            const distance = ((newPrice - triggerPrice) / newPrice) * 100;
+                            botState.distToNext = Math.max(0, distance);
+                            
+                            // Update ROI in real-time
+                            if (botState.openPosition.costHold > 0) {
+                                const unrealizedROI = ((newPrice - botState.avgPrice) / botState.avgPrice) * 100;
+                                botState.roi = unrealizedROI;
+                            }
+                        }
                     }
                     if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
                 } catch (e) {}
@@ -365,7 +400,7 @@ async function boot() {
         });
     });
     
-    // Fast loops for real-time updates (every 1 second)
+    // Fast loops for real-time updates
     setInterval(async () => {
         await fetchPositionAndROI();
         await updatePositionSizing();
@@ -375,22 +410,19 @@ async function boot() {
         await fetchAccountAndBalance();
     }, 2000);
     
-    // Trade execution every 2 seconds
     setInterval(async () => {
         await checkAndExecuteTrades();
     }, 2000);
     
-    console.log(`🤖 Bot started | ${config.symbol} | ${config.leverage}X`);
-    console.log(`📊 No database - using memory only | Settings: TP=${botState.settings.takeProfit}%, MaxSteps=${botState.settings.maxSteps}`);
+    console.log(`📊 Waiting for price data...`);
 }
 
 // ==================== UI ====================
 app.get('/', (req, res) => {
-    res.send(`
-<!DOCTYPE html>
+    res.send(`<!DOCTYPE html>
 <html class="bg-white">
 <head>
-    <title>HTX Compounder | No DB Edition</title>
+    <title>HTX Compounder | Real-Time</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
@@ -407,22 +439,19 @@ app.get('/', (req, res) => {
         }
         .balance-update { animation: pulse-green 0.3s ease; }
         .roi-update { animation: pulse-green 0.3s ease; }
-        .btn-danger { transition: all 0.2s ease; }
-        .btn-danger:hover { background-color: #dc2626 !important; transform: scale(1.02); color: white !important; }
-        .btn-warning:hover { background-color: #d97706 !important; transform: scale(1.02); }
+        .distance-update { animation: pulse-green 0.2s ease; }
     </style>
 </head>
 <body class="text-gray-900 p-4 md:p-10 bg-gray-50">
     <div class="max-w-6xl mx-auto">
-        
         <div class="flex justify-between items-center mb-8">
             <div>
                 <h1 class="text-gray-900 text-3xl font-bold tracking-tight">
                     COMPOUND<span class="gradient-text">_BOT</span>
-                    <span class="text-sm font-mono text-gray-400 ml-2">No DB</span>
+                    <span class="text-sm font-mono text-gray-400 ml-2">Real-Time</span>
                 </h1>
                 <p class="text-xs text-gray-400 uppercase tracking-wider mt-1">${config.symbol} | ${config.leverage}X Leverage</p>
-                <p class="text-[10px] text-emerald-600 mt-2">⚡ Memory-only | Settings: TP=${botState.settings.takeProfit}% | Steps=${botState.settings.maxSteps}</p>
+                <p class="text-[10px] text-emerald-600 mt-2">⚡ Real-time distance updates | TP=${botState.settings.takeProfit}% | Steps=${botState.settings.maxSteps}</p>
             </div>
             <div class="text-right">
                 <p class="text-3xl font-bold text-emerald-600" id="dgrText">0.00%</p>
@@ -500,7 +529,7 @@ app.get('/', (req, res) => {
                 </div>
                 <div class="text-right">
                     <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Next Step Distance</p>
-                    <p id="distText" class="text-4xl font-bold text-orange-500 stat-number">0.000%</p>
+                    <p id="distText" class="text-4xl font-bold text-orange-500 stat-number distance-update">0.000%</p>
                 </div>
             </div>
             <div class="w-full bg-gray-100 rounded-full h-2 overflow-hidden">
@@ -513,7 +542,6 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- BUTTONS SECTION -->
         <div class="flex justify-between items-center mb-8 gap-4 flex-wrap">
             <div class="flex gap-3">
                 <button onclick="resetStats()" class="text-gray-600 hover:text-red-600 transition-colors px-4 py-2 rounded-lg bg-gray-100 hover:bg-red-50 text-sm font-medium border border-gray-200">📊 Reset Stats</button>
@@ -539,6 +567,7 @@ app.get('/', (req, res) => {
     <script>
         let lastROI = 0;
         let lastBalance = 0;
+        let lastDistance = 0;
         
         function calculateSafetyOrders(baseOrder, multiplier) {
             const orders = [];
@@ -567,6 +596,13 @@ app.get('/', (req, res) => {
                     roiEl.classList.add('roi-update');
                     setTimeout(() => roiEl.classList.remove('roi-update'), 300);
                     lastROI = d.roi;
+                }
+                
+                if (d.distToNext !== lastDistance) {
+                    const distEl = document.getElementById('distText');
+                    distEl.classList.add('distance-update');
+                    setTimeout(() => distEl.classList.remove('distance-update'), 200);
+                    lastDistance = d.distToNext;
                 }
                 
                 const roiEl = document.getElementById('roi');
@@ -600,7 +636,7 @@ app.get('/', (req, res) => {
 
                 document.getElementById('curPrice').innerHTML = d.currentPrice.toFixed(8);
                 document.getElementById('stepText').innerHTML = d.safetyOrdersFilled + ' <span class="text-2xl text-gray-400">/ ' + (d.settings?.maxSteps || 10) + '</span>';
-                document.getElementById('distText').innerHTML = d.distToNext.toFixed(3) + '%';
+                document.getElementById('distText').innerHTML = d.distToNext.toFixed(4) + '%';
 
                 const progressPct = (d.safetyOrdersFilled / (d.settings?.maxSteps || 10)) * 100;
                 document.getElementById('progressBar').style.width = progressPct + '%';
@@ -648,7 +684,7 @@ app.get('/', (req, res) => {
         
         function refreshUI() { update(); }
         
-        setInterval(update, 500);
+        setInterval(update, 200);
         update();
     </script>
 </body>
@@ -664,7 +700,8 @@ app.get('/api/status', async (req, res) => {
         allTimeHigh: botState.allTimeHigh,
         totalTrades: botState.totalTrades,
         winningTrades: botState.winningTrades,
-        roi: botState.roi
+        roi: botState.roi,
+        distToNext: botState.distToNext
     });
 });
 
