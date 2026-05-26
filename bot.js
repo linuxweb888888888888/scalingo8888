@@ -34,6 +34,7 @@ let botState = {
     peakBalance: 0,
     initialBalance: 0,
     safetyOrdersFilled: 0,
+    maxAffordableSteps: 0, // NEW: Calculated limit
     distToNext: 0,
     settings: {
         baseOrder: 0,        
@@ -44,12 +45,9 @@ let botState = {
     },
     estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
     openPosition: { volume: 0, direction: "", costHold: 0 },
-    allTimeHigh: 0,
     totalTrades: 0,
     winningTrades: 0
 };
-
-let tradeHistory = [];
 
 // ==================== API HANDLER ====================
 async function htxRequest(method, path, data = {}) {
@@ -65,19 +63,43 @@ async function htxRequest(method, path, data = {}) {
     } catch (e) { return null; }
 }
 
-// ==================== LOGIC: CALCULATE CURRENT STEP FROM VOLUME ====================
-// This ensures that even if you refresh, the "Safety Steps" shows the correct number
+// ==================== MATH: CALCULATE LIMITS ====================
+function calculateMaxPossibleSteps(balance, leverage, baseOrder, multiplier, price) {
+    if (price <= 0 || baseOrder <= 0) return 0;
+    
+    let totalContracts = 0;
+    let currentStepVolume = baseOrder;
+    let buyingPower = balance * leverage;
+    let steps = 0;
+
+    // Simulate steps until we run out of buying power
+    while (true) {
+        let stepNotional = currentStepVolume * price; 
+        // Note: For SHIB, HTX contract size is usually 1,000 or 1,000,000. 
+        // If your baseOrder is already calculated with face value, this is correct.
+        
+        if ((totalContracts * price) + stepNotional > buyingPower) {
+            break;
+        }
+        
+        totalContracts += currentStepVolume;
+        currentStepVolume = Math.floor(currentStepVolume * multiplier);
+        steps++;
+        
+        if (steps > 100) break; // Safety break
+    }
+    return steps;
+}
+
 function calculateCurrentStep(totalVol, baseVol, multiplier) {
     if (totalVol <= baseVol) return 0;
     let step = 0;
     let runningTotal = baseVol;
     let lastOrder = baseVol;
-
     while (runningTotal < totalVol && step < 100) {
         step++;
         lastOrder = Math.floor(lastOrder * multiplier);
         runningTotal += lastOrder;
-        // If we are within 5% of the total volume, we found the step
         if (Math.abs(runningTotal - totalVol) / totalVol < 0.05) return step;
     }
     return step;
@@ -108,8 +130,17 @@ async function syncData() {
             botState.realizedProfit = botState.displayBalance - botState.initialBalance;
             botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
             
-            // MATH: Base Order = Wallet Balance * 10
+            // MATH: Base Order = Balance * 10
             botState.settings.baseOrder = Math.max(1, Math.floor(botState.walletBalance * 10));
+            
+            // MATH: How many steps can we survive?
+            botState.maxAffordableSteps = calculateMaxPossibleSteps(
+                botState.walletBalance, 
+                config.leverage, 
+                botState.settings.baseOrder, 
+                botState.settings.volumeMult, 
+                botState.currentPrice
+            );
         }
 
         const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
@@ -121,7 +152,6 @@ async function syncData() {
             const currentVol = parseFloat(pos.volume);
             botState.openPosition = { volume: currentVol, direction: pos.direction, costHold: botState.avgPrice };
             
-            // FIX: Calculate steps based on actual volume on exchange
             botState.safetyOrdersFilled = calculateCurrentStep(currentVol, botState.settings.baseOrder, botState.settings.volumeMult);
 
             const currentDrop = ((botState.avgPrice - botState.currentPrice) / botState.avgPrice) * 100;
@@ -129,10 +159,7 @@ async function syncData() {
             botState.distToNext = Math.max(0, targetDrop - currentDrop);
         } else {
             botState.openPosition = { volume: 0, direction: "", costHold: 0 };
-            botState.roi = 0;
-            botState.avgPrice = 0;
-            botState.distToNext = 0;
-            botState.safetyOrdersFilled = 0;
+            botState.roi = 0; botState.avgPrice = 0; botState.distToNext = 0; botState.safetyOrdersFilled = 0;
         }
         
         const elapsed = (Date.now() - botState.startTime) / 3600000;
@@ -142,54 +169,35 @@ async function syncData() {
     } catch (e) {}
 }
 
-// ==================== TRADE LOGIC ====================
+// ==================== TRADING LOGIC ====================
 async function checkTrades() {
     if (!botState.isRunning || botState.isTrading || botState.currentPrice <= 0) return;
     botState.isTrading = true;
-
     try {
         const hasPos = botState.openPosition.volume > 0;
-
-        // 1. Take Profit
         if (hasPos && botState.roi >= botState.settings.takeProfit) {
-            console.log("🎯 Taking Profit...");
-            const res = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
+            await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: botState.openPosition.volume,
                 direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
             });
-            if (res?.code === 200) {
-                botState.winningTrades++;
-                botState.totalTrades++;
-                botState.safetyOrdersFilled = 0;
-            }
-        } 
-        // 2. Safety Orders
-        else if (hasPos) {
+            botState.winningTrades++; botState.totalTrades++; botState.safetyOrdersFilled = 0;
+        } else if (hasPos) {
             const currentDrop = ((botState.avgPrice - botState.currentPrice) / botState.avgPrice) * 100;
             const targetDrop = (botState.safetyOrdersFilled + 1) * botState.settings.priceDrop;
-
             if (currentDrop >= targetDrop) {
                 const nextVol = Math.max(1, Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled + 1)));
-                console.log(`📉 Triggering Safety Step ${botState.safetyOrdersFilled + 1} | Vol: ${nextVol}`);
-                const res = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
+                await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: nextVol,
                     direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
-                if (res?.code === 200) {
-                    botState.safetyOrdersFilled++;
-                    botState.totalTrades++;
-                }
+                botState.safetyOrdersFilled++; botState.totalTrades++;
             }
-        }
-        // 3. Open Initial
-        else if (!hasPos && botState.settings.baseOrder > 0) {
-            const res = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
+        } else if (!hasPos && botState.settings.baseOrder > 0) {
+            await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: botState.settings.baseOrder,
                 direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
-            if (res?.code === 200) {
-                botState.totalTrades++;
-            }
+            botState.totalTrades++;
         }
     } catch (e) {}
     botState.isTrading = false;
@@ -206,7 +214,7 @@ app.get('/', (req, res) => {
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
     <style>
         body { font-family: 'Inter', sans-serif; background: #ffffff; color: #111827; }
-        .card { background: white; border: 1px solid #f3f4f6; border-radius: 1.5rem; padding: 2rem; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.02); }
+        .card { background: white; border: 1px solid #f3f4f6; border-radius: 1.5rem; padding: 2rem; }
         .stat-val { font-size: 2.5rem; font-weight: 800; letter-spacing: -0.05em; }
         .label { font-size: 0.7rem; font-weight: 700; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 0.5rem; }
     </style>
@@ -216,10 +224,10 @@ app.get('/', (req, res) => {
         <div class="flex justify-between items-end mb-16">
             <div>
                 <h1 class="text-3xl font-black tracking-tighter">COMPOUND_BOT <span class="text-emerald-500">PRO</span></h1>
-                <p class="text-[10px] text-gray-400 font-bold tracking-[0.2em] uppercase mt-1">${config.symbol} • ${config.leverage}X LEVERAGE</p>
+                <p class="text-[10px] text-gray-400 font-bold tracking-[0.2em] uppercase mt-1">${config.symbol} • ${config.leverage}X</p>
             </div>
             <div class="text-right">
-                <p class="label">Daily Growth Rate</p>
+                <p class="label">Daily Growth</p>
                 <p id="dgr" class="text-3xl font-black text-emerald-500">0.00%</p>
             </div>
         </div>
@@ -233,52 +241,40 @@ app.get('/', (req, res) => {
             <div class="card">
                 <p class="label">Current ROI</p>
                 <p id="roi" class="stat-val">0.00%</p>
-                <p id="dist" class="text-sm font-bold text-orange-500">Next Step: 0.000%</p>
+                <p id="dist" class="text-sm font-bold text-orange-500">Next: 0.000%</p>
             </div>
             <div class="card">
                 <p class="label">Safety Steps</p>
                 <div class="flex items-baseline gap-2">
                     <p id="steps" class="stat-val text-blue-600">0</p>
-                    <span class="text-gray-300 font-bold text-xl">/ ∞</span>
+                    <span id="maxSteps" class="text-gray-300 font-bold text-xl">/ 0</span>
                 </div>
-                <p class="text-sm font-bold text-gray-400">Unlimited Active</p>
+                <p class="text-[10px] font-bold text-gray-400">UNTIL WALLET CAPACITY</p>
             </div>
             <div class="card">
                 <p class="label">Wallet Balance</p>
                 <p id="bal" class="stat-val text-gray-900">$0.00</p>
-                <p id="trades" class="text-sm font-bold text-gray-400">0 Total Trades</p>
+                <p id="trades" class="text-sm font-bold text-gray-400">0 Trades</p>
             </div>
         </div>
 
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
-            <div class="md:col-span-2 card">
-                <p class="label mb-6">Live Market Metrics</p>
-                <div class="grid grid-cols-3 gap-4 text-center">
-                    <div>
-                        <p class="text-[10px] font-bold text-gray-400 uppercase">Current Price</p>
-                        <p id="price" class="text-xl font-mono font-bold">0.00000000</p>
-                    </div>
-                    <div>
-                        <p class="text-[10px] font-bold text-gray-400 uppercase">Base Contracts</p>
-                        <p id="base" class="text-xl font-bold">0</p>
-                    </div>
-                    <div>
-                        <p class="text-[10px] font-bold text-gray-400 uppercase">Step Multiplier</p>
-                        <p class="text-xl font-bold">1.2x</p>
-                    </div>
+        <div class="card bg-gray-50 border-none">
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-center">
+                <div>
+                    <p class="label">Base Order</p>
+                    <p id="base" class="text-xl font-bold text-gray-800">0</p>
                 </div>
-            </div>
-            <div class="card bg-gray-50 border-none">
-                <p class="label">Projected Earnings</p>
-                <div class="space-y-4 mt-4">
-                    <div class="flex justify-between border-b border-gray-200 pb-2">
-                        <span class="text-xs font-bold text-gray-500">Next 24h</span>
-                        <span id="estDay" class="text-sm font-bold text-emerald-600">$0.00</span>
-                    </div>
-                    <div class="flex justify-between">
-                        <span class="text-xs font-bold text-gray-500">Next 30d</span>
-                        <span id="estMonth" class="text-sm font-bold text-gray-900">$0.00</span>
-                    </div>
+                <div>
+                    <p class="label">Live Price</p>
+                    <p id="price" class="text-xl font-mono font-bold text-gray-800">0.000000</p>
+                </div>
+                <div>
+                    <p class="label">Est. 24h</p>
+                    <p id="estDay" class="text-xl font-bold text-emerald-600">$0.00</p>
+                </div>
+                <div>
+                    <p class="label">Est. Month</p>
+                    <p id="estMonth" class="text-xl font-bold text-gray-800">$0.00</p>
                 </div>
             </div>
         </div>
@@ -295,8 +291,9 @@ app.get('/', (req, res) => {
                 document.getElementById('roi').style.color = d.roi >= 0 ? '#10b981' : '#ef4444';
                 document.getElementById('bal').innerText = '$' + d.displayBalance.toFixed(2);
                 document.getElementById('steps').innerText = d.safetyOrdersFilled;
-                document.getElementById('dist').innerText = 'Next Step in: ' + d.distToNext.toFixed(3) + '%';
-                document.getElementById('trades').innerText = d.totalTrades + ' Total Trades';
+                document.getElementById('maxSteps').innerText = '/ ' + d.maxAffordableSteps;
+                document.getElementById('dist').innerText = 'Next: ' + d.distToNext.toFixed(3) + '%';
+                document.getElementById('trades').innerText = d.totalTrades + ' Trades';
                 document.getElementById('dgr').innerText = d.estimates.dgr.toFixed(3) + '%';
                 document.getElementById('base').innerText = d.settings.baseOrder;
                 document.getElementById('price').innerText = d.currentPrice.toFixed(8);
