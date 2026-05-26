@@ -16,13 +16,7 @@ mongoose.connect(MONGO_URI).then(() => console.log("📦 MongoDB Connected"));
 const BotSchema = new mongoose.Schema({
     id: { type: String, default: "htx_martingale" },
     initialBalance: { type: Number, default: 0 },
-    startTime: { type: Number, default: Date.now() },
-    settings: {
-        volumeMult: { type: Number, default: 1.2 },
-        takeProfit: { type: Number, default: 1.5 },
-        priceDrop: { type: Number, default: 0.1 },
-        faceValue: { type: Number, default: 0.001 } // Common for SHIB-USDT on HTX
-    }
+    startTime: { type: Number, default: Date.now() }
 });
 const BotModel = mongoose.model('BotConfig_V33', BotSchema);
 
@@ -57,7 +51,7 @@ let botState = {
         volumeMult: 1.2,     
         takeProfit: 1.5, 
         maxSteps: 10,
-        faceValue: 0.001
+        faceValue: 0.001 // USDT value of 1 SHIB contract
     }
 };
 
@@ -87,58 +81,53 @@ async function runLogic() {
         ]);
 
         const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
-        
-        if (accRes?.data) {
-            const acc = accRes.data.find(a => a.margin_asset === 'USDT');
-            if (acc) {
-                const equity = parseFloat(acc.margin_balance) || 0;
-                const unrealized = pos ? (parseFloat(pos.unrealized_pnl) || 0) : 0;
-                // STRICT STATIC BALANCE
-                botState.walletBalance = equity - unrealized;
+        const acc = accRes?.data?.find(a => a.margin_asset === 'USDT');
+
+        if (acc) {
+            // --- STRICT STATIC LOCK ---
+            // Only update balance and math when NO position is open.
+            if (!pos) {
+                const equity = parseFloat(acc.margin_balance);
+                botState.walletBalance = Number(equity.toFixed(4));
                 
-                if (botState.initialBalance <= 0 && botState.walletBalance > 0) {
+                // DYNAMIC FIT MATH
+                const m = botState.settings.volumeMult; // 1.2
+                const n = 10; // Steps
+                const multiplierSum = (Math.pow(m, n + 1) - 1) / (m - 1); // ~32.15
+                
+                // Buying Power Allocation
+                // We want the TOTAL margin of 10 steps to fit in 85% of balance
+                const totalAllowedMargin = botState.walletBalance * 0.85; 
+                const baseMargin = totalAllowedMargin / multiplierSum;
+                
+                // Base Order in Contracts = (Base Margin * Leverage) / Face Value
+                // For $1.81, this results in ~450 contracts ($0.045 real USDT used)
+                botState.settings.baseOrder = Math.max(1, Math.floor((baseMargin * config.leverage) / botState.settings.faceValue));
+                
+                if (botState.initialBalance <= 0) {
                     botState.initialBalance = botState.walletBalance;
                     botState.startTime = Date.now();
                 }
             }
         }
 
-        // ==================== DYNAMIC FIT MATH ====================
-        const m = botState.settings.volumeMult;
-        let n = 10; // Target steps
-        const buyingPower = botState.walletBalance * config.leverage * 0.8; // 80% Utilization
-
-        let multiplierSum = (Math.pow(m, n + 1) - 1) / (m - 1);
-        let baseNotional = buyingPower / multiplierSum;
-        let calculatedBase = Math.floor(baseNotional / botState.settings.faceValue);
-
-        // If the balance is too low to support 10 steps, reduce steps until Base >= 1 contract
-        while (calculatedBase < 1 && n > 1) {
-            n--;
-            multiplierSum = (Math.pow(m, n + 1) - 1) / (m - 1);
-            baseNotional = buyingPower / multiplierSum;
-            calculatedBase = Math.floor(baseNotional / botState.settings.faceValue);
-        }
-
-        botState.settings.baseOrder = Math.max(1, calculatedBase);
-        botState.settings.maxSteps = n;
-
         // Static Stats
         botState.realizedProfit = botState.walletBalance - botState.initialBalance;
         botState.profitPct = botState.initialBalance > 0 ? (botState.realizedProfit / botState.initialBalance) * 100 : 0;
 
-        // ==================== COMPOUNDING ESTIMATES ====================
+        // --- COMPOUNDING ESTIMATES ---
         const elapsedDays = (Date.now() - botState.startTime) / (1000 * 60 * 60 * 24);
         if (elapsedDays > 0.0005) {
             const dgr = Math.pow((botState.walletBalance / botState.initialBalance), (1 / elapsedDays)) - 1;
-            botState.estimates.dgr = dgr > 0 ? dgr * 100 : 0;
+            const safeDGR = dgr > 0 ? dgr : 0;
+            botState.estimates.dgr = safeDGR * 100;
             botState.estimates.hr = botState.realizedProfit / (elapsedDays * 24);
-            botState.estimates.day = botState.walletBalance * (dgr > 0 ? dgr : 0);
-            botState.estimates.week = (botState.walletBalance * Math.pow((1 + (dgr > 0 ? dgr : 0)), 7)) - botState.walletBalance;
-            botState.estimates.month = (botState.walletBalance * Math.pow((1 + (dgr > 0 ? dgr : 0)), 30)) - botState.walletBalance;
+            botState.estimates.day = botState.walletBalance * safeDGR;
+            botState.estimates.week = (botState.walletBalance * Math.pow((1 + safeDGR), 7)) - botState.walletBalance;
+            botState.estimates.month = (botState.walletBalance * Math.pow((1 + safeDGR), 30)) - botState.walletBalance;
         }
 
-        // ==================== EXECUTION ====================
+        // --- EXECUTION ---
         if (pos) {
             botState.avgPrice = parseFloat(pos.cost_hold);
             botState.roi = parseFloat(pos.profit_rate) * 100;
@@ -159,7 +148,7 @@ async function runLogic() {
                     direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
             }
-        } else {
+        } else if (botState.settings.baseOrder > 0) {
             botState.safetyOrdersFilled = 0;
             await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: botState.settings.baseOrder,
@@ -174,14 +163,8 @@ async function runLogic() {
 async function boot() {
     let data = await BotModel.findOne({ id: "htx_martingale" });
     if (!data) data = await BotModel.create({ id: "htx_martingale" });
-    
     botState.initialBalance = data.initialBalance || 0;
     botState.startTime = data.startTime || Date.now();
-    
-    // Load requested settings
-    botState.settings.volumeMult = 1.2;
-    botState.settings.takeProfit = 1.5;
-    botState.settings.priceDrop = 0.1;
 
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' })));
@@ -217,8 +200,8 @@ app.get('/', (req, res) => {
     <div class="max-w-6xl mx-auto">
         <div class="flex justify-between items-center mb-10">
             <div>
-                <h1 class="text-slate-900 text-2xl font-bold tracking-tighter uppercase">Compounding <span class="text-blue-600">Engine</span></h1>
-                <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">${config.symbol} | Static Mode</p>
+                <h1 class="text-slate-900 text-2xl font-bold tracking-tighter uppercase">Static <span class="text-blue-600">Engine</span></h1>
+                <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">${config.symbol} | Locked Fit Mode</p>
             </div>
             <div class="text-right">
                 <p id="dgrText" class="text-blue-600 font-bold text-2xl">0.00% DGR</p>
@@ -245,32 +228,30 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
+        <!-- ESTIMATES -->
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
-            <div class="bg-blue-600 p-8 rounded-[2rem] shadow-xl shadow-blue-100 relative overflow-hidden text-white">
-                <div class="absolute top-0 right-0 p-4 opacity-10 text-5xl italic font-black">24H</div>
-                <p class="text-[10px] opacity-70 font-bold uppercase mb-2">24h Compound</p>
+            <div class="bg-blue-600 p-8 rounded-[2rem] shadow-xl shadow-blue-100 relative overflow-hidden text-white text-center">
                 <p id="estDay" class="text-4xl font-bold">$0.00</p>
+                <p class="text-[10px] opacity-70 font-bold uppercase mt-2">Next 24h Projection</p>
             </div>
-            <div class="glass p-8 rounded-[2rem] relative overflow-hidden">
-                <div class="absolute top-0 right-0 p-4 opacity-5 text-5xl italic font-black">7D</div>
-                <p class="text-[10px] text-slate-400 font-bold uppercase mb-2">7 Day Compound</p>
+            <div class="glass p-8 rounded-[2rem] relative overflow-hidden text-center">
                 <p id="estWeek" class="text-4xl text-slate-900 font-bold">$0.00</p>
+                <p class="text-[10px] text-slate-400 font-bold uppercase mt-2">7 Day Projection</p>
             </div>
-            <div class="glass p-8 rounded-[2rem] border-b-4 border-b-blue-600 relative overflow-hidden">
-                <div class="absolute top-0 right-0 p-4 opacity-5 text-5xl italic font-black">30D</div>
-                <p class="text-[10px] text-slate-400 font-bold uppercase mb-2">30 Day Compound</p>
+            <div class="glass p-8 rounded-[2rem] border-b-4 border-b-blue-600 relative overflow-hidden text-center">
                 <p id="estMonth" class="text-4xl text-slate-900 font-bold">$0.00</p>
+                <p class="text-[10px] text-slate-400 font-bold uppercase mt-2">30 Day Projection</p>
             </div>
         </div>
 
         <div class="glass p-8 rounded-[2rem] mb-8">
             <div class="flex justify-between items-end mb-6">
                 <div>
-                    <p class="text-[10px] text-slate-400 font-bold uppercase mb-1">Dynamic Steps Fit</p>
+                    <p class="text-[10px] text-slate-400 font-bold uppercase mb-1">Martingale Progress</p>
                     <p id="stepText" class="text-5xl text-slate-900 font-bold">0 / 10</p>
                 </div>
                 <div class="text-right">
-                    <p class="text-[10px] text-slate-400 font-bold uppercase mb-1">Current Base Size</p>
+                    <p class="text-[10px] text-slate-400 font-bold uppercase mb-1">Fit Base Order</p>
                     <p id="baseOrderText" class="text-5xl text-blue-600 font-bold">0</p>
                 </div>
             </div>
@@ -283,7 +264,7 @@ app.get('/', (req, res) => {
             <div>Static Hourly: <span id="estHr" class="text-slate-900 ml-1">$0.00</span></div>
             <div class="flex gap-8">
                 <span>Price: <span id="curPrice" class="text-slate-900 ml-1">0.00</span></span>
-                <button onclick="resetStats()" class="text-red-400 hover:text-red-600">Reset Session</button>
+                <button onclick="resetStats()" class="text-red-400 hover:text-red-600 transition-colors uppercase">Reset Session</button>
             </div>
         </div>
     </div>
@@ -295,7 +276,7 @@ app.get('/', (req, res) => {
                 const d = await r.json();
                 document.getElementById('p1').innerText = '$' + d.realizedProfit.toFixed(4);
                 document.getElementById('p2').innerText = d.profitPct.toFixed(2) + '%';
-                document.getElementById('bal').innerText = '$' + d.walletBalance.toFixed(2);
+                document.getElementById('bal').innerText = '$' + d.walletBalance.toFixed(4);
                 document.getElementById('baseOrderText').innerText = d.settings.baseOrder;
                 
                 const roiEl = document.getElementById('roi');
