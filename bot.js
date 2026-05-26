@@ -10,7 +10,7 @@ const app = express();
 app.use(express.json());
 
 // ==================== MONGODB SETUP ====================
-const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://user:pass@cluster.mongodb.net/botdb";
+const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
 mongoose.connect(MONGO_URI).then(() => console.log("📦 MongoDB Connected"));
 
 const BotSchema = new mongoose.Schema({
