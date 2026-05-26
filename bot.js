@@ -31,7 +31,7 @@ const BotStateSchema = new mongoose.Schema({
         priceDrop: { type: Number, default: 0.1 },
         volumeMult: { type: Number, default: 1.2 },
         takeProfit: { type: Number, default: 1.5 },
-        maxSteps: { type: Number, default: 30 }  // Changed to 30
+        maxSteps: { type: Number, default: 30 }
     },
     estimates: {
         hr: { type: Number, default: 0 },
@@ -83,9 +83,8 @@ const DailySnapshot = mongoose.model('DailySnapshot', DailySnapshotSchema);
 // ==================== FORCE UPDATE EXISTING RECORDS ====================
 async function updateExistingRecords() {
     try {
-        // Update all existing bot states to have maxSteps = 30
         const result = await BotState.updateMany(
-            { "settings.maxSteps": { $lt: 30 } },  // Find records with maxSteps less than 30
+            { "settings.maxSteps": { $lt: 30 } },
             { 
                 $set: { 
                     "settings.maxSteps": 30,
@@ -97,7 +96,6 @@ async function updateExistingRecords() {
         );
         console.log(`📀 Updated ${result.modifiedCount} existing records to maxSteps: 30`);
         
-        // Also update any records where settings.maxSteps doesn't exist
         const result2 = await BotState.updateMany(
             { "settings.maxSteps": { $exists: false } },
             { 
@@ -122,7 +120,7 @@ mongoose.connect(MONGO_URI, {
     useUnifiedTopology: true
 }).then(async () => {
     console.log("📦 MongoDB Connected - Persistent Storage Active");
-    await updateExistingRecords(); // Force update old records
+    await updateExistingRecords();
 }).catch(err => console.error("MongoDB connection error:", err));
 
 // ==================== CONFIGURATION ====================
@@ -181,7 +179,6 @@ async function loadStateFromDB() {
     const data = await BotState.findOne({ id: "htx_martingale_main" });
     
     if (data) {
-        // Ensure maxSteps is set to 30 even if loaded from DB
         const loadedSettings = data.settings || {};
         if (loadedSettings.maxSteps !== 30) {
             console.log(`⚠️ Found maxSteps = ${loadedSettings.maxSteps} in DB, forcing to 30`);
@@ -210,7 +207,7 @@ async function loadStateFromDB() {
                 priceDrop: loadedSettings.priceDrop || 0.1,
                 volumeMult: loadedSettings.volumeMult || 1.2,
                 takeProfit: loadedSettings.takeProfit || 1.5,
-                maxSteps: 30  // Force to 30
+                maxSteps: 30
             },
             openPosition: data.openPosition ?? { volume: 0, direction: "", costHold: 0 },
             allTimeHigh: data.allTimeHigh ?? 0,
@@ -247,7 +244,6 @@ async function loadStateFromDB() {
         console.log("🆕 No existing state found - Creating new session with 30 safety orders");
     }
     
-    // Save the forced 30-step config back to DB
     await saveStateToDB();
     return botState;
 }
@@ -325,11 +321,9 @@ async function fetchPositionAndROI() {
                 costHold: parseFloat(pos.cost_hold)
             };
             
-            // Calculate distance to next safety order
             const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
             botState.distToNext = Math.max(0, ((botState.currentPrice - triggerPrice) / botState.currentPrice) * 100);
         } else {
-            // NO OPEN ORDERS DETECTED - RESET TO ZERO
             if (botState.openPosition.volume !== 0 || botState.safetyOrdersFilled !== 0) {
                 console.log("🔄 No open orders detected - Resetting bot state to zero");
                 botState.openPosition = { volume: 0, direction: "", costHold: 0 };
@@ -421,68 +415,20 @@ async function fetchAccountAndBalance() {
     }
 }
 
-// FIXED: Proper base calculation for 30 steps
+// ==================== ORIGINAL POSITION SIZING (RESTORED) ====================
 async function updatePositionSizing() {
     if (botState.currentPrice > 0 && botState.walletBalance > 0) {
-        const m = botState.settings.volumeMult; // Multiplier (e.g., 1.2)
-        const n = botState.settings.maxSteps;   // Number of safety orders (30)
+        const m = botState.settings.volumeMult;
+        const n = botState.settings.maxSteps;
         
-        // Calculate sum of geometric series for ALL orders (initial + 30 safety orders = 31 total)
-        // Formula: Sum = (m^(n+1) - 1) / (m - 1)
-        let multiplierSum;
-        if (Math.abs(m - 1) < 1e-9) {
-            multiplierSum = n + 1; // If multiplier is 1, sum = number of terms
-        } else {
-            multiplierSum = (Math.pow(m, n + 1) - 1) / (m - 1);
-        }
-        
-        // Contract value = price * 1000 (typical for HTX linear contracts)
-        const contractValue = botState.currentPrice * 1000;
-        
-        // Total position value with leverage
-        const totalPositionValue = (botState.walletBalance * config.leverage) / contractValue;
-        
-        // Base order = total position / sum of geometric series
-        let rawBase = totalPositionValue / multiplierSum;
-        
-        // Safety margin: use 70% of calculated base to leave room for price fluctuations
-        botState.maxSafeBase = Math.max(1, Math.floor(rawBase * 0.7));
-        
-        // Update base order in settings
+        // ORIGINAL FORMULA THAT WAS WORKING
+        const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
+        const rawBase = (botState.walletBalance * config.leverage) / (multiplierSum * botState.currentPrice * 1000);
+        botState.maxSafeBase = Math.floor(rawBase * 0.85);
         botState.settings.baseOrder = botState.maxSafeBase;
         
-        // Calculate total contracts if all safety orders execute
-        let totalContracts = 0;
-        for (let i = 0; i <= n; i++) {
-            totalContracts += botState.settings.baseOrder * Math.pow(m, i);
-        }
-        
-        const totalValue = totalContracts * contractValue;
-        const requiredMargin = totalValue / config.leverage;
-        const marginUsage = (requiredMargin / botState.walletBalance) * 100;
-        
-        console.log(`\n📐 POSITION SIZING FOR ${n} SAFETY ORDERS:`);
-        console.log(`   Balance: $${botState.walletBalance.toFixed(2)}`);
-        console.log(`   Current Price: $${botState.currentPrice.toFixed(8)}`);
-        console.log(`   Leverage: ${config.leverage}X`);
-        console.log(`   Geometric Sum (${n}+1 steps): ${multiplierSum.toFixed(2)}`);
-        console.log(`   Raw Base: ${rawBase.toFixed(2)} contracts`);
-        console.log(`   ✅ BASE ORDER: ${botState.settings.baseOrder} contracts`);
-        console.log(`   Total Contracts (if fully deployed): ${totalContracts.toFixed(0)}`);
-        console.log(`   Total Position Value: $${totalValue.toFixed(2)}`);
-        console.log(`   Required Margin: $${requiredMargin.toFixed(2)} (${marginUsage.toFixed(1)}% of balance)`);
-        
-        // Show first few safety order sizes
-        console.log(`   📊 Safety Order Sizes (${n} total):`);
-        for (let i = 1; i <= Math.min(5, n); i++) {
-            const safetyVol = Math.floor(botState.settings.baseOrder * Math.pow(m, i));
-            console.log(`     #${i}: ${safetyVol} contracts`);
-        }
-        if (n > 5) console.log(`     ... and ${n-5} more steps`);
-        console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
-        
-    } else {
-        console.log(`⚠️ Cannot calculate position sizing - Price: ${botState.currentPrice}, Balance: ${botState.walletBalance}`);
+        console.log(`📐 Position Sizing | Balance: $${botState.walletBalance.toFixed(2)} | Base Order: ${botState.settings.baseOrder} | Max Steps: ${n}`);
+        console.log(`   Multiplier Sum: ${multiplierSum.toFixed(2)} | Raw Base: ${rawBase.toFixed(2)}`);
     }
 }
 
@@ -501,7 +447,6 @@ async function checkAndExecuteTrades() {
             const currentVolume = parseFloat(pos.volume);
             const triggerPrice = avgPrice * (1 - (botState.settings.priceDrop / 100));
             
-            // Check take profit
             if (currentROI >= botState.settings.takeProfit) {
                 const result = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, 
@@ -519,7 +464,6 @@ async function checkAndExecuteTrades() {
                     await saveStateToDB();
                 }
             }
-            // Check safety order (up to maxSteps = 30)
             else if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
                 botState.safetyOrdersFilled++;
                 const safetyVol = Math.max(1, Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled)));
@@ -535,7 +479,7 @@ async function checkAndExecuteTrades() {
                 
                 if (result?.code === 200) {
                     await saveTradeHistory('safety', safetyVol, botState.currentPrice, botState.safetyOrdersFilled, 0, botState.displayBalance);
-                    console.log(`📉 SAFETY ORDER #${botState.safetyOrdersFilled}/${botState.settings.maxSteps} | Vol: ${safetyVol} | Price: ${botState.currentPrice.toFixed(8)}`);
+                    console.log(`📉 Safety Order #${botState.safetyOrdersFilled}/${botState.settings.maxSteps} | Vol: ${safetyVol} | Price: ${botState.currentPrice.toFixed(8)}`);
                     await saveStateToDB();
                 } else {
                     console.log(`❌ Safety order ${botState.safetyOrdersFilled} failed:`, result?.err_msg || result);
@@ -543,7 +487,6 @@ async function checkAndExecuteTrades() {
                 }
             }
         } 
-        // Open initial position
         else if (botState.maxSafeBase > 0 && botState.settings.baseOrder > 0 && botState.currentPrice > 0) {
             console.log(`🎯 Attempting to open initial position | Base Order: ${botState.settings.baseOrder} contracts | Price: ${botState.currentPrice.toFixed(8)}`);
             
@@ -577,7 +520,6 @@ async function checkAndExecuteTrades() {
 async function boot() {
     await loadStateFromDB();
     
-    // WebSocket for real-time price
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' })));
     ws.on('message', (data) => {
@@ -594,7 +536,6 @@ async function boot() {
         });
     });
     
-    // Fast loops for real-time updates
     setInterval(async () => {
         await fetchPositionAndROI();
         await updatePositionSizing();
