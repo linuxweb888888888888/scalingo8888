@@ -20,7 +20,7 @@ const BotSchema = new mongoose.Schema({
     storedProfitPct: { type: Number, default: 0 },
     startTime: { type: Number, default: Date.now() }
 });
-const BotModel = mongoose.model('BotConfig_V32', BotSchema);
+const BotModel = mongoose.model('BotConfig_V33', BotSchema);
 
 // ==================== CONFIGURATION ====================
 const config = {
@@ -39,7 +39,6 @@ let botState = {
     startTime: Date.now(),
     currentPrice: 0,
     avgPrice: 0,
-    totalContracts: 0,
     roi: 0, 
     realizedProfit: 0,
     profitPct: 0,      
@@ -48,7 +47,7 @@ let botState = {
     maxSafeBase: 0,
     safetyOrdersFilled: 0,
     distToNext: 0,
-    estimates: { hr: 0, day: 0, month: 0, dgr: 0 }, 
+    estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 }, 
     settings: {
         baseOrder: 0, 
         priceDrop: 0.1,      
@@ -88,6 +87,7 @@ async function runLogic() {
         if (accRes?.data) {
             const acc = accRes.data.find(a => a.margin_asset === 'USDT');
             if (acc) {
+                // Static balance (Equity - Unrealized)
                 const equity = parseFloat(acc.margin_balance) || 0;
                 const unrealized = pos ? (parseFloat(pos.unrealized_pnl) || 0) : 0;
                 botState.walletBalance = equity - unrealized;
@@ -95,34 +95,26 @@ async function runLogic() {
                 if (botState.initialBalance <= 0 && botState.walletBalance > 0) {
                     botState.initialBalance = botState.walletBalance;
                     botState.startTime = Date.now();
-                    await BotModel.updateOne({ id: "htx_martingale" }, { initialBalance: botState.initialBalance, startTime: botState.startTime }, { upsert: true });
                 }
             }
         }
 
-        // ==================== COMPOUNDING PROJECTIONS ====================
-        const elapsedMs = Date.now() - botState.startTime;
-        const elapsedDays = elapsedMs / (1000 * 60 * 60 * 24);
-
-        if (elapsedDays > 0.005 && botState.walletBalance > botState.initialBalance) {
-            // 1. Calculate Daily Growth Rate (DGR) using CAGR formula
-            // (Current / Initial) ^ (1 / days) - 1
+        // ==================== COMPOUNDING MATH ====================
+        const elapsedDays = (Date.now() - botState.startTime) / (1000 * 60 * 60 * 24);
+        if (elapsedDays > 0.001 && botState.walletBalance > botState.initialBalance) {
+            // Daily Growth Rate (DGR) formula
             const dgr = Math.pow((botState.walletBalance / botState.initialBalance), (1 / elapsedDays)) - 1;
             botState.estimates.dgr = dgr * 100;
-
-            // 2. Linear Hourly (Simple average for immediate feel)
+            
             botState.estimates.hr = botState.realizedProfit / (elapsedDays * 24);
-
-            // 3. Compounded Daily (What you will make in the NEXT 24 hours)
+            
+            // Compound Projections
             botState.estimates.day = botState.walletBalance * dgr;
-
-            // 4. Compounded Monthly (Balance in 30 days if growth continues)
-            // Balance = P * (1 + r)^30
-            const projectBal30d = botState.walletBalance * Math.pow((1 + dgr), 30);
-            botState.estimates.month = projectBal30d - botState.walletBalance;
+            botState.estimates.week = (botState.walletBalance * Math.pow((1 + dgr), 7)) - botState.walletBalance;
+            botState.estimates.month = (botState.walletBalance * Math.pow((1 + dgr), 30)) - botState.walletBalance;
         }
 
-        // BASE ORDER SCALING
+        // Scaled Base Order Calculation
         if (botState.currentPrice > 0 && botState.walletBalance > 0) {
             const m = botState.settings.volumeMult, n = botState.settings.maxSteps;
             const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
@@ -133,7 +125,6 @@ async function runLogic() {
 
         if (pos) {
             botState.avgPrice = parseFloat(pos.cost_hold);
-            botState.totalContracts = parseFloat(pos.volume);
             botState.roi = parseFloat(pos.profit_rate) * 100;
 
             const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
@@ -141,7 +132,7 @@ async function runLogic() {
 
             if (botState.roi >= botState.settings.takeProfit) {
                 await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol, volume: botState.totalContracts,
+                    contract_code: config.symbol, volume: pos.volume,
                     direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
                 botState.safetyOrdersFilled = 0;
@@ -161,11 +152,8 @@ async function runLogic() {
             botState.safetyOrdersFilled = 0;
         }
 
-        // Sync local stats
-        if (botState.initialBalance > 0) {
-            botState.realizedProfit = botState.walletBalance - botState.initialBalance;
-            botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
-        }
+        botState.realizedProfit = botState.walletBalance - botState.initialBalance;
+        botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
 
     } catch (e) {}
     botState.isTrading = false;
@@ -200,86 +188,144 @@ async function boot() {
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
-<html>
+<html class="bg-black">
 <head>
-    <title>HTX Compounder V32</title>
+    <title>HTX Compounder V33</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@500;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Roboto Mono', monospace; }
+        .glass { background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.08); }
+        .glow-blue { box-shadow: 0 0 20px rgba(59, 130, 246, 0.2); }
+    </style>
 </head>
-<body class="bg-black text-white p-6 font-sans">
-    <div class="max-w-4xl mx-auto">
-        <div class="flex justify-between items-center mb-8">
-            <h1 class="text-xl font-bold tracking-tighter text-blue-500">COMPOUND BOT V32</h1>
-            <div class="bg-green-500/10 text-green-500 px-3 py-1 rounded-full text-[10px] font-bold">ACTIVE</div>
-        </div>
-
-        <!-- Profit Summary -->
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-            <div class="bg-zinc-900 p-4 rounded-xl border border-zinc-800"><p class="text-[10px] text-zinc-500 uppercase">Realized Profit</p><p id="p1" class="text-xl font-mono text-green-400">$0.00</p></div>
-            <div class="bg-zinc-900 p-4 rounded-xl border border-zinc-800"><p class="text-[10px] text-zinc-500 uppercase">Growth %</p><p id="p2" class="text-xl font-mono text-green-400">0.00%</p></div>
-            <div class="bg-zinc-900 p-4 rounded-xl border border-zinc-800"><p class="text-[10px] text-zinc-500 uppercase">Live ROI</p><p id="roi" class="text-xl font-mono text-zinc-600">0.00%</p></div>
-            <div class="bg-zinc-900 p-4 rounded-xl border border-zinc-800"><p class="text-[10px] text-zinc-500 uppercase">DGR Rate</p><p id="dgr" class="text-xl font-mono text-blue-400">0.00%</p></div>
-        </div>
-
-        <!-- COMPOUNDING PROJECTIONS -->
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
-            <div class="bg-blue-600 p-6 rounded-2xl">
-                <p class="text-[10px] text-blue-200 font-bold uppercase mb-1">Linear Avg / Hr</p>
-                <p id="estHr" class="text-3xl font-mono font-bold">$0.00</p>
+<body class="text-zinc-300 p-4 md:p-10">
+    <div class="max-w-6xl mx-auto">
+        
+        <div class="flex justify-between items-center mb-10">
+            <div>
+                <h1 class="text-white text-2xl font-bold tracking-tighter">COMPOUND_BOT <span class="text-blue-500">v33</span></h1>
+                <p class="text-[10px] text-zinc-500 uppercase tracking-widest">${config.symbol} | ${config.leverage}X Leverage</p>
             </div>
-            <div class="bg-zinc-900 border-2 border-blue-600 p-6 rounded-2xl shadow-xl shadow-blue-900/20">
-                <p class="text-[10px] text-blue-500 font-bold uppercase mb-1">Next 24h (Compounded)</p>
-                <p id="estDay" class="text-3xl font-mono font-bold">$0.00</p>
-                <p class="text-[9px] text-zinc-500 mt-2 italic">Expectancy based on current balance</p>
-            </div>
-            <div class="bg-blue-900/40 p-6 rounded-2xl border border-blue-800">
-                <p class="text-[10px] text-blue-400 font-bold uppercase mb-1">30 Day Projection</p>
-                <p id="estMonth" class="text-3xl font-mono font-bold">$0.00</p>
-                <p class="text-[9px] text-blue-500 mt-2 italic">100% Reinvestment Model</p>
+            <div class="text-right">
+                <p id="dgrText" class="text-blue-500 font-bold text-xl">0.00% DGR</p>
+                <p class="text-[10px] text-zinc-600 uppercase">Daily Growth Rate</p>
             </div>
         </div>
 
-        <!-- Safety Progress -->
-        <div class="bg-zinc-900 p-6 rounded-2xl border border-zinc-800 mb-6">
-            <div class="flex justify-between items-end mb-4">
-                <div><p class="text-[10px] text-zinc-500 uppercase">Martingale Steps</p><p id="stepText" class="text-4xl font-mono font-bold">0 / 10</p></div>
-                <div class="text-right"><p class="text-[10px] text-zinc-500 uppercase">Dist. to Next Buy</p><p id="distText" class="text-4xl font-mono font-bold text-orange-500">0.00%</p></div>
+        <!-- STATS GRID -->
+        <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+            <div class="glass p-5 rounded-2xl">
+                <p class="text-[10px] text-zinc-500 uppercase mb-1">Net Profit</p>
+                <p id="p1" class="text-2xl text-green-500 font-bold">$0.00</p>
             </div>
-            <div class="w-full bg-zinc-800 rounded-full h-3 overflow-hidden flex">
-                <div id="progressBar" class="bg-blue-500 h-full transition-all duration-700" style="width: 0%"></div>
+            <div class="glass p-5 rounded-2xl">
+                <p class="text-[10px] text-zinc-500 uppercase mb-1">Total Gain</p>
+                <p id="p2" class="text-2xl text-green-500 font-bold">0.00%</p>
+            </div>
+            <div class="glass p-5 rounded-2xl">
+                <p class="text-[10px] text-zinc-500 uppercase mb-1">Open Position ROI</p>
+                <p id="roi" class="text-2xl text-zinc-600 font-bold">0.00%</p>
+            </div>
+            <div class="glass p-5 rounded-2xl">
+                <p class="text-[10px] text-zinc-500 uppercase mb-1">Current Balance</p>
+                <p id="bal" class="text-2xl text-white font-bold">$0.00</p>
             </div>
         </div>
 
-        <div class="flex justify-between items-center text-zinc-500">
-            <div class="text-xs">Price: <span id="curPrice" class="font-mono text-zinc-300">0.0000</span></div>
-            <button onclick="resetStats()" class="text-[10px] font-bold hover:text-red-500 transition-colors">RESET ALL SESSION DATA</button>
+        <!-- COMPOUNDING PROJECTIONS SECTION -->
+        <h2 class="text-zinc-500 text-[10px] font-bold uppercase mb-4 tracking-widest">Compounding Estimates (100% Reinvestment)</h2>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
+            
+            <div class="bg-blue-600/10 border border-blue-500/20 p-8 rounded-3xl glow-blue relative overflow-hidden">
+                <div class="absolute top-0 right-0 p-4 opacity-10 text-4xl italic font-black text-blue-500">24H</div>
+                <p class="text-[10px] text-blue-400 font-bold uppercase mb-2">Next 24 Hours</p>
+                <p id="estDay" class="text-4xl text-white font-bold">$0.00</p>
+                <p class="text-[10px] text-blue-800 mt-4 font-bold">ESTIMATED EARNINGS</p>
+            </div>
+
+            <div class="glass p-8 rounded-3xl relative overflow-hidden">
+                <div class="absolute top-0 right-0 p-4 opacity-5 text-4xl italic font-black text-white">7D</div>
+                <p class="text-[10px] text-zinc-500 font-bold uppercase mb-2">Next 7 Days</p>
+                <p id="estWeek" class="text-4xl text-white font-bold">$0.00</p>
+                <p class="text-[10px] text-zinc-700 mt-4 font-bold">COMPOUNDED GROWTH</p>
+            </div>
+
+            <div class="glass p-8 rounded-3xl border-l-4 border-l-blue-600 relative overflow-hidden">
+                <div class="absolute top-0 right-0 p-4 opacity-5 text-4xl italic font-black text-white">30D</div>
+                <p class="text-[10px] text-zinc-500 font-bold uppercase mb-2">Next 30 Days</p>
+                <p id="estMonth" class="text-4xl text-white font-bold">$0.00</p>
+                <p class="text-[10px] text-zinc-700 mt-4 font-bold">PROJECTED PROFIT</p>
+            </div>
+        </div>
+
+        <!-- RISK & PROGRESS -->
+        <div class="glass p-8 rounded-3xl mb-8">
+            <div class="flex justify-between items-end mb-6">
+                <div>
+                    <p class="text-[10px] text-zinc-500 uppercase mb-1">Safety Orders Filled</p>
+                    <p id="stepText" class="text-5xl text-white font-bold">0 / 10</p>
+                </div>
+                <div class="text-right">
+                    <p class="text-[10px] text-zinc-500 uppercase mb-1">Next Step Distance</p>
+                    <p id="distText" class="text-5xl text-orange-500 font-bold">0.00%</p>
+                </div>
+            </div>
+            <div class="w-full bg-zinc-900 rounded-full h-4 overflow-hidden shadow-inner">
+                <div id="progressBar" class="bg-gradient-to-r from-blue-600 to-blue-400 h-full transition-all duration-1000" style="width: 0%"></div>
+            </div>
+        </div>
+
+        <!-- FOOTER -->
+        <div class="flex justify-between items-center text-[10px] font-bold text-zinc-600 uppercase">
+            <div>Avg Profit/Hr: <span id="estHr" class="text-zinc-400 ml-1">$0.00</span></div>
+            <div class="flex gap-6">
+                <span>Price: <span id="curPrice" class="text-zinc-400 ml-1">0.00</span></span>
+                <button onclick="resetStats()" class="text-red-900 hover:text-red-500 transition-colors">Emergency Reset Session</button>
+            </div>
         </div>
     </div>
 
     <script>
         async function update() {
             try {
-                const r = await fetch('/api/status'); const d = await r.json();
+                const r = await fetch('/api/status'); 
+                const d = await r.json();
+                
                 document.getElementById('p1').innerText = '$' + d.realizedProfit.toFixed(4);
                 document.getElementById('p2').innerText = d.profitPct.toFixed(2) + '%';
-                document.getElementById('roi').innerText = d.roi.toFixed(2) + '%';
-                document.getElementById('dgr').innerText = d.estimates.dgr.toFixed(2) + '%';
                 
+                const roiEl = document.getElementById('roi');
+                roiEl.innerText = d.roi.toFixed(2) + '%';
+                roiEl.className = 'text-2xl font-bold ' + (d.roi >= 0 ? 'text-green-500' : 'text-red-600');
+                
+                document.getElementById('bal').innerText = '$' + d.walletBalance.toFixed(2);
+                document.getElementById('dgrText').innerText = d.estimates.dgr.toFixed(2) + '% DGR';
+                
+                // Estimates
                 document.getElementById('estHr').innerText = '$' + d.estimates.hr.toFixed(2);
                 document.getElementById('estDay').innerText = '$' + d.estimates.day.toFixed(2);
+                document.getElementById('estWeek').innerText = '$' + d.estimates.week.toFixed(2);
                 document.getElementById('estMonth').innerText = '$' + d.estimates.month.toFixed(0);
 
+                // Risk
                 document.getElementById('curPrice').innerText = d.currentPrice.toFixed(8);
                 document.getElementById('stepText').innerText = d.safetyOrdersFilled + ' / ' + d.settings.maxSteps;
                 document.getElementById('distText').innerText = d.distToNext.toFixed(3) + '%';
 
                 const progressPct = (d.safetyOrdersFilled / d.settings.maxSteps) * 100;
-                document.getElementById('progressBar').style.width = progressPct + '%';
-                if(progressPct > 70) document.getElementById('progressBar').className = "bg-red-500 h-full transition-all";
+                const bar = document.getElementById('progressBar');
+                bar.style.width = progressPct + '%';
+                
+                if(progressPct > 75) bar.classList.replace('from-blue-600', 'from-red-600');
+                else if(progressPct > 45) bar.classList.replace('from-blue-600', 'from-orange-500');
+                else { bar.classList.add('from-blue-600'); bar.classList.remove('from-red-600', 'from-orange-500'); }
+
             } catch (e) {}
         }
-        async function resetStats() { if(confirm("Clear data?")) await fetch('/api/reset-stats', {method:'POST'}); update(); }
-        setInterval(update, 1000); update();
+        async function resetStats() { if(confirm("This resets Initial Balance and Projections. Continue?")) await fetch('/api/reset-stats', {method:'POST'}); update(); }
+        setInterval(update, 1000); 
+        update();
     </script>
 </body>
 </html>`);
@@ -290,7 +336,7 @@ app.post('/api/reset-stats', async (req, res) => {
     botState.initialBalance = botState.walletBalance; 
     botState.startTime = Date.now();
     botState.realizedProfit = 0; botState.profitPct = 0;
-    botState.estimates = { hr: 0, day: 0, month: 0, dgr: 0 };
+    botState.estimates = { hr: 0, day: 0, week: 0, month: 0, dgr: 0 };
     await BotModel.updateOne({ id: "htx_martingale" }, { initialBalance: botState.initialBalance, startTime: botState.startTime, storedRealizedProfit: 0, storedProfitPct: 0 }, { upsert: true });
     res.sendStatus(200); 
 });
