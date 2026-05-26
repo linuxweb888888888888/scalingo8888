@@ -46,10 +46,10 @@ let botState = {
     distToNext: 0,
     settings: {
         baseOrder: 0,
-        priceDrop: 0.1,
+        priceDrop: 1.5,      // CHANGED: 1.5% drop for safety orders (was 0.1%)
         volumeMult: 1.2,
-        takeProfit: 1.5,
-        maxSteps: 10
+        takeProfit: 2.0,     // CHANGED: 2% take profit (was 1.5%)
+        maxSteps: 5          // CHANGED: Max 5 safety orders (was 10)
     },
     estimates: {
         hr: 0,
@@ -119,16 +119,17 @@ function updateEstimates() {
 // ==================== UPDATE DISTANCE (REAL-TIME) ====================
 function updateDistance() {
     if (botState.openPosition && botState.openPosition.volume > 0 && botState.avgPrice > 0 && botState.currentPrice > 0) {
-        const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
-        const distance = ((botState.currentPrice - triggerPrice) / botState.currentPrice) * 100;
-        const newDistance = Math.max(0, distance);
+        // FIXED: Calculate actual percentage drop from avg price
+        const currentDropPercent = ((botState.avgPrice - botState.currentPrice) / botState.avgPrice) * 100;
+        const nextTriggerDrop = botState.safetyOrdersFilled * botState.settings.priceDrop;
+        const distanceToNext = Math.max(0, nextTriggerDrop - currentDropPercent);
         
-        // Log significant distance changes
-        if (Math.abs(newDistance - botState.distToNext) > 0.0001) {
-            console.log(`📏 Distance updated: ${botState.distToNext.toFixed(4)}% → ${newDistance.toFixed(4)}% | Avg: ${botState.avgPrice.toFixed(8)} | Price: ${botState.currentPrice.toFixed(8)}`);
+        botState.distToNext = distanceToNext;
+        
+        // Log distance updates occasionally
+        if (Math.random() < 0.01) { // 1% of updates
+            console.log(`📏 Distance: ${distanceToNext.toFixed(4)}% | Drop: ${currentDropPercent.toFixed(4)}% | Next trigger at: ${nextTriggerDrop.toFixed(2)}%`);
         }
-        
-        botState.distToNext = newDistance;
     } else {
         if (botState.distToNext !== 0) {
             console.log(`📏 Distance reset to 0 (no position)`);
@@ -137,7 +138,7 @@ function updateDistance() {
     }
 }
 
-// ==================== FETCH FROM EXCHANGE ONLY ====================
+// ==================== FETCH FROM EXCHANGE ====================
 async function fetchPositionAndROI() {
     try {
         const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
@@ -146,30 +147,33 @@ async function fetchPositionAndROI() {
         if (pos) {
             const oldAvg = botState.avgPrice;
             const oldVol = botState.openPosition.volume;
+            const newAvg = parseFloat(pos.cost_hold);
+            const newROI = parseFloat(pos.profit_rate) * 100;
             
-            botState.roi = parseFloat(pos.profit_rate) * 100;
-            botState.avgPrice = parseFloat(pos.cost_hold);
+            botState.roi = newROI;
+            botState.avgPrice = newAvg;
             botState.openPosition = {
                 volume: parseFloat(pos.volume),
                 direction: pos.direction,
-                costHold: parseFloat(pos.cost_hold)
+                costHold: newAvg
             };
             
             // Log if avg price changed (safety order executed)
-            if (oldAvg !== botState.avgPrice && oldAvg > 0) {
-                console.log(`🔄 AVG PRICE UPDATED: ${oldAvg.toFixed(8)} → ${botState.avgPrice.toFixed(8)}`);
-                console.log(`📊 New ROI: ${botState.roi.toFixed(2)}% | New Volume: ${botState.openPosition.volume}`);
+            if (oldAvg !== newAvg && oldAvg > 0) {
+                console.log(`🔄 AVG PRICE UPDATED: ${oldAvg.toFixed(8)} → ${newAvg.toFixed(8)}`);
+                console.log(`📊 New ROI: ${newROI.toFixed(2)}% | New Volume: ${botState.openPosition.volume}`);
             }
             
             updateDistance();
         } else {
             if (botState.openPosition.volume > 0) {
-                console.log(`📭 Position closed`);
+                console.log(`📭 Position closed - Profit: ${botState.realizedProfit.toFixed(4)} USDT`);
             }
             botState.openPosition = { volume: 0, direction: "", costHold: 0 };
             botState.roi = 0;
             botState.distToNext = 0;
             botState.avgPrice = 0;
+            botState.safetyOrdersFilled = 0; // Reset safety orders when position closes
         }
     } catch (e) {
         console.error("Position fetch error:", e);
@@ -260,29 +264,29 @@ async function saveTradeHistory(type, volume, price, safetyLevel, roi, balanceAf
 
 async function refreshPositionAfterTrade() {
     // Fetch updated position after a trade
-    setTimeout(async () => {
-        const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
-        const newPos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
-        if (newPos) {
-            const oldAvg = botState.avgPrice;
-            botState.avgPrice = parseFloat(newPos.cost_hold);
-            botState.roi = parseFloat(newPos.profit_rate) * 100;
-            botState.openPosition = {
-                volume: parseFloat(newPos.volume),
-                direction: newPos.direction,
-                costHold: parseFloat(newPos.cost_hold)
-            };
-            updateDistance();
-            console.log(`🔄 Post-trade update - Avg: ${oldAvg.toFixed(8)} → ${botState.avgPrice.toFixed(8)}, Distance: ${botState.distToNext.toFixed(4)}%`);
-        } else if (botState.openPosition.volume > 0) {
-            // Position might be closed
-            botState.openPosition = { volume: 0, direction: "", costHold: 0 };
-            botState.roi = 0;
-            botState.distToNext = 0;
-            botState.avgPrice = 0;
-            console.log(`🔄 Position closed after trade`);
-        }
-    }, 500);
+    await new Promise(resolve => setTimeout(resolve, 500));
+    const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
+    const newPos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
+    if (newPos) {
+        const oldAvg = botState.avgPrice;
+        botState.avgPrice = parseFloat(newPos.cost_hold);
+        botState.roi = parseFloat(newPos.profit_rate) * 100;
+        botState.openPosition = {
+            volume: parseFloat(newPos.volume),
+            direction: newPos.direction,
+            costHold: parseFloat(newPos.cost_hold)
+        };
+        updateDistance();
+        console.log(`🔄 Post-trade update - Avg: ${oldAvg.toFixed(8)} → ${botState.avgPrice.toFixed(8)}, Distance: ${botState.distToNext.toFixed(4)}%`);
+    } else if (botState.openPosition.volume > 0) {
+        // Position might be closed
+        botState.openPosition = { volume: 0, direction: "", costHold: 0 };
+        botState.roi = 0;
+        botState.distToNext = 0;
+        botState.avgPrice = 0;
+        botState.safetyOrdersFilled = 0;
+        console.log(`🔄 Position closed after trade`);
+    }
 }
 
 async function checkAndExecuteTrades() {
@@ -290,53 +294,81 @@ async function checkAndExecuteTrades() {
     botState.isTrading = true;
 
     try {
+        // Fetch current position from exchange
         const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
         let pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
         
         if (pos) {
             const currentROI = parseFloat(pos.profit_rate) * 100;
-            const avgPrice = parseFloat(pos.cost_hold);
-            const triggerPrice = avgPrice * (1 - (botState.settings.priceDrop / 100));
+            const currentAvgPrice = parseFloat(pos.cost_hold);
+            const currentVolume = parseFloat(pos.volume);
+            
+            // FIXED: Calculate current drop percentage
+            const currentDropPercent = ((currentAvgPrice - botState.currentPrice) / currentAvgPrice) * 100;
+            const requiredDropForNextOrder = (botState.safetyOrdersFilled + 1) * botState.settings.priceDrop;
+            
+            // Log status periodically
+            if (Math.random() < 0.05) { // 5% of checks
+                console.log(`📊 Status | ROI: ${currentROI.toFixed(2)}% | Drop: ${currentDropPercent.toFixed(2)}% | Needed: ${requiredDropForNextOrder.toFixed(2)}% | Safety: ${botState.safetyOrdersFilled}/${botState.settings.maxSteps}`);
+            }
             
             // Check take profit
             if (currentROI >= botState.settings.takeProfit) {
+                console.log(`🎯 Take profit triggered! ROI: ${currentROI.toFixed(2)}% >= ${botState.settings.takeProfit}%`);
                 const result = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol, volume: pos.volume,
-                    direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
+                    contract_code: config.symbol, 
+                    volume: currentVolume,
+                    direction: 'sell', 
+                    offset: 'close', 
+                    lever_rate: config.leverage, 
+                    order_price_type: 'opponent'
                 });
                 
                 if (result?.code === 200) {
-                    await saveTradeHistory('take_profit', parseFloat(pos.volume), botState.currentPrice, botState.safetyOrdersFilled, currentROI, botState.displayBalance);
+                    await saveTradeHistory('take_profit', currentVolume, botState.currentPrice, botState.safetyOrdersFilled, currentROI, botState.displayBalance);
                     botState.safetyOrdersFilled = 0;
-                    console.log(`✅ Take profit! ROI: ${currentROI}%`);
+                    console.log(`✅ Take profit executed! ROI: ${currentROI.toFixed(2)}%`);
                     await refreshPositionAfterTrade();
+                } else {
+                    console.error(`❌ Take profit failed:`, result);
                 }
             }
-            // Check safety order
-            else if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
+            // FIXED: Check safety order based on actual drop percentage
+            else if (currentDropPercent >= requiredDropForNextOrder && botState.safetyOrdersFilled < botState.settings.maxSteps) {
                 const nextVol = Math.max(1, Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled + 1)));
-                console.log(`📊 Trigger price: ${triggerPrice.toFixed(8)}, Current: ${botState.currentPrice.toFixed(8)}`);
-                console.log(`🔴 SAFETY ORDER TRIGGERED! Adding ${nextVol} contracts`);
+                console.log(`🔴 SAFETY ORDER TRIGGERED!`);
+                console.log(`   Current drop: ${currentDropPercent.toFixed(2)}% >= Required: ${requiredDropForNextOrder.toFixed(2)}%`);
+                console.log(`   Adding ${nextVol} contracts (Safety #${botState.safetyOrdersFilled + 1})`);
                 
                 const result = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol, volume: nextVol,
-                    direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+                    contract_code: config.symbol, 
+                    volume: nextVol,
+                    direction: 'buy', 
+                    offset: 'open', 
+                    lever_rate: config.leverage, 
+                    order_price_type: 'opponent'
                 });
                 
                 if (result?.code === 200) {
                     botState.safetyOrdersFilled++;
-                    await saveTradeHistory('safety', nextVol, botState.currentPrice, botState.safetyOrdersFilled, 0, botState.displayBalance);
+                    await saveTradeHistory('safety', nextVol, botState.currentPrice, botState.safetyOrdersFilled, currentROI, botState.displayBalance);
                     console.log(`📉 Safety Order #${botState.safetyOrdersFilled} executed | Vol: ${nextVol}`);
                     await refreshPositionAfterTrade();
+                } else {
+                    console.error(`❌ Safety order failed:`, result);
                 }
             }
         } 
         // Open initial position
-        else if (botState.maxSafeBase > 0 && botState.settings.baseOrder > 0 && !pos) {
+        else if (botState.maxSafeBase > 0 && botState.settings.baseOrder > 0 && botState.safetyOrdersFilled === 0) {
             console.log(`🎯 Opening initial position | Vol: ${botState.settings.baseOrder}`);
             const result = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: botState.settings.baseOrder,
-                direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+                contract_code: config.symbol, 
+                volume: botState.settings.baseOrder,
+                direction: 'buy', 
+                offset: 'open', 
+                lever_rate: config.leverage, 
+                order_price_type: 'opponent'
             });
             
             if (result?.code === 200) {
@@ -344,6 +376,8 @@ async function checkAndExecuteTrades() {
                 botState.safetyOrdersFilled = 0;
                 console.log(`🎯 Position opened | Vol: ${botState.settings.baseOrder}`);
                 await refreshPositionAfterTrade();
+            } else {
+                console.error(`❌ Open position failed:`, result);
             }
         }
 
@@ -371,12 +405,12 @@ function resetStats() {
 function forceUpdateSettings() {
     botState.settings = {
         baseOrder: botState.settings.baseOrder || 0,
-        priceDrop: 0.1,
+        priceDrop: 1.5,      // Reset to 1.5%
         volumeMult: 1.2,
-        takeProfit: 1.5,
-        maxSteps: 10
+        takeProfit: 2.0,     // Reset to 2%
+        maxSteps: 5          // Reset to 5
     };
-    console.log("⚙️ Settings force updated to defaults!");
+    console.log("⚙️ Settings force updated to defaults! (Drop: 1.5%, TP: 2.0%, MaxSteps: 5)");
     updateDistance();
     return true;
 }
@@ -401,10 +435,10 @@ function fullReset() {
         distToNext: 0,
         settings: {
             baseOrder: 0,
-            priceDrop: 0.1,
+            priceDrop: 1.5,
             volumeMult: 1.2,
-            takeProfit: 1.5,
-            maxSteps: 10
+            takeProfit: 2.0,
+            maxSteps: 5
         },
         estimates: {
             hr: 0,
@@ -431,10 +465,10 @@ function fullReset() {
 // ==================== STARTUP ====================
 async function boot() {
     console.log(`🤖 Bot started | ${config.symbol} | ${config.leverage}X`);
-    console.log(`📊 Using EXCHANGE ONLY for ROI data (no WebSocket calculations)`);
-    console.log(`📏 Distance updates in REAL-TIME with every price tick`);
+    console.log(`📊 Settings: Drop: ${botState.settings.priceDrop}% | TP: ${botState.settings.takeProfit}% | Max Steps: ${botState.settings.maxSteps}`);
+    console.log(`📏 Safety orders trigger every ${botState.settings.priceDrop}% drop`);
     
-    // WebSocket for real-time price ONLY (no ROI calculation)
+    // WebSocket for real-time price ONLY
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' })));
     ws.on('message', (data) => {
@@ -448,19 +482,20 @@ async function boot() {
                         
                         // Update distance on EVERY price tick
                         if (botState.openPosition && botState.openPosition.volume > 0 && botState.avgPrice > 0) {
-                            const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
-                            const distance = ((newPrice - triggerPrice) / newPrice) * 100;
-                            const newDistance = Math.max(0, distance);
-                            
-                            if (Math.abs(newDistance - botState.distToNext) > 0.00001) {
-                                botState.distToNext = newDistance;
-                            }
+                            const currentDropPercent = ((botState.avgPrice - newPrice) / botState.avgPrice) * 100;
+                            const nextTriggerDrop = botState.safetyOrdersFilled * botState.settings.priceDrop;
+                            const distanceToNext = Math.max(0, nextTriggerDrop - currentDropPercent);
+                            botState.distToNext = distanceToNext;
                         }
                     }
                     if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
                 } catch (e) {}
             }
         });
+    });
+    
+    ws.on('error', (error) => {
+        console.error('WebSocket error:', error);
     });
     
     // Fast loops for real-time updates
@@ -485,7 +520,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html class="bg-white">
 <head>
-    <title>HTX Compounder | Real-Time Distance</title>
+    <title>HTX Compounder | Fixed Safety Orders</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
@@ -516,10 +551,10 @@ app.get('/', (req, res) => {
             <div>
                 <h1 class="text-gray-900 text-3xl font-bold tracking-tight">
                     COMPOUND<span class="gradient-text">_BOT</span>
-                    <span class="text-sm font-mono text-gray-400 ml-2">Real-Time Distance</span>
+                    <span class="text-sm font-mono text-gray-400 ml-2">Fixed Safety Orders</span>
                 </h1>
                 <p class="text-xs text-gray-400 uppercase tracking-wider mt-1">${config.symbol} | ${config.leverage}X Leverage</p>
-                <p class="text-[10px] text-emerald-600 mt-2">📡 Live distance updates | Safety orders update avg price instantly</p>
+                <p class="text-[10px] text-emerald-600 mt-2">🎯 Safety orders trigger every ${botState.settings.priceDrop}% drop</p>
             </div>
             <div class="text-right">
                 <p class="text-3xl font-bold text-emerald-600" id="dgrText">0.00%</p>
@@ -605,7 +640,7 @@ app.get('/', (req, res) => {
             </div>
             <div id="riskWarning" class="mt-4 hidden">
                 <div class="bg-amber-50 border border-amber-200 rounded-lg p-3">
-                    <p class="text-amber-700 text-xs font-semibold">⚠️ High Risk Zone</p>
+                    <p class="text-amber-700 text-xs font-semibold">⚠️ High Risk Zone - Multiple safety orders active</p>
                 </div>
             </div>
         </div>
@@ -724,7 +759,7 @@ app.get('/', (req, res) => {
         }
         
         async function forceUpdate() {
-            if(confirm("Force update settings to defaults? (TP=1.5%, Drop=0.1%, MaxSteps=10)")) {
+            if(confirm("Force update settings to defaults? (TP=2.0%, Drop=1.5%, MaxSteps=5)")) {
                 await fetch('/api/force-update', {method:'POST'});
                 setTimeout(() => update(), 500);
             }
@@ -792,6 +827,40 @@ app.post('/api/full-reset', async (req, res) => {
     res.sendStatus(200);
 });
 
+// Debug endpoint to see what's happening
+app.get('/api/debug', async (req, res) => {
+    const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
+    const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
+    
+    const currentDropPercent = botState.avgPrice && botState.currentPrice ? 
+        ((botState.avgPrice - botState.currentPrice) / botState.avgPrice) * 100 : 0;
+    const requiredDropForNextOrder = (botState.safetyOrdersFilled + 1) * botState.settings.priceDrop;
+    
+    res.json({
+        botState: {
+            avgPrice: botState.avgPrice,
+            currentPrice: botState.currentPrice,
+            currentDropPercent: currentDropPercent,
+            requiredDropForNextOrder: requiredDropForNextOrder,
+            priceDrop: botState.settings.priceDrop,
+            safetyOrdersFilled: botState.safetyOrdersFilled,
+            maxSteps: botState.settings.maxSteps,
+            roi: botState.roi
+        },
+        exchangePosition: pos ? {
+            volume: pos.volume,
+            cost_hold: pos.cost_hold,
+            profit_rate: pos.profit_rate
+        } : null,
+        condition: {
+            shouldTrigger: currentDropPercent >= requiredDropForNextOrder,
+            dropCheck: `${currentDropPercent.toFixed(2)}% >= ${requiredDropForNextOrder.toFixed(2)}%`,
+            stepsCheck: `${botState.safetyOrdersFilled} < ${botState.settings.maxSteps}`,
+            willTrigger: (currentDropPercent >= requiredDropForNextOrder) && (botState.safetyOrdersFilled < botState.settings.maxSteps)
+        }
+    });
+});
+
 process.on('SIGINT', async () => {
     console.log('Shutting down...');
     process.exit();
@@ -799,5 +868,6 @@ process.on('SIGINT', async () => {
 
 app.listen(config.port, () => {
     console.log(`🌐 Web UI: http://localhost:${config.port}`);
+    console.log(`🔍 Debug endpoint: http://localhost:${config.port}/api/debug`);
     boot();
 });
