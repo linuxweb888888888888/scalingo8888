@@ -87,6 +87,7 @@ async function runLogic() {
         if (accRes?.data) {
             const acc = accRes.data.find(a => a.margin_asset === 'USDT');
             if (acc) {
+                // Static balance (Equity - Unrealized)
                 const equity = parseFloat(acc.margin_balance) || 0;
                 const unrealized = pos ? (parseFloat(pos.unrealized_pnl) || 0) : 0;
                 botState.walletBalance = equity - unrealized;
@@ -98,6 +99,7 @@ async function runLogic() {
             }
         }
 
+        // ==================== COMPOUNDING MATH ====================
         const elapsedDays = (Date.now() - botState.startTime) / (1000 * 60 * 60 * 24);
         if (elapsedDays > 0.001 && botState.walletBalance > botState.initialBalance) {
             const dgr = Math.pow((botState.walletBalance / botState.initialBalance), (1 / elapsedDays)) - 1;
@@ -146,6 +148,7 @@ async function runLogic() {
 
         botState.realizedProfit = botState.walletBalance - botState.initialBalance;
         botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
+
     } catch (e) {}
     botState.isTrading = false;
 }
@@ -175,7 +178,7 @@ async function boot() {
     setInterval(runLogic, 3000);
 }
 
-// ==================== UI (WHITE DESIGN) ====================
+// ==================== UI ====================
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
@@ -187,10 +190,10 @@ app.get('/', (req, res) => {
     <style>
         body { font-family: 'Roboto Mono', monospace; }
         .glass { background: white; border: 1px solid rgba(0, 0, 0, 0.08); box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05); }
-        .glow-blue { box-shadow: 0 10px 25px -5px rgba(59, 130, 246, 0.3); }
+        .glow-blue { box-shadow: 0 10px 25px -5px rgba(59, 130, 246, 0.2); }
     </style>
 </head>
-<body class="text-slate-700 p-4 md:p-10">
+<body class="text-slate-600 p-4 md:p-10">
     <div class="max-w-6xl mx-auto">
         
         <div class="flex justify-between items-center mb-10">
@@ -207,7 +210,7 @@ app.get('/', (req, res) => {
         <!-- STATS GRID -->
         <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
             <div class="glass p-5 rounded-2xl">
-                <p class="text-[10px] text-slate-400 uppercase mb-1">Net Profit</p>
+                <p class="text-[10px] text-slate-400 uppercase mb-1">Net Profit (Static)</p>
                 <p id="p1" class="text-2xl text-emerald-600 font-bold">$0.00</p>
             </div>
             <div class="glass p-5 rounded-2xl">
@@ -219,7 +222,7 @@ app.get('/', (req, res) => {
                 <p id="roi" class="text-2xl text-slate-300 font-bold">0.00%</p>
             </div>
             <div class="glass p-5 rounded-2xl">
-                <p class="text-[10px] text-slate-400 uppercase mb-1">Current Balance</p>
+                <p class="text-[10px] text-slate-400 uppercase mb-1">Wallet Balance</p>
                 <p id="bal" class="text-2xl text-slate-900 font-bold">$0.00</p>
             </div>
         </div>
@@ -232,21 +235,21 @@ app.get('/', (req, res) => {
                 <div class="absolute top-0 right-0 p-4 opacity-10 text-4xl italic font-black text-white">24H</div>
                 <p class="text-[10px] text-blue-100 font-bold uppercase mb-2">Next 24 Hours</p>
                 <p id="estDay" class="text-4xl text-white font-bold">$0.00</p>
-                <p class="text-[10px] text-blue-200 mt-4 font-bold uppercase tracking-tight">Estimated Earnings</p>
+                <p class="text-[10px] text-blue-200 mt-4 font-bold uppercase">Estimated Earnings</p>
             </div>
 
             <div class="glass p-8 rounded-3xl relative overflow-hidden">
                 <div class="absolute top-0 right-0 p-4 opacity-5 text-4xl italic font-black text-slate-900">7D</div>
                 <p class="text-[10px] text-slate-400 font-bold uppercase mb-2">Next 7 Days</p>
                 <p id="estWeek" class="text-4xl text-slate-900 font-bold">$0.00</p>
-                <p class="text-[10px] text-slate-300 mt-4 font-bold uppercase tracking-tight">Compounded Growth</p>
+                <p class="text-[10px] text-slate-300 mt-4 font-bold uppercase">Compounded Growth</p>
             </div>
 
             <div class="glass p-8 rounded-3xl border-l-4 border-l-blue-600 relative overflow-hidden">
                 <div class="absolute top-0 right-0 p-4 opacity-5 text-4xl italic font-black text-slate-900">30D</div>
                 <p class="text-[10px] text-slate-400 font-bold uppercase mb-2">Next 30 Days</p>
                 <p id="estMonth" class="text-4xl text-slate-900 font-bold">$0.00</p>
-                <p class="text-[10px] text-slate-300 mt-4 font-bold uppercase tracking-tight">Projected Profit</p>
+                <p class="text-[10px] text-slate-300 mt-4 font-bold uppercase">Projected Profit</p>
             </div>
         </div>
 
@@ -306,8 +309,8 @@ app.get('/', (req, res) => {
                 const bar = document.getElementById('progressBar');
                 bar.style.width = progressPct + '%';
                 
-                if(progressPct > 75) { bar.classList.replace('bg-blue-600', 'bg-red-600'); bar.classList.remove('bg-orange-500'); }
-                else if(progressPct > 45) { bar.classList.replace('bg-blue-600', 'bg-orange-500'); bar.classList.remove('bg-red-600'); }
+                if(progressPct > 75) { bar.classList.remove('bg-blue-600', 'bg-orange-500'); bar.classList.add('bg-red-600'); }
+                else if(progressPct > 45) { bar.classList.remove('bg-blue-600', 'bg-red-600'); bar.classList.add('bg-orange-500'); }
                 else { bar.classList.add('bg-blue-600'); bar.classList.remove('bg-red-600', 'bg-orange-500'); }
 
             } catch (e) {}
