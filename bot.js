@@ -18,8 +18,7 @@ const BotSchema = new mongoose.Schema({
     initialBalance: { type: Number, default: 0 },
     storedRealizedProfit: { type: Number, default: 0 },
     storedProfitPct: { type: Number, default: 0 },
-    startTime: { type: Number, default: Date.now() },
-    peakBalance: { type: Number, default: 0 }
+    startTime: { type: Number, default: Date.now() }
 });
 const BotModel = mongoose.model('BotConfig_V33', BotSchema);
 
@@ -43,14 +42,11 @@ let botState = {
     roi: 0, 
     realizedProfit: 0,
     profitPct: 0,      
-    walletBalance: 0,       // REAL wallet balance (equity - unrealized)
-    displayBalance: 0,      // Static balance that only increases
-    peakBalance: 0,         // Track highest REAL balance achieved
+    walletBalance: 0,  
     initialBalance: 0, 
     maxSafeBase: 0,
     safetyOrdersFilled: 0,
     distToNext: 0,
-    unrealizedPnL: 0,       // Track current unrealized PnL
     estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 }, 
     settings: {
         baseOrder: 0, 
@@ -91,57 +87,39 @@ async function runLogic() {
         if (accRes?.data) {
             const acc = accRes.data.find(a => a.margin_asset === 'USDT');
             if (acc) {
-                // Get margin balance (total equity including unrealized)
+                // Static balance (Equity - Unrealized)
                 const equity = parseFloat(acc.margin_balance) || 0;
-                // Get unrealized PnL from open position
                 const unrealized = pos ? (parseFloat(pos.unrealized_pnl) || 0) : 0;
-                
-                // REAL wallet balance = Equity - Unrealized (this is the stable balance)
-                // This is the balance you would have if you closed all positions now
                 const realBalance = equity - unrealized;
                 
-                // Store unrealized for display
-                botState.unrealizedPnL = unrealized;
-                
-                // CRITICAL: Only update display balance when REAL balance increases
-                // This means profits are only "locked" when a trade closes in profit
-                if (realBalance > botState.peakBalance) {
-                    const increase = realBalance - botState.peakBalance;
-                    botState.displayBalance = botState.displayBalance + increase;
-                    botState.peakBalance = realBalance;
-                    
-                    console.log(`🎯 NEW LOCKED PROFIT! | Increase: $${increase.toFixed(4)} | Locked Balance: $${botState.displayBalance.toFixed(4)} | Peak Real: $${botState.peakBalance.toFixed(4)}`);
+                // ONLY CHANGE: Keep wallet balance static - only update when realBalance is HIGHER than current walletBalance
+                if (realBalance > botState.walletBalance) {
+                    botState.walletBalance = realBalance;
                 }
                 
-                // Store the REAL balance for calculations
-                botState.walletBalance = realBalance;
-                
-                // Initialize on first run
                 if (botState.initialBalance <= 0 && botState.walletBalance > 0) {
                     botState.initialBalance = botState.walletBalance;
-                    botState.displayBalance = botState.walletBalance;
-                    botState.peakBalance = botState.walletBalance;
                     botState.startTime = Date.now();
-                    console.log(`🚀 Bot Initialized | Starting Locked Balance: $${botState.initialBalance.toFixed(4)}`);
                 }
             }
         }
 
-        // Compounding Math using LOCKED balance (only increases on closed profits)
+        // ==================== COMPOUNDING MATH ====================
         const elapsedDays = (Date.now() - botState.startTime) / (1000 * 60 * 60 * 24);
-        if (elapsedDays > 0.001 && botState.displayBalance > botState.initialBalance) {
-            // DGR based on locked balance (realized gains only)
-            const dgr = Math.pow((botState.displayBalance / botState.initialBalance), (1 / elapsedDays)) - 1;
+        if (elapsedDays > 0.001 && botState.walletBalance > botState.initialBalance) {
+            // Daily Growth Rate (DGR) formula
+            const dgr = Math.pow((botState.walletBalance / botState.initialBalance), (1 / elapsedDays)) - 1;
             botState.estimates.dgr = dgr * 100;
-            botState.estimates.hr = (botState.displayBalance - botState.initialBalance) / (elapsedDays * 24);
             
-            // Projections based on locked balance
-            botState.estimates.day = botState.displayBalance * dgr;
-            botState.estimates.week = (botState.displayBalance * Math.pow((1 + dgr), 7)) - botState.displayBalance;
-            botState.estimates.month = (botState.displayBalance * Math.pow((1 + dgr), 30)) - botState.displayBalance;
+            botState.estimates.hr = botState.realizedProfit / (elapsedDays * 24);
+            
+            // Compound Projections
+            botState.estimates.day = botState.walletBalance * dgr;
+            botState.estimates.week = (botState.walletBalance * Math.pow((1 + dgr), 7)) - botState.walletBalance;
+            botState.estimates.month = (botState.walletBalance * Math.pow((1 + dgr), 30)) - botState.walletBalance;
         }
 
-        // Position sizing uses REAL wallet balance (equity - unrealized) for safety
+        // Scaled Base Order Calculation
         if (botState.currentPrice > 0 && botState.walletBalance > 0) {
             const m = botState.settings.volumeMult, n = botState.settings.maxSteps;
             const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
@@ -158,13 +136,11 @@ async function runLogic() {
             botState.distToNext = Math.max(0, ((botState.currentPrice - triggerPrice) / botState.currentPrice) * 100);
 
             if (botState.roi >= botState.settings.takeProfit) {
-                // Close position - this will lock the profit
-                const closeResult = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
+                await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: pos.volume,
                     direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
                 botState.safetyOrdersFilled = 0;
-                console.log(`✅ POSITION CLOSED | ROI: ${botState.roi}% | Profit will be locked on next cycle`);
             } else if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
                 botState.safetyOrdersFilled++;
                 const nextVol = Math.max(1, Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled)));
@@ -172,7 +148,6 @@ async function runLogic() {
                     contract_code: config.symbol, volume: nextVol,
                     direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
-                console.log(`📉 SAFETY ORDER #${botState.safetyOrdersFilled} | Volume: ${nextVol}`);
             }
         } else if (botState.maxSafeBase > 0) {
             await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
@@ -180,16 +155,12 @@ async function runLogic() {
                 direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
             botState.safetyOrdersFilled = 0;
-            console.log(`🎯 NEW POSITION OPENED | Base Volume: ${botState.settings.baseOrder}`);
         }
 
-        // Profit calculations based on LOCKED balance (realized profits only)
-        botState.realizedProfit = botState.displayBalance - botState.initialBalance;
+        botState.realizedProfit = botState.walletBalance - botState.initialBalance;
         botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
 
-    } catch (e) {
-        console.error("Trading error:", e);
-    }
+    } catch (e) {}
     botState.isTrading = false;
 }
 
@@ -198,14 +169,10 @@ async function boot() {
     const data = await BotModel.findOne({ id: "htx_martingale" });
     if (data) {
         botState.initialBalance = data.initialBalance || 0;
-        botState.displayBalance = data.initialBalance || 0;
-        botState.peakBalance = data.peakBalance || 0;
         botState.realizedProfit = data.storedRealizedProfit || 0;
         botState.profitPct = data.storedProfitPct || 0;
         botState.startTime = data.startTime || Date.now();
-        console.log(`📀 Loaded from DB | Locked Balance: $${botState.displayBalance.toFixed(4)} | Peak Real: $${botState.peakBalance.toFixed(4)}`);
     }
-    
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' })));
     ws.on('message', (data) => {
@@ -219,135 +186,107 @@ async function boot() {
             }
         });
     });
-    
     setInterval(runLogic, 3000);
-    console.log(`🤖 Bot started | ${config.symbol} | ${config.leverage}X Leverage`);
-    console.log(`📊 Balance will ONLY increase when positions close in profit`);
 }
 
-// ==================== UI - WHITE DESIGN ====================
+// ==================== UI ====================
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
-<html class="bg-white">
+<html class="bg-black">
 <head>
-    <title>HTX Compounder | Realized Profit Only</title>
+    <title>HTX Compounder V33</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@500;700&display=swap" rel="stylesheet">
     <style>
-        body { font-family: 'Inter', sans-serif; background: #ffffff; }
-        .card { background: white; border: 1px solid #e5e7eb; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
-        .card-glow { box-shadow: 0 4px 20px rgba(0,0,0,0.05), 0 1px 2px rgba(0,0,0,0.03); }
-        .gradient-text { background: linear-gradient(135deg, #059669 0%, #0284c7 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-        .progress-bar { background: linear-gradient(90deg, #059669 0%, #0284c7 100%); }
-        .stat-number { font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
-        .balance-locked { transition: all 0.3s ease; }
-        .unrealized-badge { background: #f3f4f6; border-radius: 8px; padding: 2px 8px; font-size: 10px; }
+        body { font-family: 'Roboto Mono', monospace; }
+        .glass { background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.08); }
+        .glow-blue { box-shadow: 0 0 20px rgba(59, 130, 246, 0.2); }
     </style>
 </head>
-<body class="text-gray-900 p-4 md:p-10 bg-gray-50">
+<body class="text-zinc-300 p-4 md:p-10">
     <div class="max-w-6xl mx-auto">
         
-        <!-- Header -->
-        <div class="flex justify-between items-center mb-8">
+        <div class="flex justify-between items-center mb-10">
             <div>
-                <h1 class="text-gray-900 text-3xl font-bold tracking-tight">
-                    COMPOUND<span class="gradient-text">_BOT</span>
-                    <span class="text-sm font-mono text-gray-400 ml-2">v33</span>
-                </h1>
-                <p class="text-xs text-gray-400 uppercase tracking-wider mt-1">${config.symbol} | ${config.leverage}X Leverage</p>
-                <p class="text-[10px] text-emerald-600 mt-2">🔒 Balance only increases when trades close in profit</p>
+                <h1 class="text-white text-2xl font-bold tracking-tighter">COMPOUND_BOT <span class="text-blue-500">v33</span></h1>
+                <p class="text-[10px] text-zinc-500 uppercase tracking-widest">${config.symbol} | ${config.leverage}X Leverage</p>
             </div>
             <div class="text-right">
-                <p class="text-3xl font-bold text-emerald-600" id="dgrText">0.00%</p>
-                <p class="text-[10px] text-gray-400 uppercase tracking-wider">Daily Growth Rate</p>
+                <p id="dgrText" class="text-blue-500 font-bold text-xl">0.00% DGR</p>
+                <p class="text-[10px] text-zinc-600 uppercase">Daily Growth Rate</p>
             </div>
         </div>
 
-        <!-- Stats Grid -->
-        <div class="grid grid-cols-2 lg:grid-cols-4 gap-5 mb-8">
-            <div class="card p-6 rounded-2xl card-glow">
-                <p class="text-[11px] text-gray-400 uppercase tracking-wider mb-2">Locked Profit</p>
-                <p id="p1" class="text-3xl font-bold text-emerald-600 stat-number">$0.00</p>
-                <p class="text-[9px] text-gray-400 mt-1">Realized gains only</p>
+        <!-- STATS GRID -->
+        <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+            <div class="glass p-5 rounded-2xl">
+                <p class="text-[10px] text-zinc-500 uppercase mb-1">Net Profit</p>
+                <p id="p1" class="text-2xl text-green-500 font-bold">$0.00</p>
             </div>
-            <div class="card p-6 rounded-2xl card-glow">
-                <p class="text-[11px] text-gray-400 uppercase tracking-wider mb-2">Total Return</p>
-                <p id="p2" class="text-3xl font-bold text-emerald-600 stat-number">0.00%</p>
+            <div class="glass p-5 rounded-2xl">
+                <p class="text-[10px] text-zinc-500 uppercase mb-1">Total Gain</p>
+                <p id="p2" class="text-2xl text-green-500 font-bold">0.00%</p>
             </div>
-            <div class="card p-6 rounded-2xl card-glow">
-                <p class="text-[11px] text-gray-400 uppercase tracking-wider mb-2">Open Position</p>
-                <p id="roi" class="text-3xl font-bold text-gray-600 stat-number">0.00%</p>
-                <p class="text-[9px] text-gray-400 mt-1">Unrealized PnL</p>
+            <div class="glass p-5 rounded-2xl">
+                <p class="text-[10px] text-zinc-500 uppercase mb-1">Open Position ROI</p>
+                <p id="roi" class="text-2xl text-zinc-600 font-bold">0.00%</p>
             </div>
-            <div class="card p-6 rounded-2xl card-glow">
-                <p class="text-[11px] text-gray-400 uppercase tracking-wider mb-2">Locked Balance</p>
-                <p id="bal" class="text-3xl font-bold text-gray-900 stat-number balance-locked">$0.00</p>
-                <p class="text-[9px] text-gray-400 mt-1">Real: <span id="realBal">$0.00</span> <span class="ml-2 unrealized-badge">Unrealized: <span id="unrealizedAmount">$0.00</span></span></p>
+            <div class="glass p-5 rounded-2xl">
+                <p class="text-[10px] text-zinc-500 uppercase mb-1">Current Balance</p>
+                <p id="bal" class="text-2xl text-white font-bold">$0.00</p>
             </div>
         </div>
 
-        <!-- Compounding Projections -->
-        <h2 class="text-gray-500 text-[11px] font-bold uppercase tracking-wider mb-4">Compounding Estimates (Based on Locked Balance)</h2>
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-5 mb-10">
+        <!-- COMPOUNDING PROJECTIONS SECTION -->
+        <h2 class="text-zinc-500 text-[10px] font-bold uppercase mb-4 tracking-widest">Compounding Estimates (100% Reinvestment)</h2>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
             
-            <div class="bg-gradient-to-br from-emerald-50 to-sky-50 border border-emerald-200 p-8 rounded-2xl card-glow relative overflow-hidden">
-                <div class="absolute top-0 right-0 p-4 opacity-10 text-6xl italic font-black text-emerald-900">24H</div>
-                <p class="text-[10px] text-emerald-700 font-bold uppercase tracking-wider mb-2">Next 24 Hours</p>
-                <p id="estDay" class="text-4xl font-bold text-emerald-900 stat-number">$0.00</p>
-                <p class="text-[10px] text-emerald-600 mt-4 font-semibold">PROJECTED RETURN</p>
+            <div class="bg-blue-600/10 border border-blue-500/20 p-8 rounded-3xl glow-blue relative overflow-hidden">
+                <div class="absolute top-0 right-0 p-4 opacity-10 text-4xl italic font-black text-blue-500">24H</div>
+                <p class="text-[10px] text-blue-400 font-bold uppercase mb-2">Next 24 Hours</p>
+                <p id="estDay" class="text-4xl text-white font-bold">$0.00</p>
+                <p class="text-[10px] text-blue-800 mt-4 font-bold">ESTIMATED EARNINGS</p>
             </div>
 
-            <div class="card p-8 rounded-2xl card-glow relative overflow-hidden">
-                <div class="absolute top-0 right-0 p-4 opacity-5 text-6xl italic font-black text-gray-900">7D</div>
-                <p class="text-[10px] text-gray-400 font-bold uppercase tracking-wider mb-2">Next 7 Days</p>
-                <p id="estWeek" class="text-4xl font-bold text-gray-900 stat-number">$0.00</p>
-                <p class="text-[10px] text-gray-400 mt-4 font-semibold">COMPOUNDED GROWTH</p>
+            <div class="glass p-8 rounded-3xl relative overflow-hidden">
+                <div class="absolute top-0 right-0 p-4 opacity-5 text-4xl italic font-black text-white">7D</div>
+                <p class="text-[10px] text-zinc-500 font-bold uppercase mb-2">Next 7 Days</p>
+                <p id="estWeek" class="text-4xl text-white font-bold">$0.00</p>
+                <p class="text-[10px] text-zinc-700 mt-4 font-bold">COMPOUNDED GROWTH</p>
             </div>
 
-            <div class="card p-8 rounded-2xl border-l-4 border-l-emerald-500 card-glow relative overflow-hidden">
-                <div class="absolute top-0 right-0 p-4 opacity-5 text-6xl italic font-black text-gray-900">30D</div>
-                <p class="text-[10px] text-gray-400 font-bold uppercase tracking-wider mb-2">Next 30 Days</p>
-                <p id="estMonth" class="text-4xl font-bold text-emerald-700 stat-number">$0.00</p>
-                <p class="text-[10px] text-gray-400 mt-4 font-semibold">PROJECTED PROFIT</p>
+            <div class="glass p-8 rounded-3xl border-l-4 border-l-blue-600 relative overflow-hidden">
+                <div class="absolute top-0 right-0 p-4 opacity-5 text-4xl italic font-black text-white">30D</div>
+                <p class="text-[10px] text-zinc-500 font-bold uppercase mb-2">Next 30 Days</p>
+                <p id="estMonth" class="text-4xl text-white font-bold">$0.00</p>
+                <p class="text-[10px] text-zinc-700 mt-4 font-bold">PROJECTED PROFIT</p>
             </div>
         </div>
 
-        <!-- Risk & Progress -->
-        <div class="card p-8 rounded-2xl card-glow mb-8">
+        <!-- RISK & PROGRESS -->
+        <div class="glass p-8 rounded-3xl mb-8">
             <div class="flex justify-between items-end mb-6">
                 <div>
-                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Safety Orders Filled</p>
-                    <p id="stepText" class="text-5xl font-bold text-gray-900 stat-number">0 <span class="text-2xl text-gray-400">/ 10</span></p>
+                    <p class="text-[10px] text-zinc-500 uppercase mb-1">Safety Orders Filled</p>
+                    <p id="stepText" class="text-5xl text-white font-bold">0 / 10</p>
                 </div>
                 <div class="text-right">
-                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Next Step Distance</p>
-                    <p id="distText" class="text-4xl font-bold text-orange-500 stat-number">0.00%</p>
+                    <p class="text-[10px] text-zinc-500 uppercase mb-1">Next Step Distance</p>
+                    <p id="distText" class="text-5xl text-orange-500 font-bold">0.00%</p>
                 </div>
             </div>
-            <div class="w-full bg-gray-100 rounded-full h-2 overflow-hidden">
-                <div id="progressBar" class="progress-bar h-full transition-all duration-500 rounded-full" style="width: 0%"></div>
-            </div>
-            
-            <div id="riskWarning" class="mt-4 hidden">
-                <div class="bg-amber-50 border border-amber-200 rounded-lg p-3">
-                    <p class="text-amber-700 text-xs font-semibold">⚠️ High Risk Zone - Multiple safety orders activated</p>
-                </div>
+            <div class="w-full bg-zinc-900 rounded-full h-4 overflow-hidden shadow-inner">
+                <div id="progressBar" class="bg-gradient-to-r from-blue-600 to-blue-400 h-full transition-all duration-1000" style="width: 0%"></div>
             </div>
         </div>
 
-        <!-- How it works -->
-        <div class="bg-blue-50 border border-blue-200 rounded-2xl p-4 mb-8">
-            <p class="text-blue-800 text-xs font-semibold">📘 How Locked Balance Works:</p>
-            <p class="text-blue-700 text-xs mt-1">Your balance ONLY increases when a trade closes in profit. Unrealized gains/losses from open positions do NOT affect your locked balance. This gives you a true picture of realized profits only.</p>
-        </div>
-
-        <!-- Footer -->
-        <div class="flex justify-between items-center text-[10px] font-semibold text-gray-400 uppercase tracking-wider">
-            <div>Avg Profit/Hr: <span id="estHr" class="text-gray-600 ml-1">$0.00</span></div>
-            <div class="flex gap-6 items-center">
-                <span>Price: <span id="curPrice" class="text-gray-900 font-mono ml-1">0.00</span></span>
-                <button onclick="resetStats()" class="text-gray-400 hover:text-red-500 transition-colors px-3 py-1 rounded-lg hover:bg-red-50">Reset Session</button>
+        <!-- FOOTER -->
+        <div class="flex justify-between items-center text-[10px] font-bold text-zinc-600 uppercase">
+            <div>Avg Profit/Hr: <span id="estHr" class="text-zinc-400 ml-1">$0.00</span></div>
+            <div class="flex gap-6">
+                <span>Price: <span id="curPrice" class="text-zinc-400 ml-1">0.00</span></span>
+                <button onclick="resetStats()" class="text-red-900 hover:text-red-500 transition-colors">Emergency Reset Session</button>
             </div>
         </div>
     </div>
@@ -358,88 +297,52 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); 
                 const d = await r.json();
                 
-                document.getElementById('p1').innerHTML = '$' + d.realizedProfit.toFixed(4);
-                document.getElementById('p2').innerHTML = d.profitPct.toFixed(2) + '%';
+                document.getElementById('p1').innerText = '$' + d.realizedProfit.toFixed(4);
+                document.getElementById('p2').innerText = d.profitPct.toFixed(2) + '%';
                 
                 const roiEl = document.getElementById('roi');
-                const unrealizedPct = d.unrealizedPnL !== 0 && d.walletBalance > 0 ? (d.unrealizedPnL / d.walletBalance * 100) : 0;
-                roiEl.innerHTML = unrealizedPct.toFixed(2) + '%';
-                roiEl.className = 'text-3xl font-bold stat-number ' + (unrealizedPct >= 0 ? 'text-emerald-600' : 'text-red-500');
+                roiEl.innerText = d.roi.toFixed(2) + '%';
+                roiEl.className = 'text-2xl font-bold ' + (d.roi >= 0 ? 'text-green-500' : 'text-red-600');
                 
-                document.getElementById('bal').innerHTML = '$' + d.displayBalance.toFixed(4);
-                document.getElementById('realBal').innerHTML = '$' + d.walletBalance.toFixed(4);
-                document.getElementById('unrealizedAmount').innerHTML = '$' + d.unrealizedPnL.toFixed(4);
+                document.getElementById('bal').innerText = '$' + d.walletBalance.toFixed(2);
+                document.getElementById('dgrText').innerText = d.estimates.dgr.toFixed(2) + '% DGR';
                 
-                const balElement = document.getElementById('bal');
-                balElement.classList.add('scale-105');
-                setTimeout(() => balElement.classList.remove('scale-105'), 300);
-                
-                document.getElementById('dgrText').innerHTML = d.estimates.dgr.toFixed(2) + '%';
-                document.getElementById('estHr').innerHTML = '$' + d.estimates.hr.toFixed(2);
-                document.getElementById('estDay').innerHTML = '$' + d.estimates.day.toFixed(2);
-                document.getElementById('estWeek').innerHTML = '$' + d.estimates.week.toFixed(2);
-                document.getElementById('estMonth').innerHTML = '$' + d.estimates.month.toFixed(0);
-                document.getElementById('curPrice').innerHTML = d.currentPrice.toFixed(8);
-                document.getElementById('stepText').innerHTML = d.safetyOrdersFilled + ' <span class="text-2xl text-gray-400">/ ' + d.settings.maxSteps + '</span>';
-                document.getElementById('distText').innerHTML = d.distToNext.toFixed(3) + '%';
+                // Estimates
+                document.getElementById('estHr').innerText = '$' + d.estimates.hr.toFixed(2);
+                document.getElementById('estDay').innerText = '$' + d.estimates.day.toFixed(2);
+                document.getElementById('estWeek').innerText = '$' + d.estimates.week.toFixed(2);
+                document.getElementById('estMonth').innerText = '$' + d.estimates.month.toFixed(0);
+
+                // Risk
+                document.getElementById('curPrice').innerText = d.currentPrice.toFixed(8);
+                document.getElementById('stepText').innerText = d.safetyOrdersFilled + ' / ' + d.settings.maxSteps;
+                document.getElementById('distText').innerText = d.distToNext.toFixed(3) + '%';
 
                 const progressPct = (d.safetyOrdersFilled / d.settings.maxSteps) * 100;
                 const bar = document.getElementById('progressBar');
                 bar.style.width = progressPct + '%';
                 
-                const warning = document.getElementById('riskWarning');
-                if (progressPct > 60) {
-                    warning.classList.remove('hidden');
-                    if (progressPct > 75) bar.style.background = 'linear-gradient(90deg, #dc2626 0%, #ea580c 100%)';
-                    else if (progressPct > 60) bar.style.background = 'linear-gradient(90deg, #f59e0b 0%, #ea580c 100%)';
-                } else {
-                    warning.classList.add('hidden');
-                    bar.style.background = 'linear-gradient(90deg, #059669 0%, #0284c7 100%)';
-                }
+                if(progressPct > 75) bar.classList.replace('from-blue-600', 'from-red-600');
+                else if(progressPct > 45) bar.classList.replace('from-blue-600', 'from-orange-500');
+                else { bar.classList.add('from-blue-600'); bar.classList.remove('from-red-600', 'from-orange-500'); }
+
             } catch (e) {}
         }
-        
-        async function resetStats() { 
-            if(confirm("⚠️ Warning: This resets Locked Balance and Projections. Continue?")) {
-                await fetch('/api/reset-stats', {method:'POST'});
-                update();
-            }
-        }
-        
+        async function resetStats() { if(confirm("This resets Initial Balance and Projections. Continue?")) await fetch('/api/reset-stats', {method:'POST'}); update(); }
         setInterval(update, 1000); 
         update();
     </script>
-    <style>
-        .balance-locked { transition: transform 0.3s ease; }
-        .scale-105 { transform: scale(1.05); }
-    </style>
 </body>
 </html>`);
 });
 
-app.get('/api/status', (req, res) => res.json({
-    ...botState,
-    displayBalance: botState.displayBalance,
-    walletBalance: botState.walletBalance,
-    unrealizedPnL: botState.unrealizedPnL
-}));
-
+app.get('/api/status', (req, res) => res.json(botState));
 app.post('/api/reset-stats', async (req, res) => { 
-    botState.initialBalance = botState.displayBalance;
-    botState.displayBalance = botState.displayBalance;
-    botState.peakBalance = botState.walletBalance;
+    botState.initialBalance = botState.walletBalance; 
     botState.startTime = Date.now();
-    botState.realizedProfit = 0; 
-    botState.profitPct = 0;
+    botState.realizedProfit = 0; botState.profitPct = 0;
     botState.estimates = { hr: 0, day: 0, week: 0, month: 0, dgr: 0 };
-    await BotModel.updateOne({ id: "htx_martingale" }, { 
-        initialBalance: botState.initialBalance, 
-        startTime: botState.startTime, 
-        storedRealizedProfit: 0, 
-        storedProfitPct: 0,
-        peakBalance: botState.peakBalance
-    }, { upsert: true });
-    console.log(`🔄 Session Reset | New locked balance: $${botState.initialBalance.toFixed(4)}`);
+    await BotModel.updateOne({ id: "htx_martingale" }, { initialBalance: botState.initialBalance, startTime: botState.startTime, storedRealizedProfit: 0, storedProfitPct: 0 }, { upsert: true });
     res.sendStatus(200); 
 });
 
