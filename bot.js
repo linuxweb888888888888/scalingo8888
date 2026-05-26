@@ -1,4 +1,3 @@
-require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
@@ -31,7 +30,7 @@ const BotStateSchema = new mongoose.Schema({
         priceDrop: { type: Number, default: 0.1 },
         volumeMult: { type: Number, default: 1.2 },
         takeProfit: { type: Number, default: 1.5 },
-        maxSteps: { type: Number, default: 30 }
+        maxSteps: { type: Number, default: 10 }
     },
     estimates: {
         hr: { type: Number, default: 0 },
@@ -99,7 +98,7 @@ const config = {
 let botState = {};
 let lastPositionFetch = 0;
 let lastAccountFetch = 0;
-const FETCH_INTERVAL = 1000;
+const FETCH_INTERVAL = 1000; // Fetch every 1 second for faster updates
 
 // ==================== PERSISTENCE FUNCTIONS ====================
 async function saveStateToDB() {
@@ -158,7 +157,7 @@ async function loadStateFromDB() {
             safetyOrdersFilled: data.safetyOrdersFilled ?? 0,
             distToNext: data.distToNext ?? 0,
             estimates: data.estimates ?? { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
-            settings: data.settings ?? { baseOrder: 0, priceDrop: 0.1, volumeMult: 1.2, takeProfit: 1.5, maxSteps: 30 },
+            settings: data.settings ?? { baseOrder: 0, priceDrop: 0.1, volumeMult: 1.2, takeProfit: 1.5, maxSteps: 10 },
             openPosition: data.openPosition ?? { volume: 0, direction: "", costHold: 0 },
             allTimeHigh: data.allTimeHigh ?? 0,
             peakProfit: data.peakProfit ?? 0,
@@ -184,7 +183,7 @@ async function loadStateFromDB() {
             safetyOrdersFilled: 0,
             distToNext: 0,
             estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
-            settings: { baseOrder: 0, priceDrop: 0.1, volumeMult: 1.2, takeProfit: 1.5, maxSteps: 30 },
+            settings: { baseOrder: 0, priceDrop: 0.1, volumeMult: 1.2, takeProfit: 1.5, maxSteps: 10 },
             openPosition: { volume: 0, direction: "", costHold: 0 },
             allTimeHigh: 0,
             peakProfit: 0,
@@ -269,25 +268,15 @@ async function fetchPositionAndROI() {
                 costHold: parseFloat(pos.cost_hold)
             };
             
+            // Calculate distance to next safety order
             const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
             botState.distToNext = Math.max(0, ((botState.currentPrice - triggerPrice) / botState.currentPrice) * 100);
         } else {
-            if (botState.openPosition.volume !== 0 || botState.safetyOrdersFilled !== 0) {
-                console.log("🔄 No open orders detected - Resetting bot state to zero");
-                botState.openPosition = { volume: 0, direction: "", costHold: 0 };
-                botState.safetyOrdersFilled = 0;
-                botState.roi = 0;
-                botState.avgPrice = 0;
-                botState.distToNext = 0;
-                await saveStateToDB();
-                await saveTradeHistory('reset', 0, botState.currentPrice, 0, 0, botState.displayBalance);
-            } else {
-                botState.openPosition = { volume: 0, direction: "", costHold: 0 };
-                if (botState.roi !== 0) botState.roi = 0;
-            }
+            botState.openPosition = { volume: 0, direction: "", costHold: 0 };
+            if (botState.roi !== 0) botState.roi = 0;
         }
         
-        console.log(`📊 ROI Updated: ${botState.roi}% | Price: ${botState.currentPrice} | Open Vol: ${botState.openPosition.volume}`);
+        console.log(`📊 ROI Updated: ${botState.roi}% | Price: ${botState.currentPrice}`);
     } catch (e) {
         console.error("Position fetch error:", e);
     }
@@ -300,6 +289,7 @@ async function fetchAccountAndBalance() {
         if (accRes?.data) {
             const acc = accRes.data.find(a => a.margin_asset === 'USDT');
             if (acc) {
+                // Also get position for unrealized PnL
                 const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
                 const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
                 
@@ -334,9 +324,11 @@ async function fetchAccountAndBalance() {
             }
         }
         
+        // Update locked profit calculations
         botState.realizedProfit = botState.displayBalance - botState.initialBalance;
         botState.profitPct = botState.initialBalance > 0 ? (botState.realizedProfit / botState.initialBalance) * 100 : 0;
         
+        // Update estimates based on locked profit
         const elapsedHours = (Date.now() - botState.startTime) / (1000 * 60 * 60);
         const elapsedDays = elapsedHours / 24;
         const lockedProfit = botState.realizedProfit;
@@ -364,125 +356,86 @@ async function fetchAccountAndBalance() {
 }
 
 async function updatePositionSizing() {
-    if (botState.currentPrice > 0 && botState.walletBalance > 0 && botState.walletBalance >= 1) {
-        const m = botState.settings.volumeMult;
-        const n = botState.settings.maxSteps;
-        
-        // Calculate sum of geometric series for base + safety orders
-        let multiplierSum = 0;
-        if (Math.abs(m - 1) < 1e-9) {
-            multiplierSum = n + 1;
-        } else {
-            multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
-        }
-        
-        const contractValue = botState.currentPrice * 1000;
-        const totalPositionValue = (botState.walletBalance * config.leverage) / contractValue;
-        
-        let rawBase = totalPositionValue / multiplierSum;
+    if (botState.currentPrice > 0 && botState.walletBalance > 0) {
+        const m = botState.settings.volumeMult, n = botState.settings.maxSteps;
+        const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
+        const rawBase = (botState.walletBalance * config.leverage) / (multiplierSum * botState.currentPrice * 1000);
         botState.maxSafeBase = Math.floor(rawBase * 0.85);
-        
-        if (botState.maxSafeBase < 1) botState.maxSafeBase = 1;
-        
         botState.settings.baseOrder = botState.maxSafeBase;
-        
-        console.log(`📐 Position Sizing | Balance: $${botState.walletBalance.toFixed(2)} | Price: ${botState.currentPrice} | Base Order: ${botState.settings.baseOrder} | Max Steps: ${n}`);
-        console.log(`   Calculation: Total Value: ${totalPositionValue.toFixed(2)} contracts | Multiplier Sum: ${multiplierSum.toFixed(2)} | Raw Base: ${rawBase.toFixed(2)} | 85%: ${botState.maxSafeBase}`);
     }
 }
 
-// ==================== TRADING LOGIC ====================
+// ==================== TRADING LOGIC (Order execution only) ====================
 async function checkAndExecuteTrades() {
     if (!botState.isRunning || botState.isTrading) return;
     botState.isTrading = true;
 
     try {
+        // Get fresh position data
         const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
         const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
         
         if (pos) {
             const currentROI = parseFloat(pos.profit_rate) * 100;
             const avgPrice = parseFloat(pos.cost_hold);
-            const currentVolume = parseFloat(pos.volume);
             const triggerPrice = avgPrice * (1 - (botState.settings.priceDrop / 100));
             
+            // Check take profit
             if (currentROI >= botState.settings.takeProfit) {
                 const result = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol, 
-                    volume: currentVolume,
-                    direction: 'sell', 
-                    offset: 'close', 
-                    lever_rate: config.leverage, 
-                    order_price_type: 'opponent'
+                    contract_code: config.symbol, volume: pos.volume,
+                    direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
                 
                 if (result?.code === 200) {
-                    await saveTradeHistory('take_profit', currentVolume, botState.currentPrice, botState.safetyOrdersFilled, currentROI, botState.displayBalance);
+                    await saveTradeHistory('take_profit', parseFloat(pos.volume), botState.currentPrice, botState.safetyOrdersFilled, currentROI, botState.displayBalance);
                     botState.safetyOrdersFilled = 0;
-                    console.log(`✅ Take profit! ROI: ${currentROI}% | Volume: ${currentVolume}`);
+                    console.log(`✅ Take profit! ROI: ${currentROI}%`);
                     await saveStateToDB();
-                } else {
-                    console.log(`❌ Take profit failed:`, result);
                 }
             }
+            // Check safety order
             else if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
                 botState.safetyOrdersFilled++;
                 const nextVol = Math.max(1, Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled)));
-                const maxAllowedVol = Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.settings.maxSteps));
-                const finalVol = Math.min(nextVol, maxAllowedVol);
-                
                 const result = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol, 
-                    volume: finalVol,
-                    direction: 'buy', 
-                    offset: 'open', 
-                    lever_rate: config.leverage, 
-                    order_price_type: 'opponent'
+                    contract_code: config.symbol, volume: nextVol,
+                    direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
                 
                 if (result?.code === 200) {
-                    await saveTradeHistory('safety', finalVol, botState.currentPrice, botState.safetyOrdersFilled, 0, botState.displayBalance);
-                    console.log(`📉 Safety Order #${botState.safetyOrdersFilled}/${botState.settings.maxSteps} | Vol: ${finalVol} | Price: ${botState.currentPrice}`);
+                    await saveTradeHistory('safety', nextVol, botState.currentPrice, botState.safetyOrdersFilled, 0, botState.displayBalance);
+                    console.log(`📉 Safety Order #${botState.safetyOrdersFilled} | Vol: ${nextVol}`);
                     await saveStateToDB();
-                } else {
-                    console.log(`❌ Safety order ${botState.safetyOrdersFilled} failed:`, result);
-                    botState.safetyOrdersFilled--;
                 }
             }
         } 
-        else if (botState.maxSafeBase > 0 && botState.settings.baseOrder > 0 && botState.currentPrice > 0) {
-            console.log(`🎯 Attempting to open initial position | Base Order: ${botState.settings.baseOrder} | Price: ${botState.currentPrice}`);
-            
+        // Open initial position
+        else if (botState.maxSafeBase > 0 && botState.settings.baseOrder > 0) {
             const result = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, 
-                volume: botState.settings.baseOrder,
-                direction: 'buy', 
-                offset: 'open', 
-                lever_rate: config.leverage, 
-                order_price_type: 'opponent'
+                contract_code: config.symbol, volume: botState.settings.baseOrder,
+                direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
             
             if (result?.code === 200) {
                 await saveTradeHistory('open', botState.settings.baseOrder, botState.currentPrice, 0, 0, botState.displayBalance);
                 botState.safetyOrdersFilled = 0;
-                console.log(`🎯 Position opened | Vol: ${botState.settings.baseOrder} | Price: ${botState.currentPrice}`);
+                console.log(`🎯 Position opened | Vol: ${botState.settings.baseOrder}`);
                 await saveStateToDB();
-            } else {
-                console.log(`❌ Failed to open position:`, result);
             }
         }
 
     } catch (e) {
         console.error("Trade execution error:", e);
-    } finally {
-        botState.isTrading = false;
     }
+    botState.isTrading = false;
 }
 
 // ==================== STARTUP ====================
 async function boot() {
     await loadStateFromDB();
     
+    // WebSocket for real-time price
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' })));
     ws.on('message', (data) => {
@@ -499,31 +452,32 @@ async function boot() {
         });
     });
     
+    // Fast loops for real-time updates (every 1 second)
     setInterval(async () => {
         await fetchPositionAndROI();
         await updatePositionSizing();
-    }, 1000);
+    }, 1000); // Update ROI and position sizing every second
     
     setInterval(async () => {
         await fetchAccountAndBalance();
-    }, 2000);
+    }, 2000); // Update balance every 2 seconds
     
+    // Trade execution every 2 seconds (but not conflicting)
     setInterval(async () => {
         await checkAndExecuteTrades();
-    }, 3000);
+    }, 2000);
     
-    console.log(`🤖 Bot started | ${config.symbol} | ${config.leverage}X | Max Safety Steps: ${botState.settings.maxSteps}`);
+    console.log(`🤖 Bot started | ${config.symbol} | ${config.leverage}X`);
     console.log(`📊 Initial: Display $${botState.displayBalance.toFixed(2)} | Real $${botState.walletBalance.toFixed(2)}`);
-    console.log(`📐 Base Order Calculator: Will use ${botState.settings.volumeMult}X multiplier for ${botState.settings.maxSteps} steps`);
 }
 
-// ==================== UI ENDPOINTS ====================
+// ==================== UI ====================
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
 <html class="bg-white">
 <head>
-    <title>HTX Compounder V33 | 30-Step Martingale</title>
+    <title>HTX Compounder V33 | Fast Sync Edition</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
@@ -549,10 +503,10 @@ app.get('/', (req, res) => {
             <div>
                 <h1 class="text-gray-900 text-3xl font-bold tracking-tight">
                     COMPOUND<span class="gradient-text">_BOT</span>
-                    <span class="text-sm font-mono text-gray-400 ml-2">v33 | 30-Step</span>
+                    <span class="text-sm font-mono text-gray-400 ml-2">v33</span>
                 </h1>
-                <p class="text-xs text-gray-400 uppercase tracking-wider mt-1">${config.symbol} | ${config.leverage}X Leverage | 30 Safety Orders</p>
-                <p class="text-[10px] text-emerald-600 mt-2">⚡ Real-time updates | Auto-reset on no positions</p>
+                <p class="text-xs text-gray-400 uppercase tracking-wider mt-1">${config.symbol} | ${config.leverage}X Leverage</p>
+                <p class="text-[10px] text-emerald-600 mt-2">⚡ Real-time updates | ROI from exchange every 1s</p>
             </div>
             <div class="text-right">
                 <p class="text-3xl font-bold text-emerald-600" id="dgrText">0.00%</p>
@@ -597,14 +551,10 @@ app.get('/', (req, res) => {
                     <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Multiplier</p>
                     <p class="text-2xl font-bold text-purple-600">${botState.settings.volumeMult || 1.2}X</p>
                 </div>
-                <div class="text-right">
-                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Max Steps</p>
-                    <p class="text-2xl font-bold text-orange-600">${botState.settings.maxSteps || 30}</p>
-                </div>
             </div>
             <div class="mt-4 pt-3 border-t border-gray-100">
                 <div class="flex justify-between text-[10px] text-gray-400">
-                    <span>Safety Orders (1-5):</span>
+                    <span>Safety Orders:</span>
                     <span>1st: <span id="so1">0</span> | 2nd: <span id="so2">0</span> | 3rd: <span id="so3">0</span> | 4th: <span id="so4">0</span> | 5th: <span id="so5">0</span></span>
                 </div>
             </div>
@@ -630,7 +580,7 @@ app.get('/', (req, res) => {
             <div class="flex justify-between items-end mb-6">
                 <div>
                     <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Safety Orders Filled</p>
-                    <p id="stepText" class="text-5xl font-bold text-gray-900 stat-number">0 <span class="text-2xl text-gray-400">/ ${botState.settings.maxSteps || 30}</span></p>
+                    <p id="stepText" class="text-5xl font-bold text-gray-900 stat-number">0 <span class="text-2xl text-gray-400">/ 10</span></p>
                 </div>
                 <div class="text-right">
                     <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Next Step Distance</p>
@@ -642,27 +592,17 @@ app.get('/', (req, res) => {
             </div>
             <div id="riskWarning" class="mt-4 hidden">
                 <div class="bg-amber-50 border border-amber-200 rounded-lg p-3">
-                    <p class="text-amber-700 text-xs font-semibold">⚠️ High Risk Zone - Multiple safety orders active</p>
+                    <p class="text-amber-700 text-xs font-semibold">⚠️ High Risk Zone</p>
                 </div>
             </div>
         </div>
 
         <div class="flex justify-between items-center text-[10px] font-semibold text-gray-400 uppercase tracking-wider">
             <div>Avg Profit/Hr: <span id="estHr" class="text-gray-600 ml-1">$0.000000</span></div>
-            <div class="flex gap-3 items-center">
+            <div class="flex gap-6 items-center">
                 <span>Price: <span id="curPrice" class="text-gray-900 font-mono ml-1">0.00000000</span></span>
-                <button onclick="recalculateBase()" class="text-blue-500 hover:text-blue-700 transition-colors px-3 py-1 rounded-lg hover:bg-blue-50 text-xs font-medium">
-                    🔄 Recalc Base
-                </button>
-                <button onclick="resetStats()" class="text-gray-400 hover:text-orange-500 transition-colors px-3 py-1 rounded-lg hover:bg-orange-50 text-xs font-medium">
-                    Reset Stats
-                </button>
-                <button onclick="resetDatabase()" class="text-red-400 hover:text-red-600 transition-colors px-3 py-1 rounded-lg hover:bg-red-50 text-xs font-medium">
-                    🗑️ Reset DB
-                </button>
-                <button onclick="viewHistory()" class="text-emerald-500 hover:text-emerald-700 transition-colors px-3 py-1 rounded-lg hover:bg-emerald-50 text-xs font-medium">
-                    History
-                </button>
+                <button onclick="resetStats()" class="text-gray-400 hover:text-red-500 transition-colors px-3 py-1 rounded-lg hover:bg-red-50">Reset</button>
+                <button onclick="viewHistory()" class="text-blue-500 hover:text-blue-700 transition-colors px-3 py-1 rounded-lg hover:bg-blue-50">History</button>
             </div>
         </div>
     </div>
@@ -679,42 +619,6 @@ app.get('/', (req, res) => {
             return orders;
         }
         
-        async function recalculateBase() {
-            try {
-                const response = await fetch('/api/recalculate-base', { method: 'POST' });
-                const data = await response.json();
-                if (data.success) {
-                    alert(\`✅ Base recalculated!\\nBase Order: \${data.baseOrder} contracts\\nMax Safe Base: \${data.maxSafeBase}\\nBalance: $\${data.walletBalance.toFixed(2)}\\nPrice: $\${data.currentPrice}\`);
-                    update();
-                } else {
-                    alert('❌ Failed to recalculate: ' + data.error);
-                }
-            } catch (e) {
-                alert('Error recalculating base: ' + e.message);
-            }
-        }
-        
-        async function resetDatabase() {
-            const confirmed = confirm('⚠️ DANGER: This will DELETE ALL TRADE HISTORY and RESET EVERYTHING!\\n\\nAre you absolutely sure?');
-            if (!confirmed) return;
-            
-            const doubleConfirm = confirm('LAST WARNING: This action cannot be undone!\\n\\nClick OK to continue.');
-            if (!doubleConfirm) return;
-            
-            try {
-                const response = await fetch('/api/reset-database?confirm=yes', { method: 'POST' });
-                const data = await response.json();
-                if (data.success) {
-                    alert('✅ Database reset successfully! Page will refresh.');
-                    location.reload();
-                } else {
-                    alert('❌ Reset failed: ' + data.error);
-                }
-            } catch (e) {
-                alert('Error resetting database: ' + e.message);
-            }
-        }
-        
         async function update() {
             try {
                 const r = await fetch('/api/status'); 
@@ -727,6 +631,7 @@ app.get('/', (req, res) => {
                 document.getElementById('openVol').innerHTML = d.openPosition?.volume?.toFixed(0) || 0;
                 document.getElementById('ath').innerHTML = '$' + (d.allTimeHigh || d.displayBalance).toFixed(2);
                 
+                // Animate ROI on change
                 if (d.roi !== lastROI) {
                     const roiEl = document.getElementById('roi');
                     roiEl.classList.add('roi-update');
@@ -797,7 +702,7 @@ app.get('/', (req, res) => {
             }
         }
         
-        setInterval(update, 500);
+        setInterval(update, 500); // Update UI every 500ms for smoother display
         update();
     </script>
     <style>
@@ -845,75 +750,6 @@ app.post('/api/reset-stats', async (req, res) => {
 app.post('/api/save-now', async (req, res) => {
     await saveStateToDB();
     res.sendStatus(200);
-});
-
-// New endpoint: Reset entire database
-app.post('/api/reset-database', async (req, res) => {
-    try {
-        if (req.query.confirm !== 'yes') {
-            return res.status(400).json({ error: 'Use ?confirm=yes to reset database' });
-        }
-        
-        await BotState.deleteMany({});
-        await TradeHistory.deleteMany({});
-        await DailySnapshot.deleteMany({});
-        
-        botState = {
-            isRunning: true,
-            isTrading: false,
-            startTime: Date.now(),
-            currentPrice: botState.currentPrice || 0,
-            avgPrice: 0,
-            roi: 0,
-            realizedProfit: 0,
-            profitPct: 0,
-            walletBalance: botState.walletBalance || 0,
-            displayBalance: botState.displayBalance || 0,
-            peakBalance: botState.peakBalance || 0,
-            initialBalance: botState.initialBalance || 0,
-            maxSafeBase: 0,
-            safetyOrdersFilled: 0,
-            distToNext: 0,
-            estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
-            settings: { 
-                baseOrder: 0, 
-                priceDrop: 0.1, 
-                volumeMult: 1.2, 
-                takeProfit: 1.5, 
-                maxSteps: 30 
-            },
-            openPosition: { volume: 0, direction: "", costHold: 0 },
-            allTimeHigh: 0,
-            peakProfit: 0,
-            totalTrades: 0,
-            winningTrades: 0
-        };
-        
-        await saveStateToDB();
-        
-        console.log("🗑️ Database completely reset!");
-        res.json({ success: true, message: "Database reset successfully" });
-    } catch (e) {
-        console.error("Reset error:", e);
-        res.status(500).json({ error: e.message });
-    }
-});
-
-// New endpoint: Force recalculate base order
-app.post('/api/recalculate-base', async (req, res) => {
-    try {
-        await updatePositionSizing();
-        await saveStateToDB();
-        res.json({ 
-            success: true, 
-            baseOrder: botState.settings.baseOrder,
-            maxSafeBase: botState.maxSafeBase,
-            walletBalance: botState.walletBalance,
-            currentPrice: botState.currentPrice
-        });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
 });
 
 process.on('SIGINT', async () => {
