@@ -40,15 +40,15 @@ let botState = {
     roi: 0, 
     realizedProfit: 0, 
     profitPct: 0,      
-    walletBalance: 0,  // The STATIC Cash Balance
+    walletBalance: 0,  // TRUE STATIC
     initialBalance: 0, 
     safetyOrdersFilled: 0,
     distToNext: 0,
     estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 }, 
     settings: {
         baseOrder: 0, 
-        priceDrop: 0.20,      
-        volumeMult: 1.35,     
+        priceDrop: 0.15,      
+        volumeMult: 1.3,     
         takeProfit: 1.1, 
         maxSteps: 10
     }
@@ -64,8 +64,12 @@ async function htxRequest(method, path, data = {}) {
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
         const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 5000 });
+        if (res.data?.status !== 'ok') console.log(`⚠️ HTX Error: ${JSON.stringify(res.data)}`);
         return res.data;
-    } catch (e) { return null; }
+    } catch (e) { 
+        console.log(`❌ API Connection Error`);
+        return null; 
+    }
 }
 
 // ==================== TRADING LOGIC ====================
@@ -84,9 +88,10 @@ async function runLogic() {
         if (accRes?.data) {
             const acc = accRes.data.find(a => a.margin_asset === 'USDT');
             if (acc) {
-                // FORCE STATIC: Cash Balance = Margin Balance - Unrealized PnL
                 const equity = parseFloat(acc.margin_balance) || 0;
                 const unrealized = pos ? (parseFloat(pos.unrealized_pnl) || 0) : 0;
+                
+                // STATIC BALANCE (Cash only)
                 botState.walletBalance = equity - unrealized;
                 
                 if (botState.initialBalance <= 0 && botState.walletBalance > 0) {
@@ -96,22 +101,23 @@ async function runLogic() {
             }
         }
 
-        // ==================== DYNAMIC 10-STEP MATH ====================
-        // Calculate the base order so that 10 steps fit in the balance
+        // ==================== DYNAMIC CAPITAL SCALING ====================
         const m = botState.settings.volumeMult;
         const n = botState.settings.maxSteps;
         const multiplierSum = (Math.pow(m, n + 1) - 1) / (m - 1);
         
-        // Use 75% of static wallet balance to be ultra-safe with leverage
-        const totalCapitalAvailable = botState.walletBalance * config.leverage * 0.75;
-        const baseVolumeNotional = totalCapitalAvailable / multiplierSum;
+        // Use a conservative chunk of leverage for base order to fit all 10 steps
+        // Formula: (Wallet * Leverage * Buffer) / SeriesSum
+        const maxSeriesValue = (botState.walletBalance * config.leverage * 0.65);
+        const baseNotional = maxSeriesValue / multiplierSum;
         
-        // Calculate Base Order in contracts (Assuming 1 contract = $10 or similar based on symbol)
-        // We divide by currentPrice to get quantity
-        const calculatedBase = Math.max(1, Math.floor(baseVolumeNotional / botState.currentPrice));
+        // IMPORTANT: Volume is in Contracts. For many coins, 1 contract = $10.
+        // We floor this to ensure we don't over-leverage.
+        let calculatedBase = Math.floor(baseNotional / 10); 
+        if (calculatedBase < 1) calculatedBase = 1; // Min 1 contract
         botState.settings.baseOrder = calculatedBase;
 
-        // Static Stats
+        // Static Gains
         botState.realizedProfit = botState.walletBalance - botState.initialBalance;
         botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
 
@@ -133,16 +139,15 @@ async function runLogic() {
             botState.distToNext = Math.max(0, ((botState.currentPrice - triggerPrice) / botState.currentPrice) * 100);
 
             if (botState.roi >= botState.settings.takeProfit) {
-                // Take Profit
+                console.log("🎯 Taking Profit...");
                 await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: pos.volume,
                     direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
-                botState.safetyOrdersFilled = 0;
             } else if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
-                // Safety Order
                 botState.safetyOrdersFilled++;
                 const nextVol = Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled));
+                console.log(`🛠 Filling Safety Order #${botState.safetyOrdersFilled}...`);
                 await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: Math.max(1, nextVol),
                     direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
@@ -150,15 +155,16 @@ async function runLogic() {
             }
         } else {
             // OPEN INITIAL POSITION
-            botState.safetyOrdersFilled = 0;
-            botState.roi = 0;
-            await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: botState.settings.baseOrder,
-                direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
-            });
+            if (botState.walletBalance > 0) {
+                console.log(`🚀 Opening Base Position: ${botState.settings.baseOrder} contracts`);
+                botState.safetyOrdersFilled = 0;
+                await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
+                    contract_code: config.symbol, volume: botState.settings.baseOrder,
+                    direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+                });
+            }
         }
-
-    } catch (e) { console.error("Loop Error:", e.message); }
+    } catch (e) {}
     botState.isTrading = false;
 }
 
@@ -182,26 +188,25 @@ async function boot() {
             }
         });
     });
-    setInterval(runLogic, 4000); // 4 second loop
+    setInterval(runLogic, 4000); 
 }
 
-// ==================== UI ====================
+// ==================== UI (WHITE DESIGN) ====================
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
 <html class="bg-slate-50">
 <head>
-    <title>HTX Compounder V33</title>
+    <title>HTX Engine V33</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@500;700&display=swap" rel="stylesheet">
     <style>
         body { font-family: 'Roboto Mono', monospace; }
-        .glass { background: white; border: 1px solid rgba(0, 0, 0, 0.08); box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05); }
+        .glass { background: white; border: 1px solid rgba(0, 0, 0, 0.08); box-shadow: 0 4px 12px rgba(0, 0, 0, 0.03); }
     </style>
 </head>
 <body class="text-slate-600 p-4 md:p-10">
     <div class="max-w-6xl mx-auto">
-        
         <div class="flex justify-between items-center mb-10">
             <div>
                 <h1 class="text-slate-900 text-2xl font-bold tracking-tighter uppercase">Compounding <span class="text-blue-600">Engine</span></h1>
@@ -213,7 +218,6 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- STATS GRID -->
         <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
             <div class="glass p-6 rounded-3xl">
                 <p class="text-[10px] text-slate-400 uppercase font-bold mb-2">Static Profit</p>
@@ -224,7 +228,7 @@ app.get('/', (req, res) => {
                 <p id="p2" class="text-3xl text-emerald-600 font-bold">0.00%</p>
             </div>
             <div class="glass p-6 rounded-3xl">
-                <p class="text-[10px] text-slate-400 uppercase font-bold mb-2">Live Position ROI</p>
+                <p class="text-[10px] text-slate-400 uppercase font-bold mb-2">Live ROI</p>
                 <p id="roi" class="text-3xl text-slate-300 font-bold">0.00%</p>
             </div>
             <div class="glass p-6 rounded-3xl">
@@ -251,7 +255,6 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- RISK & PROGRESS -->
         <div class="glass p-8 rounded-[2rem] mb-8">
             <div class="flex justify-between items-end mb-6">
                 <div>
@@ -259,20 +262,19 @@ app.get('/', (req, res) => {
                     <p id="stepText" class="text-5xl text-slate-900 font-bold">0 / 10</p>
                 </div>
                 <div class="text-right">
-                    <p class="text-[10px] text-slate-400 font-bold uppercase mb-1">Price Drop to Next Step</p>
+                    <p class="text-[10px] text-slate-400 font-bold uppercase mb-1">Price Gap to Next</p>
                     <p id="distText" class="text-5xl text-orange-500 font-bold">0.00%</p>
                 </div>
             </div>
-            <div class="w-full bg-slate-100 rounded-full h-5 overflow-hidden shadow-inner p-1">
+            <div class="w-full bg-slate-100 rounded-full h-5 overflow-hidden p-1 shadow-inner">
                 <div id="progressBar" class="bg-blue-600 h-full rounded-full transition-all duration-1000" style="width: 0%"></div>
             </div>
         </div>
 
-        <!-- FOOTER -->
         <div class="flex justify-between items-center text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-            <div>Static Hr: <span id="estHr" class="text-slate-600 ml-1">$0.00</span></div>
+            <div>Static Hourly: <span id="estHr" class="text-slate-600 ml-1">$0.00</span></div>
             <div class="flex gap-8">
-                <span>Base Order: <span id="baseText" class="text-blue-600">0</span></span>
+                <span>Base Size: <span id="bsText" class="text-blue-600">0</span></span>
                 <span>Price: <span id="curPrice" class="text-slate-900 ml-1">0.00</span></span>
                 <button onclick="resetStats()" class="text-red-400 hover:text-red-600">Reset Session</button>
             </div>
@@ -287,7 +289,7 @@ app.get('/', (req, res) => {
                 document.getElementById('p1').innerText = '$' + d.realizedProfit.toFixed(4);
                 document.getElementById('p2').innerText = d.profitPct.toFixed(2) + '%';
                 document.getElementById('bal').innerText = '$' + d.walletBalance.toFixed(2);
-                document.getElementById('baseText').innerText = d.settings.baseOrder;
+                document.getElementById('bsText').innerText = d.settings.baseOrder;
                 
                 const roiEl = document.getElementById('roi');
                 roiEl.innerText = d.roi.toFixed(2) + '%';
@@ -325,7 +327,4 @@ app.post('/api/reset-stats', async (req, res) => {
     res.sendStatus(200); 
 });
 
-app.listen(config.port, () => {
-    console.log(`Server live on port ${config.port}`);
-    boot();
-});
+app.listen(config.port, boot);
