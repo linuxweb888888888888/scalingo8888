@@ -116,7 +116,7 @@ function updateEstimates() {
     }
 }
 
-// ==================== UPDATE DISTANCE (REAL-TIME) ====================
+// ==================== UPDATE DISTANCE (REAL-TIME FROM PRICE) ====================
 function updateDistance() {
     if (botState.openPosition && botState.openPosition.volume > 0 && botState.avgPrice > 0 && botState.currentPrice > 0) {
         const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
@@ -127,13 +127,14 @@ function updateDistance() {
     }
 }
 
-// ==================== FAST UPDATE FUNCTIONS ====================
+// ==================== FETCH FROM EXCHANGE ONLY ====================
 async function fetchPositionAndROI() {
     try {
         const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
         const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
         
         if (pos) {
+            // ONLY use exchange ROI - this includes fees, funding, etc.
             botState.roi = parseFloat(pos.profit_rate) * 100;
             botState.avgPrice = parseFloat(pos.cost_hold);
             botState.openPosition = {
@@ -142,10 +143,12 @@ async function fetchPositionAndROI() {
                 costHold: parseFloat(pos.cost_hold)
             };
             updateDistance();
+            console.log(`📊 Exchange ROI: ${botState.roi.toFixed(2)}% | Vol: ${botState.openPosition.volume} | Avg: ${botState.avgPrice}`);
         } else {
             botState.openPosition = { volume: 0, direction: "", costHold: 0 };
             botState.roi = 0;
             botState.distToNext = 0;
+            botState.avgPrice = 0;
         }
     } catch (e) {
         console.error("Position fetch error:", e);
@@ -243,6 +246,7 @@ async function checkAndExecuteTrades() {
         const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
         
         if (pos) {
+            // Use exchange ROI for trade decisions too
             const currentROI = parseFloat(pos.profit_rate) * 100;
             const avgPrice = parseFloat(pos.cost_hold);
             const triggerPrice = avgPrice * (1 - (botState.settings.priceDrop / 100));
@@ -320,6 +324,7 @@ function forceUpdateSettings() {
 }
 
 function fullReset() {
+    const currentWallet = botState.walletBalance;
     botState = {
         isRunning: true,
         isTrading: false,
@@ -329,10 +334,10 @@ function fullReset() {
         roi: 0,
         realizedProfit: 0,
         profitPct: 0,
-        walletBalance: botState.walletBalance,
-        displayBalance: botState.walletBalance,
-        peakBalance: botState.walletBalance,
-        initialBalance: botState.walletBalance,
+        walletBalance: currentWallet,
+        displayBalance: currentWallet,
+        peakBalance: currentWallet,
+        initialBalance: currentWallet,
         maxSafeBase: 0,
         safetyOrdersFilled: 0,
         distToNext: 0,
@@ -355,7 +360,7 @@ function fullReset() {
             direction: "",
             costHold: 0
         },
-        allTimeHigh: botState.walletBalance,
+        allTimeHigh: currentWallet,
         peakProfit: 0,
         totalTrades: 0,
         winningTrades: 0
@@ -368,8 +373,9 @@ function fullReset() {
 // ==================== STARTUP ====================
 async function boot() {
     console.log(`🤖 Bot started | ${config.symbol} | ${config.leverage}X`);
+    console.log(`📊 Using EXCHANGE ONLY for ROI data (no WebSocket calculations)`);
     
-    // WebSocket for real-time price
+    // WebSocket for real-time price ONLY (no ROI calculation)
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' })));
     ws.on('message', (data) => {
@@ -381,17 +387,11 @@ async function boot() {
                         const newPrice = parseFloat(msg.tick.close);
                         botState.currentPrice = newPrice;
                         
-                        // REAL-TIME DISTANCE UPDATE ON EVERY PRICE CHANGE
+                        // ONLY update distance - NO ROI calculation here
                         if (botState.openPosition && botState.openPosition.volume > 0 && botState.avgPrice > 0) {
                             const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
                             const distance = ((newPrice - triggerPrice) / newPrice) * 100;
                             botState.distToNext = Math.max(0, distance);
-                            
-                            // Update ROI in real-time
-                            if (botState.openPosition.costHold > 0) {
-                                const unrealizedROI = ((newPrice - botState.avgPrice) / botState.avgPrice) * 100;
-                                botState.roi = unrealizedROI;
-                            }
                         }
                     }
                     if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
@@ -402,7 +402,7 @@ async function boot() {
     
     // Fast loops for real-time updates
     setInterval(async () => {
-        await fetchPositionAndROI();
+        await fetchPositionAndROI();  // This gets exchange ROI
         await updatePositionSizing();
     }, 1000);
     
@@ -414,7 +414,7 @@ async function boot() {
         await checkAndExecuteTrades();
     }, 2000);
     
-    console.log(`📊 Waiting for price data...`);
+    console.log(`📊 Waiting for exchange data...`);
 }
 
 // ==================== UI ====================
@@ -422,7 +422,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html class="bg-white">
 <head>
-    <title>HTX Compounder | Real-Time</title>
+    <title>HTX Compounder | Exchange ROI Only</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
@@ -448,10 +448,10 @@ app.get('/', (req, res) => {
             <div>
                 <h1 class="text-gray-900 text-3xl font-bold tracking-tight">
                     COMPOUND<span class="gradient-text">_BOT</span>
-                    <span class="text-sm font-mono text-gray-400 ml-2">Real-Time</span>
+                    <span class="text-sm font-mono text-gray-400 ml-2">Exchange ROI</span>
                 </h1>
                 <p class="text-xs text-gray-400 uppercase tracking-wider mt-1">${config.symbol} | ${config.leverage}X Leverage</p>
-                <p class="text-[10px] text-emerald-600 mt-2">⚡ Real-time distance updates | TP=${botState.settings.takeProfit}% | Steps=${botState.settings.maxSteps}</p>
+                <p class="text-[10px] text-emerald-600 mt-2">📡 ROI from exchange API (includes fees) | Distance from price feed</p>
             </div>
             <div class="text-right">
                 <p class="text-3xl font-bold text-emerald-600" id="dgrText">0.00%</p>
