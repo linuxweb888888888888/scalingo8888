@@ -46,10 +46,10 @@ let botState = {
     distToNext: 0,
     settings: {
         baseOrder: 0,
-        priceDrop: 1.5,      // CHANGED: 1.5% drop for safety orders (was 0.1%)
+        priceDrop: 0.1,      // CHANGED: 1.5% drop for safety orders (was 0.1%)
         volumeMult: 1.2,
-        takeProfit: 2.0,     // CHANGED: 2% take profit (was 1.5%)
-        maxSteps: 5          // CHANGED: Max 5 safety orders (was 10)
+        takeProfit: 1,     // CHANGED: 2% take profit (was 1.5%)
+        maxSteps: 10          // CHANGED: Max 5 safety orders (was 10)
     },
     estimates: {
         hr: 0,
