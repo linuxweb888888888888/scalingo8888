@@ -31,7 +31,7 @@ const BotStateSchema = new mongoose.Schema({
         priceDrop: { type: Number, default: 0.1 },
         volumeMult: { type: Number, default: 1.2 },
         takeProfit: { type: Number, default: 1.5 },
-        maxSteps: { type: Number, default: 10 }
+        maxSteps: { type: Number, default: 30 }  // Changed from 10 to 30
     },
     estimates: {
         hr: { type: Number, default: 0 },
@@ -158,7 +158,7 @@ async function loadStateFromDB() {
             safetyOrdersFilled: data.safetyOrdersFilled ?? 0,
             distToNext: data.distToNext ?? 0,
             estimates: data.estimates ?? { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
-            settings: data.settings ?? { baseOrder: 0, priceDrop: 0.1, volumeMult: 1.2, takeProfit: 1.5, maxSteps: 10 },
+            settings: data.settings ?? { baseOrder: 0, priceDrop: 0.1, volumeMult: 1.2, takeProfit: 1.5, maxSteps: 30 },  // Changed to 30
             openPosition: data.openPosition ?? { volume: 0, direction: "", costHold: 0 },
             allTimeHigh: data.allTimeHigh ?? 0,
             peakProfit: data.peakProfit ?? 0,
@@ -184,7 +184,7 @@ async function loadStateFromDB() {
             safetyOrdersFilled: 0,
             distToNext: 0,
             estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
-            settings: { baseOrder: 0, priceDrop: 0.1, volumeMult: 1.2, takeProfit: 1.5, maxSteps: 10 },
+            settings: { baseOrder: 0, priceDrop: 0.1, volumeMult: 1.2, takeProfit: 1.5, maxSteps: 30 },  // Changed to 30
             openPosition: { volume: 0, direction: "", costHold: 0 },
             allTimeHigh: 0,
             peakProfit: 0,
@@ -273,11 +273,23 @@ async function fetchPositionAndROI() {
             const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
             botState.distToNext = Math.max(0, ((botState.currentPrice - triggerPrice) / botState.currentPrice) * 100);
         } else {
-            botState.openPosition = { volume: 0, direction: "", costHold: 0 };
-            if (botState.roi !== 0) botState.roi = 0;
+            // NO OPEN ORDERS DETECTED - RESET TO ZERO
+            if (botState.openPosition.volume !== 0 || botState.safetyOrdersFilled !== 0) {
+                console.log("🔄 No open orders detected - Resetting bot state to zero");
+                botState.openPosition = { volume: 0, direction: "", costHold: 0 };
+                botState.safetyOrdersFilled = 0;
+                botState.roi = 0;
+                botState.avgPrice = 0;
+                botState.distToNext = 0;
+                await saveStateToDB();
+                await saveTradeHistory('reset', 0, botState.currentPrice, 0, 0, botState.displayBalance);
+            } else {
+                botState.openPosition = { volume: 0, direction: "", costHold: 0 };
+                if (botState.roi !== 0) botState.roi = 0;
+            }
         }
         
-        console.log(`📊 ROI Updated: ${botState.roi}% | Price: ${botState.currentPrice}`);
+        console.log(`📊 ROI Updated: ${botState.roi}% | Price: ${botState.currentPrice} | Open Vol: ${botState.openPosition.volume}`);
     } catch (e) {
         console.error("Position fetch error:", e);
     }
@@ -358,11 +370,32 @@ async function fetchAccountAndBalance() {
 
 async function updatePositionSizing() {
     if (botState.currentPrice > 0 && botState.walletBalance > 0) {
-        const m = botState.settings.volumeMult, n = botState.settings.maxSteps;
-        const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
-        const rawBase = (botState.walletBalance * config.leverage) / (multiplierSum * botState.currentPrice * 1000);
+        const m = botState.settings.volumeMult;
+        const n = botState.settings.maxSteps; // Now 30 steps
+        
+        // Calculate sum of geometric series for 30 steps
+        let multiplierSum = 0;
+        if (Math.abs(m - 1) < 1e-9) {
+            multiplierSum = n + 1; // If multiplier is 1, sum = n+1
+        } else {
+            multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
+        }
+        
+        // Calculate base order size
+        // Each contract value = currentPrice * 1000 (since SHIB contract size)
+        const contractValue = botState.currentPrice * 1000;
+        const totalPositionValue = (botState.walletBalance * config.leverage) / contractValue;
+        
+        // Base order = total position / multiplier sum, then take 85% for safety margin
+        let rawBase = totalPositionValue / multiplierSum;
         botState.maxSafeBase = Math.floor(rawBase * 0.85);
+        
+        // Ensure minimum of 1 contract
+        if (botState.maxSafeBase < 1) botState.maxSafeBase = 1;
+        
         botState.settings.baseOrder = botState.maxSafeBase;
+        
+        console.log(`📐 Position Sizing | Balance: $${botState.walletBalance.toFixed(2)} | Base Order: ${botState.settings.baseOrder} | Max Steps: ${n}`);
     }
 }
 
@@ -379,57 +412,86 @@ async function checkAndExecuteTrades() {
         if (pos) {
             const currentROI = parseFloat(pos.profit_rate) * 100;
             const avgPrice = parseFloat(pos.cost_hold);
+            const currentVolume = parseFloat(pos.volume);
             const triggerPrice = avgPrice * (1 - (botState.settings.priceDrop / 100));
             
             // Check take profit
             if (currentROI >= botState.settings.takeProfit) {
                 const result = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol, volume: pos.volume,
-                    direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
+                    contract_code: config.symbol, 
+                    volume: currentVolume,
+                    direction: 'sell', 
+                    offset: 'close', 
+                    lever_rate: config.leverage, 
+                    order_price_type: 'opponent'
                 });
                 
                 if (result?.code === 200) {
-                    await saveTradeHistory('take_profit', parseFloat(pos.volume), botState.currentPrice, botState.safetyOrdersFilled, currentROI, botState.displayBalance);
+                    await saveTradeHistory('take_profit', currentVolume, botState.currentPrice, botState.safetyOrdersFilled, currentROI, botState.displayBalance);
                     botState.safetyOrdersFilled = 0;
-                    console.log(`✅ Take profit! ROI: ${currentROI}%`);
+                    console.log(`✅ Take profit! ROI: ${currentROI}% | Volume: ${currentVolume}`);
                     await saveStateToDB();
+                } else {
+                    console.log(`❌ Take profit failed:`, result);
                 }
             }
-            // Check safety order
+            // Check safety order (up to 30 steps)
             else if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
                 botState.safetyOrdersFilled++;
+                // Calculate next volume based on multiplier
                 const nextVol = Math.max(1, Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled)));
+                
+                // Ensure we don't exceed position limits (safety check)
+                const maxAllowedVol = Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.settings.maxSteps));
+                const finalVol = Math.min(nextVol, maxAllowedVol);
+                
                 const result = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol, volume: nextVol,
-                    direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+                    contract_code: config.symbol, 
+                    volume: finalVol,
+                    direction: 'buy', 
+                    offset: 'open', 
+                    lever_rate: config.leverage, 
+                    order_price_type: 'opponent'
                 });
                 
                 if (result?.code === 200) {
-                    await saveTradeHistory('safety', nextVol, botState.currentPrice, botState.safetyOrdersFilled, 0, botState.displayBalance);
-                    console.log(`📉 Safety Order #${botState.safetyOrdersFilled} | Vol: ${nextVol}`);
+                    await saveTradeHistory('safety', finalVol, botState.currentPrice, botState.safetyOrdersFilled, 0, botState.displayBalance);
+                    console.log(`📉 Safety Order #${botState.safetyOrdersFilled}/${botState.settings.maxSteps} | Vol: ${finalVol} | Price: ${botState.currentPrice}`);
                     await saveStateToDB();
+                } else {
+                    console.log(`❌ Safety order ${botState.safetyOrdersFilled} failed:`, result);
+                    botState.safetyOrdersFilled--; // Rollback on failure
                 }
             }
         } 
-        // Open initial position
-        else if (botState.maxSafeBase > 0 && botState.settings.baseOrder > 0) {
+        // Open initial position if no position exists and we have calculated base order
+        else if (botState.maxSafeBase > 0 && botState.settings.baseOrder > 0 && botState.currentPrice > 0) {
+            console.log(`🎯 Attempting to open initial position | Base Order: ${botState.settings.baseOrder} | Price: ${botState.currentPrice}`);
+            
             const result = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: botState.settings.baseOrder,
-                direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+                contract_code: config.symbol, 
+                volume: botState.settings.baseOrder,
+                direction: 'buy', 
+                offset: 'open', 
+                lever_rate: config.leverage, 
+                order_price_type: 'opponent'
             });
             
             if (result?.code === 200) {
                 await saveTradeHistory('open', botState.settings.baseOrder, botState.currentPrice, 0, 0, botState.displayBalance);
                 botState.safetyOrdersFilled = 0;
-                console.log(`🎯 Position opened | Vol: ${botState.settings.baseOrder}`);
+                console.log(`🎯 Position opened | Vol: ${botState.settings.baseOrder} | Price: ${botState.currentPrice}`);
                 await saveStateToDB();
+            } else {
+                console.log(`❌ Failed to open position:`, result);
             }
         }
 
     } catch (e) {
         console.error("Trade execution error:", e);
+    } finally {
+        botState.isTrading = false;
     }
-    botState.isTrading = false;
 }
 
 // ==================== STARTUP ====================
@@ -463,13 +525,14 @@ async function boot() {
         await fetchAccountAndBalance();
     }, 2000); // Update balance every 2 seconds
     
-    // Trade execution every 2 seconds (but not conflicting)
+    // Trade execution every 3 seconds (slower to avoid conflicts)
     setInterval(async () => {
         await checkAndExecuteTrades();
-    }, 2000);
+    }, 3000);
     
-    console.log(`🤖 Bot started | ${config.symbol} | ${config.leverage}X`);
+    console.log(`🤖 Bot started | ${config.symbol} | ${config.leverage}X | Max Safety Steps: ${botState.settings.maxSteps}`);
     console.log(`📊 Initial: Display $${botState.displayBalance.toFixed(2)} | Real $${botState.walletBalance.toFixed(2)}`);
+    console.log(`📐 Base Order Calculator: Will use ${botState.settings.volumeMult}X multiplier for ${botState.settings.maxSteps} steps`);
 }
 
 // ==================== UI ====================
@@ -478,7 +541,7 @@ app.get('/', (req, res) => {
 <!DOCTYPE html>
 <html class="bg-white">
 <head>
-    <title>HTX Compounder V33 | Fast Sync Edition</title>
+    <title>HTX Compounder V33 | 30-Step Martingale</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
@@ -504,10 +567,10 @@ app.get('/', (req, res) => {
             <div>
                 <h1 class="text-gray-900 text-3xl font-bold tracking-tight">
                     COMPOUND<span class="gradient-text">_BOT</span>
-                    <span class="text-sm font-mono text-gray-400 ml-2">v33</span>
+                    <span class="text-sm font-mono text-gray-400 ml-2">v33 | 30-Step</span>
                 </h1>
-                <p class="text-xs text-gray-400 uppercase tracking-wider mt-1">${config.symbol} | ${config.leverage}X Leverage</p>
-                <p class="text-[10px] text-emerald-600 mt-2">⚡ Real-time updates | ROI from exchange every 1s</p>
+                <p class="text-xs text-gray-400 uppercase tracking-wider mt-1">${config.symbol} | ${config.leverage}X Leverage | 30 Safety Orders</p>
+                <p class="text-[10px] text-emerald-600 mt-2">⚡ Real-time updates | Auto-reset on no positions</p>
             </div>
             <div class="text-right">
                 <p class="text-3xl font-bold text-emerald-600" id="dgrText">0.00%</p>
@@ -552,10 +615,14 @@ app.get('/', (req, res) => {
                     <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Multiplier</p>
                     <p class="text-2xl font-bold text-purple-600">${botState.settings.volumeMult || 1.2}X</p>
                 </div>
+                <div class="text-right">
+                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Max Steps</p>
+                    <p class="text-2xl font-bold text-orange-600">${botState.settings.maxSteps || 30}</p>
+                </div>
             </div>
             <div class="mt-4 pt-3 border-t border-gray-100">
                 <div class="flex justify-between text-[10px] text-gray-400">
-                    <span>Safety Orders:</span>
+                    <span>Safety Orders (1-5):</span>
                     <span>1st: <span id="so1">0</span> | 2nd: <span id="so2">0</span> | 3rd: <span id="so3">0</span> | 4th: <span id="so4">0</span> | 5th: <span id="so5">0</span></span>
                 </div>
             </div>
@@ -581,7 +648,7 @@ app.get('/', (req, res) => {
             <div class="flex justify-between items-end mb-6">
                 <div>
                     <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Safety Orders Filled</p>
-                    <p id="stepText" class="text-5xl font-bold text-gray-900 stat-number">0 <span class="text-2xl text-gray-400">/ 10</span></p>
+                    <p id="stepText" class="text-5xl font-bold text-gray-900 stat-number">0 <span class="text-2xl text-gray-400">/ ${botState.settings.maxSteps || 30}</span></p>
                 </div>
                 <div class="text-right">
                     <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Next Step Distance</p>
@@ -593,7 +660,7 @@ app.get('/', (req, res) => {
             </div>
             <div id="riskWarning" class="mt-4 hidden">
                 <div class="bg-amber-50 border border-amber-200 rounded-lg p-3">
-                    <p class="text-amber-700 text-xs font-semibold">⚠️ High Risk Zone</p>
+                    <p class="text-amber-700 text-xs font-semibold">⚠️ High Risk Zone - Multiple safety orders active</p>
                 </div>
             </div>
         </div>
