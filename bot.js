@@ -16,7 +16,7 @@ mongoose.connect(MONGO_URI).then(() => console.log("📦 MongoDB Connected"));
 const BotSchema = new mongoose.Schema({
     id: { type: String, default: "htx_martingale" },
     initialBalance: { type: Number, default: 0 },
-    startTime: { type: Number, default: Date.now() }
+    startTime: { type: Number, default: Date.now()
 });
 const BotModel = mongoose.model('BotConfig_V33', BotSchema);
 
@@ -48,7 +48,7 @@ let botState = {
     settings: {
         baseOrder: 0, 
         priceDrop: 0.1,      // As requested
-        volumeMult: 1.2,     // As requested
+        volumeMult: 1.2,     // As requested - FIXED MULTIPLIER
         takeProfit: 1.5,     // As requested
         maxSteps: 10,
         faceValue: 0.001
@@ -90,15 +90,15 @@ async function runLogic() {
                 const equity = parseFloat(acc.margin_balance);
                 botState.walletBalance = Number(equity.toFixed(4));
                 
-                // DYNAMIC FIT MATH (Multiplier is always 1.2)
-                const m = botState.settings.volumeMult; 
+                // DYNAMIC FIT MATH WITH FIXED MULTIPLIER 1.2
+                const m = 1.2; // FIXED MULTIPLIER
                 const n = 10; 
                 const multiplierSum = (Math.pow(m, n + 1) - 1) / (m - 1); // ~32.15
                 
                 const totalAllowedMargin = botState.walletBalance * 0.85; 
                 const baseMargin = totalAllowedMargin / multiplierSum;
                 
-                // For $1.81, this results in ~450-480 contracts
+                // Base order calculation using 1.2 multiplier
                 botState.settings.baseOrder = Math.max(1, Math.floor((baseMargin * config.leverage) / botState.settings.faceValue));
                 
                 if (botState.initialBalance <= 0) {
@@ -139,8 +139,9 @@ async function runLogic() {
                 botState.safetyOrdersFilled = 0;
             } else if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
                 botState.safetyOrdersFilled++;
-                // Multiplier 1.2 is used here: Base * 1.2^step
-                const nextVol = Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled));
+                // MULTIPLIER 1.2 IS USED HERE (as requested)
+                // Volume = BaseOrder * (1.2 ^ step)
+                const nextVol = Math.floor(botState.settings.baseOrder * Math.pow(1.2, botState.safetyOrdersFilled));
                 await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: Math.max(1, nextVol),
                     direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
@@ -153,7 +154,9 @@ async function runLogic() {
                 direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
         }
-    } catch (e) {}
+    } catch (e) {
+        console.error("Trading loop error:", e?.message || e);
+    }
     botState.isTrading = false;
 }
 
@@ -186,7 +189,7 @@ app.get('/', (req, res) => {
 <!DOCTYPE html>
 <html class="bg-slate-50">
 <head>
-    <title>HTX Engine V33</title>
+    <title>HTX Engine V33 | Fixed 1.2x Multiplier</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@500;700&display=swap" rel="stylesheet">
     <style>
@@ -198,7 +201,7 @@ app.get('/', (req, res) => {
     <div class="max-w-6xl mx-auto">
         <div class="flex justify-between items-center mb-10">
             <div>
-                <h1 class="text-slate-900 text-2xl font-bold tracking-tighter uppercase">Static <span class="text-blue-600">Engine</span></h1>
+                <h1 class="text-slate-900 text-2xl font-bold tracking-tighter uppercase">Fixed <span class="text-blue-600">1.2x Engine</span></h1>
                 <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">${config.symbol} | 1.2x Multiplier | 1.5% TP</p>
             </div>
             <div class="text-right">
@@ -248,7 +251,7 @@ app.get('/', (req, res) => {
                     <p id="stepText" class="text-5xl text-slate-900 font-bold">0 / 10</p>
                 </div>
                 <div class="text-right">
-                    <p class="text-[10px] text-slate-400 font-bold uppercase mb-1">Fit Base Order</p>
+                    <p class="text-[10px] text-slate-400 font-bold uppercase mb-1">Base Order (1.2x)</p>
                     <p id="baseOrderText" class="text-5xl text-blue-600 font-bold">0</p>
                 </div>
             </div>
@@ -311,4 +314,8 @@ app.post('/api/reset-stats', async (req, res) => {
     res.sendStatus(200); 
 });
 
-app.listen(config.port, boot);
+app.listen(config.port, () => {
+    console.log(`🚀 HTX Martingale Bot running on port ${config.port}`);
+    console.log(`📊 Symbol: ${config.symbol} | Multiplier: 1.2x | TP: 1.5% | Drop: 0.1%`);
+    boot();
+});
