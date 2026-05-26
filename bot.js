@@ -116,13 +116,23 @@ function updateEstimates() {
     }
 }
 
-// ==================== UPDATE DISTANCE (REAL-TIME FROM PRICE) ====================
+// ==================== UPDATE DISTANCE (REAL-TIME) ====================
 function updateDistance() {
     if (botState.openPosition && botState.openPosition.volume > 0 && botState.avgPrice > 0 && botState.currentPrice > 0) {
         const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
         const distance = ((botState.currentPrice - triggerPrice) / botState.currentPrice) * 100;
-        botState.distToNext = Math.max(0, distance);
+        const newDistance = Math.max(0, distance);
+        
+        // Log significant distance changes
+        if (Math.abs(newDistance - botState.distToNext) > 0.0001) {
+            console.log(`📏 Distance updated: ${botState.distToNext.toFixed(4)}% → ${newDistance.toFixed(4)}% | Avg: ${botState.avgPrice.toFixed(8)} | Price: ${botState.currentPrice.toFixed(8)}`);
+        }
+        
+        botState.distToNext = newDistance;
     } else {
+        if (botState.distToNext !== 0) {
+            console.log(`📏 Distance reset to 0 (no position)`);
+        }
         botState.distToNext = 0;
     }
 }
@@ -134,7 +144,9 @@ async function fetchPositionAndROI() {
         const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
         
         if (pos) {
-            // ONLY use exchange ROI - this includes fees, funding, etc.
+            const oldAvg = botState.avgPrice;
+            const oldVol = botState.openPosition.volume;
+            
             botState.roi = parseFloat(pos.profit_rate) * 100;
             botState.avgPrice = parseFloat(pos.cost_hold);
             botState.openPosition = {
@@ -142,9 +154,18 @@ async function fetchPositionAndROI() {
                 direction: pos.direction,
                 costHold: parseFloat(pos.cost_hold)
             };
+            
+            // Log if avg price changed (safety order executed)
+            if (oldAvg !== botState.avgPrice && oldAvg > 0) {
+                console.log(`🔄 AVG PRICE UPDATED: ${oldAvg.toFixed(8)} → ${botState.avgPrice.toFixed(8)}`);
+                console.log(`📊 New ROI: ${botState.roi.toFixed(2)}% | New Volume: ${botState.openPosition.volume}`);
+            }
+            
             updateDistance();
-            console.log(`📊 Exchange ROI: ${botState.roi.toFixed(2)}% | Vol: ${botState.openPosition.volume} | Avg: ${botState.avgPrice}`);
         } else {
+            if (botState.openPosition.volume > 0) {
+                console.log(`📭 Position closed`);
+            }
             botState.openPosition = { volume: 0, direction: "", costHold: 0 };
             botState.roi = 0;
             botState.distToNext = 0;
@@ -237,20 +258,47 @@ async function saveTradeHistory(type, volume, price, safetyLevel, roi, balanceAf
     botState.totalTrades = (botState.totalTrades || 0) + 1;
 }
 
+async function refreshPositionAfterTrade() {
+    // Fetch updated position after a trade
+    setTimeout(async () => {
+        const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
+        const newPos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
+        if (newPos) {
+            const oldAvg = botState.avgPrice;
+            botState.avgPrice = parseFloat(newPos.cost_hold);
+            botState.roi = parseFloat(newPos.profit_rate) * 100;
+            botState.openPosition = {
+                volume: parseFloat(newPos.volume),
+                direction: newPos.direction,
+                costHold: parseFloat(newPos.cost_hold)
+            };
+            updateDistance();
+            console.log(`🔄 Post-trade update - Avg: ${oldAvg.toFixed(8)} → ${botState.avgPrice.toFixed(8)}, Distance: ${botState.distToNext.toFixed(4)}%`);
+        } else if (botState.openPosition.volume > 0) {
+            // Position might be closed
+            botState.openPosition = { volume: 0, direction: "", costHold: 0 };
+            botState.roi = 0;
+            botState.distToNext = 0;
+            botState.avgPrice = 0;
+            console.log(`🔄 Position closed after trade`);
+        }
+    }, 500);
+}
+
 async function checkAndExecuteTrades() {
     if (!botState.isRunning || botState.isTrading) return;
     botState.isTrading = true;
 
     try {
         const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
-        const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
+        let pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
         
         if (pos) {
-            // Use exchange ROI for trade decisions too
             const currentROI = parseFloat(pos.profit_rate) * 100;
             const avgPrice = parseFloat(pos.cost_hold);
             const triggerPrice = avgPrice * (1 - (botState.settings.priceDrop / 100));
             
+            // Check take profit
             if (currentROI >= botState.settings.takeProfit) {
                 const result = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: pos.volume,
@@ -261,23 +309,31 @@ async function checkAndExecuteTrades() {
                     await saveTradeHistory('take_profit', parseFloat(pos.volume), botState.currentPrice, botState.safetyOrdersFilled, currentROI, botState.displayBalance);
                     botState.safetyOrdersFilled = 0;
                     console.log(`✅ Take profit! ROI: ${currentROI}%`);
+                    await refreshPositionAfterTrade();
                 }
             }
+            // Check safety order
             else if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
-                botState.safetyOrdersFilled++;
-                const nextVol = Math.max(1, Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled)));
+                const nextVol = Math.max(1, Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled + 1)));
+                console.log(`📊 Trigger price: ${triggerPrice.toFixed(8)}, Current: ${botState.currentPrice.toFixed(8)}`);
+                console.log(`🔴 SAFETY ORDER TRIGGERED! Adding ${nextVol} contracts`);
+                
                 const result = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: nextVol,
                     direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
                 
                 if (result?.code === 200) {
+                    botState.safetyOrdersFilled++;
                     await saveTradeHistory('safety', nextVol, botState.currentPrice, botState.safetyOrdersFilled, 0, botState.displayBalance);
-                    console.log(`📉 Safety Order #${botState.safetyOrdersFilled} | Vol: ${nextVol}`);
+                    console.log(`📉 Safety Order #${botState.safetyOrdersFilled} executed | Vol: ${nextVol}`);
+                    await refreshPositionAfterTrade();
                 }
             }
         } 
-        else if (botState.maxSafeBase > 0 && botState.settings.baseOrder > 0) {
+        // Open initial position
+        else if (botState.maxSafeBase > 0 && botState.settings.baseOrder > 0 && !pos) {
+            console.log(`🎯 Opening initial position | Vol: ${botState.settings.baseOrder}`);
             const result = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: botState.settings.baseOrder,
                 direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
@@ -287,6 +343,7 @@ async function checkAndExecuteTrades() {
                 await saveTradeHistory('open', botState.settings.baseOrder, botState.currentPrice, 0, 0, botState.displayBalance);
                 botState.safetyOrdersFilled = 0;
                 console.log(`🎯 Position opened | Vol: ${botState.settings.baseOrder}`);
+                await refreshPositionAfterTrade();
             }
         }
 
@@ -320,6 +377,7 @@ function forceUpdateSettings() {
         maxSteps: 10
     };
     console.log("⚙️ Settings force updated to defaults!");
+    updateDistance();
     return true;
 }
 
@@ -374,6 +432,7 @@ function fullReset() {
 async function boot() {
     console.log(`🤖 Bot started | ${config.symbol} | ${config.leverage}X`);
     console.log(`📊 Using EXCHANGE ONLY for ROI data (no WebSocket calculations)`);
+    console.log(`📏 Distance updates in REAL-TIME with every price tick`);
     
     // WebSocket for real-time price ONLY (no ROI calculation)
     const ws = new WebSocket(config.wsHost);
@@ -387,11 +446,15 @@ async function boot() {
                         const newPrice = parseFloat(msg.tick.close);
                         botState.currentPrice = newPrice;
                         
-                        // ONLY update distance - NO ROI calculation here
+                        // Update distance on EVERY price tick
                         if (botState.openPosition && botState.openPosition.volume > 0 && botState.avgPrice > 0) {
                             const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
                             const distance = ((newPrice - triggerPrice) / newPrice) * 100;
-                            botState.distToNext = Math.max(0, distance);
+                            const newDistance = Math.max(0, distance);
+                            
+                            if (Math.abs(newDistance - botState.distToNext) > 0.00001) {
+                                botState.distToNext = newDistance;
+                            }
                         }
                     }
                     if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
@@ -402,7 +465,7 @@ async function boot() {
     
     // Fast loops for real-time updates
     setInterval(async () => {
-        await fetchPositionAndROI();  // This gets exchange ROI
+        await fetchPositionAndROI();
         await updatePositionSizing();
     }, 1000);
     
@@ -422,7 +485,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html class="bg-white">
 <head>
-    <title>HTX Compounder | Exchange ROI Only</title>
+    <title>HTX Compounder | Real-Time Distance</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
@@ -437,9 +500,14 @@ app.get('/', (req, res) => {
             50% { transform: scale(1.02); background-color: rgba(5, 150, 105, 0.1); }
             100% { transform: scale(1); }
         }
+        @keyframes pulse-orange {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.05); color: #ea580c; }
+            100% { transform: scale(1); }
+        }
         .balance-update { animation: pulse-green 0.3s ease; }
         .roi-update { animation: pulse-green 0.3s ease; }
-        .distance-update { animation: pulse-green 0.2s ease; }
+        .distance-update { animation: pulse-orange 0.2s ease; }
     </style>
 </head>
 <body class="text-gray-900 p-4 md:p-10 bg-gray-50">
@@ -448,10 +516,10 @@ app.get('/', (req, res) => {
             <div>
                 <h1 class="text-gray-900 text-3xl font-bold tracking-tight">
                     COMPOUND<span class="gradient-text">_BOT</span>
-                    <span class="text-sm font-mono text-gray-400 ml-2">Exchange ROI</span>
+                    <span class="text-sm font-mono text-gray-400 ml-2">Real-Time Distance</span>
                 </h1>
                 <p class="text-xs text-gray-400 uppercase tracking-wider mt-1">${config.symbol} | ${config.leverage}X Leverage</p>
-                <p class="text-[10px] text-emerald-600 mt-2">📡 ROI from exchange API (includes fees) | Distance from price feed</p>
+                <p class="text-[10px] text-emerald-600 mt-2">📡 Live distance updates | Safety orders update avg price instantly</p>
             </div>
             <div class="text-right">
                 <p class="text-3xl font-bold text-emerald-600" id="dgrText">0.00%</p>
