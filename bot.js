@@ -52,7 +52,7 @@ let botState = {
         takeProfit: 1.5,
         maxSteps: 10
     },
-    martingaleLadder: [] // Will store all steps
+    martingaleLadder: [] // Will store all steps based on REAL wallet balance
 };
 
 // ==================== API HANDLER ====================
@@ -78,42 +78,48 @@ async function htxRequest(method, path, data = {}) {
     }
 }
 
-// ==================== CALCULATE FULL MARTINGALE LADDER ====================
+// ==================== CALCULATE MARTINGALE LADDER USING REAL WALLET ====================
 function calculateMartingaleLadder(walletBalance, baseOrder) {
+    if (walletBalance <= 0 || baseOrder <= 0) return [];
+    
     const leverage = config.leverage;
-    const marginPerContract = 1 / leverage; // 0.1 USDT per contract
+    const marginPerContract = 1 / leverage; // 0.1 USDT per contract at 10x leverage
     const multiplier = 1.2;
-    const steps = botState.settings.maxSteps;
+    const maxSteps = botState.settings.maxSteps;
+    const maxWalletUsage = walletBalance * 0.85; // Use 85% max for safety
     
     let ladder = [];
     let totalContracts = 0;
     let totalMargin = 0;
-    let currentStepSize = baseOrder;
     
-    for (let step = 0; step <= steps; step++) {
+    for (let step = 0; step <= maxSteps; step++) {
+        let stepSize;
         if (step === 0) {
-            currentStepSize = baseOrder;
+            stepSize = baseOrder;
         } else {
-            currentStepSize = Math.floor(baseOrder * Math.pow(multiplier, step));
+            stepSize = Math.floor(baseOrder * Math.pow(multiplier, step));
         }
         
-        totalContracts += currentStepSize;
+        totalContracts += stepSize;
         totalMargin = totalContracts * marginPerContract;
         
-        // Calculate percentage of wallet used
-        const percentUsed = (totalMargin / walletBalance) * 100;
+        // Calculate percentage of REAL wallet used
+        const percentOfRealWallet = (totalMargin / walletBalance) * 100;
+        const canAfford = totalMargin <= maxWalletUsage;
         
         ladder.push({
             step: step,
-            additionalSize: currentStepSize,
+            stepLabel: step === 0 ? 'BASE' : `#${step}`,
+            additionalSize: stepSize,
             totalSize: totalContracts,
             marginNeeded: totalMargin,
-            percentOfWallet: Math.min(percentUsed, 100),
-            canAfford: totalMargin <= walletBalance * 0.85 // 85% max usage
+            percentOfWallet: Math.min(percentOfRealWallet, 100),
+            canAfford: canAfford,
+            isWithinLimit: totalMargin <= walletBalance
         });
         
-        // Stop if we exceed wallet capacity
-        if (totalMargin > walletBalance) break;
+        // Stop if we exceed wallet balance completely
+        if (totalMargin > walletBalance * 1.5) break;
     }
     
     return ladder;
@@ -155,29 +161,29 @@ async function runLogic() {
             pos = posRes.data.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
         }
         
+        // Get REAL wallet balance from HTX
         let walletBalance = 0;
         if (accRes && accRes.data && accRes.data.length > 0) {
             const account = accRes.data[0];
             walletBalance = parseFloat(account.margin_balance) || 0;
+            console.log(`💰 REAL Wallet Balance: $${walletBalance.toFixed(4)}`);
         }
 
         if (walletBalance > 0) {
             botState.walletBalance = Number(walletBalance.toFixed(4));
             
-            if (botState.walletBalance > 0) {
-                // Calculate base order (minimum 1 contract)
-                const marginPerContract = 1 / config.leverage;
-                const seriesSum = (Math.pow(1.2, 11) - 1) / (1.2 - 1);
-                const availableMargin = botState.walletBalance * 0.85;
-                let baseOrder = Math.floor(availableMargin / (seriesSum * marginPerContract));
-                baseOrder = Math.max(1, Math.min(baseOrder, 100));
-                botState.settings.baseOrder = baseOrder;
-                
-                // Calculate the full martingale ladder
-                botState.martingaleLadder = calculateMartingaleLadder(botState.walletBalance, botState.settings.baseOrder);
-                
-                console.log(`🎯 Base Order: ${botState.settings.baseOrder} | Total Steps: ${botState.martingaleLadder.length}`);
-            }
+            // Calculate base order based on REAL wallet balance
+            const marginPerContract = 1 / config.leverage; // 0.1 USDT
+            const seriesSum = (Math.pow(1.2, 11) - 1) / (1.2 - 1); // ~32.15
+            const availableMargin = botState.walletBalance * 0.85;
+            let baseOrder = Math.floor(availableMargin / (seriesSum * marginPerContract));
+            baseOrder = Math.max(1, Math.min(baseOrder, 1000));
+            botState.settings.baseOrder = baseOrder;
+            
+            // Calculate the FULL martingale ladder using REAL wallet balance
+            botState.martingaleLadder = calculateMartingaleLadder(botState.walletBalance, botState.settings.baseOrder);
+            
+            console.log(`📐 Base Order: ${botState.settings.baseOrder} | Wallet: $${botState.walletBalance} | Steps available: ${botState.martingaleLadder.length}`);
             
             if (botState.initialBalance <= 0 && botState.walletBalance > 0) {
                 botState.initialBalance = botState.walletBalance;
@@ -185,14 +191,17 @@ async function runLogic() {
                 await BotModel.updateOne({ id: "htx_martingale" }, 
                     { initialBalance: botState.initialBalance, startTime: botState.startTime }, 
                     { upsert: true });
+                console.log(`🎯 Initial Balance Set: $${botState.initialBalance}`);
             }
         }
 
+        // Update profit stats
         if (botState.initialBalance > 0 && botState.walletBalance > 0) {
             botState.realizedProfit = botState.walletBalance - botState.initialBalance;
             botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
         }
 
+        // Compounding estimates
         const elapsedHours = (Date.now() - botState.startTime) / (1000 * 60 * 60);
         if (elapsedHours > 0.1 && botState.initialBalance > 0 && botState.walletBalance > 0 && botState.initialBalance !== botState.walletBalance) {
             const hourlyReturn = Math.pow(botState.walletBalance / botState.initialBalance, (1 / elapsedHours)) - 1;
@@ -204,12 +213,14 @@ async function runLogic() {
             botState.estimates.month = botState.walletBalance * (Math.pow(1 + safeHourly, 24 * 30) - 1);
         }
 
+        // Trading execution
         if (pos && botState.currentPrice > 0) {
             botState.avgPrice = parseFloat(pos.cost_hold);
             botState.roi = parseFloat(pos.profit_rate) * 100;
             const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
             
             if (botState.roi >= botState.settings.takeProfit) {
+                console.log(`🎯 TAKE PROFIT at ${botState.roi}%`);
                 await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: pos.volume,
                     direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
@@ -218,12 +229,14 @@ async function runLogic() {
             } else if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
                 botState.safetyOrdersFilled++;
                 const nextVol = Math.floor(botState.settings.baseOrder * Math.pow(1.2, botState.safetyOrdersFilled));
+                console.log(`📉 SAFETY ORDER #${botState.safetyOrdersFilled}: +${nextVol} contracts`);
                 await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: Math.max(1, nextVol),
                     direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
             }
         } else if (botState.settings.baseOrder > 0 && botState.walletBalance > 0 && botState.currentPrice > 0) {
+            console.log(`🚀 OPENING POSITION: ${botState.settings.baseOrder} contracts`);
             botState.safetyOrdersFilled = 0;
             await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: botState.settings.baseOrder,
@@ -278,33 +291,34 @@ async function boot() {
     }, 1000);
 }
 
-// ==================== UI WITH MARTINGALE LADDER ====================
+// ==================== UI ====================
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
 <html class="bg-slate-50">
 <head>
-    <title>HTX Engine | Full Martingale Ladder</title>
+    <title>HTX Martingale | Real Balance Ladder</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@500;700&display=swap" rel="stylesheet">
     <style>
         body { font-family: 'Roboto Mono', monospace; }
         .glass { background: white; border: 1px solid rgba(0, 0, 0, 0.08); box-shadow: 0 4px 12px rgba(0, 0, 0, 0.02); }
-        .step-active { background: #2563eb; color: white; border-color: #2563eb; }
-        .step-upcoming { background: white; color: #2563eb; border: 2px solid #2563eb; }
-        .step-exceed { background: #fef2f2; color: #dc2626; border: 2px solid #fecaca; }
+        .step-active { background: #dbeafe; border-left: 4px solid #2563eb; }
+        .step-completed { background: #f0fdf4; border-left: 4px solid #22c55e; }
+        .step-exceed { background: #fef2f2; border-left: 4px solid #ef4444; opacity: 0.6; }
     </style>
 </head>
 <body class="text-slate-600 p-4 md:p-10">
     <div class="max-w-7xl mx-auto">
+        <!-- Header -->
         <div class="flex justify-between items-center mb-8">
             <div>
-                <h1 class="text-slate-900 text-2xl font-bold tracking-tighter uppercase">Martingale <span class="text-blue-600">Ladder</span></h1>
+                <h1 class="text-slate-900 text-2xl font-bold tracking-tighter uppercase">Real Balance <span class="text-blue-600">Martingale Ladder</span></h1>
                 <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">${config.symbol} | 1.2x Multiplier | 10x Leverage</p>
             </div>
-            <div class="text-right">
-                <p id="dgrText" class="text-blue-600 font-bold text-2xl">0.00%</p>
-                <p class="text-[10px] text-slate-400 uppercase font-bold">Daily Growth Rate</p>
+            <div class="text-right bg-blue-50 px-6 py-3 rounded-2xl">
+                <p class="text-[10px] text-blue-600 uppercase font-bold">REAL WALLET</p>
+                <p id="realWallet" class="text-3xl text-blue-600 font-bold">$0.0000</p>
             </div>
         </div>
 
@@ -323,8 +337,8 @@ app.get('/', (req, res) => {
                 <p id="roi" class="text-2xl font-bold text-slate-300">0.00%</p>
             </div>
             <div class="glass p-5 rounded-2xl">
-                <p class="text-[10px] text-slate-400 uppercase font-bold">Wallet Balance</p>
-                <p id="bal" class="text-2xl text-slate-900 font-bold">$0.0000</p>
+                <p class="text-[10px] text-slate-400 uppercase font-bold">Base Order</p>
+                <p id="baseOrderDisplay" class="text-2xl text-blue-600 font-bold">0</p>
             </div>
         </div>
 
@@ -344,12 +358,12 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- MARTINGALE LADDER - FULL TABLE -->
+        <!-- MARTINGALE LADDER BASED ON REAL WALLET -->
         <div class="glass p-6 rounded-2xl mb-6">
             <div class="flex justify-between items-center mb-4">
                 <div>
                     <p class="text-[10px] text-slate-400 uppercase font-bold">Martingale Ladder (1.2x Multiplier)</p>
-                    <p class="text-xs text-slate-500 mt-1">Base Order: <span id="baseOrderDisplay" class="font-bold text-blue-600">0</span> contracts</p>
+                    <p class="text-xs text-slate-500 mt-1">Based on <span id="walletForLadder" class="font-bold text-blue-600">$0.00</span> real wallet balance</p>
                 </div>
                 <div class="text-right">
                     <p class="text-[10px] text-slate-400 uppercase">Current Step</p>
@@ -357,9 +371,9 @@ app.get('/', (req, res) => {
                 </div>
             </div>
             
-            <div class="overflow-x-auto">
+            <div class="overflow-x-auto max-h-[400px] overflow-y-auto">
                 <table class="w-full text-sm">
-                    <thead>
+                    <thead class="sticky top-0 bg-white">
                         <tr class="border-b-2 border-slate-200">
                             <th class="text-left py-3 text-[10px] text-slate-400 uppercase font-bold">Step</th>
                             <th class="text-right py-3 text-[10px] text-slate-400 uppercase font-bold">Add Size</th>
@@ -370,23 +384,29 @@ app.get('/', (req, res) => {
                         </tr>
                     </thead>
                     <tbody id="ladderBody">
-                        <tr><td colspan="6" class="text-center py-8 text-slate-400">Loading ladder...</td></tr>
+                        <tr><td colspan="6" class="text-center py-8 text-slate-400">Loading from real wallet balance...</td></tr>
                     </tbody>
                 </table>
             </div>
             
+            <!-- Wallet Usage Bar -->
             <div class="mt-4 pt-3 border-t border-slate-100">
+                <div class="flex justify-between text-[9px] text-slate-400 mb-1">
+                    <span>Wallet Usage</span>
+                    <span id="totalPercent">0%</span>
+                </div>
                 <div class="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
                     <div id="totalProgress" class="bg-blue-600 h-full rounded-full transition-all duration-500" style="width: 0%"></div>
                 </div>
-                <p class="text-[9px] text-slate-400 text-center mt-2">Total wallet usage progression</p>
+                <p class="text-[9px] text-slate-400 text-center mt-2">Max 85% of wallet used for safety</p>
             </div>
         </div>
 
-        <!-- Current Price & Actions -->
+        <!-- Current Info -->
         <div class="flex justify-between items-center text-[10px] font-bold text-slate-400 uppercase">
             <div>Price: <span id="curPrice" class="text-slate-900 ml-1">0.00000000</span></div>
             <div>Hourly Avg: <span id="estHr" class="text-slate-900 ml-1">$0.0000</span></div>
+            <div>DGR: <span id="dgrText" class="text-blue-600 ml-1">0.00%</span></div>
             <button onclick="resetStats()" class="text-red-400 hover:text-red-600 transition-colors">Reset Session</button>
         </div>
     </div>
@@ -399,9 +419,12 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); 
                 const d = await r.json();
                 
+                // Update header with REAL wallet
+                document.getElementById('realWallet').innerHTML = '$' + d.walletBalance.toFixed(4);
+                document.getElementById('walletForLadder').innerHTML = '$' + d.walletBalance.toFixed(4);
+                
                 document.getElementById('p1').innerText = '$' + d.realizedProfit.toFixed(4);
                 document.getElementById('p2').innerText = d.profitPct.toFixed(2) + '%';
-                document.getElementById('bal').innerHTML = '$' + d.walletBalance.toFixed(4);
                 document.getElementById('baseOrderDisplay').innerText = d.settings.baseOrder;
                 document.getElementById('stepIndicator').innerHTML = d.safetyOrdersFilled + '/<span id="maxSteps">' + d.settings.maxSteps + '</span>';
                 
@@ -418,7 +441,7 @@ app.get('/', (req, res) => {
                 
                 currentStep = d.safetyOrdersFilled;
                 
-                // Render ladder
+                // Render ladder from REAL wallet data
                 if (d.martingaleLadder && d.martingaleLadder.length > 0) {
                     const tbody = document.getElementById('ladderBody');
                     tbody.innerHTML = '';
@@ -427,44 +450,47 @@ app.get('/', (req, res) => {
                     
                     d.martingaleLadder.forEach(step => {
                         const row = document.createElement('tr');
-                        row.className = 'border-b border-slate-100';
-                        
-                        let statusClass = '';
+                        let rowClass = '';
                         let statusText = '';
+                        let statusColor = '';
                         let isActive = step.step === currentStep;
                         let isPast = step.step < currentStep;
-                        let canAfford = step.canAfford;
                         
-                        if (isPast && canAfford) {
+                        if (isPast && step.canAfford) {
                             statusText = '✓ COMPLETED';
-                            statusClass = 'text-emerald-600';
-                        } else if (isActive && canAfford) {
+                            statusColor = 'text-emerald-600';
+                            rowClass = 'step-completed';
+                        } else if (isActive && step.canAfford) {
                             statusText = '⚡ ACTIVE';
-                            statusClass = 'text-blue-600 font-bold';
-                        } else if (!canAfford) {
-                            statusText = '✗ EXCEEDS';
-                            statusClass = 'text-red-500';
+                            statusColor = 'text-blue-600 font-bold';
+                            rowClass = 'step-active';
+                        } else if (!step.canAfford) {
+                            statusText = '✗ EXCEEDS WALLET';
+                            statusColor = 'text-red-500';
+                            rowClass = 'step-exceed';
                         } else {
                             statusText = '○ READY';
-                            statusClass = 'text-slate-400';
+                            statusColor = 'text-slate-400';
                         }
                         
                         if (step.percentOfWallet > maxPercent) maxPercent = step.percentOfWallet;
                         
+                        row.className = rowClass + ' border-b border-slate-100';
                         row.innerHTML = \`
-                            <td class="py-3 font-mono font-bold text-left">\${step.step === 0 ? 'BASE' : '#' + step.step}\${isActive ? ' 🔴' : ''}</td>
+                            <td class="py-3 font-mono font-bold text-left pl-2">\${step.stepLabel}\${isActive ? ' 🔴' : ''}</td>
                             <td class="py-3 text-right font-mono">\${step.additionalSize.toLocaleString()}</td>
                             <td class="py-3 text-right font-mono">\${step.totalSize.toLocaleString()}</td>
                             <td class="py-3 text-right font-mono">$\${step.marginNeeded.toFixed(4)}</td>
-                            <td class="py-3 text-right font-mono">\${step.percentOfWallet.toFixed(1)}%</td>
-                            <td class="py-3 text-center"><span class="text-[9px] font-bold \${statusClass}">\${statusText}</span></td>
+                            <td class="py-3 text-right font-mono">\${step.percentOfWallet.toFixed(2)}%</td>
+                            <td class="py-3 text-center"><span class="text-[9px] font-bold \${statusColor}">\${statusText}</span></td>
                         \`;
-                        
-                        if (isActive) row.classList.add('bg-blue-50');
                         tbody.appendChild(row);
                     });
                     
-                    document.getElementById('totalProgress').style.width = Math.min(maxPercent, 100) + '%';
+                    document.getElementById('totalProgress').style.width = Math.min(maxPercent, 85) + '%';
+                    document.getElementById('totalPercent').innerText = maxPercent.toFixed(1) + '%';
+                } else {
+                    document.getElementById('ladderBody').innerHTML = '<tr><td colspan="6" class="text-center py-8 text-slate-400">Waiting for wallet balance from HTX...</td></tr>';
                 }
             } catch (e) {
                 console.error(e);
@@ -478,7 +504,7 @@ app.get('/', (req, res) => {
             }
         }
         
-        setInterval(update, 1000); 
+        setInterval(update, 2000); 
         update();
     </script>
 </body>
