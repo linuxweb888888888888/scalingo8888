@@ -17,15 +17,12 @@ mongoose.connect(MONGO_URI).then(() => console.log("📦 MongoDB Connected"));
 const BotSchema = new mongoose.Schema({
     id: { type: String, default: "htx_martingale" },
     initialBalance: { type: Number, default: 0 },
-    displayBalance: { type: Number, default: 0 }, // NEW: Static display balance
+    displayBalance: { type: Number, default: 0 },
     storedRealizedProfit: { type: Number, default: 0 },
     storedProfitPct: { type: Number, default: 0 },
     startTime: { type: Number, default: Date.now() },
     peakBalance: { type: Number, default: 0 },
-    safetyOrdersFilled: { type: Number, default: 0 }, // NEW: Current martingale step
-    lastPrice: { type: Number, default: 0 }, // NEW: Last known price
-    avgPrice: { type: Number, default: 0 }, // NEW: Average entry price
-    hasOpenPosition: { type: Boolean, default: false } // NEW: Track if position exists
+    safetyOrdersFilled: { type: Number, default: 0 }
 });
 const BotModel = mongoose.model('BotConfig_V34', BotSchema);
 
@@ -39,12 +36,6 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws'
 };
-
-// Validate required configuration
-if (!config.apiKey || !config.secretKey) {
-    console.error('❌ Missing API credentials in .env file');
-    process.exit(1);
-}
 
 let botState = {
     isRunning: true,
@@ -62,7 +53,6 @@ let botState = {
     maxSafeBase: 0,
     safetyOrdersFilled: 0,
     distToNext: 0,
-    hasOpenPosition: false,
     estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 }, 
     settings: {
         baseOrder: 0, 
@@ -72,30 +62,6 @@ let botState = {
         maxSteps: 10
     }
 };
-
-// ==================== DATABASE PERSISTENCE ====================
-async function saveStateToDB() {
-    try {
-        await BotModel.updateOne({ id: "htx_martingale" }, {
-            initialBalance: botState.initialBalance,
-            displayBalance: botState.displayBalance,
-            storedRealizedProfit: botState.realizedProfit,
-            storedProfitPct: botState.profitPct,
-            startTime: botState.startTime,
-            peakBalance: botState.peakBalance,
-            safetyOrdersFilled: botState.safetyOrdersFilled,
-            lastPrice: botState.currentPrice,
-            avgPrice: botState.avgPrice,
-            hasOpenPosition: botState.hasOpenPosition
-        }, { upsert: true });
-        console.log(`💾 State saved | Display: $${botState.displayBalance.toFixed(2)} | Steps: ${botState.safetyOrdersFilled}`);
-    } catch (error) {
-        console.error('Failed to save state:', error);
-    }
-}
-
-// Save state every 30 seconds
-setInterval(saveStateToDB, 30000);
 
 // ==================== API HANDLER ====================
 async function htxRequest(method, path, data = {}) {
@@ -108,10 +74,7 @@ async function htxRequest(method, path, data = {}) {
     try {
         const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 5000 });
         return res.data;
-    } catch (e) { 
-        console.error(`API Error: ${method} ${path}`, e.message);
-        return null; 
-    }
+    } catch (e) { return null; }
 }
 
 // ==================== TRADING LOGIC ====================
@@ -125,17 +88,7 @@ async function runLogic() {
             htxRequest('POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' })
         ]);
 
-        // Check for open position
         const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
-        botState.hasOpenPosition = !!pos;
-        
-        if (pos) {
-            botState.avgPrice = parseFloat(pos.cost_hold);
-            botState.roi = parseFloat(pos.profit_rate) * 100;
-        } else {
-            botState.roi = 0;
-            botState.avgPrice = 0;
-        }
         
         if (accRes?.data) {
             const acc = accRes.data.find(a => a.margin_asset === 'USDT');
@@ -145,14 +98,13 @@ async function runLogic() {
                 const unrealized = pos ? (parseFloat(pos.unrealized_pnl) || 0) : 0;
                 const realBalance = equity - unrealized;
                 
-                // ONLY update display balance when REAL balance increases to new high
+                // NEW LOGIC: Only update display balance when REAL balance increases
                 if (realBalance > botState.peakBalance) {
                     const increase = realBalance - botState.peakBalance;
                     botState.displayBalance = botState.displayBalance + increase;
                     botState.peakBalance = realBalance;
                     
                     console.log(`🎯 New Peak Balance! Real: $${realBalance.toFixed(2)} | Display: $${botState.displayBalance.toFixed(2)} | Increase: $${increase.toFixed(2)}`);
-                    await saveStateToDB(); // Immediate save on new high
                 }
                 
                 // Store the real balance for calculations
@@ -165,7 +117,6 @@ async function runLogic() {
                     botState.peakBalance = botState.walletBalance;
                     botState.startTime = Date.now();
                     console.log(`🚀 Bot Initialized | Starting Balance: $${botState.initialBalance.toFixed(2)}`);
-                    await saveStateToDB();
                 }
             }
         }
@@ -173,6 +124,7 @@ async function runLogic() {
         // Compounding Math using DISPLAY balance (static, only increases)
         const elapsedDays = (Date.now() - botState.startTime) / (1000 * 60 * 60 * 24);
         if (elapsedDays > 0.001 && botState.displayBalance > botState.initialBalance) {
+            // DGR based on static display balance
             const dgr = Math.pow((botState.displayBalance / botState.initialBalance), (1 / elapsedDays)) - 1;
             botState.estimates.dgr = dgr * 100;
             botState.estimates.hr = (botState.displayBalance - botState.initialBalance) / (elapsedDays * 24);
@@ -187,76 +139,41 @@ async function runLogic() {
         if (botState.currentPrice > 0 && botState.walletBalance > 0) {
             const m = botState.settings.volumeMult, n = botState.settings.maxSteps;
             const multiplierSum = (1 - Math.pow(m, n + 1)) / (1 - m);
-            const rawBase = (botState.walletBalance * config.leverage) / (multiplierSum * botState.currentPrice);
+            const rawBase = (botState.walletBalance * config.leverage) / (multiplierSum * botState.currentPrice * 1000);
             botState.maxSafeBase = Math.floor(rawBase * 0.85);
-            botState.settings.baseOrder = Math.max(1, botState.maxSafeBase);
+            botState.settings.baseOrder = botState.maxSafeBase;
         }
 
-        // Trading decisions
         if (pos) {
+            botState.avgPrice = parseFloat(pos.cost_hold);
+            botState.roi = parseFloat(pos.profit_rate) * 100;
+
             const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
             botState.distToNext = Math.max(0, ((botState.currentPrice - triggerPrice) / botState.currentPrice) * 100);
 
-            // Take profit
             if (botState.roi >= botState.settings.takeProfit) {
-                const closeOrder = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol, 
-                    volume: pos.volume,
-                    direction: 'sell', 
-                    offset: 'close', 
-                    lever_rate: config.leverage, 
-                    order_price_type: 'opponent'
+                await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
+                    contract_code: config.symbol, volume: pos.volume,
+                    direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
-                if (closeOrder?.status === 'ok') {
-                    botState.safetyOrdersFilled = 0;
-                    botState.hasOpenPosition = false;
-                    console.log(`✅ Take profit triggered | ROI: ${botState.roi}% | Profit: $${(parseFloat(pos.unrealized_pnl) || 0).toFixed(2)}`);
-                    await saveStateToDB();
-                }
-            } 
-            // Safety order (martingale step)
-            else if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
+                botState.safetyOrdersFilled = 0;
+                console.log(`✅ Take profit triggered | ROI: ${botState.roi}%`);
+            } else if (botState.currentPrice <= triggerPrice && botState.safetyOrdersFilled < botState.settings.maxSteps) {
                 botState.safetyOrdersFilled++;
                 const nextVol = Math.max(1, Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled)));
-                
-                // Maximum position size safety check
-                const maxPositionUSD = botState.walletBalance * 5; // Max 5x wallet
-                const positionUSD = nextVol * botState.currentPrice;
-                
-                if (positionUSD <= maxPositionUSD) {
-                    const safetyOrder = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                        contract_code: config.symbol, 
-                        volume: nextVol,
-                        direction: 'buy', 
-                        offset: 'open', 
-                        lever_rate: config.leverage, 
-                        order_price_type: 'opponent'
-                    });
-                    if (safetyOrder?.status === 'ok') {
-                        console.log(`📉 Safety Order #${botState.safetyOrdersFilled} | Volume: ${nextVol} | Size: $${positionUSD.toFixed(2)}`);
-                        await saveStateToDB();
-                    }
-                } else {
-                    console.log(`⚠️ Safety order blocked: Position size $${positionUSD.toFixed(2)} exceeds max $${maxPositionUSD.toFixed(2)}`);
-                }
+                await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
+                    contract_code: config.symbol, volume: nextVol,
+                    direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+                });
+                console.log(`📉 Safety Order #${botState.safetyOrdersFilled} | Volume: ${nextVol}`);
             }
-        } 
-        // Open initial position if no position exists
-        else if (botState.maxSafeBase > 0 && botState.currentPrice > 0) {
-            const openOrder = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, 
-                volume: botState.settings.baseOrder,
-                direction: 'buy', 
-                offset: 'open', 
-                lever_rate: config.leverage, 
-                order_price_type: 'opponent'
+        } else if (botState.maxSafeBase > 0) {
+            await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: botState.settings.baseOrder,
+                direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
-            if (openOrder?.status === 'ok') {
-                botState.safetyOrdersFilled = 0;
-                botState.hasOpenPosition = true;
-                console.log(`🎯 Initial position opened | Volume: ${botState.settings.baseOrder} | Price: $${botState.currentPrice}`);
-                await saveStateToDB();
-            }
+            botState.safetyOrdersFilled = 0;
+            console.log(`🎯 Initial position opened | Volume: ${botState.settings.baseOrder}`);
         }
 
         // Profit calculations based on DISPLAY balance (static)
@@ -269,48 +186,29 @@ async function runLogic() {
     botState.isTrading = false;
 }
 
-// ==================== WEBSOCKET PRICE FEED ====================
-function setupWebSocket() {
-    const ws = new WebSocket(config.wsHost);
-    
-    ws.on('open', () => {
-        console.log('🔌 WebSocket connected');
-        ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' }));
-    });
-    
-    ws.on('message', (data) => {
-        zlib.gunzip(data, (err, dezipped) => {
-            if (!err) {
-                try {
-                    const msg = JSON.parse(dezipped.toString());
-                    if (msg.tick?.close) {
-                        botState.currentPrice = parseFloat(msg.tick.close);
-                    }
-                    if (msg.ping) {
-                        ws.send(JSON.stringify({ pong: msg.ping }));
-                    }
-                } catch (e) {}
-            }
-        });
-    });
-    
-    ws.on('error', (error) => {
-        console.error('WebSocket error:', error);
-    });
-    
-    ws.on('close', () => {
-        console.log('WebSocket closed, reconnecting in 5 seconds...');
-        setTimeout(setupWebSocket, 5000);
-    });
-    
-    return ws;
+// ==================== DATABASE PERSISTENCE ====================
+async function saveStateToDB() {
+    try {
+        await BotModel.updateOne({ id: "htx_martingale" }, {
+            initialBalance: botState.initialBalance,
+            displayBalance: botState.displayBalance,
+            storedRealizedProfit: botState.realizedProfit,
+            storedProfitPct: botState.profitPct,
+            startTime: botState.startTime,
+            peakBalance: botState.peakBalance,
+            safetyOrdersFilled: botState.safetyOrdersFilled
+        }, { upsert: true });
+        console.log(`💾 State saved | Display: $${botState.displayBalance.toFixed(2)} | Steps: ${botState.safetyOrdersFilled}`);
+    } catch (error) {
+        console.error('Failed to save state:', error);
+    }
 }
+
+// Save state every 30 seconds
+setInterval(saveStateToDB, 30000);
 
 // ==================== STARTUP ====================
 async function boot() {
-    console.log('🚀 Booting HTX Martingale Bot V34...');
-    
-    // Load state from database
     const data = await BotModel.findOne({ id: "htx_martingale" });
     if (data) {
         botState.initialBalance = data.initialBalance || 0;
@@ -320,29 +218,25 @@ async function boot() {
         botState.profitPct = data.storedProfitPct || 0;
         botState.startTime = data.startTime || Date.now();
         botState.safetyOrdersFilled = data.safetyOrdersFilled || 0;
-        botState.avgPrice = data.avgPrice || 0;
-        botState.currentPrice = data.lastPrice || 0;
-        botState.hasOpenPosition = data.hasOpenPosition || false;
-        
-        console.log(`📀 Loaded from DB:`);
-        console.log(`   Initial Balance: $${botState.initialBalance.toFixed(2)}`);
-        console.log(`   Display Balance: $${botState.displayBalance.toFixed(2)}`);
-        console.log(`   Peak Balance: $${botState.peakBalance.toFixed(2)}`);
-        console.log(`   Safety Orders: ${botState.safetyOrdersFilled}/${botState.settings.maxSteps}`);
-        console.log(`   Open Position: ${botState.hasOpenPosition ? 'YES' : 'NO'}`);
-        console.log(`   Avg Price: $${botState.avgPrice}`);
-    } else {
-        console.log('📀 No saved state found, starting fresh');
+        console.log(`📀 Loaded from DB | Initial: $${botState.initialBalance} | Display: $${botState.displayBalance} | Peak: $${botState.peakBalance} | Steps: ${botState.safetyOrdersFilled}`);
     }
     
-    // Setup WebSocket
-    setupWebSocket();
+    const ws = new WebSocket(config.wsHost);
+    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' })));
+    ws.on('message', (data) => {
+        zlib.gunzip(data, (err, dezipped) => {
+            if (!err) {
+                try {
+                    const msg = JSON.parse(dezipped.toString());
+                    if (msg.tick?.close) botState.currentPrice = parseFloat(msg.tick.close);
+                    if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
+                } catch (e) {}
+            }
+        });
+    });
     
-    // Run trading logic every 3 seconds
     setInterval(runLogic, 3000);
-    
     console.log(`🤖 Bot started | Symbol: ${config.symbol} | Leverage: ${config.leverage}X`);
-    console.log(`📊 Monitoring: ${config.symbol} | Update interval: 3s`);
 }
 
 // ==================== UI - WHITE DESIGN ====================
@@ -472,7 +366,6 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); 
                 const d = await r.json();
                 
-                // Format numbers
                 document.getElementById('p1').innerHTML = '$' + d.realizedProfit.toFixed(4);
                 document.getElementById('p2').innerHTML = d.profitPct.toFixed(2) + '%';
                 
@@ -480,7 +373,6 @@ app.get('/', (req, res) => {
                 roiEl.innerHTML = d.roi.toFixed(2) + '%';
                 roiEl.className = 'text-3xl font-bold stat-number ' + (d.roi >= 0 ? 'text-emerald-600' : 'text-red-500');
                 
-                // Display static balance and real balance
                 const balElement = document.getElementById('bal');
                 const oldBalance = parseFloat(balElement.innerHTML.replace('$', ''));
                 const newBalance = d.displayBalance;
@@ -488,7 +380,6 @@ app.get('/', (req, res) => {
                 balElement.innerHTML = '$' + newBalance.toFixed(2);
                 document.getElementById('realBal').innerHTML = '$' + d.walletBalance.toFixed(2);
                 
-                // Add animation when balance increases
                 if (newBalance > oldBalance) {
                     balElement.classList.add('scale-105');
                     setTimeout(() => balElement.classList.remove('scale-105'), 300);
@@ -496,13 +387,11 @@ app.get('/', (req, res) => {
                 
                 document.getElementById('dgrText').innerHTML = d.estimates.dgr.toFixed(2) + '%';
                 
-                // Estimates
                 document.getElementById('estHr').innerHTML = '$' + d.estimates.hr.toFixed(2);
                 document.getElementById('estDay').innerHTML = '$' + d.estimates.day.toFixed(2);
                 document.getElementById('estWeek').innerHTML = '$' + d.estimates.week.toFixed(2);
                 document.getElementById('estMonth').innerHTML = '$' + d.estimates.month.toFixed(0);
 
-                // Risk
                 document.getElementById('curPrice').innerHTML = d.currentPrice.toFixed(8);
                 document.getElementById('stepText').innerHTML = d.safetyOrdersFilled + ' <span class="text-2xl text-gray-400">/ ' + d.settings.maxSteps + '</span>';
                 document.getElementById('distText').innerHTML = d.distToNext.toFixed(3) + '%';
@@ -511,7 +400,6 @@ app.get('/', (req, res) => {
                 const bar = document.getElementById('progressBar');
                 bar.style.width = progressPct + '%';
                 
-                // Show warning when at risk
                 const warning = document.getElementById('riskWarning');
                 if (progressPct > 60) {
                     warning.classList.remove('hidden');
@@ -582,8 +470,4 @@ app.post('/api/force-save', async (req, res) => {
     });
 });
 
-// ==================== START SERVER ====================
-app.listen(config.port, () => {
-    console.log(`🌐 Web UI: http://localhost:${config.port}`);
-    boot();
-});
+app.listen(config.port, boot);
