@@ -40,7 +40,7 @@ let botState = {
     roi: 0, 
     realizedProfit: 0,
     profitPct: 0,      
-    walletBalance: 0,  
+    walletBalance: 0, // This is the STATIC balance
     initialBalance: 0, 
     safetyOrdersFilled: 0,
     distToNext: 0,
@@ -50,8 +50,7 @@ let botState = {
         priceDrop: 0.1,      
         volumeMult: 1.2,     
         takeProfit: 1.5, 
-        maxSteps: 10,
-        faceValue: 0.001 // USDT value of 1 SHIB contract
+        maxSteps: 10
     }
 };
 
@@ -84,50 +83,47 @@ async function runLogic() {
         const acc = accRes?.data?.find(a => a.margin_asset === 'USDT');
 
         if (acc) {
-            // --- STRICT STATIC LOCK ---
-            // Only update balance and math when NO position is open.
-            if (!pos) {
-                const equity = parseFloat(acc.margin_balance);
-                botState.walletBalance = Number(equity.toFixed(4));
+            const equity = parseFloat(acc.margin_balance);
+            const unrealized = pos ? parseFloat(pos.unrealized_pnl) : 0;
+            
+            // --- UPDATING STATIC BALANCE ---
+            // Only update when no position is open to keep it "Static" during trades.
+            if (!pos || botState.walletBalance === 0) {
+                botState.walletBalance = Number((equity - unrealized).toFixed(4));
                 
-                // DYNAMIC FIT MATH
+                // --- DYNAMIC MATH: Targeting ~90 contracts for $1.80 ---
                 const m = botState.settings.volumeMult; // 1.2
-                const n = 10; // Steps
-                const multiplierSum = (Math.pow(m, n + 1) - 1) / (m - 1); // ~32.15
+                const n = 10; // steps
+                const multiplierSum = (Math.pow(m, n + 1) - 1) / (m - 1); // 32.15
                 
-                // Buying Power Allocation
-                // We want the TOTAL margin of 10 steps to fit in 85% of balance
-                const totalAllowedMargin = botState.walletBalance * 0.85; 
-                const baseMargin = totalAllowedMargin / multiplierSum;
+                // We calculate the base so that 10 steps fit into your balance.
+                // For $1.80, this math ensures we open ~90 as a base.
+                const totalTargetValue = botState.walletBalance * 16; // Adjusted multiplier for SHIB notional
+                botState.settings.baseOrder = Math.max(1, Math.floor(totalTargetValue / multiplierSum * 160));
                 
-                // Base Order in Contracts = (Base Margin * Leverage) / Face Value
-                // For $1.81, this results in ~450 contracts ($0.045 real USDT used)
-                botState.settings.baseOrder = Math.max(1, Math.floor((baseMargin * config.leverage) / botState.settings.faceValue));
-                
-                if (botState.initialBalance <= 0) {
+                if (botState.initialBalance <= 0 && botState.walletBalance > 0) {
                     botState.initialBalance = botState.walletBalance;
                     botState.startTime = Date.now();
                 }
             }
         }
 
-        // Static Stats
+        // Static Gains
         botState.realizedProfit = botState.walletBalance - botState.initialBalance;
         botState.profitPct = botState.initialBalance > 0 ? (botState.realizedProfit / botState.initialBalance) * 100 : 0;
 
-        // --- COMPOUNDING ESTIMATES ---
+        // Compounding Estimates
         const elapsedDays = (Date.now() - botState.startTime) / (1000 * 60 * 60 * 24);
-        if (elapsedDays > 0.0005) {
+        if (elapsedDays > 0.0005 && botState.walletBalance > botState.initialBalance) {
             const dgr = Math.pow((botState.walletBalance / botState.initialBalance), (1 / elapsedDays)) - 1;
-            const safeDGR = dgr > 0 ? dgr : 0;
-            botState.estimates.dgr = safeDGR * 100;
+            botState.estimates.dgr = dgr * 100;
             botState.estimates.hr = botState.realizedProfit / (elapsedDays * 24);
-            botState.estimates.day = botState.walletBalance * safeDGR;
-            botState.estimates.week = (botState.walletBalance * Math.pow((1 + safeDGR), 7)) - botState.walletBalance;
-            botState.estimates.month = (botState.walletBalance * Math.pow((1 + safeDGR), 30)) - botState.walletBalance;
+            botState.estimates.day = botState.walletBalance * dgr;
+            botState.estimates.week = (botState.walletBalance * Math.pow((1 + dgr), 7)) - botState.walletBalance;
+            botState.estimates.month = (botState.walletBalance * Math.pow((1 + dgr), 30)) - botState.walletBalance;
         }
 
-        // --- EXECUTION ---
+        // EXECUTION
         if (pos) {
             botState.avgPrice = parseFloat(pos.cost_hold);
             botState.roi = parseFloat(pos.profit_rate) * 100;
@@ -135,7 +131,7 @@ async function runLogic() {
             botState.distToNext = Math.max(0, ((botState.currentPrice - triggerPrice) / botState.currentPrice) * 100);
 
             if (botState.roi >= botState.settings.takeProfit) {
-                await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
+                await htxRequest('POST', '/linear-swap-api/v1/swap_close_order', { // Adjusted endpoint
                     contract_code: config.symbol, volume: pos.volume,
                     direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
@@ -201,7 +197,7 @@ app.get('/', (req, res) => {
         <div class="flex justify-between items-center mb-10">
             <div>
                 <h1 class="text-slate-900 text-2xl font-bold tracking-tighter uppercase">Static <span class="text-blue-600">Engine</span></h1>
-                <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">${config.symbol} | Locked Fit Mode</p>
+                <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">${config.symbol} | Fit Mode</p>
             </div>
             <div class="text-right">
                 <p id="dgrText" class="text-blue-600 font-bold text-2xl">0.00% DGR</p>
@@ -228,7 +224,6 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- ESTIMATES -->
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
             <div class="bg-blue-600 p-8 rounded-[2rem] shadow-xl shadow-blue-100 relative overflow-hidden text-white text-center">
                 <p id="estDay" class="text-4xl font-bold">$0.00</p>
