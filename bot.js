@@ -3,86 +3,9 @@ const crypto = require('crypto');
 const axios = require('axios');
 const WebSocket = require('ws');
 const zlib = require('zlib');
-const mongoose = require('mongoose');
 
 const app = express();
 app.use(express.json());
-
-// ==================== MONGODB SETUP ====================
-const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
-
-const BotStateSchema = new mongoose.Schema({
-    id: { type: String, default: "htx_martingale_main", unique: true },
-    initialBalance: { type: Number, default: 0 },
-    displayBalance: { type: Number, default: 0 },
-    peakBalance: { type: Number, default: 0 },
-    walletBalance: { type: Number, default: 0 },
-    realizedProfit: { type: Number, default: 0 },
-    profitPct: { type: Number, default: 0 },
-    currentPrice: { type: Number, default: 0 },
-    avgPrice: { type: Number, default: 0 },
-    roi: { type: Number, default: 0 },
-    safetyOrdersFilled: { type: Number, default: 0 },
-    distToNext: { type: Number, default: 0 },
-    maxSafeBase: { type: Number, default: 0 },
-    settings: {
-        baseOrder: { type: Number, default: 0 },
-        priceDrop: { type: Number, default: 0.1 },
-        volumeMult: { type: Number, default: 1.2 },
-        takeProfit: { type: Number, default: 1.5 },
-        maxSteps: { type: Number, default: 10 }
-    },
-    estimates: {
-        hr: { type: Number, default: 0 },
-        day: { type: Number, default: 0 },
-        week: { type: Number, default: 0 },
-        month: { type: Number, default: 0 },
-        dgr: { type: Number, default: 0 }
-    },
-    isRunning: { type: Boolean, default: true },
-    startTime: { type: Number, default: Date.now },
-    lastUpdate: { type: Number, default: Date.now },
-    openPosition: {
-        volume: { type: Number, default: 0 },
-        direction: { type: String, default: "" },
-        costHold: { type: Number, default: 0 }
-    },
-    allTimeHigh: { type: Number, default: 0 },
-    peakProfit: { type: Number, default: 0 },
-    totalTrades: { type: Number, default: 0 },
-    winningTrades: { type: Number, default: 0 }
-});
-
-const BotState = mongoose.model('BotState_Persistent', BotStateSchema);
-
-const TradeHistorySchema = new mongoose.Schema({
-    timestamp: { type: Number, default: Date.now },
-    type: { type: String, enum: ['open', 'safety', 'take_profit', 'reset'] },
-    volume: Number,
-    price: Number,
-    safetyLevel: Number,
-    roi: Number,
-    balanceAfter: Number
-});
-
-const TradeHistory = mongoose.model('TradeHistory', TradeHistorySchema);
-
-const DailySnapshotSchema = new mongoose.Schema({
-    date: { type: String, unique: true },
-    displayBalance: Number,
-    walletBalance: Number,
-    profit: Number,
-    profitPct: Number,
-    dgr: Number,
-    tradesToday: Number
-});
-
-const DailySnapshot = mongoose.model('DailySnapshot', DailySnapshotSchema);
-
-mongoose.connect(MONGO_URI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true
-}).then(() => console.log("📦 MongoDB Connected - Persistent Storage Active"));
 
 // ==================== CONFIGURATION ====================
 const config = {
@@ -95,149 +18,50 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws'
 };
 
-let botState = {};
-let lastPositionFetch = 0;
-let lastAccountFetch = 0;
-const FETCH_INTERVAL = 1000; // Fetch every 1 second for faster updates
+// ==================== BOT STATE (Memory Only) ====================
+let botState = {
+    isRunning: true,
+    isTrading: false,
+    startTime: Date.now(),
+    currentPrice: 0,
+    avgPrice: 0,
+    roi: 0,
+    realizedProfit: 0,
+    profitPct: 0,
+    walletBalance: 0,
+    displayBalance: 0,
+    peakBalance: 0,
+    initialBalance: 0,
+    maxSafeBase: 0,
+    safetyOrdersFilled: 0,
+    distToNext: 0,
+    settings: {
+        baseOrder: 0,
+        priceDrop: 0.1,
+        volumeMult: 1.2,
+        takeProfit: 1.5,
+        maxSteps: 10
+    },
+    estimates: {
+        hr: 0,
+        day: 0,
+        week: 0,
+        month: 0,
+        dgr: 0
+    },
+    openPosition: {
+        volume: 0,
+        direction: "",
+        costHold: 0
+    },
+    allTimeHigh: 0,
+    peakProfit: 0,
+    totalTrades: 0,
+    winningTrades: 0
+};
 
-// ==================== PERSISTENCE FUNCTIONS ====================
-async function saveStateToDB() {
-    try {
-        await BotState.updateOne(
-            { id: "htx_martingale_main" },
-            {
-                initialBalance: botState.initialBalance,
-                displayBalance: botState.displayBalance,
-                peakBalance: botState.peakBalance,
-                walletBalance: botState.walletBalance,
-                realizedProfit: botState.realizedProfit,
-                profitPct: botState.profitPct,
-                currentPrice: botState.currentPrice,
-                avgPrice: botState.avgPrice,
-                roi: botState.roi,
-                safetyOrdersFilled: botState.safetyOrdersFilled,
-                distToNext: botState.distToNext,
-                maxSafeBase: botState.maxSafeBase,
-                settings: botState.settings,
-                estimates: botState.estimates,
-                isRunning: botState.isRunning,
-                startTime: botState.startTime,
-                lastUpdate: Date.now(),
-                openPosition: botState.openPosition || { volume: 0, direction: "", costHold: 0 },
-                allTimeHigh: botState.allTimeHigh || botState.peakBalance,
-                peakProfit: botState.peakProfit || 0,
-                totalTrades: botState.totalTrades || 0,
-                winningTrades: botState.winningTrades || 0
-            },
-            { upsert: true }
-        );
-    } catch (e) {
-        console.error("DB Save Error:", e);
-    }
-}
-
-async function loadStateFromDB() {
-    const data = await BotState.findOne({ id: "htx_martingale_main" });
-    
-    if (data) {
-        botState = {
-            isRunning: data.isRunning ?? true,
-            isTrading: false,
-            startTime: data.startTime ?? Date.now(),
-            currentPrice: data.currentPrice ?? 0,
-            avgPrice: data.avgPrice ?? 0,
-            roi: data.roi ?? 0,
-            realizedProfit: data.realizedProfit ?? 0,
-            profitPct: data.profitPct ?? 0,
-            walletBalance: data.walletBalance ?? 0,
-            displayBalance: data.displayBalance ?? 0,
-            peakBalance: data.peakBalance ?? 0,
-            initialBalance: data.initialBalance ?? 0,
-            maxSafeBase: data.maxSafeBase ?? 0,
-            safetyOrdersFilled: data.safetyOrdersFilled ?? 0,
-            distToNext: data.distToNext ?? 0,
-            estimates: data.estimates ?? { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
-            settings: data.settings ?? { baseOrder: 0, priceDrop: 0.1, volumeMult: 1.2, takeProfit: 1.5, maxSteps: 10 },
-            openPosition: data.openPosition ?? { volume: 0, direction: "", costHold: 0 },
-            allTimeHigh: data.allTimeHigh ?? 0,
-            peakProfit: data.peakProfit ?? 0,
-            totalTrades: data.totalTrades ?? 0,
-            winningTrades: data.winningTrades ?? 0
-        };
-        console.log(`📀 Loaded from DB | Display: $${botState.displayBalance.toFixed(2)}`);
-    } else {
-        botState = {
-            isRunning: true,
-            isTrading: false,
-            startTime: Date.now(),
-            currentPrice: 0,
-            avgPrice: 0,
-            roi: 0,
-            realizedProfit: 0,
-            profitPct: 0,
-            walletBalance: 0,
-            displayBalance: 0,
-            peakBalance: 0,
-            initialBalance: 0,
-            maxSafeBase: 0,
-            safetyOrdersFilled: 0,
-            distToNext: 0,
-            estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
-            settings: { baseOrder: 0, priceDrop: 0.1, volumeMult: 1.2, takeProfit: 1.5, maxSteps: 10 },
-            openPosition: { volume: 0, direction: "", costHold: 0 },
-            allTimeHigh: 0,
-            peakProfit: 0,
-            totalTrades: 0,
-            winningTrades: 0
-        };
-        console.log("🆕 No existing state found - Creating new session");
-    }
-    return botState;
-}
-
-async function saveTradeHistory(type, volume, price, safetyLevel, roi, balanceAfter) {
-    try {
-        await TradeHistory.create({
-            timestamp: Date.now(),
-            type,
-            volume,
-            price,
-            safetyLevel: safetyLevel || 0,
-            roi: roi || 0,
-            balanceAfter
-        });
-        
-        if (type === 'take_profit') {
-            botState.winningTrades = (botState.winningTrades || 0) + 1;
-            if (roi > (botState.peakProfit || 0)) botState.peakProfit = roi;
-        }
-        botState.totalTrades = (botState.totalTrades || 0) + 1;
-        
-    } catch (e) {
-        console.error("Trade history save error:", e);
-    }
-}
-
-async function saveDailySnapshot() {
-    const today = new Date().toISOString().split('T')[0];
-    const existing = await DailySnapshot.findOne({ date: today });
-    
-    if (!existing && botState.displayBalance > 0) {
-        await DailySnapshot.create({
-            date: today,
-            displayBalance: botState.displayBalance,
-            walletBalance: botState.walletBalance,
-            profit: botState.realizedProfit,
-            profitPct: botState.profitPct,
-            dgr: botState.estimates.dgr,
-            tradesToday: 0
-        });
-        console.log(`📸 Daily snapshot saved for ${today}`);
-    }
-}
-
-setInterval(saveStateToDB, 30000);
-setInterval(() => saveDailySnapshot(), 3600000);
+// Trade history in memory
+let tradeHistory = [];
 
 // ==================== API HANDLER ====================
 async function htxRequest(method, path, data = {}) {
@@ -250,7 +74,10 @@ async function htxRequest(method, path, data = {}) {
     try {
         const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 5000 });
         return res.data;
-    } catch (e) { return null; }
+    } catch (e) { 
+        console.error("API Error:", e.message);
+        return null; 
+    }
 }
 
 // ==================== FAST UPDATE FUNCTIONS ====================
@@ -307,7 +134,6 @@ async function fetchAccountAndBalance() {
                     }
                     
                     console.log(`🎯 New Peak! Display: $${botState.displayBalance.toFixed(2)}`);
-                    await saveStateToDB();
                 }
                 
                 botState.walletBalance = realBalance;
@@ -319,7 +145,6 @@ async function fetchAccountAndBalance() {
                     botState.allTimeHigh = botState.walletBalance;
                     botState.startTime = Date.now();
                     console.log(`🚀 Bot Initialized | Starting: $${botState.initialBalance.toFixed(2)}`);
-                    await saveStateToDB();
                 }
             }
         }
@@ -365,7 +190,28 @@ async function updatePositionSizing() {
     }
 }
 
-// ==================== TRADING LOGIC (Order execution only) ====================
+// ==================== TRADING LOGIC ====================
+async function saveTradeHistory(type, volume, price, safetyLevel, roi, balanceAfter) {
+    tradeHistory.unshift({
+        timestamp: Date.now(),
+        type,
+        volume,
+        price,
+        safetyLevel: safetyLevel || 0,
+        roi: roi || 0,
+        balanceAfter
+    });
+    
+    // Keep only last 100 trades in memory
+    if (tradeHistory.length > 100) tradeHistory.pop();
+    
+    if (type === 'take_profit') {
+        botState.winningTrades = (botState.winningTrades || 0) + 1;
+        if (roi > (botState.peakProfit || 0)) botState.peakProfit = roi;
+    }
+    botState.totalTrades = (botState.totalTrades || 0) + 1;
+}
+
 async function checkAndExecuteTrades() {
     if (!botState.isRunning || botState.isTrading) return;
     botState.isTrading = true;
@@ -391,7 +237,6 @@ async function checkAndExecuteTrades() {
                     await saveTradeHistory('take_profit', parseFloat(pos.volume), botState.currentPrice, botState.safetyOrdersFilled, currentROI, botState.displayBalance);
                     botState.safetyOrdersFilled = 0;
                     console.log(`✅ Take profit! ROI: ${currentROI}%`);
-                    await saveStateToDB();
                 }
             }
             // Check safety order
@@ -406,7 +251,6 @@ async function checkAndExecuteTrades() {
                 if (result?.code === 200) {
                     await saveTradeHistory('safety', nextVol, botState.currentPrice, botState.safetyOrdersFilled, 0, botState.displayBalance);
                     console.log(`📉 Safety Order #${botState.safetyOrdersFilled} | Vol: ${nextVol}`);
-                    await saveStateToDB();
                 }
             }
         } 
@@ -421,7 +265,6 @@ async function checkAndExecuteTrades() {
                 await saveTradeHistory('open', botState.settings.baseOrder, botState.currentPrice, 0, 0, botState.displayBalance);
                 botState.safetyOrdersFilled = 0;
                 console.log(`🎯 Position opened | Vol: ${botState.settings.baseOrder}`);
-                await saveStateToDB();
             }
         }
 
@@ -431,10 +274,78 @@ async function checkAndExecuteTrades() {
     botState.isTrading = false;
 }
 
+// ==================== RESET FUNCTIONS ====================
+function resetStats() {
+    botState.initialBalance = botState.displayBalance;
+    botState.peakBalance = botState.walletBalance;
+    botState.startTime = Date.now();
+    botState.realizedProfit = 0;
+    botState.profitPct = 0;
+    botState.estimates = { hr: 0, day: 0, week: 0, month: 0, dgr: 0 };
+    console.log("📊 Stats reset!");
+    return true;
+}
+
+function forceUpdateSettings() {
+    botState.settings = {
+        baseOrder: botState.settings.baseOrder || 0,
+        priceDrop: 0.1,
+        volumeMult: 1.2,
+        takeProfit: 1.5,
+        maxSteps: 10
+    };
+    console.log("⚙️ Settings force updated to defaults!");
+    return true;
+}
+
+function fullReset() {
+    botState = {
+        isRunning: true,
+        isTrading: false,
+        startTime: Date.now(),
+        currentPrice: botState.currentPrice,
+        avgPrice: 0,
+        roi: 0,
+        realizedProfit: 0,
+        profitPct: 0,
+        walletBalance: botState.walletBalance,
+        displayBalance: botState.walletBalance,
+        peakBalance: botState.walletBalance,
+        initialBalance: botState.walletBalance,
+        maxSafeBase: 0,
+        safetyOrdersFilled: 0,
+        distToNext: 0,
+        settings: {
+            baseOrder: 0,
+            priceDrop: 0.1,
+            volumeMult: 1.2,
+            takeProfit: 1.5,
+            maxSteps: 10
+        },
+        estimates: {
+            hr: 0,
+            day: 0,
+            week: 0,
+            month: 0,
+            dgr: 0
+        },
+        openPosition: {
+            volume: 0,
+            direction: "",
+            costHold: 0
+        },
+        allTimeHigh: botState.walletBalance,
+        peakProfit: 0,
+        totalTrades: 0,
+        winningTrades: 0
+    };
+    tradeHistory = [];
+    console.log("🗑️ Full reset completed!");
+    return true;
+}
+
 // ==================== STARTUP ====================
 async function boot() {
-    await loadStateFromDB();
-    
     // WebSocket for real-time price
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' })));
@@ -456,19 +367,19 @@ async function boot() {
     setInterval(async () => {
         await fetchPositionAndROI();
         await updatePositionSizing();
-    }, 1000); // Update ROI and position sizing every second
+    }, 1000);
     
     setInterval(async () => {
         await fetchAccountAndBalance();
-    }, 2000); // Update balance every 2 seconds
+    }, 2000);
     
-    // Trade execution every 2 seconds (but not conflicting)
+    // Trade execution every 2 seconds
     setInterval(async () => {
         await checkAndExecuteTrades();
     }, 2000);
     
     console.log(`🤖 Bot started | ${config.symbol} | ${config.leverage}X`);
-    console.log(`📊 Initial: Display $${botState.displayBalance.toFixed(2)} | Real $${botState.walletBalance.toFixed(2)}`);
+    console.log(`📊 No database - using memory only | Settings: TP=${botState.settings.takeProfit}%, MaxSteps=${botState.settings.maxSteps}`);
 }
 
 // ==================== UI ====================
@@ -477,7 +388,7 @@ app.get('/', (req, res) => {
 <!DOCTYPE html>
 <html class="bg-white">
 <head>
-    <title>HTX Compounder V33 | Fast Sync Edition</title>
+    <title>HTX Compounder | No DB Edition</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
@@ -494,6 +405,9 @@ app.get('/', (req, res) => {
         }
         .balance-update { animation: pulse-green 0.3s ease; }
         .roi-update { animation: pulse-green 0.3s ease; }
+        .btn-danger { transition: all 0.2s ease; }
+        .btn-danger:hover { background-color: #dc2626 !important; transform: scale(1.02); color: white !important; }
+        .btn-warning:hover { background-color: #d97706 !important; transform: scale(1.02); }
     </style>
 </head>
 <body class="text-gray-900 p-4 md:p-10 bg-gray-50">
@@ -503,10 +417,10 @@ app.get('/', (req, res) => {
             <div>
                 <h1 class="text-gray-900 text-3xl font-bold tracking-tight">
                     COMPOUND<span class="gradient-text">_BOT</span>
-                    <span class="text-sm font-mono text-gray-400 ml-2">v33</span>
+                    <span class="text-sm font-mono text-gray-400 ml-2">No DB</span>
                 </h1>
                 <p class="text-xs text-gray-400 uppercase tracking-wider mt-1">${config.symbol} | ${config.leverage}X Leverage</p>
-                <p class="text-[10px] text-emerald-600 mt-2">⚡ Real-time updates | ROI from exchange every 1s</p>
+                <p class="text-[10px] text-emerald-600 mt-2">⚡ Memory-only | Settings: TP=${botState.settings.takeProfit}% | Steps=${botState.settings.maxSteps}</p>
             </div>
             <div class="text-right">
                 <p class="text-3xl font-bold text-emerald-600" id="dgrText">0.00%</p>
@@ -580,7 +494,7 @@ app.get('/', (req, res) => {
             <div class="flex justify-between items-end mb-6">
                 <div>
                     <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Safety Orders Filled</p>
-                    <p id="stepText" class="text-5xl font-bold text-gray-900 stat-number">0 <span class="text-2xl text-gray-400">/ 10</span></p>
+                    <p id="stepText" class="text-5xl font-bold text-gray-900 stat-number">0 <span class="text-2xl text-gray-400">/ ${botState.settings.maxSteps}</span></p>
                 </div>
                 <div class="text-right">
                     <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Next Step Distance</p>
@@ -597,12 +511,25 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
+        <!-- BUTTONS SECTION -->
+        <div class="flex justify-between items-center mb-8 gap-4 flex-wrap">
+            <div class="flex gap-3">
+                <button onclick="resetStats()" class="text-gray-600 hover:text-red-600 transition-colors px-4 py-2 rounded-lg bg-gray-100 hover:bg-red-50 text-sm font-medium border border-gray-200">📊 Reset Stats</button>
+                <button onclick="forceUpdate()" class="text-amber-600 hover:text-amber-700 transition-colors px-4 py-2 rounded-lg bg-amber-50 hover:bg-amber-100 text-sm font-medium border border-amber-200">⚙️ Force Update Settings</button>
+                <button onclick="fullReset()" class="text-red-600 hover:text-white transition-colors px-4 py-2 rounded-lg bg-red-50 hover:bg-red-600 text-sm font-medium border border-red-200">🗑️ Full Reset</button>
+            </div>
+            <div class="flex gap-3">
+                <button onclick="viewHistory()" class="text-blue-500 hover:text-blue-700 transition-colors px-4 py-2 rounded-lg bg-blue-50 hover:bg-blue-100 text-sm font-medium">📜 Trade History</button>
+                <button onclick="refreshUI()" class="text-gray-500 hover:text-gray-700 transition-colors px-4 py-2 rounded-lg bg-gray-100 hover:bg-gray-200 text-sm font-medium">🔄 Refresh</button>
+            </div>
+        </div>
+
         <div class="flex justify-between items-center text-[10px] font-semibold text-gray-400 uppercase tracking-wider">
             <div>Avg Profit/Hr: <span id="estHr" class="text-gray-600 ml-1">$0.000000</span></div>
             <div class="flex gap-6 items-center">
                 <span>Price: <span id="curPrice" class="text-gray-900 font-mono ml-1">0.00000000</span></span>
-                <button onclick="resetStats()" class="text-gray-400 hover:text-red-500 transition-colors px-3 py-1 rounded-lg hover:bg-red-50">Reset</button>
-                <button onclick="viewHistory()" class="text-blue-500 hover:text-blue-700 transition-colors px-3 py-1 rounded-lg hover:bg-blue-50">History</button>
+                <span>TP: <span id="tpDisplay" class="text-emerald-600 font-mono ml-1">${botState.settings.takeProfit}%</span></span>
+                <span>Drop: <span id="dropDisplay" class="text-orange-600 font-mono ml-1">${botState.settings.priceDrop}%</span></span>
             </div>
         </div>
     </div>
@@ -630,8 +557,9 @@ app.get('/', (req, res) => {
                 document.getElementById('winningTrades').innerHTML = d.winningTrades || 0;
                 document.getElementById('openVol').innerHTML = d.openPosition?.volume?.toFixed(0) || 0;
                 document.getElementById('ath').innerHTML = '$' + (d.allTimeHigh || d.displayBalance).toFixed(2);
+                document.getElementById('tpDisplay').innerHTML = d.settings?.takeProfit + '%';
+                document.getElementById('dropDisplay').innerHTML = d.settings?.priceDrop + '%';
                 
-                // Animate ROI on change
                 if (d.roi !== lastROI) {
                     const roiEl = document.getElementById('roi');
                     roiEl.classList.add('roi-update');
@@ -669,10 +597,10 @@ app.get('/', (req, res) => {
                 document.getElementById('estMonth').innerHTML = '$' + d.estimates.month.toFixed(6);
 
                 document.getElementById('curPrice').innerHTML = d.currentPrice.toFixed(8);
-                document.getElementById('stepText').innerHTML = d.safetyOrdersFilled + ' <span class="text-2xl text-gray-400">/ ' + d.settings.maxSteps + '</span>';
+                document.getElementById('stepText').innerHTML = d.safetyOrdersFilled + ' <span class="text-2xl text-gray-400">/ ' + (d.settings?.maxSteps || 10) + '</span>';
                 document.getElementById('distText').innerHTML = d.distToNext.toFixed(3) + '%';
 
-                const progressPct = (d.safetyOrdersFilled / d.settings.maxSteps) * 100;
+                const progressPct = (d.safetyOrdersFilled / (d.settings?.maxSteps || 10)) * 100;
                 document.getElementById('progressBar').style.width = progressPct + '%';
                 
                 const warning = document.getElementById('riskWarning');
@@ -683,9 +611,23 @@ app.get('/', (req, res) => {
         }
         
         async function resetStats() { 
-            if(confirm("Reset initial balance?")) {
+            if(confirm("Reset stats only? (Keep position and balance)")) {
                 await fetch('/api/reset-stats', {method:'POST'});
                 update();
+            }
+        }
+        
+        async function forceUpdate() {
+            if(confirm("Force update settings to defaults? (TP=1.5%, Drop=0.1%, MaxSteps=10)")) {
+                await fetch('/api/force-update', {method:'POST'});
+                setTimeout(() => update(), 500);
+            }
+        }
+        
+        async function fullReset() {
+            if(confirm("⚠️ FULL RESET - Clear all trades and reset to current balance? This cannot be undone!")) {
+                await fetch('/api/full-reset', {method:'POST'});
+                setTimeout(() => update(), 500);
             }
         }
         
@@ -702,22 +644,16 @@ app.get('/', (req, res) => {
             }
         }
         
-        setInterval(update, 500); // Update UI every 500ms for smoother display
+        function refreshUI() { update(); }
+        
+        setInterval(update, 500);
         update();
     </script>
-    <style>
-        .roi-update { animation: pulse-green 0.3s ease; }
-        .balance-update { animation: pulse-green 0.3s ease; }
-        @keyframes pulse-green {
-            0% { transform: scale(1); }
-            50% { transform: scale(1.02); background-color: rgba(5, 150, 105, 0.1); border-radius: 8px; }
-            100% { transform: scale(1); }
-        }
-    </style>
 </body>
 </html>`);
 });
 
+// ==================== API ENDPOINTS ====================
 app.get('/api/status', async (req, res) => {
     res.json({
         ...botState,
@@ -731,31 +667,26 @@ app.get('/api/status', async (req, res) => {
 });
 
 app.get('/api/trade-history', async (req, res) => {
-    const trades = await TradeHistory.find().sort({ timestamp: -1 }).limit(50);
-    res.json(trades);
+    res.json(tradeHistory.slice(0, 50));
 });
 
 app.post('/api/reset-stats', async (req, res) => {
-    await saveTradeHistory('reset', 0, botState.currentPrice, 0, 0, botState.displayBalance);
-    botState.initialBalance = botState.displayBalance;
-    botState.peakBalance = botState.walletBalance;
-    botState.startTime = Date.now();
-    botState.realizedProfit = 0;
-    botState.profitPct = 0;
-    botState.estimates = { hr: 0, day: 0, week: 0, month: 0, dgr: 0 };
-    await saveStateToDB();
+    resetStats();
     res.sendStatus(200);
 });
 
-app.post('/api/save-now', async (req, res) => {
-    await saveStateToDB();
+app.post('/api/force-update', async (req, res) => {
+    forceUpdateSettings();
+    res.sendStatus(200);
+});
+
+app.post('/api/full-reset', async (req, res) => {
+    fullReset();
     res.sendStatus(200);
 });
 
 process.on('SIGINT', async () => {
-    console.log('Saving state...');
-    await saveStateToDB();
-    await mongoose.disconnect();
+    console.log('Shutting down...');
     process.exit();
 });
 
