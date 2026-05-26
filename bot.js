@@ -87,7 +87,7 @@ async function runLogic() {
         if (accRes?.data) {
             const acc = accRes.data.find(a => a.margin_asset === 'USDT');
             if (acc) {
-                // Static balance (Equity - Unrealized)
+                // STATIC BALANCE CALCULATION (Exactly as first pasted)
                 const equity = parseFloat(acc.margin_balance) || 0;
                 const unrealized = pos ? (parseFloat(pos.unrealized_pnl) || 0) : 0;
                 botState.walletBalance = equity - unrealized;
@@ -121,6 +121,7 @@ async function runLogic() {
         if (pos) {
             botState.avgPrice = parseFloat(pos.cost_hold);
             botState.roi = parseFloat(pos.profit_rate) * 100;
+
             const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
             botState.distToNext = Math.max(0, ((botState.currentPrice - triggerPrice) / botState.currentPrice) * 100);
 
@@ -146,6 +147,7 @@ async function runLogic() {
             botState.safetyOrdersFilled = 0;
         }
 
+        // STATIC GAIN CALCULATION
         botState.realizedProfit = botState.walletBalance - botState.initialBalance;
         botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
 
@@ -178,7 +180,7 @@ async function boot() {
     setInterval(runLogic, 3000);
 }
 
-// ==================== UI ====================
+// ==================== UI (WHITE DESIGN) ====================
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
@@ -189,11 +191,11 @@ app.get('/', (req, res) => {
     <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@500;700&display=swap" rel="stylesheet">
     <style>
         body { font-family: 'Roboto Mono', monospace; }
-        .glass { background: white; border: 1px solid rgba(0, 0, 0, 0.08); box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05); }
-        .glow-blue { box-shadow: 0 10px 25px -5px rgba(59, 130, 246, 0.2); }
+        .glass { background: white; border: 1px solid rgba(0, 0, 0, 0.08); box-shadow: 0 2px 4px rgba(0,0,0,0.02); }
+        .glow-blue { box-shadow: 0 10px 30px -5px rgba(59, 130, 246, 0.2); }
     </style>
 </head>
-<body class="text-slate-600 p-4 md:p-10">
+<body class="text-slate-700 p-4 md:p-10">
     <div class="max-w-6xl mx-auto">
         
         <div class="flex justify-between items-center mb-10">
@@ -203,35 +205,35 @@ app.get('/', (req, res) => {
             </div>
             <div class="text-right">
                 <p id="dgrText" class="text-blue-600 font-bold text-xl">0.00% DGR</p>
-                <p class="text-[10px] text-slate-400 uppercase tracking-widest">Daily Growth Rate</p>
+                <p class="text-[10px] text-slate-400 uppercase">Daily Growth Rate</p>
             </div>
         </div>
 
         <!-- STATS GRID -->
         <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
             <div class="glass p-5 rounded-2xl">
-                <p class="text-[10px] text-slate-400 uppercase mb-1">Net Profit (Static)</p>
+                <p class="text-[10px] text-slate-400 uppercase mb-1">Static Profit</p>
                 <p id="p1" class="text-2xl text-emerald-600 font-bold">$0.00</p>
             </div>
             <div class="glass p-5 rounded-2xl">
-                <p class="text-[10px] text-slate-400 uppercase mb-1">Total Gain</p>
+                <p class="text-[10px] text-slate-400 uppercase mb-1">Static Gain</p>
                 <p id="p2" class="text-2xl text-emerald-600 font-bold">0.00%</p>
             </div>
             <div class="glass p-5 rounded-2xl">
-                <p class="text-[10px] text-slate-400 uppercase mb-1">Open Position ROI</p>
+                <p class="text-[10px] text-slate-400 uppercase mb-1">Live Position ROI</p>
                 <p id="roi" class="text-2xl text-slate-300 font-bold">0.00%</p>
             </div>
             <div class="glass p-5 rounded-2xl">
-                <p class="text-[10px] text-slate-400 uppercase mb-1">Wallet Balance</p>
+                <p class="text-[10px] text-slate-400 uppercase mb-1">Static Balance</p>
                 <p id="bal" class="text-2xl text-slate-900 font-bold">$0.00</p>
             </div>
         </div>
 
         <!-- COMPOUNDING PROJECTIONS SECTION -->
-        <h2 class="text-slate-400 text-[10px] font-bold uppercase mb-4 tracking-widest">Compounding Estimates (100% Reinvestment)</h2>
+        <h2 class="text-slate-400 text-[10px] font-bold uppercase mb-4 tracking-widest">Compounding Estimates</h2>
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
             
-            <div class="bg-blue-600 border border-blue-700 p-8 rounded-3xl glow-blue relative overflow-hidden">
+            <div class="bg-blue-600 p-8 rounded-3xl glow-blue relative overflow-hidden">
                 <div class="absolute top-0 right-0 p-4 opacity-10 text-4xl italic font-black text-white">24H</div>
                 <p class="text-[10px] text-blue-100 font-bold uppercase mb-2">Next 24 Hours</p>
                 <p id="estDay" class="text-4xl text-white font-bold">$0.00</p>
@@ -265,7 +267,7 @@ app.get('/', (req, res) => {
                     <p id="distText" class="text-5xl text-orange-500 font-bold">0.00%</p>
                 </div>
             </div>
-            <div class="w-full bg-slate-100 rounded-full h-4 overflow-hidden shadow-inner">
+            <div class="w-full bg-slate-100 rounded-full h-4 overflow-hidden">
                 <div id="progressBar" class="bg-blue-600 h-full transition-all duration-1000" style="width: 0%"></div>
             </div>
         </div>
@@ -275,7 +277,7 @@ app.get('/', (req, res) => {
             <div>Avg Profit/Hr: <span id="estHr" class="text-slate-600 ml-1">$0.00</span></div>
             <div class="flex gap-6">
                 <span>Price: <span id="curPrice" class="text-slate-600 ml-1">0.00</span></span>
-                <button onclick="resetStats()" class="text-slate-300 hover:text-red-500 transition-colors">Emergency Reset Session</button>
+                <button onclick="resetStats()" class="text-red-300 hover:text-red-600 transition-colors">Reset Session</button>
             </div>
         </div>
     </div>
@@ -286,21 +288,25 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); 
                 const d = await r.json();
                 
+                // Static fields
                 document.getElementById('p1').innerText = '$' + d.realizedProfit.toFixed(4);
                 document.getElementById('p2').innerText = d.profitPct.toFixed(2) + '%';
+                document.getElementById('bal').innerText = '$' + d.walletBalance.toFixed(2);
                 
+                // Live ROI field
                 const roiEl = document.getElementById('roi');
                 roiEl.innerText = d.roi.toFixed(2) + '%';
-                roiEl.className = 'text-2xl font-bold ' + (d.roi >= 0 ? (d.roi == 0 ? 'text-slate-300' : 'text-emerald-600') : 'text-red-600');
+                roiEl.className = 'text-2xl font-bold ' + (d.roi >= 0 ? (d.roi == 0 ? 'text-slate-300' : 'text-emerald-600') : 'text-red-500');
                 
-                document.getElementById('bal').innerText = '$' + d.walletBalance.toFixed(2);
                 document.getElementById('dgrText').innerText = d.estimates.dgr.toFixed(2) + '% DGR';
                 
+                // Estimates
                 document.getElementById('estHr').innerText = '$' + d.estimates.hr.toFixed(2);
                 document.getElementById('estDay').innerText = '$' + d.estimates.day.toFixed(2);
                 document.getElementById('estWeek').innerText = '$' + d.estimates.week.toFixed(2);
                 document.getElementById('estMonth').innerText = '$' + d.estimates.month.toFixed(0);
 
+                // Risk
                 document.getElementById('curPrice').innerText = d.currentPrice.toFixed(8);
                 document.getElementById('stepText').innerText = d.safetyOrdersFilled + ' / ' + d.settings.maxSteps;
                 document.getElementById('distText').innerText = d.distToNext.toFixed(3) + '%';
@@ -309,13 +315,13 @@ app.get('/', (req, res) => {
                 const bar = document.getElementById('progressBar');
                 bar.style.width = progressPct + '%';
                 
-                if(progressPct > 75) { bar.classList.remove('bg-blue-600', 'bg-orange-500'); bar.classList.add('bg-red-600'); }
-                else if(progressPct > 45) { bar.classList.remove('bg-blue-600', 'bg-red-600'); bar.classList.add('bg-orange-500'); }
-                else { bar.classList.add('bg-blue-600'); bar.classList.remove('bg-red-600', 'bg-orange-500'); }
+                if(progressPct > 75) bar.className = 'bg-red-500 h-full transition-all duration-1000';
+                else if(progressPct > 45) bar.className = 'bg-orange-500 h-full transition-all duration-1000';
+                else bar.className = 'bg-blue-600 h-full transition-all duration-1000';
 
             } catch (e) {}
         }
-        async function resetStats() { if(confirm("This resets Initial Balance and Projections. Continue?")) await fetch('/api/reset-stats', {method:'POST'}); update(); }
+        async function resetStats() { if(confirm("Reset Initial Balance?")) await fetch('/api/reset-stats', {method:'POST'}); update(); }
         setInterval(update, 1000); 
         update();
     </script>
