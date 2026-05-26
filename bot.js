@@ -1,5 +1,3 @@
-//
-
 require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
@@ -88,7 +86,7 @@ const TradeHistory = mongoose.model('TradeHistory', TradeHistorySchema);
 
 // Daily Snapshot Schema
 const DailySnapshotSchema = new mongoose.Schema({
-    date: { type: String, unique: true }, // YYYY-MM-DD
+    date: { type: String, unique: true },
     displayBalance: Number,
     walletBalance: Number,
     profit: Number,
@@ -150,7 +148,6 @@ async function saveStateToDB() {
             },
             { upsert: true }
         );
-        console.log(`💾 State saved to DB | Balance: $${botState.displayBalance?.toFixed(2)}`);
     } catch (e) {
         console.error("DB Save Error:", e);
     }
@@ -184,10 +181,8 @@ async function loadStateFromDB() {
             totalTrades: data.totalTrades ?? 0,
             winningTrades: data.winningTrades ?? 0
         };
-        
-        console.log(`📀 Loaded from DB | Display: $${botState.displayBalance.toFixed(2)} | Real: $${botState.walletBalance.toFixed(2)} | Trades: ${botState.totalTrades}`);
+        console.log(`📀 Loaded from DB | Display: $${botState.displayBalance.toFixed(2)} | Real: $${botState.walletBalance.toFixed(2)}`);
     } else {
-        // First time setup
         botState = {
             isRunning: true,
             isTrading: false,
@@ -229,7 +224,6 @@ async function saveTradeHistory(type, volume, price, safetyLevel, roi, balanceAf
             balanceAfter
         });
         
-        // Update trade counters
         if (type === 'take_profit') {
             botState.winningTrades = (botState.winningTrades || 0) + 1;
             if (roi > (botState.peakProfit || 0)) botState.peakProfit = roi;
@@ -259,9 +253,7 @@ async function saveDailySnapshot() {
     }
 }
 
-// Auto-save every 30 seconds
 setInterval(saveStateToDB, 30000);
-// Daily snapshot at midnight
 setInterval(() => saveDailySnapshot(), 3600000);
 
 // ==================== API HANDLER ====================
@@ -291,15 +283,18 @@ async function runLogic() {
 
         const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
         
-        // Update open position tracking
         if (pos) {
             botState.openPosition = {
                 volume: parseFloat(pos.volume),
                 direction: pos.direction,
                 costHold: parseFloat(pos.cost_hold)
             };
+            // Get ROI directly from exchange
+            botState.roi = parseFloat(pos.profit_rate) * 100;
+            botState.avgPrice = parseFloat(pos.cost_hold);
         } else {
             botState.openPosition = { volume: 0, direction: "", costHold: 0 };
+            botState.roi = 0;
         }
         
         if (accRes?.data) {
@@ -309,20 +304,16 @@ async function runLogic() {
                 const unrealized = pos ? (parseFloat(pos.unrealized_pnl) || 0) : 0;
                 const realBalance = equity - unrealized;
                 
-                // NEW LOGIC: Only update display balance when REAL balance increases
                 if (realBalance > botState.peakBalance) {
                     const increase = realBalance - botState.peakBalance;
                     botState.displayBalance = botState.displayBalance + increase;
                     botState.peakBalance = realBalance;
                     
-                    // Update all-time high tracking
                     if (botState.displayBalance > (botState.allTimeHigh || 0)) {
                         botState.allTimeHigh = botState.displayBalance;
                     }
                     
-                    console.log(`🎯 New Peak Balance! Real: $${realBalance.toFixed(2)} | Display: $${botState.displayBalance.toFixed(2)} | Increase: $${increase.toFixed(2)}`);
-                    
-                    // Save immediately on new high
+                    console.log(`🎯 New Peak Balance! Real: $${realBalance.toFixed(2)} | Display: $${botState.displayBalance.toFixed(2)}`);
                     await saveStateToDB();
                 }
                 
@@ -340,15 +331,38 @@ async function runLogic() {
             }
         }
 
-        // Compounding Math using DISPLAY balance (static, only increases)
-        const elapsedDays = (Date.now() - botState.startTime) / (1000 * 60 * 60 * 24);
-        if (elapsedDays > 0.001 && botState.displayBalance > botState.initialBalance) {
-            const dgr = Math.pow((botState.displayBalance / botState.initialBalance), (1 / elapsedDays)) - 1;
-            botState.estimates.dgr = dgr * 100;
-            botState.estimates.hr = (botState.displayBalance - botState.initialBalance) / (elapsedDays * 24);
-            botState.estimates.day = botState.displayBalance * dgr;
-            botState.estimates.week = (botState.displayBalance * Math.pow((1 + dgr), 7)) - botState.displayBalance;
-            botState.estimates.month = (botState.displayBalance * Math.pow((1 + dgr), 30)) - botState.displayBalance;
+        // Calculate estimates based on LOCKED PROFIT (realizedProfit only)
+        const elapsedHours = (Date.now() - botState.startTime) / (1000 * 60 * 60);
+        const elapsedDays = elapsedHours / 24;
+        
+        // Use realizedProfit (locked profit) for calculations
+        const lockedProfit = botState.realizedProfit;
+        const lockedProfitPct = botState.profitPct;
+        
+        if (elapsedHours > 0.1 && lockedProfit > 0 && botState.initialBalance > 0) {
+            // Calculate hourly profit rate based on locked profit
+            const hourlyProfitRate = lockedProfit / elapsedHours;
+            const totalReturnPct = (lockedProfit / botState.initialBalance) * 100;
+            
+            // Calculate DGR based on locked profit growth
+            if (elapsedDays > 0.01) {
+                const growthFactor = (botState.initialBalance + lockedProfit) / botState.initialBalance;
+                const dgr = Math.pow(growthFactor, (1 / elapsedDays)) - 1;
+                botState.estimates.dgr = dgr * 100;
+            } else {
+                // If less than a day, estimate DGR from hourly rate
+                botState.estimates.dgr = (hourlyProfitRate / botState.initialBalance) * 24 * 100;
+            }
+            
+            botState.estimates.hr = hourlyProfitRate;
+            botState.estimates.day = hourlyProfitRate * 24;
+            botState.estimates.week = hourlyProfitRate * 24 * 7;
+            botState.estimates.month = hourlyProfitRate * 24 * 30;
+            
+            console.log(`📊 Estimates | Locked Profit: $${lockedProfit.toFixed(4)} | Hourly: $${hourlyProfitRate.toFixed(4)} | DGR: ${botState.estimates.dgr.toFixed(4)}%`);
+        } else if (elapsedHours > 0.1 && lockedProfit <= 0 && botState.initialBalance > 0) {
+            // Show zero estimates when no locked profit yet
+            botState.estimates = { hr: 0, day: 0, week: 0, month: 0, dgr: 0 };
         }
 
         // Position sizing uses REAL wallet balance for safety
@@ -361,9 +375,6 @@ async function runLogic() {
         }
 
         if (pos) {
-            botState.avgPrice = parseFloat(pos.cost_hold);
-            botState.roi = parseFloat(pos.profit_rate) * 100;
-
             const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
             botState.distToNext = Math.max(0, ((botState.currentPrice - triggerPrice) / botState.currentPrice) * 100);
 
@@ -407,9 +418,9 @@ async function runLogic() {
             }
         }
 
-        // Profit calculations based on DISPLAY balance (static)
+        // Update locked profit calculations
         botState.realizedProfit = botState.displayBalance - botState.initialBalance;
-        botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100 || 0;
+        botState.profitPct = botState.initialBalance > 0 ? (botState.realizedProfit / botState.initialBalance) * 100 : 0;
 
     } catch (e) {
         console.error("Trading error:", e);
@@ -439,7 +450,7 @@ async function boot() {
     setInterval(runLogic, 3000);
     
     console.log(`🤖 Bot started | Symbol: ${config.symbol} | Leverage: ${config.leverage}X`);
-    console.log(`📊 Initial State | Display: $${botState.displayBalance.toFixed(2)} | Real: $${botState.walletBalance.toFixed(2)}`);
+    console.log(`📊 Initial State | Display: $${botState.displayBalance.toFixed(2)} | Real: $${botState.walletBalance.toFixed(2)} | Locked Profit: $${botState.realizedProfit.toFixed(4)}`);
 }
 
 // ==================== UI - FULL FEATURED DASHBOARD ====================
@@ -490,12 +501,12 @@ app.get('/', (req, res) => {
         <div class="grid grid-cols-2 lg:grid-cols-4 gap-5 mb-8">
             <div class="card p-6 rounded-2xl card-glow transition-all hover:shadow-md">
                 <p class="text-[11px] text-gray-400 uppercase tracking-wider mb-2">Net Profit (Locked)</p>
-                <p id="p1" class="text-3xl font-bold text-emerald-600 stat-number">$0.00</p>
+                <p id="p1" class="text-3xl font-bold text-emerald-600 stat-number">$0.0000</p>
                 <p class="text-[9px] text-gray-400 mt-1">Total trades: <span id="totalTrades">0</span></p>
             </div>
             <div class="card p-6 rounded-2xl card-glow transition-all hover:shadow-md">
                 <p class="text-[11px] text-gray-400 uppercase tracking-wider mb-2">Total Gain</p>
-                <p id="p2" class="text-3xl font-bold text-emerald-600 stat-number">0.00%</p>
+                <p id="p2" class="text-3xl font-bold text-emerald-600 stat-number">0.0000%</p>
                 <p class="text-[9px] text-gray-400 mt-1">Winning trades: <span id="winningTrades">0</span></p>
             </div>
             <div class="card p-6 rounded-2xl card-glow transition-all hover:shadow-md">
@@ -510,28 +521,53 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- Compounding Projections -->
-        <h2 class="text-gray-500 text-[11px] font-bold uppercase tracking-wider mb-4">Compounding Estimates (Based on Locked Balance)</h2>
+        <!-- Base Order Display -->
+        <div class="card p-6 rounded-2xl card-glow mb-8 bg-gradient-to-r from-gray-50 to-white">
+            <div class="flex justify-between items-center">
+                <div>
+                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Base Start Contracts</p>
+                    <p id="baseOrderDisplay" class="text-3xl font-bold text-blue-600 stat-number">0</p>
+                    <p class="text-[9px] text-gray-400 mt-1">Initial position size</p>
+                </div>
+                <div class="text-right">
+                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Max Safe Base</p>
+                    <p id="maxSafeBaseDisplay" class="text-2xl font-bold text-gray-700 stat-number">0</p>
+                </div>
+                <div class="text-right">
+                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Volume Multiplier</p>
+                    <p class="text-2xl font-bold text-purple-600">${botState.settings.volumeMult || 1.2}X</p>
+                </div>
+            </div>
+            <div class="mt-4 pt-3 border-t border-gray-100">
+                <div class="flex justify-between text-[10px] text-gray-400">
+                    <span>Safety Order Progression:</span>
+                    <span>1st: <span id="so1">0</span> | 2nd: <span id="so2">0</span> | 3rd: <span id="so3">0</span> | 4th: <span id="so4">0</span> | 5th: <span id="so5">0</span></span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Compounding Projections (Based on Locked Profit) -->
+        <h2 class="text-gray-500 text-[11px] font-bold uppercase tracking-wider mb-4">Compounding Estimates (Based on Locked Profit)</h2>
         <div class="grid grid-cols-1 md:grid-cols-3 gap-5 mb-10">
             
             <div class="bg-gradient-to-br from-emerald-50 to-sky-50 border border-emerald-200 p-8 rounded-2xl card-glow relative overflow-hidden">
                 <div class="absolute top-0 right-0 p-4 opacity-10 text-6xl italic font-black text-emerald-900">24H</div>
                 <p class="text-[10px] text-emerald-700 font-bold uppercase tracking-wider mb-2">Next 24 Hours</p>
-                <p id="estDay" class="text-4xl font-bold text-emerald-900 stat-number">$0.00</p>
+                <p id="estDay" class="text-4xl font-bold text-emerald-900 stat-number">$0.0000</p>
                 <p class="text-[10px] text-emerald-600 mt-4 font-semibold">ESTIMATED EARNINGS</p>
             </div>
 
             <div class="card p-8 rounded-2xl card-glow relative overflow-hidden">
                 <div class="absolute top-0 right-0 p-4 opacity-5 text-6xl italic font-black text-gray-900">7D</div>
                 <p class="text-[10px] text-gray-400 font-bold uppercase tracking-wider mb-2">Next 7 Days</p>
-                <p id="estWeek" class="text-4xl font-bold text-gray-900 stat-number">$0.00</p>
+                <p id="estWeek" class="text-4xl font-bold text-gray-900 stat-number">$0.0000</p>
                 <p class="text-[10px] text-gray-400 mt-4 font-semibold">COMPOUNDED GROWTH</p>
             </div>
 
             <div class="card p-8 rounded-2xl border-l-4 border-l-emerald-500 card-glow relative overflow-hidden">
                 <div class="absolute top-0 right-0 p-4 opacity-5 text-6xl italic font-black text-gray-900">30D</div>
                 <p class="text-[10px] text-gray-400 font-bold uppercase tracking-wider mb-2">Next 30 Days</p>
-                <p id="estMonth" class="text-4xl font-bold text-emerald-700 stat-number">$0.00</p>
+                <p id="estMonth" class="text-4xl font-bold text-emerald-700 stat-number">$0.0000</p>
                 <p class="text-[10px] text-gray-400 mt-4 font-semibold">PROJECTED PROFIT</p>
             </div>
         </div>
@@ -545,7 +581,7 @@ app.get('/', (req, res) => {
                 </div>
                 <div class="text-right">
                     <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Next Step Distance</p>
-                    <p id="distText" class="text-4xl font-bold text-orange-500 stat-number">0.00%</p>
+                    <p id="distText" class="text-4xl font-bold text-orange-500 stat-number">0.000%</p>
                 </div>
             </div>
             <div class="w-full bg-gray-100 rounded-full h-2 overflow-hidden">
@@ -561,9 +597,9 @@ app.get('/', (req, res) => {
 
         <!-- Footer -->
         <div class="flex justify-between items-center text-[10px] font-semibold text-gray-400 uppercase tracking-wider">
-            <div>Avg Profit/Hr: <span id="estHr" class="text-gray-600 ml-1">$0.00</span></div>
+            <div>Avg Profit/Hr: <span id="estHr" class="text-gray-600 ml-1">$0.0000</span></div>
             <div class="flex gap-6 items-center">
-                <span>Price: <span id="curPrice" class="text-gray-900 font-mono ml-1">0.00</span></span>
+                <span>Price: <span id="curPrice" class="text-gray-900 font-mono ml-1">0.00000000</span></span>
                 <button onclick="resetStats()" class="text-gray-400 hover:text-red-500 transition-colors px-3 py-1 rounded-lg hover:bg-red-50">Reset Session</button>
                 <button onclick="viewHistory()" class="text-blue-500 hover:text-blue-700 transition-colors px-3 py-1 rounded-lg hover:bg-blue-50">Trade History</button>
             </div>
@@ -573,21 +609,43 @@ app.get('/', (req, res) => {
     <script>
         let lastBalance = 0;
         
+        function calculateSafetyOrders(baseOrder, multiplier, maxSteps) {
+            const orders = [];
+            for (let i = 1; i <= 5; i++) {
+                orders.push(Math.floor(baseOrder * Math.pow(multiplier, i)));
+            }
+            return orders;
+        }
+        
         async function update() {
             try {
                 const r = await fetch('/api/status'); 
                 const d = await r.json();
                 
-                document.getElementById('p1').innerHTML = '$' + d.realizedProfit.toFixed(4);
-                document.getElementById('p2').innerHTML = d.profitPct.toFixed(2) + '%';
+                document.getElementById('p1').innerHTML = '$' + d.realizedProfit.toFixed(6);
+                document.getElementById('p2').innerHTML = d.profitPct.toFixed(6) + '%';
                 document.getElementById('totalTrades').innerHTML = d.totalTrades || 0;
                 document.getElementById('winningTrades').innerHTML = d.winningTrades || 0;
                 document.getElementById('openVol').innerHTML = d.openPosition?.volume?.toFixed(0) || 0;
                 document.getElementById('ath').innerHTML = '$' + (d.allTimeHigh || d.displayBalance).toFixed(2);
                 
+                // ROI from exchange
                 const roiEl = document.getElementById('roi');
                 roiEl.innerHTML = d.roi.toFixed(2) + '%';
                 roiEl.className = 'text-3xl font-bold stat-number ' + (d.roi >= 0 ? 'text-emerald-600' : 'text-red-500');
+                
+                // Base order display
+                document.getElementById('baseOrderDisplay').innerHTML = d.settings.baseOrder || 0;
+                document.getElementById('maxSafeBaseDisplay').innerHTML = d.maxSafeBase || 0;
+                
+                // Calculate safety order progression
+                const baseOrder = d.settings.baseOrder || 0;
+                const multiplier = d.settings.volumeMult || 1.2;
+                const safetyOrders = calculateSafetyOrders(baseOrder, multiplier, 5);
+                for (let i = 1; i <= 5; i++) {
+                    const el = document.getElementById('so' + i);
+                    if (el) el.innerHTML = safetyOrders[i-1] || 0;
+                }
                 
                 // Animate balance on increase
                 if (d.displayBalance > lastBalance) {
@@ -599,12 +657,13 @@ app.get('/', (req, res) => {
                 
                 document.getElementById('bal').innerHTML = '$' + d.displayBalance.toFixed(2);
                 document.getElementById('realBal').innerHTML = '$' + d.walletBalance.toFixed(2);
-                document.getElementById('dgrText').innerHTML = d.estimates.dgr.toFixed(2) + '%';
+                document.getElementById('dgrText').innerHTML = d.estimates.dgr.toFixed(4) + '%';
                 
-                document.getElementById('estHr').innerHTML = '$' + d.estimates.hr.toFixed(2);
-                document.getElementById('estDay').innerHTML = '$' + d.estimates.day.toFixed(2);
-                document.getElementById('estWeek').innerHTML = '$' + d.estimates.week.toFixed(2);
-                document.getElementById('estMonth').innerHTML = '$' + d.estimates.month.toFixed(0);
+                // Estimates - show with higher precision for small numbers
+                document.getElementById('estHr').innerHTML = '$' + d.estimates.hr.toFixed(6);
+                document.getElementById('estDay').innerHTML = '$' + d.estimates.day.toFixed(6);
+                document.getElementById('estWeek').innerHTML = '$' + d.estimates.week.toFixed(6);
+                document.getElementById('estMonth').innerHTML = '$' + d.estimates.month.toFixed(6);
 
                 document.getElementById('curPrice').innerHTML = d.currentPrice.toFixed(8);
                 document.getElementById('stepText').innerHTML = d.safetyOrdersFilled + ' <span class="text-2xl text-gray-400">/ ' + d.settings.maxSteps + '</span>';
@@ -678,7 +737,8 @@ app.get('/api/status', async (req, res) => {
         allTimeHigh: botState.allTimeHigh,
         totalTrades: botState.totalTrades,
         winningTrades: botState.winningTrades,
-        peakProfit: botState.peakProfit
+        peakProfit: botState.peakProfit,
+        roi: botState.roi  // ROI directly from exchange
     });
 });
 
