@@ -16,8 +16,6 @@ mongoose.connect(MONGO_URI).then(() => console.log("📦 MongoDB Connected"));
 const BotSchema = new mongoose.Schema({
     id: { type: String, default: "htx_martingale" },
     initialBalance: { type: Number, default: 0 },
-    storedRealizedProfit: { type: Number, default: 0 },
-    storedProfitPct: { type: Number, default: 0 },
     startTime: { type: Number, default: Date.now() }
 });
 const BotModel = mongoose.model('BotConfig_V33', BotSchema);
@@ -40,11 +38,10 @@ let botState = {
     currentPrice: 0,
     avgPrice: 0,
     roi: 0, 
-    realizedProfit: 0, // Static
-    profitPct: 0,      // Static
-    walletBalance: 0,  // Static (Equity - Unrealized)
+    realizedProfit: 0, 
+    profitPct: 0,      
+    walletBalance: 0,  // Cash Balance (Static during trades)
     initialBalance: 0, 
-    maxSafeBase: 0,
     safetyOrdersFilled: 0,
     distToNext: 0,
     estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 }, 
@@ -87,24 +84,41 @@ async function runLogic() {
         if (accRes?.data) {
             const acc = accRes.data.find(a => a.margin_asset === 'USDT');
             if (acc) {
-                // FORCE STATIC BALANCE: Equity minus Unrealized PnL 
-                // This ensures balance doesn't flicker with price movements
+                // TRUE STATIC CALCULATION
+                // margin_balance on HTX is Equity. To get the static cash balance, we subtract unrealized PnL.
                 const equity = parseFloat(acc.margin_balance) || 0;
                 const unrealized = pos ? (parseFloat(pos.unrealized_pnl) || 0) : 0;
+                
+                // This value only changes when a trade closes (Realized PnL)
                 botState.walletBalance = equity - unrealized;
                 
-                if (botState.initialBalance <= 0 && botState.walletBalance > 0) {
+                if (botState.initialBalance <= 0) {
                     botState.initialBalance = botState.walletBalance;
                     botState.startTime = Date.now();
                 }
             }
         }
 
-        // ==================== COMPOUNDING MATH (STATIC) ====================
-        const elapsedDays = (Date.now() - botState.startTime) / (1000 * 60 * 60 * 24);
-        botState.realizedProfit = botState.walletBalance - botState.initialBalance;
-        botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
+        // ==================== DYNAMIC STEP SCALING ====================
+        // Recalculate base order based on current static balance to ensure strategy scales
+        if (botState.currentPrice > 0 && botState.walletBalance > 0) {
+            const m = botState.settings.volumeMult;
+            const n = botState.settings.maxSteps;
+            const multiplierSum = (Math.pow(m, n + 1) - 1) / (m - 1);
+            
+            // Allocate 80% of balance to the strategy to account for fees/slippage
+            const maxNotional = (botState.walletBalance * config.leverage * 0.8);
+            const baseNotional = maxNotional / multiplierSum;
+            
+            // Dynamic base order in contracts
+            botState.settings.baseOrder = Math.max(1, Math.floor(baseNotional / botState.currentPrice));
+        }
 
+        // ==================== STATIC PROFIT CALC ====================
+        botState.realizedProfit = botState.walletBalance - botState.initialBalance;
+        botState.profitPct = botState.initialBalance > 0 ? (botState.realizedProfit / botState.initialBalance) * 100 : 0;
+
+        const elapsedDays = (Date.now() - botState.startTime) / (1000 * 60 * 60 * 24);
         if (elapsedDays > 0.001 && botState.walletBalance > botState.initialBalance) {
             const dgr = Math.pow((botState.walletBalance / botState.initialBalance), (1 / elapsedDays)) - 1;
             botState.estimates.dgr = dgr * 100;
@@ -114,30 +128,10 @@ async function runLogic() {
             botState.estimates.month = (botState.walletBalance * Math.pow((1 + dgr), 30)) - botState.walletBalance;
         }
 
-        // ==================== EFFICIENT STEP CALCULATION ====================
-        // Logic: Calculate total size required if ALL steps fill, ensure it fits in current balance
-        if (botState.currentPrice > 0 && botState.walletBalance > 0) {
-            const m = botState.settings.volumeMult;
-            const n = botState.settings.maxSteps;
-            // Sum of geometric series: 1 + m + m^2 ... m^n
-            const multiplierSum = (Math.pow(m, n + 1) - 1) / (m - 1);
-            
-            // maxTotalVolume = (Balance * Leverage) / Price
-            // We multiply by 0.7 to leave 30% margin for safety/fees
-            const maxTotalVolume = (botState.walletBalance * config.leverage * 0.7) / botState.currentPrice;
-            
-            // Divide by multiplierSum to get the Base Order
-            const rawBase = maxTotalVolume / multiplierSum;
-            
-            // HTX Linear Swap usually uses 10-100 contracts per 1 unit depending on coin
-            // We floor it to a whole number of contracts
-            botState.settings.baseOrder = Math.max(1, Math.floor(rawBase));
-        }
-
+        // ==================== EXECUTION ====================
         if (pos) {
             botState.avgPrice = parseFloat(pos.cost_hold);
             botState.roi = parseFloat(pos.profit_rate) * 100;
-
             const triggerPrice = botState.avgPrice * (1 - (botState.settings.priceDrop / 100));
             botState.distToNext = Math.max(0, ((botState.currentPrice - triggerPrice) / botState.currentPrice) * 100);
 
@@ -163,7 +157,7 @@ async function runLogic() {
             botState.safetyOrdersFilled = 0;
         }
 
-    } catch (e) {}
+    } catch (e) { console.log("Logic Error:", e.message); }
     botState.isTrading = false;
 }
 
@@ -201,25 +195,23 @@ app.get('/', (req, res) => {
     <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@500;700&display=swap" rel="stylesheet">
     <style>
         body { font-family: 'Roboto Mono', monospace; }
-        .glass { background: white; border: 1px solid rgba(0, 0, 0, 0.08); box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05); }
-        .glow-blue { box-shadow: 0 10px 25px -5px rgba(59, 130, 246, 0.15); }
+        .glass { background: white; border: 1px solid rgba(0, 0, 0, 0.08); box-shadow: 0 4px 12px rgba(0, 0, 0, 0.03); }
+        .glow-blue { box-shadow: 0 10px 30px -5px rgba(59, 130, 246, 0.2); }
     </style>
 </head>
 <body class="text-slate-600 p-4 md:p-10">
     <div class="max-w-6xl mx-auto">
-        
         <div class="flex justify-between items-center mb-10">
             <div>
-                <h1 class="text-slate-900 text-2xl font-bold tracking-tighter uppercase">Compounding <span class="text-blue-600">Engine</span></h1>
-                <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">${config.symbol} | ${config.leverage}X Leverage</p>
+                <h1 class="text-slate-900 text-2xl font-bold tracking-tighter">DYNAMIC_ENGINE <span class="text-blue-600">v33</span></h1>
+                <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">${config.symbol} | ${config.leverage}X LEVERAGE</p>
             </div>
             <div class="text-right">
                 <p id="dgrText" class="text-blue-600 font-bold text-2xl">0.00% DGR</p>
-                <p class="text-[10px] text-slate-400 uppercase font-bold tracking-widest">Daily Growth Rate</p>
+                <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Growth Rate</p>
             </div>
         </div>
 
-        <!-- STATS GRID -->
         <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
             <div class="glass p-6 rounded-3xl">
                 <p class="text-[10px] text-slate-400 uppercase font-bold mb-2">Static Profit</p>
@@ -230,60 +222,51 @@ app.get('/', (req, res) => {
                 <p id="p2" class="text-3xl text-emerald-600 font-bold">0.00%</p>
             </div>
             <div class="glass p-6 rounded-3xl">
-                <p class="text-[10px] text-slate-400 uppercase font-bold mb-2">Live Position ROI</p>
+                <p class="text-[10px] text-slate-400 uppercase font-bold mb-2">Live ROI</p>
                 <p id="roi" class="text-3xl text-slate-300 font-bold">0.00%</p>
             </div>
             <div class="glass p-6 rounded-3xl">
-                <p class="text-[10px] text-slate-400 uppercase font-bold mb-2">Wallet Balance</p>
+                <p class="text-[10px] text-slate-400 uppercase font-bold mb-2">Static Balance</p>
                 <p id="bal" class="text-3xl text-slate-900 font-bold">$0.00</p>
             </div>
         </div>
 
-        <h2 class="text-slate-400 text-[10px] font-bold uppercase mb-4 tracking-widest">Compounding Projections</h2>
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
-            
             <div class="bg-blue-600 border border-blue-700 p-8 rounded-[2rem] glow-blue relative overflow-hidden">
                 <div class="absolute top-0 right-0 p-4 opacity-10 text-5xl italic font-black text-white">24H</div>
-                <p class="text-[10px] text-blue-100 font-bold uppercase mb-2">Expected Next 24 Hours</p>
+                <p class="text-[10px] text-blue-100 font-bold uppercase mb-2">Next 24h Estimate</p>
                 <p id="estDay" class="text-4xl text-white font-bold">$0.00</p>
-                <p class="text-[10px] text-blue-200 mt-4 font-bold">STATIC ESTIMATE</p>
             </div>
-
             <div class="glass p-8 rounded-[2rem] relative overflow-hidden">
                 <div class="absolute top-0 right-0 p-4 opacity-5 text-5xl italic font-black text-slate-900">7D</div>
-                <p class="text-[10px] text-slate-400 font-bold uppercase mb-2">Projected 7 Days</p>
+                <p class="text-[10px] text-slate-400 font-bold uppercase mb-2">7 Day Projection</p>
                 <p id="estWeek" class="text-4xl text-slate-900 font-bold">$0.00</p>
-                <p class="text-[10px] text-slate-300 mt-4 font-bold uppercase">Compound Interest</p>
             </div>
-
             <div class="glass p-8 rounded-[2rem] border-b-4 border-b-blue-600 relative overflow-hidden">
                 <div class="absolute top-0 right-0 p-4 opacity-5 text-5xl italic font-black text-slate-900">30D</div>
-                <p class="text-[10px] text-slate-400 font-bold uppercase mb-2">Projected 30 Days</p>
+                <p class="text-[10px] text-slate-400 font-bold uppercase mb-2">30 Day Projection</p>
                 <p id="estMonth" class="text-4xl text-slate-900 font-bold">$0.00</p>
-                <p class="text-[10px] text-slate-300 mt-4 font-bold uppercase">100% Reinvestment</p>
             </div>
         </div>
 
-        <!-- RISK & PROGRESS -->
         <div class="glass p-8 rounded-[2rem] mb-8">
             <div class="flex justify-between items-end mb-6">
                 <div>
-                    <p class="text-[10px] text-slate-400 font-bold uppercase mb-1">Martingale Progress</p>
+                    <p class="text-[10px] text-slate-400 font-bold uppercase mb-1">Safety Steps Filled</p>
                     <p id="stepText" class="text-5xl text-slate-900 font-bold">0 / 10</p>
                 </div>
                 <div class="text-right">
-                    <p class="text-[10px] text-slate-400 font-bold uppercase mb-1">Safety Order Gap</p>
+                    <p class="text-[10px] text-slate-400 font-bold uppercase mb-1">Price Gap to Next</p>
                     <p id="distText" class="text-5xl text-orange-500 font-bold">0.00%</p>
                 </div>
             </div>
-            <div class="w-full bg-slate-100 rounded-full h-5 overflow-hidden shadow-inner p-1">
+            <div class="w-full bg-slate-100 rounded-full h-5 overflow-hidden p-1 shadow-inner">
                 <div id="progressBar" class="bg-blue-600 h-full rounded-full transition-all duration-1000" style="width: 0%"></div>
             </div>
         </div>
 
-        <!-- FOOTER -->
         <div class="flex justify-between items-center text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-            <div>Avg Profit/Hr: <span id="estHr" class="text-slate-600 ml-1">$0.00</span></div>
+            <div>Static Hourly: <span id="estHr" class="text-slate-600 ml-1">$0.00</span></div>
             <div class="flex gap-8">
                 <span>Price: <span id="curPrice" class="text-slate-900 ml-1">0.00</span></span>
                 <button onclick="resetStats()" class="text-red-400 hover:text-red-600 transition-colors">Reset Session</button>
@@ -296,7 +279,6 @@ app.get('/', (req, res) => {
             try {
                 const r = await fetch('/api/status'); 
                 const d = await r.json();
-                
                 document.getElementById('p1').innerText = '$' + d.realizedProfit.toFixed(4);
                 document.getElementById('p2').innerText = d.profitPct.toFixed(2) + '%';
                 document.getElementById('bal').innerText = '$' + d.walletBalance.toFixed(2);
@@ -322,7 +304,6 @@ app.get('/', (req, res) => {
                 if(progressPct > 75) bar.className = 'bg-red-500 h-full rounded-full transition-all duration-1000';
                 else if(progressPct > 45) bar.className = 'bg-orange-500 h-full rounded-full transition-all duration-1000';
                 else bar.className = 'bg-blue-600 h-full rounded-full transition-all duration-1000';
-
             } catch (e) {}
         }
         async function resetStats() { if(confirm("Reset Initial Balance?")) await fetch('/api/reset-stats', {method:'POST'}); update(); }
@@ -339,7 +320,7 @@ app.post('/api/reset-stats', async (req, res) => {
     botState.startTime = Date.now();
     botState.realizedProfit = 0; botState.profitPct = 0;
     botState.estimates = { hr: 0, day: 0, week: 0, month: 0, dgr: 0 };
-    await BotModel.updateOne({ id: "htx_martingale" }, { initialBalance: botState.initialBalance, startTime: botState.startTime, storedRealizedProfit: 0, storedProfitPct: 0 }, { upsert: true });
+    await BotModel.updateOne({ id: "htx_martingale" }, { initialBalance: botState.initialBalance, startTime: botState.startTime }, { upsert: true });
     res.sendStatus(200); 
 });
 
