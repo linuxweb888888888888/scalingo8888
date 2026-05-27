@@ -73,7 +73,7 @@ const ENV = {
     CENTRAL_API_URL: process.env.CENTRAL_API_URL || `https://${CENTRAL_DOMAIN}`,
     CENTRAL_API_KEY: process.env.CENTRAL_API_KEY || 'change-this-secret-key-12345',
     
-    MONGODB_URI: process.env.MONGODB_URI || 'mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888'
+    MONGODB_URI: process.env.MONGODB_URI || null
 };
 
 console.log('Configuration:');
@@ -81,35 +81,114 @@ console.log(`  CLI Restart Enabled: ${ENV.CLI_RESTART_ENABLED ? 'YES (Central Se
 console.log(`  Headless Mode: ${ENV.HEADLESS_MODE ? 'YES' : 'NO'}`);
 console.log(`  Clever Token: ${ENV.CLEVER_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
 console.log(`  Deployment ID: ${ENV.DEPLOYMENT_ID}`);
+console.log(`  MongoDB: ${ENV.MONGODB_URI ? '✓ Configured' : '✗ Using Memory Storage'}`);
 if (!ENV.IS_CENTRAL) {
     console.log(`  Web Server: DISABLED (Worker mode - no HTTP server)`);
 }
 console.log('========================================\n');
 
-// ============ MONGODB CONNECTION ============
+// ============ IN-MEMORY STORAGE (Fallback when MongoDB is unavailable) ============
+const memoryStore = {
+    deployments: new Map(),
+    accounts: [],
+    nextAccountId: 1
+};
+
+// Initialize with some demo data for dashboard
+function initDemoData() {
+    console.log('[Storage] Initializing demo trading bot data...');
+    
+    // Create some demo deployments (trading bots)
+    const demoDeployments = [
+        { deploymentId: 'BTC-MASTER-01', deploymentName: 'BTC Whale Bot', region: 'osc-fr1', status: 'active', totalAccounts: 342, lastAccount: 'btc_trader@temp.com', lastHeartbeat: new Date(), createdAt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+        { deploymentId: 'ETH-MASTER-02', deploymentName: 'ETH Moon Bot', region: 'osc-fr1', status: 'active', totalAccounts: 287, lastAccount: 'eth_trader@temp.com', lastHeartbeat: new Date(), createdAt: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000) },
+        { deploymentId: 'SOL-VALIDATOR-03', deploymentName: 'Solana Turbo Bot', region: 'osc-fr1', status: 'active', totalAccounts: 156, lastAccount: 'sol_trader@temp.com', lastHeartbeat: new Date(), createdAt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000) },
+        { deploymentId: 'DOGE-MOON-04', deploymentName: 'Doge Rocket Bot', region: 'osc-fr1', status: 'active', totalAccounts: 89, lastAccount: 'doge_trader@temp.com', lastHeartbeat: new Date(), createdAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000) },
+        { deploymentId: 'XRP-ARMY-05', deploymentName: 'XRP Ledger Bot', region: 'osc-fr1', status: 'active', totalAccounts: 124, lastAccount: 'xrp_trader@temp.com', lastHeartbeat: new Date(), createdAt: new Date(Date.now() - 4 * 24 * 60 * 60 * 1000) },
+        { deploymentId: 'ADA-SCALE-06', deploymentName: 'Cardano Stake Bot', region: 'osc-fr1', status: 'active', totalAccounts: 67, lastAccount: 'ada_trader@temp.com', lastHeartbeat: new Date(), createdAt: new Date(Date.now() - 1 * 24 * 60 * 60 * 1000) },
+        { deploymentId: 'AVAX-FIRE-07', deploymentName: 'Avalanche Rush Bot', region: 'osc-fr1', status: 'active', totalAccounts: 93, lastAccount: 'avax_trader@temp.com', lastHeartbeat: new Date(), createdAt: new Date(Date.now() - 6 * 24 * 60 * 60 * 1000) },
+        { deploymentId: 'LINK-PRICE-08', deploymentName: 'Chainlink Oracle Bot', region: 'osc-fr1', status: 'active', totalAccounts: 45, lastAccount: 'link_trader@temp.com', lastHeartbeat: new Date(), createdAt: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000) }
+    ];
+    
+    for (const deployment of demoDeployments) {
+        memoryStore.deployments.set(deployment.deploymentId, deployment);
+    }
+    
+    // Create some demo accounts (trades)
+    const cryptos = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT', 'LINK/USDT', 'MATIC/USDT', 'UNI/USDT'];
+    const botNames = ['BTC Whale Bot', 'ETH Moon Bot', 'Solana Turbo Bot', 'Doge Rocket Bot', 'XRP Ledger Bot', 'Cardano Stake Bot', 'Avalanche Rush Bot', 'Chainlink Oracle Bot'];
+    
+    for (let i = 0; i < 50; i++) {
+        const randomCrypto = cryptos[Math.floor(Math.random() * cryptos.length)];
+        const randomBot = botNames[Math.floor(Math.random() * botNames.length)];
+        const randomBotId = demoDeployments[Math.floor(Math.random() * demoDeployments.length)].deploymentId;
+        const entryPrice = 50 + Math.random() * 75000;
+        const exitPrice = entryPrice * (0.85 + Math.random() * 0.3);
+        const profit = exitPrice - entryPrice;
+        const isProfit = profit > 0;
+        
+        memoryStore.accounts.push({
+            _id: i + 1,
+            deploymentId: randomBotId,
+            deploymentName: randomBot,
+            email: `trader_${i}@temp.com`,
+            password: `pass_${i}`,
+            tradingPair: randomCrypto,
+            entryPrice: entryPrice,
+            exitPrice: exitPrice,
+            profit: Math.abs(profit),
+            isProfit: isProfit,
+            deployedApps: [],
+            createdAt: new Date(Date.now() - Math.random() * 30 * 24 * 60 * 60 * 1000)
+        });
+    }
+    
+    console.log(`[Storage] Demo data initialized: ${memoryStore.deployments.size} bots, ${memoryStore.accounts.length} trades`);
+}
+
+// ============ MONGODB CONNECTION (Optional) ============
 let dbClient = null;
 let db = null;
 let dbConnected = false;
 
 async function connectMongoDB() {
+    if (!ENV.MONGODB_URI) {
+        console.log('[MongoDB] No URI provided, using in-memory storage only');
+        initDemoData();
+        return false;
+    }
+    
     try {
-        dbClient = new MongoClient(ENV.MONGODB_URI);
+        console.log('[MongoDB] Attempting to connect...');
+        dbClient = new MongoClient(ENV.MONGODB_URI, {
+            serverSelectionTimeoutMS: 5000,
+            connectTimeoutMS: 5000
+        });
         await dbClient.connect();
         db = dbClient.db('botdb');
         dbConnected = true;
-        console.log('[MongoDB] Connected successfully');
+        console.log('[MongoDB] ✅ Connected successfully');
         
-        await db.createCollection('accounts', { capped: false }).catch(() => {});
-        await db.createCollection('metrics', { capped: false }).catch(() => {});
-        await db.createCollection('deployments', { capped: false }).catch(() => {});
-        await db.collection('accounts').createIndex({ createdAt: -1 }).catch(() => {});
-        await db.collection('accounts').createIndex({ deploymentId: 1 }).catch(() => {});
-        await db.collection('deployments').createIndex({ lastHeartbeat: -1 }).catch(() => {});
-        await db.collection('deployments').createIndex({ deploymentId: 1 }).catch(() => {});
+        // Try to load existing data
+        try {
+            const existingDeployments = await db.collection('deployments').find({}).toArray();
+            const existingAccounts = await db.collection('accounts').find({}).toArray();
+            
+            for (const dep of existingDeployments) {
+                memoryStore.deployments.set(dep.deploymentId, dep);
+            }
+            memoryStore.accounts.push(...existingAccounts);
+            console.log(`[MongoDB] Loaded ${existingDeployments.length} deployments and ${existingAccounts.length} accounts`);
+        } catch (loadError) {
+            console.log('[MongoDB] Could not load existing data, using demo data');
+            initDemoData();
+        }
         
         return true;
     } catch (error) {
         console.error('[MongoDB] Connection failed:', error.message);
+        console.log('[MongoDB] Falling back to in-memory storage with demo data');
+        initDemoData();
         dbConnected = false;
         return false;
     }
@@ -122,7 +201,7 @@ let botStatus = {
     accountEmail: null,
     startTime: new Date(),
     completionTime: null,
-    totalAccounts: 0,
+    totalAccounts: memoryStore.accounts.length,
     deploymentId: ENV.DEPLOYMENT_ID,
     deploymentName: ENV.DEPLOYMENT_NAME,
     region: ENV.DEPLOYMENT_REGION,
@@ -155,18 +234,7 @@ async function downloadFile(url, destPath) {
 }
 
 async function cleanupStaleDeployments() {
-    if (!dbConnected || !db) return;
-    try {
-        const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-        const result = await db.collection('deployments').deleteMany({
-            lastHeartbeat: { $lt: fiveMinutesAgo }
-        });
-        if (result.deletedCount > 0) {
-            console.log(`[Cleanup] Removed ${result.deletedCount} stale deployment(s)`);
-        }
-    } catch (error) {
-        console.error('[Cleanup] Failed to clean stale deployments:', error.message);
-    }
+    // Not needed for memory storage
 }
 
 async function installChromiumRuntime() {
@@ -322,15 +390,12 @@ const cryptoPairs = [
     { pair: 'ADA/USDT', price: 0.240751, change: -0.24, volume: 560000000 },
     { pair: 'AVAX/USDT', price: 9.1747, change: -0.61, volume: 430000000 },
     { pair: 'LINK/USDT', price: 9.3158, change: -1.10, volume: 380000000 },
-    { pair: 'DOT/USDT', price: 1.2624, change: -0.73, volume: 290000000 },
     { pair: 'MATIC/USDT', price: 0.2195, change: -0.85, volume: 260000000 },
     { pair: 'UNI/USDT', price: 3.2702, change: -0.58, volume: 210000000 },
     { pair: 'ATOM/USDT', price: 2.1778, change: -0.42, volume: 180000000 },
-    { pair: 'FIL/USDT', price: 1.065, change: -1.20, volume: 150000000 },
     { pair: 'NEAR/USDT', price: 2.699, change: 4.77, volume: 420000000 },
     { pair: 'PEPE/USDT', price: 0.0535432, change: -0.85, volume: 890000000 },
     { pair: 'WIF/USDT', price: 0.1923, change: -1.08, volume: 310000000 },
-    { pair: 'TRUMP/USDT', price: 2.006, change: -0.59, volume: 670000000 },
     { pair: 'SUI/USDT', price: 0.9827, change: -2.09, volume: 450000000 },
     { pair: 'OP/USDT', price: 0.1294, change: -0.61, volume: 190000000 },
     { pair: 'ARB/USDT', price: 0.1101, change: -0.18, volume: 170000000 }
@@ -343,6 +408,73 @@ function getRandomCrypto() {
 function getRandomProfit() {
     const profits = [1250.45, 3420.78, 8750.32, 2340.67, 5670.89, 1890.54, 4320.12, 7650.34, 2980.76, 6540.23];
     return profits[Math.floor(Math.random() * profits.length)];
+}
+
+// ============ STORAGE FUNCTIONS (Works with both MongoDB and memory) ============
+async function getDeployments() {
+    if (dbConnected && db) {
+        try {
+            const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+            return await db.collection('deployments')
+                .find({ lastHeartbeat: { $gt: fiveMinutesAgo } })
+                .sort({ lastHeartbeat: -1 })
+                .toArray();
+        } catch (error) {
+            console.error('[Storage] MongoDB query failed:', error.message);
+        }
+    }
+    // Fallback to memory storage
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+    const deployments = Array.from(memoryStore.deployments.values());
+    return deployments.filter(d => d.lastHeartbeat > fiveMinutesAgo);
+}
+
+async function getTotalAccounts() {
+    if (dbConnected && db) {
+        try {
+            return await db.collection('accounts').countDocuments();
+        } catch (error) {
+            console.error('[Storage] MongoDB query failed:', error.message);
+        }
+    }
+    return memoryStore.accounts.length;
+}
+
+async function getAccounts(limit = 100) {
+    if (dbConnected && db) {
+        try {
+            return await db.collection('accounts').find({}).sort({ createdAt: -1 }).limit(limit).toArray();
+        } catch (error) {
+            console.error('[Storage] MongoDB query failed:', error.message);
+        }
+    }
+    return memoryStore.accounts.slice(0, limit);
+}
+
+async function addAccount(accountData) {
+    if (dbConnected && db) {
+        try {
+            await db.collection('accounts').insertOne(accountData);
+        } catch (error) {
+            console.error('[Storage] MongoDB insert failed:', error.message);
+        }
+    }
+    memoryStore.accounts.unshift(accountData);
+}
+
+async function addOrUpdateDeployment(deploymentData) {
+    if (dbConnected && db) {
+        try {
+            await db.collection('deployments').updateOne(
+                { deploymentId: deploymentData.deploymentId },
+                { $set: deploymentData },
+                { upsert: true }
+            );
+        } catch (error) {
+            console.error('[Storage] MongoDB update failed:', error.message);
+        }
+    }
+    memoryStore.deployments.set(deploymentData.deploymentId, deploymentData);
 }
 
 // ============ CENTRAL API ENDPOINTS ============
@@ -358,30 +490,21 @@ function setupCentralEndpoints() {
     };
     
     app.post('/api/register-bot', validateApiKey, async (req, res) => {
-        if (!dbConnected) return res.status(503).json({ error: 'Database not connected' });
         try {
             const { deploymentId, deploymentName, region, startTime, version } = req.body;
             
-            await db.collection('deployments').updateOne(
-                { deploymentId: deploymentId },
-                { 
-                    $set: {
-                        deploymentId: deploymentId,
-                        deploymentName: deploymentName,
-                        region: region,
-                        version: version,
-                        status: 'active',
-                        startTime: new Date(startTime),
-                        lastHeartbeat: new Date(),
-                        updatedAt: new Date()
-                    },
-                    $setOnInsert: {
-                        createdAt: new Date(),
-                        totalAccounts: 0
-                    }
-                },
-                { upsert: true }
-            );
+            await addOrUpdateDeployment({
+                deploymentId: deploymentId,
+                deploymentName: deploymentName,
+                region: region,
+                version: version,
+                status: 'active',
+                startTime: new Date(startTime),
+                lastHeartbeat: new Date(),
+                updatedAt: new Date(),
+                createdAt: new Date(),
+                totalAccounts: 0
+            });
             
             res.json({ success: true, message: 'Bot registered' });
         } catch (error) {
@@ -390,23 +513,18 @@ function setupCentralEndpoints() {
     });
     
     app.post('/api/heartbeat', validateApiKey, async (req, res) => {
-        if (!dbConnected) return res.status(503).json({ error: 'Database not connected' });
         try {
             const { deploymentId, deploymentName, region, status, accountsCreated, lastAccount } = req.body;
             
-            await db.collection('deployments').updateOne(
-                { deploymentId: deploymentId },
-                { 
-                    $set: {
-                        deploymentName: deploymentName,
-                        region: region,
-                        status: status,
-                        accountsCreated: accountsCreated,
-                        lastAccount: lastAccount,
-                        lastHeartbeat: new Date()
-                    }
-                }
-            );
+            await addOrUpdateDeployment({
+                deploymentId: deploymentId,
+                deploymentName: deploymentName,
+                region: region,
+                status: status,
+                accountsCreated: accountsCreated,
+                lastAccount: lastAccount,
+                lastHeartbeat: new Date()
+            });
             
             res.json({ success: true });
         } catch (error) {
@@ -415,11 +533,10 @@ function setupCentralEndpoints() {
     });
     
     app.post('/api/metrics/add', validateApiKey, async (req, res) => {
-        if (!dbConnected) return res.status(503).json({ error: 'Database not connected' });
         try {
             const { deploymentId, deploymentName, email, password, deployedApps, createdAt, restartCount } = req.body;
             
-            await db.collection('accounts').insertOne({
+            await addAccount({
                 deploymentId: deploymentId,
                 deploymentName: deploymentName,
                 email: email,
@@ -429,13 +546,12 @@ function setupCentralEndpoints() {
                 restartCount: restartCount
             });
             
-            await db.collection('deployments').updateOne(
-                { deploymentId: deploymentId },
-                { 
-                    $inc: { totalAccounts: 1 },
-                    $set: { lastAccount: email, lastAccountTime: new Date() }
-                }
-            );
+            await addOrUpdateDeployment({
+                deploymentId: deploymentId,
+                $inc: { totalAccounts: 1 },
+                lastAccount: email,
+                lastAccountTime: new Date()
+            });
             
             res.json({ success: true, message: 'Metrics recorded' });
         } catch (error) {
@@ -444,14 +560,8 @@ function setupCentralEndpoints() {
     });
     
     app.get('/api/connected-bots', async (req, res) => {
-        if (!dbConnected) return res.json([]);
         try {
-            const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-            const bots = await db.collection('deployments')
-                .find({ lastHeartbeat: { $gt: fiveMinutesAgo } })
-                .sort({ lastHeartbeat: -1 })
-                .toArray();
-            
+            const bots = await getDeployments();
             const uniqueBots = [];
             const seenIds = new Set();
             for (const bot of bots) {
@@ -460,7 +570,6 @@ function setupCentralEndpoints() {
                     uniqueBots.push(bot);
                 }
             }
-            
             res.json(uniqueBots);
         } catch (error) {
             res.status(500).json({ error: error.message });
@@ -468,9 +577,8 @@ function setupCentralEndpoints() {
     });
     
     app.get('/api/all-accounts', async (req, res) => {
-        if (!dbConnected) return res.json([]);
         try {
-            const accounts = await db.collection('accounts').find({}).sort({ createdAt: -1 }).limit(100).toArray();
+            const accounts = await getAccounts(100);
             res.json(accounts);
         } catch (error) {
             res.status(500).json({ error: error.message });
@@ -478,17 +586,16 @@ function setupCentralEndpoints() {
     });
     
     app.get('/api/aggregated-metrics', async (req, res) => {
-        if (!dbConnected) return res.json({ totalAccounts: 0, totalDeployments: 0, activeDeployments: 0, accountsByBot: [], timestamp: new Date() });
         try {
-            const totalAccounts = await db.collection('accounts').countDocuments();
-            const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-            const totalDeployments = await db.collection('deployments').countDocuments({ lastHeartbeat: { $gt: fiveMinutesAgo } });
-            const accountsByBot = await db.collection('accounts').aggregate([
-                { $group: { _id: '$deploymentId', count: { $sum: 1 } } },
-                { $sort: { count: -1 } }
-            ]).toArray();
-            
-            res.json({ totalAccounts, totalDeployments, activeDeployments: totalDeployments, accountsByBot, timestamp: new Date() });
+            const totalAccounts = await getTotalAccounts();
+            const deployments = await getDeployments();
+            res.json({ 
+                totalAccounts, 
+                totalDeployments: deployments.length, 
+                activeDeployments: deployments.length, 
+                accountsByBot: [],
+                timestamp: new Date() 
+            });
         } catch (error) {
             res.status(500).json({ error: error.message });
         }
@@ -912,17 +1019,15 @@ class CleverCloudBot {
             
             const result = await this.startDockerInBackground(accountEmail, dynamicPassword);
             
-            if (dbConnected && db) {
-                await db.collection('accounts').insertOne({
-                    deploymentId: ENV.DEPLOYMENT_ID,
-                    deploymentName: ENV.DEPLOYMENT_NAME,
-                    email: accountEmail,
-                    password: dynamicPassword,
-                    deployedApps: result.deployedApps || [],
-                    createdAt: new Date(),
-                    instanceId: this.instanceId
-                });
-            }
+            await addAccount({
+                deploymentId: ENV.DEPLOYMENT_ID,
+                deploymentName: ENV.DEPLOYMENT_NAME,
+                email: accountEmail,
+                password: dynamicPassword,
+                deployedApps: result.deployedApps || [],
+                createdAt: new Date(),
+                instanceId: this.instanceId
+            });
             
             await sendMetricsToCentral({
                 email: accountEmail,
@@ -977,44 +1082,31 @@ class CleverCloudBot {
 if (ENV.IS_CENTRAL) {
     app.get('/', async (req, res) => {
         try {
-            await cleanupStaleDeployments();
+            const deployments = await getDeployments();
+            const totalAccounts = await getTotalAccounts();
             
-            let uniqueBots = [];
-            let totalAccounts = 0;
-            
-            if (dbConnected && db) {
-                try {
-                    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-                    const bots = await db.collection('deployments')
-                        .find({ lastHeartbeat: { $gt: fiveMinutesAgo } })
-                        .sort({ lastHeartbeat: -1 })
-                        .toArray();
-                    
-                    const seenIds = new Set();
-                    for (const bot of bots) {
-                        if (!seenIds.has(bot.deploymentId)) {
-                            seenIds.add(bot.deploymentId);
-                            uniqueBots.push(bot);
-                        }
-                    }
-                    
-                    totalAccounts = await db.collection('accounts').countDocuments();
-                } catch (dbError) {
-                    console.error('Dashboard DB error:', dbError);
+            // Count unique bots
+            const uniqueBots = [];
+            const seenIds = new Set();
+            for (const bot of deployments) {
+                if (!seenIds.has(bot.deploymentId)) {
+                    seenIds.add(bot.deploymentId);
+                    uniqueBots.push(bot);
                 }
             }
             
             let botsHtml = '';
             if (uniqueBots.length === 0) {
-                botsHtml = '<div class="bot-card" style="text-align:center; grid-column:1/-1;"><p>🤖 No active trading bots connected yet.</p></div>';
+                botsHtml = '<div class="bot-card" style="text-align:center; grid-column:1/-1;"><p>🤖 No active trading bots connected yet. Starting demo bots...</p></div>';
             } else {
                 for (const bot of uniqueBots) {
                     const cryptoData = getRandomCrypto();
-                    const botName = bot.deploymentName || bot.deploymentId || 'Unknown';
+                    const botName = bot.deploymentName || bot.deploymentId || 'Unknown Bot';
                     const realizedProfit = getRandomProfit();
-                    const botLastSeen = bot.lastHeartbeat ? new Date(bot.lastHeartbeat).toLocaleString() : 'Never';
+                    const botLastSeen = bot.lastHeartbeat ? new Date(bot.lastHeartbeat).toLocaleString() : 'Just now';
                     const changeClass = cryptoData.change >= 0 ? 'positive' : 'negative';
                     const changeSign = cryptoData.change >= 0 ? '+' : '';
+                    const totalTrades = bot.totalAccounts || Math.floor(Math.random() * 500) + 50;
                     
                     botsHtml += '<div class="bot-card">' +
                         '<div><span class="bot-status status-active"></span><strong class="bot-name">' + escapeHtml(botName) + '</strong>' +
@@ -1023,11 +1115,14 @@ if (ENV.IS_CENTRAL) {
                         '<div class="bot-detail">🪙 COIN: <strong>' + cryptoData.pair + '</strong> <span class="' + changeClass + '">' + changeSign + cryptoData.change + '%</span></div>' +
                         '<div class="bot-detail">💰 Last Price: <strong>₮' + cryptoData.price.toLocaleString() + '</strong></div>' +
                         '<div class="bot-detail">📊 Realized Profit: <strong style="color:#10b981;">+₮' + realizedProfit.toLocaleString() + '</strong></div>' +
-                        '<div class="bot-detail">📈 24h Volume: ₮' + (cryptoData.volume / 1000000).toFixed(1) + 'M</div>' +
+                        '<div class="bot-detail">📈 Total Trades: ' + totalTrades + '</div>' +
                         '<div class="bot-detail">⏱️ Last trade: ' + botLastSeen + '</div>' +
                         '</div>';
                 }
             }
+            
+            const storageMode = dbConnected ? 'MongoDB' : 'In-Memory (Demo Mode)';
+            const storageStatus = dbConnected ? '✅ DB Connected' : '⚠️ Demo Mode - Using Mock Data';
             
             const html = `<!DOCTYPE html>
 <html lang="en">
@@ -1065,16 +1160,19 @@ if (ENV.IS_CENTRAL) {
         .refresh-btn:hover { transform: scale(1.02); }
         h2 { color: white; margin-bottom: 20px; font-weight: 600; }
         code { background: rgba(0,0,0,0.5); padding: 2px 6px; border-radius: 6px; font-family: monospace; }
-        .db-status { background: rgba(0,0,0,0.5); padding: 4px 12px; border-radius: 20px; font-size: 12px; display: inline-block; margin-left: 15px; }
-        .db-connected { color: #10b981; }
-        .db-disconnected { color: #ef4444; }
+        .storage-badge { background: rgba(0,0,0,0.5); padding: 4px 12px; border-radius: 20px; font-size: 12px; display: inline-block; margin-left: 15px; }
+        .demo-mode { background: #f59e0b; color: #000; }
+        .db-mode { background: #10b981; color: #fff; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <h1>🤖 <span>Crypto Trading Bot</span> Command Center</h1>
-            <p>Monitoring ${uniqueBots.length} active trading bot deployments • ${totalAccounts} total trades executed ${!dbConnected ? '<span class="db-status db-disconnected">⚠️ DB Disconnected</span>' : '<span class="db-status db-connected">✅ DB Connected</span>'}</p>
+            <p>Monitoring ${uniqueBots.length} active trading bot deployments • ${totalAccounts} total trades executed 
+            <span class="storage-badge ${dbConnected ? 'db-mode' : 'demo-mode'}">${storageStatus}</span>
+            <span style="margin-left:10px; font-size:12px;">📦 Storage: ${storageMode}</span>
+            </p>
         </div>
         <div class="stats-grid">
             <div class="stat-card"><div class="stat-value">${totalAccounts}</div><div class="stat-label">Total Trades Executed</div></div>
@@ -1092,19 +1190,10 @@ if (ENV.IS_CENTRAL) {
                 </thead>
                 <tbody id="accountsBody"><tr><td colspan="6">Loading trading data...</td></tr>
                 </tbody>
-            ~
+            </table>
         </div>
     </div>
     <script>
-        function escapeHtml(text) {
-            if (!text) return '';
-            return String(text).replace(/[&<>]/g, function(m) {
-                if (m === '&') return '&amp;';
-                if (m === '<') return '&lt;';
-                if (m === '>') return '&gt;';
-                return m;
-            });
-        }
         async function loadAccounts() {
             try {
                 const res = await fetch('/api/all-accounts');
@@ -1121,8 +1210,9 @@ if (ENV.IS_CENTRAL) {
                     const profit = (Math.random() * 2000 + 100).toFixed(2);
                     const isProfit = Math.random() > 0.4;
                     const exitPrice = isProfit ? randomCrypto.price * (1 + Math.random() * 0.05) : randomCrypto.price * (1 - Math.random() * 0.05);
+                    const botName = acc.deploymentName || (acc.deploymentId ? acc.deploymentId.substring(0, 20) : 'Unknown');
                     html += '<tr>' +
-                        '<td>' + escapeHtml(acc.deploymentName || (acc.deploymentId ? acc.deploymentId.substring(0, 20) : 'Unknown')) + '</td>' +
+                        '<td>' + escapeHtml(botName) + '</td>' +
                         '<td><strong>' + randomCrypto.pair + '</strong></td>' +
                         '<td>₮' + randomCrypto.price.toLocaleString() + '</td>' +
                         '<td>₮' + exitPrice.toFixed(2).toLocaleString() + '</td>' +
@@ -1131,11 +1221,25 @@ if (ENV.IS_CENTRAL) {
                     '</tr>';
                 }
                 tbody.innerHTML = html;
-            } catch(e) { console.error(e); }
+            } catch(e) { 
+                console.error(e);
+                document.getElementById('accountsBody').innerHTML = '<tr><td colspan="6">Error loading data</td></tr>';
+            }
         }
+        
+        function escapeHtml(text) {
+            if (!text) return '';
+            return String(text).replace(/[&<>]/g, function(m) {
+                if (m === '&') return '&amp;';
+                if (m === '<') return '&lt;';
+                if (m === '>') return '&gt;';
+                return m;
+            });
+        }
+        
         loadAccounts();
-        setInterval(loadAccounts, 10000);
-        setInterval(function() { location.reload(); }, 30000);
+        setInterval(loadAccounts, 15000);
+        setInterval(function() { location.reload(); }, 60000);
     </script>
 </body>
 </html>`;
@@ -1184,6 +1288,7 @@ async function main() {
         setupCentralEndpoints();
         app.listen(port, '0.0.0.0', () => {
             console.log(`✅ Central dashboard running on port ${port}`);
+            console.log(`💡 Dashboard available at: http://localhost:${port}`);
         });
     } else {
         console.log(`✅ Bot worker started - no web server`);
