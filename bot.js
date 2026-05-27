@@ -37,7 +37,7 @@ let botState = {
     maxAffordableSteps: 0,
     distToNext: 0,
     settings: {
-        baseOrder: 0,        
+        baseOrder: 1,        
         priceDrop: 0.1,      // Static 0.1% Drop
         volumeMult: 1.2,     // 1.2x Multiplier
         takeProfit: 1.5,     // 1.5% TP
@@ -79,7 +79,7 @@ function calculateMaxPossibleSteps(balance, leverage, baseOrder, multiplier, pri
         totalContracts += currentStepVolume;
         currentStepVolume = Math.floor(currentStepVolume * multiplier);
         steps++;
-        if (steps > 50) break;
+        if (steps > 150) break; // Safety break
     }
     return steps;
 }
@@ -120,9 +120,22 @@ async function syncData() {
             botState.realizedProfit = botState.displayBalance - botState.initialBalance;
             botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
             
-            // Logic: Balance * 10
-            botState.settings.baseOrder = Math.max(1, Math.floor(botState.walletBalance * 10));
-            botState.maxAffordableSteps = calculateMaxPossibleSteps(botState.walletBalance, config.leverage, botState.settings.baseOrder, botState.settings.volumeMult, botState.currentPrice);
+            // DYNAMIC CALCULATION LOGIC:
+            if (botState.currentPrice > 0) {
+                // 1. Calculate how many steps the wallet currently supports
+                const currentCapacity = calculateMaxPossibleSteps(botState.walletBalance, config.leverage, botState.settings.baseOrder || 1, botState.settings.volumeMult, botState.currentPrice);
+                botState.maxAffordableSteps = currentCapacity;
+
+                // 2. Determine SHIB amount at Leverage 10
+                const shibAtLeverage = (botState.walletBalance * config.leverage) / botState.currentPrice;
+
+                // 3. Dynamic Math: (SHIB / Dynamic Capacity) / 1000 / 4
+                // We use Math.max(1, currentCapacity) to avoid division by zero
+                const divisor = Math.max(1, botState.maxAffordableSteps);
+                const baseResult = ((shibAtLeverage / divisor) / 1000) / 4;
+                
+                botState.settings.baseOrder = Math.max(1, Math.floor(baseResult));
+            }
         }
 
         const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
@@ -134,7 +147,6 @@ async function syncData() {
             botState.openPosition = { volume: parseFloat(pos.volume), direction: pos.direction, costHold: botState.avgPrice };
             botState.safetyOrdersFilled = calculateCurrentStep(botState.openPosition.volume, botState.settings.baseOrder, botState.settings.volumeMult);
 
-            // Static 0.1% Distance logic
             const currentDrop = ((botState.avgPrice - botState.currentPrice) / botState.avgPrice) * 100;
             botState.distToNext = Math.max(0, botState.settings.priceDrop - currentDrop);
         } else {
@@ -237,7 +249,7 @@ app.get('/', (req, res) => {
         <div class="card p-6 rounded-2xl mb-8 bg-gradient-to-r from-gray-50 to-white">
             <div class="grid grid-cols-2 md:grid-cols-4 gap-4 items-center">
                 <div>
-                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Base Order (Bal * 10)</p>
+                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Base Order</p>
                     <p id="baseOrderDisplay" class="text-xl font-bold text-gray-800">0</p>
                 </div>
                 <div>
