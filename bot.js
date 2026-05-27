@@ -38,10 +38,10 @@ let botState = {
     distToNext: 0,
     profitShibLeveraged: 0, 
     settings: {
-        baseOrder: 1,        // Starts at 1
-        priceDrop: 0.1,      
-        volumeMult: 1.2,     
-        takeProfit: 1.5,     
+        baseOrder: 1,        
+        priceDrop: 0.1,      // 0.1% Drop
+        volumeMult: 1.2,     // 1.2x Multiplier
+        takeProfit: 1.5,     // 1.5% TP
         maxSteps: 999        
     },
     estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
@@ -50,8 +50,6 @@ let botState = {
     totalTrades: 0,
     winningTrades: 0
 };
-
-let tradeHistory = [];
 
 // ==================== API HANDLER ====================
 async function htxRequest(method, path, data = {}) {
@@ -78,7 +76,8 @@ function calculateMaxPossibleSteps(balance, leverage, baseOrder, multiplier, pri
         let totalValueWithNextStep = (totalContractsAccumulated + nextOrderSize) * price * 1000;
         if (totalValueWithNextStep > buyingPower) break;
         totalContractsAccumulated += nextOrderSize;
-        nextOrderSize = Math.floor(nextOrderSize * multiplier);
+        // CHANGED TO CEIL: Ensures volume actually grows
+        nextOrderSize = Math.ceil(nextOrderSize * multiplier);
         steps++;
         if (steps > 500) break; 
     }
@@ -90,9 +89,11 @@ function calculateCurrentStep(totalVol, baseVol, multiplier) {
     let step = 0; let runningTotal = baseVol; let lastOrder = baseVol;
     while (runningTotal < totalVol && step < 100) {
         step++;
-        lastOrder = Math.floor(lastOrder * multiplier);
+        // CHANGED TO CEIL: Matches buying logic
+        lastOrder = Math.ceil(lastOrder * multiplier);
         runningTotal += lastOrder;
         if (Math.abs(runningTotal - totalVol) / totalVol < 0.05) return step;
+        if (runningTotal > totalVol) return step;
     }
     return step;
 }
@@ -121,18 +122,13 @@ async function syncData() {
             botState.realizedProfit = botState.displayBalance - botState.initialBalance;
             botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
             
-            // --- UPDATED COMPOUNDING LOGIC ---
             if (botState.currentPrice > 0) {
-                // 1. Profit SHIB at 10x
                 botState.profitShibLeveraged = (botState.realizedProfit * 10) / botState.currentPrice;
-                
-                // 2. Convert profit to contracts (1 contract = 1,000 SHIB)
                 const profitContracts = Math.floor(botState.profitShibLeveraged / 1000);
                 
-                // 3. BASE ORDER STARTS AT 1 + Profit Contracts
+                // Base Order = 1 + Profit Units
                 botState.settings.baseOrder = Math.max(1, 1 + profitContracts);
 
-                // 4. Calculate Capacity
                 botState.maxAffordableSteps = calculateMaxPossibleSteps(
                     botState.walletBalance, 
                     config.leverage, 
@@ -179,7 +175,8 @@ async function checkTrades() {
         } else if (hasPos) {
             const currentDrop = ((botState.avgPrice - botState.currentPrice) / botState.avgPrice) * 100;
             if (currentDrop >= botState.settings.priceDrop) {
-                const nextVol = Math.max(1, Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled + 1)));
+                // CHANGED TO CEIL: Ensures step size actually grows (1, 2, 3, 4, 6...)
+                const nextVol = Math.max(1, Math.ceil(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled + 1)));
                 await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: nextVol,
                     direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
@@ -219,7 +216,7 @@ app.get('/', (req, res) => {
             <div>
                 <h1 class="text-3xl font-bold tracking-tight">COMPOUND<span class="gradient-text">_BOT</span></h1>
                 <p class="text-[10px] text-gray-400 uppercase tracking-widest mt-1">${config.symbol} | ${config.leverage}X LEVERAGE</p>
-                <p class="text-[10px] text-emerald-600 font-bold mt-2">🎯 1 CONTRACT START + COMPOUNDING</p>
+                <p class="text-[10px] text-emerald-600 font-bold mt-2">🎯 1 CONTRACT START + MATH.CEIL GROWTH</p>
             </div>
             <div class="text-right">
                 <p id="dgrText" class="text-3xl font-bold text-emerald-600">0.00%</p>
