@@ -16,7 +16,9 @@ const config = {
     leverage: parseInt(process.env.LEVERAGE) || 10,
     port: process.env.PORT || 3000,
     restHost: 'api.hbdm.com',
-    wsHost: 'wss://api.hbdm.com/linear-swap-ws'
+    wsHost: 'wss://api.hbdm.com/linear-swap-ws',
+    // 0.05% standard taker fee - 5% discount = 0.000475
+    feeRate: 0.000475 
 };
 
 // ==================== BOT STATE ====================
@@ -26,7 +28,7 @@ let botState = {
     startTime: Date.now(),
     currentPrice: 0,
     avgPrice: 0,
-    roi: 0,
+    roi: 0, // This will store NET ROI (Profit minus Fees)
     realizedProfit: 0,
     profitPct: 0,
     walletBalance: 0,
@@ -38,16 +40,14 @@ let botState = {
     distToNext: 0,
     settings: {
         baseOrder: 0,        
-        priceDrop: 0.1,      // Static 0.1% Drop
-        volumeMult: 1.5,     // 1.5x Multiplier
-        takeProfit: 0.6,     // 0.6% TP for High Frequency
+        priceDrop: 0.1,      // 0.1% Drop Trigger
+        volumeMult: 1.5,     // 1.5x Martingale Multiplier
+        takeProfit: 0.1,     // 0.6% NET Profit Target
         maxSteps: 999        
     },
     estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
     openPosition: { volume: 0, direction: "", costHold: 0 },
-    allTimeHigh: 0,
-    totalTrades: 0,
-    winningTrades: 0
+    totalTrades: 0
 };
 
 // ==================== API HANDLER ====================
@@ -71,13 +71,12 @@ function calculateMaxPossibleSteps(balance, leverage, baseOrder, multiplier, pri
     let currentStepVolume = baseOrder;
     let buyingPower = balance * leverage;
     let steps = 0;
-    while (true) {
+    while (steps < 20) {
         let stepNotional = currentStepVolume * price;
-        if ((totalContracts * price) + stepNotional > buyingPower) break;
+        if ((totalContracts * price) + stepNotional > (buyingPower * 0.9)) break; // 90% utilization safety
         totalContracts += currentStepVolume;
         currentStepVolume = Math.floor(currentStepVolume * multiplier);
         steps++;
-        if (steps > 50) break;
     }
     return steps;
 }
@@ -85,7 +84,7 @@ function calculateMaxPossibleSteps(balance, leverage, baseOrder, multiplier, pri
 function calculateCurrentStep(totalVol, baseVol, multiplier) {
     if (totalVol <= baseVol) return 0;
     let step = 0; let runningTotal = baseVol; let lastOrder = baseVol;
-    while (runningTotal < totalVol && step < 100) {
+    while (runningTotal < totalVol && step < 25) {
         step++;
         lastOrder = Math.floor(lastOrder * multiplier);
         runningTotal += lastOrder;
@@ -94,7 +93,7 @@ function calculateCurrentStep(totalVol, baseVol, multiplier) {
     return step;
 }
 
-// ==================== DATA SYNC ====================
+// ==================== DATA SYNC & FEE ENGINE ====================
 async function syncData() {
     try {
         const accRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
@@ -112,15 +111,13 @@ async function syncData() {
             if (realBalance > botState.peakBalance) {
                 botState.displayBalance += (realBalance - botState.peakBalance);
                 botState.peakBalance = realBalance;
-                if (botState.displayBalance > (botState.allTimeHigh || 0)) botState.allTimeHigh = botState.displayBalance;
             }
             botState.walletBalance = realBalance;
             botState.realizedProfit = botState.displayBalance - botState.initialBalance;
             botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
             
-            // --- UPDATED MULTIPLIER (35) ---
+            // AGGRESSIVE COMPOUNDING (35X MULTIPLIER)
             botState.settings.baseOrder = Math.max(1, Math.floor(botState.walletBalance * 35));
-            
             botState.maxAffordableSteps = calculateMaxPossibleSteps(botState.walletBalance, config.leverage, botState.settings.baseOrder, botState.settings.volumeMult, botState.currentPrice);
         }
 
@@ -129,7 +126,12 @@ async function syncData() {
 
         if (pos) {
             botState.avgPrice = parseFloat(pos.cost_hold);
-            botState.roi = parseFloat(pos.profit_rate) * 100;
+            const rawRoi = parseFloat(pos.profit_rate) * 100;
+            
+            // FEE CALCULATION: (FeeRate * 2 orders) * Leverage * 100 to get % of Margin
+            const roundTripFeePercent = (config.feeRate * 2) * config.leverage * 100;
+            botState.roi = rawRoi - roundTripFeePercent; // NET ROI after fees
+
             botState.openPosition = { volume: parseFloat(pos.volume), direction: pos.direction, costHold: botState.avgPrice };
             botState.safetyOrdersFilled = calculateCurrentStep(botState.openPosition.volume, botState.settings.baseOrder, botState.settings.volumeMult);
 
@@ -152,12 +154,14 @@ async function checkTrades() {
     botState.isTrading = true;
     try {
         const hasPos = botState.openPosition.volume > 0;
+        
+        // Take Profit logic (Targeting NET Profit after fees)
         if (hasPos && botState.roi >= botState.settings.takeProfit) {
             await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: botState.openPosition.volume,
                 direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
             });
-            botState.winningTrades++; botState.totalTrades++;
+            botState.totalTrades++;
         } else if (hasPos) {
             const currentDrop = ((botState.avgPrice - botState.currentPrice) / botState.avgPrice) * 100;
             if (currentDrop >= botState.settings.priceDrop) {
@@ -200,8 +204,8 @@ app.get('/', (req, res) => {
         <div class="flex justify-between items-center mb-8">
             <div>
                 <h1 class="text-3xl font-bold tracking-tight">COMPOUND<span class="gradient-text">_BOT</span></h1>
-                <p class="text-[10px] text-gray-400 uppercase tracking-widest mt-1">${config.symbol} | ${config.leverage}X LEVERAGE</p>
-                <p class="text-[10px] text-emerald-600 font-bold mt-2">🎯 STATIC 0.1% DROP TRIGGER</p>
+                <p class="text-[10px] text-gray-400 uppercase tracking-widest mt-1">${config.symbol} | FEE: 0.0475%</p>
+                <p class="text-[10px] text-emerald-600 font-bold mt-2">🎯 TARGET: 0.6% NET PROFIT</p>
             </div>
             <div class="text-right">
                 <p id="dgrText" class="text-3xl font-bold text-emerald-600">0.00%</p>
@@ -216,7 +220,7 @@ app.get('/', (req, res) => {
                 <p id="p2" class="text-[10px] font-bold text-gray-400 mt-1">0.00% TOTAL GAIN</p>
             </div>
             <div class="card p-6 rounded-2xl">
-                <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Open ROI</p>
+                <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Net ROI (After Fee)</p>
                 <p id="roi" class="text-3xl font-bold stat-number">0.00%</p>
                 <p id="distText" class="text-[10px] font-bold text-orange-500 mt-1">NEXT STEP: 0.100%</p>
             </div>
@@ -243,11 +247,11 @@ app.get('/', (req, res) => {
                     <p id="curPrice" class="text-xl font-mono font-bold text-gray-800">0.00000000</p>
                 </div>
                 <div>
-                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Take Profit</p>
-                    <p class="text-xl font-bold text-emerald-600">0.6%</p>
+                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Take Profit Target</p>
+                    <p class="text-xl font-bold text-emerald-600">0.6% NET</p>
                 </div>
                 <div>
-                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Step Multiplier</p>
+                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Aggression Mult</p>
                     <p class="text-xl font-bold text-purple-600">1.5x</p>
                 </div>
             </div>
