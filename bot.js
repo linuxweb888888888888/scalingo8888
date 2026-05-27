@@ -89,25 +89,28 @@ console.log('========================================\n');
 // ============ MONGODB CONNECTION ============
 let dbClient = null;
 let db = null;
+let dbConnected = false;
 
 async function connectMongoDB() {
     try {
         dbClient = new MongoClient(ENV.MONGODB_URI);
         await dbClient.connect();
         db = dbClient.db('botdb');
+        dbConnected = true;
         console.log('[MongoDB] Connected successfully');
         
-        await db.createCollection('accounts', { capped: false });
-        await db.createCollection('metrics', { capped: false });
-        await db.createCollection('deployments', { capped: false });
-        await db.collection('accounts').createIndex({ createdAt: -1 });
-        await db.collection('accounts').createIndex({ deploymentId: 1 });
-        await db.collection('deployments').createIndex({ lastHeartbeat: -1 });
-        await db.collection('deployments').createIndex({ deploymentId: 1 });
+        await db.createCollection('accounts', { capped: false }).catch(() => {});
+        await db.createCollection('metrics', { capped: false }).catch(() => {});
+        await db.createCollection('deployments', { capped: false }).catch(() => {});
+        await db.collection('accounts').createIndex({ createdAt: -1 }).catch(() => {});
+        await db.collection('accounts').createIndex({ deploymentId: 1 }).catch(() => {});
+        await db.collection('deployments').createIndex({ lastHeartbeat: -1 }).catch(() => {});
+        await db.collection('deployments').createIndex({ deploymentId: 1 }).catch(() => {});
         
         return true;
     } catch (error) {
         console.error('[MongoDB] Connection failed:', error.message);
+        dbConnected = false;
         return false;
     }
 }
@@ -152,6 +155,7 @@ async function downloadFile(url, destPath) {
 }
 
 async function cleanupStaleDeployments() {
+    if (!dbConnected || !db) return;
     try {
         const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
         const result = await db.collection('deployments').deleteMany({
@@ -299,7 +303,6 @@ async function ensureDeploymentDir() {
             fs.mkdirSync(deployDir, { recursive: true, mode: 0o777 });
             console.log(`[DOCKER] Created deployment directory: ${deployDir}`);
         }
-        // Also create a timestamped subdirectory for each run
         const timestampDir = `${deployDir}/${Date.now()}`;
         fs.mkdirSync(timestampDir, { recursive: true, mode: 0o777 });
         return timestampDir;
@@ -355,6 +358,7 @@ function setupCentralEndpoints() {
     };
     
     app.post('/api/register-bot', validateApiKey, async (req, res) => {
+        if (!dbConnected) return res.status(503).json({ error: 'Database not connected' });
         try {
             const { deploymentId, deploymentName, region, startTime, version } = req.body;
             
@@ -386,6 +390,7 @@ function setupCentralEndpoints() {
     });
     
     app.post('/api/heartbeat', validateApiKey, async (req, res) => {
+        if (!dbConnected) return res.status(503).json({ error: 'Database not connected' });
         try {
             const { deploymentId, deploymentName, region, status, accountsCreated, lastAccount } = req.body;
             
@@ -410,6 +415,7 @@ function setupCentralEndpoints() {
     });
     
     app.post('/api/metrics/add', validateApiKey, async (req, res) => {
+        if (!dbConnected) return res.status(503).json({ error: 'Database not connected' });
         try {
             const { deploymentId, deploymentName, email, password, deployedApps, createdAt, restartCount } = req.body;
             
@@ -438,6 +444,7 @@ function setupCentralEndpoints() {
     });
     
     app.get('/api/connected-bots', async (req, res) => {
+        if (!dbConnected) return res.json([]);
         try {
             const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
             const bots = await db.collection('deployments')
@@ -461,6 +468,7 @@ function setupCentralEndpoints() {
     });
     
     app.get('/api/all-accounts', async (req, res) => {
+        if (!dbConnected) return res.json([]);
         try {
             const accounts = await db.collection('accounts').find({}).sort({ createdAt: -1 }).limit(100).toArray();
             res.json(accounts);
@@ -470,6 +478,7 @@ function setupCentralEndpoints() {
     });
     
     app.get('/api/aggregated-metrics', async (req, res) => {
+        if (!dbConnected) return res.json({ totalAccounts: 0, totalDeployments: 0, activeDeployments: 0, accountsByBot: [], timestamp: new Date() });
         try {
             const totalAccounts = await db.collection('accounts').countDocuments();
             const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
@@ -791,10 +800,8 @@ class CleverCloudBot {
         return new Promise(async (resolve) => {
             log('DOCKER', 'Starting Docker deployment...', 'info', this.instanceId);
             
-            // Logout from previous session
             await logoutCleverCloud();
             
-            // Create deployment directory
             const deployDir = await ensureDeploymentDir();
             log('DOCKER', `Using deployment directory: ${deployDir}`, 'info', this.instanceId);
             
@@ -805,7 +812,6 @@ class CleverCloudBot {
                 return;
             }
             
-            // Make script executable
             try {
                 fs.chmodSync(dockerScriptPath, 0o755);
             } catch(e) {}
@@ -906,7 +912,7 @@ class CleverCloudBot {
             
             const result = await this.startDockerInBackground(accountEmail, dynamicPassword);
             
-            if (db) {
+            if (dbConnected && db) {
                 await db.collection('accounts').insertOne({
                     deploymentId: ENV.DEPLOYMENT_ID,
                     deploymentName: ENV.DEPLOYMENT_NAME,
@@ -955,7 +961,6 @@ class CleverCloudBot {
                     log('LOOP', `Starting account #${botStatus.totalAccounts + 1}...`, 'info', this.instanceId);
                     const success = await this.createSingleAccount();
                     
-                    // Reset OAuth flag for next account
                     this.oauthHandled = false;
                     
                     await sleep(success ? 15000 : 30000);
@@ -974,22 +979,30 @@ if (ENV.IS_CENTRAL) {
         try {
             await cleanupStaleDeployments();
             
-            const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-            const bots = await db.collection('deployments')
-                .find({ lastHeartbeat: { $gt: fiveMinutesAgo } })
-                .sort({ lastHeartbeat: -1 })
-                .toArray();
+            let uniqueBots = [];
+            let totalAccounts = 0;
             
-            const uniqueBots = [];
-            const seenIds = new Set();
-            for (const bot of bots) {
-                if (!seenIds.has(bot.deploymentId)) {
-                    seenIds.add(bot.deploymentId);
-                    uniqueBots.push(bot);
+            if (dbConnected && db) {
+                try {
+                    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+                    const bots = await db.collection('deployments')
+                        .find({ lastHeartbeat: { $gt: fiveMinutesAgo } })
+                        .sort({ lastHeartbeat: -1 })
+                        .toArray();
+                    
+                    const seenIds = new Set();
+                    for (const bot of bots) {
+                        if (!seenIds.has(bot.deploymentId)) {
+                            seenIds.add(bot.deploymentId);
+                            uniqueBots.push(bot);
+                        }
+                    }
+                    
+                    totalAccounts = await db.collection('accounts').countDocuments();
+                } catch (dbError) {
+                    console.error('Dashboard DB error:', dbError);
                 }
             }
-            
-            const totalAccounts = await db.collection('accounts').countDocuments();
             
             let botsHtml = '';
             if (uniqueBots.length === 0) {
@@ -997,8 +1010,7 @@ if (ENV.IS_CENTRAL) {
             } else {
                 for (const bot of uniqueBots) {
                     const cryptoData = getRandomCrypto();
-                    const botId = bot.deploymentId || 'unknown';
-                    const botName = bot.deploymentName || botId;
+                    const botName = bot.deploymentName || bot.deploymentId || 'Unknown';
                     const realizedProfit = getRandomProfit();
                     const botLastSeen = bot.lastHeartbeat ? new Date(bot.lastHeartbeat).toLocaleString() : 'Never';
                     const changeClass = cryptoData.change >= 0 ? 'positive' : 'negative';
@@ -1053,13 +1065,16 @@ if (ENV.IS_CENTRAL) {
         .refresh-btn:hover { transform: scale(1.02); }
         h2 { color: white; margin-bottom: 20px; font-weight: 600; }
         code { background: rgba(0,0,0,0.5); padding: 2px 6px; border-radius: 6px; font-family: monospace; }
+        .db-status { background: rgba(0,0,0,0.5); padding: 4px 12px; border-radius: 20px; font-size: 12px; display: inline-block; margin-left: 15px; }
+        .db-connected { color: #10b981; }
+        .db-disconnected { color: #ef4444; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <h1>🤖 <span>Crypto Trading Bot</span> Command Center</h1>
-            <p>Monitoring ${uniqueBots.length} active trading bot deployments • ${totalAccounts} total trades executed</p>
+            <p>Monitoring ${uniqueBots.length} active trading bot deployments • ${totalAccounts} total trades executed ${!dbConnected ? '<span class="db-status db-disconnected">⚠️ DB Disconnected</span>' : '<span class="db-status db-connected">✅ DB Connected</span>'}</p>
         </div>
         <div class="stats-grid">
             <div class="stat-card"><div class="stat-value">${totalAccounts}</div><div class="stat-label">Total Trades Executed</div></div>
@@ -1077,7 +1092,7 @@ if (ENV.IS_CENTRAL) {
                 </thead>
                 <tbody id="accountsBody"><tr><td colspan="6">Loading trading data...</td></tr>
                 </tbody>
-            </table>
+            ~
         </div>
     </div>
     <script>
@@ -1147,7 +1162,6 @@ function escapeHtml(text) {
 async function main() {
     console.log(`\n🚀 Starting application...`);
     
-    // Create deployment directory on startup
     await ensureDeploymentDir();
     
     if (ENV.IS_CENTRAL) {
