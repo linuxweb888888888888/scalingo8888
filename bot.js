@@ -36,11 +36,12 @@ let botState = {
     safetyOrdersFilled: 0,
     maxAffordableSteps: 0,
     distToNext: 0,
+    profitShibLeveraged: 0, // Profit converted to SHIB units at 10x
     settings: {
         baseOrder: 0,        
-        priceDrop: 0.1,      // Static 0.1% Drop
-        volumeMult: 1.2,     // 1.2x Multiplier
-        takeProfit: 1.5,     // 1.5% TP
+        priceDrop: 0.1,      
+        volumeMult: 1.2,     
+        takeProfit: 1.5,     
         maxSteps: 999        
     },
     estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
@@ -49,8 +50,6 @@ let botState = {
     totalTrades: 0,
     winningTrades: 0
 };
-
-let tradeHistory = [];
 
 // ==================== API HANDLER ====================
 async function htxRequest(method, path, data = {}) {
@@ -74,14 +73,12 @@ function calculateMaxPossibleSteps(balance, leverage, baseOrder, multiplier, pri
     let buyingPower = balance * leverage;
     let steps = 0;
     while (true) {
-        let stepNotional = currentStepVolume * price;
-        // Check if the accumulation of contracts exceeds full wallet buying power
-        if ((totalContracts * price) + stepNotional > buyingPower) break;
+        let stepNotional = currentStepVolume * price * 1000; // 1000 SHIB per contract
+        if (((totalContracts + currentStepVolume) * price * 1000) > buyingPower) break;
         totalContracts += currentStepVolume;
         currentStepVolume = Math.floor(currentStepVolume * multiplier);
         steps++;
-        // Safety break set to 500 instead of 50 to allow full balance calculation
-        if (steps > 500) break;
+        if (steps > 300) break; 
     }
     return steps;
 }
@@ -116,15 +113,24 @@ async function syncData() {
             if (realBalance > botState.peakBalance) {
                 botState.displayBalance += (realBalance - botState.peakBalance);
                 botState.peakBalance = realBalance;
-                if (botState.displayBalance > (botState.allTimeHigh || 0)) botState.allTimeHigh = botState.displayBalance;
             }
             botState.walletBalance = realBalance;
             botState.realizedProfit = botState.displayBalance - botState.initialBalance;
             botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
             
-            // Logic: Balance * 10
-            botState.settings.baseOrder = Math.max(1, Math.floor(botState.walletBalance * 10));
-            // Calculating steps based on FULL dynamic wallet balance
+            // --- UPDATED COMPOUNDING MATH (1 Contract = 1000 SHIB) ---
+            if (botState.currentPrice > 0) {
+                // 1. Calculate Profit in SHIB tokens at 10x
+                botState.profitShibLeveraged = (botState.realizedProfit * 10) / botState.currentPrice;
+                
+                // 2. Convert SHIB units to HTX Contracts (SHIB units / 1000)
+                const profitContracts = Math.floor(botState.profitShibLeveraged / 1000);
+                
+                // 3. New Base Order = (Current Wallet * 10) + Profit Contracts
+                const initialBase = Math.floor(botState.walletBalance * 10);
+                botState.settings.baseOrder = Math.max(1, initialBase + profitContracts);
+            }
+
             botState.maxAffordableSteps = calculateMaxPossibleSteps(botState.walletBalance, config.leverage, botState.settings.baseOrder, botState.settings.volumeMult, botState.currentPrice);
         }
 
@@ -136,8 +142,6 @@ async function syncData() {
             botState.roi = parseFloat(pos.profit_rate) * 100;
             botState.openPosition = { volume: parseFloat(pos.volume), direction: pos.direction, costHold: botState.avgPrice };
             botState.safetyOrdersFilled = calculateCurrentStep(botState.openPosition.volume, botState.settings.baseOrder, botState.settings.volumeMult);
-
-            // Static 0.1% Distance logic
             const currentDrop = ((botState.avgPrice - botState.currentPrice) / botState.avgPrice) * 100;
             botState.distToNext = Math.max(0, botState.settings.priceDrop - currentDrop);
         } else {
@@ -151,7 +155,6 @@ async function syncData() {
     } catch (e) {}
 }
 
-// ==================== TRADING LOGIC ====================
 async function checkTrades() {
     if (!botState.isRunning || botState.isTrading || botState.currentPrice <= 0) return;
     botState.isTrading = true;
@@ -162,7 +165,7 @@ async function checkTrades() {
                 contract_code: config.symbol, volume: botState.openPosition.volume,
                 direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
             });
-            botState.winningTrades++; botState.totalTrades++;
+            botState.totalTrades++;
         } else if (hasPos) {
             const currentDrop = ((botState.avgPrice - botState.currentPrice) / botState.avgPrice) * 100;
             if (currentDrop >= botState.settings.priceDrop) {
@@ -184,7 +187,6 @@ async function checkTrades() {
     botState.isTrading = false;
 }
 
-// ==================== UI ====================
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
@@ -192,106 +194,44 @@ app.get('/', (req, res) => {
 <head>
     <title>HTX Compounder PRO</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap" rel="stylesheet">
     <style>
         body { font-family: 'Inter', sans-serif; background: #ffffff; }
-        .card { background: white; border: 1px solid #e5e7eb; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
-        .gradient-text { background: linear-gradient(135deg, #059669 0%, #0284c7 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-        .stat-number { font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
+        .card { background: white; border: 1px solid #e5e7eb; padding: 1.5rem; border-radius: 1rem; }
     </style>
 </head>
-<body class="text-gray-900 p-6 md:p-10 bg-gray-50">
+<body class="p-10 bg-gray-50 text-gray-900">
     <div class="max-w-6xl mx-auto">
-        <div class="flex justify-between items-center mb-8">
-            <div>
-                <h1 class="text-3xl font-bold tracking-tight">COMPOUND<span class="gradient-text">_BOT</span></h1>
-                <p class="text-[10px] text-gray-400 uppercase tracking-widest mt-1">${config.symbol} | ${config.leverage}X LEVERAGE</p>
-                <p class="text-[10px] text-emerald-600 font-bold mt-2">🎯 STATIC 0.1% DROP TRIGGER</p>
+        <h1 class="text-3xl font-bold mb-8">HTX COMPOUNDING (1K SHIB/CONT)</h1>
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
+            <div class="card">
+                <p class="text-xs text-gray-400 uppercase font-bold mb-1">Net Profit USDT</p>
+                <p id="p1" class="text-2xl font-bold text-emerald-600">$0.0000</p>
             </div>
-            <div class="text-right">
-                <p id="dgrText" class="text-3xl font-bold text-emerald-600">0.00%</p>
-                <p class="text-[10px] text-gray-400 uppercase tracking-wider">Daily Growth Rate</p>
+            <div class="card">
+                <p class="text-xs text-gray-400 uppercase font-bold mb-1">Profit SHIB (10x)</p>
+                <p id="pShib" class="text-2xl font-bold text-emerald-900">0</p>
             </div>
-        </div>
-
-        <div class="grid grid-cols-2 lg:grid-cols-4 gap-5 mb-8">
-            <div class="card p-6 rounded-2xl">
-                <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Net Profit</p>
-                <p id="p1" class="text-3xl font-bold text-emerald-600 stat-number">$0.00</p>
-                <p id="p2" class="text-[10px] font-bold text-gray-400 mt-1">0.00% TOTAL GAIN</p>
+            <div class="card">
+                <p class="text-xs text-gray-400 uppercase font-bold mb-1">Safety Steps</p>
+                <p id="stepText" class="text-2xl font-bold text-blue-600">0 / 0</p>
             </div>
-            <div class="card p-6 rounded-2xl">
-                <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Open ROI</p>
-                <p id="roi" class="text-3xl font-bold stat-number">0.00%</p>
-                <p id="distText" class="text-[10px] font-bold text-orange-500 mt-1">NEXT STEP: 0.100%</p>
-            </div>
-            <div class="card p-6 rounded-2xl">
-                <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Safety Steps</p>
-                <p id="stepText" class="text-3xl font-bold text-blue-600 stat-number">0 <span class="text-lg text-gray-300">/ 0</span></p>
-                <p class="text-[10px] font-bold text-gray-400 mt-1">WALLET CAPACITY LIMIT</p>
-            </div>
-            <div class="card p-6 rounded-2xl">
-                <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Display Balance</p>
-                <p id="bal" class="text-3xl font-bold text-gray-900 stat-number">$0.00</p>
-                <p id="totalTrades" class="text-[10px] font-bold text-gray-400 mt-1">0 TOTAL TRADES</p>
+            <div class="card">
+                <p class="text-xs text-gray-400 uppercase font-bold mb-1">Base Order</p>
+                <p id="baseOrderDisplay" class="text-2xl font-bold">0</p>
             </div>
         </div>
-
-        <div class="card p-6 rounded-2xl mb-8 bg-gradient-to-r from-gray-50 to-white">
-            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 items-center">
-                <div>
-                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Base Order (Bal * 10)</p>
-                    <p id="baseOrderDisplay" class="text-xl font-bold text-gray-800">0</p>
-                </div>
-                <div>
-                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Live Price</p>
-                    <p id="curPrice" class="text-xl font-mono font-bold text-gray-800">0.00000000</p>
-                </div>
-                <div>
-                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Take Profit</p>
-                    <p class="text-xl font-bold text-emerald-600">1.5%</p>
-                </div>
-                <div>
-                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Step Multiplier</p>
-                    <p class="text-xl font-bold text-purple-600">1.2x</p>
-                </div>
-            </div>
-        </div>
-
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
-            <div class="bg-emerald-50 border border-emerald-100 p-8 rounded-2xl">
-                <p class="text-[10px] text-emerald-700 font-bold uppercase mb-2">Estimated 24h Profit</p>
-                <p id="estDay" class="text-3xl font-bold text-emerald-900">$0.00</p>
-            </div>
-            <div class="card p-8 rounded-2xl">
-                <p class="text-[10px] text-gray-400 font-bold uppercase mb-2">Estimated 7 Days</p>
-                <p id="estWeek" class="text-3xl font-bold text-gray-900">$0.00</p>
-            </div>
-            <div class="card p-8 rounded-2xl">
-                <p class="text-[10px] text-gray-400 font-bold uppercase mb-2">Estimated 30 Days</p>
-                <p id="estMonth" class="text-3xl font-bold text-gray-700">$0.00</p>
-            </div>
-        </div>
+        <p class="text-[10px] text-gray-400 font-mono uppercase tracking-widest">Pricing: <span id="curPrice">0</span> | Leverage: ${config.leverage}x</p>
     </div>
-
     <script>
         async function update() {
             try {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('p1').innerText = '$' + d.realizedProfit.toFixed(4);
-                document.getElementById('p2').innerText = d.profitPct.toFixed(4) + '% TOTAL GAIN';
-                document.getElementById('roi').innerText = d.roi.toFixed(2) + '%';
-                document.getElementById('roi').style.color = d.roi >= 0 ? '#059669' : '#dc2626';
-                document.getElementById('bal').innerText = '$' + d.displayBalance.toFixed(2);
-                document.getElementById('totalTrades').innerText = d.totalTrades + ' TOTAL TRADES';
-                document.getElementById('stepText').innerHTML = d.safetyOrdersFilled + ' <span class="text-lg text-gray-300">/ ' + d.maxAffordableSteps + '</span>';
-                document.getElementById('distText').innerText = 'NEXT STEP: ' + d.distToNext.toFixed(3) + '%';
-                document.getElementById('dgrText').innerText = d.estimates.dgr.toFixed(4) + '%';
+                document.getElementById('pShib').innerText = Math.floor(d.profitShibLeveraged).toLocaleString() + ' SHIB';
+                document.getElementById('stepText').innerText = d.safetyOrdersFilled + ' / ' + d.maxAffordableSteps;
                 document.getElementById('baseOrderDisplay').innerText = d.settings.baseOrder;
                 document.getElementById('curPrice').innerText = d.currentPrice.toFixed(8);
-                document.getElementById('estDay').innerText = '$' + d.estimates.day.toFixed(2);
-                document.getElementById('estWeek').innerText = '$' + d.estimates.week.toFixed(2);
-                document.getElementById('estMonth').innerText = '$' + d.estimates.month.toFixed(2);
             } catch (e) {}
         }
         setInterval(update, 1000);
