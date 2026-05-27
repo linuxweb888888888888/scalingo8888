@@ -36,7 +36,7 @@ let botState = {
     safetyOrdersFilled: 0,
     maxAffordableSteps: 0,
     distToNext: 0,
-    profitShibLeveraged: 0, // NEW: Net Profit units at 10x
+    profitShibLeveraged: 0, // Net Profit units at 10x
     settings: {
         baseOrder: 0,        
         priceDrop: 0.1,      // Static 0.1% Drop
@@ -69,19 +69,25 @@ async function htxRequest(method, path, data = {}) {
 
 // ==================== CALCULATIONS ====================
 function calculateMaxPossibleSteps(balance, leverage, baseOrder, multiplier, price) {
-    if (price <= 0 || baseOrder <= 0) return 0;
-    let totalContracts = 0;
-    let currentStepVolume = baseOrder;
+    if (price <= 0 || baseOrder <= 0 || balance <= 0) return 0;
+    
+    let totalContractsAccumulated = 0;
+    let nextOrderSize = baseOrder;
     let buyingPower = balance * leverage;
     let steps = 0;
+
     while (true) {
-        // HTX SHIB Contract Size = 1,000 units
-        let stepNotional = currentStepVolume * price * 1000;
-        if (((totalContracts + currentStepVolume) * price * 1000) > buyingPower) break;
-        totalContracts += currentStepVolume;
-        currentStepVolume = Math.floor(currentStepVolume * multiplier);
+        // HTX SHIB-USDT Contract size is 1,000 units
+        // Calculate the value of the position if we add the next step
+        let totalValueWithNextStep = (totalContractsAccumulated + nextOrderSize) * price * 1000;
+        
+        if (totalValueWithNextStep > buyingPower) break;
+
+        totalContractsAccumulated += nextOrderSize;
+        nextOrderSize = Math.floor(nextOrderSize * multiplier);
         steps++;
-        if (steps > 500) break; // High dynamic break
+
+        if (steps > 500) break; // Infinite loop safety
     }
     return steps;
 }
@@ -122,21 +128,27 @@ async function syncData() {
             botState.realizedProfit = botState.displayBalance - botState.initialBalance;
             botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
             
-            // --- COMPOUNDING CHANGES ---
+            // --- COMPOUNDING + DYNAMIC CAPACITY LOGIC ---
             if (botState.currentPrice > 0) {
-                // 1. Calculate Profit units at 10x
+                // 1. Profit SHIB at 10x
                 botState.profitShibLeveraged = (botState.realizedProfit * 10) / botState.currentPrice;
                 
-                // 2. Convert to Contracts (1 contract = 1,000 SHIB)
+                // 2. Convert profit to contracts (1 contract = 1,000 SHIB)
                 const profitContracts = Math.floor(botState.profitShibLeveraged / 1000);
                 
-                // 3. Final Base Order = (Wallet Balance * 10) + Profit Contracts
+                // 3. Compounded Base Order = (Balance * 10) + Profit Contracts
                 const originalBase = Math.floor(botState.walletBalance * 10);
                 botState.settings.baseOrder = Math.max(1, originalBase + profitContracts);
-            }
 
-            // DYNAMIC Wallet Limit Calculation
-            botState.maxAffordableSteps = calculateMaxPossibleSteps(botState.walletBalance, config.leverage, botState.settings.baseOrder, botState.settings.volumeMult, botState.currentPrice);
+                // 4. Calculate Dynamic Capacity based on the NEW Compounded Base Order
+                botState.maxAffordableSteps = calculateMaxPossibleSteps(
+                    botState.walletBalance, 
+                    config.leverage, 
+                    botState.settings.baseOrder, 
+                    botState.settings.volumeMult, 
+                    botState.currentPrice
+                );
+            }
         }
 
         const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
@@ -216,7 +228,7 @@ app.get('/', (req, res) => {
             <div>
                 <h1 class="text-3xl font-bold tracking-tight">COMPOUND<span class="gradient-text">_BOT</span></h1>
                 <p class="text-[10px] text-gray-400 uppercase tracking-widest mt-1">${config.symbol} | ${config.leverage}X LEVERAGE</p>
-                <p class="text-[10px] text-emerald-600 font-bold mt-2">🎯 PROFIT-TO-CONTRACT COMPOUNDING</p>
+                <p class="text-[10px] text-emerald-600 font-bold mt-2">🎯 DYNAMIC COMPOUNDING ACTIVE</p>
             </div>
             <div class="text-right">
                 <p id="dgrText" class="text-3xl font-bold text-emerald-600">0.00%</p>
@@ -243,7 +255,7 @@ app.get('/', (req, res) => {
             <div class="card p-6 rounded-2xl">
                 <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Safety Steps</p>
                 <p id="stepText" class="text-2xl font-bold text-blue-600 stat-number">0 <span class="text-lg text-gray-300">/ 0</span></p>
-                <p class="text-[10px] font-bold text-gray-400 mt-1 uppercase">Capacity</p>
+                <p class="text-[10px] font-bold text-gray-400 mt-1 uppercase">Wallet Limit</p>
             </div>
             <div class="card p-6 rounded-2xl">
                 <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Display Balance</p>
@@ -272,21 +284,6 @@ app.get('/', (req, res) => {
                 </div>
             </div>
         </div>
-
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
-            <div class="bg-emerald-50 border border-emerald-100 p-8 rounded-2xl">
-                <p class="text-[10px] text-emerald-700 font-bold uppercase mb-2">Estimated 24h Profit</p>
-                <p id="estDay" class="text-3xl font-bold text-emerald-900">$0.00</p>
-            </div>
-            <div class="card p-8 rounded-2xl">
-                <p class="text-[10px] text-gray-400 font-bold uppercase mb-2">Estimated 7 Days</p>
-                <p id="estWeek" class="text-3xl font-bold text-gray-900">$0.00</p>
-            </div>
-            <div class="card p-8 rounded-2xl">
-                <p class="text-[10px] text-gray-400 font-bold uppercase mb-2">Estimated 30 Days</p>
-                <p id="estMonth" class="text-3xl font-bold text-gray-700">$0.00</p>
-            </div>
-        </div>
     </div>
 
     <script>
@@ -305,9 +302,6 @@ app.get('/', (req, res) => {
                 document.getElementById('dgrText').innerText = d.estimates.dgr.toFixed(4) + '%';
                 document.getElementById('baseOrderDisplay').innerText = d.settings.baseOrder;
                 document.getElementById('curPrice').innerText = d.currentPrice.toFixed(8);
-                document.getElementById('estDay').innerText = '$' + d.estimates.day.toFixed(2);
-                document.getElementById('estWeek').innerText = '$' + d.estimates.week.toFixed(2);
-                document.getElementById('estMonth').innerText = '$' + d.estimates.month.toFixed(2);
             } catch (e) {}
         }
         setInterval(update, 1000);
