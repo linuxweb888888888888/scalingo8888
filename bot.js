@@ -38,7 +38,7 @@ let botState = {
 config.symbols.forEach((sym, index) => {
     botState.coins[sym] = {
         symbol: sym,
-        wsKey: sym.replace('-', '').toLowerCase(),
+        wsKey: sym.replace('-', '').toLowerCase(), // e.g. shibusdt
         direction: index % 2 === 0 ? 'buy' : 'sell', 
         currentPrice: 0,
         avgPrice: 0,
@@ -66,7 +66,7 @@ async function htxRequest(method, path, data = {}) {
     } catch (e) { return null; }
 }
 
-// ==================== CALCULATIONS (FIXED MULTIPLIER) ====================
+// ==================== CALCULATIONS ====================
 function calculateMaxPossibleSteps(balance, leverage, baseOrder, multiplier, price) {
     if (price <= 0 || baseOrder <= 0) return 0;
     let totalContracts = 0;
@@ -77,8 +77,7 @@ function calculateMaxPossibleSteps(balance, leverage, baseOrder, multiplier, pri
         let stepNotional = nextStepVol * price; 
         if ((totalContracts * price) + stepNotional > buyingPower) break;
         totalContracts += nextStepVol;
-        // FIX: Ensure next volume is ALWAYS higher than previous
-        nextStepVol = Math.max(nextStepVol + 1, Math.floor(nextStepVol * multiplier));
+        nextStepVol = Math.max(nextStepVol + 1, Math.ceil(nextStepVol * multiplier));
         steps++;
     }
     return steps;
@@ -89,7 +88,7 @@ function calculateCurrentStep(totalVol, baseVol, multiplier) {
     let step = 0; let runningTotal = baseVol; let lastOrder = baseVol;
     while (runningTotal < totalVol && step < 100) {
         step++;
-        lastOrder = Math.max(lastOrder + 1, Math.floor(lastOrder * multiplier));
+        lastOrder = Math.max(lastOrder + 1, Math.ceil(lastOrder * multiplier));
         runningTotal += lastOrder;
     }
     return step;
@@ -104,23 +103,35 @@ async function syncData() {
             const equity = parseFloat(acc.margin_balance);
             const unrealized = parseFloat(acc.profit_unreal) || 0;
             const realBalance = equity - unrealized;
-            if (botState.initialBalance <= 0) { botState.initialBalance = realBalance; botState.displayBalance = realBalance; botState.peakBalance = realBalance; }
-            if (realBalance > botState.peakBalance) { botState.displayBalance += (realBalance - botState.peakBalance); botState.peakBalance = realBalance; }
+
+            if (botState.initialBalance <= 0) {
+                botState.initialBalance = realBalance;
+                botState.displayBalance = realBalance;
+                botState.peakBalance = realBalance;
+            }
+            if (realBalance > botState.peakBalance) {
+                botState.displayBalance += (realBalance - botState.peakBalance);
+                botState.peakBalance = realBalance;
+            }
             botState.walletBalance = realBalance;
             botState.realizedProfit = botState.displayBalance - botState.initialBalance;
-            botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
+            botState.profitPct = botState.initialBalance > 0 ? (botState.realizedProfit / botState.initialBalance) * 100 : 0;
         }
 
         const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { margin_asset: 'USDT' });
+        
         for (let sym of config.symbols) {
             const coin = botState.coins[sym];
             const pos = posRes?.data?.find(p => p.contract_code === sym && parseFloat(p.volume) > 0);
-            coin.maxAffordableSteps = calculateMaxPossibleSteps(botState.walletBalance, config.leverage, coin.baseOrder, coin.settings.volumeMult, coin.currentPrice);
+
+            if (coin.currentPrice > 0) {
+                coin.maxAffordableSteps = calculateMaxPossibleSteps(botState.walletBalance, config.leverage, coin.baseOrder, coin.settings.volumeMult, coin.currentPrice);
+            }
+
             if (pos) {
                 coin.avgPrice = parseFloat(pos.cost_hold);
                 coin.volume = parseFloat(pos.volume);
-                coin.direction = pos.direction; // Sync actual direction
-                // ROI Formula for HTX
+                coin.direction = pos.direction; 
                 const side = coin.direction === 'buy' ? 1 : -1;
                 coin.roi = ((coin.currentPrice - coin.avgPrice) / coin.avgPrice) * side * config.leverage * 100;
                 coin.safetyOrdersFilled = calculateCurrentStep(coin.volume, coin.baseOrder, coin.settings.volumeMult);
@@ -131,46 +142,42 @@ async function syncData() {
                 coin.volume = 0; coin.roi = 0; coin.avgPrice = 0; coin.distToNext = 0; coin.safetyOrdersFilled = 0;
             }
         }
+        
         const elapsed = (Date.now() - botState.startTime) / 3600000;
         const hr = botState.realizedProfit / Math.max(elapsed, 0.01);
         botState.estimates = { hr, day: hr * 24, week: hr * 168, month: hr * 720, dgr: (hr * 24 / botState.initialBalance) * 100 };
     } catch (e) {}
 }
 
-// ==================== TRADING LOGIC (FIXED TP & MULT) ====================
+// ==================== TRADING LOGIC ====================
 async function checkTrades() {
     if (!botState.isRunning || botState.isTrading) return;
     botState.isTrading = true;
+    
     for (let sym of config.symbols) {
         const coin = botState.coins[sym];
         if (coin.currentPrice <= 0) continue;
+
         try {
             const hasPos = coin.volume > 0;
-            const closeDir = coin.direction === 'buy' ? 'sell' : 'buy';
+            const oppDir = coin.direction === 'buy' ? 'sell' : 'buy';
 
-            // 1. Take Profit Logic
             if (hasPos && coin.roi >= coin.settings.takeProfit) {
                 await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: sym, volume: coin.volume, direction: closeDir, offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
+                    contract_code: sym, volume: coin.volume, direction: oppDir, offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
                 botState.totalTrades++;
-            } 
-            // 2. Safety Order Logic
-            else if (hasPos) {
+            } else if (hasPos) {
                 const diff = coin.direction === 'buy' ? (coin.avgPrice - coin.currentPrice) : (coin.currentPrice - coin.avgPrice);
                 const currentDrop = (diff / coin.avgPrice) * 100;
                 if (currentDrop >= coin.settings.priceDrop) {
-                    // Calculation: Current Vol * Multiplier, but at least +1 contract
-                    let nextVol = Math.max(1, Math.floor(coin.baseOrder * Math.pow(coin.settings.volumeMult, coin.safetyOrdersFilled + 1)));
-                    // Ensure the order is actually larger than 0
+                    const nextVol = Math.max(1, Math.ceil(coin.baseOrder * Math.pow(coin.settings.volumeMult, coin.safetyOrdersFilled + 1)));
                     await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                         contract_code: sym, volume: nextVol, direction: coin.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
                     });
                     botState.totalTrades++;
                 }
-            } 
-            // 3. Initial Entry
-            else if (!hasPos) {
+            } else if (!hasPos) {
                 await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: sym, volume: coin.baseOrder, direction: coin.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
@@ -181,7 +188,7 @@ async function checkTrades() {
     botState.isTrading = false;
 }
 
-// ==================== UI (SAME DESIGN) ====================
+// ==================== UI ====================
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
@@ -200,8 +207,8 @@ app.get('/', (req, res) => {
     <div class="max-w-6xl mx-auto">
         <div class="flex justify-between items-center mb-8 bg-white p-6 rounded-2xl border border-gray-100">
             <div>
-                <h1 class="text-3xl font-bold tracking-tight uppercase">Multi<span class="gradient-text">_Compounder</span></h1>
-                <p class="text-[10px] text-gray-400 uppercase tracking-widest mt-1">TP: 1.5% | Drop: 0.1% | Mult: 1.2x</p>
+                <h1 class="text-3xl font-bold tracking-tight uppercase">MULTI<span class="gradient-text">_DCA</span></h1>
+                <p class="text-[10px] text-gray-400 uppercase tracking-widest mt-1">1-Contract Base | 1.2x Multiplier | 1.5% TP</p>
             </div>
             <div class="text-right">
                 <p id="totalProfit" class="text-3xl font-bold text-emerald-600">$0.00</p>
@@ -218,7 +225,7 @@ app.get('/', (req, res) => {
                 document.getElementById('totalPct').innerText = 'Total Profit (' + d.profitPct.toFixed(2) + '%)';
                 const container = document.getElementById('coinContainer');
                 let html = '';
-                Object.values(d.coins).sort((a,b) => b.roi - a.roi).forEach(coin => {
+                Object.values(d.coins).forEach(coin => {
                     const isLong = coin.direction === 'buy';
                     html += \`
                     <div class="card p-5 rounded-xl">
@@ -230,14 +237,14 @@ app.get('/', (req, res) => {
                                 </span>
                             </div>
                             <div>
-                                <p class="text-[10px] text-gray-400 uppercase">ROI / Avg</p>
+                                <p class="text-[10px] text-gray-400 uppercase">ROI / Avg Price</p>
                                 <p class="text-lg font-bold \${coin.roi >= 0 ? 'text-emerald-600' : 'text-rose-600'}">\${coin.roi.toFixed(2)}%</p>
-                                <p class="text-[10px] text-gray-400 font-mono">\${coin.avgPrice.toFixed(8)}</p>
+                                <p class="text-[10px] text-gray-500 font-mono">\${coin.avgPrice.toFixed(8)}</p>
                             </div>
                             <div>
                                 <p class="text-[10px] text-gray-400 uppercase">Steps</p>
                                 <p class="text-lg font-bold text-blue-600">\${coin.safetyOrdersFilled} <span class="text-gray-300 text-sm">/ \${coin.maxAffordableSteps}</span></p>
-                                <p class="text-[10px] text-orange-500 font-bold uppercase">Next Drop: \${coin.distToNext.toFixed(3)}%</p>
+                                <p class="text-[10px] text-orange-500 font-bold uppercase">Next Step: \${coin.distToNext.toFixed(3)}%</p>
                             </div>
                             <div class="text-right">
                                 <p class="text-[10px] text-gray-400 uppercase">Live Price</p>
@@ -258,6 +265,7 @@ app.get('/', (req, res) => {
 
 app.get('/api/status', (req, res) => res.json(botState));
 
+// ==================== WEB SOCKET (FIXED SYMBOLS) ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => {
@@ -270,15 +278,32 @@ function startWS() {
         zlib.gunzip(data, (err, dec) => {
             if (err) return;
             const msg = JSON.parse(dec.toString());
-            const incomingKey = msg.ch?.split('.')[1]; 
-            if (incomingKey && msg.tick?.close) {
-                const sym = config.symbols.find(s => s.replace('-', '').toLowerCase() === incomingKey);
-                if (sym) botState.coins[sym].currentPrice = parseFloat(msg.tick.close);
+            
+            // HTX sends heartbeat as ping
+            if (msg.ping) {
+                ws.send(JSON.stringify({ pong: msg.ping }));
+                return;
             }
-            if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
+
+            // Extract symbol from channel 'market.shibusdt.detail'
+            if (msg.ch) {
+                const parts = msg.ch.split('.');
+                const incomingWsKey = parts[1];
+                if (msg.tick && msg.tick.close) {
+                    // Find the original symbol using the wsKey
+                    const sym = config.symbols.find(s => s.replace('-', '').toLowerCase() === incomingWsKey);
+                    if (sym) {
+                        botState.coins[sym].currentPrice = parseFloat(msg.tick.close);
+                    }
+                }
+            }
         });
     });
-    ws.on('close', () => setTimeout(startWS, 5000));
+    ws.on('close', () => {
+        console.log("WebSocket Closed. Reconnecting...");
+        setTimeout(startWS, 5000);
+    });
+    ws.on('error', (e) => console.log("WS Error: ", e.message));
 }
 
 app.listen(config.port, () => {
