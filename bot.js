@@ -38,9 +38,9 @@ let botState = {
     distToNext: 0,
     settings: {
         baseOrder: 0,        
-        priceDrop: 0.1,      // Static 0.1% Drop
-        volumeMult: 1.2,     // 1.2x Multiplier
-        takeProfit: 1.5,     // 1.5% TP
+        priceDrop: 0.15,      // Static 0.1% Drop
+        volumeMult: 1.3,     // 1.2x Multiplier
+        takeProfit: 1,     // 1.5% TP
         maxSteps: 999        
     },
     estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
