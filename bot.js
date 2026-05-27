@@ -12,11 +12,12 @@ app.use(express.json());
 const config = {
     apiKey: process.env.HTX_API_KEY,
     secretKey: process.env.HTX_SECRET_KEY,
-    symbol: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase(),
     leverage: parseInt(process.env.LEVERAGE) || 10,
     port: process.env.PORT || 3000,
     restHost: 'api.hbdm.com',
-    wsHost: 'wss://api.hbdm.com/linear-swap-ws'
+    wsHost: 'wss://api.hbdm.com/linear-swap-ws',
+    // List of "Small" coins likely to fit high step counts
+    symbols: ['SHIB-USDT', 'PEPE-USDT', 'BONK-USDT', 'FLOKI-USDT', 'LUNC-USDT', 'XEC-USDT', 'BTTC-USDT', 'HOT-USDT', 'XVG-USDT', 'WIF-USDT']
 };
 
 // ==================== BOT STATE ====================
@@ -24,33 +25,33 @@ let botState = {
     isRunning: true,
     isTrading: false,
     startTime: Date.now(),
-    currentPrice: 0,
-    avgPrice: 0,
-    roi: 0,
-    realizedProfit: 0,
-    profitPct: 0,
+    initialBalance: 0,
     walletBalance: 0,
     displayBalance: 0,
     peakBalance: 0,
-    initialBalance: 0,
-    safetyOrdersFilled: 0,
-    maxAffordableSteps: 0,
-    distToNext: 0,
-    settings: {
-        baseOrder: 0,        
-        priceDrop: 0.1,      // Static 0.1% Drop
-        volumeMult: 1.2,     // 1.2x Multiplier
-        takeProfit: 1.5,     // 1.5% TP
-        maxSteps: 999        
-    },
-    estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
-    openPosition: { volume: 0, direction: "", costHold: 0 },
-    allTimeHigh: 0,
+    realizedProfit: 0,
+    profitPct: 0,
     totalTrades: 0,
-    winningTrades: 0
+    estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
+    coins: {} // Holds individual state for each symbol
 };
 
-let tradeHistory = [];
+// Initialize coin states
+config.symbols.forEach((sym, index) => {
+    botState.coins[sym] = {
+        symbol: sym,
+        direction: index % 2 === 0 ? 'buy' : 'sell', // Even = Long, Odd = Short
+        currentPrice: 0,
+        avgPrice: 0,
+        roi: 0,
+        safetyOrdersFilled: 0,
+        maxAffordableSteps: 0,
+        distToNext: 0,
+        volume: 0,
+        baseOrder: 0,
+        settings: { priceDrop: 0.1, volumeMult: 1.2, takeProfit: 1.5 }
+    };
+});
 
 // ==================== API HANDLER ====================
 async function htxRequest(method, path, data = {}) {
@@ -71,15 +72,14 @@ function calculateMaxPossibleSteps(balance, leverage, baseOrder, multiplier, pri
     if (price <= 0 || baseOrder <= 0) return 0;
     let totalContracts = 0;
     let currentStepVolume = baseOrder;
-    let buyingPower = balance * leverage;
+    let buyingPower = (balance / config.symbols.length) * leverage; // Split balance among coins
     let steps = 0;
-    while (true) {
+    while (steps < 100) {
         let stepNotional = currentStepVolume * price;
         if ((totalContracts * price) + stepNotional > buyingPower) break;
         totalContracts += currentStepVolume;
         currentStepVolume = Math.floor(currentStepVolume * multiplier);
         steps++;
-        if (steps > 50) break;
     }
     return steps;
 }
@@ -114,32 +114,34 @@ async function syncData() {
             if (realBalance > botState.peakBalance) {
                 botState.displayBalance += (realBalance - botState.peakBalance);
                 botState.peakBalance = realBalance;
-                if (botState.displayBalance > (botState.allTimeHigh || 0)) botState.allTimeHigh = botState.displayBalance;
             }
             botState.walletBalance = realBalance;
             botState.realizedProfit = botState.displayBalance - botState.initialBalance;
             botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
-            
-            // Logic: Balance * 10
-            botState.settings.baseOrder = Math.max(1, Math.floor(botState.walletBalance * 10));
-            botState.maxAffordableSteps = calculateMaxPossibleSteps(botState.walletBalance, config.leverage, botState.settings.baseOrder, botState.settings.volumeMult, botState.currentPrice);
         }
 
-        const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
-        const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
+        const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { margin_asset: 'USDT' });
+        
+        for (let sym of config.symbols) {
+            const coin = botState.coins[sym];
+            const pos = posRes?.data?.find(p => p.contract_code === sym && parseFloat(p.volume) > 0);
 
-        if (pos) {
-            botState.avgPrice = parseFloat(pos.cost_hold);
-            botState.roi = parseFloat(pos.profit_rate) * 100;
-            botState.openPosition = { volume: parseFloat(pos.volume), direction: pos.direction, costHold: botState.avgPrice };
-            botState.safetyOrdersFilled = calculateCurrentStep(botState.openPosition.volume, botState.settings.baseOrder, botState.settings.volumeMult);
+            // Dynamic base order per coin (Balance divided by coin count * 10)
+            coin.baseOrder = Math.max(1, Math.floor((botState.walletBalance / config.symbols.length) * 10));
+            coin.maxAffordableSteps = calculateMaxPossibleSteps(botState.walletBalance, config.leverage, coin.baseOrder, coin.settings.volumeMult, coin.currentPrice);
 
-            // Static 0.1% Distance logic
-            const currentDrop = ((botState.avgPrice - botState.currentPrice) / botState.avgPrice) * 100;
-            botState.distToNext = Math.max(0, botState.settings.priceDrop - currentDrop);
-        } else {
-            botState.openPosition = { volume: 0, direction: "", costHold: 0 };
-            botState.roi = 0; botState.avgPrice = 0; botState.distToNext = 0; botState.safetyOrdersFilled = 0;
+            if (pos) {
+                coin.avgPrice = parseFloat(pos.cost_hold);
+                coin.roi = parseFloat(pos.profit_rate) * 100;
+                coin.volume = parseFloat(pos.volume);
+                coin.safetyOrdersFilled = calculateCurrentStep(coin.volume, coin.baseOrder, coin.settings.volumeMult);
+
+                const diff = coin.direction === 'buy' ? (coin.avgPrice - coin.currentPrice) : (coin.currentPrice - coin.avgPrice);
+                const currentDrop = (diff / coin.avgPrice) * 100;
+                coin.distToNext = Math.max(0, coin.settings.priceDrop - currentDrop);
+            } else {
+                coin.volume = 0; coin.roi = 0; coin.avgPrice = 0; coin.distToNext = 0; coin.safetyOrdersFilled = 0;
+            }
         }
         
         const elapsed = (Date.now() - botState.startTime) / 3600000;
@@ -150,34 +152,40 @@ async function syncData() {
 
 // ==================== TRADING LOGIC ====================
 async function checkTrades() {
-    if (!botState.isRunning || botState.isTrading || botState.currentPrice <= 0) return;
+    if (!botState.isRunning || botState.isTrading) return;
     botState.isTrading = true;
-    try {
-        const hasPos = botState.openPosition.volume > 0;
-        if (hasPos && botState.roi >= botState.settings.takeProfit) {
-            await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: botState.openPosition.volume,
-                direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
-            });
-            botState.winningTrades++; botState.totalTrades++;
-        } else if (hasPos) {
-            const currentDrop = ((botState.avgPrice - botState.currentPrice) / botState.avgPrice) * 100;
-            if (currentDrop >= botState.settings.priceDrop) {
-                const nextVol = Math.max(1, Math.floor(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled + 1)));
+    
+    for (let sym of config.symbols) {
+        const coin = botState.coins[sym];
+        if (coin.currentPrice <= 0) continue;
+
+        try {
+            const hasPos = coin.volume > 0;
+            const oppDir = coin.direction === 'buy' ? 'sell' : 'buy';
+
+            if (hasPos && coin.roi >= coin.settings.takeProfit) {
                 await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol, volume: nextVol,
-                    direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+                    contract_code: sym, volume: coin.volume, direction: oppDir, offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
+                });
+                botState.totalTrades++;
+            } else if (hasPos) {
+                const diff = coin.direction === 'buy' ? (coin.avgPrice - coin.currentPrice) : (coin.currentPrice - coin.avgPrice);
+                const currentDrop = (diff / coin.avgPrice) * 100;
+                if (currentDrop >= coin.settings.priceDrop) {
+                    const nextVol = Math.max(1, Math.floor(coin.baseOrder * Math.pow(coin.settings.volumeMult, coin.safetyOrdersFilled + 1)));
+                    await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
+                        contract_code: sym, volume: nextVol, direction: coin.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+                    });
+                    botState.totalTrades++;
+                }
+            } else if (!hasPos && coin.baseOrder > 0) {
+                await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
+                    contract_code: sym, volume: coin.baseOrder, direction: coin.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
                 });
                 botState.totalTrades++;
             }
-        } else if (!hasPos && botState.settings.baseOrder > 0) {
-            await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: botState.settings.baseOrder,
-                direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
-            });
-            botState.totalTrades++;
-        }
-    } catch (e) {}
+        } catch (e) {}
+    }
     botState.isTrading = false;
 }
 
@@ -187,87 +195,31 @@ app.get('/', (req, res) => {
 <!DOCTYPE html>
 <html class="bg-white">
 <head>
-    <title>HTX Compounder PRO</title>
+    <title>HTX Multi-Compounder</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
-        body { font-family: 'Inter', sans-serif; background: #ffffff; }
-        .card { background: white; border: 1px solid #e5e7eb; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+        body { font-family: 'Inter', sans-serif; background: #f9fafb; }
+        .card { background: white; border: 1px solid #e5e7eb; box-shadow: 0 1px 3px rgba(0,0,0,0.05); transition: all 0.2s; }
         .gradient-text { background: linear-gradient(135deg, #059669 0%, #0284c7 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
         .stat-number { font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
     </style>
 </head>
-<body class="text-gray-900 p-6 md:p-10 bg-gray-50">
+<body class="text-gray-900 p-4 md:p-10">
     <div class="max-w-6xl mx-auto">
-        <div class="flex justify-between items-center mb-8">
+        <div class="flex justify-between items-center mb-8 bg-white p-6 rounded-2xl border border-gray-100">
             <div>
-                <h1 class="text-3xl font-bold tracking-tight">COMPOUND<span class="gradient-text">_BOT</span></h1>
-                <p class="text-[10px] text-gray-400 uppercase tracking-widest mt-1">${config.symbol} | ${config.leverage}X LEVERAGE</p>
-                <p class="text-[10px] text-emerald-600 font-bold mt-2">🎯 STATIC 0.1% DROP TRIGGER</p>
+                <h1 class="text-3xl font-bold tracking-tight">MULTI<span class="gradient-text">_COMPOUND</span></h1>
+                <p class="text-[10px] text-gray-400 uppercase tracking-widest mt-1">Multi-Coin DCA Portfolio | ${config.leverage}X</p>
             </div>
             <div class="text-right">
-                <p id="dgrText" class="text-3xl font-bold text-emerald-600">0.00%</p>
-                <p class="text-[10px] text-gray-400 uppercase tracking-wider">Daily Growth Rate</p>
+                <p id="totalProfit" class="text-3xl font-bold text-emerald-600">$0.00</p>
+                <p id="totalPct" class="text-[10px] text-gray-400 uppercase tracking-wider">Total Profit (0.00%)</p>
             </div>
         </div>
 
-        <div class="grid grid-cols-2 lg:grid-cols-4 gap-5 mb-8">
-            <div class="card p-6 rounded-2xl">
-                <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Net Profit</p>
-                <p id="p1" class="text-3xl font-bold text-emerald-600 stat-number">$0.00</p>
-                <p id="p2" class="text-[10px] font-bold text-gray-400 mt-1">0.00% TOTAL GAIN</p>
-            </div>
-            <div class="card p-6 rounded-2xl">
-                <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Open ROI</p>
-                <p id="roi" class="text-3xl font-bold stat-number">0.00%</p>
-                <p id="distText" class="text-[10px] font-bold text-orange-500 mt-1">NEXT STEP: 0.100%</p>
-            </div>
-            <div class="card p-6 rounded-2xl">
-                <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Safety Steps</p>
-                <p id="stepText" class="text-3xl font-bold text-blue-600 stat-number">0 <span class="text-lg text-gray-300">/ 0</span></p>
-                <p class="text-[10px] font-bold text-gray-400 mt-1">WALLET CAPACITY LIMIT</p>
-            </div>
-            <div class="card p-6 rounded-2xl">
-                <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Display Balance</p>
-                <p id="bal" class="text-3xl font-bold text-gray-900 stat-number">$0.00</p>
-                <p id="totalTrades" class="text-[10px] font-bold text-gray-400 mt-1">0 TOTAL TRADES</p>
-            </div>
-        </div>
-
-        <div class="card p-6 rounded-2xl mb-8 bg-gradient-to-r from-gray-50 to-white">
-            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 items-center">
-                <div>
-                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Base Order (Bal * 10)</p>
-                    <p id="baseOrderDisplay" class="text-xl font-bold text-gray-800">0</p>
-                </div>
-                <div>
-                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Live Price</p>
-                    <p id="curPrice" class="text-xl font-mono font-bold text-gray-800">0.00000000</p>
-                </div>
-                <div>
-                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Take Profit</p>
-                    <p class="text-xl font-bold text-emerald-600">1.5%</p>
-                </div>
-                <div>
-                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Step Multiplier</p>
-                    <p class="text-xl font-bold text-purple-600">1.2x</p>
-                </div>
-            </div>
-        </div>
-
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
-            <div class="bg-emerald-50 border border-emerald-100 p-8 rounded-2xl">
-                <p class="text-[10px] text-emerald-700 font-bold uppercase mb-2">Estimated 24h Profit</p>
-                <p id="estDay" class="text-3xl font-bold text-emerald-900">$0.00</p>
-            </div>
-            <div class="card p-8 rounded-2xl">
-                <p class="text-[10px] text-gray-400 font-bold uppercase mb-2">Estimated 7 Days</p>
-                <p id="estWeek" class="text-3xl font-bold text-gray-900">$0.00</p>
-            </div>
-            <div class="card p-8 rounded-2xl">
-                <p class="text-[10px] text-gray-400 font-bold uppercase mb-2">Estimated 30 Days</p>
-                <p id="estMonth" class="text-3xl font-bold text-gray-700">$0.00</p>
-            </div>
+        <div id="coinContainer" class="space-y-6">
+            <!-- Coins will be injected here -->
         </div>
     </div>
 
@@ -275,20 +227,41 @@ app.get('/', (req, res) => {
         async function update() {
             try {
                 const r = await fetch('/api/status'); const d = await r.json();
-                document.getElementById('p1').innerText = '$' + d.realizedProfit.toFixed(4);
-                document.getElementById('p2').innerText = d.profitPct.toFixed(4) + '% TOTAL GAIN';
-                document.getElementById('roi').innerText = d.roi.toFixed(2) + '%';
-                document.getElementById('roi').style.color = d.roi >= 0 ? '#059669' : '#dc2626';
-                document.getElementById('bal').innerText = '$' + d.displayBalance.toFixed(2);
-                document.getElementById('totalTrades').innerText = d.totalTrades + ' TOTAL TRADES';
-                document.getElementById('stepText').innerHTML = d.safetyOrdersFilled + ' <span class="text-lg text-gray-300">/ ' + d.maxAffordableSteps + '</span>';
-                document.getElementById('distText').innerText = 'NEXT STEP: ' + d.distToNext.toFixed(3) + '%';
-                document.getElementById('dgrText').innerText = d.estimates.dgr.toFixed(4) + '%';
-                document.getElementById('baseOrderDisplay').innerText = d.settings.baseOrder;
-                document.getElementById('curPrice').innerText = d.currentPrice.toFixed(8);
-                document.getElementById('estDay').innerText = '$' + d.estimates.day.toFixed(2);
-                document.getElementById('estWeek').innerText = '$' + d.estimates.week.toFixed(2);
-                document.getElementById('estMonth').innerText = '$' + d.estimates.month.toFixed(2);
+                document.getElementById('totalProfit').innerText = '$' + d.realizedProfit.toFixed(4);
+                document.getElementById('totalPct').innerText = 'Total Profit (' + d.profitPct.toFixed(2) + '%)';
+                
+                const container = document.getElementById('coinContainer');
+                let html = '';
+                
+                Object.values(d.coins).forEach(coin => {
+                    const isLong = coin.direction === 'buy';
+                    html += \`
+                    <div class="card p-6 rounded-2xl">
+                        <div class="grid grid-cols-2 lg:grid-cols-4 gap-6 items-center">
+                            <div>
+                                <h3 class="font-black text-xl">\${coin.symbol}</h3>
+                                <span class="px-2 py-0.5 rounded text-[10px] font-bold \${isLong ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'} uppercase">
+                                    \${isLong ? 'Long' : 'Short'} Odd/Even
+                                </span>
+                            </div>
+                            <div>
+                                <p class="text-[10px] text-gray-400 uppercase">ROI / Avg Price</p>
+                                <p class="text-xl font-bold \${coin.roi >= 0 ? 'text-emerald-600' : 'text-rose-600'}">\${coin.roi.toFixed(2)}%</p>
+                                <p class="text-[10px] text-gray-500 font-mono">\${coin.avgPrice.toFixed(8)}</p>
+                            </div>
+                            <div>
+                                <p class="text-[10px] text-gray-400 uppercase">Steps (Capacity: \${coin.maxAffordableSteps})</p>
+                                <p class="text-xl font-bold text-blue-600">\${coin.safetyOrdersFilled} <span class="text-gray-300">/ 50+</span></p>
+                                <p class="text-[10px] \${coin.distToNext <= 0.02 ? 'text-rose-500' : 'text-orange-500'} font-bold">NEXT: \${coin.distToNext.toFixed(3)}%</p>
+                            </div>
+                            <div class="text-right">
+                                <p class="text-[10px] text-gray-400 uppercase">Current Price</p>
+                                <p class="text-xl font-mono font-bold text-gray-800">\${coin.currentPrice.toFixed(8)}</p>
+                            </div>
+                        </div>
+                    </div>\`;
+                });
+                container.innerHTML = html;
             } catch (e) {}
         }
         setInterval(update, 1000);
@@ -302,12 +275,19 @@ app.get('/api/status', (req, res) => res.json(botState));
 
 function startWS() {
     const ws = new WebSocket(config.wsHost);
-    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' })));
+    ws.on('open', () => {
+        config.symbols.forEach(sym => {
+            ws.send(JSON.stringify({ sub: `market.${sym}.detail`, id: sym }));
+        });
+    });
     ws.on('message', (data) => {
         zlib.gunzip(data, (err, dec) => {
             if (err) return;
             const msg = JSON.parse(dec.toString());
-            if (msg.tick?.close) botState.currentPrice = parseFloat(msg.tick.close);
+            const sym = msg.ch?.split('.')[1];
+            if (sym && botState.coins[sym] && msg.tick?.close) {
+                botState.coins[sym].currentPrice = parseFloat(msg.tick.close);
+            }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
         });
     });
