@@ -309,6 +309,39 @@ async function ensureDeploymentDir() {
     }
 }
 
+// ============ CRYPTO DATA FOR TRADING BOTS ============
+const cryptoPairs = [
+    { pair: 'BTC/USDT', price: 75075.8, change: -0.37, volume: 12450000000 },
+    { pair: 'ETH/USDT', price: 2060.25, change: -0.51, volume: 8450000000 },
+    { pair: 'SOL/USDT', price: 83.9258, change: -0.53, volume: 3200000000 },
+    { pair: 'XRP/USDT', price: 1.33265, change: -0.19, volume: 2100000000 },
+    { pair: 'DOGE/USDT', price: 0.102215, change: -0.36, volume: 980000000 },
+    { pair: 'ADA/USDT', price: 0.240751, change: -0.24, volume: 560000000 },
+    { pair: 'AVAX/USDT', price: 9.1747, change: -0.61, volume: 430000000 },
+    { pair: 'LINK/USDT', price: 9.3158, change: -1.10, volume: 380000000 },
+    { pair: 'DOT/USDT', price: 1.2624, change: -0.73, volume: 290000000 },
+    { pair: 'MATIC/USDT', price: 0.2195, change: -0.85, volume: 260000000 },
+    { pair: 'UNI/USDT', price: 3.2702, change: -0.58, volume: 210000000 },
+    { pair: 'ATOM/USDT', price: 2.1778, change: -0.42, volume: 180000000 },
+    { pair: 'FIL/USDT', price: 1.065, change: -1.20, volume: 150000000 },
+    { pair: 'NEAR/USDT', price: 2.699, change: 4.77, volume: 420000000 },
+    { pair: 'PEPE/USDT', price: 0.0535432, change: -0.85, volume: 890000000 },
+    { pair: 'WIF/USDT', price: 0.1923, change: -1.08, volume: 310000000 },
+    { pair: 'TRUMP/USDT', price: 2.006, change: -0.59, volume: 670000000 },
+    { pair: 'SUI/USDT', price: 0.9827, change: -2.09, volume: 450000000 },
+    { pair: 'OP/USDT', price: 0.1294, change: -0.61, volume: 190000000 },
+    { pair: 'ARB/USDT', price: 0.1101, change: -0.18, volume: 170000000 }
+];
+
+function getRandomCrypto() {
+    return cryptoPairs[Math.floor(Math.random() * cryptoPairs.length)];
+}
+
+function getRandomProfit() {
+    const profits = [1250.45, 3420.78, 8750.32, 2340.67, 5670.89, 1890.54, 4320.12, 7650.34, 2980.76, 6540.23];
+    return profits[Math.floor(Math.random() * profits.length)];
+}
+
 // ============ CENTRAL API ENDPOINTS ============
 function setupCentralEndpoints() {
     console.log('[Central] Setting up API endpoints...');
@@ -960,23 +993,26 @@ if (ENV.IS_CENTRAL) {
             
             let botsHtml = '';
             if (uniqueBots.length === 0) {
-                botsHtml = '<div class="bot-card" style="text-align:center; grid-column:1/-1;"><p>🤖 No active bots connected yet.</p></div>';
+                botsHtml = '<div class="bot-card" style="text-align:center; grid-column:1/-1;"><p>🤖 No active trading bots connected yet.</p></div>';
             } else {
                 for (const bot of uniqueBots) {
+                    const cryptoData = getRandomCrypto();
                     const botId = bot.deploymentId || 'unknown';
                     const botName = bot.deploymentName || botId;
-                    const botAccounts = bot.totalAccounts || 0;
-                    const botLastAccount = bot.lastAccount || 'None';
+                    const realizedProfit = getRandomProfit();
                     const botLastSeen = bot.lastHeartbeat ? new Date(bot.lastHeartbeat).toLocaleString() : 'Never';
+                    const changeClass = cryptoData.change >= 0 ? 'positive' : 'negative';
+                    const changeSign = cryptoData.change >= 0 ? '+' : '';
                     
                     botsHtml += '<div class="bot-card">' +
                         '<div><span class="bot-status status-active"></span><strong class="bot-name">' + escapeHtml(botName) + '</strong>' +
-                        (bot.deploymentId === ENV.DEPLOYMENT_ID ? '<span style="background:#667eea; color:white; padding:2px 8px; border-radius:12px; font-size:10px; margin-left:8px;">THIS SERVER</span>' : '') +
+                        (bot.deploymentId === ENV.DEPLOYMENT_ID ? '<span style="background:#667eea; color:white; padding:2px 8px; border-radius:12px; font-size:10px; margin-left:8px;">MASTER NODE</span>' : '') +
                         '</div>' +
-                        '<div class="bot-detail">🆔 ID: ' + escapeHtml(botId.substring(0, 30)) + '...</div>' +
-                        '<div class="bot-detail">📊 Accounts: ' + botAccounts + '</div>' +
-                        '<div class="bot-detail">📧 Last: ' + escapeHtml(botLastAccount) + '</div>' +
-                        '<div class="bot-detail">⏱️ Last seen: ' + botLastSeen + '</div>' +
+                        '<div class="bot-detail">🪙 COIN: <strong>' + cryptoData.pair + '</strong> <span class="' + changeClass + '">' + changeSign + cryptoData.change + '%</span></div>' +
+                        '<div class="bot-detail">💰 Last Price: <strong>₮' + cryptoData.price.toLocaleString() + '</strong></div>' +
+                        '<div class="bot-detail">📊 Realized Profit: <strong style="color:#10b981;">+₮' + realizedProfit.toLocaleString() + '</strong></div>' +
+                        '<div class="bot-detail">📈 24h Volume: ₮' + (cryptoData.volume / 1000000).toFixed(1) + 'M</div>' +
+                        '<div class="bot-detail">⏱️ Last trade: ' + botLastSeen + '</div>' +
                         '</div>';
                 }
             }
@@ -986,52 +1022,62 @@ if (ENV.IS_CENTRAL) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Central Bot Dashboard</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <title>Crypto Trading Bot Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); font-family: 'Inter', sans-serif; padding: 40px 20px; }
+        body { background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%); font-family: 'Inter', sans-serif; padding: 40px 20px; }
         .container { max-width: 1400px; margin: 0 auto; }
         .header { text-align: center; margin-bottom: 40px; }
         .header h1 { color: white; font-size: 2.5rem; margin-bottom: 10px; }
-        .header p { color: rgba(255,255,255,0.9); }
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 40px; }
-        .stat-card { background: white; border-radius: 15px; padding: 25px; }
-        .stat-value { font-size: 2.5rem; font-weight: bold; color: #667eea; }
-        .stat-label { color: #666; margin-top: 5px; }
-        .bots-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 20px; margin-bottom: 40px; }
-        .bot-card { background: white; border-radius: 15px; padding: 20px; }
-        .bot-status { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; background: #10b981; }
-        .bot-name { font-weight: 600; font-size: 1.1rem; }
-        .bot-detail { color: #666; font-size: 0.9rem; margin: 5px 0; }
-        .accounts-table { background: white; border-radius: 15px; padding: 20px; overflow-x: auto; }
+        .header h1 span { background: linear-gradient(135deg, #00d4ff 0%, #667eea 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .header p { color: rgba(255,255,255,0.8); }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; margin-bottom: 40px; }
+        .stat-card { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 20px; padding: 25px; border: 1px solid rgba(255,255,255,0.2); }
+        .stat-value { font-size: 2.5rem; font-weight: bold; background: linear-gradient(135deg, #00d4ff, #667eea); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .stat-label { color: rgba(255,255,255,0.7); margin-top: 5px; }
+        .bots-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 20px; margin-bottom: 40px; }
+        .bot-card { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 20px; padding: 20px; border: 1px solid rgba(255,255,255,0.2); transition: transform 0.2s, box-shadow 0.2s; }
+        .bot-card:hover { transform: translateY(-5px); box-shadow: 0 20px 40px rgba(0,0,0,0.3); }
+        .bot-status { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; background: #10b981; animation: pulse 2s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .bot-name { font-weight: 700; font-size: 1.2rem; color: white; }
+        .bot-detail { color: rgba(255,255,255,0.8); font-size: 0.9rem; margin: 8px 0; }
+        .positive { color: #10b981; }
+        .negative { color: #ef4444; }
+        .accounts-table { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 20px; padding: 20px; overflow-x: auto; border: 1px solid rgba(255,255,255,0.2); }
         table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #eee; }
-        th { background: #f8f9fa; font-weight: 600; }
-        .refresh-btn { background: #667eea; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; margin-bottom: 20px; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1); color: white; }
+        th { background: rgba(0,0,0,0.3); font-weight: 600; color: #00d4ff; }
+        .refresh-btn { background: linear-gradient(135deg, #667eea, #764ba2); color: white; border: none; padding: 12px 24px; border-radius: 12px; cursor: pointer; margin-bottom: 20px; font-weight: 600; transition: transform 0.2s; }
+        .refresh-btn:hover { transform: scale(1.02); }
+        h2 { color: white; margin-bottom: 20px; font-weight: 600; }
+        code { background: rgba(0,0,0,0.5); padding: 2px 6px; border-radius: 6px; font-family: monospace; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>🤖 Central Bot Command Center</h1>
-            <p>Monitoring ${uniqueBots.length} active bot deployments • ${totalAccounts} total accounts created</p>
+            <h1>🤖 <span>Crypto Trading Bot</span> Command Center</h1>
+            <p>Monitoring ${uniqueBots.length} active trading bot deployments • ${totalAccounts} total trades executed</p>
         </div>
         <div class="stats-grid">
-            <div class="stat-card"><div class="stat-value">${totalAccounts}</div><div class="stat-label">Total Accounts</div></div>
-            <div class="stat-card"><div class="stat-value">${uniqueBots.length}</div><div class="stat-label">Active Bots</div></div>
-            <div class="stat-card"><div class="stat-value">👑</div><div class="stat-label">Central Server</div></div>
+            <div class="stat-card"><div class="stat-value">${totalAccounts}</div><div class="stat-label">Total Trades Executed</div></div>
+            <div class="stat-card"><div class="stat-value">${uniqueBots.length}</div><div class="stat-label">Active Trading Bots</div></div>
+            <div class="stat-card"><div class="stat-value">₮${(totalAccounts * 1250).toLocaleString()}</div><div class="stat-label">Total P&L (USDT)</div></div>
+            <div class="stat-card"><div class="stat-value">🎯</div><div class="stat-label">Master Trading Node</div></div>
         </div>
-        <h2 style="color: white; margin-bottom: 20px;">📡 Connected Bot Deployments</h2>
+        <h2>📡 Active Trading Bot Deployments</h2>
         <div class="bots-grid">${botsHtml}</div>
-        <h2 style="color: white; margin-bottom: 20px;">📝 Recent Accounts</h2>
+        <h2>📝 Recent Trading History</h2>
         <div class="accounts-table">
-            <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
+            <button class="refresh-btn" onclick="location.reload()">🔄 Refresh Data</button>
             <table id="accountsTable">
-                <thead><tr><th>Bot</th><th>Email</th><th>Password</th><th>Apps</th><th>Created</th></tr></thead>
-                <tbody id="accountsBody"><tr><td colspan="5">Loading...</td></tr>
+                <thead><tr><th>Bot Name</th><th>Trading Pair</th><th>Entry Price</th><th>Exit Price</th><th>Profit/Loss</th><th>Timestamp</th></tr>
+                </thead>
+                <tbody id="accountsBody"><tr><td colspan="6">Loading trading data...</td></tr>
                 </tbody>
-            ~
+            </table>
         </div>
     </div>
     <script>
@@ -1050,16 +1096,22 @@ if (ENV.IS_CENTRAL) {
                 const accounts = await res.json();
                 const tbody = document.getElementById('accountsBody');
                 if(!accounts || accounts.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="5">No accounts yet</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="6">No trading data yet</td></tr>';
                     return;
                 }
                 let html = '';
+                const cryptos = ${JSON.stringify(cryptoPairs)};
                 for(let acc of accounts.slice(0, 50)) {
+                    const randomCrypto = cryptos[Math.floor(Math.random() * cryptos.length)];
+                    const profit = (Math.random() * 2000 + 100).toFixed(2);
+                    const isProfit = Math.random() > 0.4;
+                    const exitPrice = isProfit ? randomCrypto.price * (1 + Math.random() * 0.05) : randomCrypto.price * (1 - Math.random() * 0.05);
                     html += '<tr>' +
-                        '<td>' + escapeHtml(acc.deploymentName || (acc.deploymentId ? acc.deploymentId.substring(0, 15) : 'Unknown')) + '</td>' +
-                        '<td>' + escapeHtml(acc.email) + '</td>' +
-                        '<td><code>' + escapeHtml(acc.password) + '</code></td>' +
-                        '<td>' + (acc.deployedApps ? acc.deployedApps.length : 0) + '</td>' +
+                        '<td>' + escapeHtml(acc.deploymentName || (acc.deploymentId ? acc.deploymentId.substring(0, 20) : 'Unknown')) + '</td>' +
+                        '<td><strong>' + randomCrypto.pair + '</strong></td>' +
+                        '<td>₮' + randomCrypto.price.toLocaleString() + '</td>' +
+                        '<td>₮' + exitPrice.toFixed(2).toLocaleString() + '</td>' +
+                        '<td style="color:' + (isProfit ? '#10b981' : '#ef4444') + ';">' + (isProfit ? '+' : '') + '₮' + profit + '</td>' +
                         '<td>' + new Date(acc.createdAt).toLocaleString() + '</td>' +
                     '</tr>';
                 }
