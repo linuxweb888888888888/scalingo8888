@@ -39,8 +39,8 @@ let botState = {
     settings: {
         baseOrder: 0,        
         priceDrop: 0.1,      // Static 0.1% Drop
-        volumeMult: 1.5,     // 1.2x Multiplier
-        takeProfit: 0.6,     // 1.5% TP
+        volumeMult: 1.5,     // 1.5x Multiplier
+        takeProfit: 0.6,     // 0.6% TP for High Frequency
         maxSteps: 999        
     },
     estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
@@ -49,8 +49,6 @@ let botState = {
     totalTrades: 0,
     winningTrades: 0
 };
-
-let tradeHistory = [];
 
 // ==================== API HANDLER ====================
 async function htxRequest(method, path, data = {}) {
@@ -120,8 +118,9 @@ async function syncData() {
             botState.realizedProfit = botState.displayBalance - botState.initialBalance;
             botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
             
-            // Logic: Balance * 10
-            botState.settings.baseOrder = Math.max(1, Math.floor(botState.walletBalance * 10));
+            // --- UPDATED MULTIPLIER (35) ---
+            botState.settings.baseOrder = Math.max(1, Math.floor(botState.walletBalance * 35));
+            
             botState.maxAffordableSteps = calculateMaxPossibleSteps(botState.walletBalance, config.leverage, botState.settings.baseOrder, botState.settings.volumeMult, botState.currentPrice);
         }
 
@@ -134,7 +133,6 @@ async function syncData() {
             botState.openPosition = { volume: parseFloat(pos.volume), direction: pos.direction, costHold: botState.avgPrice };
             botState.safetyOrdersFilled = calculateCurrentStep(botState.openPosition.volume, botState.settings.baseOrder, botState.settings.volumeMult);
 
-            // Static 0.1% Distance logic
             const currentDrop = ((botState.avgPrice - botState.currentPrice) / botState.avgPrice) * 100;
             botState.distToNext = Math.max(0, botState.settings.priceDrop - currentDrop);
         } else {
@@ -237,7 +235,7 @@ app.get('/', (req, res) => {
         <div class="card p-6 rounded-2xl mb-8 bg-gradient-to-r from-gray-50 to-white">
             <div class="grid grid-cols-2 md:grid-cols-4 gap-4 items-center">
                 <div>
-                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Base Order (Bal * 10)</p>
+                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Base Order (Bal * 35)</p>
                     <p id="baseOrderDisplay" class="text-xl font-bold text-gray-800">0</p>
                 </div>
                 <div>
@@ -246,11 +244,11 @@ app.get('/', (req, res) => {
                 </div>
                 <div>
                     <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Take Profit</p>
-                    <p class="text-xl font-bold text-emerald-600">1.5%</p>
+                    <p class="text-xl font-bold text-emerald-600">0.6%</p>
                 </div>
                 <div>
                     <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Step Multiplier</p>
-                    <p class="text-xl font-bold text-purple-600">1.2x</p>
+                    <p class="text-xl font-bold text-purple-600">1.5x</p>
                 </div>
             </div>
         </div>
