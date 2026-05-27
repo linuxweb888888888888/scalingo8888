@@ -36,13 +36,13 @@ let botState = {
     safetyOrdersFilled: 0,
     maxAffordableSteps: 0,
     distToNext: 0,
-    profitShibLeveraged: 0, // NEW: Net Profit converted to SHIB units at 10x
+    profitShibLeveraged: 0, // NEW: Profit units at 10x
     settings: {
-        baseOrder: 0,        
+        baseOrder: 0,
         priceDrop: 0.1,      // Static 0.1% Drop
         volumeMult: 1.2,     // 1.2x Multiplier
         takeProfit: 1.5,     // 1.5% TP
-        maxSteps: 999        
+        maxSteps: 999
     },
     estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
     openPosition: { volume: 0, direction: "", costHold: 0 },
@@ -75,13 +75,13 @@ function calculateMaxPossibleSteps(balance, leverage, baseOrder, multiplier, pri
     let buyingPower = balance * leverage;
     let steps = 0;
     while (true) {
-        // HTX SHIB-USDT: Notional = contracts * price * 1000
+        // HTX SHIB-USDT Contract size is 1000 units
         let stepNotional = currentStepVolume * price * 1000;
         if (((totalContracts + currentStepVolume) * price * 1000) > buyingPower) break;
         totalContracts += currentStepVolume;
         currentStepVolume = Math.floor(currentStepVolume * multiplier);
         steps++;
-        if (steps > 500) break; // Dynamic limit
+        if (steps > 500) break;
     }
     return steps;
 }
@@ -121,16 +121,16 @@ async function syncData() {
             botState.walletBalance = realBalance;
             botState.realizedProfit = botState.displayBalance - botState.initialBalance;
             botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
-            
-            // --- UPDATED COMPOUNDING CHANGES ---
+
+            // COMPOUNDING LOGIC
             if (botState.currentPrice > 0) {
-                // 1. Calculate Profit in SHIB units at 10x leverage
+                // Calculate Profit SHIB at 10x
                 botState.profitShibLeveraged = (botState.realizedProfit * 10) / botState.currentPrice;
                 
-                // 2. Convert to Contracts (1 contract = 1000 SHIB)
+                // Convert profit to contracts (1 contract = 1000 SHIB)
                 const profitContracts = Math.floor(botState.profitShibLeveraged / 1000);
                 
-                // 3. Add to Base Start (Original logic: Balance * 10)
+                // Final Base Order: (Balance * 10) + Profit Contracts
                 const originalBase = Math.floor(botState.walletBalance * 10);
                 botState.settings.baseOrder = Math.max(1, originalBase + profitContracts);
             }
@@ -153,7 +153,7 @@ async function syncData() {
             botState.openPosition = { volume: 0, direction: "", costHold: 0 };
             botState.roi = 0; botState.avgPrice = 0; botState.distToNext = 0; botState.safetyOrdersFilled = 0;
         }
-        
+
         const elapsed = (Date.now() - botState.startTime) / 3600000;
         const hr = botState.realizedProfit / Math.max(elapsed, 0.01);
         botState.estimates = { hr, day: hr * 24, week: hr * 168, month: hr * 720, dgr: (hr * 24 / botState.initialBalance) * 100 };
@@ -215,7 +215,7 @@ app.get('/', (req, res) => {
             <div>
                 <h1 class="text-3xl font-bold tracking-tight">COMPOUND<span class="gradient-text">_BOT</span></h1>
                 <p class="text-[10px] text-gray-400 uppercase tracking-widest mt-1">${config.symbol} | ${config.leverage}X LEVERAGE</p>
-                <p class="text-[10px] text-emerald-600 font-bold mt-2">🎯 PROFIT-TO-CONTRACT COMPOUNDING</p>
+                <p class="text-[10px] text-emerald-600 font-bold mt-2">🎯 PROFIT COMPOUNDING ACTIVE</p>
             </div>
             <div class="text-right">
                 <p id="dgrText" class="text-3xl font-bold text-emerald-600">0.00%</p>
@@ -223,32 +223,68 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <div class="grid grid-cols-2 lg:grid-cols-4 gap-5 mb-8">
+        <div class="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-8">
             <div class="card p-6 rounded-2xl">
                 <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Net Profit</p>
-                <p id="p1" class="text-3xl font-bold text-emerald-600 stat-number">$0.00</p>
+                <p id="p1" class="text-2xl font-bold text-emerald-600 stat-number">$0.00</p>
                 <p id="p2" class="text-[10px] font-bold text-gray-400 mt-1">0.00% TOTAL GAIN</p>
             </div>
             <div class="card p-6 rounded-2xl">
                 <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Profit SHIB (10x)</p>
-                <p id="pShib" class="text-3xl font-bold text-emerald-900 stat-number">0</p>
-                <p class="text-[10px] font-bold text-gray-400 mt-1 uppercase">Leveraged Units</p>
+                <p id="pShib" class="text-2xl font-bold text-emerald-900 stat-number">0</p>
+                <p class="text-[10px] font-bold text-gray-400 mt-1 uppercase">Units</p>
+            </div>
+            <div class="card p-6 rounded-2xl">
+                <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Open ROI</p>
+                <p id="roi" class="text-2xl font-bold stat-number">0.00%</p>
+                <p id="distText" class="text-[10px] font-bold text-orange-500 mt-1">NEXT STEP: 0.100%</p>
             </div>
             <div class="card p-6 rounded-2xl">
                 <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Safety Steps</p>
-                <p id="stepText" class="text-3xl font-bold text-blue-600 stat-number">0 <span class="text-lg text-gray-300">/ 0</span></p>
-                <p class="text-[10px] font-bold text-gray-400 mt-1 uppercase">Dynamic Capacity</p>
+                <p id="stepText" class="text-2xl font-bold text-blue-600 stat-number">0 <span class="text-lg text-gray-300">/ 0</span></p>
+                <p class="text-[10px] font-bold text-gray-400 mt-1 uppercase">Capacity</p>
             </div>
             <div class="card p-6 rounded-2xl">
-                <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Base Order</p>
-                <p id="baseOrderDisplay" class="text-3xl font-bold text-gray-900 stat-number">0</p>
-                <p class="text-[10px] font-bold text-gray-400 mt-1 uppercase">Compounded Start</p>
+                <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Display Balance</p>
+                <p id="bal" class="text-2xl font-bold text-gray-900 stat-number">$0.00</p>
+                <p id="totalTrades" class="text-[10px] font-bold text-gray-400 mt-1">0 TOTAL TRADES</p>
             </div>
         </div>
 
-        <div class="card p-6 rounded-2xl mb-8 bg-gradient-to-r from-gray-50 to-white text-center">
-             <p class="text-[10px] text-gray-400 uppercase tracking-widest mb-1">Live Market Price</p>
-             <p id="curPrice" class="text-xl font-mono font-bold text-gray-800">0.00000000</p>
+        <div class="card p-6 rounded-2xl mb-8 bg-gradient-to-r from-gray-50 to-white">
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 items-center">
+                <div>
+                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Base Order (Compounded)</p>
+                    <p id="baseOrderDisplay" class="text-xl font-bold text-gray-800">0</p>
+                </div>
+                <div>
+                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Live Price</p>
+                    <p id="curPrice" class="text-xl font-mono font-bold text-gray-800">0.00000000</p>
+                </div>
+                <div>
+                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Take Profit</p>
+                    <p class="text-xl font-bold text-emerald-600">1.5%</p>
+                </div>
+                <div>
+                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Step Multiplier</p>
+                    <p class="text-xl font-bold text-purple-600">1.2x</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
+            <div class="bg-emerald-50 border border-emerald-100 p-8 rounded-2xl">
+                <p class="text-[10px] text-emerald-700 font-bold uppercase mb-2">Estimated 24h Profit</p>
+                <p id="estDay" class="text-3xl font-bold text-emerald-900">$0.00</p>
+            </div>
+            <div class="card p-8 rounded-2xl">
+                <p class="text-[10px] text-gray-400 font-bold uppercase mb-2">Estimated 7 Days</p>
+                <p id="estWeek" class="text-3xl font-bold text-gray-900">$0.00</p>
+            </div>
+            <div class="card p-8 rounded-2xl">
+                <p class="text-[10px] text-gray-400 font-bold uppercase mb-2">Estimated 30 Days</p>
+                <p id="estMonth" class="text-3xl font-bold text-gray-700">$0.00</p>
+            </div>
         </div>
     </div>
 
@@ -259,14 +295,23 @@ app.get('/', (req, res) => {
                 document.getElementById('p1').innerText = '$' + d.realizedProfit.toFixed(4);
                 document.getElementById('p2').innerText = d.profitPct.toFixed(4) + '% TOTAL GAIN';
                 document.getElementById('pShib').innerText = Math.floor(d.profitShibLeveraged).toLocaleString();
+                document.getElementById('roi').innerText = d.roi.toFixed(2) + '%';
+                document.getElementById('roi').style.color = d.roi >= 0 ? '#059669' : '#dc2626';
+                document.getElementById('bal').innerText = '$' + d.displayBalance.toFixed(2);
+                document.getElementById('totalTrades').innerText = d.totalTrades + ' TOTAL TRADES';
                 document.getElementById('stepText').innerHTML = d.safetyOrdersFilled + ' <span class="text-lg text-gray-300">/ ' + d.maxAffordableSteps + '</span>';
+                document.getElementById('distText').innerText = 'NEXT STEP: ' + d.distToNext.toFixed(3) + '%';
+                document.getElementById('dgrText').innerText = d.estimates.dgr.toFixed(4) + '%';
                 document.getElementById('baseOrderDisplay').innerText = d.settings.baseOrder;
                 document.getElementById('curPrice').innerText = d.currentPrice.toFixed(8);
-                document.getElementById('dgrText').innerText = d.estimates.dgr.toFixed(4) + '%';
+                document.getElementById('estDay').innerText = '$' + d.estimates.day.toFixed(2);
+                document.getElementById('estWeek').innerText = '$' + d.estimates.week.toFixed(2);
+                document.getElementById('estMonth').innerText = '$' + d.estimates.month.toFixed(2);
             } catch (e) {}
         }
         setInterval(update, 1000);
     </script>
+
 </body>
 </html>
     `);
