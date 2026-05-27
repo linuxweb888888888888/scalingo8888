@@ -36,13 +36,13 @@ let botState = {
     safetyOrdersFilled: 0,
     maxAffordableSteps: 0,
     distToNext: 0,
-    profitShibLeveraged: 0, // NEW: Profit units at 10x
+    profitShibLeveraged: 0, // NEW: Net Profit units at 10x
     settings: {
-        baseOrder: 0,
+        baseOrder: 0,        
         priceDrop: 0.1,      // Static 0.1% Drop
         volumeMult: 1.2,     // 1.2x Multiplier
         takeProfit: 1.5,     // 1.5% TP
-        maxSteps: 999
+        maxSteps: 999        
     },
     estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
     openPosition: { volume: 0, direction: "", costHold: 0 },
@@ -75,13 +75,13 @@ function calculateMaxPossibleSteps(balance, leverage, baseOrder, multiplier, pri
     let buyingPower = balance * leverage;
     let steps = 0;
     while (true) {
-        // HTX SHIB-USDT Contract size is 1000 units
+        // HTX SHIB Contract Size = 1,000 units
         let stepNotional = currentStepVolume * price * 1000;
         if (((totalContracts + currentStepVolume) * price * 1000) > buyingPower) break;
         totalContracts += currentStepVolume;
         currentStepVolume = Math.floor(currentStepVolume * multiplier);
         steps++;
-        if (steps > 500) break;
+        if (steps > 500) break; // High dynamic break
     }
     return steps;
 }
@@ -121,20 +121,21 @@ async function syncData() {
             botState.walletBalance = realBalance;
             botState.realizedProfit = botState.displayBalance - botState.initialBalance;
             botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
-
-            // COMPOUNDING LOGIC
+            
+            // --- COMPOUNDING CHANGES ---
             if (botState.currentPrice > 0) {
-                // Calculate Profit SHIB at 10x
+                // 1. Calculate Profit units at 10x
                 botState.profitShibLeveraged = (botState.realizedProfit * 10) / botState.currentPrice;
                 
-                // Convert profit to contracts (1 contract = 1000 SHIB)
+                // 2. Convert to Contracts (1 contract = 1,000 SHIB)
                 const profitContracts = Math.floor(botState.profitShibLeveraged / 1000);
                 
-                // Final Base Order: (Balance * 10) + Profit Contracts
+                // 3. Final Base Order = (Wallet Balance * 10) + Profit Contracts
                 const originalBase = Math.floor(botState.walletBalance * 10);
                 botState.settings.baseOrder = Math.max(1, originalBase + profitContracts);
             }
 
+            // DYNAMIC Wallet Limit Calculation
             botState.maxAffordableSteps = calculateMaxPossibleSteps(botState.walletBalance, config.leverage, botState.settings.baseOrder, botState.settings.volumeMult, botState.currentPrice);
         }
 
@@ -153,7 +154,7 @@ async function syncData() {
             botState.openPosition = { volume: 0, direction: "", costHold: 0 };
             botState.roi = 0; botState.avgPrice = 0; botState.distToNext = 0; botState.safetyOrdersFilled = 0;
         }
-
+        
         const elapsed = (Date.now() - botState.startTime) / 3600000;
         const hr = botState.realizedProfit / Math.max(elapsed, 0.01);
         botState.estimates = { hr, day: hr * 24, week: hr * 168, month: hr * 720, dgr: (hr * 24 / botState.initialBalance) * 100 };
@@ -215,7 +216,7 @@ app.get('/', (req, res) => {
             <div>
                 <h1 class="text-3xl font-bold tracking-tight">COMPOUND<span class="gradient-text">_BOT</span></h1>
                 <p class="text-[10px] text-gray-400 uppercase tracking-widest mt-1">${config.symbol} | ${config.leverage}X LEVERAGE</p>
-                <p class="text-[10px] text-emerald-600 font-bold mt-2">🎯 PROFIT COMPOUNDING ACTIVE</p>
+                <p class="text-[10px] text-emerald-600 font-bold mt-2">🎯 PROFIT-TO-CONTRACT COMPOUNDING</p>
             </div>
             <div class="text-right">
                 <p id="dgrText" class="text-3xl font-bold text-emerald-600">0.00%</p>
@@ -311,7 +312,6 @@ app.get('/', (req, res) => {
         }
         setInterval(update, 1000);
     </script>
-
 </body>
 </html>
     `);
