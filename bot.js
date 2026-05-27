@@ -36,12 +36,12 @@ let botState = {
     safetyOrdersFilled: 0,
     maxAffordableSteps: 0,
     distToNext: 0,
-    profitShibLeveraged: 0, // Net Profit units at 10x
+    profitShibLeveraged: 0, 
     settings: {
-        baseOrder: 0,        
-        priceDrop: 0.1,      // Static 0.1% Drop
-        volumeMult: 1.2,     // 1.2x Multiplier
-        takeProfit: 1.5,     // 1.5% TP
+        baseOrder: 1,        // Starts at 1
+        priceDrop: 0.1,      
+        volumeMult: 1.2,     
+        takeProfit: 1.5,     
         maxSteps: 999        
     },
     estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
@@ -70,24 +70,17 @@ async function htxRequest(method, path, data = {}) {
 // ==================== CALCULATIONS ====================
 function calculateMaxPossibleSteps(balance, leverage, baseOrder, multiplier, price) {
     if (price <= 0 || baseOrder <= 0 || balance <= 0) return 0;
-    
     let totalContractsAccumulated = 0;
     let nextOrderSize = baseOrder;
     let buyingPower = balance * leverage;
     let steps = 0;
-
     while (true) {
-        // HTX SHIB-USDT Contract size is 1,000 units
-        // Calculate the value of the position if we add the next step
         let totalValueWithNextStep = (totalContractsAccumulated + nextOrderSize) * price * 1000;
-        
         if (totalValueWithNextStep > buyingPower) break;
-
         totalContractsAccumulated += nextOrderSize;
         nextOrderSize = Math.floor(nextOrderSize * multiplier);
         steps++;
-
-        if (steps > 500) break; // Infinite loop safety
+        if (steps > 500) break; 
     }
     return steps;
 }
@@ -128,7 +121,7 @@ async function syncData() {
             botState.realizedProfit = botState.displayBalance - botState.initialBalance;
             botState.profitPct = (botState.realizedProfit / botState.initialBalance) * 100;
             
-            // --- COMPOUNDING + DYNAMIC CAPACITY LOGIC ---
+            // --- UPDATED COMPOUNDING LOGIC ---
             if (botState.currentPrice > 0) {
                 // 1. Profit SHIB at 10x
                 botState.profitShibLeveraged = (botState.realizedProfit * 10) / botState.currentPrice;
@@ -136,11 +129,10 @@ async function syncData() {
                 // 2. Convert profit to contracts (1 contract = 1,000 SHIB)
                 const profitContracts = Math.floor(botState.profitShibLeveraged / 1000);
                 
-                // 3. Compounded Base Order = (Balance * 10) + Profit Contracts
-                const originalBase = Math.floor(botState.walletBalance * 10);
-                botState.settings.baseOrder = Math.max(1, originalBase + profitContracts);
+                // 3. BASE ORDER STARTS AT 1 + Profit Contracts
+                botState.settings.baseOrder = Math.max(1, 1 + profitContracts);
 
-                // 4. Calculate Dynamic Capacity based on the NEW Compounded Base Order
+                // 4. Calculate Capacity
                 botState.maxAffordableSteps = calculateMaxPossibleSteps(
                     botState.walletBalance, 
                     config.leverage, 
@@ -159,7 +151,6 @@ async function syncData() {
             botState.roi = parseFloat(pos.profit_rate) * 100;
             botState.openPosition = { volume: parseFloat(pos.volume), direction: pos.direction, costHold: botState.avgPrice };
             botState.safetyOrdersFilled = calculateCurrentStep(botState.openPosition.volume, botState.settings.baseOrder, botState.settings.volumeMult);
-
             const currentDrop = ((botState.avgPrice - botState.currentPrice) / botState.avgPrice) * 100;
             botState.distToNext = Math.max(0, botState.settings.priceDrop - currentDrop);
         } else {
@@ -228,7 +219,7 @@ app.get('/', (req, res) => {
             <div>
                 <h1 class="text-3xl font-bold tracking-tight">COMPOUND<span class="gradient-text">_BOT</span></h1>
                 <p class="text-[10px] text-gray-400 uppercase tracking-widest mt-1">${config.symbol} | ${config.leverage}X LEVERAGE</p>
-                <p class="text-[10px] text-emerald-600 font-bold mt-2">🎯 DYNAMIC COMPOUNDING ACTIVE</p>
+                <p class="text-[10px] text-emerald-600 font-bold mt-2">🎯 1 CONTRACT START + COMPOUNDING</p>
             </div>
             <div class="text-right">
                 <p id="dgrText" class="text-3xl font-bold text-emerald-600">0.00%</p>
