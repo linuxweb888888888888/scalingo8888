@@ -3,7 +3,7 @@ const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
 const WebSocket = require('ws');
-const zlib = require('zlib');
+const zlib = require('zlib'); // This is a built-in Node.js module, no need to install
 
 const app = express();
 app.use(express.json());
@@ -37,7 +37,9 @@ const config = {
     port: process.env.PORT || 3000,
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
-    accounts: apiAccounts
+    accounts: apiAccounts,
+    takeProfitPercent: parseFloat(process.env.TAKE_PROFIT_PERCENT) || 2.0,  // 2% take profit
+    stopLossPercent: parseFloat(process.env.STOP_LOSS_PERCENT) || 2.0      // 2% stop loss
 };
 
 // ==================== ACCOUNT STATES ====================
@@ -48,28 +50,30 @@ let accountStates = {};
 config.accounts.forEach((account, idx) => {
     const direction = idx === 0 ? 'buy' : 'sell'; // First account buys, second sells
     accountStates[account.accountId] = {
-    isRunning: true,
-    isTrading: false,
-    startTime: Date.now(),
-    currentPrice: 0,
-    avgPrice: 0,
-    roi: 0,
-    realizedProfit: 0,
-    profitPct: 0,
-    walletBalance: 0,
-    displayBalance: 0,
-    peakBalance: 0,
-    initialBalance: 0,
-    direction: direction, // 'buy' or 'sell'
-    position: { volume: 0, costHold: 0 },
-    totalTrades: 0,
-    winningTrades: 0,
-    allTimeHigh: 0,
-    settings: {
-        baseOrder: 1,
-        takeProfit: parseFloat(process.env.TAKE_PROFIT) || 1.5, // 1.5% TP
-        orderSize: parseFloat(process.env.ORDER_SIZE) || 1 // Fixed order size
-    }
+        isRunning: true,
+        isTrading: false,
+        startTime: Date.now(),
+        currentPrice: 0,
+        avgPrice: 0,
+        roi: 0,
+        realizedProfit: 0,
+        profitPct: 0,
+        walletBalance: 0,
+        displayBalance: 0,
+        peakBalance: 0,
+        initialBalance: 0,
+        direction: direction, // 'buy' or 'sell'
+        position: { volume: 0, costHold: 0 },
+        totalTrades: 0,
+        winningTrades: 0,
+        losingTrades: 0,
+        allTimeHigh: 0,
+        settings: {
+            baseOrder: 1,
+            takeProfit: config.takeProfitPercent,
+            stopLoss: config.stopLossPercent,
+            orderSize: parseFloat(process.env.ORDER_SIZE) || 1 // Fixed order size
+        }
     };
 });
 
@@ -84,12 +88,14 @@ let botState = {
     initialBalance: 0,
     settings: {
         baseOrder: 1,
-        takeProfit: 1.5
+        takeProfit: config.takeProfitPercent,
+        stopLoss: config.stopLossPercent
     },
     estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
     allTimeHigh: 0,
     totalTrades: 0,
     winningTrades: 0,
+    losingTrades: 0,
     profitShibLeveraged: 0,
     openPosition: { volume: 0, direction: "", costHold: 0 },
     roi: 0,
@@ -188,9 +194,11 @@ function updateCombinedState() {
     let totalInitialBalance = 0;
     let totalTrades = 0;
     let totalWinningTrades = 0;
+    let totalLosingTrades = 0;
     let totalVolume = 0;
     let activeDirection = "";
     let activeCostHold = 0;
+    let activeRoi = 0;
     
     Object.values(accountStates).forEach(state => {
         totalRealizedProfit += state.realizedProfit;
@@ -198,11 +206,13 @@ function updateCombinedState() {
         totalInitialBalance += state.initialBalance;
         totalTrades += state.totalTrades;
         totalWinningTrades += state.winningTrades;
+        totalLosingTrades += state.losingTrades;
         
         if (state.position.volume > 0) {
             totalVolume += state.position.volume;
             activeDirection = state.direction;
             activeCostHold = state.avgPrice;
+            activeRoi = state.roi;
         }
     });
     
@@ -211,6 +221,7 @@ function updateCombinedState() {
     botState.initialBalance = totalInitialBalance;
     botState.totalTrades = totalTrades;
     botState.winningTrades = totalWinningTrades;
+    botState.losingTrades = totalLosingTrades;
     botState.profitPct = totalInitialBalance > 0 ? (totalRealizedProfit / totalInitialBalance) * 100 : 0;
     
     if (totalVolume > 0) {
@@ -219,7 +230,7 @@ function updateCombinedState() {
             direction: activeDirection, 
             costHold: activeCostHold 
         };
-        botState.roi = Object.values(accountStates).find(s => s.position.volume > 0)?.roi || 0;
+        botState.roi = activeRoi;
     } else {
         botState.openPosition = { volume: 0, direction: "", costHold: 0 };
         botState.roi = 0;
@@ -250,24 +261,42 @@ async function checkTradesForAccount(account, state) {
     try {
         const hasPosition = state.position.volume > 0;
         
-        // Check take profit condition
-        if (hasPosition && state.roi >= state.settings.takeProfit) {
-            // Close position with profit
-            const closeDirection = state.direction === 'buy' ? 'sell' : 'buy';
-            await htxRequest(account, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, 
-                volume: state.position.volume,
-                direction: closeDirection, 
-                offset: 'close', 
-                lever_rate: config.leverage, 
-                order_price_type: 'opponent'
-            });
-            state.winningTrades++;
-            state.totalTrades++;
-            console.log(`Account ${account.accountId}: Closed ${state.direction} position with ${state.roi}% profit`);
+        if (hasPosition) {
+            // Check TAKE PROFIT condition (positive ROI)
+            if (state.roi >= state.settings.takeProfit) {
+                // Close position with profit
+                const closeDirection = state.direction === 'buy' ? 'sell' : 'buy';
+                await htxRequest(account, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                    contract_code: config.symbol, 
+                    volume: state.position.volume,
+                    direction: closeDirection, 
+                    offset: 'close', 
+                    lever_rate: config.leverage, 
+                    order_price_type: 'opponent'
+                });
+                state.winningTrades++;
+                state.totalTrades++;
+                console.log(`✅ Account ${account.accountId} (${state.direction.toUpperCase()}): TAKE PROFIT at ${state.roi.toFixed(2)}%`);
+            } 
+            // Check STOP LOSS condition (negative ROI)
+            else if (state.roi <= -state.settings.stopLoss) {
+                // Close position with loss
+                const closeDirection = state.direction === 'buy' ? 'sell' : 'buy';
+                await htxRequest(account, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                    contract_code: config.symbol, 
+                    volume: state.position.volume,
+                    direction: closeDirection, 
+                    offset: 'close', 
+                    lever_rate: config.leverage, 
+                    order_price_type: 'opponent'
+                });
+                state.losingTrades++;
+                state.totalTrades++;
+                console.log(`❌ Account ${account.accountId} (${state.direction.toUpperCase()}): STOP LOSS at ${state.roi.toFixed(2)}%`);
+            }
         } 
         // Open position if no position exists
-        else if (!hasPosition && state.settings.baseOrder > 0) {
+        else if (!hasPosition && state.settings.orderSize > 0) {
             await htxRequest(account, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, 
                 volume: state.settings.orderSize,
@@ -277,7 +306,7 @@ async function checkTradesForAccount(account, state) {
                 order_price_type: 'opponent'
             });
             state.totalTrades++;
-            console.log(`Account ${account.accountId}: Opened ${state.direction} position with ${state.settings.orderSize} contracts`);
+            console.log(`🟢 Account ${account.accountId}: Opened ${state.direction.toUpperCase()} position with ${state.settings.orderSize} contracts`);
         }
     } catch (e) {
         console.error(`Trade error for account ${account.accountId}:`, e);
@@ -306,7 +335,7 @@ app.get('/', (req, res) => {
 <!DOCTYPE html>
 <html class="bg-white">
 <head>
-    <title>HTX Dual Direction Bot</title>
+    <title>HTX Dual Direction Bot - 2% TP/SL</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
@@ -323,7 +352,7 @@ app.get('/', (req, res) => {
                 <h1 class="text-3xl font-bold tracking-tight">DUAL<span class="gradient-text">_DIRECTION</span></h1>
                 <p class="text-[10px] text-gray-400 uppercase tracking-widest mt-1">${config.symbol} | ${config.leverage}X LEVERAGE</p>
                 <p class="text-[10px] text-emerald-600 font-bold mt-2">🎯 ${accountInfo}</p>
-                <p class="text-[10px] text-blue-600 mt-1">🔄 One direction per account | Fixed position sizing</p>
+                <p class="text-[10px] text-blue-600 mt-1">🎯 TP: ${config.takeProfitPercent}% | 🛡️ SL: ${config.stopLossPercent}%</p>
             </div>
             <div class="text-right">
                 <p id="dgrText" class="text-3xl font-bold text-emerald-600">0.00%</p>
@@ -348,9 +377,9 @@ app.get('/', (req, res) => {
                 <p id="directionText" class="text-[10px] font-bold text-blue-600 mt-1">NO ACTIVE POSITION</p>
             </div>
             <div class="card p-6 rounded-2xl">
-                <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Active Accounts</p>
-                <p id="activeAccounts" class="text-2xl font-bold text-blue-600 stat-number">${config.accounts.length}</p>
-                <p class="text-[10px] font-bold text-gray-400 mt-1 uppercase">Buy/Sell Separate</p>
+                <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Win/Loss Ratio</p>
+                <p id="wlRatio" class="text-2xl font-bold text-blue-600 stat-number">0.00</p>
+                <p class="text-[10px] font-bold text-gray-400 mt-1 uppercase">Wins / Losses</p>
             </div>
             <div class="card p-6 rounded-2xl">
                 <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Combined Balance</p>
@@ -406,11 +435,11 @@ app.get('/', (req, res) => {
                 </div>
                 <div>
                     <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Take Profit</p>
-                    <p class="text-xl font-bold text-emerald-600">${config.accounts[0]?.settings.takeProfit || 1.5}%</p>
+                    <p class="text-xl font-bold text-emerald-600">${config.takeProfitPercent}%</p>
                 </div>
                 <div>
-                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Strategy</p>
-                    <p class="text-xl font-bold text-purple-600">Fixed Size</p>
+                    <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Stop Loss</p>
+                    <p class="text-xl font-bold text-red-600">${config.stopLossPercent}%</p>
                 </div>
             </div>
         </div>
@@ -431,8 +460,11 @@ app.get('/', (req, res) => {
                 document.getElementById('dgrText').innerText = d.estimates.dgr.toFixed(4) + '%';
                 document.getElementById('curPrice').innerText = d.currentPrice.toFixed(8);
                 
+                const winLossRatio = d.winningTrades / Math.max(d.losingTrades, 1);
+                document.getElementById('wlRatio').innerHTML = winLossRatio.toFixed(2) + '<span class="text-lg text-gray-300"> | ' + d.winningTrades + '/' + d.losingTrades + '</span>';
+                
                 if (d.openPosition.volume > 0) {
-                    document.getElementById('directionText').innerHTML = d.openPosition.direction.toUpperCase() + ' ' + d.openPosition.volume + ' CONTRACTS';
+                    document.getElementById('directionText').innerHTML = d.openPosition.direction.toUpperCase() + ' ' + d.openPosition.volume + ' CONTRACTS @ ' + d.roi.toFixed(2) + '%';
                 } else {
                     document.getElementById('directionText').innerHTML = 'NO ACTIVE POSITION';
                 }
@@ -442,7 +474,11 @@ app.get('/', (req, res) => {
                     for (const acc of d.accounts) {
                         document.getElementById('balance_' + acc.id)?.innerText = '$' + acc.balance.toFixed(2);
                         document.getElementById('position_' + acc.id)?.innerText = acc.position;
-                        document.getElementById('roi_' + acc.id)?.innerText = acc.roi.toFixed(2) + '%';
+                        const roiElem = document.getElementById('roi_' + acc.id);
+                        if (roiElem) {
+                            roiElem.innerText = acc.roi.toFixed(2) + '%';
+                            roiElem.style.color = acc.roi >= 0 ? '#059669' : '#dc2626';
+                        }
                         document.getElementById('profit_' + acc.id)?.innerText = '$' + acc.profit.toFixed(2);
                         document.getElementById('trades_' + acc.id)?.innerText = acc.trades;
                     }
@@ -508,7 +544,8 @@ async function initialize() {
         console.log(`  Account ${acc.accountId}: ${idx === 0 ? 'BUY (LONG)' : 'SELL (SHORT)'} direction`);
     });
     console.log(`Order Size: ${config.accounts[0]?.settings.orderSize || 1} contracts`);
-    console.log(`Take Profit: ${config.accounts[0]?.settings.takeProfit || 1.5}%`);
+    console.log(`Take Profit: ${config.takeProfitPercent}%`);
+    console.log(`Stop Loss: ${config.stopLossPercent}%`);
     console.log('========================================\n');
     
     // Initial sync for all accounts
