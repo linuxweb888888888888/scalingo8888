@@ -28,12 +28,13 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     
-    // --- TURBO PROFIT STRATEGY ---
-    minNetProfitUsdt: 0.00000001, // Zero-floor exit (Fastest)
-    initialOrderSize: 10,        // Initial contracts
-    syncThreshold: 0.03,         // Sync if drift > 0.03%
-    scalingFactor: 0.25,         // Add 25% of volume to repair faster
-    feeRate: 0.0005              // 0.05% Taker fee
+    // --- ROI STRATEGY ---
+    targetNetRoi: 1.5,            // EXIT AT 1.5% NET ROI
+    initialOrderSize: 10,        
+    syncThreshold: 0.03,         
+    scalingFactor: 0.25,         
+    feeRate: 0.0005,
+    contractSize: 0              // Auto-detected
 };
 
 // ==================== GLOBAL STATE ====================
@@ -67,15 +68,24 @@ async function htxRequest(account, method, path, data = {}) {
 // ==================== CORE LOGIC ====================
 
 async function sync() {
+    if (config.contractSize === 0) {
+        const info = await htxRequest(config.accounts[0], 'GET', '/linear-swap-api/v1/swap_contract_info', { contract_code: config.symbol });
+        if (info?.status === 'ok') {
+            const contract = info.data.find(c => c.contract_code === config.symbol);
+            config.contractSize = contract ? parseFloat(contract.contract_size) : 1;
+        }
+    }
+
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
+        
         if (res?.status === 'ok' && res.data) {
-            const pos = res.data.find(p => parseFloat(p.volume) > 0 && p.direction === state.direction);
-            if (pos) {
+            const pos = res.data.find(p => p.direction === state.direction);
+            if (pos && parseFloat(pos.volume) > 0) {
                 state.avgPrice = parseFloat(pos.cost_hold);
                 state.volume = parseFloat(pos.volume);
-                state.unrealizedUsdt = parseFloat(pos.profit) || 0;
+                state.unrealizedUsdt = parseFloat(pos.profit);
                 const price = market.last;
                 state.roi = state.direction === 'buy' 
                     ? ((price - state.avgPrice) / state.avgPrice) * 100 * config.leverage
@@ -97,9 +107,8 @@ async function tradeLoop() {
     const long = accountStates[config.accounts[0].accountId];
     const short = accountStates[config.accounts[1].accountId];
 
-    // 1. Initial Hedge Entry
     if (long.volume === 0 && short.volume === 0) {
-        market.status = 'FAST ENTRY...';
+        market.status = 'Opening Hedge...';
         isProcessing = true;
         await Promise.all(config.accounts.map((acc, idx) => htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
             contract_code: config.symbol, volume: config.initialOrderSize, direction: idx === 0 ? 'buy' : 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
@@ -108,38 +117,35 @@ async function tradeLoop() {
         return;
     }
 
-    // 2. Net Profit Calculation (Includes Fees for both sides)
+    // --- ROI CALCULATION ---
     const totalVol = long.volume + short.volume;
-    const estFees = (totalVol * market.last) * config.feeRate;
-    const netProfit = (long.unrealizedUsdt + short.unrealizedUsdt) - estFees;
+    const realNotional = totalVol * config.contractSize * market.last;
+    const marginUsed = realNotional / config.leverage;
+    const estFees = realNotional * config.feeRate;
+    const netPnLUsdt = (long.unrealizedUsdt + short.unrealizedUsdt) - estFees;
+    const netRoi = (netPnLUsdt / marginUsed) * 100;
 
-    // FAST EXIT
-    if (netProfit >= config.minNetProfitUsdt) {
-        market.status = `PROFIT HIT: +$${netProfit.toFixed(8)}`;
+    market.currentNetRoi = netRoi; // Store for API
+
+    if (netRoi >= config.targetNetRoi) {
+        market.status = `ROI TARGET REACHED: ${netRoi.toFixed(2)}%`;
         await closeAll();
         return;
     }
 
-    // 3. AGGRESSIVE SYNC & BALANCE
+    // --- AGGRESSIVE SYNCING ---
     const drift = long.roi + short.roi;
     const now = Date.now();
-
-    if (now - lastActionTime > 4000) { // 4s Pulse
+    if (now - lastActionTime > 4000) {
         let targetAcc = null;
-        let amount = 1;
-
-        // PRIORITY A: BALANCE VOLUME (Safety)
         if (long.volume !== short.volume) {
             targetAcc = long.volume < short.volume ? config.accounts[0] : config.accounts[1];
-            amount = Math.abs(long.volume - short.volume); // Immediate catch-up
-            market.status = 'Balancing Hedge...';
-        } 
-        // PRIORITY B: AGGRESSIVE REPAIR
-        else if (Math.abs(drift) > config.syncThreshold) {
+            market.status = 'Balancing Volume...';
+            var amount = Math.abs(long.volume - short.volume);
+        } else if (Math.abs(drift) > config.syncThreshold) {
             targetAcc = long.roi < -short.roi ? config.accounts[0] : config.accounts[1];
-            // Scaled addition: 25% of current size or min 1
-            amount = Math.max(1, Math.floor(targetAcc.volume * config.scalingFactor));
-            market.status = 'Turbo Syncing...';
+            market.status = 'Turbo Syncing ROI...';
+            var amount = Math.max(1, Math.floor(targetAcc.volume * config.scalingFactor));
         }
 
         if (targetAcc) {
@@ -150,7 +156,7 @@ async function tradeLoop() {
             lastActionTime = now;
         }
     } else {
-        market.status = 'Optimizing for Exit';
+        market.status = `Targeting ${config.targetNetRoi}% ROI`;
     }
 }
 
@@ -165,7 +171,7 @@ async function closeAll() {
     setTimeout(() => { isProcessing = false; }, 4000);
 }
 
-// ==================== WEBSOCKET ====================
+// ==================== WS ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -186,7 +192,7 @@ function startWS() {
 }
 
 // ==================== DASHBOARD ====================
-app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), feeRate: config.feeRate }));
+app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), config }));
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -203,7 +209,6 @@ app.get('/', (req, res) => {
 </head>
 <body class="p-4 md:p-10">
     <div class="max-w-4xl mx-auto">
-        <!-- Header -->
         <div class="flex justify-between items-center mb-8">
             <div>
                 <h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1>
@@ -221,20 +226,18 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- MAIN PROFIT ANALYZER -->
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20">
             <div class="relative z-10 text-center">
-                <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Incl. Fees)</p>
-                <h2 id="netProfit" class="text-6xl font-black mb-4 font-mono">+$0.00000000</h2>
+                <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Incl. Fees) ROI</p>
+                <h2 id="netRoi" class="text-7xl font-black mb-4 font-mono">+0.0000%</h2>
                 <div class="inline-flex items-center gap-2 bg-zinc-900 px-4 py-2 rounded-full border border-zinc-800">
-                    <span class="text-[10px] font-bold text-zinc-500 uppercase">Market Spread:</span>
-                    <span id="currentSpread" class="text-xs font-mono font-bold">0.000%</span>
+                    <span class="text-[10px] font-bold text-zinc-500 uppercase">Target:</span>
+                    <span class="text-xs font-mono font-bold text-indigo-400">${config.targetNetRoi.toFixed(2)}%</span>
                 </div>
             </div>
             <div class="absolute top-0 left-1/2 -translate-x-1/2 w-64 h-64 bg-indigo-600/10 blur-[100px] rounded-full"></div>
         </div>
 
-        <!-- Position Progress Cards -->
         <div class="grid md:grid-cols-2 gap-6">
             <div class="glass rounded-[2rem] p-6 border-l-4 border-emerald-500">
                 <div class="flex justify-between items-center mb-4">
@@ -272,27 +275,32 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('markPrice').innerText = d.market.last.toFixed(8);
                 document.getElementById('botStatus').innerText = d.market.status;
-                document.getElementById('currentSpread').innerText = d.market.spread.toFixed(3) + '%';
                 
-                let longU = 0, shortU = 0, totalVal = 0, totalRealized = 0;
+                let totalContracts = 0, totalPnL = 0, totalRealized = 0;
                 d.accounts.forEach(a => {
                     const isLong = a.direction === 'buy';
                     const prefix = isLong ? 'long' : 'short';
-                    if(isLong) longU = a.unrealizedUsdt; else shortU = a.unrealizedUsdt;
                     document.getElementById(prefix + 'Roi').innerText = a.roi.toFixed(2) + '%';
                     document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(8);
-                    const prog = Math.min(100, Math.max(0, Math.abs(a.roi) * 20));
+                    const prog = Math.min(100, Math.max(0, Math.abs(a.roi) * 10));
                     document.getElementById(prefix + 'Bar').style.width = (a.volume > 0 ? prog : 0) + '%';
-                    totalVal += (a.volume * d.market.last);
+                    totalContracts += a.volume;
+                    totalPnL += a.unrealizedUsdt;
                     totalRealized += a.realizedProfit;
                 });
 
                 document.getElementById('totalRealized').innerText = (totalRealized >= 0 ? '+' : '') + '$' + totalRealized.toFixed(6);
-                const exitFees = totalVal * d.feeRate;
-                const projected = (longU + shortU) - exitFees;
-                const pElem = document.getElementById('netProfit');
-                pElem.innerText = (projected >= 0 ? '+' : '') + '$' + projected.toFixed(8);
-                pElem.className = 'text-6xl font-black mb-4 font-mono ' + (projected >= 0 ? 'text-emerald-400' : 'text-rose-500');
+
+                const cSize = d.config.contractSize || 1;
+                const realNotional = totalContracts * cSize * d.market.last;
+                const marginUsed = realNotional / d.config.leverage;
+                const exitFees = realNotional * d.config.feeRate;
+                const netPnL = totalPnL - exitFees;
+                const netRoi = (netPnL / marginUsed) * 100;
+
+                const roiElem = document.getElementById('netRoi');
+                roiElem.innerText = (netRoi >= 0 ? '+' : '') + netRoi.toFixed(4) + '%';
+                roiElem.className = 'text-7xl font-black mb-4 font-mono ' + (netRoi >= 0 ? 'text-emerald-400' : 'text-rose-500');
             } catch(e) {}
         }
         setInterval(update, 1000);
@@ -303,5 +311,5 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(sync, 2000);
-setInterval(tradeLoop, 2500); // High-speed trade loop
+setInterval(tradeLoop, 2500);
 app.listen(config.port, '0.0.0.0');
