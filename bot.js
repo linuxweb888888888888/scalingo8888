@@ -27,17 +27,17 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    orderSize: 1,                // Start with 1
-    triggerRoi: 2.0,             // Wait for 2% ROI
-    feeRate: 0.0005,             // 0.05% Taker fee
-    contractSize: 0              // Auto-detected
+    orderSize: 1,                
+    triggerRoi: 2.0,             // Wait for +2.0% ROI on the WINNER
+    feeRate: 0.0005,             
+    contractSize: 0              
 };
 
 // ==================== GLOBAL STATE ====================
 let market = { last: 0, status: 'initializing' };
 let accountStates = {};
 let isProcessing = false;
-let hasAddedThisCycle = false; // Flag to ensure we only add ONCE
+let hasAddedThisCycle = false; 
 
 config.accounts.forEach((account, idx) => {
     accountStates[account.accountId] = {
@@ -99,10 +99,10 @@ async function tradeLoop() {
     const long = accountStates[config.accounts[0].accountId];
     const short = accountStates[config.accounts[1].accountId];
 
-    // 1. Start Cycle
+    // 1. Cycle Startup
     if (long.volume === 0 && short.volume === 0) {
-        market.status = 'Starting New Cycle...';
-        hasAddedThisCycle = false; // Reset flag
+        market.status = 'Opening 1:1 Winner-Strategy...';
+        hasAddedThisCycle = false;
         isProcessing = true;
         await Promise.all(config.accounts.map((acc, idx) => htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
             contract_code: config.symbol, volume: config.orderSize, direction: idx === 0 ? 'buy' : 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
@@ -111,39 +111,43 @@ async function tradeLoop() {
         return;
     }
 
-    // 2. Net Profit Calculation
+    // 2. Exact Sum Calculation
     const totalVol = long.volume + short.volume;
     const estExitFees = (totalVol * config.contractSize * market.last) * config.feeRate;
-    const netProfit = (long.unrealizedUsdt + short.unrealizedUsdt) - estExitFees;
+    const combinedPnL = long.unrealizedUsdt + short.unrealizedUsdt;
+    const netProfit = combinedPnL - estExitFees;
 
-    // 3. Exit Condition (Any Net Profit)
+    // 3. Profit Kill Switch
     if (netProfit > 0.00000001) {
-        market.status = `Exit Profit Found: $${netProfit.toFixed(8)}`;
+        market.status = `Winner Overpowered Loser: +$${netProfit.toFixed(8)}`;
         await closeAll();
         return;
     }
 
-    // 4. One-Time 2% Repair Trigger
+    // 4. One-Time WINNER Addition Trigger
     if (!hasAddedThisCycle) {
         let targetAcc = null;
+        
+        // ONLY trigger if ROI is positive and OVER 2.0%
         if (long.roi >= config.triggerRoi) {
-            targetAcc = config.accounts[1]; // Long is winning, add to Short
+            targetAcc = config.accounts[0]; // Add to Long because Long is winning
+            market.status = `Adding to Winning LONG (${long.roi.toFixed(2)}%)`;
         } else if (short.roi >= config.triggerRoi) {
-            targetAcc = config.accounts[0]; // Short is winning, add to Long
+            targetAcc = config.accounts[1]; // Add to Short because Short is winning
+            market.status = `Adding to Winning SHORT (${short.roi.toFixed(2)}%)`;
         }
 
         if (targetAcc) {
             const side = accountStates[targetAcc.accountId].direction;
-            market.status = `Triggering One-Time Add (${side.toUpperCase()})`;
             await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: 1, direction: side, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
-            hasAddedThisCycle = true; // Mark as done for this cycle
+            hasAddedThisCycle = true; 
         } else {
-            market.status = `Waiting for ${config.triggerRoi}% ROI Threshold`;
+            market.status = 'Waiting for >2% Winner';
         }
     } else {
-        market.status = 'Monitoring for Net Profit Exit';
+        market.status = 'Winner Loaded - Seeking Net Profit';
     }
 }
 
@@ -159,7 +163,7 @@ async function closeAll() {
     setTimeout(() => { isProcessing = false; }, 5000);
 }
 
-// ==================== WS & DASHBOARD ====================
+// ==================== WS & DASHBOARD (STAYING SAME DESIGN) ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -201,7 +205,7 @@ app.get('/', (req, res) => {
             <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Incl. Fees)</p>
             <h2 id="netProfit" class="text-6xl font-black mb-4 font-mono">+$0.00000000</h2>
             <div class="inline-flex items-center gap-2 bg-zinc-900 px-4 py-2 rounded-full border border-zinc-800">
-                <span class="text-[10px] font-bold text-zinc-500 uppercase">One-Time Add:</span><span id="addFlag" class="text-xs font-mono font-bold text-indigo-400">No</span>
+                <span class="text-[10px] font-bold text-zinc-500 uppercase">One-Time Win-Add:</span><span id="addFlag" class="text-xs font-mono font-bold text-indigo-400">No</span>
             </div>
         </div>
         <div class="grid md:grid-cols-2 gap-6">
@@ -229,7 +233,7 @@ app.get('/', (req, res) => {
                     const prefix = a.direction === 'buy' ? 'long' : 'short';
                     document.getElementById(prefix + 'Roi').innerText = a.roi.toFixed(2) + '%';
                     document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(8);
-                    document.getElementById(prefix + 'Bar').style.width = Math.min(100, Math.max(0, Math.abs(a.roi) * 20)) + '%';
+                    document.getElementById(prefix + 'Bar').style.width = Math.min(100, Math.abs(a.roi) * 20) + '%';
                     tC += a.volume; tP += a.unrealizedUsdt; tR += a.realizedProfit;
                 });
                 document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(8);
