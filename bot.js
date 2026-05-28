@@ -29,7 +29,7 @@ const config = {
     accounts: apiAccounts,
     
     // --- AGGRESSIVE SETTINGS ---
-    minNetProfitUsdt: 0.0001,    // Close immediately when green
+    minNetProfitUsdt: 0.0005,    // Close immediately when green
     initialOrderSize: 10,        // Start size
     rebalanceStep: 1,            // Min contract increment
     syncThreshold: 0.05,         // Sync if drift > 0.05%
