@@ -38,11 +38,14 @@ const config = {
     accounts: apiAccounts,
     takeProfitPercent: parseFloat(process.env.TAKE_PROFIT_PERCENT) || 2.0,
     stopLossPercent: parseFloat(process.env.STOP_LOSS_PERCENT) || 2.0,
-    orderSize: parseFloat(process.env.ORDER_SIZE) || 1
+    orderSize: parseFloat(process.env.ORDER_SIZE) || 1,
+    syncTrades: true // Enable synchronized trading
 };
 
 // ==================== ACCOUNT STATES ====================
 let accountStates = {};
+let lastSyncTime = 0;
+let hedgeDeviation = 0;
 
 // Initialize states for each account
 config.accounts.forEach((account, idx) => {
@@ -66,6 +69,7 @@ config.accounts.forEach((account, idx) => {
         winningTrades: 0,
         losingTrades: 0,
         allTimeHigh: 0,
+        lastOpenTime: 0,
         settings: {
             takeProfit: config.takeProfitPercent,
             stopLoss: config.stopLossPercent,
@@ -94,7 +98,10 @@ let botState = {
     losingTrades: 0,
     profitShibLeveraged: 0,
     openPosition: { volume: 0, direction: "", costHold: 0 },
-    roi: 0
+    roi: 0,
+    hedgeDeviation: 0,
+    longRoi: 0,
+    shortRoi: 0
 };
 
 // ==================== API HANDLER ====================
@@ -187,6 +194,8 @@ function updateCombinedState() {
     let activeDirection = "";
     let activeCostHold = 0;
     let activeRoi = 0;
+    let longRoi = 0;
+    let shortRoi = 0;
     
     Object.values(accountStates).forEach(state => {
         totalRealizedProfit += state.realizedProfit;
@@ -202,6 +211,12 @@ function updateCombinedState() {
             activeCostHold = state.avgPrice;
             activeRoi = state.roi;
         }
+        
+        if (state.direction === 'buy') {
+            longRoi = state.roi;
+        } else if (state.direction === 'sell') {
+            shortRoi = state.roi;
+        }
     });
     
     botState.realizedProfit = totalRealizedProfit;
@@ -211,6 +226,9 @@ function updateCombinedState() {
     botState.winningTrades = totalWinningTrades;
     botState.losingTrades = totalLosingTrades;
     botState.profitPct = totalInitialBalance > 0 ? (totalRealizedProfit / totalInitialBalance) * 100 : 0;
+    botState.longRoi = longRoi;
+    botState.shortRoi = shortRoi;
+    botState.hedgeDeviation = Math.abs(longRoi + shortRoi); // Should be close to 0 in perfect hedge
     
     if (totalVolume > 0) {
         botState.openPosition = { 
@@ -239,7 +257,61 @@ function updateCombinedState() {
     };
 }
 
-// ==================== TRADING LOGIC ====================
+// ==================== SYNCHRONIZED TRADING LOGIC ====================
+async function openSynchronizedPositions() {
+    if (config.accounts.length < 2) return;
+    
+    const longAccount = config.accounts[0];
+    const shortAccount = config.accounts[1];
+    const longState = accountStates[longAccount.accountId];
+    const shortState = accountStates[shortAccount.accountId];
+    
+    // Check if both positions are closed
+    const longHasPosition = longState.position.volume > 0;
+    const shortHasPosition = shortState.position.volume > 0;
+    
+    // If both are closed, open new positions simultaneously
+    if (!longHasPosition && !shortHasPosition && !longState.isTrading && !shortState.isTrading) {
+        const now = Date.now();
+        if (now - lastSyncTime > 5000) { // Prevent rapid re-entries
+            lastSyncTime = now;
+            
+            console.log(`🔗 Opening synchronized positions - LONG and SHORT at ${botState.currentPrice}`);
+            
+            // Open LONG position
+            const longOrder = await htxRequest(longAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol,
+                volume: longState.settings.orderSize,
+                direction: 'buy',
+                offset: 'open',
+                lever_rate: config.leverage,
+                order_price_type: 'opponent'
+            });
+            
+            // Small delay to ensure order processes
+            await new Promise(resolve => setTimeout(resolve, 500));
+            
+            // Open SHORT position
+            const shortOrder = await htxRequest(shortAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol,
+                volume: shortState.settings.orderSize,
+                direction: 'sell',
+                offset: 'open',
+                lever_rate: config.leverage,
+                order_price_type: 'opponent'
+            });
+            
+            if (longOrder?.data?.order_id || shortOrder?.data?.order_id) {
+                longState.totalTrades++;
+                shortState.totalTrades++;
+                longState.lastOpenTime = now;
+                shortState.lastOpenTime = now;
+                console.log(`✅ Synchronized positions opened at ${botState.currentPrice}`);
+            }
+        }
+    }
+}
+
 async function checkTradesForAccount(account, state) {
     if (!state.isRunning || state.isTrading || botState.currentPrice <= 0) return;
     state.isTrading = true;
@@ -248,6 +320,7 @@ async function checkTradesForAccount(account, state) {
         const hasPosition = state.position.volume > 0;
         
         if (hasPosition) {
+            // Check take profit condition
             if (state.roi >= state.settings.takeProfit) {
                 const closeDirection = state.direction === 'buy' ? 'sell' : 'buy';
                 await htxRequest(account, 'POST', '/linear-swap-api/v1/swap_cross_order', {
@@ -262,6 +335,7 @@ async function checkTradesForAccount(account, state) {
                 state.totalTrades++;
                 console.log(`✅ Account ${account.accountId} (${state.direction.toUpperCase()}): TAKE PROFIT at ${state.roi.toFixed(2)}%`);
             } 
+            // Check stop loss condition
             else if (state.roi <= -state.settings.stopLoss) {
                 const closeDirection = state.direction === 'buy' ? 'sell' : 'buy';
                 await htxRequest(account, 'POST', '/linear-swap-api/v1/swap_cross_order', {
@@ -276,18 +350,6 @@ async function checkTradesForAccount(account, state) {
                 state.totalTrades++;
                 console.log(`❌ Account ${account.accountId} (${state.direction.toUpperCase()}): STOP LOSS at ${state.roi.toFixed(2)}%`);
             }
-        } 
-        else if (!hasPosition && state.settings.orderSize > 0) {
-            await htxRequest(account, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, 
-                volume: state.settings.orderSize,
-                direction: state.direction, 
-                offset: 'open', 
-                lever_rate: config.leverage, 
-                order_price_type: 'opponent'
-            });
-            state.totalTrades++;
-            console.log(`🟢 Account ${account.accountId}: Opened ${state.direction.toUpperCase()} position with ${state.settings.orderSize} contracts`);
         }
     } catch (e) {
         console.error(`Trade error for account ${account.accountId}:`, e);
@@ -297,6 +359,10 @@ async function checkTradesForAccount(account, state) {
 }
 
 async function checkTrades() {
+    // First, try to open synchronized positions
+    await openSynchronizedPositions();
+    
+    // Then check for take profit/stop loss on both accounts
     for (let i = 0; i < config.accounts.length; i++) {
         const account = config.accounts[i];
         const state = accountStates[account.accountId];
@@ -304,14 +370,14 @@ async function checkTrades() {
     }
 }
 
-// ==================== WEB UI WITH NEAT DESIGN ====================
+// ==================== WEB UI WITH HEDGE DISPLAY ====================
 app.get('/', (req, res) => {
     const htmlContent = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HTX Dual Direction Trading Bot</title>
+    <title>HTX Hedged Dual Direction Bot</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -326,6 +392,9 @@ app.get('/', (req, res) => {
             50% { opacity: 0.7; }
         }
         .pulse { animation: pulse-green 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+        .hedge-perfect { color: #10b981; }
+        .hedge-off { color: #f59e0b; }
+        .hedge-bad { color: #ef4444; }
     </style>
 </head>
 <body class="bg-gradient-to-br from-gray-50 to-gray-100">
@@ -334,15 +403,15 @@ app.get('/', (req, res) => {
         <div class="gradient-bg rounded-2xl shadow-2xl p-6 mb-8 text-white">
             <div class="flex justify-between items-center">
                 <div>
-                    <h1 class="text-4xl font-bold mb-2">🤖 HTX Dual Direction Bot</h1>
-                    <p class="text-white/80 text-sm">Advanced Futures Trading Automation | LONG + SHORT Strategy</p>
+                    <h1 class="text-4xl font-bold mb-2">🔄 HTX Hedged Bot</h1>
+                    <p class="text-white/80 text-sm">Perfectly Hedged LONG + SHORT Strategy | Synchronized Trading</p>
                 </div>
                 <div class="text-right">
                     <div class="text-3xl font-bold number-font" id="livePrice">$0.00000000</div>
                     <div class="text-sm text-white/70">${config.symbol}</div>
                 </div>
             </div>
-            <div class="grid grid-cols-4 gap-4 mt-6 pt-4 border-t border-white/20">
+            <div class="grid grid-cols-5 gap-4 mt-6 pt-4 border-t border-white/20">
                 <div>
                     <div class="text-xs text-white/70">Leverage</div>
                     <div class="text-xl font-bold">${config.leverage}X</div>
@@ -358,6 +427,10 @@ app.get('/', (req, res) => {
                 <div>
                     <div class="text-xs text-white/70">Stop Loss</div>
                     <div class="text-xl font-bold text-red-300">${config.stopLossPercent}%</div>
+                </div>
+                <div>
+                    <div class="text-xs text-white/70">Hedge Status</div>
+                    <div class="text-xl font-bold" id="hedgeStatus">Perfect</div>
                 </div>
             </div>
         </div>
@@ -384,6 +457,29 @@ app.get('/', (req, res) => {
                 <div class="text-3xl font-bold text-emerald-600 number-font" id="dgr">0.00%</div>
                 <div class="text-sm text-gray-500 mt-2">Total Trades: <span id="totalTradesCount">0</span></div>
             </div>
+        </div>
+
+        <!-- Hedge Visualization -->
+        <div class="bg-white rounded-xl shadow-lg p-6 mb-8">
+            <h3 class="text-lg font-bold mb-4">🔄 Hedge Correlation (Should be opposite)</h3>
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <div class="text-center">
+                    <div class="text-sm text-gray-500 mb-2">LONG ROI</div>
+                    <div class="text-3xl font-bold" id="longRoi">0.00%</div>
+                </div>
+                <div class="text-center">
+                    <div class="text-sm text-gray-500 mb-2">Hedge Deviation (Target: 0)</div>
+                    <div class="text-3xl font-bold" id="hedgeDeviation">0.00%</div>
+                </div>
+                <div class="text-center">
+                    <div class="text-sm text-gray-500 mb-2">SHORT ROI</div>
+                    <div class="text-3xl font-bold" id="shortRoi">0.00%</div>
+                </div>
+            </div>
+            <div class="mt-4 h-4 bg-gray-200 rounded-full overflow-hidden">
+                <div id="hedgeBar" class="h-full bg-gradient-to-r from-red-500 via-yellow-500 to-green-500 transition-all duration-500" style="width: 50%"></div>
+            </div>
+            <p class="text-xs text-center text-gray-500 mt-2">⬅️ SHORT Hedge | Perfect Hedge (0%) | LONG Hedge ➡️</p>
         </div>
 
         <!-- Account Cards -->
@@ -430,7 +526,7 @@ app.get('/', (req, res) => {
         <div class="bg-white rounded-xl shadow-lg p-4 text-center">
             <div class="flex items-center justify-center gap-2">
                 <div class="w-2 h-2 bg-green-500 rounded-full pulse"></div>
-                <span class="text-sm text-gray-600">Bot is actively monitoring markets | Last update: <span id="lastUpdate">Just now</span></span>
+                <span class="text-sm text-gray-600">Bot is actively monitoring markets | Synchronized Trading ENABLED | Last update: <span id="lastUpdate">Just now</span></span>
             </div>
         </div>
     </div>
@@ -467,6 +563,32 @@ app.get('/', (req, res) => {
                 
                 const expectedValue = data.realizedProfit / Math.max(data.totalTrades, 1);
                 document.getElementById('expectedValue').innerText = '$' + expectedValue.toFixed(4);
+                
+                // Update hedge display
+                document.getElementById('longRoi').innerText = data.longRoi.toFixed(2) + '%';
+                document.getElementById('shortRoi').innerText = data.shortRoi.toFixed(2) + '%';
+                document.getElementById('longRoi').style.color = data.longRoi >= 0 ? '#10b981' : '#ef4444';
+                document.getElementById('shortRoi').style.color = data.shortRoi >= 0 ? '#10b981' : '#ef4444';
+                
+                const hedgeDev = Math.abs(data.hedgeDeviation);
+                document.getElementById('hedgeDeviation').innerText = hedgeDev.toFixed(2) + '%';
+                
+                // Hedge status text and color
+                const hedgeStatusElem = document.getElementById('hedgeStatus');
+                if (hedgeDev < 0.2) {
+                    hedgeStatusElem.innerText = '✓ Perfect';
+                    hedgeStatusElem.className = 'text-xl font-bold text-green-300';
+                } else if (hedgeDev < 1) {
+                    hedgeStatusElem.innerText = '⚠️ Slight Off';
+                    hedgeStatusElem.className = 'text-xl font-bold text-yellow-300';
+                } else {
+                    hedgeStatusElem.innerText = '❌ Off';
+                    hedgeStatusElem.className = 'text-xl font-bold text-red-300';
+                }
+                
+                // Hedge bar (50% is perfect, shifts based on deviation)
+                const hedgeBarPosition = 50 + (data.longRoi - data.shortRoi) * 5;
+                document.getElementById('hedgeBar').style.width = Math.min(100, Math.max(0, hedgeBarPosition)) + '%';
                 
                 // Update account cards
                 if (data.accounts && data.accounts.length > 0) {
@@ -619,10 +741,11 @@ function startWS() {
 // ==================== INITIALIZE ====================
 async function initialize() {
     console.log('========================================');
-    console.log('DUAL DIRECTION TRADING BOT');
+    console.log('HEDGED DUAL DIRECTION TRADING BOT');
     console.log('========================================');
     console.log(`Symbol: ${config.symbol}`);
     console.log(`Leverage: ${config.leverage}X`);
+    console.log(`Synchronized Trading: ENABLED`);
     console.log(`Active Accounts: ${config.accounts.length}`);
     config.accounts.forEach((acc, idx) => {
         console.log(`  Account ${acc.accountId}: ${idx === 0 ? 'BUY (LONG)' : 'SELL (SHORT)'} direction`);
