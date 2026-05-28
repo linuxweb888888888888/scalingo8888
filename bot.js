@@ -28,12 +28,12 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     
-    // --- TURBO EXCHANGE SYNC SETTINGS ---
-    targetNetRoi: 0.25,            // EXIT AT 1.5% NET ROI (INCLUDING FEES)
+    // --- WINNER-WEIGHTING AI SETTINGS ---
+    targetNetRoi: 1.5,            // EXIT AT 1.5% NET ROI
     initialOrderSize: 10,        
-    repairStep: 5,               
-    feeRate: 0.0005,             // 0.05% Taker Fee
-    contractSize: 0              // Auto-detected
+    repairStep: 5,               // Scaled adding
+    feeRate: 0.0005,             
+    contractSize: 0              
 };
 
 // ==================== GLOBAL STATE ====================
@@ -67,7 +67,6 @@ async function htxRequest(account, method, path, data = {}) {
 // ==================== CORE LOGIC ====================
 
 async function sync() {
-    // Detect contract size once (e.g., SHIB is 1,000,000)
     if (config.contractSize === 0) {
         const info = await htxRequest(config.accounts[0], 'GET', '/linear-swap-api/v1/swap_contract_info', { contract_code: config.symbol });
         if (info?.status === 'ok') {
@@ -78,25 +77,19 @@ async function sync() {
 
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
-        
-        // 1. PULL OFFICIAL POSITION DATA
         const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
+        
         if (res?.status === 'ok' && res.data) {
             const pos = res.data.find(p => p.direction === state.direction);
             if (pos && parseFloat(pos.volume) > 0) {
                 state.avgPrice = parseFloat(pos.cost_hold);
                 state.volume = parseFloat(pos.volume);
                 state.unrealizedUsdt = parseFloat(pos.profit);
-                
-                // --- DIRECT ROI FROM HTX ---
-                // 'profit_rate' is the official decimal ROI (e.g. 0.015 for 1.5%)
+                // DIRECT EXCHANGE ROI
                 state.roi = parseFloat(pos.profit_rate) * 100; 
-            } else { 
-                state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; 
-            }
+            } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
         }
 
-        // 2. PULL OFFICIAL EQUITY DATA
         const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
         if (accRes?.status === 'ok' && accRes.data) {
             const equity = parseFloat(accRes.data[0].margin_balance);
@@ -112,9 +105,8 @@ async function tradeLoop() {
     const long = accountStates[config.accounts[0].accountId];
     const short = accountStates[config.accounts[1].accountId];
 
-    // Initial Hedge
     if (long.volume === 0 && short.volume === 0) {
-        market.status = 'Opening Official Hedge...';
+        market.status = 'AI Initializing Winner Hedge...';
         isProcessing = true;
         await Promise.all(config.accounts.map((acc, idx) => htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
             contract_code: config.symbol, volume: config.initialOrderSize, direction: idx === 0 ? 'buy' : 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
@@ -123,13 +115,10 @@ async function tradeLoop() {
         return;
     }
 
-    // Calculation: Total Equity across both accounts to find Margin
     const totalVol = long.volume + short.volume;
     const realNotional = totalVol * config.contractSize * market.last;
     const marginUsed = realNotional / config.leverage;
     const estFees = realNotional * config.feeRate;
-    
-    // Net PnL = (Exchange Long PnL + Exchange Short PnL) - (Projected Taker Fees to Close)
     const netPnLUsdt = (long.unrealizedUsdt + short.unrealizedUsdt) - estFees;
     const netRoi = marginUsed > 0 ? (netPnLUsdt / marginUsed) * 100 : 0;
 
@@ -139,25 +128,30 @@ async function tradeLoop() {
         return;
     }
 
-    // REPAIR LOGIC: Nudge the side with the lower Official ROI
+    // --- WINNER-WEIGHTING AI LOGIC ---
     const now = Date.now();
     if (now - lastActionTime > 3000) {
         let targetAcc = null;
 
-        // Force volume balance first if they drift too far apart
-        if (Math.abs(long.volume - short.volume) > 5) {
-            targetAcc = long.volume < short.volume ? config.accounts[0] : config.accounts[1];
-            market.status = 'Balancing Contracts...';
-        } else {
-            // Repair the side pulling the Net ROI down
-            targetAcc = long.roi < short.roi ? config.accounts[0] : config.accounts[1];
-            market.status = 'Repairing Exchange ROI...';
+        // If Long is winning (ROI > 0) and performing better than Short
+        if (long.roi > 0 && long.roi > short.roi) {
+            targetAcc = config.accounts[0]; // Push the winner
+            market.status = 'AI: Weighting Long Winner';
+        } 
+        // If Short is winning (ROI > 0) and performing better than Long
+        else if (short.roi > 0 && short.roi > long.roi) {
+            targetAcc = config.accounts[1]; // Push the winner
+            market.status = 'AI: Weighting Short Winner';
+        }
+        // If both are negative, repair the side that is closest to turning positive
+        else {
+            targetAcc = long.roi > short.roi ? config.accounts[0] : config.accounts[1];
+            market.status = 'AI: Repairing Laggard';
         }
 
         if (targetAcc) {
-            const side = accountStates[targetAcc.accountId].direction;
             await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: config.repairStep, direction: side, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+                contract_code: config.symbol, volume: config.repairStep, direction: accountStates[targetAcc.accountId].direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
             lastActionTime = now;
         }
@@ -207,15 +201,15 @@ app.get('/', (req, res) => {
 <body class="p-4 md:p-10">
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-8">
-            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Processing...</p></div>
+            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC AI</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Processing...</p></div>
             <div class="flex gap-10 text-right">
                 <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p><p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p></div>
-                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Combined Realized (Equity)</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.00000000</p></div>
+                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Combined Realized (Equity Growth)</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.00000000</p></div>
             </div>
         </div>
 
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20 text-center">
-            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit ROI (HTX Synced)</p>
+            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit ROI (Direct HTX Sync)</p>
             <h2 id="netRoi" class="text-7xl font-black mb-4 font-mono">+0.0000%</h2>
             <div class="inline-flex items-center gap-2 bg-zinc-900 px-4 py-2 rounded-full border border-zinc-800">
                 <span class="text-[10px] font-bold text-zinc-500 uppercase">Target:</span><span class="text-xs font-mono font-bold text-indigo-400">${config.targetNetRoi.toFixed(2)}%</span>
