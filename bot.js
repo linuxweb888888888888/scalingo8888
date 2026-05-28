@@ -39,15 +39,14 @@ const config = {
     takeProfitPercent: parseFloat(process.env.TAKE_PROFIT_PERCENT) || 2.0,
     stopLossPercent: parseFloat(process.env.STOP_LOSS_PERCENT) || 2.0,
     orderSize: parseFloat(process.env.ORDER_SIZE) || 1,
-    hedgeThreshold: parseFloat(process.env.HEDGE_THRESHOLD) || 0.1 // 0.1% deviation allowed
+    hedgeThreshold: parseFloat(process.env.HEDGE_THRESHOLD) || 0.1
 };
 
 // ==================== ACCOUNT STATES ====================
 let accountStates = {};
 let lastSyncTime = 0;
-let hedgeDeviation = 0;
-let lastResetTime = 0;
 let totalResets = 0;
+let isOpeningPositions = false;
 
 // Initialize states for each account
 config.accounts.forEach((account, idx) => {
@@ -122,7 +121,7 @@ async function htxRequest(account, method, path, data = {}) {
     const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
-        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 5000 });
+        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 10000 });
         return res.data;
     } catch (e) { 
         console.error(`API Error for account ${account.accountId}:`, e.message);
@@ -144,6 +143,7 @@ async function syncAccountData(account, state) {
                 state.initialBalance = realBalance;
                 state.displayBalance = realBalance;
                 state.peakBalance = realBalance;
+                console.log(`Account ${account.accountId} (${state.direction.toUpperCase()}) Initial Balance: $${realBalance.toFixed(2)}`);
             }
             if (realBalance > state.peakBalance) {
                 state.displayBalance += (realBalance - state.peakBalance);
@@ -171,16 +171,6 @@ async function syncAccountData(account, state) {
             state.avgPrice = 0;
         }
         
-        const elapsed = (Date.now() - state.startTime) / 3600000;
-        const hr = state.realizedProfit / Math.max(elapsed, 0.01);
-        state.estimates = { 
-            hr, 
-            day: hr * 24, 
-            week: hr * 168, 
-            month: hr * 720, 
-            dgr: (hr * 24 / Math.max(state.initialBalance, 0.01)) * 100 
-        };
-        
         updateCombinedState();
     } catch (e) {
         console.error(`Sync error for account ${account.accountId}:`, e);
@@ -194,10 +184,6 @@ function updateCombinedState() {
     let totalTrades = 0;
     let totalWinningTrades = 0;
     let totalLosingTrades = 0;
-    let totalVolume = 0;
-    let activeDirection = "";
-    let activeCostHold = 0;
-    let activeRoi = 0;
     let longRoi = 0;
     let shortRoi = 0;
     
@@ -208,13 +194,6 @@ function updateCombinedState() {
         totalTrades += state.totalTrades;
         totalWinningTrades += state.winningTrades;
         totalLosingTrades += state.losingTrades;
-        
-        if (state.position.volume > 0) {
-            totalVolume += state.position.volume;
-            activeDirection = state.direction;
-            activeCostHold = state.avgPrice;
-            activeRoi = state.roi;
-        }
         
         if (state.direction === 'buy') {
             longRoi = state.roi;
@@ -234,18 +213,7 @@ function updateCombinedState() {
     botState.shortRoi = shortRoi;
     botState.hedgeDeviation = Math.abs(longRoi + shortRoi);
     botState.totalResets = totalResets;
-    
-    if (totalVolume > 0) {
-        botState.openPosition = { 
-            volume: totalVolume, 
-            direction: activeDirection, 
-            costHold: activeCostHold 
-        };
-        botState.roi = activeRoi;
-    } else {
-        botState.openPosition = { volume: 0, direction: "", costHold: 0 };
-        botState.roi = 0;
-    }
+    botState.roi = longRoi !== 0 ? longRoi : shortRoi;
     
     if (botState.currentPrice > 0) {
         botState.profitShibLeveraged = (botState.realizedProfit * 10) / botState.currentPrice;
@@ -262,154 +230,40 @@ function updateCombinedState() {
     };
 }
 
-// ==================== PERFECT HEDGE MANAGEMENT ====================
-async function resetAndReopenPositions(reason) {
-    if (config.accounts.length < 2) return;
-    
-    const now = Date.now();
-    // Prevent too frequent resets (minimum 10 seconds between resets)
-    if (now - lastResetTime < 10000) return;
+// ==================== ATOMIC POSITION OPENING ====================
+async function openBothPositionsTogether() {
+    if (config.accounts.length < 2) return false;
+    if (isOpeningPositions) return false;
     
     const longAccount = config.accounts[0];
     const shortAccount = config.accounts[1];
     const longState = accountStates[longAccount.accountId];
     const shortState = accountStates[shortAccount.accountId];
     
-    // Check if both positions exist
+    // Check if both are closed
     const longHasPosition = longState.position.volume > 0;
     const shortHasPosition = shortState.position.volume > 0;
     
-    if (longHasPosition && shortHasPosition) {
-        console.log(`\n🔄 PERFECT HEDGE RESET TRIGGERED`);
-        console.log(`   Reason: ${reason}`);
-        console.log(`   LONG ROI: ${longState.roi.toFixed(2)}% | SHORT ROI: ${shortState.roi.toFixed(2)}%`);
-        console.log(`   Deviation: ${(longState.roi + shortState.roi).toFixed(2)}%`);
+    if (!longHasPosition && !shortHasPosition) {
+        isOpeningPositions = true;
         
-        // Close both positions
-        if (!longState.isTrading && !shortState.isTrading) {
-            longState.isTrading = true;
-            shortState.isTrading = true;
-            
-            // Close LONG position
-            if (longState.position.volume > 0) {
-                await htxRequest(longAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol,
-                    volume: longState.position.volume,
-                    direction: 'sell',
-                    offset: 'close',
-                    lever_rate: config.leverage,
-                    order_price_type: 'opponent'
-                });
-                console.log(`   ✅ Closed LONG position`);
-            }
-            
-            await new Promise(resolve => setTimeout(resolve, 500));
-            
-            // Close SHORT position
-            if (shortState.position.volume > 0) {
-                await htxRequest(shortAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol,
-                    volume: shortState.position.volume,
-                    direction: 'buy',
-                    offset: 'close',
-                    lever_rate: config.leverage,
-                    order_price_type: 'opponent'
-                });
-                console.log(`   ✅ Closed SHORT position`);
-            }
-            
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            
-            // Reopen both positions simultaneously
-            console.log(`   🚀 Reopening fresh positions at ${botState.currentPrice}`);
-            
-            // Open LONG
-            await htxRequest(longAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol,
-                volume: longState.settings.orderSize,
-                direction: 'buy',
-                offset: 'open',
-                lever_rate: config.leverage,
-                order_price_type: 'opponent'
-            });
-            
-            await new Promise(resolve => setTimeout(resolve, 500));
-            
-            // Open SHORT
-            await htxRequest(shortAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol,
-                volume: shortState.settings.orderSize,
-                direction: 'sell',
-                offset: 'open',
-                lever_rate: config.leverage,
-                order_price_type: 'opponent'
-            });
-            
-            longState.totalTrades++;
-            shortState.totalTrades++;
-            longState.lastOpenTime = now;
-            shortState.lastOpenTime = now;
-            totalResets++;
-            
-            console.log(`   ✅ Fresh positions opened - Hedge reset #${totalResets}`);
-            console.log(`=========================================\n`);
-            
-            longState.isTrading = false;
-            shortState.isTrading = false;
-            lastResetTime = now;
-            botState.lastResetReason = reason;
-        }
-    }
-}
-
-async function checkHedgePerfect() {
-    if (config.accounts.length < 2) return;
-    
-    const longState = accountStates[config.accounts[0].accountId];
-    const shortState = accountStates[config.accounts[1].accountId];
-    
-    const longHasPosition = longState.position.volume > 0;
-    const shortHasPosition = shortState.position.volume > 0;
-    
-    // Only check if both positions exist
-    if (longHasPosition && shortHasPosition) {
-        const deviation = Math.abs(longState.roi + shortState.roi);
+        console.log(`\n🔗 Attempting to open BOTH positions simultaneously at ${botState.currentPrice}`);
         
-        // If deviation exceeds threshold, reset both positions
-        if (deviation > config.hedgeThreshold) {
-            const reason = `Hedge deviation ${deviation.toFixed(2)}% > ${config.hedgeThreshold}% threshold`;
-            await resetAndReopenPositions(reason);
-        }
-    }
-    // If only one side has position (shouldn't happen), reset
-    else if (longHasPosition !== shortHasPosition) {
-        const reason = `One side only - LONG:${longHasPosition} SHORT:${shortHasPosition}`;
-        await resetAndReopenPositions(reason);
-    }
-}
-
-// ==================== SYNCHRONIZED TRADING ====================
-async function openSynchronizedPositions() {
-    if (config.accounts.length < 2) return;
-    
-    const longAccount = config.accounts[0];
-    const shortAccount = config.accounts[1];
-    const longState = accountStates[longAccount.accountId];
-    const shortState = accountStates[shortAccount.accountId];
-    
-    // Check if both positions are closed
-    const longHasPosition = longState.position.volume > 0;
-    const shortHasPosition = shortState.position.volume > 0;
-    
-    // If both are closed, open new positions simultaneously
-    if (!longHasPosition && !shortHasPosition && !longState.isTrading && !shortState.isTrading) {
-        const now = Date.now();
-        if (now - lastSyncTime > 5000) { // Prevent rapid re-entries
-            lastSyncTime = now;
+        try {
+            // Check balances first
+            console.log(`   Checking balances...`);
+            console.log(`   LONG Account Balance: $${longState.walletBalance.toFixed(2)}`);
+            console.log(`   SHORT Account Balance: $${shortState.walletBalance.toFixed(2)}`);
             
-            console.log(`\n🔗 Opening synchronized positions at ${botState.currentPrice}`);
+            if (longState.walletBalance < 1) {
+                console.log(`   ❌ LONG account has insufficient balance! Need at least $1 USDT`);
+            }
+            if (shortState.walletBalance < 1) {
+                console.log(`   ❌ SHORT account has insufficient balance! Need at least $1 USDT`);
+            }
             
             // Open LONG position
+            console.log(`   Opening LONG position...`);
             const longOrder = await htxRequest(longAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol,
                 volume: longState.settings.orderSize,
@@ -419,10 +273,17 @@ async function openSynchronizedPositions() {
                 order_price_type: 'opponent'
             });
             
-            // Small delay to ensure order processes
-            await new Promise(resolve => setTimeout(resolve, 500));
+            if (longOrder?.data?.order_id) {
+                console.log(`   ✅ LONG position opened successfully (Order: ${longOrder.data.order_id})`);
+            } else {
+                console.log(`   ❌ LONG position failed:`, longOrder);
+            }
+            
+            // Wait 1 second between orders
+            await new Promise(resolve => setTimeout(resolve, 1000));
             
             // Open SHORT position
+            console.log(`   Opening SHORT position...`);
             const shortOrder = await htxRequest(shortAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol,
                 volume: shortState.settings.orderSize,
@@ -432,27 +293,176 @@ async function openSynchronizedPositions() {
                 order_price_type: 'opponent'
             });
             
-            if (longOrder?.data?.order_id || shortOrder?.data?.order_id) {
+            if (shortOrder?.data?.order_id) {
+                console.log(`   ✅ SHORT position opened successfully (Order: ${shortOrder.data.order_id})`);
+            } else {
+                console.log(`   ❌ SHORT position failed:`, shortOrder);
+            }
+            
+            // Verify both opened
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            // Refresh data to check if positions are actually open
+            await syncAccountData(longAccount, longState);
+            await syncAccountData(shortAccount, shortState);
+            
+            const longNowHasPosition = longState.position.volume > 0;
+            const shortNowHasPosition = shortState.position.volume > 0;
+            
+            if (longNowHasPosition && shortNowHasPosition) {
+                console.log(`   ✅ SUCCESS: Both positions are now open!`);
                 longState.totalTrades++;
                 shortState.totalTrades++;
-                longState.lastOpenTime = now;
-                shortState.lastOpenTime = now;
-                console.log(`✅ Synchronized positions opened at ${botState.currentPrice}`);
+                longState.lastOpenTime = Date.now();
+                shortState.lastOpenTime = Date.now();
                 console.log(`=========================================\n`);
+                isOpeningPositions = false;
+                return true;
+            } else if (!longNowHasPosition && !shortNowHasPosition) {
+                console.log(`   ❌ FAILED: Neither position opened`);
+            } else if (!longNowHasPosition) {
+                console.log(`   ⚠️ PARTIAL: Only SHORT position opened - LONG failed`);
+                // Close the open position to maintain consistency
+                console.log(`   Closing orphaned SHORT position...`);
+                await htxRequest(shortAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                    contract_code: config.symbol,
+                    volume: shortState.position.volume,
+                    direction: 'buy',
+                    offset: 'close',
+                    lever_rate: config.leverage,
+                    order_price_type: 'opponent'
+                });
+            } else if (!shortNowHasPosition) {
+                console.log(`   ⚠️ PARTIAL: Only LONG position opened - SHORT failed`);
+                // Close the open position to maintain consistency
+                console.log(`   Closing orphaned LONG position...`);
+                await htxRequest(longAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                    contract_code: config.symbol,
+                    volume: longState.position.volume,
+                    direction: 'sell',
+                    offset: 'close',
+                    lever_rate: config.leverage,
+                    order_price_type: 'opponent'
+                });
             }
+            
+        } catch (error) {
+            console.error(`   Error opening positions:`, error);
+        }
+        
+        console.log(`=========================================\n`);
+        isOpeningPositions = false;
+        return false;
+    }
+    return false;
+}
+
+// ==================== FORCE RESET (close both if only one open) ====================
+async function forceResetIfOnlyOneOpen() {
+    if (config.accounts.length < 2) return;
+    
+    const longAccount = config.accounts[0];
+    const shortAccount = config.accounts[1];
+    const longState = accountStates[longAccount.accountId];
+    const shortState = accountStates[shortAccount.accountId];
+    
+    const longHasPosition = longState.position.volume > 0;
+    const shortHasPosition = shortState.position.volume > 0;
+    
+    // If ONLY ONE side has a position, close it immediately
+    if (longHasPosition !== shortHasPosition) {
+        console.log(`\n⚠️ IMBALANCE DETECTED: Only ${longHasPosition ? 'LONG' : 'SHORT'} has position`);
+        
+        if (longHasPosition) {
+            console.log(`   Closing orphaned LONG position...`);
+            await htxRequest(longAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol,
+                volume: longState.position.volume,
+                direction: 'sell',
+                offset: 'close',
+                lever_rate: config.leverage,
+                order_price_type: 'opponent'
+            });
+            console.log(`   ✅ LONG position closed`);
+        } else if (shortHasPosition) {
+            console.log(`   Closing orphaned SHORT position...`);
+            await htxRequest(shortAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol,
+                volume: shortState.position.volume,
+                direction: 'buy',
+                offset: 'close',
+                lever_rate: config.leverage,
+                order_price_type: 'opponent'
+            });
+            console.log(`   ✅ SHORT position closed`);
+        }
+        
+        console.log(`   Both positions now closed. Will reopen together.`);
+        console.log(`=========================================\n`);
+        
+        totalResets++;
+        botState.lastResetReason = "Single side only - force reset";
+    }
+}
+
+// ==================== CHECK HEDGE PERFECT ====================
+async function checkHedgePerfect() {
+    if (config.accounts.length < 2) return;
+    
+    const longState = accountStates[config.accounts[0].accountId];
+    const shortState = accountStates[config.accounts[1].accountId];
+    
+    const longHasPosition = longState.position.volume > 0;
+    const shortHasPosition = shortState.position.volume > 0;
+    
+    // If both have positions, check hedge deviation
+    if (longHasPosition && shortHasPosition) {
+        const deviation = Math.abs(longState.roi + shortState.roi);
+        
+        if (deviation > config.hedgeThreshold) {
+            console.log(`\n🔄 HEDGE RESET TRIGGERED - Deviation: ${deviation.toFixed(2)}%`);
+            console.log(`   LONG ROI: ${longState.roi.toFixed(2)}% | SHORT ROI: ${shortState.roi.toFixed(2)}%`);
+            
+            // Close both positions
+            await htxRequest(config.accounts[0], 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol,
+                volume: longState.position.volume,
+                direction: 'sell',
+                offset: 'close',
+                lever_rate: config.leverage,
+                order_price_type: 'opponent'
+            });
+            
+            await new Promise(resolve => setTimeout(resolve, 500));
+            
+            await htxRequest(config.accounts[1], 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol,
+                volume: shortState.position.volume,
+                direction: 'buy',
+                offset: 'close',
+                lever_rate: config.leverage,
+                order_price_type: 'opponent'
+            });
+            
+            console.log(`   ✅ Both positions closed`);
+            console.log(`   Will reopen both together on next cycle`);
+            console.log(`=========================================\n`);
+            
+            totalResets++;
+            botState.lastResetReason = `Hedge deviation ${deviation.toFixed(2)}% > ${config.hedgeThreshold}%`;
         }
     }
 }
 
 async function checkTradesForAccount(account, state) {
     if (!state.isRunning || state.isTrading || botState.currentPrice <= 0) return;
-    state.isTrading = true;
     
-    try {
-        const hasPosition = state.position.volume > 0;
-        
-        if (hasPosition) {
-            // Check take profit condition
+    const hasPosition = state.position.volume > 0;
+    
+    if (hasPosition) {
+        state.isTrading = true;
+        try {
+            // Check take profit
             if (state.roi >= state.settings.takeProfit) {
                 const closeDirection = state.direction === 'buy' ? 'sell' : 'buy';
                 await htxRequest(account, 'POST', '/linear-swap-api/v1/swap_cross_order', {
@@ -467,7 +477,7 @@ async function checkTradesForAccount(account, state) {
                 state.totalTrades++;
                 console.log(`✅ Account ${account.accountId} (${state.direction.toUpperCase()}): TAKE PROFIT at ${state.roi.toFixed(2)}%`);
             } 
-            // Check stop loss condition
+            // Check stop loss
             else if (state.roi <= -state.settings.stopLoss) {
                 const closeDirection = state.direction === 'buy' ? 'sell' : 'buy';
                 await htxRequest(account, 'POST', '/linear-swap-api/v1/swap_cross_order', {
@@ -482,22 +492,24 @@ async function checkTradesForAccount(account, state) {
                 state.totalTrades++;
                 console.log(`❌ Account ${account.accountId} (${state.direction.toUpperCase()}): STOP LOSS at ${state.roi.toFixed(2)}%`);
             }
+        } catch (e) {
+            console.error(`Trade error for account ${account.accountId}:`, e);
         }
-    } catch (e) {
-        console.error(`Trade error for account ${account.accountId}:`, e);
+        state.isTrading = false;
     }
-    
-    state.isTrading = false;
 }
 
 async function checkTrades() {
-    // First, try to open synchronized positions
-    await openSynchronizedPositions();
+    // FIRST: Force close if only one side is open (most important)
+    await forceResetIfOnlyOneOpen();
     
-    // Check hedge perfection
+    // SECOND: Open both positions together if both are closed
+    await openBothPositionsTogether();
+    
+    // THIRD: Check hedge deviation if both are open
     await checkHedgePerfect();
     
-    // Then check for take profit/stop loss on both accounts
+    // FOURTH: Check take profit/stop loss
     for (let i = 0; i < config.accounts.length; i++) {
         const account = config.accounts[i];
         const state = accountStates[account.accountId];
@@ -522,23 +534,17 @@ app.get('/', (req, res) => {
         .card-hover { transition: all 0.3s ease; }
         .card-hover:hover { transform: translateY(-5px); box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1); }
         .number-font { font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
-        @keyframes pulse-green {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.7; }
-        }
+        @keyframes pulse-green { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
         .pulse { animation: pulse-green 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
-        .hedge-perfect { color: #10b981; }
-        .hedge-reset { animation: pulse-green 1s ease-in-out; }
     </style>
 </head>
 <body class="bg-gradient-to-br from-gray-50 to-gray-100">
     <div class="container mx-auto px-4 py-8 max-w-7xl">
-        <!-- Header -->
         <div class="gradient-bg rounded-2xl shadow-2xl p-6 mb-8 text-white">
             <div class="flex justify-between items-center">
                 <div>
                     <h1 class="text-4xl font-bold mb-2">🎯 Perfect Hedge Bot</h1>
-                    <p class="text-white/80 text-sm">Perfectly Synchronized LONG + SHORT | Auto-Reset on Deviation</p>
+                    <p class="text-white/80 text-sm">Atomic Position Opening | Both Sides MUST Open Together</p>
                 </div>
                 <div class="text-right">
                     <div class="text-3xl font-bold number-font" id="livePrice">$0.00000000</div>
@@ -555,7 +561,6 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- Combined Stats -->
         <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
             <div class="bg-white rounded-xl shadow-lg p-6 card-hover">
                 <div class="text-gray-500 text-sm mb-2">💰 Total Net Profit</div>
@@ -579,11 +584,10 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- Hedge Status -->
         <div class="bg-white rounded-xl shadow-lg p-6 mb-8">
             <div class="flex justify-between items-center mb-4">
                 <h3 class="text-lg font-bold">🎯 Hedge Status Monitor</h3>
-                <div class="text-xs bg-green-100 text-green-600 px-2 py-1 rounded-full">Auto-Reset ACTIVE</div>
+                <div class="text-xs bg-green-100 text-green-600 px-2 py-1 rounded-full">Atomic Opening ACTIVE</div>
             </div>
             <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-4">
                 <div class="text-center">
@@ -603,37 +607,25 @@ app.get('/', (req, res) => {
             <div class="mt-4 h-4 bg-gray-200 rounded-full overflow-hidden">
                 <div id="hedgeBar" class="h-full bg-gradient-to-r from-red-500 via-yellow-500 to-green-500 transition-all duration-500" style="width: 50%"></div>
             </div>
-            <div class="flex justify-between text-xs text-gray-500 mt-2">
-                <span>⬅️ SHORT Better</span>
-                <span>Perfect Hedge (0%)</span>
-                <span>LONG Better ➡️</span>
-            </div>
             <div class="mt-4 p-3 bg-gray-50 rounded-lg">
                 <div class="flex justify-between text-sm">
                     <span class="text-gray-600">Last Reset Reason:</span>
                     <span class="font-mono font-bold" id="lastResetReason">None</span>
                 </div>
-                <div class="flex justify-between text-sm mt-1">
-                    <span class="text-gray-600">Total Hedge Resets:</span>
-                    <span class="font-mono font-bold" id="totalResets">0</span>
-                </div>
             </div>
         </div>
 
-        <!-- Account Cards -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8" id="accountsContainer"></div>
-
-        <!-- Chart -->
+        
         <div class="bg-white rounded-xl shadow-lg p-6 mb-8">
             <h3 class="text-lg font-bold mb-4">Profit Timeline</h3>
             <canvas id="profitChart" height="100"></canvas>
         </div>
 
-        <!-- Status -->
         <div class="bg-white rounded-xl shadow-lg p-4 text-center">
             <div class="flex items-center justify-center gap-2">
                 <div class="w-2 h-2 bg-green-500 rounded-full pulse"></div>
-                <span class="text-sm text-gray-600">Perfect Hedge Mode | Auto-reset when deviation > ${config.hedgeThreshold}% | Last update: <span id="lastUpdate">Just now</span></span>
+                <span class="text-sm text-gray-600">Atomic Hedge Mode | Both positions open/close together | Last update: <span id="lastUpdate">Just now</span></span>
             </div>
         </div>
     </div>
@@ -656,7 +648,6 @@ app.get('/', (req, res) => {
                 document.getElementById('wins').innerText = data.winningTrades;
                 document.getElementById('losses').innerText = data.losingTrades;
                 document.getElementById('resetCount').innerText = data.totalResets || 0;
-                document.getElementById('totalResets').innerText = data.totalResets || 0;
                 document.getElementById('lastResetReason').innerText = data.lastResetReason || 'None';
                 
                 const winLossRatio = data.winningTrades / Math.max(data.losingTrades, 1);
@@ -670,15 +661,10 @@ app.get('/', (req, res) => {
                 
                 const hedgeDev = Math.abs(data.hedgeDeviation);
                 document.getElementById('hedgeDeviation').innerText = hedgeDev.toFixed(2) + '%';
-                
                 const hedgeElem = document.getElementById('hedgeDeviation');
-                if (hedgeDev < 0.2) {
-                    hedgeElem.style.color = '#10b981';
-                } else if (hedgeDev < 1) {
-                    hedgeElem.style.color = '#f59e0b';
-                } else {
-                    hedgeElem.style.color = '#ef4444';
-                }
+                if (hedgeDev < 0.2) hedgeElem.style.color = '#10b981';
+                else if (hedgeDev < 1) hedgeElem.style.color = '#f59e0b';
+                else hedgeElem.style.color = '#ef4444';
                 
                 const hedgeBarPosition = 50 + (data.longRoi - data.shortRoi) * 5;
                 document.getElementById('hedgeBar').style.width = Math.min(100, Math.max(0, hedgeBarPosition)) + '%';
@@ -686,13 +672,11 @@ app.get('/', (req, res) => {
                 if (data.accounts && data.accounts.length > 0) {
                     const container = document.getElementById('accountsContainer');
                     container.innerHTML = '';
-                    
                     data.accounts.forEach((acc, idx) => {
                         const isLong = idx === 0;
                         const bgGradient = isLong ? 'from-emerald-50 to-emerald-100/30' : 'from-red-50 to-red-100/30';
                         const icon = isLong ? '📈' : '📉';
                         const title = isLong ? 'LONG POSITION' : 'SHORT POSITION';
-                        
                         const card = document.createElement('div');
                         card.className = \`bg-gradient-to-br \${bgGradient} rounded-xl shadow-lg p-6\`;
                         card.innerHTML = \`
@@ -715,7 +699,6 @@ app.get('/', (req, res) => {
                 profitHistory.push(data.realizedProfit);
                 if (profitHistory.length > 50) profitHistory.shift();
                 if (profitChart) { profitChart.data.datasets[0].data = profitHistory; profitChart.update(); }
-                
                 document.getElementById('lastUpdate').innerText = new Date().toLocaleTimeString();
             } catch (error) { console.error('Error:', error); }
         }
@@ -745,7 +728,6 @@ app.get('/api/status', (req, res) => {
         direction: state.direction,
         avgPrice: state.avgPrice
     }));
-    
     res.json({ ...botState, accounts: accountsData });
 });
 
@@ -771,12 +753,12 @@ function startWS() {
 // ==================== INITIALIZE ====================
 async function initialize() {
     console.log('========================================');
-    console.log('PERFECT HEDGE TRADING BOT');
+    console.log('PERFECT HEDGE TRADING BOT - ATOMIC MODE');
     console.log('========================================');
     console.log(`Symbol: ${config.symbol}`);
     console.log(`Leverage: ${config.leverage}X`);
     console.log(`Hedge Threshold: ${config.hedgeThreshold}%`);
-    console.log(`Strategy: Close & Reopen if deviation > threshold`);
+    console.log(`Strategy: Both positions MUST open together`);
     console.log(`Active Accounts: ${config.accounts.length}`);
     config.accounts.forEach((acc, idx) => {
         console.log(`  Account ${acc.accountId}: ${idx === 0 ? 'BUY (LONG)' : 'SELL (SHORT)'} direction`);
