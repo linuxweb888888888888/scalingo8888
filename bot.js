@@ -28,12 +28,12 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     
-    // --- BALANCED STEP-SYNC SETTINGS ---
-    minNetProfitUsdt: 0.0001,    
-    initialOrderSize: 10,        
-    rebalanceStep: 1,            // Minimal contract step
-    syncThreshold: 0.05,         // ROI drift trigger
-    feeRate: 0.0005              
+    // --- TURBO PROFIT STRATEGY ---
+    minNetProfitUsdt: 0.00000001, // Zero-floor exit (Fastest)
+    initialOrderSize: 10,        // Initial contracts
+    syncThreshold: 0.03,         // Sync if drift > 0.03%
+    scalingFactor: 0.25,         // Add 25% of volume to repair faster
+    feeRate: 0.0005              // 0.05% Taker fee
 };
 
 // ==================== GLOBAL STATE ====================
@@ -97,9 +97,9 @@ async function tradeLoop() {
     const long = accountStates[config.accounts[0].accountId];
     const short = accountStates[config.accounts[1].accountId];
 
-    // 1. Initial Hedge
+    // 1. Initial Hedge Entry
     if (long.volume === 0 && short.volume === 0) {
-        market.status = 'Opening Balanced Hedge';
+        market.status = 'FAST ENTRY...';
         isProcessing = true;
         await Promise.all(config.accounts.map((acc, idx) => htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
             contract_code: config.symbol, volume: config.initialOrderSize, direction: idx === 0 ? 'buy' : 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
@@ -108,46 +108,49 @@ async function tradeLoop() {
         return;
     }
 
-    // 2. Net Exit Profit
-    const currentNotional = (long.volume + short.volume) * market.last;
-    const estExitFees = currentNotional * config.feeRate;
-    const netProfit = (long.unrealizedUsdt + short.unrealizedUsdt) - estExitFees;
+    // 2. Net Profit Calculation (Includes Fees for both sides)
+    const totalVol = long.volume + short.volume;
+    const estFees = (totalVol * market.last) * config.feeRate;
+    const netProfit = (long.unrealizedUsdt + short.unrealizedUsdt) - estFees;
 
+    // FAST EXIT
     if (netProfit >= config.minNetProfitUsdt) {
-        market.status = `Taking Net Profit: +$${netProfit.toFixed(8)}`;
+        market.status = `PROFIT HIT: +$${netProfit.toFixed(8)}`;
         await closeAll();
         return;
     }
 
-    // 3. STEP-SYNC BALANCING
+    // 3. AGGRESSIVE SYNC & BALANCE
     const drift = long.roi + short.roi;
     const now = Date.now();
 
-    if (now - lastActionTime > 8000) {
+    if (now - lastActionTime > 4000) { // 4s Pulse
         let targetAcc = null;
-        let actionLabel = "";
+        let amount = 1;
 
-        // PRIORITY 1: Volume Parity (If Long != Short, match the smaller one)
+        // PRIORITY A: BALANCE VOLUME (Safety)
         if (long.volume !== short.volume) {
             targetAcc = long.volume < short.volume ? config.accounts[0] : config.accounts[1];
-            actionLabel = "Restoring Balance";
+            amount = Math.abs(long.volume - short.volume); // Immediate catch-up
+            market.status = 'Balancing Hedge...';
         } 
-        // PRIORITY 2: ROI Adjustment (If Balanced, nudge the laggard)
+        // PRIORITY B: AGGRESSIVE REPAIR
         else if (Math.abs(drift) > config.syncThreshold) {
             targetAcc = long.roi < -short.roi ? config.accounts[0] : config.accounts[1];
-            actionLabel = "Step-Sync ROI";
+            // Scaled addition: 25% of current size or min 1
+            amount = Math.max(1, Math.floor(targetAcc.volume * config.scalingFactor));
+            market.status = 'Turbo Syncing...';
         }
 
         if (targetAcc) {
             const side = accountStates[targetAcc.accountId].direction;
-            market.status = `${actionLabel} (${side.toUpperCase()})`;
             await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: config.rebalanceStep, direction: side, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+                contract_code: config.symbol, volume: amount, direction: side, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
             lastActionTime = now;
         }
     } else {
-        market.status = 'Optimizing Hedge';
+        market.status = 'Optimizing for Exit';
     }
 }
 
@@ -162,7 +165,7 @@ async function closeAll() {
     setTimeout(() => { isProcessing = false; }, 4000);
 }
 
-// ==================== WS ====================
+// ==================== WEBSOCKET ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -182,7 +185,7 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-// ==================== DASHBOARD (STAYING SAME DESIGN) ====================
+// ==================== DASHBOARD ====================
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), feeRate: config.feeRate }));
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
@@ -200,6 +203,7 @@ app.get('/', (req, res) => {
 </head>
 <body class="p-4 md:p-10">
     <div class="max-w-4xl mx-auto">
+        <!-- Header -->
         <div class="flex justify-between items-center mb-8">
             <div>
                 <h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1>
@@ -211,12 +215,13 @@ app.get('/', (req, res) => {
                     <p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p>
                 </div>
                 <div>
-                    <p class="text-[10px] text-zinc-500 font-bold uppercase">Realized Profit</p>
+                    <p class="text-[10px] text-zinc-500 font-bold uppercase">Total Realized</p>
                     <p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.000000</p>
                 </div>
             </div>
         </div>
 
+        <!-- MAIN PROFIT ANALYZER -->
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20">
             <div class="relative z-10 text-center">
                 <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Incl. Fees)</p>
@@ -229,6 +234,7 @@ app.get('/', (req, res) => {
             <div class="absolute top-0 left-1/2 -translate-x-1/2 w-64 h-64 bg-indigo-600/10 blur-[100px] rounded-full"></div>
         </div>
 
+        <!-- Position Progress Cards -->
         <div class="grid md:grid-cols-2 gap-6">
             <div class="glass rounded-[2rem] p-6 border-l-4 border-emerald-500">
                 <div class="flex justify-between items-center mb-4">
@@ -280,6 +286,7 @@ app.get('/', (req, res) => {
                     totalVal += (a.volume * d.market.last);
                     totalRealized += a.realizedProfit;
                 });
+
                 document.getElementById('totalRealized').innerText = (totalRealized >= 0 ? '+' : '') + '$' + totalRealized.toFixed(6);
                 const exitFees = totalVal * d.feeRate;
                 const projected = (longU + shortU) - exitFees;
@@ -296,5 +303,5 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(sync, 2000);
-setInterval(tradeLoop, 3000);
+setInterval(tradeLoop, 2500); // High-speed trade loop
 app.listen(config.port, '0.0.0.0');
