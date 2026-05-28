@@ -1,13 +1,17 @@
 {
   "name": "htx-arbitrage-server",
   "version": "1.0.0",
-  "description": "Master server for HTX triangular arbitrage",
+  "description": "HTX Triangular Arbitrage Master Server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
+    "socket.io": "^4.6.1",
     "axios": "^1.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
