@@ -28,26 +28,26 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     
-    // --- ADVANCED SYNC LOGIC ---
-    minNetProfitUsdt: 0.10,      // Only exit if Net Profit (after fees) > $0.10
-    orderSize: parseFloat(process.env.ORDER_SIZE) || 1, 
-    rebalanceStep: 0.2,          // Amount to add when syncing (e.g. 0.2 contracts)
-    syncThreshold: 0.20,         // Trigger sync if ROI drift > 0.20%
-    priceTolerance: 0.04,        // Max spread % to allow initial open
-    feeRate: 0.0005              // Estimated 0.05% taker fee
+    // --- PRECISION STRATEGY ---
+    minNetProfitUsdt: 0.001,      // Target positive net profit (USDT)
+    initialOrderSize: 10,        // Starting contracts
+    rebalanceStep: 1,            // Smallest adjustment (1 contract)
+    syncThreshold: 0.15,         // Drift % to trigger rebalance
+    priceTolerance: 0.05,        // Max spread to open
+    feeRate: 0.0005              // 0.05% Taker fee
 };
 
 // ==================== GLOBAL STATE ====================
 let market = { last: 0, bid: 0, ask: 0, spread: 0, status: 'initializing' };
 let accountStates = {};
 let isProcessing = false;
-let lastRebalanceTime = 0;
+let lastSyncTime = 0;
 
 config.accounts.forEach((account, idx) => {
     accountStates[account.accountId] = {
         direction: idx === 0 ? 'buy' : 'sell',
-        avgPrice: 0, roi: 0, volume: 0, wallet: 0,
-        unrealizedUsdt: 0, initialBalance: 0, realizedProfit: 0
+        avgPrice: 0, roi: 0, volume: 0,
+        unrealizedUsdt: 0, initialBalance: 0, wallet: 0
     };
 });
 
@@ -83,13 +83,6 @@ async function sync() {
                     : ((state.avgPrice - price) / state.avgPrice) * 100 * config.leverage;
             } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
         }
-        const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
-        if (accRes?.status === 'ok') {
-            const bal = parseFloat(accRes.data[0].margin_balance);
-            if (state.initialBalance === 0) state.initialBalance = bal;
-            state.wallet = bal;
-            state.realizedProfit = bal - state.initialBalance;
-        }
     }
 }
 
@@ -98,7 +91,7 @@ async function tradeLoop() {
     const long = accountStates[config.accounts[0].accountId];
     const short = accountStates[config.accounts[1].accountId];
 
-    // 1. Initial Entry
+    // 1. Initial Opening
     if (long.volume === 0 && short.volume === 0) {
         if (market.spread > config.priceTolerance) {
             market.status = `Wait Spread (${market.spread.toFixed(3)}%)`;
@@ -108,42 +101,42 @@ async function tradeLoop() {
         isProcessing = true;
         await Promise.all([
             htxRequest(config.accounts[0], 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+                contract_code: config.symbol, volume: config.initialOrderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             }),
             htxRequest(config.accounts[1], 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: config.orderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+                contract_code: config.symbol, volume: config.initialOrderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             })
         ]);
         setTimeout(() => { isProcessing = false; }, 3000);
         return;
     }
 
-    // 2. Net Profit Calculation
+    // 2. Net Exit Profit Calculation
     const totalNotional = (long.volume + short.volume) * market.last;
-    const exitFees = totalNotional * config.feeRate;
-    const netProfit = (long.unrealizedUsdt + short.unrealizedUsdt) - exitFees;
+    const estExitFees = totalNotional * config.feeRate;
+    const netProfit = (long.unrealizedUsdt + short.unrealizedUsdt) - estExitFees;
 
-    // 3. Profit Exit Trigger
+    // 3. Exit Logic
     if (netProfit >= config.minNetProfitUsdt) {
-        market.status = `Target Met (+$${netProfit.toFixed(3)})`;
+        market.status = `Target Met (+$${netProfit.toFixed(6)})`;
         await closeAll();
         return;
     }
 
-    // 4. ROI Syncing (Auto-adjusting position size)
-    const drift = long.roi + short.roi; // Ideally 0
+    // 4. Auto-Adjusting (Syncing)
+    const drift = long.roi + short.roi;
     const now = Date.now();
 
-    if (Math.abs(drift) > config.syncThreshold && (now - lastRebalanceTime > 15000)) {
-        market.status = `Syncing ROI (${drift.toFixed(2)}%)`;
-        // Identify which side is falling behind in ROI and nudge it
-        const accToNudge = long.roi < -short.roi ? config.accounts[0] : config.accounts[1];
-        const side = accountStates[accToNudge.accountId].direction;
+    if (Math.abs(drift) > config.syncThreshold && (now - lastSyncTime > 15000)) {
+        market.status = 'Syncing...';
+        // Add 1 contract to the side with lower ROI
+        const laggard = long.roi < -short.roi ? config.accounts[0] : config.accounts[1];
+        const side = accountStates[laggard.accountId].direction;
         
-        await htxRequest(accToNudge, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+        await htxRequest(laggard, 'POST', '/linear-swap-api/v1/swap_cross_order', {
             contract_code: config.symbol, volume: config.rebalanceStep, direction: side, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
         });
-        lastRebalanceTime = now;
+        lastSyncTime = now;
     } else {
         market.status = 'Hedged & Syncing';
     }
@@ -214,7 +207,7 @@ app.get('/', (req, res) => {
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20">
             <div class="relative z-10 text-center">
                 <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Incl. Fees)</p>
-                <h2 id="netProfit" class="text-6xl font-black mb-4 font-mono">+$0.00</h2>
+                <h2 id="netProfit" class="text-6xl font-black mb-4 font-mono">+$0.00000000</h2>
                 <div class="inline-flex items-center gap-2 bg-zinc-900 px-4 py-2 rounded-full border border-zinc-800">
                     <span class="text-[10px] font-bold text-zinc-500 uppercase">Market Spread:</span>
                     <span id="currentSpread" class="text-xs font-mono font-bold">0.000%</span>
@@ -235,8 +228,8 @@ app.get('/', (req, res) => {
                     <div id="longBar" class="roi-bar bg-emerald-500 h-full" style="width: 0%"></div>
                 </div>
                 <div class="flex justify-between items-center">
-                    <span class="text-xs text-zinc-500 uppercase font-bold">PnL (USDT)</span>
-                    <span id="longUsdt" class="text-sm font-mono font-bold text-white">$0.00</span>
+                    <span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL (USDT)</span>
+                    <span id="longUsdt" class="text-sm font-mono font-bold text-white">0 / $0.00000000</span>
                 </div>
             </div>
 
@@ -250,8 +243,8 @@ app.get('/', (req, res) => {
                     <div id="shortBar" class="roi-bar bg-rose-500 h-full" style="width: 0%"></div>
                 </div>
                 <div class="flex justify-between items-center">
-                    <span class="text-xs text-zinc-500 uppercase font-bold">PnL (USDT)</span>
-                    <span id="shortUsdt" class="text-sm font-mono font-bold text-white">$0.00</span>
+                    <span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL (USDT)</span>
+                    <span id="shortUsdt" class="text-sm font-mono font-bold text-white">0 / $0.00000000</span>
                 </div>
             </div>
         </div>
@@ -260,8 +253,7 @@ app.get('/', (req, res) => {
     <script>
         async function update() {
             try {
-                const r = await fetch('/api/status'); 
-                const d = await r.json();
+                const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('markPrice').innerText = d.market.last.toFixed(8);
                 document.getElementById('botStatus').innerText = d.market.status;
                 document.getElementById('currentSpread').innerText = d.market.spread.toFixed(3) + '%';
@@ -274,10 +266,9 @@ app.get('/', (req, res) => {
                     if(isLong) longU = a.unrealizedUsdt; else shortU = a.unrealizedUsdt;
                     
                     document.getElementById(prefix + 'Roi').innerText = a.roi.toFixed(2) + '%';
-                    document.getElementById(prefix + 'Usdt').innerText = (a.unrealizedUsdt >= 0 ? '+' : '') + '$' + a.unrealizedUsdt.toFixed(4);
+                    document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(8);
                     
-                    // Bar displays progress toward 1% volatility sync
-                    const prog = Math.min(100, Math.max(0, (Math.abs(a.roi) / 1.5) * 100));
+                    const prog = Math.min(100, Math.max(0, Math.abs(a.roi) * 10));
                     document.getElementById(prefix + 'Bar').style.width = (a.volume > 0 ? prog : 0) + '%';
                     
                     totalVal += (a.volume * d.market.last);
@@ -287,8 +278,8 @@ app.get('/', (req, res) => {
                 const projected = (longU + shortU) - exitFees;
                 
                 const pElem = document.getElementById('netProfit');
-                pElem.innerText = (projected >= 0 ? '+' : '') + '$' + projected.toFixed(4);
-                pElem.className = 'text-6xl font-black mb-4 font-mono ' + (projected >= 0 ? 'text-emerald-400' : 'text-zinc-600');
+                pElem.innerText = (projected >= 0 ? '+' : '') + '$' + projected.toFixed(8);
+                pElem.className = 'text-6xl font-black mb-4 font-mono ' + (projected >= 0 ? 'text-emerald-400' : 'text-rose-500');
             } catch(e) {}
         }
         setInterval(update, 1000);
