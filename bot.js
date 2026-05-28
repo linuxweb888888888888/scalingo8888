@@ -28,7 +28,8 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     orderSize: 1,                
-    triggerRoi: 2.0,             
+    triggerRoi: 2.5,             // 2.5% Trigger
+    addSize: 2,                  // 2 Contracts Add
     feeRate: 0.0005,             
     contractSize: 0              
 };
@@ -104,45 +105,31 @@ async function tradeLoop() {
     const s1 = accountStates[acc1.accountId];
     const s2 = accountStates[acc2.accountId];
 
-    // 1. SELF-HEALING ENTRY (Check each side independently)
     if (s1.volume < 1 || s2.volume < 1) {
         isProcessing = true;
         market.status = 'Syncing Hedge Entry...';
-        
         const tasks = [];
-        if (s1.volume < 1) {
-            console.log("Opening Long side...");
-            tasks.push(htxRequest(acc1, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
-            }));
-        }
-        if (s2.volume < 1) {
-            console.log("Opening Short side...");
-            tasks.push(htxRequest(acc2, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: config.orderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
-            }));
-        }
-
+        if (s1.volume < 1) tasks.push(htxRequest(acc1, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent' }));
+        if (s2.volume < 1) tasks.push(htxRequest(acc2, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent' }));
         await Promise.all(tasks);
-        hasAddedThisCycle = false; // Reset add flag for new cycle
+        hasAddedThisCycle = false;
         setTimeout(() => { isProcessing = false; }, 3000);
         return;
     }
 
-    // 2. PROFIT SUM CALCULATION
+    // PROFIT CALCULATION
     const totalVol = s1.volume + s2.volume;
     const estExitFees = (totalVol * config.contractSize * market.last) * config.feeRate;
     const combinedPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
     const netProfit = combinedPnL - estExitFees;
 
-    // 3. EXIT TRIGGER
-    if (netProfit > 0.00000001) {
+    // EXIT TRIGGER: Close when Net Exit Profit (All Fees Included) is above zero
+    if (netProfit > 0) {
         market.status = `EXIT: PROFIT +$${netProfit.toFixed(8)}`;
         await closeAll();
         return;
     }
 
-    // 4. ONE-TIME WINNER ADD TRIGGER
     if (!hasAddedThisCycle) {
         let winnerAcc = null;
         if (s1.roi >= config.triggerRoi) winnerAcc = acc1;
@@ -151,7 +138,7 @@ async function tradeLoop() {
         if (winnerAcc) {
             market.status = `Adding to Winner...`;
             await htxRequest(winnerAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: 1, direction: accountStates[winnerAcc.accountId].direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+                contract_code: config.symbol, volume: config.addSize, direction: accountStates[winnerAcc.accountId].direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
             hasAddedThisCycle = true;
         } else {
@@ -171,7 +158,6 @@ async function closeAll() {
     setTimeout(() => { isProcessing = false; }, 5000);
 }
 
-// ==================== WS & DASHBOARD ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -210,7 +196,7 @@ app.get('/', (req, res) => {
             </div>
         </div>
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20 text-center">
-            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Incl. Fees)</p>
+            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (All Fees Included)</p>
             <h2 id="netProfit" class="text-6xl font-black mb-4 font-mono">+$0.00000000</h2>
             <div class="inline-flex items-center gap-2 bg-zinc-900 px-4 py-2 rounded-full border border-zinc-800">
                 <span class="text-[10px] font-bold text-zinc-500 uppercase">One-Time Win-Add:</span><span id="addFlag" class="text-xs font-mono font-bold text-indigo-400">No</span>
