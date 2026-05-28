@@ -28,16 +28,17 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     
-    // --- BIASED SYNC STRATEGY ---
-    targetNetRoi: 1.5,            // EXIT AT 1.5% NET ROI
-    pnlBiasRoi: 2.0,              // Keep one side ~2% ahead
+    // --- AI BRAIN SETTINGS ---
+    targetNetRoi: 1.5,            
     initialOrderSize: 10,        
+    repairStep: 2,               
+    momentumLookback: 5,         // Number of price ticks to analyze momentum
     feeRate: 0.0005,
-    contractSize: 0              // Auto-detected
+    contractSize: 0              
 };
 
 // ==================== GLOBAL STATE ====================
-let market = { last: 0, bid: 0, ask: 0, spread: 0, status: 'initializing' };
+let market = { last: 0, bid: 0, ask: 0, spread: 0, status: 'initializing', history: [] };
 let accountStates = {};
 let isProcessing = false;
 let lastActionTime = 0;
@@ -78,17 +79,15 @@ async function sync() {
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
-        
         if (res?.status === 'ok' && res.data) {
             const pos = res.data.find(p => p.direction === state.direction);
             if (pos && parseFloat(pos.volume) > 0) {
                 state.avgPrice = parseFloat(pos.cost_hold);
                 state.volume = parseFloat(pos.volume);
                 state.unrealizedUsdt = parseFloat(pos.profit);
-                const price = market.last;
                 state.roi = state.direction === 'buy' 
-                    ? ((price - state.avgPrice) / state.avgPrice) * 100 * config.leverage
-                    : ((state.avgPrice - price) / state.avgPrice) * 100 * config.leverage;
+                    ? ((market.last - state.avgPrice) / state.avgPrice) * 100 * config.leverage
+                    : ((state.avgPrice - market.last) / state.avgPrice) * 100 * config.leverage;
             } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
         }
         const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
@@ -106,9 +105,8 @@ async function tradeLoop() {
     const long = accountStates[config.accounts[0].accountId];
     const short = accountStates[config.accounts[1].accountId];
 
-    // Initial Start
     if (long.volume === 0 && short.volume === 0) {
-        market.status = 'Opening Biased Hedge...';
+        market.status = 'AI Initializing Hedge...';
         isProcessing = true;
         await Promise.all(config.accounts.map((acc, idx) => htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
             contract_code: config.symbol, volume: config.initialOrderSize, direction: idx === 0 ? 'buy' : 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
@@ -117,7 +115,7 @@ async function tradeLoop() {
         return;
     }
 
-    // ROI & PnL Math
+    // --- NET ROI CALCULATION ---
     const totalVol = long.volume + short.volume;
     const realNotional = totalVol * config.contractSize * market.last;
     const marginUsed = realNotional / config.leverage;
@@ -125,45 +123,41 @@ async function tradeLoop() {
     const netPnLUsdt = (long.unrealizedUsdt + short.unrealizedUsdt) - estFees;
     const netRoi = marginUsed > 0 ? (netPnLUsdt / marginUsed) * 100 : 0;
 
-    // Target Exit (1.5% Net)
     if (netRoi >= config.targetNetRoi) {
-        market.status = `EXITING: ${netRoi.toFixed(2)}% NET ROI`;
+        market.status = `AI PROFIT TARGET REACHED: ${netRoi.toFixed(2)}%`;
         await closeAll();
         return;
     }
 
-    // BIASED SYNCING LOGIC
+    // --- AI DECISION BRAIN ---
     const now = Date.now();
     if (now - lastActionTime > 3000) {
+        // Calculate Momentum (Recent Trend)
+        const oldestPrice = market.history[0] || market.last;
+        const priceDelta = market.last - oldestPrice;
+        const trend = priceDelta > 0 ? 'UP' : 'DOWN';
+
         let targetAcc = null;
-        const drift = long.roi + short.roi; // Goal is +2.0% bias
 
-        // Priority 1: Volume Parity (Keep contracts the same)
-        if (Math.abs(long.volume - short.volume) >= 1) {
-            targetAcc = long.volume < short.volume ? config.accounts[0] : config.accounts[1];
-            market.status = 'Balancing Contracts...';
-        } 
-        // Priority 2: Create 2% Bias Advantage
-        else if (drift < config.pnlBiasRoi) {
-            // Long side isn't winning enough or short losing too much, add to Long
-            targetAcc = config.accounts[0];
-            market.status = `Nudging Bias (${drift.toFixed(2)}% < ${config.pnlBiasRoi}%)`;
-        }
-        else if (drift > (config.pnlBiasRoi + 1.0)) {
-            // Bias too high, nudge short
-            targetAcc = config.accounts[1];
-            market.status = `Cooling Bias (${drift.toFixed(2)}% > 3%)`;
+        // Logic: Repair the side that market momentum is currently favoring to speed up Net ROI recovery
+        if (trend === 'UP' && long.roi < short.roi) {
+            targetAcc = config.accounts[0]; // Buy more long to ride the upward trend to profit
+            market.status = 'AI Repair: Bullish Momentum';
+        } else if (trend === 'DOWN' && short.roi < long.roi) {
+            targetAcc = config.accounts[1]; // Buy more short to ride the downward trend to profit
+            market.status = 'AI Repair: Bearish Momentum';
+        } else {
+            // No strong momentum, default to fixing the worst laggard
+            targetAcc = long.roi < short.roi ? config.accounts[0] : config.accounts[1];
+            market.status = 'AI Repair: Balancing Laggard';
         }
 
-        if (targetAcc) {
-            const side = accountStates[targetAcc.accountId].direction;
+        if (targetAcc && Math.abs(long.roi + short.roi) > 0.05) {
             await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: 1, direction: side, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+                contract_code: config.symbol, volume: config.repairStep, direction: accountStates[targetAcc.accountId].direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
             lastActionTime = now;
         }
-    } else {
-        market.status = `Targeting ${config.targetNetRoi}% Net ROI`;
     }
 }
 
@@ -178,7 +172,7 @@ async function closeAll() {
     setTimeout(() => { isProcessing = false; }, 4000);
 }
 
-// ==================== WS & DASHBOARD (STAYING SAME DESIGN) ====================
+// ==================== WS & DASHBOARD ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -187,9 +181,9 @@ function startWS() {
             if (err) return;
             const msg = JSON.parse(dec.toString());
             if (msg.tick) {
-                market.bid = msg.tick.bid[0]; market.ask = msg.tick.ask[0];
-                market.last = (market.bid + market.ask) / 2;
-                market.spread = ((market.ask - market.bid) / market.last) * 100;
+                market.last = (msg.tick.bid[0] + msg.tick.ask[0]) / 2;
+                market.history.push(market.last);
+                if (market.history.length > config.momentumLookback) market.history.shift();
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
         });
@@ -214,22 +208,19 @@ app.get('/', (req, res) => {
 <body class="p-4 md:p-10">
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-8">
-            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Initializing...</p></div>
+            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC AI</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Analyzing Momentum...</p></div>
             <div class="flex gap-10 text-right">
                 <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p><p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p></div>
                 <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Realized Profit</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.000000</p></div>
             </div>
         </div>
-
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20 text-center">
             <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Incl. Fees) ROI</p>
             <h2 id="netRoi" class="text-7xl font-black mb-4 font-mono">+0.0000%</h2>
-            <div class="inline-flex items-center gap-4">
-                <div class="bg-zinc-900 px-4 py-2 rounded-full border border-zinc-800 text-[10px] font-bold">TARGET: <span class="text-indigo-400">${config.targetNetRoi.toFixed(2)}%</span></div>
-                <div class="bg-zinc-900 px-4 py-2 rounded-full border border-zinc-800 text-[10px] font-bold">BIAS: <span id="driftInfo" class="text-indigo-400">0.00%</span></div>
+            <div class="inline-flex items-center gap-2 bg-zinc-900 px-4 py-2 rounded-full border border-zinc-800">
+                <span class="text-[10px] font-bold text-zinc-500 uppercase">Target:</span><span class="text-xs font-mono font-bold text-indigo-400">${config.targetNetRoi.toFixed(2)}%</span>
             </div>
         </div>
-
         <div class="grid md:grid-cols-2 gap-6">
             <div class="glass rounded-[2rem] p-6 border-l-4 border-emerald-500">
                 <div class="flex justify-between items-center mb-4"><span class="text-xs font-bold text-emerald-500 uppercase tracking-widest">Long Side</span><span id="longRoi" class="text-xl font-black text-emerald-400">0.00%</span></div>
@@ -249,22 +240,21 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('markPrice').innerText = d.market.last.toFixed(8);
                 document.getElementById('botStatus').innerText = d.market.status;
-                let totalC = 0, totalP = 0, totalR = 0, drift = 0;
+                let tC = 0, tP = 0, tR = 0;
                 d.accounts.forEach(a => {
                     const isLong = a.direction === 'buy'; const prefix = isLong ? 'long' : 'short';
                     document.getElementById(prefix + 'Roi').innerText = a.roi.toFixed(2) + '%';
                     document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(8);
                     document.getElementById(prefix + 'Bar').style.width = Math.min(100, Math.abs(a.roi) * 10) + '%';
-                    totalC += a.volume; totalP += a.unrealizedUsdt; totalR += a.realizedProfit; drift += a.roi;
+                    tC += a.volume; tP += a.unrealizedUsdt; tR += a.realizedProfit;
                 });
-                document.getElementById('totalRealized').innerText = '$' + totalR.toFixed(6);
-                document.getElementById('driftInfo').innerText = drift.toFixed(2) + '%';
+                document.getElementById('totalRealized').innerText = '$' + tR.toFixed(6);
                 const cSize = d.config.contractSize || 1;
-                const realNotional = totalC * cSize * d.market.last;
-                const netRoi = realNotional > 0 ? ( (totalP - (realNotional * d.config.feeRate)) / (realNotional/d.config.leverage) ) * 100 : 0;
-                const roiElem = document.getElementById('netRoi');
-                roiElem.innerText = (netRoi >= 0 ? '+' : '') + netRoi.toFixed(4) + '%';
-                roiElem.className = 'text-7xl font-black mb-4 font-mono ' + (netRoi >= 0 ? 'text-emerald-400' : 'text-rose-500');
+                const realNotional = tC * cSize * d.market.last;
+                const netRoi = realNotional > 0 ? ( (tP - (realNotional * d.config.feeRate)) / (realNotional/d.config.leverage) ) * 100 : 0;
+                const rElem = document.getElementById('netRoi');
+                rElem.innerText = (netRoi >= 0 ? '+' : '') + netRoi.toFixed(4) + '%';
+                rElem.className = 'text-7xl font-black mb-4 font-mono ' + (netRoi >= 0 ? 'text-emerald-400' : 'text-rose-500');
             } catch(e) {}
         }
         setInterval(update, 1000);
