@@ -28,11 +28,11 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     
-    // --- FAST PROFIT SETTINGS ---
-    minNetProfitUsdt: 0.0001,    // Close immediately when profit > 0
+    // --- AGGRESSIVE SETTINGS ---
+    minNetProfitUsdt: 0.0001,    // Close immediately when green
     initialOrderSize: 10,        // Start size
-    rebalanceStep: 1,            // Smallest adjustment (1 contract)
-    syncThreshold: 0.05,         // Very aggressive sync (0.05% drift)
+    rebalanceStep: 1,            // Min contract increment
+    syncThreshold: 0.05,         // Sync if drift > 0.05%
     feeRate: 0.0005              // 0.05% Taker fee
 };
 
@@ -46,7 +46,7 @@ config.accounts.forEach((account, idx) => {
     accountStates[account.accountId] = {
         direction: idx === 0 ? 'buy' : 'sell',
         avgPrice: 0, roi: 0, volume: 0,
-        unrealizedUsdt: 0, initialBalance: 0, wallet: 0
+        unrealizedUsdt: 0, initialBalance: 0, realizedProfit: 0, wallet: 0
     };
 });
 
@@ -64,11 +64,13 @@ async function htxRequest(account, method, path, data = {}) {
     } catch (e) { return { status: 'error' }; }
 }
 
-// ==================== CORE LOGIC ====================
+// ==================== LOGIC ====================
 
 async function sync() {
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
+        
+        // Update Position
         const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
         if (res?.status === 'ok' && res.data) {
             const pos = res.data.find(p => parseFloat(p.volume) > 0 && p.direction === state.direction);
@@ -82,63 +84,55 @@ async function sync() {
                     : ((state.avgPrice - price) / state.avgPrice) * 100 * config.leverage;
             } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
         }
+
+        // Update Wallet Balance & Total Realized
+        const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
+        if (accRes?.status === 'ok') {
+            const bal = parseFloat(accRes.data[0].margin_balance);
+            if (state.initialBalance === 0) state.initialBalance = bal;
+            state.wallet = bal;
+            state.realizedProfit = bal - state.initialBalance;
+        }
     }
 }
 
 async function tradeLoop() {
     if (isProcessing || market.last === 0) return;
-    
     const long = accountStates[config.accounts[0].accountId];
     const short = accountStates[config.accounts[1].accountId];
 
-    // 1. Initial Entry
     if (long.volume === 0 && short.volume === 0) {
-        market.status = 'Booting Hedge...';
+        market.status = 'Booting Sync...';
         isProcessing = true;
-        await Promise.all([
-            htxRequest(config.accounts[0], 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: config.initialOrderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
-            }),
-            htxRequest(config.accounts[1], 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: config.initialOrderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
-            })
-        ]);
+        await Promise.all(config.accounts.map((acc, idx) => htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+            contract_code: config.symbol, volume: config.initialOrderSize, direction: idx === 0 ? 'buy' : 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+        })));
         setTimeout(() => { isProcessing = false; }, 2000);
         return;
     }
 
-    // 2. Net Profit Calculation (The "Real" Number)
     const currentNotional = (long.volume + short.volume) * market.last;
     const estExitFees = currentNotional * config.feeRate;
     const netProfit = (long.unrealizedUsdt + short.unrealizedUsdt) - estExitFees;
 
-    // 3. FAST EXIT
     if (netProfit >= config.minNetProfitUsdt) {
-        market.status = `PROFIT REACHED: $${netProfit.toFixed(8)}`;
+        market.status = `Exit: +$${netProfit.toFixed(6)}`;
         await closeAll();
         return;
     }
 
-    // 4. AGGRESSIVE AUTO-ADJUST
     const drift = long.roi + short.roi;
     const now = Date.now();
-
     if (Math.abs(drift) > config.syncThreshold && (now - lastActionTime > 8000)) {
-        // Find which side needs more weight to bring the total to profit
-        // If drift is negative, the loser is too heavy or winner too light.
         const targetAcc = long.roi < -short.roi ? config.accounts[0] : config.accounts[1];
         const side = accountStates[targetAcc.accountId].direction;
-        
-        market.status = `Fast Sync (${side})`;
-        
-        // Add min size to laggard to push avg price
+        market.status = `Syncing ${side.toUpperCase()}...`;
         await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
             contract_code: config.symbol, volume: config.rebalanceStep, direction: side, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
         });
-        
         lastActionTime = now;
     } else {
-        market.status = 'Optimizing for Profit';
+        market.status = 'Optimizing Profit';
     }
 }
 
@@ -153,7 +147,7 @@ async function closeAll() {
     setTimeout(() => { isProcessing = false; }, 4000);
 }
 
-// ==================== WEBSOCKET ====================
+// ==================== WS ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -173,7 +167,7 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-// ==================== DASHBOARD (SAME DESIGN) ====================
+// ==================== DASHBOARD ====================
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), feeRate: config.feeRate }));
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
@@ -191,17 +185,25 @@ app.get('/', (req, res) => {
 </head>
 <body class="p-4 md:p-10">
     <div class="max-w-4xl mx-auto">
+        <!-- Header -->
         <div class="flex justify-between items-center mb-8">
             <div>
                 <h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1>
                 <p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Initializing...</p>
             </div>
-            <div class="text-right">
-                <p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p>
-                <p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p>
+            <div class="flex gap-8 text-right">
+                <div>
+                    <p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p>
+                    <p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p>
+                </div>
+                <div>
+                    <p class="text-[10px] text-zinc-500 font-bold uppercase">Realized Profit</p>
+                    <p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.000000</p>
+                </div>
             </div>
         </div>
 
+        <!-- PROFIT DIFFERENCE ANALYZER -->
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20">
             <div class="relative z-10 text-center">
                 <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Incl. Fees)</p>
@@ -214,6 +216,7 @@ app.get('/', (req, res) => {
             <div class="absolute top-0 left-1/2 -translate-x-1/2 w-64 h-64 bg-indigo-600/10 blur-[100px] rounded-full"></div>
         </div>
 
+        <!-- Position Progress Cards -->
         <div class="grid md:grid-cols-2 gap-6">
             <div class="glass rounded-[2rem] p-6 border-l-4 border-emerald-500">
                 <div class="flex justify-between items-center mb-4">
@@ -253,20 +256,28 @@ app.get('/', (req, res) => {
                 document.getElementById('botStatus').innerText = d.market.status;
                 document.getElementById('currentSpread').innerText = d.market.spread.toFixed(3) + '%';
                 
-                let longU = 0, shortU = 0, totalVal = 0;
+                let longU = 0, shortU = 0, totalVal = 0, totalRealized = 0;
+                
                 d.accounts.forEach(a => {
                     const isLong = a.direction === 'buy';
                     const prefix = isLong ? 'long' : 'short';
                     if(isLong) longU = a.unrealizedUsdt; else shortU = a.unrealizedUsdt;
+                    
                     document.getElementById(prefix + 'Roi').innerText = a.roi.toFixed(2) + '%';
                     document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(8);
+                    
                     const prog = Math.min(100, Math.max(0, Math.abs(a.roi) * 20));
                     document.getElementById(prefix + 'Bar').style.width = (a.volume > 0 ? prog : 0) + '%';
+                    
                     totalVal += (a.volume * d.market.last);
+                    totalRealized += a.realizedProfit;
                 });
+
+                document.getElementById('totalRealized').innerText = (totalRealized >= 0 ? '+' : '') + '$' + totalRealized.toFixed(6);
 
                 const exitFees = totalVal * d.feeRate;
                 const projected = (longU + shortU) - exitFees;
+                
                 const pElem = document.getElementById('netProfit');
                 pElem.innerText = (projected >= 0 ? '+' : '') + '$' + projected.toFixed(8);
                 pElem.className = 'text-6xl font-black mb-4 font-mono ' + (projected >= 0 ? 'text-emerald-400' : 'text-rose-500');
