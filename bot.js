@@ -1,1318 +1,296 @@
+// server.js - Master Server on https://business-app.osc-fr1.scalingo.io
 const express = require('express');
-const fs = require('fs');
-const os = require('os');
-const { execSync, spawn } = require('child_process');
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const https = require('https');
-const { createWriteStream } = require('fs');
-const { MongoClient } = require('mongodb');
-
-// Apply stealth plugin
-puppeteer.use(StealthPlugin());
+const http = require('http');
+const socketIo = require('socket.io');
+const axios = require('axios');
+const crypto = require('crypto');
 
 const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, { cors: { origin: '*' } });
+
 app.use(express.json());
-const port = process.env.PORT || 3000;
+app.use(express.static('public'));
 
-// ============ AUTO-DETECT CENTRAL MODE ============
-const CENTRAL_DOMAIN = 'business-app.osc-fr1.scalingo.io';
-const CURRENT_HOSTNAME = os.hostname();
-const IS_CENTRAL_SERVER = CURRENT_HOSTNAME.includes('business-app') || 
-                           process.env.IS_CENTRAL === 'true' ||
-                           (process.env.DOMAIN && process.env.DOMAIN.includes('business-app'));
-
-console.log('\n========================================');
-console.log('  BOT SYSTEM DEPLOYMENT');
-console.log('========================================');
-console.log(`Current Hostname: ${CURRENT_HOSTNAME}`);
-console.log(`Central Domain: ${CENTRAL_DOMAIN}`);
-console.log(`Mode: ${IS_CENTRAL_SERVER ? '🔵 CENTRAL SERVER (Dashboard + Bot Worker)' : '🟢 BOT WORKER (Account Creator Only)'}`);
-console.log('========================================\n');
-
-// ============ PERSISTENT DEPLOYMENT ID ============
-const PERSISTENT_ID_FILE = '/app/.deployment_id';
-let persistentDeploymentId = `bot-${CURRENT_HOSTNAME}-${Date.now()}`;
-
-if (!IS_CENTRAL_SERVER) {
-    try {
-        if (fs.existsSync(PERSISTENT_ID_FILE)) {
-            persistentDeploymentId = fs.readFileSync(PERSISTENT_ID_FILE, 'utf8').trim();
-            console.log(`[ID] Using existing deployment ID: ${persistentDeploymentId}`);
-        } else {
-            persistentDeploymentId = `worker-${CURRENT_HOSTNAME}`;
-            fs.writeFileSync(PERSISTENT_ID_FILE, persistentDeploymentId);
-            console.log(`[ID] Created new persistent deployment ID: ${persistentDeploymentId}`);
-        }
-    } catch (error) {
-        console.log(`[ID] Could not persist ID, using: ${persistentDeploymentId}`);
-    }
-} else {
-    persistentDeploymentId = `central-${CURRENT_HOSTNAME}`;
-    console.log(`[ID] Central server ID: ${persistentDeploymentId}`);
-}
-
-// ============ ENVIRONMENT VARIABLES ============
-const ENV = {
-    IS_CENTRAL: IS_CENTRAL_SERVER,
-    
-    BOT_PASSWORD: process.env.BOT_PASSWORD || 'Linuxdistro&84',
-    BOT_START_DELAY: parseInt(process.env.BOT_START_DELAY) || 10,
-    HEADLESS_MODE: process.env.HEADLESS_MODE !== 'false',
-    CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome',
-    CLEVER_TOKEN: process.env.CLEVER_TOKEN || '',
-    
-    CLI_RESTART_ENABLED: IS_CENTRAL_SERVER && process.env.CLI_RESTART_ENABLED === 'true',
-    SCALINGO_API_TOKEN: process.env.SCALINGO_API_TOKEN || '',
-    SCALINGO_APP_NAME: process.env.SCALINGO_APP_NAME || '',
-    
-    DEPLOYMENT_ID: persistentDeploymentId,
-    DEPLOYMENT_NAME: process.env.DEPLOYMENT_NAME || CURRENT_HOSTNAME,
-    DEPLOYMENT_REGION: process.env.DEPLOYMENT_REGION || 'osc-fr1',
-    
-    CENTRAL_API_URL: process.env.CENTRAL_API_URL || `https://${CENTRAL_DOMAIN}`,
-    CENTRAL_API_KEY: process.env.CENTRAL_API_KEY || 'change-this-secret-key-12345',
-    
-    MONGODB_URI: process.env.MONGODB_URI || null
+// ============ CONFIGURATION ============
+const CONFIG = {
+    feeRate: 0.0015,
+    minProfitPercent: 0.55,
+    minTradeAmount: 10,
+    maxTradeAmount: 1000,
+    capital: 5000,
+    opportunityTimeout: 500,
+    workerHeartbeat: 60000,
+    port: process.env.PORT || 8080
 };
 
-console.log('Configuration:');
-console.log(`  CLI Restart Enabled: ${ENV.CLI_RESTART_ENABLED ? 'YES (Central Server Only)' : 'NO (Workers Run Continuously)'}`);
-console.log(`  Headless Mode: ${ENV.HEADLESS_MODE ? 'YES' : 'NO'}`);
-console.log(`  Clever Token: ${ENV.CLEVER_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
-console.log(`  Deployment ID: ${ENV.DEPLOYMENT_ID}`);
-console.log(`  MongoDB: ${ENV.MONGODB_URI ? '✓ Configured' : '✗ Using Memory Storage'}`);
-if (!ENV.IS_CENTRAL) {
-    console.log(`  Web Server: DISABLED (Worker mode - no HTTP server)`);
-}
-console.log('========================================\n');
-
-// ============ IN-MEMORY STORAGE (Fallback when MongoDB is unavailable) ============
-const memoryStore = {
-    deployments: new Map(),
-    accounts: [],
-    nextAccountId: 1
+const HTX = {
+    rest: 'https://api.htx.com',
+    accessKey: process.env.HTX_API_KEY,
+    secretKey: process.env.HTX_SECRET_KEY,
+    accountId: process.env.HTX_ACCOUNT_ID
 };
 
-// Initialize with some demo data for dashboard
-function initDemoData() {
-    console.log('[Storage] Initializing demo trading bot data...');
+// ============ STATE ============
+let workers = new Map();
+let activeOpportunities = [];
+let executing = false;
+let totalProfit = 0;
+let totalTrades = 0;
+let startTime = Date.now();
+
+// ============ HTX API FUNCTIONS ============
+function htxRequest(method, endpoint, params = {}, signed = false) {
+    const url = `${HTX.rest}${endpoint}`;
+    const headers = { 'Content-Type': 'application/json' };
     
-    // Create some demo deployments (trading bots)
-    const demoDeployments = [
-        { deploymentId: 'BTC-MASTER-01', deploymentName: 'BTC Whale Bot', region: 'osc-fr1', status: 'active', totalAccounts: 342, lastAccount: 'btc_trader@temp.com', lastHeartbeat: new Date(), createdAt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
-        { deploymentId: 'ETH-MASTER-02', deploymentName: 'ETH Moon Bot', region: 'osc-fr1', status: 'active', totalAccounts: 287, lastAccount: 'eth_trader@temp.com', lastHeartbeat: new Date(), createdAt: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000) },
-        { deploymentId: 'SOL-VALIDATOR-03', deploymentName: 'Solana Turbo Bot', region: 'osc-fr1', status: 'active', totalAccounts: 156, lastAccount: 'sol_trader@temp.com', lastHeartbeat: new Date(), createdAt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000) },
-        { deploymentId: 'DOGE-MOON-04', deploymentName: 'Doge Rocket Bot', region: 'osc-fr1', status: 'active', totalAccounts: 89, lastAccount: 'doge_trader@temp.com', lastHeartbeat: new Date(), createdAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000) },
-        { deploymentId: 'XRP-ARMY-05', deploymentName: 'XRP Ledger Bot', region: 'osc-fr1', status: 'active', totalAccounts: 124, lastAccount: 'xrp_trader@temp.com', lastHeartbeat: new Date(), createdAt: new Date(Date.now() - 4 * 24 * 60 * 60 * 1000) },
-        { deploymentId: 'ADA-SCALE-06', deploymentName: 'Cardano Stake Bot', region: 'osc-fr1', status: 'active', totalAccounts: 67, lastAccount: 'ada_trader@temp.com', lastHeartbeat: new Date(), createdAt: new Date(Date.now() - 1 * 24 * 60 * 60 * 1000) },
-        { deploymentId: 'AVAX-FIRE-07', deploymentName: 'Avalanche Rush Bot', region: 'osc-fr1', status: 'active', totalAccounts: 93, lastAccount: 'avax_trader@temp.com', lastHeartbeat: new Date(), createdAt: new Date(Date.now() - 6 * 24 * 60 * 60 * 1000) },
-        { deploymentId: 'LINK-PRICE-08', deploymentName: 'Chainlink Oracle Bot', region: 'osc-fr1', status: 'active', totalAccounts: 45, lastAccount: 'link_trader@temp.com', lastHeartbeat: new Date(), createdAt: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000) }
-    ];
-    
-    for (const deployment of demoDeployments) {
-        memoryStore.deployments.set(deployment.deploymentId, deployment);
-    }
-    
-    // Create some demo accounts (trades)
-    const cryptos = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT', 'LINK/USDT', 'MATIC/USDT', 'UNI/USDT'];
-    const botNames = ['BTC Whale Bot', 'ETH Moon Bot', 'Solana Turbo Bot', 'Doge Rocket Bot', 'XRP Ledger Bot', 'Cardano Stake Bot', 'Avalanche Rush Bot', 'Chainlink Oracle Bot'];
-    
-    for (let i = 0; i < 50; i++) {
-        const randomCrypto = cryptos[Math.floor(Math.random() * cryptos.length)];
-        const randomBot = botNames[Math.floor(Math.random() * botNames.length)];
-        const randomBotId = demoDeployments[Math.floor(Math.random() * demoDeployments.length)].deploymentId;
-        const entryPrice = 50 + Math.random() * 75000;
-        const exitPrice = entryPrice * (0.85 + Math.random() * 0.3);
-        const profit = exitPrice - entryPrice;
-        const isProfit = profit > 0;
+    if (signed && HTX.accessKey && HTX.secretKey) {
+        const timestamp = Date.now();
+        const signature = crypto
+            .createHmac('sha256', HTX.secretKey)
+            .update(timestamp + method + endpoint + JSON.stringify(params))
+            .digest('hex');
         
-        memoryStore.accounts.push({
-            _id: i + 1,
-            deploymentId: randomBotId,
-            deploymentName: randomBot,
-            email: `trader_${i}@temp.com`,
-            password: `pass_${i}`,
-            tradingPair: randomCrypto,
-            entryPrice: entryPrice,
-            exitPrice: exitPrice,
-            profit: Math.abs(profit),
-            isProfit: isProfit,
-            deployedApps: [],
-            createdAt: new Date(Date.now() - Math.random() * 30 * 24 * 60 * 60 * 1000)
-        });
+        headers['AccessKeyId'] = HTX.accessKey;
+        headers['Signature'] = signature;
+        headers['Timestamp'] = timestamp;
     }
     
-    console.log(`[Storage] Demo data initialized: ${memoryStore.deployments.size} bots, ${memoryStore.accounts.length} trades`);
+    return axios({ method, url, headers, params: method === 'GET' ? params : undefined, data: method !== 'GET' ? params : undefined });
 }
 
-// ============ MONGODB CONNECTION (Optional) ============
-let dbClient = null;
-let db = null;
-let dbConnected = false;
-
-async function connectMongoDB() {
-    if (!ENV.MONGODB_URI) {
-        console.log('[MongoDB] No URI provided, using in-memory storage only');
-        initDemoData();
-        return false;
-    }
+async function executeTriangle(triangle, amount) {
+    const trades = [];
+    let currentAmount = amount;
     
     try {
-        console.log('[MongoDB] Attempting to connect...');
-        dbClient = new MongoClient(ENV.MONGODB_URI, {
-            serverSelectionTimeoutMS: 5000,
-            connectTimeoutMS: 5000
-        });
-        await dbClient.connect();
-        db = dbClient.db('botdb');
-        dbConnected = true;
-        console.log('[MongoDB] ✅ Connected successfully');
-        
-        // Try to load existing data
-        try {
-            const existingDeployments = await db.collection('deployments').find({}).toArray();
-            const existingAccounts = await db.collection('accounts').find({}).toArray();
-            
-            for (const dep of existingDeployments) {
-                memoryStore.deployments.set(dep.deploymentId, dep);
-            }
-            memoryStore.accounts.push(...existingAccounts);
-            console.log(`[MongoDB] Loaded ${existingDeployments.length} deployments and ${existingAccounts.length} accounts`);
-        } catch (loadError) {
-            console.log('[MongoDB] Could not load existing data, using demo data');
-            initDemoData();
+        for (const step of triangle.steps) {
+            const order = await placeOrder(step.symbol, step.side, currentAmount);
+            if (!order || order.error) throw new Error(`Trade failed on ${step.symbol}`);
+            trades.push(order);
+            currentAmount = order.filled * (step.side === 'buy' ? 1 : (1 - CONFIG.feeRate));
         }
         
-        return true;
+        const profit = currentAmount - amount;
+        totalProfit += profit;
+        totalTrades++;
+        
+        console.log(`✅ Executed: $${profit.toFixed(4)} profit`);
+        return { success: true, profit };
+        
     } catch (error) {
-        console.error('[MongoDB] Connection failed:', error.message);
-        console.log('[MongoDB] Falling back to in-memory storage with demo data');
-        initDemoData();
-        dbConnected = false;
-        return false;
+        console.error('❌ Execution failed:', error.message);
+        await reverseTrades(trades);
+        return { success: false, error: error.message };
     }
 }
 
-// ============ STATE VARIABLES ============
-let botStatus = {
-    state: 'running',
-    accountCreated: false,
-    accountEmail: null,
-    startTime: new Date(),
-    completionTime: null,
-    totalAccounts: memoryStore.accounts.length,
-    deploymentId: ENV.DEPLOYMENT_ID,
-    deploymentName: ENV.DEPLOYMENT_NAME,
-    region: ENV.DEPLOYMENT_REGION,
-    isCentral: ENV.IS_CENTRAL
-};
-
-// ============ HELPER FUNCTIONS ============
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-function log(step, message, type = 'info', instanceId = 'MAIN') {
-    const timestamp = new Date().toLocaleTimeString();
-    console.log(`[${timestamp}] [${instanceId}] [${step}] ${message}`);
+async function placeOrder(symbol, side, amount) {
+    try {
+        const response = await htxRequest('POST', '/v1/order/orders', {
+            'account-id': HTX.accountId,
+            symbol: symbol,
+            type: `${side}-market`,
+            amount: amount.toString()
+        }, true);
+        
+        await new Promise(r => setTimeout(r, 1000));
+        return { orderId: response.data.data, filled: amount, symbol, side };
+    } catch (error) {
+        return { error: error.message };
+    }
 }
 
-async function downloadFile(url, destPath) {
-    return new Promise((resolve, reject) => {
-        const file = createWriteStream(destPath);
-        https.get(url, (response) => {
-            if (response.statusCode !== 200) {
-                reject(new Error(`Failed to download: ${response.statusCode}`));
-                return;
-            }
-            response.pipe(file);
-            file.on('finish', () => {
-                file.close();
-                resolve();
-            });
-        }).on('error', reject);
+async function reverseTrades(trades) {
+    for (let i = trades.length - 1; i >= 0; i--) {
+        const trade = trades[i];
+        await placeOrder(trade.symbol, trade.side === 'buy' ? 'sell' : 'buy', trade.filled);
+        await new Promise(r => setTimeout(r, 500));
+    }
+}
+
+// ============ API ENDPOINTS ============
+
+app.post('/addworker', async (req, res) => {
+    const { workerId, symbolsScanned, trianglesScanned, opportunitiesFound, cpu, memory, status } = req.body;
+    
+    if (!workerId) {
+        return res.status(400).json({ error: 'workerId required' });
+    }
+    
+    workers.set(workerId, {
+        workerId,
+        ip: req.ip || req.socket.remoteAddress,
+        lastHeartbeat: Date.now(),
+        symbolsScanned: symbolsScanned || 0,
+        trianglesScanned: trianglesScanned || 0,
+        opportunitiesFound: opportunitiesFound || 0,
+        cpu: cpu || 0,
+        memory: memory || 0,
+        status: status || 'online'
     });
-}
-
-async function cleanupStaleDeployments() {
-    // Not needed for memory storage
-}
-
-async function installChromiumRuntime() {
-    const chromePath = ENV.CHROMIUM_PATH;
     
-    if (fs.existsSync(chromePath)) {
-        const stats = fs.statSync(chromePath);
-        if (stats.size > 50000000) {
-            return chromePath;
-        }
+    io.emit('workers_update', Array.from(workers.values()));
+    console.log(`✅ Worker registered: ${workerId} (${workers.size} total)`);
+    res.json({ success: true, workerCount: workers.size });
+});
+
+app.post('/opportunity', async (req, res) => {
+    const { workerId, triangle, profitPercent, timestamp } = req.body;
+    
+    if (profitPercent < CONFIG.minProfitPercent) {
+        return res.json({ accepted: false, reason: 'profit too low' });
     }
     
-    log('SYSTEM', 'Installing Chromium...', 'info', 'MAIN');
-    
-    try {
-        const chromeUrl = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
-        const zipPath = '/tmp/chromium.zip';
-        
-        await downloadFile(chromeUrl, zipPath);
-        execSync(`unzip -q ${zipPath} -d /app/`, { stdio: 'inherit' });
-        
-        if (fs.existsSync(chromePath)) {
-            fs.chmodSync(chromePath, 0o755);
-            fs.unlinkSync(zipPath);
-            return chromePath;
-        }
-        throw new Error('Chrome binary not found');
-    } catch (error) {
-        log('SYSTEM', `Failed: ${error.message}`, 'error', 'MAIN');
-        return null;
-    }
-}
-
-function installScalingoCLI() {
-    if (!ENV.CLI_RESTART_ENABLED) {
-        return false;
-    }
-    
-    const cliPath = '/app/bin/scalingo';
-    
-    if (fs.existsSync(cliPath)) {
-        console.log('[CLI] Scalingo CLI already installed');
-        return true;
-    }
-    
-    console.log('[CLI] Installing Scalingo CLI...');
-    
-    try {
-        if (!fs.existsSync('/app/bin')) {
-            fs.mkdirSync('/app/bin', { recursive: true });
-        }
-        
-        execSync('curl -L -o /tmp/scalingo.tar.gz https://github.com/Scalingo/cli/releases/download/1.44.1/scalingo_1.44.1_linux_amd64.tar.gz', { stdio: 'inherit' });
-        execSync('cd /tmp && tar -xzf scalingo.tar.gz', { stdio: 'inherit' });
-        execSync('cp /tmp/scalingo_1.44.1_linux_amd64/scalingo /app/bin/scalingo', { stdio: 'inherit' });
-        execSync('chmod +x /app/bin/scalingo', { stdio: 'inherit' });
-        execSync('rm -rf /tmp/scalingo_1.44.1_linux_amd64 /tmp/scalingo.tar.gz', { stdio: 'inherit' });
-        
-        console.log('[CLI] ✅ Scalingo CLI installed successfully');
-        return true;
-        
-    } catch (error) {
-        console.error('[CLI] Failed to install:', error.message);
-        return false;
-    }
-}
-
-async function restartWithCLI() {
-    if (!ENV.CLI_RESTART_ENABLED) return false;
-    
-    const cliPath = '/app/bin/scalingo';
-    const appName = ENV.SCALINGO_APP_NAME;
-    const apiToken = ENV.SCALINGO_API_TOKEN;
-    
-    if (!fs.existsSync(cliPath) || !appName || !apiToken) {
-        log('RESTART', 'CLI not configured', 'warn', 'MAIN');
-        return false;
-    }
-    
-    log('RESTART', `Restarting ${appName} via CLI...`, 'info', 'MAIN');
-    
-    return new Promise((resolve) => {
-        const cmd = `${cliPath} login --api-token "${apiToken}" && ${cliPath} --app ${appName} restart`;
-        const child = spawn('bash', ['-c', cmd]);
-        
-        child.stdout.on('data', (data) => console.log(`[CLI] ${data.toString().trim()}`));
-        child.stderr.on('data', (data) => console.log(`[CLI ERR] ${data.toString().trim()}`));
-        
-        child.on('close', (code) => {
-            if (code === 0) {
-                log('RESTART', '✅ CLI restart initiated!', 'success', 'MAIN');
-                resolve(true);
-            } else {
-                log('RESTART', `CLI failed with code ${code}`, 'error', 'MAIN');
-                resolve(false);
-            }
-        });
-    });
-}
-
-async function logoutCleverCloud() {
-    log('CLI', 'Logging out of Clever Cloud...', 'info', 'MAIN');
-    try {
-        execSync('clever logout', { stdio: 'inherit' });
-        log('CLI', '✅ Logged out successfully', 'success', 'MAIN');
-    } catch (error) {
-        log('CLI', 'No active session to logout', 'info', 'MAIN');
-    }
-    
-    try {
-        const homeDir = process.env.HOME || '/app';
-        const tokenFiles = [
-            `${homeDir}/.config/clever-cloud/credentials.json`,
-            `${homeDir}/.clever.json`,
-            `/.clever.json`
-        ];
-        
-        for (const tokenFile of tokenFiles) {
-            if (fs.existsSync(tokenFile)) {
-                fs.unlinkSync(tokenFile);
-                log('CLI', `Removed ${tokenFile}`, 'info', 'MAIN');
-            }
-        }
-    } catch (error) {
-        // Ignore errors
-    }
-}
-
-// Create deployment directory
-async function ensureDeploymentDir() {
-    const deployDir = '/app/deployments';
-    try {
-        if (!fs.existsSync(deployDir)) {
-            fs.mkdirSync(deployDir, { recursive: true, mode: 0o777 });
-            console.log(`[DOCKER] Created deployment directory: ${deployDir}`);
-        }
-        const timestampDir = `${deployDir}/${Date.now()}`;
-        fs.mkdirSync(timestampDir, { recursive: true, mode: 0o777 });
-        return timestampDir;
-    } catch (error) {
-        console.error(`[DOCKER] Failed to create directory: ${error.message}`);
-        return '/tmp/deployments';
-    }
-}
-
-// ============ CRYPTO DATA FOR TRADING BOTS ============
-const cryptoPairs = [
-    { pair: 'BTC/USDT', price: 75075.8, change: -0.37, volume: 12450000000 },
-    { pair: 'ETH/USDT', price: 2060.25, change: -0.51, volume: 8450000000 },
-    { pair: 'SOL/USDT', price: 83.9258, change: -0.53, volume: 3200000000 },
-    { pair: 'XRP/USDT', price: 1.33265, change: -0.19, volume: 2100000000 },
-    { pair: 'DOGE/USDT', price: 0.102215, change: -0.36, volume: 980000000 },
-    { pair: 'ADA/USDT', price: 0.240751, change: -0.24, volume: 560000000 },
-    { pair: 'AVAX/USDT', price: 9.1747, change: -0.61, volume: 430000000 },
-    { pair: 'LINK/USDT', price: 9.3158, change: -1.10, volume: 380000000 },
-    { pair: 'MATIC/USDT', price: 0.2195, change: -0.85, volume: 260000000 },
-    { pair: 'UNI/USDT', price: 3.2702, change: -0.58, volume: 210000000 },
-    { pair: 'ATOM/USDT', price: 2.1778, change: -0.42, volume: 180000000 },
-    { pair: 'NEAR/USDT', price: 2.699, change: 4.77, volume: 420000000 },
-    { pair: 'PEPE/USDT', price: 0.0535432, change: -0.85, volume: 890000000 },
-    { pair: 'WIF/USDT', price: 0.1923, change: -1.08, volume: 310000000 },
-    { pair: 'SUI/USDT', price: 0.9827, change: -2.09, volume: 450000000 },
-    { pair: 'OP/USDT', price: 0.1294, change: -0.61, volume: 190000000 },
-    { pair: 'ARB/USDT', price: 0.1101, change: -0.18, volume: 170000000 }
-];
-
-function getRandomCrypto() {
-    return cryptoPairs[Math.floor(Math.random() * cryptoPairs.length)];
-}
-
-function getRandomProfit() {
-    const profits = [1250.45, 3420.78, 8750.32, 2340.67, 5670.89, 1890.54, 4320.12, 7650.34, 2980.76, 6540.23];
-    return profits[Math.floor(Math.random() * profits.length)];
-}
-
-// ============ STORAGE FUNCTIONS (Works with both MongoDB and memory) ============
-async function getDeployments() {
-    if (dbConnected && db) {
-        try {
-            const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-            return await db.collection('deployments')
-                .find({ lastHeartbeat: { $gt: fiveMinutesAgo } })
-                .sort({ lastHeartbeat: -1 })
-                .toArray();
-        } catch (error) {
-            console.error('[Storage] MongoDB query failed:', error.message);
-        }
-    }
-    // Fallback to memory storage
-    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-    const deployments = Array.from(memoryStore.deployments.values());
-    return deployments.filter(d => d.lastHeartbeat > fiveMinutesAgo);
-}
-
-async function getTotalAccounts() {
-    if (dbConnected && db) {
-        try {
-            return await db.collection('accounts').countDocuments();
-        } catch (error) {
-            console.error('[Storage] MongoDB query failed:', error.message);
-        }
-    }
-    return memoryStore.accounts.length;
-}
-
-async function getAccounts(limit = 100) {
-    if (dbConnected && db) {
-        try {
-            return await db.collection('accounts').find({}).sort({ createdAt: -1 }).limit(limit).toArray();
-        } catch (error) {
-            console.error('[Storage] MongoDB query failed:', error.message);
-        }
-    }
-    return memoryStore.accounts.slice(0, limit);
-}
-
-async function addAccount(accountData) {
-    if (dbConnected && db) {
-        try {
-            await db.collection('accounts').insertOne(accountData);
-        } catch (error) {
-            console.error('[Storage] MongoDB insert failed:', error.message);
-        }
-    }
-    memoryStore.accounts.unshift(accountData);
-}
-
-async function addOrUpdateDeployment(deploymentData) {
-    if (dbConnected && db) {
-        try {
-            await db.collection('deployments').updateOne(
-                { deploymentId: deploymentData.deploymentId },
-                { $set: deploymentData },
-                { upsert: true }
-            );
-        } catch (error) {
-            console.error('[Storage] MongoDB update failed:', error.message);
-        }
-    }
-    memoryStore.deployments.set(deploymentData.deploymentId, deploymentData);
-}
-
-// ============ CENTRAL API ENDPOINTS ============
-function setupCentralEndpoints() {
-    console.log('[Central] Setting up API endpoints...');
-    
-    const validateApiKey = (req, res, next) => {
-        const key = req.headers['x-api-key'];
-        if (key !== ENV.CENTRAL_API_KEY) {
-            return res.status(401).json({ error: 'Invalid API key' });
-        }
-        next();
+    const opportunity = {
+        id: Date.now() + '-' + workerId,
+        workerId,
+        triangle,
+        profitPercent,
+        timestamp: timestamp || Date.now(),
+        expiresAt: Date.now() + CONFIG.opportunityTimeout
     };
     
-    app.post('/api/register-bot', validateApiKey, async (req, res) => {
-        try {
-            const { deploymentId, deploymentName, region, startTime, version } = req.body;
-            
-            await addOrUpdateDeployment({
-                deploymentId: deploymentId,
-                deploymentName: deploymentName,
-                region: region,
-                version: version,
-                status: 'active',
-                startTime: new Date(startTime),
-                lastHeartbeat: new Date(),
-                updatedAt: new Date(),
-                createdAt: new Date(),
-                totalAccounts: 0
-            });
-            
-            res.json({ success: true, message: 'Bot registered' });
-        } catch (error) {
-            res.status(500).json({ error: error.message });
-        }
+    activeOpportunities.push(opportunity);
+    activeOpportunities = activeOpportunities.filter(o => o.expiresAt > Date.now());
+    io.emit('opportunity', opportunity);
+    
+    if (!executing) {
+        executing = true;
+        const amount = Math.min(CONFIG.maxTradeAmount, CONFIG.capital * 0.1);
+        const result = await executeTriangle(triangle, amount);
+        executing = false;
+        io.emit('execution', { opportunity, result });
+        return res.json({ accepted: true, executed: result.success, profit: result.profit });
+    }
+    
+    res.json({ accepted: true, executed: false, reason: 'queued' });
+});
+
+app.get('/workers', (req, res) => {
+    const workerList = Array.from(workers.values()).map(w => ({
+        ...w,
+        lastHeartbeatAgo: Date.now() - w.lastHeartbeat,
+        isActive: (Date.now() - w.lastHeartbeat) < CONFIG.workerHeartbeat
+    }));
+    res.json(workerList);
+});
+
+app.get('/metrics', (req, res) => {
+    const activeWorkers = Array.from(workers.values()).filter(w => 
+        (Date.now() - w.lastHeartbeat) < CONFIG.workerHeartbeat
+    ).length;
+    
+    res.json({
+        uptime: Math.floor((Date.now() - startTime) / 1000),
+        totalWorkers: workers.size,
+        activeWorkers,
+        totalProfit: totalProfit.toFixed(4),
+        totalTrades,
+        activeOpportunities: activeOpportunities.length
     });
-    
-    app.post('/api/heartbeat', validateApiKey, async (req, res) => {
-        try {
-            const { deploymentId, deploymentName, region, status, accountsCreated, lastAccount } = req.body;
-            
-            await addOrUpdateDeployment({
-                deploymentId: deploymentId,
-                deploymentName: deploymentName,
-                region: region,
-                status: status,
-                accountsCreated: accountsCreated,
-                lastAccount: lastAccount,
-                lastHeartbeat: new Date()
-            });
-            
-            res.json({ success: true });
-        } catch (error) {
-            res.status(500).json({ error: error.message });
-        }
-    });
-    
-    app.post('/api/metrics/add', validateApiKey, async (req, res) => {
-        try {
-            const { deploymentId, deploymentName, email, password, deployedApps, createdAt, restartCount } = req.body;
-            
-            await addAccount({
-                deploymentId: deploymentId,
-                deploymentName: deploymentName,
-                email: email,
-                password: password,
-                deployedApps: deployedApps,
-                createdAt: new Date(createdAt),
-                restartCount: restartCount
-            });
-            
-            await addOrUpdateDeployment({
-                deploymentId: deploymentId,
-                $inc: { totalAccounts: 1 },
-                lastAccount: email,
-                lastAccountTime: new Date()
-            });
-            
-            res.json({ success: true, message: 'Metrics recorded' });
-        } catch (error) {
-            res.status(500).json({ error: error.message });
-        }
-    });
-    
-    app.get('/api/connected-bots', async (req, res) => {
-        try {
-            const bots = await getDeployments();
-            const uniqueBots = [];
-            const seenIds = new Set();
-            for (const bot of bots) {
-                if (!seenIds.has(bot.deploymentId)) {
-                    seenIds.add(bot.deploymentId);
-                    uniqueBots.push(bot);
-                }
-            }
-            res.json(uniqueBots);
-        } catch (error) {
-            res.status(500).json({ error: error.message });
-        }
-    });
-    
-    app.get('/api/all-accounts', async (req, res) => {
-        try {
-            const accounts = await getAccounts(100);
-            res.json(accounts);
-        } catch (error) {
-            res.status(500).json({ error: error.message });
-        }
-    });
-    
-    app.get('/api/aggregated-metrics', async (req, res) => {
-        try {
-            const totalAccounts = await getTotalAccounts();
-            const deployments = await getDeployments();
-            res.json({ 
-                totalAccounts, 
-                totalDeployments: deployments.length, 
-                activeDeployments: deployments.length, 
-                accountsByBot: [],
-                timestamp: new Date() 
-            });
-        } catch (error) {
-            res.status(500).json({ error: error.message });
-        }
-    });
-    
-    console.log('[Central] ✅ API endpoints ready');
-}
+});
 
-// ============ BOT FUNCTIONS ============
-async function sendHeartbeat() {
-    const apiUrl = `${ENV.CENTRAL_API_URL}/api/heartbeat`;
-    
-    try {
-        const response = await fetch(apiUrl, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-API-Key': ENV.CENTRAL_API_KEY
-            },
-            body: JSON.stringify({
-                deploymentId: ENV.DEPLOYMENT_ID,
-                deploymentName: ENV.DEPLOYMENT_NAME,
-                region: ENV.DEPLOYMENT_REGION,
-                status: botStatus.state,
-                accountsCreated: botStatus.totalAccounts,
-                lastAccount: botStatus.accountEmail,
-                timestamp: new Date()
-            })
-        });
-        
-        if (response.ok) console.log('[Heartbeat] ✅ Sent');
-    } catch (error) {
-        console.log('[Heartbeat] ❌ Failed:', error.message);
-    }
-}
-
-async function sendMetricsToCentral(accountData) {
-    const apiUrl = `${ENV.CENTRAL_API_URL}/api/metrics/add`;
-    
-    try {
-        const response = await fetch(apiUrl, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-API-Key': ENV.CENTRAL_API_KEY
-            },
-            body: JSON.stringify({
-                deploymentId: ENV.DEPLOYMENT_ID,
-                deploymentName: ENV.DEPLOYMENT_NAME,
-                email: accountData.email,
-                password: accountData.password,
-                deployedApps: accountData.deployedApps || [],
-                createdAt: accountData.createdAt,
-                restartCount: botStatus.totalAccounts
-            })
-        });
-        
-        if (response.ok) log('CENTRAL', `✅ Metrics sent for ${accountData.email}`, 'success');
-    } catch (error) {
-        log('CENTRAL', `❌ Failed: ${error.message}`, 'error');
-    }
-}
-
-async function registerWithCentral() {
-    const apiUrl = `${ENV.CENTRAL_API_URL}/api/register-bot`;
-    
-    try {
-        const response = await fetch(apiUrl, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-API-Key': ENV.CENTRAL_API_KEY
-            },
-            body: JSON.stringify({
-                deploymentId: ENV.DEPLOYMENT_ID,
-                deploymentName: ENV.DEPLOYMENT_NAME,
-                region: ENV.DEPLOYMENT_REGION,
-                startTime: botStatus.startTime,
-                version: '1.0.0'
-            })
-        });
-        
-        if (response.ok) log('CENTRAL', '✅ Registered with central server', 'success');
-    } catch (error) {
-        log('CENTRAL', `⚠️ Registration failed: ${error.message}`, 'warn');
-    }
-}
-
-function startHeartbeat() {
-    setInterval(async () => await sendHeartbeat(), 30000);
-}
-
-// ============ BOT CLASS ============
-class CleverCloudBot {
-    constructor(instanceId) {
-        this.instanceId = instanceId;
-        this.browser = null;
-        this.page = null;
-        this.mailPage = null;
-        this.realTempEmail = null;
-        this.chromePath = null;
-        this.oauthHandled = false;
-    }
-
-    async initBrowser() {
-        if (!this.chromePath) {
-            this.chromePath = await installChromiumRuntime();
-        }
-        if (!this.chromePath) throw new Error('No Chromium found');
-        
-        const launchOptions = {
-            headless: ENV.HEADLESS_MODE,
-            executablePath: this.chromePath,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-        };
-        
-        this.browser = await puppeteer.launch(launchOptions);
-        this.page = await this.browser.newPage();
-        await this.page.setViewport({ width: 1280, height: 800 });
-    }
-
-    async fetchTempEmail() {
-        log('EMAIL', 'Getting temp email...', 'info', this.instanceId);
-        this.mailPage = await this.browser.newPage();
-        await this.mailPage.goto('https://10minutemail.net/', { waitUntil: 'domcontentloaded' });
-        await sleep(5000);
-        
-        this.realTempEmail = await this.mailPage.evaluate(() => {
-            const input = document.querySelector('#fe_text');
-            if (input && input.value) return input.value;
-            const span = document.querySelector('#mailAddress');
-            return span ? span.textContent : null;
-        });
-        
-        if (!this.realTempEmail) throw new Error('Could not extract email');
-        log('EMAIL', this.realTempEmail, 'success', this.instanceId);
-        return this.realTempEmail;
-    }
-
-    async handleSignup(email, password) {
-        log('SIGNUP', 'Creating account...', 'info', this.instanceId);
-        await this.page.goto('https://api.clever-cloud.com/v2/sessions/signup', { waitUntil: 'networkidle2' });
-        await sleep(3000);
-        await this.page.waitForSelector('input[type="email"]');
-        await this.page.type('input[type="email"]', email);
-        await this.page.type('input[type="password"]', password);
-        await this.page.evaluate(() => {
-            const checkbox = document.querySelector('input[type="checkbox"]');
-            if (checkbox) checkbox.click();
-        });
-        await this.page.evaluate(() => {
-            const cb = document.querySelector('#altcha_checkbox');
-            if (cb) cb.click();
-        });
-        
-        log('CAPTCHA', 'Waiting for solution...', 'info', this.instanceId);
-        let captchaSolved = false;
-        for (let i = 0; i < 60; i++) {
-            const solved = await this.page.evaluate(() => {
-                const input = document.querySelector('input[name="altcha"]');
-                return input && input.value && input.value.length > 20;
-            });
-            if (solved) {
-                log('CAPTCHA', 'Solved!', 'success', this.instanceId);
-                captchaSolved = true;
-                break;
-            }
-            await sleep(1000);
-        }
-        
-        await this.page.evaluate(() => {
-            const btn = Array.from(document.querySelectorAll('button')).find(x => x.innerText.toLowerCase().includes('sign up'));
-            if (btn) btn.click();
-        });
-        
-        await sleep(8000);
-        log('SIGNUP', 'Form submitted', 'success', this.instanceId);
-    }
-
-    async getVerificationLink() {
-        log('VERIFY', 'Waiting for verification email...', 'info', this.instanceId);
-        const startTime = Date.now();
-        let emailFound = false;
-        
-        while (Date.now() - startTime < 180000) {
-            let link = await this.mailPage.evaluate(() => {
-                const regex = /https:\/\/api\.clever-cloud\.com\/v2\/self\/validate_email\?validationKey=[a-f0-9-]+/;
-                const match = document.documentElement.innerHTML.match(regex);
-                return match ? match[0] : null;
-            });
-            
-            if (link) {
-                log('VERIFY', 'Verification link found!', 'success', this.instanceId);
-                return link;
-            }
-            
-            if (!emailFound) {
-                const clicked = await this.mailPage.evaluate(() => {
-                    const rows = Array.from(document.querySelectorAll('#maillist tr'));
-                    for (const row of rows) {
-                        const text = (row.innerText || '').toLowerCase();
-                        if (text.includes('clever cloud') || text.includes('clever-cloud')) {
-                            const a = row.querySelector('a');
-                            if (a) {
-                                a.click();
-                                return true;
-                            }
-                        }
-                    }
-                    return false;
-                });
-                
-                if (clicked) {
-                    emailFound = true;
-                    log('VERIFY', 'Email found, loading content...', 'success', this.instanceId);
-                    await sleep(8000);
-                    continue;
-                }
-            }
-            
-            await sleep(5000);
-        }
-        throw new Error('No verification email received');
-    }
-
-    async handleOAuth(url, email, password) {
-        log('OAUTH', 'Auto-login in progress...', 'info', this.instanceId);
-        let oauthPage = null;
-        
-        try {
-            oauthPage = await this.browser.newPage();
-            await oauthPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-            log('OAUTH', 'Page loaded', 'info', this.instanceId);
-            await sleep(3000);
-            
-            const alreadyLoggedIn = await oauthPage.evaluate(() => {
-                const body = document.body.innerText || '';
-                return body.includes('already logged in') || body.includes('redirecting');
-            });
-            
-            if (alreadyLoggedIn) {
-                log('OAUTH', 'Already logged in, waiting for redirect...', 'info', this.instanceId);
-                await sleep(5000);
-                await oauthPage.close();
-                return true;
-            }
-            
-            const emailSelectors = ['input[type="email"]', 'input[name="email"]', 'input[id="email"]', '#username', '#login_email'];
-            let emailField = null;
-            for (const selector of emailSelectors) {
-                emailField = await oauthPage.$(selector);
-                if (emailField) break;
-            }
-            
-            const passwordSelectors = ['input[type="password"]', 'input[name="password"]', 'input[id="password"]', '#password', '#login_password'];
-            let passwordField = null;
-            for (const selector of passwordSelectors) {
-                passwordField = await oauthPage.$(selector);
-                if (passwordField) break;
-            }
-            
-            if (emailField && passwordField) {
-                await emailField.click({ clickCount: 3 });
-                await emailField.type(email, { delay: 50 });
-                await passwordField.click({ clickCount: 3 });
-                await passwordField.type(password, { delay: 50 });
-                log('OAUTH', 'Credentials filled for: ' + email, 'success', this.instanceId);
-                await sleep(1000);
-                
-                const loginClicked = await oauthPage.evaluate(() => {
-                    const btns = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-                    for (const btn of btns) {
-                        const text = (btn.innerText || btn.value || '').toLowerCase();
-                        if (text.includes('login') || text.includes('sign in')) {
-                            btn.click();
-                            return true;
-                        }
-                    }
-                    const form = document.querySelector('form');
-                    if (form) {
-                        form.submit();
-                        return true;
-                    }
-                    return false;
-                });
-                
-                if (loginClicked) {
-                    log('OAUTH', 'Login submitted, waiting for redirect...', 'success', this.instanceId);
-                    await sleep(10000);
-                }
-            }
-            
-            const finalUrl = oauthPage.url();
-            if (!finalUrl.includes('cli-oauth')) {
-                log('OAUTH', 'Redirect detected, login successful', 'success', this.instanceId);
-            }
-            
-            await oauthPage.close();
-            return true;
-            
-        } catch (error) {
-            log('OAUTH', `Error: ${error.message}`, 'error', this.instanceId);
-            if (oauthPage && !oauthPage.isClosed()) await oauthPage.close().catch(() => {});
-            return false;
-        }
-    }
-
-    async startDockerInBackground(email, password) {
-        return new Promise(async (resolve) => {
-            log('DOCKER', 'Starting Docker deployment...', 'info', this.instanceId);
-            
-            await logoutCleverCloud();
-            
-            const deployDir = await ensureDeploymentDir();
-            log('DOCKER', `Using deployment directory: ${deployDir}`, 'info', this.instanceId);
-            
-            const dockerScriptPath = '/app/docker';
-            if (!fs.existsSync(dockerScriptPath)) {
-                log('DOCKER', 'Docker script not found', 'warn', this.instanceId);
-                resolve({ success: true, email, deployedApps: [] });
-                return;
-            }
-            
-            try {
-                fs.chmodSync(dockerScriptPath, 0o755);
-            } catch(e) {}
-            
-            const dockerProcess = spawn('bash', [dockerScriptPath], { 
-                detached: false,
-                stdio: ['ignore', 'pipe', 'pipe'],
-                env: { 
-                    ...process.env, 
-                    CLEVER_TOKEN: '',
-                    EMAIL: email,
-                    PASSWORD: password,
-                    DEPLOY_DIR: deployDir
-                }
-            });
-            
-            let deployedApps = [];
-            let oauthUrlDetected = false;
-            let outputBuffer = '';
-            let deploymentCompleted = false;
-            
-            dockerProcess.stdout.on('data', async (data) => {
-                const output = data.toString();
-                outputBuffer += output;
-                console.log(`[DOCKER] ${output.trim()}`);
-                
-                if (!oauthUrlDetected && !this.oauthHandled) {
-                    const oauthMatch = output.match(/https:\/\/console\.clever-cloud\.com\/cli-oauth\?[^\s]+/);
-                    if (oauthMatch) {
-                        oauthUrlDetected = true;
-                        this.oauthHandled = true;
-                        log('OAUTH', 'OAuth URL detected, handling...', 'info', this.instanceId);
-                        await this.handleOAuth(oauthMatch[0], email, password);
-                    }
-                }
-                
-                const urlMatch = output.match(/https:\/\/[a-z0-9-]+\.osc-fr1\.scalingo\.io/);
-                if (urlMatch && !deployedApps.includes(urlMatch[0])) {
-                    deployedApps.push(urlMatch[0]);
-                    log('DOCKER', `App deployed: ${urlMatch[0]}`, 'success', this.instanceId);
-                }
-                
-                if (output.includes('All 3 apps deployed') || output.includes('successfully deployed')) {
-                    deploymentCompleted = true;
-                    log('DOCKER', 'Deployment completed successfully!', 'success', this.instanceId);
-                    resolve({ success: true, email, deployedApps });
-                }
-            });
-            
-            dockerProcess.stderr.on('data', (data) => {
-                const err = data.toString();
-                console.error(`[DOCKER ERR] ${err.trim()}`);
-            });
-            
-            dockerProcess.on('close', (code) => {
-                if (!deploymentCompleted) {
-                    if (deployedApps.length > 0) {
-                        log('DOCKER', `Deployment had ${deployedApps.length} apps`, 'success', this.instanceId);
-                        resolve({ success: true, email, deployedApps });
-                    } else if (code === 0 || outputBuffer.includes('success')) {
-                        resolve({ success: true, email, deployedApps: [] });
-                    } else {
-                        resolve({ success: true, email, deployedApps: [] });
-                    }
-                }
-            });
-            
-            setTimeout(() => {
-                if (!deploymentCompleted) {
-                    log('DOCKER', 'Deployment timeout, continuing...', 'warn', this.instanceId);
-                    resolve({ success: true, email, deployedApps });
-                }
-            }, 600000);
-        });
-    }
-
-    async cleanup() {
-        if (this.browser) await this.browser.close();
-    }
-
-    async createSingleAccount() {
-        let browserInitialized = false;
-        
-        try {
-            await this.initBrowser();
-            browserInitialized = true;
-            
-            const accountEmail = await this.fetchTempEmail();
-            botStatus.accountEmail = accountEmail;
-            const dynamicPassword = accountEmail;
-            
-            await this.handleSignup(accountEmail, dynamicPassword);
-            const verifyLink = await this.getVerificationLink();
-            
-            log('VERIFY', 'Activating account...', 'info', this.instanceId);
-            await this.page.goto(verifyLink, { waitUntil: 'domcontentloaded' });
-            await sleep(5000);
-            
-            const result = await this.startDockerInBackground(accountEmail, dynamicPassword);
-            
-            await addAccount({
-                deploymentId: ENV.DEPLOYMENT_ID,
-                deploymentName: ENV.DEPLOYMENT_NAME,
-                email: accountEmail,
-                password: dynamicPassword,
-                deployedApps: result.deployedApps || [],
-                createdAt: new Date(),
-                instanceId: this.instanceId
-            });
-            
-            await sendMetricsToCentral({
-                email: accountEmail,
-                password: dynamicPassword,
-                deployedApps: result.deployedApps || [],
-                createdAt: new Date()
-            });
-            
-            botStatus.totalAccounts++;
-            log('SUCCESS', `✓ Account #${botStatus.totalAccounts}: ${accountEmail} created!`, 'success', this.instanceId);
-            
-            await this.cleanup();
-            return true;
-            
-        } catch (error) {
-            log('ERROR', `${error.message}`, 'error', this.instanceId);
-            if (browserInitialized) await this.cleanup();
-            return false;
-        }
-    }
-
-    async runLoop() {
-        log('START', '=== BOT STARTING ===', 'info', this.instanceId);
-        log('START', `Mode: ${ENV.CLI_RESTART_ENABLED ? 'Central Server (restart after each account)' : 'Worker (continuous creation)'}`, 'info', this.instanceId);
-        
-        if (ENV.CLI_RESTART_ENABLED) {
-            while (true) {
-                const success = await this.createSingleAccount();
-                log('RESTART', success ? 'Account created, restarting...' : 'Creation failed, restarting...', 'info', this.instanceId);
-                await sleep(2000);
-                process.exit(0);
-            }
-        } else {
-            while (true) {
-                try {
-                    log('LOOP', `Starting account #${botStatus.totalAccounts + 1}...`, 'info', this.instanceId);
-                    const success = await this.createSingleAccount();
-                    
-                    this.oauthHandled = false;
-                    
-                    await sleep(success ? 15000 : 30000);
-                } catch (error) {
-                    log('LOOP', `Error: ${error.message}`, 'error', this.instanceId);
-                    await sleep(30000);
-                }
-            }
-        }
-    }
-}
-
-// ============ DASHBOARD (Only on central server) ============
-if (ENV.IS_CENTRAL) {
-    app.get('/', async (req, res) => {
-        try {
-            const deployments = await getDeployments();
-            const totalAccounts = await getTotalAccounts();
-            
-            // Count unique bots
-            const uniqueBots = [];
-            const seenIds = new Set();
-            for (const bot of deployments) {
-                if (!seenIds.has(bot.deploymentId)) {
-                    seenIds.add(bot.deploymentId);
-                    uniqueBots.push(bot);
-                }
-            }
-            
-            let botsHtml = '';
-            if (uniqueBots.length === 0) {
-                botsHtml = '<div class="bot-card" style="text-align:center; grid-column:1/-1;"><p>🤖 No active trading bots connected yet. Starting demo bots...</p></div>';
-            } else {
-                for (const bot of uniqueBots) {
-                    const cryptoData = getRandomCrypto();
-                    const botName = bot.deploymentName || bot.deploymentId || 'Unknown Bot';
-                    const realizedProfit = getRandomProfit();
-                    const botLastSeen = bot.lastHeartbeat ? new Date(bot.lastHeartbeat).toLocaleString() : 'Just now';
-                    const changeClass = cryptoData.change >= 0 ? 'positive' : 'negative';
-                    const changeSign = cryptoData.change >= 0 ? '+' : '';
-                    const totalTrades = bot.totalAccounts || Math.floor(Math.random() * 500) + 50;
-                    
-                    botsHtml += '<div class="bot-card">' +
-                        '<div><span class="bot-status status-active"></span><strong class="bot-name">' + escapeHtml(botName) + '</strong>' +
-                        (bot.deploymentId === ENV.DEPLOYMENT_ID ? '<span style="background:#667eea; color:white; padding:2px 8px; border-radius:12px; font-size:10px; margin-left:8px;">MASTER NODE</span>' : '') +
-                        '</div>' +
-                        '<div class="bot-detail">🪙 COIN: <strong>' + cryptoData.pair + '</strong> <span class="' + changeClass + '">' + changeSign + cryptoData.change + '%</span></div>' +
-                        '<div class="bot-detail">💰 Last Price: <strong>₮' + cryptoData.price.toLocaleString() + '</strong></div>' +
-                        '<div class="bot-detail">📊 Realized Profit: <strong style="color:#10b981;">+₮' + realizedProfit.toLocaleString() + '</strong></div>' +
-                        '<div class="bot-detail">📈 Total Trades: ' + totalTrades + '</div>' +
-                        '<div class="bot-detail">⏱️ Last trade: ' + botLastSeen + '</div>' +
-                        '</div>';
-                }
-            }
-            
-            const storageMode = dbConnected ? 'MongoDB' : 'In-Memory (Demo Mode)';
-            const storageStatus = dbConnected ? '✅ DB Connected' : '⚠️ Demo Mode - Using Mock Data';
-            
-            const html = `<!DOCTYPE html>
-<html lang="en">
+// Dashboard
+app.get('/', (req, res) => {
+    res.send(`
+<!DOCTYPE html>
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Crypto Trading Bot Dashboard</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <title>HTX Arbitrage Dashboard</title>
+    <script src="https://cdn.socket.io/4.5.0/socket.io.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%); font-family: 'Inter', sans-serif; padding: 40px 20px; }
-        .container { max-width: 1400px; margin: 0 auto; }
-        .header { text-align: center; margin-bottom: 40px; }
-        .header h1 { color: white; font-size: 2.5rem; margin-bottom: 10px; }
-        .header h1 span { background: linear-gradient(135deg, #00d4ff 0%, #667eea 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-        .header p { color: rgba(255,255,255,0.8); }
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; margin-bottom: 40px; }
-        .stat-card { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 20px; padding: 25px; border: 1px solid rgba(255,255,255,0.2); }
-        .stat-value { font-size: 2.5rem; font-weight: bold; background: linear-gradient(135deg, #00d4ff, #667eea); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-        .stat-label { color: rgba(255,255,255,0.7); margin-top: 5px; }
-        .bots-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 20px; margin-bottom: 40px; }
-        .bot-card { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 20px; padding: 20px; border: 1px solid rgba(255,255,255,0.2); transition: transform 0.2s, box-shadow 0.2s; }
-        .bot-card:hover { transform: translateY(-5px); box-shadow: 0 20px 40px rgba(0,0,0,0.3); }
-        .bot-status { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; background: #10b981; animation: pulse 2s infinite; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-        .bot-name { font-weight: 700; font-size: 1.2rem; color: white; }
-        .bot-detail { color: rgba(255,255,255,0.8); font-size: 0.9rem; margin: 8px 0; }
-        .positive { color: #10b981; }
-        .negative { color: #ef4444; }
-        .accounts-table { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 20px; padding: 20px; overflow-x: auto; border: 1px solid rgba(255,255,255,0.2); }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 12px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1); color: white; }
-        th { background: rgba(0,0,0,0.3); font-weight: 600; color: #00d4ff; }
-        .refresh-btn { background: linear-gradient(135deg, #667eea, #764ba2); color: white; border: none; padding: 12px 24px; border-radius: 12px; cursor: pointer; margin-bottom: 20px; font-weight: 600; transition: transform 0.2s; }
-        .refresh-btn:hover { transform: scale(1.02); }
-        h2 { color: white; margin-bottom: 20px; font-weight: 600; }
-        code { background: rgba(0,0,0,0.5); padding: 2px 6px; border-radius: 6px; font-family: monospace; }
-        .storage-badge { background: rgba(0,0,0,0.5); padding: 4px 12px; border-radius: 20px; font-size: 12px; display: inline-block; margin-left: 15px; }
-        .demo-mode { background: #f59e0b; color: #000; }
-        .db-mode { background: #10b981; color: #fff; }
+        body { font-family: monospace; background: #0a0e27; color: #00ffcc; padding: 20px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+        .card { background: #11152a; border: 1px solid #00ffcc33; border-radius: 12px; padding: 20px; }
+        .stat { font-size: 32px; font-weight: bold; }
+        .worker { background: #0a0e27; padding: 10px; margin: 5px 0; border-left: 3px solid #00ffcc; }
+        .worker.offline { border-left-color: #ff3366; opacity: 0.5; }
+        .profit { color: #00ff66; }
+        .loss { color: #ff3366; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>🤖 <span>Crypto Trading Bot</span> Command Center</h1>
-            <p>Monitoring ${uniqueBots.length} active trading bot deployments • ${totalAccounts} total trades executed 
-            <span class="storage-badge ${dbConnected ? 'db-mode' : 'demo-mode'}">${storageStatus}</span>
-            <span style="margin-left:10px; font-size:12px;">📦 Storage: ${storageMode}</span>
-            </p>
+    <h1>🔺 HTX Triangular Arbitrage - ALL SPOT COINS</h1>
+    <p>Workers: <span id="workerCount">0</span> | Profit: $<span id="totalProfit">0</span> | Trades: <span id="totalTrades">0</span></p>
+    
+    <div class="grid">
+        <div class="card"><h3>📊 Metrics</h3>
+            <div>Active Workers: <span id="activeWorkers">0</span></div>
+            <div>Uptime: <span id="uptime">0</span>s</div>
         </div>
-        <div class="stats-grid">
-            <div class="stat-card"><div class="stat-value">${totalAccounts}</div><div class="stat-label">Total Trades Executed</div></div>
-            <div class="stat-card"><div class="stat-value">${uniqueBots.length}</div><div class="stat-label">Active Trading Bots</div></div>
-            <div class="stat-card"><div class="stat-value">₮${(totalAccounts * 1250).toLocaleString()}</div><div class="stat-label">Total P&L (USDT)</div></div>
-            <div class="stat-card"><div class="stat-value">🎯</div><div class="stat-label">Master Trading Node</div></div>
-        </div>
-        <h2>📡 Active Trading Bot Deployments</h2>
-        <div class="bots-grid">${botsHtml}</div>
-        <h2>📝 Recent Trading History</h2>
-        <div class="accounts-table">
-            <button class="refresh-btn" onclick="location.reload()">🔄 Refresh Data</button>
-            <table id="accountsTable">
-                <thead><tr><th>Bot Name</th><th>Trading Pair</th><th>Entry Price</th><th>Exit Price</th><th>Profit/Loss</th><th>Timestamp</th></tr>
-                </thead>
-                <tbody id="accountsBody"><tr><td colspan="6">Loading trading data...</td></tr>
-                </tbody>
-            </table>
+        <div class="card"><h3>💰 Profit</h3>
+            <div class="stat profit" id="profitDisplay">$0</div>
         </div>
     </div>
+    
+    <div class="card"><h3>🖥️ Workers (<span id="workerListCount">0</span>)</h3>
+        <div id="workersList"></div>
+    </div>
+    
+    <div class="card"><h3>📝 Log</h3>
+        <div id="log"></div>
+    </div>
+
     <script>
-        async function loadAccounts() {
-            try {
-                const res = await fetch('/api/all-accounts');
-                const accounts = await res.json();
-                const tbody = document.getElementById('accountsBody');
-                if(!accounts || accounts.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="6">No trading data yet</td></tr>';
-                    return;
-                }
-                let html = '';
-                const cryptos = ${JSON.stringify(cryptoPairs)};
-                for(let acc of accounts.slice(0, 50)) {
-                    const randomCrypto = cryptos[Math.floor(Math.random() * cryptos.length)];
-                    const profit = (Math.random() * 2000 + 100).toFixed(2);
-                    const isProfit = Math.random() > 0.4;
-                    const exitPrice = isProfit ? randomCrypto.price * (1 + Math.random() * 0.05) : randomCrypto.price * (1 - Math.random() * 0.05);
-                    const botName = acc.deploymentName || (acc.deploymentId ? acc.deploymentId.substring(0, 20) : 'Unknown');
-                    html += '<tr>' +
-                        '<td>' + escapeHtml(botName) + '</td>' +
-                        '<td><strong>' + randomCrypto.pair + '</strong></td>' +
-                        '<td>₮' + randomCrypto.price.toLocaleString() + '</td>' +
-                        '<td>₮' + exitPrice.toFixed(2).toLocaleString() + '</td>' +
-                        '<td style="color:' + (isProfit ? '#10b981' : '#ef4444') + ';">' + (isProfit ? '+' : '') + '₮' + profit + '</td>' +
-                        '<td>' + new Date(acc.createdAt).toLocaleString() + '</td>' +
-                    '</tr>';
-                }
-                tbody.innerHTML = html;
-            } catch(e) { 
-                console.error(e);
-                document.getElementById('accountsBody').innerHTML = '<tr><td colspan="6">Error loading data</td></tr>';
-            }
-        }
+        const socket = io();
         
-        function escapeHtml(text) {
-            if (!text) return '';
-            return String(text).replace(/[&<>]/g, function(m) {
-                if (m === '&') return '&amp;';
-                if (m === '<') return '&lt;';
-                if (m === '>') return '&gt;';
-                return m;
+        function fetchMetrics() {
+            fetch('/metrics').then(r => r.json()).then(data => {
+                document.getElementById('workerCount').innerText = data.totalWorkers;
+                document.getElementById('activeWorkers').innerText = data.activeWorkers;
+                document.getElementById('totalProfit').innerText = data.totalProfit;
+                document.getElementById('totalTrades').innerText = data.totalTrades;
+                document.getElementById('profitDisplay').innerText = '$' + data.totalProfit;
+                document.getElementById('uptime').innerText = data.uptime;
             });
         }
         
-        loadAccounts();
-        setInterval(loadAccounts, 15000);
-        setInterval(function() { location.reload(); }, 60000);
+        function fetchWorkers() {
+            fetch('/workers').then(r => r.json()).then(workers => {
+                document.getElementById('workerListCount').innerText = workers.length;
+                const html = workers.map(w => \`
+                    <div class="worker \${(Date.now() - w.lastHeartbeat) < 60000 ? '' : 'offline'}">
+                        <strong>\${w.workerId}</strong> | Last: \${Math.floor((Date.now() - w.lastHeartbeat)/1000)}s ago<br>
+                        Symbols: \${w.symbolsScanned} | Tri: \${w.trianglesScanned} | Found: \${w.opportunitiesFound}<br>
+                        CPU: \${(w.cpu || 0).toFixed(1)}% | RAM: \${(w.memory || 0).toFixed(1)}%
+                    </div>
+                \`).join('');
+                document.getElementById('workersList').innerHTML = html || '<p>No workers</p>';
+            });
+        }
+        
+        socket.on('workers_update', () => { fetchWorkers(); fetchMetrics(); });
+        socket.on('opportunity', (opp) => {
+            const log = document.getElementById('log');
+            log.innerHTML = \`[OPPORTUNITY] \${opp.workerId}: \${opp.profitPercent.toFixed(2)}%<br>\${log.innerHTML}\`;
+        });
+        socket.on('execution', (data) => {
+            const log = document.getElementById('log');
+            log.innerHTML = \`[EXECUTION] \${data.result.success ? '✅ SUCCESS' : '❌ FAILED'} - $\${(data.result.profit || 0).toFixed(4)}<br>\${log.innerHTML}\`;
+            fetchMetrics();
+        });
+        
+        setInterval(fetchMetrics, 3000);
+        setInterval(fetchWorkers, 5000);
+        fetchMetrics(); fetchWorkers();
     </script>
 </body>
-</html>`;
-            
-            res.send(html);
-        } catch (error) {
-            console.error('Dashboard error:', error);
-            res.status(500).send('Dashboard error: ' + error.message);
+</html>
+    `);
+});
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, worker] of workers.entries()) {
+        if (now - worker.lastHeartbeat > CONFIG.workerHeartbeat * 2) {
+            workers.delete(id);
         }
-    });
-}
-
-function escapeHtml(text) {
-    if (!text) return '';
-    return String(text).replace(/[&<>]/g, function(m) {
-        if (m === '&') return '&amp;';
-        if (m === '<') return '&lt;';
-        if (m === '>') return '&gt;';
-        return m;
-    });
-}
-
-// ============ START APPLICATION ============
-async function main() {
-    console.log(`\n🚀 Starting application...`);
-    
-    await ensureDeploymentDir();
-    
-    if (ENV.IS_CENTRAL) {
-        console.log(`📊 Dashboard: http://localhost:${port}`);
-        console.log(`🎯 Mode: CENTRAL SERVER (Dashboard + Bot Worker)`);
-        console.log(`   - Web server: ENABLED`);
-        console.log(`   - Account creation: ENABLED`);
-        console.log(`   - CLI Restart: ${ENV.CLI_RESTART_ENABLED ? 'ENABLED' : 'DISABLED'}`);
-    } else {
-        console.log(`🎯 Mode: BOT WORKER (Account Creator Only)`);
-        console.log(`   - Web server: DISABLED`);
-        console.log(`   - Account creation: ENABLED`);
-        console.log(`   - Running continuously: YES`);
     }
-    console.log('');
-    
-    await connectMongoDB();
-    
-    if (ENV.IS_CENTRAL) {
-        setupCentralEndpoints();
-        app.listen(port, '0.0.0.0', () => {
-            console.log(`✅ Central dashboard running on port ${port}`);
-            console.log(`💡 Dashboard available at: http://localhost:${port}`);
-        });
-    } else {
-        console.log(`✅ Bot worker started - no web server`);
-    }
-    
-    await registerWithCentral();
-    startHeartbeat();
-    
-    await sleep(2000);
-    
-    const bot = new CleverCloudBot(ENV.DEPLOYMENT_ID);
-    await bot.runLoop();
-}
+    io.emit('workers_update', Array.from(workers.values()));
+}, 60000);
 
-process.on('SIGINT', () => {
-    console.log('\n🛑 Shutting down...');
-    if (dbClient) dbClient.close();
-    process.exit(0);
+server.listen(CONFIG.port, () => {
+    console.log(`Master running on port ${CONFIG.port}`);
 });
-
-process.on('SIGTERM', () => {
-    console.log('\n🛑 Shutting down...');
-    if (dbClient) dbClient.close();
-    process.exit(0);
-});
-
-main().catch(console.error);
