@@ -58,6 +58,7 @@ async function htxRequest(account, method, path, data = {}) {
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
         const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 5000 });
+        if (res.data.status !== 'ok') console.log(`HTX Response Error:`, JSON.stringify(res.data));
         return res.data;
     } catch (e) { return { status: 'error' }; }
 }
@@ -78,10 +79,11 @@ async function sync() {
         const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
         
         if (res?.status === 'ok' && res.data) {
-            const pos = res.data.find(p => p.direction === state.direction && parseFloat(p.volume) >= 1);
-            if (pos) {
+            // Filter by direction to get exact contract count
+            const pos = res.data.find(p => p.direction === state.direction);
+            if (pos && parseFloat(pos.volume) > 0) {
                 state.avgPrice = parseFloat(pos.cost_hold);
-                state.volume = parseFloat(pos.volume);
+                state.volume = Math.floor(parseFloat(pos.volume)); // Ensure volume is integer contracts
                 state.unrealizedUsdt = parseFloat(pos.profit);
                 state.roi = parseFloat(pos.profit_rate) * 100;
             } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
@@ -105,33 +107,33 @@ async function tradeLoop() {
     const s1 = accountStates[acc1.accountId];
     const s2 = accountStates[acc2.accountId];
 
-    // 1. ENTRY / SYNC
+    // 1. ENTRY
     if (s1.volume < 1 || s2.volume < 1) {
         isProcessing = true;
-        market.status = 'Syncing Hedge Entry...';
+        market.status = 'Opening Hedge...';
         const tasks = [];
-        if (s1.volume < 1) tasks.push(htxRequest(acc1, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent' }));
-        if (s2.volume < 1) tasks.push(htxRequest(acc2, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent' }));
+        if (s1.volume < 1) tasks.push(htxRequest(acc1, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'lightning' }));
+        if (s2.volume < 1) tasks.push(htxRequest(acc2, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'lightning' }));
         await Promise.all(tasks);
         hasAddedThisCycle = false;
         setTimeout(() => { isProcessing = false; }, 3000);
         return;
     }
 
-    // 2. NET PROFIT CALCULATION
+    // 2. MATH
     const totalVol = s1.volume + s2.volume;
     const estExitFees = (totalVol * config.contractSize * market.last) * config.feeRate;
-    const combinedPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
-    const netProfit = combinedPnL - estExitFees;
+    const netProfit = (s1.unrealizedUsdt + s2.unrealizedUsdt) - estExitFees;
 
-    // 3. AGGRESSIVE EXIT: Close immediately if net profit is > 0
+    // 3. EXIT TRIGGER (When Net Profit > 0)
     if (netProfit > 0) {
-        market.status = `EXITING: PROFIT +$${netProfit.toFixed(8)}`;
+        market.status = `FORCE CLOSING: +$${netProfit.toFixed(8)}`;
+        console.log(`Closing Positions: Long ${s1.volume} contracts, Short ${s2.volume} contracts`);
         await closeAll();
         return;
     }
 
-    // 4. WINNER ADD
+    // 4. WIN-ADD TRIGGER
     if (!hasAddedThisCycle) {
         let winnerAcc = null;
         if (s1.roi >= config.triggerRoi) winnerAcc = acc1;
@@ -140,35 +142,34 @@ async function tradeLoop() {
         if (winnerAcc) {
             market.status = `Adding to Winner...`;
             await htxRequest(winnerAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: config.addSize, direction: accountStates[winnerAcc.accountId].direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+                contract_code: config.symbol, volume: config.addSize, direction: accountStates[winnerAcc.accountId].direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'lightning'
             });
             hasAddedThisCycle = true;
-        } else {
-            market.status = `Running: Waiting ${config.triggerRoi}%`;
         }
     }
 }
 
 async function closeAll() {
     isProcessing = true;
-    // Force close orders for both accounts simultaneously
+    
     await Promise.all(config.accounts.map(acc => {
         const state = accountStates[acc.accountId];
-        if (state.volume > 0) {
+        const contractCount = Math.floor(state.volume); // Force integer contracts
+        
+        if (contractCount > 0) {
             return htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, 
-                volume: state.volume, 
+                volume: contractCount, 
                 direction: state.direction === 'buy' ? 'sell' : 'buy', 
                 offset: 'close', 
                 lever_rate: config.leverage, 
-                order_price_type: 'opponent' 
+                order_price_type: 'lightning' // Instant Market Close
             });
         }
         return Promise.resolve();
     }));
     
-    // Short lockout to let exchange process the close
-    setTimeout(() => { isProcessing = false; }, 4000);
+    setTimeout(() => { isProcessing = false; }, 5000);
 }
 
 function startWS() {
@@ -185,7 +186,6 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-// UI and API routes remain exactly the same as provided in your initial working version
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), config, hasAddedThisCycle }));
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
