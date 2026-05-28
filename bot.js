@@ -20,14 +20,6 @@ while (process.env[`HTX_API_KEY_${accountIndex}`] && process.env[`HTX_SECRET_KEY
     accountIndex++;
 }
 
-if (apiAccounts.length === 0 && process.env.HTX_API_KEY && process.env.HTX_SECRET_KEY) {
-    apiAccounts.push({
-        apiKey: process.env.HTX_API_KEY,
-        secretKey: process.env.HTX_SECRET_KEY,
-        accountId: 1
-    });
-}
-
 const config = {
     symbol: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase(),
     leverage: parseInt(process.env.LEVERAGE) || 10,
@@ -36,12 +28,20 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     takeProfitPercent: parseFloat(process.env.TAKE_PROFIT_PERCENT) || 2.0,
-    stopLossPercent: parseFloat(process.env.STOP_LOSS_PERCENT) || 2.0,
+    stopLossPercent: parseFloat(process.env.STOP_LOSS_PERCENT) || 5.0, // Wider SL for hedge
     orderSize: parseFloat(process.env.ORDER_SIZE) || 1,
-    hedgeThreshold: parseFloat(process.env.HEDGE_THRESHOLD) || 0.1
+    hedgeThreshold: parseFloat(process.env.HEDGE_THRESHOLD) || 0.15,
+    maxSpreadPct: 0.08 // ❌ Won't open if Bid/Ask gap is wider than this %
 };
 
-// ==================== ACCOUNT STATES ====================
+// ==================== GLOBAL MARKET STATE ====================
+let marketData = {
+    bid: 0,
+    ask: 0,
+    mid: 0,
+    spread: 0
+};
+
 let accountStates = {};
 let totalResets = 0;
 let isOpeningPositions = false;
@@ -49,87 +49,46 @@ let isOpeningPositions = false;
 config.accounts.forEach((account, idx) => {
     const direction = idx === 0 ? 'buy' : 'sell';
     accountStates[account.accountId] = {
-        isRunning: true,
-        isTrading: false,
-        startTime: Date.now(),
-        currentPrice: 0,
-        avgPrice: 0,
-        roi: 0,
-        realizedProfit: 0,
-        profitPct: 0,
+        accountId: account.accountId,
+        direction: direction,
         walletBalance: 0,
+        initialBalance: 0,
         displayBalance: 0,
         peakBalance: 0,
-        initialBalance: 0,
-        direction: direction,
-        position: { volume: 0, costHold: 0 },
+        avgPrice: 0,
+        roi: 0,
+        position: { volume: 0 },
         totalTrades: 0,
         winningTrades: 0,
         losingTrades: 0,
-        allTimeHigh: 0,
-        settings: {
-            takeProfit: config.takeProfitPercent,
-            stopLoss: config.stopLossPercent,
-            orderSize: config.orderSize
-        }
+        realizedProfit: 0
     };
 });
 
-let botState = {
-    isRunning: true,
-    startTime: Date.now(),
-    currentPrice: 0,
-    realizedProfit: 0,
-    profitPct: 0,
-    displayBalance: 0,
-    initialBalance: 0,
-    estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
-    totalTrades: 0,
-    winningTrades: 0,
-    losingTrades: 0,
-    longRoi: 0,
-    shortRoi: 0,
-    hedgeDeviation: 0,
-    totalResets: 0,
-    lastResetReason: ""
-};
+let botState = { realizedProfit: 0, profitPct: 0, totalResets: 0, lastResetReason: "" };
 
 // ==================== API HANDLER ====================
 async function htxRequest(account, method, path, data = {}) {
     const timestamp = new Date().toISOString().split('.')[0];
-    const params = { 
-        AccessKeyId: account.apiKey, 
-        SignatureMethod: 'HmacSHA256', 
-        SignatureVersion: '2', 
-        Timestamp: timestamp 
-    };
+    const params = { AccessKeyId: account.apiKey, SignatureMethod: 'HmacSHA256', SignatureVersion: '2', Timestamp: timestamp };
     const query = Object.keys(params).sort().map(k => `${k}=${encodeURIComponent(params[k])}`).join('&');
     const payload = [method.toUpperCase(), config.restHost, path, query].join('\n');
     const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
-        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 10000 });
+        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 5000 });
         return res.data;
-    } catch (e) { 
-        return { status: 'error', 'err-msg': e.message }; 
-    }
+    } catch (e) { return { status: 'error', message: e.message }; }
 }
 
-// ==================== DATA SYNC ====================
+// ==================== DATA SYNC & ROI CALC ====================
 async function syncAccountData(account, state) {
     try {
         const accRes = await htxRequest(account, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
         if (accRes?.data) {
             const acc = accRes.data.find(a => a.margin_asset === 'USDT');
-            const equity = parseFloat(acc.margin_balance);
-            const unrealized = parseFloat(acc.profit_unreal) || 0;
-            const realBalance = equity - unrealized;
-
-            if (state.initialBalance <= 0) {
-                state.initialBalance = realBalance;
-                state.displayBalance = realBalance;
-                state.peakBalance = realBalance;
-            }
+            const realBalance = parseFloat(acc.margin_balance) - (parseFloat(acc.profit_unreal) || 0);
+            if (state.initialBalance <= 0) state.initialBalance = state.peakBalance = state.displayBalance = realBalance;
             if (realBalance > state.peakBalance) {
                 state.displayBalance += (realBalance - state.peakBalance);
                 state.peakBalance = realBalance;
@@ -143,224 +102,136 @@ async function syncAccountData(account, state) {
 
         if (pos) {
             state.avgPrice = parseFloat(pos.cost_hold);
-            state.roi = parseFloat(pos.profit_rate) * 100;
-            state.position = { volume: parseFloat(pos.volume), costHold: state.avgPrice };
+            state.position.volume = parseFloat(pos.volume);
+            
+            // 🎯 BETTER ROI CALCULATION: Compare entry vs MID price to remove Bid/Ask bias
+            if (state.direction === 'buy') {
+                state.roi = ((marketData.mid - state.avgPrice) / state.avgPrice) * 100 * config.leverage;
+            } else {
+                state.roi = ((state.avgPrice - marketData.mid) / state.avgPrice) * 100 * config.leverage;
+            }
         } else {
-            state.position = { volume: 0, costHold: 0 };
+            state.position.volume = 0;
             state.roi = 0;
-            state.avgPrice = 0;
         }
-        updateCombinedState();
-    } catch (e) { console.error(`Sync error:`, e.message); }
+    } catch (e) { console.log("Sync Error:", e.message); }
 }
 
-function updateCombinedState() {
-    let totalRealizedProfit = 0, totalDisplayBalance = 0, totalInitialBalance = 0;
-    let totalTrades = 0, totalWins = 0, totalLosses = 0;
-    let longRoi = 0, shortRoi = 0;
-    
-    Object.values(accountStates).forEach(state => {
-        totalRealizedProfit += state.realizedProfit;
-        totalDisplayBalance += state.displayBalance;
-        totalInitialBalance += state.initialBalance;
-        totalTrades += state.totalTrades;
-        totalWins += state.winningTrades;
-        totalLosses += state.losingTrades;
-        if (state.direction === 'buy') longRoi = state.roi;
-        if (state.direction === 'sell') shortRoi = state.roi;
-    });
-    
-    botState.realizedProfit = totalRealizedProfit;
-    botState.displayBalance = totalDisplayBalance;
-    botState.initialBalance = totalInitialBalance;
-    botState.totalTrades = totalTrades;
-    botState.winningTrades = totalWins;
-    botState.losingTrades = totalLosses;
-    botState.profitPct = totalInitialBalance > 0 ? (totalRealizedProfit / totalInitialBalance) * 100 : 0;
-    botState.longRoi = longRoi;
-    botState.shortRoi = shortRoi;
-    botState.hedgeDeviation = Math.abs(longRoi + shortRoi);
-    botState.totalResets = totalResets;
-    
-    const elapsed = (Date.now() - botState.startTime) / 3600000;
-    const hr = botState.realizedProfit / Math.max(elapsed, 0.01);
-    botState.estimates = { hr, day: hr * 24, dgr: (hr * 24 / Math.max(botState.initialBalance, 0.01)) * 100 };
-}
-
-// ==================== SIMULTANEOUS TRADING LOGIC ====================
+// ==================== ATOMIC TRADING LOGIC ====================
 
 async function openBothPositionsTogether() {
-    if (config.accounts.length < 2 || isOpeningPositions) return;
-    
-    const longAcc = config.accounts[0], shortAcc = config.accounts[1];
-    const longState = accountStates[longAcc.accountId], shortState = accountStates[shortAcc.accountId];
-    
-    if (longState.position.volume === 0 && shortState.position.volume === 0) {
-        isOpeningPositions = true;
-        console.log(`\n🚀 DISPATCHING SIMULTANEOUS ORDERS [${config.symbol}]`);
+    if (isOpeningPositions || marketData.mid === 0) return;
 
-        // Fire both orders at the same time using Promise.all
-        const results = await Promise.all([
-            htxRequest(longAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: longState.settings.orderSize,
-                direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+    const longState = accountStates[config.accounts[0].accountId];
+    const shortState = accountStates[config.accounts[1].accountId];
+
+    if (longState.position.volume === 0 && shortState.position.volume === 0) {
+        
+        // 🛑 SPREAD PROTECTION
+        if (marketData.spread > config.maxSpreadPct) {
+            console.log(`⏳ Waiting for spread to narrow... Current: ${marketData.spread.toFixed(4)}%`);
+            return;
+        }
+
+        isOpeningPositions = true;
+        console.log(`\n🚀 SPREAD OK (${marketData.spread.toFixed(4)}%). OPENING ATOMICALY...`);
+
+        // Use Promise.all to send both orders in the same event loop tick
+        const [res1, res2] = await Promise.all([
+            htxRequest(config.accounts[0], 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: config.orderSize,
+                direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
             }),
-            htxRequest(shortAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: shortState.settings.orderSize,
-                direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+            htxRequest(config.accounts[1], 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: config.orderSize,
+                direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
             })
         ]);
 
-        if (results[0].status === 'ok' && results[1].status === 'ok') {
-            console.log(`   ✅ BOTH orders successfully dispatched`);
+        if (res1.status === 'ok' && res2.status === 'ok') {
+            console.log("✅ Both orders filled.");
             longState.totalTrades++; shortState.totalTrades++;
-        } else {
-            console.log(`   ⚠️ Partial fill or error. Safety cleanup will handle imbalances.`);
         }
         
-        await new Promise(r => setTimeout(r, 1500));
+        await new Promise(r => setTimeout(r, 1000));
         isOpeningPositions = false;
     }
 }
 
-async function forceResetIfOnlyOneOpen() {
-    const longState = accountStates[config.accounts[0].accountId];
-    const shortState = accountStates[config.accounts[1].accountId];
-    
-    if ((longState.position.volume > 0) !== (shortState.position.volume > 0)) {
-        console.log(`\n⚠️ IMBALANCE DETECTED - Reseting...`);
-        botState.lastResetReason = "Single side detected";
-        
-        await Promise.all([
-            longState.position.volume > 0 ? htxRequest(config.accounts[0], 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: longState.position.volume, direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
-            }) : Promise.resolve(),
-            shortState.position.volume > 0 ? htxRequest(config.accounts[1], 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: shortState.position.volume, direction: 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
-            }) : Promise.resolve()
-        ]);
+async function handleSafetyAndProfit() {
+    const long = accountStates[config.accounts[0].accountId];
+    const short = accountStates[config.accounts[1].accountId];
+
+    // 1. Force Reset if only one side exists (Imbalance)
+    if ((long.position.volume > 0) !== (short.position.volume > 0)) {
+        console.log("⚠️ Imbalance detected. Force closing...");
+        await Promise.all(config.accounts.map(acc => {
+            const state = accountStates[acc.accountId];
+            return state.position.volume > 0 ? htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: state.position.volume,
+                direction: state.direction === 'buy' ? 'sell' : 'buy', 
+                offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5'
+            }) : Promise.resolve();
+        }));
         totalResets++;
+        return;
     }
-}
 
-async function checkHedgePerfect() {
-    const longState = accountStates[config.accounts[0].accountId];
-    const shortState = accountStates[config.accounts[1].accountId];
-    
-    if (longState.position.volume > 0 && shortState.position.volume > 0) {
-        const deviation = Math.abs(longState.roi + shortState.roi);
-        
+    // 2. Hedge Drift Check (If they move too far apart)
+    if (long.position.volume > 0 && short.position.volume > 0) {
+        const deviation = Math.abs(long.roi + short.roi);
         if (deviation > config.hedgeThreshold) {
-            console.log(`\n🔄 HEDGE DEVIATION TOO HIGH: ${deviation.toFixed(2)}% - Closing both.`);
-            botState.lastResetReason = `Hedge Drift: ${deviation.toFixed(2)}%`;
-            
-            await Promise.all([
-                htxRequest(config.accounts[0], 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol, volume: longState.position.volume, direction: 'sell', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
-                }),
-                htxRequest(config.accounts[1], 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol, volume: shortState.position.volume, direction: 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
-                })
-            ]);
+            console.log(`🔄 Drift too high (${deviation.toFixed(2)}%). Resetting Hedge...`);
+            // Close both simultaneously
+            await Promise.all(config.accounts.map(acc => {
+                const state = accountStates[acc.accountId];
+                return htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                    contract_code: config.symbol, volume: state.position.volume,
+                    direction: state.direction === 'buy' ? 'sell' : 'buy', 
+                    offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5'
+                });
+            }));
             totalResets++;
+            return;
         }
-    }
-}
 
-async function checkTrades() {
-    await forceResetIfOnlyOneOpen();
-    await openBothPositionsTogether();
-    await checkHedgePerfect();
-
-    // Check Take Profit / Stop Loss
-    for (const acc of config.accounts) {
-        const state = accountStates[acc.accountId];
-        if (state.position.volume > 0) {
-            if (state.roi >= state.settings.takeProfit || state.roi <= -state.settings.stopLoss) {
-                const dir = state.direction === 'buy' ? 'sell' : 'buy';
-                const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol, volume: state.position.volume, direction: dir, offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
-                });
-                if (res.status === 'ok') {
-                    if (state.roi > 0) state.winningTrades++; else state.losingTrades++;
-                    state.totalTrades++;
-                    console.log(`🎯 TP/SL Triggered for ${state.direction.toUpperCase()}: ${state.roi.toFixed(2)}%`);
-                }
+        // 3. Take Profit Check (Check if combined or individual side hits target)
+        // In a perfect hedge, we look for one side to hit TP
+        for (const state of [long, short]) {
+            if (state.roi >= config.takeProfitPercent) {
+                console.log(`🎯 TP Hit on ${state.direction.toUpperCase()}! Closing both...`);
+                await Promise.all(config.accounts.map(acc => {
+                    const s = accountStates[acc.accountId];
+                    return htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                        contract_code: config.symbol, volume: s.position.volume,
+                        direction: s.direction === 'buy' ? 'sell' : 'buy', 
+                        offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5'
+                    });
+                }));
+                state.winningTrades++;
+                break;
             }
         }
     }
 }
 
-// ==================== WEB UI ====================
-app.get('/', (req, res) => {
-    res.send(`<!DOCTYPE html><html><head><title>Perfect Hedge</title><script src="https://cdn.tailwindcss.com"></script></head>
-    <body class="bg-slate-900 text-white font-sans p-8">
-        <div class="max-w-6xl mx-auto">
-            <div class="flex justify-between items-end mb-8 bg-slate-800 p-6 rounded-2xl border border-slate-700">
-                <div><h1 class="text-3xl font-black text-indigo-400">🎯 ATOMIC HEDGE</h1><p class="text-slate-400">Simultaneous Order Execution Active</p></div>
-                <div class="text-right"><div id="price" class="text-4xl font-mono font-bold">$0.0000</div><div class="text-indigo-400 font-bold">${config.symbol}</div></div>
-            </div>
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-                <div class="bg-slate-800 p-6 rounded-xl border border-slate-700">
-                    <div class="text-slate-400 text-sm uppercase">Total Profit</div>
-                    <div id="profit" class="text-3xl font-bold text-emerald-400">$0.00</div>
-                </div>
-                <div class="bg-slate-800 p-6 rounded-xl border border-slate-700">
-                    <div class="text-slate-400 text-sm uppercase">Hedge Deviation</div>
-                    <div id="dev" class="text-3xl font-bold text-amber-400">0.00%</div>
-                </div>
-                <div class="bg-slate-800 p-6 rounded-xl border border-slate-700">
-                    <div class="text-slate-400 text-sm uppercase">Safety Resets</div>
-                    <div id="resets" class="text-3xl font-bold text-rose-400">0</div>
-                </div>
-            </div>
-            <div id="accounts" class="grid grid-cols-1 md:grid-cols-2 gap-6"></div>
-        </div>
-        <script>
-            async function update() {
-                const r = await fetch('/api/status'); const d = await r.json();
-                document.getElementById('price').innerText = '$' + d.currentPrice.toFixed(8);
-                document.getElementById('profit').innerText = '$' + d.realizedProfit.toFixed(4);
-                document.getElementById('dev').innerText = d.hedgeDeviation.toFixed(2) + '%';
-                document.getElementById('resets').innerText = d.totalResets;
-                
-                let html = '';
-                d.accounts.forEach(a => {
-                    const isLong = a.direction === 'buy';
-                    html += \`<div class="bg-slate-800 p-6 rounded-xl border-l-4 \${isLong ? 'border-emerald-500' : 'border-rose-500'}">
-                        <div class="flex justify-between mb-4">
-                            <span class="font-bold text-xl">\${isLong ? 'LONG' : 'SHORT'} Side</span>
-                            <span class="font-mono \${a.roi >= 0 ? 'text-emerald-400' : 'text-rose-400'}">\${a.roi.toFixed(2)}%</span>
-                        </div>
-                        <div class="text-sm text-slate-400">Position: \${a.position} contracts</div>
-                        <div class="text-sm text-slate-400">Entry: \$\${(a.avgPrice || 0).toFixed(8)}</div>
-                    </div>\`;
-                });
-                document.getElementById('accounts').innerHTML = html;
-            }
-            setInterval(update, 1000);
-        </script>
-    </body></html>`);
-});
-
-app.get('/api/status', (req, res) => {
-    const accountsData = Object.entries(accountStates).map(([id, state]) => ({
-        id: parseInt(id), position: state.position.volume, roi: state.roi, direction: state.direction, avgPrice: state.avgPrice
-    }));
-    res.json({ ...botState, accounts: accountsData });
-});
-
-// ==================== WEBSOCKET & INIT ====================
+// ==================== WEBSOCKET (BBO FOR REALTIME SPREAD) ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
-    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.detail`, id: 'p1' })));
+    ws.on('open', () => {
+        // Subscribe to Best Bid Offer (BBO) for precise price
+        ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo1' }));
+    });
+
     ws.on('message', (data) => {
         zlib.gunzip(data, (err, dec) => {
             if (err) return;
             const msg = JSON.parse(dec.toString());
-            if (msg.tick?.close) {
-                botState.currentPrice = parseFloat(msg.tick.close);
-                Object.values(accountStates).forEach(s => { s.currentPrice = botState.currentPrice; });
+            if (msg.tick) {
+                marketData.bid = parseFloat(msg.tick.bid[0]);
+                marketData.ask = parseFloat(msg.tick.ask[0]);
+                marketData.mid = (marketData.bid + marketData.ask) / 2;
+                marketData.spread = ((marketData.ask - marketData.bid) / marketData.mid) * 100;
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
         });
@@ -368,18 +239,71 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-async function initialize() {
-    console.log(`🚀 Perfect Hedge Starting for ${config.symbol}...`);
-    for (const acc of config.accounts) await syncAccountData(acc, accountStates[acc.accountId]);
+// ==================== WEB UI ====================
+app.get('/', (req, res) => {
+    res.send(`<!DOCTYPE html><html><head><title>Perfect Hedge Pro</title><script src="https://cdn.tailwindcss.com"></script></head>
+    <body class="bg-black text-gray-200 p-8">
+        <div class="max-w-4xl mx-auto">
+            <div class="flex justify-between items-center bg-gray-900 p-6 rounded-xl border border-gray-800 mb-6">
+                <div><h1 class="text-2xl font-bold text-blue-500">🛡️ PERFECT HEDGE</h1><p class="text-xs text-gray-500">Spread Protected | Atomic Execution</p></div>
+                <div class="text-right">
+                    <div id="price" class="text-3xl font-mono">$0.000000</div>
+                    <div id="spread" class="text-xs text-orange-400">Spread: 0.00%</div>
+                </div>
+            </div>
+            <div id="accs" class="grid grid-cols-2 gap-6"></div>
+            <div class="mt-6 bg-gray-900 p-4 rounded-lg text-center font-mono text-sm">
+                Total Profit: <span id="profit" class="text-green-400">$0.00</span> | Resets: <span id="resets" class="text-red-400">0</span>
+            </div>
+        </div>
+        <script>
+            setInterval(async () => {
+                const r = await fetch('/api/status'); const d = await r.json();
+                document.getElementById('price').innerText = d.mid.toFixed(8);
+                document.getElementById('spread').innerText = 'Spread: ' + d.spread.toFixed(4) + '%';
+                document.getElementById('resets').innerText = d.totalResets;
+                document.getElementById('profit').innerText = '$' + d.totalProfit.toFixed(4);
+                let h = '';
+                d.accounts.forEach(a => {
+                    h += \`<div class="bg-gray-900 p-6 rounded-xl border-t-2 \${a.direction === 'buy' ? 'border-green-500' : 'border-red-500'}">
+                        <div class="flex justify-between font-bold mb-2"><span>\${a.direction.toUpperCase()}</span><span class="\${a.roi >= 0 ? 'text-green-400' : 'text-red-400'}">\${a.roi.toFixed(2)}%</span></div>
+                        <div class="text-xs text-gray-500">Entry: \${a.avgPrice.toFixed(8)}</div>
+                        <div class="text-xs text-gray-500">Size: \${a.position}</div>
+                    </div>\`;
+                });
+                document.getElementById('accs').innerHTML = h;
+            }, 1000);
+        </script>
+    </body></html>`);
+});
+
+app.get('/api/status', (req, res) => {
+    let totalProfit = 0;
+    const accs = Object.values(accountStates).map(s => {
+        totalProfit += s.realizedProfit;
+        return { direction: s.direction, roi: s.roi, avgPrice: s.avgPrice, position: s.position.volume };
+    });
+    res.json({ mid: marketData.mid, spread: marketData.spread, totalResets, totalProfit, accounts: accs });
+});
+
+// ==================== INIT ====================
+async function main() {
+    startWS();
+    // Wait for price
+    while (marketData.mid === 0) { console.log("Waiting for price..."); await new Promise(r => setTimeout(r, 1000)); }
     
     app.listen(config.port, '0.0.0.0', () => {
-        console.log(`✅ Web UI: http://localhost:${config.port}`);
-        startWS();
+        console.log(`Bot Running on Port ${config.port}`);
+        // Data Sync Loop
         setInterval(async () => {
             for (const acc of config.accounts) await syncAccountData(acc, accountStates[acc.accountId]);
         }, 2000);
-        setInterval(checkTrades, 3000);
+        // Trade Logic Loop
+        setInterval(async () => {
+            await openBothPositionsTogether();
+            await handleSafetyAndProfit();
+        }, 3000);
     });
 }
 
-initialize();
+main();
