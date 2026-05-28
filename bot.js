@@ -29,7 +29,7 @@ const config = {
     accounts: apiAccounts,
     
     // --- AI BRAIN SETTINGS ---
-    targetNetRoi: 1.5,            
+    targetNetRoi: 0.1,            
     initialOrderSize: 10,        
     repairStep: 2,               
     momentumLookback: 5,         // Number of price ticks to analyze momentum
