@@ -28,7 +28,7 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     orderSize: 1,                
-    triggerRoi: 2.0,             // Wait for +2.0% ROI on the WINNER
+    triggerRoi: 2.0,             // Wait for +2.0% ROI on Winner
     feeRate: 0.0005,             
     contractSize: 0              
 };
@@ -57,6 +57,7 @@ async function htxRequest(account, method, path, data = {}) {
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
         const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 5000 });
+        if(res.data.status !== 'ok') console.log(`[HTX Error] Acc ${account.accountId}: ${res.data['err-msg']}`);
         return res.data;
     } catch (e) { return { status: 'error' }; }
 }
@@ -75,15 +76,18 @@ async function sync() {
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
+        
         if (res?.status === 'ok' && res.data) {
-            const pos = res.data.find(p => p.direction === state.direction);
-            if (pos && parseFloat(pos.volume) > 0) {
+            // Find position and filter out "dust" (less than 1 contract)
+            const pos = res.data.find(p => p.direction === state.direction && parseFloat(p.volume) >= 1);
+            if (pos) {
                 state.avgPrice = parseFloat(pos.cost_hold);
                 state.volume = parseFloat(pos.volume);
                 state.unrealizedUsdt = parseFloat(pos.profit);
                 state.roi = parseFloat(pos.profit_rate) * 100;
             } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
         }
+
         const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
         if (accRes?.status === 'ok' && accRes.data) {
             const equity = parseFloat(accRes.data[0].margin_balance);
@@ -97,57 +101,60 @@ async function sync() {
 async function tradeLoop() {
     if (isProcessing || market.last === 0) return;
     const long = accountStates[config.accounts[0].accountId];
-    const short = accountStates[config.accounts[1].accountId];
+    const short = accountStates[accountIndex === 2 ? config.accounts[1].accountId : Object.keys(accountStates)[1]]; 
+    
+    // Explicitly grab the two accounts
+    const acc1 = config.accounts[0];
+    const acc2 = config.accounts[1];
 
-    // 1. Cycle Startup
-    if (long.volume === 0 && short.volume === 0) {
-        market.status = 'Opening 1:1 Winner-Strategy...';
-        hasAddedThisCycle = false;
+    // 1. ATOMIC OPENING (FORCE BOTH AT ONCE)
+    if (accountStates[acc1.accountId].volume < 1 && accountStates[acc2.accountId].volume < 1) {
+        market.status = 'FIRE: ATOMIC ENTRY';
         isProcessing = true;
-        await Promise.all(config.accounts.map((acc, idx) => htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-            contract_code: config.symbol, volume: config.orderSize, direction: idx === 0 ? 'buy' : 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
-        })));
+        hasAddedThisCycle = false;
+
+        console.log("Opening Long and Short simultaneously...");
+        await Promise.all([
+            htxRequest(acc1, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+            }),
+            htxRequest(acc2, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: config.orderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+            })
+        ]);
+
         setTimeout(() => { isProcessing = false; }, 3000);
         return;
     }
 
-    // 2. Exact Sum Calculation
-    const totalVol = long.volume + short.volume;
+    // 2. PROFIT CALCULATION
+    const totalVol = accountStates[acc1.accountId].volume + accountStates[acc2.accountId].volume;
     const estExitFees = (totalVol * config.contractSize * market.last) * config.feeRate;
-    const combinedPnL = long.unrealizedUsdt + short.unrealizedUsdt;
+    const combinedPnL = accountStates[acc1.accountId].unrealizedUsdt + accountStates[acc2.accountId].unrealizedUsdt;
     const netProfit = combinedPnL - estExitFees;
 
-    // 3. Profit Kill Switch
+    // 3. EXIT KILL SWITCH
     if (netProfit > 0.00000001) {
-        market.status = `Winner Overpowered Loser: +$${netProfit.toFixed(8)}`;
+        market.status = `EXIT: PROFIT +$${netProfit.toFixed(8)}`;
         await closeAll();
         return;
     }
 
-    // 4. One-Time WINNER Addition Trigger
+    // 4. ONE-TIME WINNER ADD
     if (!hasAddedThisCycle) {
-        let targetAcc = null;
-        
-        // ONLY trigger if ROI is positive and OVER 2.0%
-        if (long.roi >= config.triggerRoi) {
-            targetAcc = config.accounts[0]; // Add to Long because Long is winning
-            market.status = `Adding to Winning LONG (${long.roi.toFixed(2)}%)`;
-        } else if (short.roi >= config.triggerRoi) {
-            targetAcc = config.accounts[1]; // Add to Short because Short is winning
-            market.status = `Adding to Winning SHORT (${short.roi.toFixed(2)}%)`;
-        }
+        let winnerAcc = null;
+        if (accountStates[acc1.accountId].roi >= config.triggerRoi) winnerAcc = acc1;
+        else if (accountStates[acc2.accountId].roi >= config.triggerRoi) winnerAcc = acc2;
 
-        if (targetAcc) {
-            const side = accountStates[targetAcc.accountId].direction;
-            await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: 1, direction: side, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+        if (winnerAcc) {
+            market.status = `Winner Detected: Adding 1 Lot`;
+            await htxRequest(winnerAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: 1, direction: accountStates[winnerAcc.accountId].direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
-            hasAddedThisCycle = true; 
+            hasAddedThisCycle = true;
         } else {
-            market.status = 'Waiting for >2% Winner';
+            market.status = `Hedged: Waiting for ${config.triggerRoi}% ROI`;
         }
-    } else {
-        market.status = 'Winner Loaded - Seeking Net Profit';
     }
 }
 
@@ -159,11 +166,10 @@ async function closeAll() {
             contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
         }) : Promise.resolve();
     }));
-    hasAddedThisCycle = false; 
     setTimeout(() => { isProcessing = false; }, 5000);
 }
 
-// ==================== WS & DASHBOARD (STAYING SAME DESIGN) ====================
+// ==================== WS & DASHBOARD ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -195,14 +201,14 @@ app.get('/', (req, res) => {
 <body class="p-4 md:p-10">
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-8">
-            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Running...</p></div>
+            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Parallel Entry Active</p></div>
             <div class="flex gap-10 text-right">
                 <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p><p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p></div>
-                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Combined Realized</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.00000000</p></div>
+                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Total Equity Growth</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.00000000</p></div>
             </div>
         </div>
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20 text-center">
-            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Incl. Fees)</p>
+            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (All Fees Included)</p>
             <h2 id="netProfit" class="text-6xl font-black mb-4 font-mono">+$0.00000000</h2>
             <div class="inline-flex items-center gap-2 bg-zinc-900 px-4 py-2 rounded-full border border-zinc-800">
                 <span class="text-[10px] font-bold text-zinc-500 uppercase">One-Time Win-Add:</span><span id="addFlag" class="text-xs font-mono font-bold text-indigo-400">No</span>
