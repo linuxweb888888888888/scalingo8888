@@ -39,16 +39,15 @@ const config = {
     takeProfitPercent: parseFloat(process.env.TAKE_PROFIT_PERCENT) || 2.0,
     stopLossPercent: parseFloat(process.env.STOP_LOSS_PERCENT) || 2.0,
     orderSize: parseFloat(process.env.ORDER_SIZE) || 1,
-    hedgeThreshold: parseFloat(process.env.HEDGE_THRESHOLD) || 0.3, // Re-hedge when deviation > 0.3%
-    autoRebalance: true // Enable automatic hedge rebalancing
+    hedgeThreshold: parseFloat(process.env.HEDGE_THRESHOLD) || 0.1 // 0.1% deviation allowed
 };
 
 // ==================== ACCOUNT STATES ====================
 let accountStates = {};
 let lastSyncTime = 0;
 let hedgeDeviation = 0;
-let lastHedgeAdjustTime = 0;
-let totalHedgeAdjustments = 0;
+let lastResetTime = 0;
+let totalResets = 0;
 
 // Initialize states for each account
 config.accounts.forEach((account, idx) => {
@@ -73,8 +72,6 @@ config.accounts.forEach((account, idx) => {
         losingTrades: 0,
         allTimeHigh: 0,
         lastOpenTime: 0,
-        lastRebalanceTime: 0,
-        rebalanceCount: 0,
         settings: {
             takeProfit: config.takeProfitPercent,
             stopLoss: config.stopLossPercent,
@@ -107,8 +104,8 @@ let botState = {
     hedgeDeviation: 0,
     longRoi: 0,
     shortRoi: 0,
-    totalHedgeAdjustments: 0,
-    lastHedgeAction: ""
+    totalResets: 0,
+    lastResetReason: ""
 };
 
 // ==================== API HANDLER ====================
@@ -236,7 +233,7 @@ function updateCombinedState() {
     botState.longRoi = longRoi;
     botState.shortRoi = shortRoi;
     botState.hedgeDeviation = Math.abs(longRoi + shortRoi);
-    botState.totalHedgeAdjustments = totalHedgeAdjustments;
+    botState.totalResets = totalResets;
     
     if (totalVolume > 0) {
         botState.openPosition = { 
@@ -265,84 +262,36 @@ function updateCombinedState() {
     };
 }
 
-// ==================== AUTO HEDGE REBALANCING ====================
-async function rebalanceHedge() {
-    if (!config.autoRebalance || config.accounts.length < 2) return;
+// ==================== PERFECT HEDGE MANAGEMENT ====================
+async function resetAndReopenPositions(reason) {
+    if (config.accounts.length < 2) return;
     
     const now = Date.now();
-    // Prevent too frequent rebalancing (minimum 30 seconds between adjustments)
-    if (now - lastHedgeAdjustTime < 30000) return;
+    // Prevent too frequent resets (minimum 10 seconds between resets)
+    if (now - lastResetTime < 10000) return;
     
     const longAccount = config.accounts[0];
     const shortAccount = config.accounts[1];
     const longState = accountStates[longAccount.accountId];
     const shortState = accountStates[shortAccount.accountId];
     
-    // Only rebalance if both positions are open
+    // Check if both positions exist
     const longHasPosition = longState.position.volume > 0;
     const shortHasPosition = shortState.position.volume > 0;
     
-    if (!longHasPosition || !shortHasPosition) return;
-    
-    const deviation = longState.roi + shortState.roi; // Should be close to 0
-    const absDeviation = Math.abs(deviation);
-    
-    // Check if deviation exceeds threshold
-    if (absDeviation > config.hedgeThreshold) {
-        console.log(`\n🔄 HEDGE REBALANCE TRIGGERED`);
+    if (longHasPosition && shortHasPosition) {
+        console.log(`\n🔄 PERFECT HEDGE RESET TRIGGERED`);
+        console.log(`   Reason: ${reason}`);
         console.log(`   LONG ROI: ${longState.roi.toFixed(2)}% | SHORT ROI: ${shortState.roi.toFixed(2)}%`);
-        console.log(`   Deviation: ${absDeviation.toFixed(2)}% (Threshold: ${config.hedgeThreshold}%)`);
+        console.log(`   Deviation: ${(longState.roi + shortState.roi).toFixed(2)}%`);
         
-        // Determine which side needs adjustment
-        if (deviation > 0) {
-            // LONG is outperforming SHORT (LONG profit > SHORT loss)
-            // Need to reduce LONG or increase SHORT
-            console.log(`   📊 LONG is outperforming - Adjusting SHORT position`);
-            botState.lastHedgeAction = "Increased SHORT position";
+        // Close both positions
+        if (!longState.isTrading && !shortState.isTrading) {
+            longState.isTrading = true;
+            shortState.isTrading = true;
             
-            // Close current SHORT and reopen with adjusted size
-            if (!shortState.isTrading) {
-                shortState.isTrading = true;
-                
-                // Close existing SHORT position
-                await htxRequest(shortAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol,
-                    volume: shortState.position.volume,
-                    direction: 'buy',
-                    offset: 'close',
-                    lever_rate: config.leverage,
-                    order_price_type: 'opponent'
-                });
-                
-                await new Promise(resolve => setTimeout(resolve, 500));
-                
-                // Reopen SHORT with adjusted size
-                const adjustedSize = Math.max(1, Math.floor(shortState.settings.orderSize * (1 + absDeviation / 10)));
-                await htxRequest(shortAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol,
-                    volume: adjustedSize,
-                    direction: 'sell',
-                    offset: 'open',
-                    lever_rate: config.leverage,
-                    order_price_type: 'opponent'
-                });
-                
-                shortState.rebalanceCount++;
-                totalHedgeAdjustments++;
-                console.log(`   ✅ SHORT position rebalanced (Size: ${shortState.settings.orderSize} → ${adjustedSize})`);
-                
-                shortState.isTrading = false;
-            }
-        } else if (deviation < 0) {
-            // SHORT is outperforming LONG (SHORT profit > LONG loss)
-            // Need to reduce SHORT or increase LONG
-            console.log(`   📊 SHORT is outperforming - Adjusting LONG position`);
-            botState.lastHedgeAction = "Increased LONG position";
-            
-            if (!longState.isTrading) {
-                longState.isTrading = true;
-                
-                // Close existing LONG position
+            // Close LONG position
+            if (longState.position.volume > 0) {
                 await htxRequest(longAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol,
                     volume: longState.position.volume,
@@ -351,34 +300,95 @@ async function rebalanceHedge() {
                     lever_rate: config.leverage,
                     order_price_type: 'opponent'
                 });
-                
-                await new Promise(resolve => setTimeout(resolve, 500));
-                
-                // Reopen LONG with adjusted size
-                const adjustedSize = Math.max(1, Math.floor(longState.settings.orderSize * (1 + absDeviation / 10)));
-                await htxRequest(longAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                console.log(`   ✅ Closed LONG position`);
+            }
+            
+            await new Promise(resolve => setTimeout(resolve, 500));
+            
+            // Close SHORT position
+            if (shortState.position.volume > 0) {
+                await htxRequest(shortAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol,
-                    volume: adjustedSize,
+                    volume: shortState.position.volume,
                     direction: 'buy',
-                    offset: 'open',
+                    offset: 'close',
                     lever_rate: config.leverage,
                     order_price_type: 'opponent'
                 });
-                
-                longState.rebalanceCount++;
-                totalHedgeAdjustments++;
-                console.log(`   ✅ LONG position rebalanced (Size: ${longState.settings.orderSize} → ${adjustedSize})`);
-                
-                longState.isTrading = false;
+                console.log(`   ✅ Closed SHORT position`);
             }
+            
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            
+            // Reopen both positions simultaneously
+            console.log(`   🚀 Reopening fresh positions at ${botState.currentPrice}`);
+            
+            // Open LONG
+            await htxRequest(longAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol,
+                volume: longState.settings.orderSize,
+                direction: 'buy',
+                offset: 'open',
+                lever_rate: config.leverage,
+                order_price_type: 'opponent'
+            });
+            
+            await new Promise(resolve => setTimeout(resolve, 500));
+            
+            // Open SHORT
+            await htxRequest(shortAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol,
+                volume: shortState.settings.orderSize,
+                direction: 'sell',
+                offset: 'open',
+                lever_rate: config.leverage,
+                order_price_type: 'opponent'
+            });
+            
+            longState.totalTrades++;
+            shortState.totalTrades++;
+            longState.lastOpenTime = now;
+            shortState.lastOpenTime = now;
+            totalResets++;
+            
+            console.log(`   ✅ Fresh positions opened - Hedge reset #${totalResets}`);
+            console.log(`=========================================\n`);
+            
+            longState.isTrading = false;
+            shortState.isTrading = false;
+            lastResetTime = now;
+            botState.lastResetReason = reason;
         }
-        
-        lastHedgeAdjustTime = now;
-        console.log(`=========================================\n`);
     }
 }
 
-// ==================== SYNCHRONIZED TRADING LOGIC ====================
+async function checkHedgePerfect() {
+    if (config.accounts.length < 2) return;
+    
+    const longState = accountStates[config.accounts[0].accountId];
+    const shortState = accountStates[config.accounts[1].accountId];
+    
+    const longHasPosition = longState.position.volume > 0;
+    const shortHasPosition = shortState.position.volume > 0;
+    
+    // Only check if both positions exist
+    if (longHasPosition && shortHasPosition) {
+        const deviation = Math.abs(longState.roi + shortState.roi);
+        
+        // If deviation exceeds threshold, reset both positions
+        if (deviation > config.hedgeThreshold) {
+            const reason = `Hedge deviation ${deviation.toFixed(2)}% > ${config.hedgeThreshold}% threshold`;
+            await resetAndReopenPositions(reason);
+        }
+    }
+    // If only one side has position (shouldn't happen), reset
+    else if (longHasPosition !== shortHasPosition) {
+        const reason = `One side only - LONG:${longHasPosition} SHORT:${shortHasPosition}`;
+        await resetAndReopenPositions(reason);
+    }
+}
+
+// ==================== SYNCHRONIZED TRADING ====================
 async function openSynchronizedPositions() {
     if (config.accounts.length < 2) return;
     
@@ -400,7 +410,7 @@ async function openSynchronizedPositions() {
             console.log(`\n🔗 Opening synchronized positions at ${botState.currentPrice}`);
             
             // Open LONG position
-            await htxRequest(longAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+            const longOrder = await htxRequest(longAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol,
                 volume: longState.settings.orderSize,
                 direction: 'buy',
@@ -409,10 +419,11 @@ async function openSynchronizedPositions() {
                 order_price_type: 'opponent'
             });
             
+            // Small delay to ensure order processes
             await new Promise(resolve => setTimeout(resolve, 500));
             
             // Open SHORT position
-            await htxRequest(shortAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+            const shortOrder = await htxRequest(shortAccount, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol,
                 volume: shortState.settings.orderSize,
                 direction: 'sell',
@@ -421,11 +432,14 @@ async function openSynchronizedPositions() {
                 order_price_type: 'opponent'
             });
             
-            longState.totalTrades++;
-            shortState.totalTrades++;
-            longState.lastOpenTime = now;
-            shortState.lastOpenTime = now;
-            console.log(`✅ Synchronized positions opened\n`);
+            if (longOrder?.data?.order_id || shortOrder?.data?.order_id) {
+                longState.totalTrades++;
+                shortState.totalTrades++;
+                longState.lastOpenTime = now;
+                shortState.lastOpenTime = now;
+                console.log(`✅ Synchronized positions opened at ${botState.currentPrice}`);
+                console.log(`=========================================\n`);
+            }
         }
     }
 }
@@ -480,25 +494,25 @@ async function checkTrades() {
     // First, try to open synchronized positions
     await openSynchronizedPositions();
     
+    // Check hedge perfection
+    await checkHedgePerfect();
+    
     // Then check for take profit/stop loss on both accounts
     for (let i = 0; i < config.accounts.length; i++) {
         const account = config.accounts[i];
         const state = accountStates[account.accountId];
         await checkTradesForAccount(account, state);
     }
-    
-    // Finally, check and rebalance hedge if needed
-    await rebalanceHedge();
 }
 
-// ==================== WEB UI WITH AUTO-HEDGE DISPLAY ====================
+// ==================== WEB UI ====================
 app.get('/', (req, res) => {
     const htmlContent = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HTX Auto-Hedge Bot | Perfect Correlation</title>
+    <title>HTX Perfect Hedge Bot</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -506,21 +520,15 @@ app.get('/', (req, res) => {
         * { font-family: 'Inter', sans-serif; }
         .gradient-bg { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
         .card-hover { transition: all 0.3s ease; }
-        .card-hover:hover { transform: translateY(-5px); box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1), 0 10px 10px -5px rgba(0,0,0,0.02); }
+        .card-hover:hover { transform: translateY(-5px); box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1); }
         .number-font { font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
         @keyframes pulse-green {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.7; }
         }
-        @keyframes slide-in {
-            from { transform: translateX(-100%); opacity: 0; }
-            to { transform: translateX(0); opacity: 1; }
-        }
         .pulse { animation: pulse-green 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
-        .slide-in { animation: slide-in 0.5s ease-out; }
         .hedge-perfect { color: #10b981; }
-        .hedge-off { color: #f59e0b; }
-        .hedge-bad { color: #ef4444; }
+        .hedge-reset { animation: pulse-green 1s ease-in-out; }
     </style>
 </head>
 <body class="bg-gradient-to-br from-gray-50 to-gray-100">
@@ -529,8 +537,8 @@ app.get('/', (req, res) => {
         <div class="gradient-bg rounded-2xl shadow-2xl p-6 mb-8 text-white">
             <div class="flex justify-between items-center">
                 <div>
-                    <h1 class="text-4xl font-bold mb-2">🔄 Auto-Hedge Bot</h1>
-                    <p class="text-white/80 text-sm">Perfectly Hedged LONG + SHORT | Auto-Rebalancing | ${config.hedgeThreshold}% Threshold</p>
+                    <h1 class="text-4xl font-bold mb-2">🎯 Perfect Hedge Bot</h1>
+                    <p class="text-white/80 text-sm">Perfectly Synchronized LONG + SHORT | Auto-Reset on Deviation</p>
                 </div>
                 <div class="text-right">
                     <div class="text-3xl font-bold number-font" id="livePrice">$0.00000000</div>
@@ -538,30 +546,12 @@ app.get('/', (req, res) => {
                 </div>
             </div>
             <div class="grid grid-cols-6 gap-4 mt-6 pt-4 border-t border-white/20">
-                <div>
-                    <div class="text-xs text-white/70">Leverage</div>
-                    <div class="text-xl font-bold">${config.leverage}X</div>
-                </div>
-                <div>
-                    <div class="text-xs text-white/70">Order Size</div>
-                    <div class="text-xl font-bold">${config.orderSize}</div>
-                </div>
-                <div>
-                    <div class="text-xs text-white/70">Take Profit</div>
-                    <div class="text-xl font-bold text-green-300">${config.takeProfitPercent}%</div>
-                </div>
-                <div>
-                    <div class="text-xs text-white/70">Stop Loss</div>
-                    <div class="text-xl font-bold text-red-300">${config.stopLossPercent}%</div>
-                </div>
-                <div>
-                    <div class="text-xs text-white/70">Hedge Threshold</div>
-                    <div class="text-xl font-bold text-yellow-300">${config.hedgeThreshold}%</div>
-                </div>
-                <div>
-                    <div class="text-xs text-white/70">Adjustments</div>
-                    <div class="text-xl font-bold" id="adjustmentCount">0</div>
-                </div>
+                <div><div class="text-xs text-white/70">Leverage</div><div class="text-xl font-bold">${config.leverage}X</div></div>
+                <div><div class="text-xs text-white/70">Order Size</div><div class="text-xl font-bold">${config.orderSize}</div></div>
+                <div><div class="text-xs text-white/70">Take Profit</div><div class="text-xl font-bold text-green-300">${config.takeProfitPercent}%</div></div>
+                <div><div class="text-xs text-white/70">Stop Loss</div><div class="text-xl font-bold text-red-300">${config.stopLossPercent}%</div></div>
+                <div><div class="text-xs text-white/70">Hedge Threshold</div><div class="text-xl font-bold text-yellow-300">${config.hedgeThreshold}%</div></div>
+                <div><div class="text-xs text-white/70">Resets</div><div class="text-xl font-bold" id="resetCount">0</div></div>
             </div>
         </div>
 
@@ -589,11 +579,11 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- Hedge Visualization -->
-        <div class="bg-white rounded-xl shadow-lg p-6 mb-8 slide-in">
+        <!-- Hedge Status -->
+        <div class="bg-white rounded-xl shadow-lg p-6 mb-8">
             <div class="flex justify-between items-center mb-4">
-                <h3 class="text-lg font-bold">🔄 Auto-Hedge Correlation Monitor</h3>
-                <div class="text-xs bg-blue-100 text-blue-600 px-2 py-1 rounded-full">Auto-Rebalancing ACTIVE</div>
+                <h3 class="text-lg font-bold">🎯 Hedge Status Monitor</h3>
+                <div class="text-xs bg-green-100 text-green-600 px-2 py-1 rounded-full">Auto-Reset ACTIVE</div>
             </div>
             <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-4">
                 <div class="text-center">
@@ -601,8 +591,9 @@ app.get('/', (req, res) => {
                     <div class="text-3xl font-bold" id="longRoi">0.00%</div>
                 </div>
                 <div class="text-center">
-                    <div class="text-sm text-gray-500 mb-2">🎯 Hedge Deviation (Target: 0%)</div>
+                    <div class="text-sm text-gray-500 mb-2">🎯 Hedge Deviation</div>
                     <div class="text-3xl font-bold" id="hedgeDeviation">0.00%</div>
+                    <div class="text-xs text-gray-400">Target: 0% | Reset if > ${config.hedgeThreshold}%</div>
                 </div>
                 <div class="text-center">
                     <div class="text-sm text-gray-500 mb-2">📉 SHORT ROI</div>
@@ -613,18 +604,18 @@ app.get('/', (req, res) => {
                 <div id="hedgeBar" class="h-full bg-gradient-to-r from-red-500 via-yellow-500 to-green-500 transition-all duration-500" style="width: 50%"></div>
             </div>
             <div class="flex justify-between text-xs text-gray-500 mt-2">
-                <span>⬅️ SHORT Hedge (-100%)</span>
+                <span>⬅️ SHORT Better</span>
                 <span>Perfect Hedge (0%)</span>
-                <span>LONG Hedge (+100%) ➡️</span>
+                <span>LONG Better ➡️</span>
             </div>
             <div class="mt-4 p-3 bg-gray-50 rounded-lg">
                 <div class="flex justify-between text-sm">
-                    <span class="text-gray-600">Last Hedge Action:</span>
-                    <span class="font-mono font-bold" id="lastHedgeAction">None</span>
+                    <span class="text-gray-600">Last Reset Reason:</span>
+                    <span class="font-mono font-bold" id="lastResetReason">None</span>
                 </div>
                 <div class="flex justify-between text-sm mt-1">
-                    <span class="text-gray-600">Total Rebalances:</span>
-                    <span class="font-mono font-bold" id="totalRebalances">0</span>
+                    <span class="text-gray-600">Total Hedge Resets:</span>
+                    <span class="font-mono font-bold" id="totalResets">0</span>
                 </div>
             </div>
         </div>
@@ -632,48 +623,17 @@ app.get('/', (req, res) => {
         <!-- Account Cards -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8" id="accountsContainer"></div>
 
-        <!-- Charts Section -->
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
-            <div class="bg-white rounded-xl shadow-lg p-6">
-                <h3 class="text-lg font-bold mb-4">Profit Timeline</h3>
-                <canvas id="profitChart" height="200"></canvas>
-            </div>
-            <div class="bg-white rounded-xl shadow-lg p-6">
-                <h3 class="text-lg font-bold mb-4">Performance Metrics</h3>
-                <div class="space-y-4">
-                    <div>
-                        <div class="flex justify-between text-sm mb-1">
-                            <span>Win Rate</span>
-                            <span id="winRate">0%</span>
-                        </div>
-                        <div class="w-full bg-gray-200 rounded-full h-2">
-                            <div id="winRateBar" class="bg-green-500 rounded-full h-2" style="width: 0%"></div>
-                        </div>
-                    </div>
-                    <div>
-                        <div class="flex justify-between text-sm mb-1">
-                            <span>Profit Factor</span>
-                            <span id="profitFactor">0.00</span>
-                        </div>
-                        <div class="w-full bg-gray-200 rounded-full h-2">
-                            <div id="profitFactorBar" class="bg-blue-500 rounded-full h-2" style="width: 0%"></div>
-                        </div>
-                    </div>
-                    <div>
-                        <div class="flex justify-between text-sm mb-1">
-                            <span>Expected Value</span>
-                            <span id="expectedValue">$0.00</span>
-                        </div>
-                    </div>
-                </div>
-            </div>
+        <!-- Chart -->
+        <div class="bg-white rounded-xl shadow-lg p-6 mb-8">
+            <h3 class="text-lg font-bold mb-4">Profit Timeline</h3>
+            <canvas id="profitChart" height="100"></canvas>
         </div>
 
-        <!-- Status Badge -->
+        <!-- Status -->
         <div class="bg-white rounded-xl shadow-lg p-4 text-center">
             <div class="flex items-center justify-center gap-2">
                 <div class="w-2 h-2 bg-green-500 rounded-full pulse"></div>
-                <span class="text-sm text-gray-600">Auto-Hedge Active | Rebalancing when deviation > ${config.hedgeThreshold}% | Last update: <span id="lastUpdate">Just now</span></span>
+                <span class="text-sm text-gray-600">Perfect Hedge Mode | Auto-reset when deviation > ${config.hedgeThreshold}% | Last update: <span id="lastUpdate">Just now</span></span>
             </div>
         </div>
     </div>
@@ -695,26 +655,14 @@ app.get('/', (req, res) => {
                 document.getElementById('totalTradesCount').innerText = data.totalTrades;
                 document.getElementById('wins').innerText = data.winningTrades;
                 document.getElementById('losses').innerText = data.losingTrades;
-                document.getElementById('adjustmentCount').innerText = data.totalHedgeAdjustments || 0;
-                document.getElementById('totalRebalances').innerText = data.totalHedgeAdjustments || 0;
-                document.getElementById('lastHedgeAction').innerText = data.lastHedgeAction || 'None';
+                document.getElementById('resetCount').innerText = data.totalResets || 0;
+                document.getElementById('totalResets').innerText = data.totalResets || 0;
+                document.getElementById('lastResetReason').innerText = data.lastResetReason || 'None';
                 
                 const winLossRatio = data.winningTrades / Math.max(data.losingTrades, 1);
                 document.getElementById('wlRatio').innerText = winLossRatio.toFixed(2);
                 document.getElementById('dgr').innerText = data.estimates.dgr.toFixed(2) + '%';
                 
-                const winRate = (data.winningTrades / Math.max(data.totalTrades, 1)) * 100;
-                document.getElementById('winRate').innerText = winRate.toFixed(1) + '%';
-                document.getElementById('winRateBar').style.width = winRate + '%';
-                
-                const profitFactor = data.totalTrades > 0 ? (data.winningTrades / Math.max(data.losingTrades, 1)) : 0;
-                document.getElementById('profitFactor').innerText = profitFactor.toFixed(2);
-                document.getElementById('profitFactorBar').style.width = Math.min(profitFactor * 20, 100) + '%';
-                
-                const expectedValue = data.realizedProfit / Math.max(data.totalTrades, 1);
-                document.getElementById('expectedValue').innerText = '$' + expectedValue.toFixed(4);
-                
-                // Update hedge display
                 document.getElementById('longRoi').innerText = data.longRoi.toFixed(2) + '%';
                 document.getElementById('shortRoi').innerText = data.shortRoi.toFixed(2) + '%';
                 document.getElementById('longRoi').style.color = data.longRoi >= 0 ? '#10b981' : '#ef4444';
@@ -723,7 +671,6 @@ app.get('/', (req, res) => {
                 const hedgeDev = Math.abs(data.hedgeDeviation);
                 document.getElementById('hedgeDeviation').innerText = hedgeDev.toFixed(2) + '%';
                 
-                // Color code hedge deviation
                 const hedgeElem = document.getElementById('hedgeDeviation');
                 if (hedgeDev < 0.2) {
                     hedgeElem.style.color = '#10b981';
@@ -733,11 +680,9 @@ app.get('/', (req, res) => {
                     hedgeElem.style.color = '#ef4444';
                 }
                 
-                // Hedge bar (50% is perfect, shifts based on deviation)
                 const hedgeBarPosition = 50 + (data.longRoi - data.shortRoi) * 5;
                 document.getElementById('hedgeBar').style.width = Math.min(100, Math.max(0, hedgeBarPosition)) + '%';
                 
-                // Update account cards
                 if (data.accounts && data.accounts.length > 0) {
                     const container = document.getElementById('accountsContainer');
                     container.innerHTML = '';
@@ -745,48 +690,23 @@ app.get('/', (req, res) => {
                     data.accounts.forEach((acc, idx) => {
                         const isLong = idx === 0;
                         const bgGradient = isLong ? 'from-emerald-50 to-emerald-100/30' : 'from-red-50 to-red-100/30';
-                        const borderColor = isLong ? 'border-emerald-200' : 'border-red-200';
                         const icon = isLong ? '📈' : '📉';
                         const title = isLong ? 'LONG POSITION' : 'SHORT POSITION';
                         
                         const card = document.createElement('div');
-                        card.className = \`bg-gradient-to-br \${bgGradient} rounded-xl shadow-lg p-6 card-hover border \${borderColor}\`;
+                        card.className = \`bg-gradient-to-br \${bgGradient} rounded-xl shadow-lg p-6\`;
                         card.innerHTML = \`
                             <div class="flex justify-between items-start mb-4">
-                                <div>
-                                    <div class="text-3xl mb-2">\${icon}</div>
-                                    <h3 class="text-xl font-bold">Account \${acc.id}</h3>
-                                    <div class="text-sm text-gray-600">\${title}</div>
-                                </div>
-                                <div class="text-right">
-                                    <div class="text-xs text-gray-500">Balance</div>
-                                    <div class="text-2xl font-bold number-font" id="balance_\${acc.id}">$\${acc.balance.toFixed(2)}</div>
-                                </div>
+                                <div><div class="text-3xl mb-2">\${icon}</div><h3 class="text-xl font-bold">Account \${acc.id}</h3><div class="text-sm text-gray-600">\${title}</div></div>
+                                <div class="text-right"><div class="text-xs text-gray-500">Balance</div><div class="text-2xl font-bold">$\${acc.balance.toFixed(2)}</div></div>
                             </div>
                             <div class="grid grid-cols-2 gap-4 mb-4">
-                                <div>
-                                    <div class="text-xs text-gray-500">Position Size</div>
-                                    <div class="text-lg font-bold number-font" id="position_\${acc.id}">\${acc.position}</div>
-                                </div>
-                                <div>
-                                    <div class="text-xs text-gray-500">Current ROI</div>
-                                    <div class="text-lg font-bold number-font" id="roi_\${acc.id}" style="color: \${acc.roi >= 0 ? '#059669' : '#dc2626'}">\${acc.roi.toFixed(2)}%</div>
-                                </div>
-                                <div>
-                                    <div class="text-xs text-gray-500">Avg Entry</div>
-                                    <div class="text-sm number-font">$\${(acc.avgPrice || 0).toFixed(8)}</div>
-                                </div>
-                                <div>
-                                    <div class="text-xs text-gray-500">Trades</div>
-                                    <div class="text-sm number-font">\${acc.trades}</div>
-                                </div>
+                                <div><div class="text-xs text-gray-500">Position Size</div><div class="text-lg font-bold">\${acc.position}</div></div>
+                                <div><div class="text-xs text-gray-500">Current ROI</div><div class="text-lg font-bold" style="color: \${acc.roi >= 0 ? '#059669' : '#dc2626'}">\${acc.roi.toFixed(2)}%</div></div>
+                                <div><div class="text-xs text-gray-500">Avg Entry</div><div class="text-sm">$\${(acc.avgPrice || 0).toFixed(8)}</div></div>
+                                <div><div class="text-xs text-gray-500">Trades</div><div class="text-sm">\${acc.trades}</div></div>
                             </div>
-                            <div class="border-t pt-3">
-                                <div class="flex justify-between text-sm">
-                                    <span class="text-gray-600">Realized P&L</span>
-                                    <span class="font-bold number-font" style="color: \${acc.profit >= 0 ? '#059669' : '#dc2626'}">$\${acc.profit.toFixed(2)}</span>
-                                </div>
-                            </div>
+                            <div class="border-t pt-3"><div class="flex justify-between text-sm"><span class="text-gray-600">Realized P&L</span><span class="font-bold" style="color: \${acc.profit >= 0 ? '#059669' : '#dc2626'}">$\${acc.profit.toFixed(2)}</span></div></div>
                         \`;
                         container.appendChild(card);
                     });
@@ -794,46 +714,15 @@ app.get('/', (req, res) => {
                 
                 profitHistory.push(data.realizedProfit);
                 if (profitHistory.length > 50) profitHistory.shift();
-                
-                if (profitChart) {
-                    profitChart.data.datasets[0].data = profitHistory;
-                    profitChart.update();
-                }
+                if (profitChart) { profitChart.data.datasets[0].data = profitHistory; profitChart.update(); }
                 
                 document.getElementById('lastUpdate').innerText = new Date().toLocaleTimeString();
-            } catch (error) {
-                console.error('Error updating UI:', error);
-            }
+            } catch (error) { console.error('Error:', error); }
         }
         
         function initChart() {
             const ctx = document.getElementById('profitChart').getContext('2d');
-            profitChart = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels: Array(50).fill(''),
-                    datasets: [{
-                        label: 'Total Profit ($)',
-                        data: Array(50).fill(0),
-                        borderColor: 'rgb(16, 185, 129)',
-                        backgroundColor: 'rgba(16, 185, 129, 0.1)',
-                        tension: 0.4,
-                        fill: true
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: true,
-                    plugins: {
-                        legend: { display: false },
-                        tooltip: { mode: 'index', intersect: false }
-                    },
-                    scales: {
-                        y: { beginAtZero: false, grid: { color: 'rgba(0,0,0,0.05)' } },
-                        x: { display: false }
-                    }
-                }
-            });
+            profitChart = new Chart(ctx, { type: 'line', data: { labels: Array(50).fill(''), datasets: [{ label: 'Total Profit ($)', data: Array(50).fill(0), borderColor: 'rgb(16, 185, 129)', backgroundColor: 'rgba(16, 185, 129, 0.1)', tension: 0.4, fill: true }] }, options: { responsive: true, maintainAspectRatio: true, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: false }, x: { display: false } } } });
         }
         
         initChart();
@@ -854,15 +743,10 @@ app.get('/api/status', (req, res) => {
         profit: state.realizedProfit,
         trades: state.totalTrades,
         direction: state.direction,
-        avgPrice: state.avgPrice,
-        initialBalance: state.initialBalance,
-        rebalanceCount: state.rebalanceCount
+        avgPrice: state.avgPrice
     }));
     
-    res.json({
-        ...botState,
-        accounts: accountsData
-    });
+    res.json({ ...botState, accounts: accountsData });
 });
 
 // ==================== WEBSOCKET ====================
@@ -875,9 +759,7 @@ function startWS() {
             const msg = JSON.parse(dec.toString());
             if (msg.tick?.close) {
                 botState.currentPrice = parseFloat(msg.tick.close);
-                Object.values(accountStates).forEach(state => {
-                    state.currentPrice = botState.currentPrice;
-                });
+                Object.values(accountStates).forEach(state => { state.currentPrice = botState.currentPrice; });
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
         });
@@ -889,12 +771,12 @@ function startWS() {
 // ==================== INITIALIZE ====================
 async function initialize() {
     console.log('========================================');
-    console.log('AUTO-HEDGE DUAL DIRECTION TRADING BOT');
+    console.log('PERFECT HEDGE TRADING BOT');
     console.log('========================================');
     console.log(`Symbol: ${config.symbol}`);
     console.log(`Leverage: ${config.leverage}X`);
-    console.log(`Auto-Rebalancing: ENABLED`);
     console.log(`Hedge Threshold: ${config.hedgeThreshold}%`);
+    console.log(`Strategy: Close & Reopen if deviation > threshold`);
     console.log(`Active Accounts: ${config.accounts.length}`);
     config.accounts.forEach((acc, idx) => {
         console.log(`  Account ${acc.accountId}: ${idx === 0 ? 'BUY (LONG)' : 'SELL (SHORT)'} direction`);
