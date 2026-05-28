@@ -28,12 +28,11 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     
-    // --- PRECISION STRATEGY ---
-    minNetProfitUsdt: 0.001,      // Target positive net profit (USDT)
-    initialOrderSize: 10,        // Starting contracts
+    // --- FAST PROFIT SETTINGS ---
+    minNetProfitUsdt: 0.0001,    // Close immediately when profit > 0
+    initialOrderSize: 10,        // Start size
     rebalanceStep: 1,            // Smallest adjustment (1 contract)
-    syncThreshold: 0.15,         // Drift % to trigger rebalance
-    priceTolerance: 0.05,        // Max spread to open
+    syncThreshold: 0.05,         // Very aggressive sync (0.05% drift)
     feeRate: 0.0005              // 0.05% Taker fee
 };
 
@@ -41,7 +40,7 @@ const config = {
 let market = { last: 0, bid: 0, ask: 0, spread: 0, status: 'initializing' };
 let accountStates = {};
 let isProcessing = false;
-let lastSyncTime = 0;
+let lastActionTime = 0;
 
 config.accounts.forEach((account, idx) => {
     accountStates[account.accountId] = {
@@ -65,7 +64,7 @@ async function htxRequest(account, method, path, data = {}) {
     } catch (e) { return { status: 'error' }; }
 }
 
-// ==================== LOGIC ====================
+// ==================== CORE LOGIC ====================
 
 async function sync() {
     for (const acc of config.accounts) {
@@ -88,16 +87,13 @@ async function sync() {
 
 async function tradeLoop() {
     if (isProcessing || market.last === 0) return;
+    
     const long = accountStates[config.accounts[0].accountId];
     const short = accountStates[config.accounts[1].accountId];
 
-    // 1. Initial Opening
+    // 1. Initial Entry
     if (long.volume === 0 && short.volume === 0) {
-        if (market.spread > config.priceTolerance) {
-            market.status = `Wait Spread (${market.spread.toFixed(3)}%)`;
-            return;
-        }
-        market.status = 'Opening Sync';
+        market.status = 'Booting Hedge...';
         isProcessing = true;
         await Promise.all([
             htxRequest(config.accounts[0], 'POST', '/linear-swap-api/v1/swap_cross_order', {
@@ -107,38 +103,42 @@ async function tradeLoop() {
                 contract_code: config.symbol, volume: config.initialOrderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             })
         ]);
-        setTimeout(() => { isProcessing = false; }, 3000);
+        setTimeout(() => { isProcessing = false; }, 2000);
         return;
     }
 
-    // 2. Net Exit Profit Calculation
-    const totalNotional = (long.volume + short.volume) * market.last;
-    const estExitFees = totalNotional * config.feeRate;
+    // 2. Net Profit Calculation (The "Real" Number)
+    const currentNotional = (long.volume + short.volume) * market.last;
+    const estExitFees = currentNotional * config.feeRate;
     const netProfit = (long.unrealizedUsdt + short.unrealizedUsdt) - estExitFees;
 
-    // 3. Exit Logic
+    // 3. FAST EXIT
     if (netProfit >= config.minNetProfitUsdt) {
-        market.status = `Target Met (+$${netProfit.toFixed(6)})`;
+        market.status = `PROFIT REACHED: $${netProfit.toFixed(8)}`;
         await closeAll();
         return;
     }
 
-    // 4. Auto-Adjusting (Syncing)
+    // 4. AGGRESSIVE AUTO-ADJUST
     const drift = long.roi + short.roi;
     const now = Date.now();
 
-    if (Math.abs(drift) > config.syncThreshold && (now - lastSyncTime > 15000)) {
-        market.status = 'Syncing...';
-        // Add 1 contract to the side with lower ROI
-        const laggard = long.roi < -short.roi ? config.accounts[0] : config.accounts[1];
-        const side = accountStates[laggard.accountId].direction;
+    if (Math.abs(drift) > config.syncThreshold && (now - lastActionTime > 8000)) {
+        // Find which side needs more weight to bring the total to profit
+        // If drift is negative, the loser is too heavy or winner too light.
+        const targetAcc = long.roi < -short.roi ? config.accounts[0] : config.accounts[1];
+        const side = accountStates[targetAcc.accountId].direction;
         
-        await htxRequest(laggard, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+        market.status = `Fast Sync (${side})`;
+        
+        // Add min size to laggard to push avg price
+        await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
             contract_code: config.symbol, volume: config.rebalanceStep, direction: side, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
         });
-        lastSyncTime = now;
+        
+        lastActionTime = now;
     } else {
-        market.status = 'Hedged & Syncing';
+        market.status = 'Optimizing for Profit';
     }
 }
 
@@ -150,10 +150,10 @@ async function closeAll() {
             contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
         }) : Promise.resolve();
     }));
-    setTimeout(() => { isProcessing = false; }, 5000);
+    setTimeout(() => { isProcessing = false; }, 4000);
 }
 
-// ==================== WS ====================
+// ==================== WEBSOCKET ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -173,7 +173,7 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-// ==================== DASHBOARD ====================
+// ==================== DASHBOARD (SAME DESIGN) ====================
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), feeRate: config.feeRate }));
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
@@ -191,7 +191,6 @@ app.get('/', (req, res) => {
 </head>
 <body class="p-4 md:p-10">
     <div class="max-w-4xl mx-auto">
-        <!-- Header -->
         <div class="flex justify-between items-center mb-8">
             <div>
                 <h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1>
@@ -203,7 +202,6 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- PROFIT DIFFERENCE ANALYZER -->
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20">
             <div class="relative z-10 text-center">
                 <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Incl. Fees)</p>
@@ -216,9 +214,7 @@ app.get('/', (req, res) => {
             <div class="absolute top-0 left-1/2 -translate-x-1/2 w-64 h-64 bg-indigo-600/10 blur-[100px] rounded-full"></div>
         </div>
 
-        <!-- Position Progress Cards -->
         <div class="grid md:grid-cols-2 gap-6">
-            <!-- Long Card -->
             <div class="glass rounded-[2rem] p-6 border-l-4 border-emerald-500">
                 <div class="flex justify-between items-center mb-4">
                     <span class="text-xs font-bold text-emerald-500 uppercase tracking-widest">Long Side</span>
@@ -233,7 +229,6 @@ app.get('/', (req, res) => {
                 </div>
             </div>
 
-            <!-- Short Card -->
             <div class="glass rounded-[2rem] p-6 border-l-4 border-rose-500">
                 <div class="flex justify-between items-center mb-4">
                     <span class="text-xs font-bold text-rose-500 uppercase tracking-widest">Short Side</span>
@@ -259,24 +254,19 @@ app.get('/', (req, res) => {
                 document.getElementById('currentSpread').innerText = d.market.spread.toFixed(3) + '%';
                 
                 let longU = 0, shortU = 0, totalVal = 0;
-                
                 d.accounts.forEach(a => {
                     const isLong = a.direction === 'buy';
                     const prefix = isLong ? 'long' : 'short';
                     if(isLong) longU = a.unrealizedUsdt; else shortU = a.unrealizedUsdt;
-                    
                     document.getElementById(prefix + 'Roi').innerText = a.roi.toFixed(2) + '%';
                     document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(8);
-                    
-                    const prog = Math.min(100, Math.max(0, Math.abs(a.roi) * 10));
+                    const prog = Math.min(100, Math.max(0, Math.abs(a.roi) * 20));
                     document.getElementById(prefix + 'Bar').style.width = (a.volume > 0 ? prog : 0) + '%';
-                    
                     totalVal += (a.volume * d.market.last);
                 });
 
                 const exitFees = totalVal * d.feeRate;
                 const projected = (longU + shortU) - exitFees;
-                
                 const pElem = document.getElementById('netProfit');
                 pElem.innerText = (projected >= 0 ? '+' : '') + '$' + projected.toFixed(8);
                 pElem.className = 'text-6xl font-black mb-4 font-mono ' + (projected >= 0 ? 'text-emerald-400' : 'text-rose-500');
