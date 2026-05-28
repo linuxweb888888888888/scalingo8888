@@ -27,7 +27,8 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    orderSize: 1,                // STRICTLY 1 CONTRACT
+    orderSize: 1,                // Start with 1
+    triggerRoi: 2.0,             // Wait for 2% ROI
     feeRate: 0.0005,             // 0.05% Taker fee
     contractSize: 0              // Auto-detected
 };
@@ -36,6 +37,7 @@ const config = {
 let market = { last: 0, status: 'initializing' };
 let accountStates = {};
 let isProcessing = false;
+let hasAddedThisCycle = false; // Flag to ensure we only add ONCE
 
 config.accounts.forEach((account, idx) => {
     accountStates[account.accountId] = {
@@ -97,9 +99,10 @@ async function tradeLoop() {
     const long = accountStates[config.accounts[0].accountId];
     const short = accountStates[config.accounts[1].accountId];
 
-    // 1. Initial Opening (Only if nothing is open)
+    // 1. Start Cycle
     if (long.volume === 0 && short.volume === 0) {
-        market.status = 'Opening 1 Contract Hedge';
+        market.status = 'Starting New Cycle...';
+        hasAddedThisCycle = false; // Reset flag
         isProcessing = true;
         await Promise.all(config.accounts.map((acc, idx) => htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
             contract_code: config.symbol, volume: config.orderSize, direction: idx === 0 ? 'buy' : 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
@@ -108,17 +111,39 @@ async function tradeLoop() {
         return;
     }
 
-    // 2. Simple Net Calculation
+    // 2. Net Profit Calculation
     const totalVol = long.volume + short.volume;
     const estExitFees = (totalVol * config.contractSize * market.last) * config.feeRate;
     const netProfit = (long.unrealizedUsdt + short.unrealizedUsdt) - estExitFees;
 
-    // 3. Exit Trigger
+    // 3. Exit Condition (Any Net Profit)
     if (netProfit > 0.00000001) {
-        market.status = `Closing for Profit: $${netProfit.toFixed(8)}`;
+        market.status = `Exit Profit Found: $${netProfit.toFixed(8)}`;
         await closeAll();
+        return;
+    }
+
+    // 4. One-Time 2% Repair Trigger
+    if (!hasAddedThisCycle) {
+        let targetAcc = null;
+        if (long.roi >= config.triggerRoi) {
+            targetAcc = config.accounts[1]; // Long is winning, add to Short
+        } else if (short.roi >= config.triggerRoi) {
+            targetAcc = config.accounts[0]; // Short is winning, add to Long
+        }
+
+        if (targetAcc) {
+            const side = accountStates[targetAcc.accountId].direction;
+            market.status = `Triggering One-Time Add (${side.toUpperCase()})`;
+            await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: 1, direction: side, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+            });
+            hasAddedThisCycle = true; // Mark as done for this cycle
+        } else {
+            market.status = `Waiting for ${config.triggerRoi}% ROI Threshold`;
+        }
     } else {
-        market.status = 'Monitoring 1:1 Hedge';
+        market.status = 'Monitoring for Net Profit Exit';
     }
 }
 
@@ -130,6 +155,7 @@ async function closeAll() {
             contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
         }) : Promise.resolve();
     }));
+    hasAddedThisCycle = false; 
     setTimeout(() => { isProcessing = false; }, 5000);
 }
 
@@ -148,7 +174,7 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), config }));
+app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), config, hasAddedThisCycle }));
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -168,14 +194,14 @@ app.get('/', (req, res) => {
             <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Running...</p></div>
             <div class="flex gap-10 text-right">
                 <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p><p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p></div>
-                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Realized Profit (Equity Growth)</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.00000000</p></div>
+                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Combined Realized</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.00000000</p></div>
             </div>
         </div>
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20 text-center">
-            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Sum of PnL - Fees)</p>
+            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Incl. Fees)</p>
             <h2 id="netProfit" class="text-6xl font-black mb-4 font-mono">+$0.00000000</h2>
             <div class="inline-flex items-center gap-2 bg-zinc-900 px-4 py-2 rounded-full border border-zinc-800">
-                <span class="text-[10px] font-bold text-zinc-500 uppercase">Target:</span><span class="text-xs font-mono font-bold text-indigo-400">Any Positive Sum</span>
+                <span class="text-[10px] font-bold text-zinc-500 uppercase">One-Time Add:</span><span id="addFlag" class="text-xs font-mono font-bold text-indigo-400">No</span>
             </div>
         </div>
         <div class="grid md:grid-cols-2 gap-6">
@@ -197,12 +223,13 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('markPrice').innerText = d.market.last.toFixed(8);
                 document.getElementById('botStatus').innerText = d.market.status;
+                document.getElementById('addFlag').innerText = d.hasAddedThisCycle ? 'Yes' : 'No';
                 let tC = 0, tP = 0, tR = 0;
                 d.accounts.forEach(a => {
                     const prefix = a.direction === 'buy' ? 'long' : 'short';
                     document.getElementById(prefix + 'Roi').innerText = a.roi.toFixed(2) + '%';
                     document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(8);
-                    document.getElementById(prefix + 'Bar').style.width = Math.min(100, Math.abs(a.roi) * 20) + '%';
+                    document.getElementById(prefix + 'Bar').style.width = Math.min(100, Math.max(0, Math.abs(a.roi) * 20)) + '%';
                     tC += a.volume; tP += a.unrealizedUsdt; tR += a.realizedProfit;
                 });
                 document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(8);
