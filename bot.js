@@ -105,6 +105,7 @@ async function tradeLoop() {
     const s1 = accountStates[acc1.accountId];
     const s2 = accountStates[acc2.accountId];
 
+    // 1. ENTRY / SYNC
     if (s1.volume < 1 || s2.volume < 1) {
         isProcessing = true;
         market.status = 'Syncing Hedge Entry...';
@@ -117,19 +118,20 @@ async function tradeLoop() {
         return;
     }
 
-    // PROFIT CALCULATION
+    // 2. NET PROFIT CALCULATION
     const totalVol = s1.volume + s2.volume;
     const estExitFees = (totalVol * config.contractSize * market.last) * config.feeRate;
     const combinedPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
     const netProfit = combinedPnL - estExitFees;
 
-    // EXIT TRIGGER: Close when Net Exit Profit (All Fees Included) is above zero
+    // 3. AGGRESSIVE EXIT: Close immediately if net profit is > 0
     if (netProfit > 0) {
-        market.status = `EXIT: PROFIT +$${netProfit.toFixed(8)}`;
+        market.status = `EXITING: PROFIT +$${netProfit.toFixed(8)}`;
         await closeAll();
         return;
     }
 
+    // 4. WINNER ADD
     if (!hasAddedThisCycle) {
         let winnerAcc = null;
         if (s1.roi >= config.triggerRoi) winnerAcc = acc1;
@@ -149,13 +151,24 @@ async function tradeLoop() {
 
 async function closeAll() {
     isProcessing = true;
+    // Force close orders for both accounts simultaneously
     await Promise.all(config.accounts.map(acc => {
         const state = accountStates[acc.accountId];
-        return state.volume > 0 ? htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-            contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
-        }) : Promise.resolve();
+        if (state.volume > 0) {
+            return htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, 
+                volume: state.volume, 
+                direction: state.direction === 'buy' ? 'sell' : 'buy', 
+                offset: 'close', 
+                lever_rate: config.leverage, 
+                order_price_type: 'opponent' 
+            });
+        }
+        return Promise.resolve();
     }));
-    setTimeout(() => { isProcessing = false; }, 5000);
+    
+    // Short lockout to let exchange process the close
+    setTimeout(() => { isProcessing = false; }, 4000);
 }
 
 function startWS() {
@@ -172,6 +185,7 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
+// UI and API routes remain exactly the same as provided in your initial working version
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), config, hasAddedThisCycle }));
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
