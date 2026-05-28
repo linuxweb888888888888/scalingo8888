@@ -28,7 +28,7 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     
-    // --- AI & PROFIT SETTINGS ---
+    // --- WINNER-WEIGHTING SETTINGS ---
     targetNetRoi: 1.5,            
     initialOrderSize: 10,        
     repairStep: 2,               
@@ -78,8 +78,6 @@ async function sync() {
 
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
-        
-        // Update Position Stats
         const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
         if (res?.status === 'ok' && res.data) {
             const pos = res.data.find(p => p.direction === state.direction);
@@ -93,13 +91,12 @@ async function sync() {
             } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
         }
 
-        // Update Wallet/Equity Stats (Realized Profit Calculation)
         const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
         if (accRes?.status === 'ok' && accRes.data) {
-            const equity = parseFloat(accRes.data[0].margin_balance); // Current Equity
+            const equity = parseFloat(accRes.data[0].margin_balance);
             if (state.initialBalance === 0) state.initialBalance = equity;
             state.wallet = equity;
-            state.realizedProfit = equity - state.initialBalance; // Realized growth for this account
+            state.realizedProfit = equity - state.initialBalance;
         }
     }
 }
@@ -109,8 +106,9 @@ async function tradeLoop() {
     const long = accountStates[config.accounts[0].accountId];
     const short = accountStates[config.accounts[1].accountId];
 
+    // 1. Initial Start
     if (long.volume === 0 && short.volume === 0) {
-        market.status = 'AI Initializing...';
+        market.status = 'AI Powering On...';
         isProcessing = true;
         await Promise.all(config.accounts.map((acc, idx) => htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
             contract_code: config.symbol, volume: config.initialOrderSize, direction: idx === 0 ? 'buy' : 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
@@ -119,6 +117,7 @@ async function tradeLoop() {
         return;
     }
 
+    // 2. Net ROI Calculation
     const totalVol = long.volume + short.volume;
     const realNotional = totalVol * config.contractSize * market.last;
     const marginUsed = realNotional / config.leverage;
@@ -127,22 +126,37 @@ async function tradeLoop() {
     const netRoi = marginUsed > 0 ? (netPnLUsdt / marginUsed) * 100 : 0;
 
     if (netRoi >= config.targetNetRoi) {
-        market.status = `EXITING: ${netRoi.toFixed(2)}% ROI`;
+        market.status = `CLOSING PROFIT: ${netRoi.toFixed(2)}%`;
         await closeAll();
         return;
     }
 
+    // 3. WINNER-WEIGHTING LOGIC
     const now = Date.now();
     if (now - lastActionTime > 3000) {
-        const oldestPrice = market.history[0] || market.last;
-        const trend = (market.last - oldestPrice) > 0 ? 'UP' : 'DOWN';
         let targetAcc = null;
 
-        if (trend === 'UP' && long.roi < short.roi) targetAcc = config.accounts[0];
-        else if (trend === 'DOWN' && short.roi < long.roi) targetAcc = config.accounts[1];
-        else targetAcc = long.roi < short.roi ? config.accounts[0] : config.accounts[1];
+        // Compare absolute PnL values. We want Winner PnL > Loser PnL.
+        const longVal = long.unrealizedUsdt;
+        const shortVal = short.unrealizedUsdt;
 
-        if (targetAcc && Math.abs(long.roi + short.roi) > 0.05) {
+        // If Long is winning but Short is losing more
+        if (longVal > 0 && Math.abs(longVal) < Math.abs(shortVal)) {
+            targetAcc = config.accounts[0]; // Add to Long (the winner)
+            market.status = 'AI: Weighting Long Winner';
+        } 
+        // If Short is winning but Long is losing more
+        else if (shortVal > 0 && Math.abs(shortVal) < Math.abs(longVal)) {
+            targetAcc = config.accounts[1]; // Add to Short (the winner)
+            market.status = 'AI: Weighting Short Winner';
+        } 
+        // If they are roughly matched, repair the one with worse ROI
+        else {
+            targetAcc = long.roi < short.roi ? config.accounts[0] : config.accounts[1];
+            market.status = 'AI: Optimizing Balance';
+        }
+
+        if (targetAcc) {
             await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: config.repairStep, direction: accountStates[targetAcc.accountId].direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
@@ -198,7 +212,7 @@ app.get('/', (req, res) => {
 <body class="p-4 md:p-10">
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-8">
-            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC AI</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Analyzing Momentum...</p></div>
+            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC AI</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Processing...</p></div>
             <div class="flex gap-10 text-right">
                 <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p><p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p></div>
                 <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Combined Realized</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.00000000</p></div>
