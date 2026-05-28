@@ -27,21 +27,15 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    
-    // --- TURBO SUM PROFIT SETTINGS ---
-    initialOrderSize: 10,        
-    repairStepAggressive: 15,    // Lot size to add during momentum
-    repairStepSlow: 1,           
-    momentumLookback: 5,
+    orderSize: 1,                // STRICTLY 1 CONTRACT
     feeRate: 0.0005,             // 0.05% Taker fee
     contractSize: 0              // Auto-detected
 };
 
 // ==================== GLOBAL STATE ====================
-let market = { last: 0, status: 'initializing', history: [] };
+let market = { last: 0, status: 'initializing' };
 let accountStates = {};
 let isProcessing = false;
-let lastActionTime = 0;
 
 config.accounts.forEach((account, idx) => {
     accountStates[account.accountId] = {
@@ -84,8 +78,8 @@ async function sync() {
             if (pos && parseFloat(pos.volume) > 0) {
                 state.avgPrice = parseFloat(pos.cost_hold);
                 state.volume = parseFloat(pos.volume);
-                state.unrealizedUsdt = parseFloat(pos.profit); // USDT PnL
-                state.roi = parseFloat(pos.profit_rate) * 100; // Exchange ROI %
+                state.unrealizedUsdt = parseFloat(pos.profit);
+                state.roi = parseFloat(pos.profit_rate) * 100;
             } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
         }
         const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
@@ -103,62 +97,28 @@ async function tradeLoop() {
     const long = accountStates[config.accounts[0].accountId];
     const short = accountStates[config.accounts[1].accountId];
 
-    // 1. Initial Start
+    // 1. Initial Opening (Only if nothing is open)
     if (long.volume === 0 && short.volume === 0) {
-        market.status = 'AI Initializing...';
+        market.status = 'Opening 1 Contract Hedge';
         isProcessing = true;
         await Promise.all(config.accounts.map((acc, idx) => htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-            contract_code: config.symbol, volume: config.initialOrderSize, direction: idx === 0 ? 'buy' : 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+            contract_code: config.symbol, volume: config.orderSize, direction: idx === 0 ? 'buy' : 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
         })));
-        setTimeout(() => { isProcessing = false; }, 2000);
+        setTimeout(() => { isProcessing = false; }, 3000);
         return;
     }
 
-    // 2. THE OVERPOWER SUM CALCULATION
+    // 2. Simple Net Calculation
     const totalVol = long.volume + short.volume;
     const estExitFees = (totalVol * config.contractSize * market.last) * config.feeRate;
-    const combinedPnL = long.unrealizedUsdt + short.unrealizedUsdt;
-    const netExitProfit = combinedPnL - estExitFees;
+    const netProfit = (long.unrealizedUsdt + short.unrealizedUsdt) - estExitFees;
 
-    // 3. EXIT TRIGGER (Any positive sum after fees)
-    if (netExitProfit > 0.00000001) {
-        market.status = `SUM PROFIT REACHED: +$${netExitProfit.toFixed(8)}`;
+    // 3. Exit Trigger
+    if (netProfit > 0.00000001) {
+        market.status = `Closing for Profit: $${netProfit.toFixed(8)}`;
         await closeAll();
-        return;
-    }
-
-    // 4. MOMENTUM AI (Lot adding)
-    const now = Date.now();
-    if (now - lastActionTime > 3000) {
-        const oldestPrice = market.history[0] || market.last;
-        const trend = (market.last - oldestPrice) > 0 ? 'UP' : 'DOWN';
-        
-        let targetAcc = null;
-        let amount = config.repairStepSlow;
-
-        if (trend === 'UP' && long.roi < 0) {
-            // Price moving UP toward Long entry - add aggressive LOT
-            targetAcc = config.accounts[0];
-            amount = config.repairStepAggressive;
-            market.status = 'AI: Scaling Winner Lot';
-        } else if (trend === 'DOWN' && short.roi < 0) {
-            // Price moving DOWN toward Short entry - add aggressive LOT
-            targetAcc = config.accounts[1];
-            amount = config.repairStepAggressive;
-            market.status = 'AI: Scaling Winner Lot';
-        } else {
-            // Standard repair
-            targetAcc = long.roi < short.roi ? config.accounts[0] : config.accounts[1];
-            amount = config.repairStepSlow;
-            market.status = 'AI: Syncing Sum';
-        }
-
-        if (targetAcc) {
-            await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: amount, direction: accountStates[targetAcc.accountId].direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
-            });
-            lastActionTime = now;
-        }
+    } else {
+        market.status = 'Monitoring 1:1 Hedge';
     }
 }
 
@@ -170,7 +130,7 @@ async function closeAll() {
             contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'opponent'
         }) : Promise.resolve();
     }));
-    setTimeout(() => { isProcessing = false; }, 4000);
+    setTimeout(() => { isProcessing = false; }, 5000);
 }
 
 // ==================== WS & DASHBOARD ====================
@@ -181,11 +141,7 @@ function startWS() {
         zlib.gunzip(data, (err, dec) => {
             if (err) return;
             const msg = JSON.parse(dec.toString());
-            if (msg.tick) {
-                market.last = (msg.tick.bid[0] + msg.tick.ask[0]) / 2;
-                market.history.push(market.last);
-                if (market.history.length > config.momentumLookback) market.history.shift();
-            }
+            if (msg.tick) market.last = (msg.tick.bid[0] + msg.tick.ask[0]) / 2;
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
         });
     });
@@ -209,30 +165,28 @@ app.get('/', (req, res) => {
 <body class="p-4 md:p-10">
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-8">
-            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC AI</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Processing...</p></div>
+            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Running...</p></div>
             <div class="flex gap-10 text-right">
                 <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p><p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p></div>
-                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Combined Equity Growth</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.00000000</p></div>
+                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Realized Profit (Equity Growth)</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.00000000</p></div>
             </div>
         </div>
-
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20 text-center">
-            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (8 Decimals)</p>
+            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Sum of PnL - Fees)</p>
             <h2 id="netProfit" class="text-6xl font-black mb-4 font-mono">+$0.00000000</h2>
             <div class="inline-flex items-center gap-2 bg-zinc-900 px-4 py-2 rounded-full border border-zinc-800">
-                <span class="text-[10px] font-bold text-zinc-500 uppercase">Status:</span><span class="text-xs font-mono font-bold text-indigo-400">Targeting Any Profit</span>
+                <span class="text-[10px] font-bold text-zinc-500 uppercase">Target:</span><span class="text-xs font-mono font-bold text-indigo-400">Any Positive Sum</span>
             </div>
         </div>
-
         <div class="grid md:grid-cols-2 gap-6">
             <div class="glass rounded-[2rem] p-6 border-l-4 border-emerald-500">
                 <div class="flex justify-between items-center mb-4"><span class="text-xs font-bold text-emerald-500 uppercase tracking-widest">Long Side</span><span id="longRoi" class="text-xl font-black text-emerald-400">0.00%</span></div>
-                <div class="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden mb-4"><div id="longBar" class="roi-bar bg-emerald-500 h-full"></div></div>
+                <div class="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden mb-4"><div id="longBar" class="roi-bar bg-emerald-500 h-full" style="width: 0%"></div></div>
                 <div class="flex justify-between items-center"><span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL (USDT)</span><span id="longUsdt" class="text-sm font-mono font-bold text-white">0 / $0.00000000</span></div>
             </div>
             <div class="glass rounded-[2rem] p-6 border-l-4 border-rose-500">
                 <div class="flex justify-between items-center mb-4"><span class="text-xs font-bold text-rose-500 uppercase tracking-widest">Short Side</span><span id="shortRoi" class="text-xl font-black text-rose-400">0.00%</span></div>
-                <div class="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden mb-4"><div id="shortBar" class="roi-bar bg-rose-500 h-full"></div></div>
+                <div class="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden mb-4"><div id="shortBar" class="roi-bar bg-rose-500 h-full" style="width: 0%"></div></div>
                 <div class="flex justify-between items-center"><span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL (USDT)</span><span id="shortUsdt" class="text-sm font-mono font-bold text-white">0 / $0.00000000</span></div>
             </div>
         </div>
@@ -248,14 +202,13 @@ app.get('/', (req, res) => {
                     const prefix = a.direction === 'buy' ? 'long' : 'short';
                     document.getElementById(prefix + 'Roi').innerText = a.roi.toFixed(2) + '%';
                     document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(8);
-                    document.getElementById(prefix + 'Bar').style.width = Math.min(100, Math.max(0, Math.abs(a.roi) * 10)) + '%';
+                    document.getElementById(prefix + 'Bar').style.width = Math.min(100, Math.abs(a.roi) * 20) + '%';
                     tC += a.volume; tP += a.unrealizedUsdt; tR += a.realizedProfit;
                 });
                 document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(8);
                 const cSize = d.config.contractSize || 1;
                 const realNotional = tC * cSize * d.market.last;
-                const exitFees = realNotional * d.config.feeRate;
-                const projected = tP - exitFees;
+                const projected = tP - (realNotional * d.config.feeRate);
                 const pElem = document.getElementById('netProfit');
                 pElem.innerText = (projected >= 0 ? '+' : '') + '$' + projected.toFixed(8);
                 pElem.className = 'text-6xl font-black mb-4 font-mono ' + (projected >= 0 ? 'text-emerald-400' : 'text-rose-500');
@@ -267,4 +220,4 @@ app.get('/', (req, res) => {
 </html>`);
 });
 
-startWS(); setInterval(sync, 2000); setInterval(tradeLoop, 2500); app.listen(config.port, '0.0.0.0');
+startWS(); setInterval(sync, 2000); setInterval(tradeLoop, 3000); app.listen(config.port, '0.0.0.0');
