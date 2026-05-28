@@ -28,13 +28,13 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     
-    // --- TURBO RECOVERY SETTINGS ---
-    targetNetRoi: 1.5,            
+    // --- TURBO PROFIT SETTINGS ---
+    targetNetRoi: 1.5,            // Secondary exit target
     initialOrderSize: 10,        
-    repairStepAggressive: 15,    // Large lot to add during momentum windows
-    repairStepSlow: 1,           // Small lot for steady repair
-    momentumLookback: 5,         // Ticks to analyze speed
-    feeRate: 0.0005,             
+    repairStepAggressive: 15,    // Lot to add when momentum is favorable
+    repairStepSlow: 1,           
+    momentumLookback: 5,
+    feeRate: 0.0005,             // 0.05% Taker fee
     contractSize: 0              
 };
 
@@ -86,7 +86,7 @@ async function sync() {
                 state.avgPrice = parseFloat(pos.cost_hold);
                 state.volume = parseFloat(pos.volume);
                 state.unrealizedUsdt = parseFloat(pos.profit);
-                state.roi = parseFloat(pos.profit_rate) * 100; 
+                state.roi = parseFloat(pos.profit_rate) * 100; // Exchange direct ROI
             } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
         }
         const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
@@ -119,16 +119,20 @@ async function tradeLoop() {
     const realNotional = totalVol * config.contractSize * market.last;
     const marginUsed = realNotional / config.leverage;
     const estFees = realNotional * config.feeRate;
+    
+    // NET CALCULATION
     const netPnLUsdt = (long.unrealizedUsdt + short.unrealizedUsdt) - estFees;
     const netRoi = marginUsed > 0 ? (netPnLUsdt / marginUsed) * 100 : 0;
 
-    if (netRoi >= config.targetNetRoi) {
-        market.status = `EXIT PROFIT: ${netRoi.toFixed(2)}%`;
+    // --- PROFIT OVERPOWER EXIT ---
+    // If Winner > (Loser + Fees), Net PnL will be greater than 0
+    if (netPnLUsdt > 0.00000001 || netRoi >= config.targetNetRoi) {
+        market.status = `OVERPOWER EXIT: +$${netPnLUsdt.toFixed(8)}`;
         await closeAll();
         return;
     }
 
-    // --- MOMENTUM AI LOGIC ---
+    // --- MOMENTUM REPAIR ---
     const now = Date.now();
     if (now - lastActionTime > 3000) {
         const oldestPrice = market.history[0] || market.last;
@@ -137,22 +141,17 @@ async function tradeLoop() {
         let targetAcc = null;
         let amount = config.repairStepSlow;
 
-        // Detect high-probability recovery window
         if (trend === 'UP' && long.roi < 0) {
-            // Price is moving UP toward Long entry - Scale Lot Aggressively
             targetAcc = config.accounts[0];
             amount = config.repairStepAggressive;
-            market.status = 'AI: Turbo Scaling Long';
+            market.status = 'AI: Scaling Long Recovery';
         } else if (trend === 'DOWN' && short.roi < 0) {
-            // Price is moving DOWN toward Short entry - Scale Lot Aggressively
             targetAcc = config.accounts[1];
             amount = config.repairStepAggressive;
-            market.status = 'AI: Turbo Scaling Short';
+            market.status = 'AI: Scaling Short Recovery';
         } else {
-            // Neutral momentum - Simple slow repair
             targetAcc = long.roi < short.roi ? config.accounts[0] : config.accounts[1];
-            amount = config.repairStepSlow;
-            market.status = 'AI: Steady Repair';
+            market.status = 'AI: Correcting Drift';
         }
 
         if (targetAcc) {
@@ -211,21 +210,19 @@ app.get('/', (req, res) => {
 <body class="p-4 md:p-10">
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-8">
-            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC AI</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Processing...</p></div>
+            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC AI</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Momentum Scanning...</p></div>
             <div class="flex gap-10 text-right">
                 <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p><p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p></div>
                 <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Combined Equity Growth</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.00000000</p></div>
             </div>
         </div>
-
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20 text-center">
-            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Incl. Fees) ROI</p>
+            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit ROI (HTX Direct Sync)</p>
             <h2 id="netRoi" class="text-7xl font-black mb-4 font-mono">+0.0000%</h2>
             <div class="inline-flex items-center gap-2 bg-zinc-900 px-4 py-2 rounded-full border border-zinc-800">
-                <span class="text-[10px] font-bold text-zinc-500 uppercase">Target:</span><span class="text-xs font-mono font-bold text-indigo-400">${config.targetNetRoi.toFixed(2)}%</span>
+                <span class="text-[10px] font-bold text-zinc-500 uppercase">Target:</span><span class="text-xs font-mono font-bold text-indigo-400">Net +0.00%</span>
             </div>
         </div>
-
         <div class="grid md:grid-cols-2 gap-6">
             <div class="glass rounded-[2rem] p-6 border-l-4 border-emerald-500">
                 <div class="flex justify-between items-center mb-4"><span class="text-xs font-bold text-emerald-500 uppercase tracking-widest">Long Side</span><span id="longRoi" class="text-xl font-black text-emerald-400">0.00%</span></div>
@@ -256,8 +253,8 @@ app.get('/', (req, res) => {
                 document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(8);
                 const cSize = d.config.contractSize || 1;
                 const realNotional = tC * cSize * d.market.last;
-                const netPnL = tP - (realNotional * d.config.feeRate);
                 const marginUsed = realNotional / d.config.leverage;
+                const netPnL = tP - (realNotional * d.config.feeRate);
                 const netRoi = marginUsed > 0 ? (netPnL / marginUsed) * 100 : 0;
                 const rElem = document.getElementById('netRoi');
                 rElem.innerText = (netRoi >= 0 ? '+' : '') + netRoi.toFixed(4) + '%';
@@ -270,4 +267,4 @@ app.get('/', (req, res) => {
 </html>`);
 });
 
-startWS(); setInterval(sync, 2000); setInterval(tradeLoop, 3000); app.listen(config.port, '0.0.0.0');
+startWS(); setInterval(sync, 2000); setInterval(tradeLoop, 2500); app.listen(config.port, '0.0.0.0');
