@@ -304,38 +304,299 @@ async function checkTrades() {
     }
 }
 
-// ==================== WEB UI ====================
+// ==================== WEB UI WITH NEAT DESIGN ====================
 app.get('/', (req, res) => {
-    const accountInfo = config.accounts.map((acc, idx) => 
-        `${idx === 0 ? '📈 LONG' : '📉 SHORT'} Account ${acc.accountId}`
-    ).join(' | ');
-    
     res.send(`<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>HTX Dual Direction Bot</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HTX Dual Direction Trading Bot</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <meta http-equiv="refresh" content="5">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        * { font-family: 'Inter', sans-serif; }
+        .gradient-bg { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+        .card-hover { transition: all 0.3s ease; }
+        .card-hover:hover { transform: translateY(-5px); box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1), 0 10px 10px -5px rgba(0,0,0,0.02); }
+        .blur-bg { backdrop-filter: blur(10px); }
+        .number-font { font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
+        @keyframes pulse-green {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        .pulse { animation: pulse-green 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+    </style>
 </head>
-<body class="p-8 bg-gray-100">
-    <div class="max-w-4xl mx-auto">
-        <div class="bg-white rounded-lg shadow p-6 mb-4">
-            <h1 class="text-2xl font-bold mb-2">HTX Dual Direction Bot</h1>
-            <p>Symbol: ${config.symbol} | Leverage: ${config.leverage}X | TP: ${config.takeProfitPercent}% | SL: ${config.stopLossPercent}%</p>
-            <p>Accounts: ${accountInfo}</p>
+<body class="bg-gradient-to-br from-gray-50 to-gray-100">
+    <div class="container mx-auto px-4 py-8 max-w-7xl">
+        <!-- Header -->
+        <div class="gradient-bg rounded-2xl shadow-2xl p-6 mb-8 text-white">
+            <div class="flex justify-between items-center">
+                <div>
+                    <h1 class="text-4xl font-bold mb-2">🤖 HTX Dual Direction Bot</h1>
+                    <p class="text-white/80 text-sm">Advanced Futures Trading Automation | LONG + SHORT Strategy</p>
+                </div>
+                <div class="text-right">
+                    <div class="text-3xl font-bold number-font" id="livePrice">$0.00000000</div>
+                    <div class="text-sm text-white/70">${config.symbol}</div>
+                </div>
+            </div>
+            <div class="grid grid-cols-4 gap-4 mt-6 pt-4 border-t border-white/20">
+                <div>
+                    <div class="text-xs text-white/70">Leverage</div>
+                    <div class="text-xl font-bold">${config.leverage}X</div>
+                </div>
+                <div>
+                    <div class="text-xs text-white/70">Order Size</div>
+                    <div class="text-xl font-bold">${config.orderSize} contracts</div>
+                </div>
+                <div>
+                    <div class="text-xs text-white/70">Take Profit</div>
+                    <div class="text-xl font-bold text-green-300">${config.takeProfitPercent}%</div>
+                </div>
+                <div>
+                    <div class="text-xs text-white/70">Stop Loss</div>
+                    <div class="text-xl font-bold text-red-300">${config.stopLossPercent}%</div>
+                </div>
+            </div>
         </div>
-        <div class="bg-white rounded-lg shadow p-6">
-            <pre id="status" class="text-sm"></pre>
+
+        <!-- Combined Stats -->
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
+            <div class="bg-white rounded-xl shadow-lg p-6 card-hover">
+                <div class="text-gray-500 text-sm mb-2">💰 Total Net Profit</div>
+                <div class="text-3xl font-bold text-green-600 number-font" id="totalProfit">$0.00</div>
+                <div class="text-sm text-gray-500 mt-2" id="totalProfitPct">0.00%</div>
+            </div>
+            <div class="bg-white rounded-xl shadow-lg p-6 card-hover">
+                <div class="text-gray-500 text-sm mb-2">📊 Total Balance</div>
+                <div class="text-3xl font-bold text-blue-600 number-font" id="totalBalance">$0.00</div>
+                <div class="text-sm text-gray-500 mt-2">Initial: $<span id="initialBalance">0.00</span></div>
+            </div>
+            <div class="bg-white rounded-xl shadow-lg p-6 card-hover">
+                <div class="text-gray-500 text-sm mb-2">🎯 Win/Loss Ratio</div>
+                <div class="text-3xl font-bold text-purple-600 number-font" id="wlRatio">0.00</div>
+                <div class="text-sm text-gray-500 mt-2">Wins: <span id="wins">0</span> | Losses: <span id="losses">0</span></div>
+            </div>
+            <div class="bg-white rounded-xl shadow-lg p-6 card-hover">
+                <div class="text-gray-500 text-sm mb-2">📈 Daily Growth Rate</div>
+                <div class="text-3xl font-bold text-emerald-600 number-font" id="dgr">0.00%</div>
+                <div class="text-sm text-gray-500 mt-2">Total Trades: <span id="totalTradesCount">0</span></div>
+            </div>
+        </div>
+
+        <!-- Account Cards -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8" id="accountsContainer">
+            <!-- Dynamic account cards will be inserted here -->
+        </div>
+
+        <!-- Charts Section -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+            <div class="bg-white rounded-xl shadow-lg p-6">
+                <h3 class="text-lg font-bold mb-4">Profit Timeline</h3>
+                <canvas id="profitChart" height="200"></canvas>
+            </div>
+            <div class="bg-white rounded-xl shadow-lg p-6">
+                <h3 class="text-lg font-bold mb-4">Performance Metrics</h3>
+                <div class="space-y-4">
+                    <div>
+                        <div class="flex justify-between text-sm mb-1">
+                            <span>Win Rate</span>
+                            <span id="winRate">0%</span>
+                        </div>
+                        <div class="w-full bg-gray-200 rounded-full h-2">
+                            <div id="winRateBar" class="bg-green-500 rounded-full h-2" style="width: 0%"></div>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="flex justify-between text-sm mb-1">
+                            <span>Profit Factor</span>
+                            <span id="profitFactor">0.00</span>
+                        </div>
+                        <div class="w-full bg-gray-200 rounded-full h-2">
+                            <div id="profitFactorBar" class="bg-blue-500 rounded-full h-2" style="width: 0%"></div>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="flex justify-between text-sm mb-1">
+                            <span>Expected Value</span>
+                            <span id="expectedValue">$0.00</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Status Badge -->
+        <div class="bg-white rounded-xl shadow-lg p-4 text-center">
+            <div class="flex items-center justify-center gap-2">
+                <div class="w-2 h-2 bg-green-500 rounded-full pulse"></div>
+                <span class="text-sm text-gray-600">Bot is actively monitoring markets | Last update: <span id="lastUpdate">Just now</span></span>
+            </div>
         </div>
     </div>
+
     <script>
-        async function load() {
-            const r = await fetch('/api/status');
-            const d = await r.json();
-            document.getElementById('status').innerHTML = JSON.stringify(d, null, 2);
+        let profitHistory = [];
+        let profitChart = null;
+
+        // Generate account card HTML
+        function generateAccountCard(account, index) {
+            const isLong = index === 0;
+            const bgGradient = isLong ? 'from-emerald-50 to-emerald-100/30' : 'from-red-50 to-red-100/30';
+            const borderColor = isLong ? 'border-emerald-200' : 'border-red-200';
+            const icon = isLong ? '📈' : '📉';
+            const title = isLong ? 'LONG POSITION' : 'SHORT POSITION';
+            
+            return `
+                <div class="bg-gradient-to-br ${bgGradient} rounded-xl shadow-lg p-6 card-hover border ${borderColor}">
+                    <div class="flex justify-between items-start mb-4">
+                        <div>
+                            <div class="text-3xl mb-2">${icon}</div>
+                            <h3 class="text-xl font-bold">Account ${account.id}</h3>
+                            <div class="text-sm text-gray-600">${title}</div>
+                        </div>
+                        <div class="text-right">
+                            <div class="text-xs text-gray-500">Balance</div>
+                            <div class="text-2xl font-bold number-font" id="balance_${account.id}">$0.00</div>
+                        </div>
+                    </div>
+                    
+                    <div class="grid grid-cols-2 gap-4 mb-4">
+                        <div>
+                            <div class="text-xs text-gray-500">Position Size</div>
+                            <div class="text-lg font-bold number-font" id="position_${account.id}">0</div>
+                        </div>
+                        <div>
+                            <div class="text-xs text-gray-500">Current ROI</div>
+                            <div class="text-lg font-bold number-font" id="roi_${account.id}">0%</div>
+                        </div>
+                        <div>
+                            <div class="text-xs text-gray-500">Avg Entry</div>
+                            <div class="text-sm number-font" id="avgPrice_${account.id}">$0.0000</div>
+                        </div>
+                        <div>
+                            <div class="text-xs text-gray-500">Trades</div>
+                            <div class="text-sm number-font" id="trades_${account.id}">0</div>
+                        </div>
+                    </div>
+                    
+                    <div class="border-t pt-3">
+                        <div class="flex justify-between text-sm">
+                            <span class="text-gray-600">Realized P&L</span>
+                            <span class="font-bold number-font" id="profit_${account.id}">$0.00</span>
+                        </div>
+                        <div class="flex justify-between text-sm mt-1">
+                            <span class="text-gray-600">Win/Loss</span>
+                            <span class="text-sm" id="wl_${account.id}">0/0</span>
+                        </div>
+                    </div>
+                </div>
+            `;
         }
-        setInterval(load, 2000);
-        load();
+
+        async function updateUI() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                
+                // Update combined stats
+                document.getElementById('totalProfit').innerText = '$' + data.realizedProfit.toFixed(4);
+                document.getElementById('totalProfitPct').innerText = data.profitPct.toFixed(2) + '%';
+                document.getElementById('totalBalance').innerText = '$' + data.displayBalance.toFixed(2);
+                document.getElementById('initialBalance').innerText = data.initialBalance.toFixed(2);
+                document.getElementById('livePrice').innerText = '$' + data.currentPrice.toFixed(8);
+                document.getElementById('totalTradesCount').innerText = data.totalTrades;
+                document.getElementById('wins').innerText = data.winningTrades;
+                document.getElementById('losses').innerText = data.losingTrades;
+                
+                const winLossRatio = data.winningTrades / Math.max(data.losingTrades, 1);
+                document.getElementById('wlRatio').innerText = winLossRatio.toFixed(2);
+                document.getElementById('dgr').innerText = data.estimates.dgr.toFixed(2) + '%';
+                
+                const winRate = (data.winningTrades / Math.max(data.totalTrades, 1)) * 100;
+                document.getElementById('winRate').innerText = winRate.toFixed(1) + '%';
+                document.getElementById('winRateBar').style.width = winRate + '%';
+                
+                const profitFactor = data.totalTrades > 0 ? (data.winningTrades / Math.max(data.losingTrades, 1)) : 0;
+                document.getElementById('profitFactor').innerText = profitFactor.toFixed(2);
+                document.getElementById('profitFactorBar').style.width = Math.min(profitFactor * 20, 100) + '%';
+                
+                const expectedValue = data.realizedProfit / Math.max(data.totalTrades, 1);
+                document.getElementById('expectedValue').innerText = '$' + expectedValue.toFixed(4);
+                
+                // Update account cards
+                if (data.accounts) {
+                    const container = document.getElementById('accountsContainer');
+                    container.innerHTML = data.accounts.map((acc, idx) => generateAccountCard(acc, idx)).join('');
+                    
+                    data.accounts.forEach(acc => {
+                        document.getElementById(`balance_${acc.id}`).innerText = '$' + acc.balance.toFixed(2);
+                        document.getElementById(`position_${acc.id}`).innerText = acc.position;
+                        const roiElem = document.getElementById(`roi_${acc.id}`);
+                        roiElem.innerText = acc.roi.toFixed(2) + '%';
+                        roiElem.style.color = acc.roi >= 0 ? '#059669' : '#dc2626';
+                        document.getElementById(`avgPrice_${acc.id}`).innerText = '$' + acc.avgPrice?.toFixed(8) || '$0.0000';
+                        document.getElementById(`trades_${acc.id}`).innerText = acc.trades;
+                        document.getElementById(`profit_${acc.id}`).innerText = '$' + acc.profit.toFixed(2);
+                        const profitColor = acc.profit >= 0 ? '#059669' : '#dc2626';
+                        document.getElementById(`profit_${acc.id}`).style.color = profitColor;
+                        document.getElementById(`wl_${acc.id}`).innerText = '?/?' ; // Would need separate win/loss per account
+                    });
+                }
+                
+                // Update profit history for chart
+                profitHistory.push(data.realizedProfit);
+                if (profitHistory.length > 50) profitHistory.shift();
+                
+                if (profitChart) {
+                    profitChart.data.datasets[0].data = profitHistory;
+                    profitChart.update();
+                }
+                
+                document.getElementById('lastUpdate').innerText = new Date().toLocaleTimeString();
+            } catch (error) {
+                console.error('Error updating UI:', error);
+            }
+        }
+        
+        // Initialize chart
+        function initChart() {
+            const ctx = document.getElementById('profitChart').getContext('2d');
+            profitChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: Array(50).fill(''),
+                    datasets: [{
+                        label: 'Total Profit ($)',
+                        data: Array(50).fill(0),
+                        borderColor: 'rgb(16, 185, 129)',
+                        backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                        tension: 0.4,
+                        fill: true
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: { mode: 'index', intersect: false }
+                    },
+                    scales: {
+                        y: { beginAtZero: false, grid: { color: 'rgba(0,0,0,0.05)' } },
+                        x: { display: false }
+                    }
+                }
+            });
+        }
+        
+        // Start updates
+        initChart();
+        setInterval(updateUI, 1000);
+        updateUI();
     </script>
 </body>
 </html>`);
@@ -349,7 +610,9 @@ app.get('/api/status', (req, res) => {
         roi: state.roi,
         profit: state.realizedProfit,
         trades: state.totalTrades,
-        direction: state.direction
+        direction: state.direction,
+        avgPrice: state.avgPrice,
+        initialBalance: state.initialBalance
     }));
     
     res.json({
