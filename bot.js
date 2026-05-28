@@ -29,7 +29,7 @@ const config = {
     accounts: apiAccounts,
     
     // --- WINNER-WEIGHTING SETTINGS ---
-    targetNetRoi: 0.1,            
+    targetNetRoi: 0.25,            
     initialOrderSize: 10,        
     repairStep: 2,               
     momentumLookback: 5,
