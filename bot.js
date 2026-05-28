@@ -28,8 +28,8 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     orderSize: 1,                
-    triggerRoi: 2.5,             // 2.5% Trigger
-    addSize: 2,                  // 2 Contracts Add
+    triggerRoi: 3,             // 2.5% Trigger
+    addSize: 5,                  // 2 Contracts Add
     feeRate: 0.0005,             
     contractSize: 0              
 };
