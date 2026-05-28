@@ -306,7 +306,7 @@ async function checkTrades() {
 
 // ==================== WEB UI WITH NEAT DESIGN ====================
 app.get('/', (req, res) => {
-    res.send(`<!DOCTYPE html>
+    const htmlContent = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -320,7 +320,6 @@ app.get('/', (req, res) => {
         .gradient-bg { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
         .card-hover { transition: all 0.3s ease; }
         .card-hover:hover { transform: translateY(-5px); box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1), 0 10px 10px -5px rgba(0,0,0,0.02); }
-        .blur-bg { backdrop-filter: blur(10px); }
         .number-font { font-feature-settings: "tnum"; font-variant-numeric: tabular-nums; }
         @keyframes pulse-green {
             0%, 100% { opacity: 1; }
@@ -388,9 +387,7 @@ app.get('/', (req, res) => {
         </div>
 
         <!-- Account Cards -->
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8" id="accountsContainer">
-            <!-- Dynamic account cards will be inserted here -->
-        </div>
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8" id="accountsContainer"></div>
 
         <!-- Charts Section -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
@@ -442,67 +439,11 @@ app.get('/', (req, res) => {
         let profitHistory = [];
         let profitChart = null;
 
-        // Generate account card HTML
-        function generateAccountCard(account, index) {
-            const isLong = index === 0;
-            const bgGradient = isLong ? 'from-emerald-50 to-emerald-100/30' : 'from-red-50 to-red-100/30';
-            const borderColor = isLong ? 'border-emerald-200' : 'border-red-200';
-            const icon = isLong ? '📈' : '📉';
-            const title = isLong ? 'LONG POSITION' : 'SHORT POSITION';
-            
-            return `
-                <div class="bg-gradient-to-br ${bgGradient} rounded-xl shadow-lg p-6 card-hover border ${borderColor}">
-                    <div class="flex justify-between items-start mb-4">
-                        <div>
-                            <div class="text-3xl mb-2">${icon}</div>
-                            <h3 class="text-xl font-bold">Account ${account.id}</h3>
-                            <div class="text-sm text-gray-600">${title}</div>
-                        </div>
-                        <div class="text-right">
-                            <div class="text-xs text-gray-500">Balance</div>
-                            <div class="text-2xl font-bold number-font" id="balance_${account.id}">$0.00</div>
-                        </div>
-                    </div>
-                    
-                    <div class="grid grid-cols-2 gap-4 mb-4">
-                        <div>
-                            <div class="text-xs text-gray-500">Position Size</div>
-                            <div class="text-lg font-bold number-font" id="position_${account.id}">0</div>
-                        </div>
-                        <div>
-                            <div class="text-xs text-gray-500">Current ROI</div>
-                            <div class="text-lg font-bold number-font" id="roi_${account.id}">0%</div>
-                        </div>
-                        <div>
-                            <div class="text-xs text-gray-500">Avg Entry</div>
-                            <div class="text-sm number-font" id="avgPrice_${account.id}">$0.0000</div>
-                        </div>
-                        <div>
-                            <div class="text-xs text-gray-500">Trades</div>
-                            <div class="text-sm number-font" id="trades_${account.id}">0</div>
-                        </div>
-                    </div>
-                    
-                    <div class="border-t pt-3">
-                        <div class="flex justify-between text-sm">
-                            <span class="text-gray-600">Realized P&L</span>
-                            <span class="font-bold number-font" id="profit_${account.id}">$0.00</span>
-                        </div>
-                        <div class="flex justify-between text-sm mt-1">
-                            <span class="text-gray-600">Win/Loss</span>
-                            <span class="text-sm" id="wl_${account.id}">0/0</span>
-                        </div>
-                    </div>
-                </div>
-            `;
-        }
-
         async function updateUI() {
             try {
                 const response = await fetch('/api/status');
                 const data = await response.json();
                 
-                // Update combined stats
                 document.getElementById('totalProfit').innerText = '$' + data.realizedProfit.toFixed(4);
                 document.getElementById('totalProfitPct').innerText = data.profitPct.toFixed(2) + '%';
                 document.getElementById('totalBalance').innerText = '$' + data.displayBalance.toFixed(2);
@@ -528,26 +469,60 @@ app.get('/', (req, res) => {
                 document.getElementById('expectedValue').innerText = '$' + expectedValue.toFixed(4);
                 
                 // Update account cards
-                if (data.accounts) {
+                if (data.accounts && data.accounts.length > 0) {
                     const container = document.getElementById('accountsContainer');
-                    container.innerHTML = data.accounts.map((acc, idx) => generateAccountCard(acc, idx)).join('');
+                    container.innerHTML = '';
                     
-                    data.accounts.forEach(acc => {
-                        document.getElementById(`balance_${acc.id}`).innerText = '$' + acc.balance.toFixed(2);
-                        document.getElementById(`position_${acc.id}`).innerText = acc.position;
-                        const roiElem = document.getElementById(`roi_${acc.id}`);
-                        roiElem.innerText = acc.roi.toFixed(2) + '%';
-                        roiElem.style.color = acc.roi >= 0 ? '#059669' : '#dc2626';
-                        document.getElementById(`avgPrice_${acc.id}`).innerText = '$' + acc.avgPrice?.toFixed(8) || '$0.0000';
-                        document.getElementById(`trades_${acc.id}`).innerText = acc.trades;
-                        document.getElementById(`profit_${acc.id}`).innerText = '$' + acc.profit.toFixed(2);
-                        const profitColor = acc.profit >= 0 ? '#059669' : '#dc2626';
-                        document.getElementById(`profit_${acc.id}`).style.color = profitColor;
-                        document.getElementById(`wl_${acc.id}`).innerText = '?/?' ; // Would need separate win/loss per account
+                    data.accounts.forEach((acc, idx) => {
+                        const isLong = idx === 0;
+                        const bgGradient = isLong ? 'from-emerald-50 to-emerald-100/30' : 'from-red-50 to-red-100/30';
+                        const borderColor = isLong ? 'border-emerald-200' : 'border-red-200';
+                        const icon = isLong ? '📈' : '📉';
+                        const title = isLong ? 'LONG POSITION' : 'SHORT POSITION';
+                        
+                        const card = document.createElement('div');
+                        card.className = \`bg-gradient-to-br \${bgGradient} rounded-xl shadow-lg p-6 card-hover border \${borderColor}\`;
+                        card.innerHTML = \`
+                            <div class="flex justify-between items-start mb-4">
+                                <div>
+                                    <div class="text-3xl mb-2">\${icon}</div>
+                                    <h3 class="text-xl font-bold">Account \${acc.id}</h3>
+                                    <div class="text-sm text-gray-600">\${title}</div>
+                                </div>
+                                <div class="text-right">
+                                    <div class="text-xs text-gray-500">Balance</div>
+                                    <div class="text-2xl font-bold number-font" id="balance_\${acc.id}">$\${acc.balance.toFixed(2)}</div>
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-4 mb-4">
+                                <div>
+                                    <div class="text-xs text-gray-500">Position Size</div>
+                                    <div class="text-lg font-bold number-font" id="position_\${acc.id}">\${acc.position}</div>
+                                </div>
+                                <div>
+                                    <div class="text-xs text-gray-500">Current ROI</div>
+                                    <div class="text-lg font-bold number-font" id="roi_\${acc.id}" style="color: \${acc.roi >= 0 ? '#059669' : '#dc2626'}">\${acc.roi.toFixed(2)}%</div>
+                                </div>
+                                <div>
+                                    <div class="text-xs text-gray-500">Avg Entry</div>
+                                    <div class="text-sm number-font">$\${(acc.avgPrice || 0).toFixed(8)}</div>
+                                </div>
+                                <div>
+                                    <div class="text-xs text-gray-500">Trades</div>
+                                    <div class="text-sm number-font">\${acc.trades}</div>
+                                </div>
+                            </div>
+                            <div class="border-t pt-3">
+                                <div class="flex justify-between text-sm">
+                                    <span class="text-gray-600">Realized P&L</span>
+                                    <span class="font-bold number-font" style="color: \${acc.profit >= 0 ? '#059669' : '#dc2626'}">$\${acc.profit.toFixed(2)}</span>
+                                </div>
+                            </div>
+                        \`;
+                        container.appendChild(card);
                     });
                 }
                 
-                // Update profit history for chart
                 profitHistory.push(data.realizedProfit);
                 if (profitHistory.length > 50) profitHistory.shift();
                 
@@ -562,7 +537,6 @@ app.get('/', (req, res) => {
             }
         }
         
-        // Initialize chart
         function initChart() {
             const ctx = document.getElementById('profitChart').getContext('2d');
             profitChart = new Chart(ctx, {
@@ -593,13 +567,13 @@ app.get('/', (req, res) => {
             });
         }
         
-        // Start updates
         initChart();
         setInterval(updateUI, 1000);
         updateUI();
     </script>
 </body>
-</html>`);
+</html>`;
+    res.send(htmlContent);
 });
 
 app.get('/api/status', (req, res) => {
