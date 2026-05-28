@@ -29,15 +29,13 @@ const config = {
     accounts: apiAccounts,
     takeProfitPercent: parseFloat(process.env.TAKE_PROFIT_PERCENT) || 1.5,
     orderSize: parseFloat(process.env.ORDER_SIZE) || 1,
-    // 🎯 PRICE SYNC TOLERANCE
-    // 0.02 means the Bid and Ask must be within 0.02% of each other to open.
-    // If your entry prices aren't "the same" enough, decrease this number.
-    priceTolerance: 0.03, 
-    hedgeThreshold: 3.0, 
+    priceTolerance: 0.04, // Must be within 0.04% spread to open
+    hedgeThreshold: 4.0, 
+    feeRate: 0.0005 // Estimating 0.05% Taker fee for exit projection
 };
 
 // ==================== GLOBAL STATE ====================
-let market = { last: 0, bid: 0, ask: 0, spread: 0, syncStatus: 'waiting' };
+let market = { last: 0, bid: 0, ask: 0, spread: 0, status: 'initializing' };
 let accountStates = {};
 let isProcessing = false;
 let startTime = Date.now();
@@ -64,7 +62,8 @@ async function htxRequest(account, method, path, data = {}) {
     } catch (e) { return { status: 'error' }; }
 }
 
-// ==================== SYNC DATA ====================
+// ==================== LOGIC ====================
+
 async function sync() {
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
@@ -91,25 +90,19 @@ async function sync() {
     }
 }
 
-// ==================== TRADE LOOP WITH PRICE CHECK ====================
 async function tradeLoop() {
     if (isProcessing || market.last === 0) return;
     const long = accountStates[config.accounts[0].accountId];
     const short = accountStates[config.accounts[1].accountId];
 
-    // If we have no positions, check if entry prices are "The Same"
     if (long.volume === 0 && short.volume === 0) {
-        
-        // 🛡️ THE GATEKEEPER: Check if Bid/Ask spread is within tolerance
+        // 🛡️ SYNC GATEKEEPER
         if (market.spread > config.priceTolerance) {
-            market.syncStatus = `Unsynced (${market.spread.toFixed(3)}%)`;
-            return; 
+            market.status = `Waiting for Sync (${market.spread.toFixed(3)}%)`;
+            return;
         }
-
-        market.syncStatus = 'Synced - Opening';
+        market.status = 'Opening Sync';
         isProcessing = true;
-        
-        // ATOMIC OPEN (Simultaneous)
         await Promise.all([
             htxRequest(config.accounts[0], 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
@@ -119,12 +112,14 @@ async function tradeLoop() {
             })
         ]);
         setTimeout(() => { isProcessing = false; }, 2000);
-
     } else if (long.volume > 0 && short.volume > 0) {
-        market.syncStatus = 'Hedged';
+        market.status = 'Hedged';
+        // Profit Logic
         if (long.roi >= config.takeProfitPercent || short.roi >= config.takeProfitPercent) await closeAll();
+        // Drift Logic
         if (Math.abs(long.roi + short.roi) > config.hedgeThreshold) await closeAll();
     } else {
+        market.status = 'Imbalance Detected';
         await closeAll();
     }
 }
@@ -140,12 +135,10 @@ async function closeAll() {
     setTimeout(() => { isProcessing = false; }, 2000);
 }
 
-// ==================== WS (BBO DATA) ====================
+// ==================== WS ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
-    ws.on('open', () => {
-        ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo1' }));
-    });
+    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
     ws.on('message', (data) => {
         zlib.gunzip(data, (err, dec) => {
             if (err) return;
@@ -154,7 +147,6 @@ function startWS() {
                 market.bid = msg.tick.bid[0];
                 market.ask = msg.tick.ask[0];
                 market.last = (market.bid + market.ask) / 2;
-                // Calculate real-time price difference (spread)
                 market.spread = ((market.ask - market.bid) / market.last) * 100;
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
@@ -164,48 +156,121 @@ function startWS() {
 }
 
 // ==================== DASHBOARD ====================
-app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates) }));
+app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), feeRate: config.feeRate }));
 app.get('/', (req, res) => {
-    res.send(`<!DOCTYPE html><html><head><title>Atomic Sync</title><script src="https://cdn.tailwindcss.com"></script>
-    <style>body { background: #0c0c0e; color: #e4e4e7; font-family: sans-serif; }</style></head>
-    <body class="p-8"><div class="max-w-2xl mx-auto">
-        <div class="flex justify-between items-end mb-8 bg-zinc-900/50 p-6 rounded-3xl border border-zinc-800">
-            <div><h1 class="text-xl font-black tracking-tighter text-indigo-500 uppercase">Atomic Sync Bot</h1>
-            <p class="text-[10px] font-bold text-zinc-500 uppercase">Status: <span id="status" class="text-indigo-400">--</span></p></div>
-            <div class="text-right"><p id="price" class="text-2xl font-mono font-bold">0.00000000</p></div>
+    res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Atomic Hedge Pro</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Plus Jakarta Sans', sans-serif; background: #09090b; color: #fafafa; }
+        .glass { background: rgba(24, 24, 27, 0.8); backdrop-filter: blur(12px); border: 1px solid rgba(63, 63, 70, 0.5); }
+        .roi-bar { transition: width 0.4s ease; }
+    </style>
+</head>
+<body class="p-4 md:p-10">
+    <div class="max-w-4xl mx-auto">
+        <!-- Header -->
+        <div class="flex justify-between items-center mb-8">
+            <div>
+                <h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1>
+                <p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Initializing...</p>
+            </div>
+            <div class="text-right">
+                <p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p>
+                <p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p>
+            </div>
         </div>
-        <div class="bg-zinc-900/50 rounded-3xl p-8 border border-zinc-800 mb-6 text-center">
-            <p class="text-[10px] text-zinc-500 font-bold uppercase mb-2">Price Sync (Spread)</p>
-            <h2 id="spreadDisplay" class="text-4xl font-black font-mono">0.000%</h2>
-            <p class="text-[10px] text-zinc-600 mt-2">Opening Tolerance: < ${config.priceTolerance}%</p>
-        </div>
-        <div id="accs" class="grid grid-cols-2 gap-4"></div>
-    </div>
-    <script>
-        setInterval(async () => {
-            const r = await fetch('/api/status'); const d = await r.json();
-            document.getElementById('price').innerText = d.market.last.toFixed(8);
-            document.getElementById('status').innerText = d.market.syncStatus;
-            
-            const sp = d.market.spread;
-            const spEl = document.getElementById('spreadDisplay');
-            spEl.innerText = sp.toFixed(3) + '%';
-            spEl.className = 'text-4xl font-black font-mono ' + (sp <= ${config.priceTolerance} ? 'text-emerald-500' : 'text-zinc-600');
 
-            document.getElementById('accs').innerHTML = d.accounts.map(a => \`
-                <div class="bg-zinc-900/50 p-4 rounded-2xl border border-zinc-800">
-                    <div class="flex justify-between text-[10px] font-bold uppercase mb-2">
-                        <span class="\${a.direction==='buy'?'text-emerald-500':'text-rose-500'}">\${a.direction}</span>
-                        <span class="\${a.roi>=0?'text-emerald-400':'text-rose-400'}">\${a.roi.toFixed(2)}%</span>
-                    </div>
-                    <div class="text-xs font-mono text-zinc-500">Entry: \${(a.avgPrice||0).toFixed(8)}</div>
+        <!-- PROFIT DIFFERENCE ANALYZER -->
+        <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20">
+            <div class="relative z-10 text-center">
+                <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Incl. Fees)</p>
+                <h2 id="netProfit" class="text-6xl font-black mb-4 font-mono">+$0.00</h2>
+                <div class="inline-flex items-center gap-2 bg-zinc-900 px-4 py-2 rounded-full border border-zinc-800">
+                    <span class="text-[10px] font-bold text-zinc-500 uppercase">Hedge Spread:</span>
+                    <span id="currentSpread" class="text-xs font-mono font-bold">0.000%</span>
                 </div>
-            \`).join('');
-        }, 1000);
-    </script></body></html>`);
+            </div>
+            <div class="absolute top-0 left-1/2 -translate-x-1/2 w-64 h-64 bg-indigo-600/10 blur-[100px] rounded-full"></div>
+        </div>
+
+        <!-- Position Progress Cards -->
+        <div class="grid md:grid-cols-2 gap-6">
+            <!-- Long Card -->
+            <div class="glass rounded-[2rem] p-6 border-l-4 border-emerald-500">
+                <div class="flex justify-between items-center mb-4">
+                    <span class="text-xs font-bold text-emerald-500 uppercase tracking-widest">Long Side</span>
+                    <span id="longRoi" class="text-xl font-black text-emerald-400">0.00%</span>
+                </div>
+                <div class="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden mb-4">
+                    <div id="longBar" class="roi-bar bg-emerald-500 h-full" style="width: 0%"></div>
+                </div>
+                <div class="flex justify-between items-center">
+                    <span class="text-xs text-zinc-500 uppercase font-bold">PnL (USDT)</span>
+                    <span id="longUsdt" class="text-sm font-mono font-bold text-white">$0.00</span>
+                </div>
+            </div>
+
+            <!-- Short Card -->
+            <div class="glass rounded-[2rem] p-6 border-l-4 border-rose-500">
+                <div class="flex justify-between items-center mb-4">
+                    <span class="text-xs font-bold text-rose-500 uppercase tracking-widest">Short Side</span>
+                    <span id="shortRoi" class="text-xl font-black text-rose-400">0.00%</span>
+                </div>
+                <div class="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden mb-4">
+                    <div id="shortBar" class="roi-bar bg-rose-500 h-full" style="width: 0%"></div>
+                </div>
+                <div class="flex justify-between items-center">
+                    <span class="text-xs text-zinc-500 uppercase font-bold">PnL (USDT)</span>
+                    <span id="shortUsdt" class="text-sm font-mono font-bold text-white">$0.00</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function update() {
+            const r = await fetch('/api/status'); const d = await r.json();
+            document.getElementById('markPrice').innerText = d.market.last.toFixed(8);
+            document.getElementById('botStatus').innerText = d.market.status;
+            document.getElementById('currentSpread').innerText = d.market.spread.toFixed(3) + '%';
+            
+            let longU = 0, shortU = 0, totalVal = 0;
+            
+            d.accounts.forEach(a => {
+                const isLong = a.direction === 'buy';
+                const prefix = isLong ? 'long' : 'short';
+                if(isLong) longU = a.unrealizedUsdt; else shortU = a.unrealizedUsdt;
+                
+                document.getElementById(prefix + 'Roi').innerText = a.roi.toFixed(2) + '%';
+                document.getElementById(prefix + 'Usdt').innerText = (a.unrealizedUsdt >= 0 ? '+' : '') + '$' + a.unrealizedUsdt.toFixed(4);
+                
+                const prog = Math.min(100, Math.max(0, (a.roi / ${config.takeProfitPercent}) * 100));
+                document.getElementById(prefix + 'Bar').style.width = (a.volume > 0 ? prog : 0) + '%';
+                
+                totalVal += (a.volume * d.market.last);
+            });
+
+            // Calculate Projected Exit Profit
+            // (PnL Sum) - (Estimated Taker Fees for both sides)
+            const exitFees = totalVal * d.feeRate;
+            const projected = (longU + shortU) - exitFees;
+            
+            const pElem = document.getElementById('netProfit');
+            pElem.innerText = (projected >= 0 ? '+' : '') + '$' + projected.toFixed(4);
+            pElem.className = 'text-6xl font-black mb-4 font-mono ' + (projected >= 0 ? 'text-emerald-400' : 'text-zinc-600');
+        }
+        setInterval(update, 1000);
+    </script>
+</body>
+</html>`);
 });
 
 startWS();
 setInterval(sync, 2000);
 setInterval(tradeLoop, 3000);
-app.listen(config.port, '0.0.0.0', () => console.log('Hedge Sync Active'));
+app.listen(config.port, '0.0.0.0', () => console.log(`Atomic Sync Ready on ${config.port}`));
