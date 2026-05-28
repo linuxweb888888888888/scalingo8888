@@ -28,9 +28,9 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     orderSize: 1,                
-    triggerRoi: 3,             // 2.5% Trigger
-    addSize: 5,                  // 2 Contracts Add
-    feeRate: 0.0005,             
+    triggerRoi: 3.0,             // 3.0% ROI Target
+    addSize: 5,                  // Add 5 contracts to winner
+    feeRate: 0.0006,             // Conservative fee estimate (0.06%)
     contractSize: 0              
 };
 
@@ -58,9 +58,14 @@ async function htxRequest(account, method, path, data = {}) {
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
         const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 5000 });
-        if (res.data.status !== 'ok') console.log(`HTX Response Error:`, JSON.stringify(res.data));
+        if (res.data.status !== 'ok') {
+            console.log(`❌ HTX ERROR: ${JSON.stringify(res.data)}`);
+        }
         return res.data;
-    } catch (e) { return { status: 'error' }; }
+    } catch (e) { 
+        console.log(`❌ REQUEST FAILED: ${e.message}`);
+        return { status: 'error' }; 
+    }
 }
 
 // ==================== CORE LOGIC ====================
@@ -79,11 +84,10 @@ async function sync() {
         const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
         
         if (res?.status === 'ok' && res.data) {
-            // Filter by direction to get exact contract count
             const pos = res.data.find(p => p.direction === state.direction);
             if (pos && parseFloat(pos.volume) > 0) {
                 state.avgPrice = parseFloat(pos.cost_hold);
-                state.volume = Math.floor(parseFloat(pos.volume)); // Ensure volume is integer contracts
+                state.volume = Math.floor(parseFloat(pos.volume));
                 state.unrealizedUsdt = parseFloat(pos.profit);
                 state.roi = parseFloat(pos.profit_rate) * 100;
             } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
@@ -107,33 +111,34 @@ async function tradeLoop() {
     const s1 = accountStates[acc1.accountId];
     const s2 = accountStates[acc2.accountId];
 
-    // 1. ENTRY
+    // 1. OPEN INITIAL HEDGE (1v1)
     if (s1.volume < 1 || s2.volume < 1) {
         isProcessing = true;
         market.status = 'Opening Hedge...';
         const tasks = [];
-        if (s1.volume < 1) tasks.push(htxRequest(acc1, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'lightning' }));
-        if (s2.volume < 1) tasks.push(htxRequest(acc2, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'lightning' }));
+        if (s1.volume < 1) tasks.push(htxRequest(acc1, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' }));
+        if (s2.volume < 1) tasks.push(htxRequest(acc2, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' }));
         await Promise.all(tasks);
         hasAddedThisCycle = false;
         setTimeout(() => { isProcessing = false; }, 3000);
         return;
     }
 
-    // 2. MATH
+    // 2. CALCULATE NET PROFIT
     const totalVol = s1.volume + s2.volume;
     const estExitFees = (totalVol * config.contractSize * market.last) * config.feeRate;
-    const netProfit = (s1.unrealizedUsdt + s2.unrealizedUsdt) - estExitFees;
+    const combinedPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
+    const netProfit = combinedPnL - estExitFees;
 
-    // 3. EXIT TRIGGER (When Net Profit > 0)
-    if (netProfit > 0) {
-        market.status = `FORCE CLOSING: +$${netProfit.toFixed(8)}`;
-        console.log(`Closing Positions: Long ${s1.volume} contracts, Short ${s2.volume} contracts`);
+    // 3. EXIT TRIGGER (Close if net profit > 0 and we have added size)
+    if (netProfit > 0 && totalVol > (config.orderSize * 2)) {
+        market.status = `EXITING: +$${netProfit.toFixed(8)}`;
+        console.log(`✅ Profit Target Met: $${netProfit}. Executing Close All.`);
         await closeAll();
         return;
     }
 
-    // 4. WIN-ADD TRIGGER
+    // 4. ONE-TIME WINNER ADD (Trigger 3.0%)
     if (!hasAddedThisCycle) {
         let winnerAcc = null;
         if (s1.roi >= config.triggerRoi) winnerAcc = acc1;
@@ -141,20 +146,31 @@ async function tradeLoop() {
 
         if (winnerAcc) {
             market.status = `Adding to Winner...`;
-            await htxRequest(winnerAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: config.addSize, direction: accountStates[winnerAcc.accountId].direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'lightning'
+            const result = await htxRequest(winnerAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, 
+                volume: config.addSize, 
+                direction: accountStates[winnerAcc.accountId].direction, 
+                offset: 'open', 
+                lever_rate: config.leverage, 
+                order_price_type: 'optimal_5' 
             });
-            hasAddedThisCycle = true;
+
+            if (result && result.status === 'ok') {
+                console.log(`🚀 Successfully added ${config.addSize} contracts to the winner.`);
+                hasAddedThisCycle = true;
+            }
+        } else {
+            market.status = `Running: Waiting ${config.triggerRoi}%`;
         }
     }
 }
 
 async function closeAll() {
     isProcessing = true;
-    
+    console.log("🚀 SENDING MARKET CLOSE ORDERS...");
     await Promise.all(config.accounts.map(acc => {
         const state = accountStates[acc.accountId];
-        const contractCount = Math.floor(state.volume); // Force integer contracts
+        const contractCount = Math.floor(state.volume);
         
         if (contractCount > 0) {
             return htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
@@ -163,15 +179,15 @@ async function closeAll() {
                 direction: state.direction === 'buy' ? 'sell' : 'buy', 
                 offset: 'close', 
                 lever_rate: config.leverage, 
-                order_price_type: 'lightning' // Instant Market Close
+                order_price_type: 'optimal_5' 
             });
         }
         return Promise.resolve();
     }));
-    
     setTimeout(() => { isProcessing = false; }, 5000);
 }
 
+// ==================== WS & DASHBOARD ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -191,7 +207,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>Atomic Hedge Pro</title>
+    <meta charset="UTF-8"><title>AtomicSync Pro</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&display=swap" rel="stylesheet">
     <style>
@@ -218,12 +234,12 @@ app.get('/', (req, res) => {
         </div>
         <div class="grid md:grid-cols-2 gap-6">
             <div class="glass rounded-[2rem] p-6 border-l-4 border-emerald-500">
-                <div class="flex justify-between items-center mb-4"><span class="text-xs font-bold text-emerald-500 uppercase tracking-widest">Long Side</span><span id="longRoi" class="text-xl font-black text-emerald-400">0.00%</span></div>
+                <div class="flex justify-between items-center mb-4"><span class="text-xs font-bold text-emerald-500 uppercase tracking-widest">Long Side (Acc 1)</span><span id="longRoi" class="text-xl font-black text-emerald-400">0.00%</span></div>
                 <div class="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden mb-4"><div id="longBar" class="roi-bar bg-emerald-500 h-full" style="width: 0%"></div></div>
                 <div class="flex justify-between items-center"><span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL (USDT)</span><span id="longUsdt" class="text-sm font-mono font-bold text-white">0 / $0.00000000</span></div>
             </div>
             <div class="glass rounded-[2rem] p-6 border-l-4 border-rose-500">
-                <div class="flex justify-between items-center mb-4"><span class="text-xs font-bold text-rose-500 uppercase tracking-widest">Short Side</span><span id="shortRoi" class="text-xl font-black text-rose-400">0.00%</span></div>
+                <div class="flex justify-between items-center mb-4"><span class="text-xs font-bold text-rose-500 uppercase tracking-widest">Short Side (Acc 2)</span><span id="shortRoi" class="text-xl font-black text-rose-400">0.00%</span></div>
                 <div class="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden mb-4"><div id="shortBar" class="roi-bar bg-rose-500 h-full" style="width: 0%"></div></div>
                 <div class="flex justify-between items-center"><span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL (USDT)</span><span id="shortUsdt" class="text-sm font-mono font-bold text-white">0 / $0.00000000</span></div>
             </div>
@@ -241,7 +257,7 @@ app.get('/', (req, res) => {
                     const prefix = a.direction === 'buy' ? 'long' : 'short';
                     document.getElementById(prefix + 'Roi').innerText = a.roi.toFixed(2) + '%';
                     document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(8);
-                    document.getElementById(prefix + 'Bar').style.width = Math.min(100, Math.abs(a.roi) * 20) + '%';
+                    document.getElementById(prefix + 'Bar').style.width = Math.min(100, Math.abs(a.roi) * (100 / d.config.triggerRoi)) + '%';
                     tC += a.volume; tP += a.unrealizedUsdt; tR += a.realizedProfit;
                 });
                 document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(8);
@@ -260,3 +276,4 @@ app.get('/', (req, res) => {
 });
 
 startWS(); setInterval(sync, 2000); setInterval(tradeLoop, 3000); app.listen(config.port, '0.0.0.0');
+console.log(`AtomicSync Dashboard Running on Port ${config.port}`);
