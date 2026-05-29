@@ -28,8 +28,8 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     orderSize: 1,                
-    triggerRoi: 50,             // 3.0% ROI Target
-    addSize: 1,                  // Add 5 contracts to winner
+    triggerRoi: 50,             // ROI Target to trigger an addition
+    addSize: 1,                  // Add 1 contract to winner
     feeRate: 0.0006,             // Conservative fee estimate (0.06%)
     contractSize: 0              
 };
@@ -138,30 +138,34 @@ async function tradeLoop() {
         return;
     }
 
-    // 4. ONE-TIME WINNER ADD (Trigger 3.0%)
-    if (!hasAddedThisCycle) {
-        let winnerAcc = null;
-        if (s1.roi >= config.triggerRoi) winnerAcc = acc1;
-        else if (s2.roi >= config.triggerRoi) winnerAcc = acc2;
+    // 4. ADD ONE CONTRACT EACH TIME TO THE SIDE BRINGING UP PROFIT
+    let winnerAcc = null;
+    if (s1.roi >= config.triggerRoi && s1.unrealizedUsdt > s2.unrealizedUsdt) {
+        winnerAcc = acc1;
+    } else if (s2.roi >= config.triggerRoi && s2.unrealizedUsdt > s1.unrealizedUsdt) {
+        winnerAcc = acc2;
+    }
 
-        if (winnerAcc) {
-            market.status = `Adding to Winner...`;
-            const result = await htxRequest(winnerAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, 
-                volume: config.addSize, 
-                direction: accountStates[winnerAcc.accountId].direction, 
-                offset: 'open', 
-                lever_rate: config.leverage, 
-                order_price_type: 'optimal_5' 
-            });
+    if (winnerAcc) {
+        isProcessing = true; // Prevent spamming multiple orders in one go
+        market.status = `Scaling into profit...`;
+        const result = await htxRequest(winnerAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+            contract_code: config.symbol, 
+            volume: config.addSize, 
+            direction: accountStates[winnerAcc.accountId].direction, 
+            offset: 'open', 
+            lever_rate: config.leverage, 
+            order_price_type: 'optimal_5' 
+        });
 
-            if (result && result.status === 'ok') {
-                console.log(`🚀 Successfully added ${config.addSize} contracts to the winner.`);
-                hasAddedThisCycle = true;
-            }
-        } else {
-            market.status = `Running: Waiting ${config.triggerRoi}%`;
+        if (result && result.status === 'ok') {
+            console.log(`🚀 Added ${config.addSize} contract to help bring up net profit.`);
+            hasAddedThisCycle = true;
         }
+        // Wait 5 seconds for sync to update ROI before allowing another addition
+        setTimeout(() => { isProcessing = false; }, 5000);
+    } else {
+        market.status = `Running: Waiting ${config.triggerRoi}%`;
     }
 }
 
@@ -184,6 +188,7 @@ async function closeAll() {
         }
         return Promise.resolve();
     }));
+    hasAddedThisCycle = false;
     setTimeout(() => { isProcessing = false; }, 5000);
 }
 
@@ -229,7 +234,7 @@ app.get('/', (req, res) => {
             <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (All Fees Included)</p>
             <h2 id="netProfit" class="text-6xl font-black mb-4 font-mono">+$0.00000000</h2>
             <div class="inline-flex items-center gap-2 bg-zinc-900 px-4 py-2 rounded-full border border-zinc-800">
-                <span class="text-[10px] font-bold text-zinc-500 uppercase">One-Time Win-Add:</span><span id="addFlag" class="text-xs font-mono font-bold text-indigo-400">No</span>
+                <span class="text-[10px] font-bold text-zinc-500 uppercase">Scale Active:</span><span id="addFlag" class="text-xs font-mono font-bold text-indigo-400">Yes (Multi-Add)</span>
             </div>
         </div>
         <div class="grid md:grid-cols-2 gap-6">
@@ -251,7 +256,6 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('markPrice').innerText = d.market.last.toFixed(8);
                 document.getElementById('botStatus').innerText = d.market.status;
-                document.getElementById('addFlag').innerText = d.hasAddedThisCycle ? 'Yes' : 'No';
                 let tC = 0, tP = 0, tR = 0;
                 d.accounts.forEach(a => {
                     const prefix = a.direction === 'buy' ? 'long' : 'short';
