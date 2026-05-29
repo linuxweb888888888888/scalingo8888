@@ -28,7 +28,7 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     spreadThreshold: 0.05,        // Only opens if spread < 0.05%
-    mirrorRoiTakeProfit: 0.05     // AUTO-CLOSE when Mirror ROI hits 0.05%
+    mirrorRoiTakeProfit: 0.0005     // AUTO-CLOSE when Mirror ROI hits 0.05%
 };
 
 // ==================== GLOBAL STATE ====================
