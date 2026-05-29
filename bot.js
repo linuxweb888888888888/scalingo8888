@@ -30,7 +30,7 @@ const config = {
     orderSize: 1,                
     addSize: 1,                  
     contractSize: 0,
-    roiThreshold: 0.1,           
+    roiThreshold: 0.05, // Tightened from 0.1 to 0.05 for better sync
     maxVolGap: 500,
     maxSpreadPct: 0.05, 
     profitRoiTarget: parseFloat(process.env.PROFIT_ROI_TARGET) || 0.25               
@@ -113,7 +113,6 @@ function instantCheck() {
     const currentCombinedRoi = totalWallet > 0 ? ((s1.unrealizedUsdt + s2.unrealizedUsdt) / totalWallet) * 100 : 0;
 
     if (currentCombinedRoi >= config.profitRoiTarget) {
-        console.log(`Target Met: ${currentCombinedRoi}%`);
         closeAll();
     }
 }
@@ -123,26 +122,35 @@ function tradeLoop() {
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
 
-    // ATOMIC ENTRY PROTECTION
+    // 1. ATOMIC ENTRY (If both or one is empty)
     if (s1.volume < 1 || s2.volume < 1) {
         if (market.spreadPct > config.maxSpreadPct) {
-            market.status = `Waiting Spread (${market.spreadPct.toFixed(3)}%)`;
+            market.status = `Waiting Spread...`;
             return;
         }
-        market.status = "Opening Positions...";
+        market.status = "Opening Sync...";
         isProcessing = true;
-        
         const orders = [];
         if(s1.volume < 1) orders.push(htxRequest(config.accounts[0], 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' }));
         if(s2.volume < 1) orders.push(htxRequest(config.accounts[1], 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' }));
-
-        Promise.all(orders).finally(() => { 
-            setTimeout(() => { isProcessing = false; }, 3000); 
-        });
+        Promise.all(orders).finally(() => { setTimeout(() => { isProcessing = false; }, 3000); });
         return;
     }
 
-    // MIRROR SYNC LOGIC
+    // 2. VOLUME SYNCHRONIZATION (High Priority)
+    // If one side has more volume than the other, add to the smaller side immediately
+    if (Math.abs(s1.volume - s2.volume) >= config.addSize) {
+        market.status = "Balancing Volume...";
+        const target = (s1.volume < s2.volume) ? config.accounts[0] : config.accounts[1];
+        isProcessing = true;
+        htxRequest(target, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+            contract_code: config.symbol, volume: config.addSize, direction: accountStates[target.accountId].direction, 
+            offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
+        }).finally(() => { setTimeout(() => { isProcessing = false; }, 3000); });
+        return;
+    }
+
+    // 3. ROI MIRROR LOGIC
     const roi1Mag = Math.abs(s1.roi);
     const roi2Mag = Math.abs(s2.roi);
     const isMirrored = (s1.roi * s2.roi < 0);
@@ -150,22 +158,19 @@ function tradeLoop() {
 
     let targetAcc = null;
     if (!isMirrored) {
-        market.status = "Syncing Directions...";
+        market.status = "Sign Recovery...";
         targetAcc = (roi1Mag < roi2Mag) ? config.accounts[0] : config.accounts[1];
-    } else if (syncProgress > 95) {
-        if ((s1.unrealizedUsdt + s2.unrealizedUsdt) <= 0) {
-            market.status = "Profit Pushing...";
-            targetAcc = (s1.roi > s2.roi) ? config.accounts[0] : config.accounts[1];
-        } else {
-            market.status = "Holding Mirror";
-        }
     } else if (Math.abs(roi1Mag - roi2Mag) > config.roiThreshold) {
-        market.status = "Syncing Magnitudes...";
+        market.status = "Syncing ROI...";
         targetAcc = (roi1Mag > roi2Mag) ? config.accounts[0] : config.accounts[1];
+    } else if (syncProgress > 90 && (s1.unrealizedUsdt + s2.unrealizedUsdt) <= 0) {
+        market.status = "Pushing Profit...";
+        targetAcc = (s1.roi > s2.roi) ? config.accounts[0] : config.accounts[1];
+    } else {
+        market.status = "Mirror Stable";
     }
 
     if (targetAcc) {
-        if (Math.abs(s1.volume - s2.volume) > config.maxVolGap) return;
         isProcessing = true;
         htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
             contract_code: config.symbol, volume: config.addSize, direction: accountStates[targetAcc.accountId].direction, 
@@ -207,7 +212,6 @@ async function closeAll() {
     });
 
     await Promise.all(closeRequests);
-    // Longer cooldown to allow exchange to settle volume to 0
     setTimeout(() => { triggeredExit = false; isProcessing = false; }, 15000);
 }
 
@@ -269,13 +273,13 @@ app.get('/', (req, res) => {
 
         <div class="grid md:grid-cols-2 gap-6 mb-8 font-mono">
             <div class="glass rounded-[2rem] p-6 border-l-4 border-emerald-500">
-                <div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold text-emerald-500 uppercase">Long Account</span><span id="longRoi" class="text-xl font-black text-emerald-400">0.00%</span></div>
+                <div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold text-emerald-500 uppercase">Long Side</span><span id="longRoi" class="text-xl font-black text-emerald-400">0.00%</span></div>
                 <div class="mb-4"><p class="text-[10px] text-zinc-500 font-bold">ENTRY</p><p id="longEntry" class="text-sm font-bold text-white">0.00000000</p></div>
                 <div class="w-full bg-white/5 h-1.5 rounded-full overflow-hidden mb-4"><div id="longBar" class="roi-bar bg-emerald-500 h-full" style="width: 0%"></div></div>
                 <div class="flex justify-between items-center"><span class="text-[10px] text-zinc-500 font-bold">VOL / PNL</span><span id="longUsdt" class="text-xs font-bold text-white">0 / $0.00</span></div>
             </div>
             <div class="glass rounded-[2rem] p-6 border-l-4 border-rose-500">
-                <div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold text-rose-500 uppercase">Short Account</span><span id="shortRoi" class="text-xl font-black text-rose-400">0.00%</span></div>
+                <div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold text-rose-500 uppercase">Short Side</span><span id="shortRoi" class="text-xl font-black text-rose-400">0.00%</span></div>
                 <div class="mb-4"><p class="text-[10px] text-zinc-500 font-bold">ENTRY</p><p id="shortEntry" class="text-sm font-bold text-white">0.00000000</p></div>
                 <div class="w-full bg-white/5 h-1.5 rounded-full overflow-hidden mb-4"><div id="shortBar" class="roi-bar bg-rose-500 h-full" style="width: 0%"></div></div>
                 <div class="flex justify-between items-center"><span class="text-[10px] text-zinc-500 font-bold">VOL / PNL</span><span id="shortUsdt" class="text-xs font-bold text-white">0 / $0.00</span></div>
