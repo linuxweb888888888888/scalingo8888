@@ -30,8 +30,8 @@ const config = {
     orderSize: 1,                
     addSize: 1,                  
     contractSize: 0,
-    roiThreshold: 0.05, // Tightened from 0.1 to 0.05 for better sync
-    maxVolGap: 500,
+    pnlSyncThreshold: 0.005,      // Sync if PnL gap exceeds 0.005 USDT
+    maxVolGap: 1000,
     maxSpreadPct: 0.05, 
     profitRoiTarget: parseFloat(process.env.PROFIT_ROI_TARGET) || 0.25               
 };
@@ -110,7 +110,8 @@ function instantCheck() {
     if (s1.volume < 1 || s2.volume < 1) return;
 
     const totalWallet = s1.wallet + s2.wallet;
-    const currentCombinedRoi = totalWallet > 0 ? ((s1.unrealizedUsdt + s2.unrealizedUsdt) / totalWallet) * 100 : 0;
+    const netPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
+    const currentCombinedRoi = totalWallet > 0 ? (netPnL / totalWallet) * 100 : 0;
 
     if (currentCombinedRoi >= config.profitRoiTarget) {
         closeAll();
@@ -122,13 +123,13 @@ function tradeLoop() {
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
 
-    // 1. ATOMIC ENTRY (If both or one is empty)
+    // 1. ATOMIC ENTRY
     if (s1.volume < 1 || s2.volume < 1) {
         if (market.spreadPct > config.maxSpreadPct) {
-            market.status = `Waiting Spread...`;
+            market.status = `Wait Spread`;
             return;
         }
-        market.status = "Opening Sync...";
+        market.status = "Opening...";
         isProcessing = true;
         const orders = [];
         if(s1.volume < 1) orders.push(htxRequest(config.accounts[0], 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' }));
@@ -137,45 +138,40 @@ function tradeLoop() {
         return;
     }
 
-    // 2. VOLUME SYNCHRONIZATION (High Priority)
-    // If one side has more volume than the other, add to the smaller side immediately
-    if (Math.abs(s1.volume - s2.volume) >= config.addSize) {
-        market.status = "Balancing Volume...";
-        const target = (s1.volume < s2.volume) ? config.accounts[0] : config.accounts[1];
+    // 2. PNL SYNC LOGIC (Highest Priority)
+    // We calculate which side's USDT value is weighing down the net mirror
+    const netPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
+
+    if (Math.abs(netPnL) > config.pnlSyncThreshold) {
+        market.status = "Syncing PnL...";
+        // If netPnL is negative, we add to the side that is losing MORE money
+        // to improve its entry price (DCA) and balance the mirror.
+        const target = (s1.unrealizedUsdt < s2.unrealizedUsdt) ? config.accounts[0] : config.accounts[1];
+        
+        if (Math.abs(s1.volume - s2.volume) > config.maxVolGap) {
+            market.status = "Max Vol Gap!";
+            return;
+        }
+
         isProcessing = true;
         htxRequest(target, 'POST', '/linear-swap-api/v1/swap_cross_order', {
             contract_code: config.symbol, volume: config.addSize, direction: accountStates[target.accountId].direction, 
             offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
-        }).finally(() => { setTimeout(() => { isProcessing = false; }, 3000); });
+        }).finally(() => { setTimeout(() => { isProcessing = false; }, 3500); });
         return;
     }
 
-    // 3. ROI MIRROR LOGIC
-    const roi1Mag = Math.abs(s1.roi);
-    const roi2Mag = Math.abs(s2.roi);
-    const isMirrored = (s1.roi * s2.roi < 0);
-    const syncProgress = isMirrored ? (Math.min(roi1Mag, roi2Mag) / Math.max(roi1Mag, roi2Mag)) * 100 : 0;
-
-    let targetAcc = null;
-    if (!isMirrored) {
-        market.status = "Sign Recovery...";
-        targetAcc = (roi1Mag < roi2Mag) ? config.accounts[0] : config.accounts[1];
-    } else if (Math.abs(roi1Mag - roi2Mag) > config.roiThreshold) {
-        market.status = "Syncing ROI...";
-        targetAcc = (roi1Mag > roi2Mag) ? config.accounts[0] : config.accounts[1];
-    } else if (syncProgress > 90 && (s1.unrealizedUsdt + s2.unrealizedUsdt) <= 0) {
+    // 3. PROFIT PUSH
+    if (netPnL <= 0) {
         market.status = "Pushing Profit...";
-        targetAcc = (s1.roi > s2.roi) ? config.accounts[0] : config.accounts[1];
-    } else {
-        market.status = "Mirror Stable";
-    }
-
-    if (targetAcc) {
+        const target = (s1.roi > s2.roi) ? config.accounts[0] : config.accounts[1];
         isProcessing = true;
-        htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-            contract_code: config.symbol, volume: config.addSize, direction: accountStates[targetAcc.accountId].direction, 
+        htxRequest(target, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+            contract_code: config.symbol, volume: config.addSize, direction: accountStates[target.accountId].direction, 
             offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
         }).finally(() => { setTimeout(() => { isProcessing = false; }, 4000); });
+    } else {
+        market.status = "PnL Balanced";
     }
 }
 
@@ -193,11 +189,11 @@ async function closeAll() {
             shortRoi: s2.roi,
             netPnl: s1.unrealizedUsdt + s2.unrealizedUsdt
         });
-        if (tradeHistory.length > 10) tradeHistory.pop();
+        if (tradeHistory.length > 15) tradeHistory.pop();
     }
 
     triggeredExit = true;
-    market.status = "CLOSING ALL...";
+    market.status = "EXITING...";
     
     const closeRequests = config.accounts.map(acc => {
         const state = accountStates[acc.accountId];
@@ -263,26 +259,26 @@ app.get('/', (req, res) => {
 
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative border-indigo-500/20 text-center">
             <button onclick="triggerClose()" class="absolute top-6 right-6 bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-black px-5 py-2.5 rounded-full transition-all active:scale-90">CLOSE ALL</button>
-            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Live Mirror PnL</p>
+            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net USDT PnL</p>
             <h2 id="netProfit" class="text-6xl font-black mb-1 font-mono text-zinc-500">+$0.00000000</h2>
-            <p id="netRoi" class="text-sm font-bold text-indigo-400 mb-4 font-mono tracking-widest">ROI: 0.0000%</p>
+            <p id="netRoi" class="text-sm font-bold text-indigo-400 mb-4 font-mono tracking-widest">NET ROI: 0.0000%</p>
             <div class="inline-flex items-center gap-2 bg-black/40 px-4 py-2 rounded-full border border-white/5">
-                <span class="text-[10px] font-bold text-zinc-500 uppercase">Mirror Sync:</span><span id="syncPct" class="text-xs font-mono font-bold text-indigo-400">0%</span>
+                <span class="text-[10px] font-bold text-zinc-500 uppercase">PnL Sync Status:</span><span id="syncPct" class="text-xs font-mono font-bold text-indigo-400 text-emerald-400">Stable</span>
             </div>
         </div>
 
         <div class="grid md:grid-cols-2 gap-6 mb-8 font-mono">
             <div class="glass rounded-[2rem] p-6 border-l-4 border-emerald-500">
-                <div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold text-emerald-500 uppercase">Long Side</span><span id="longRoi" class="text-xl font-black text-emerald-400">0.00%</span></div>
+                <div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold text-emerald-500 uppercase">Long Account</span><span id="longRoi" class="text-xl font-black text-emerald-400">0.00%</span></div>
                 <div class="mb-4"><p class="text-[10px] text-zinc-500 font-bold">ENTRY</p><p id="longEntry" class="text-sm font-bold text-white">0.00000000</p></div>
                 <div class="w-full bg-white/5 h-1.5 rounded-full overflow-hidden mb-4"><div id="longBar" class="roi-bar bg-emerald-500 h-full" style="width: 0%"></div></div>
-                <div class="flex justify-between items-center"><span class="text-[10px] text-zinc-500 font-bold">VOL / PNL</span><span id="longUsdt" class="text-xs font-bold text-white">0 / $0.00</span></div>
+                <div class="flex justify-between items-center"><span class="text-[10px] text-zinc-500 font-bold">VOL / PNL</span><span id="longUsdt" class="text-xs font-bold text-white">0 / $0.0000</span></div>
             </div>
             <div class="glass rounded-[2rem] p-6 border-l-4 border-rose-500">
-                <div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold text-rose-500 uppercase">Short Side</span><span id="shortRoi" class="text-xl font-black text-rose-400">0.00%</span></div>
+                <div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold text-rose-500 uppercase">Short Account</span><span id="shortRoi" class="text-xl font-black text-rose-400">0.00%</span></div>
                 <div class="mb-4"><p class="text-[10px] text-zinc-500 font-bold">ENTRY</p><p id="shortEntry" class="text-sm font-bold text-white">0.00000000</p></div>
                 <div class="w-full bg-white/5 h-1.5 rounded-full overflow-hidden mb-4"><div id="shortBar" class="roi-bar bg-rose-500 h-full" style="width: 0%"></div></div>
-                <div class="flex justify-between items-center"><span class="text-[10px] text-zinc-500 font-bold">VOL / PNL</span><span id="shortUsdt" class="text-xs font-bold text-white">0 / $0.00</span></div>
+                <div class="flex justify-between items-center"><span class="text-[10px] text-zinc-500 font-bold">VOL / PNL</span><span id="shortUsdt" class="text-xs font-bold text-white">0 / $0.0000</span></div>
             </div>
         </div>
 
@@ -313,10 +309,10 @@ app.get('/', (req, res) => {
                 document.getElementById('marketSpread').className = d.market.spreadPct > 0.05 ? 'text-lg font-bold text-rose-500' : 'text-lg font-bold text-emerald-500';
                 document.getElementById('botStatus').innerText = d.market.status;
                 
-                let tP = 0, tR = 0, tW = 0, rois = [];
+                let tP = 0, tR = 0, tW = 0;
                 d.accounts.forEach(a => {
                     const prefix = a.direction === 'buy' ? 'long' : 'short';
-                    rois.push(a.roi); tP += a.unrealizedUsdt; tR += a.realizedProfit; tW += a.wallet;
+                    tP += a.unrealizedUsdt; tR += a.realizedProfit; tW += a.wallet;
                     document.getElementById(prefix + 'Roi').innerText = (a.roi >= 0 ? '+' : '') + a.roi.toFixed(2) + '%';
                     document.getElementById(prefix + 'Entry').innerText = a.avgPrice.toFixed(8);
                     document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(4);
@@ -324,11 +320,12 @@ app.get('/', (req, res) => {
                 });
 
                 const netRoi = tW > 0 ? (tP / tW) * 100 : 0;
-                const sScore = (rois[0] * rois[1] < 0) ? (Math.min(Math.abs(rois[0]), Math.abs(rois[1])) / Math.max(Math.abs(rois[0]), Math.abs(rois[1]))) * 100 : 0;
-                document.getElementById('syncPct').innerText = (isNaN(sScore) ? 0 : sScore.toFixed(1)) + '%';
+                document.getElementById('syncPct').innerText = Math.abs(tP) < d.config.pnlSyncThreshold ? 'Stable' : 'Syncing...';
+                document.getElementById('syncPct').className = 'text-xs font-mono font-bold ' + (Math.abs(tP) < d.config.pnlSyncThreshold ? 'text-emerald-400' : 'text-amber-500');
+                
                 document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(4);
                 document.getElementById('netProfit').innerText = (tP >= 0 ? '+' : '') + tP.toFixed(8);
-                document.getElementById('netRoi').innerText = 'ROI: ' + (netRoi >= 0 ? '+' : '') + netRoi.toFixed(4) + '%';
+                document.getElementById('netRoi').innerText = 'NET ROI: ' + (netRoi >= 0 ? '+' : '') + netRoi.toFixed(4) + '%';
                 document.getElementById('netProfit').className = 'text-6xl font-black mb-1 font-mono ' + (tP > 0 ? 'text-emerald-400' : (tP < 0 ? 'text-rose-500' : 'text-zinc-600'));
 
                 document.getElementById('historyBody').innerHTML = d.history.map(h => \`
