@@ -27,15 +27,23 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    spreadThreshold: 0.05,        
-    initialOrderSize: 5,         // Open exactly 5
-    reductionTriggerRoi: -2.0,   // Trigger at -2%
-    reductionAmount: 2           // Close 2 contracts
+    spreadThreshold: 0.05,
+    autoFundingChase: true,       // ENABLED: Auto-harvest funding
+    chaseLeadTimeSeconds: 30      // Seconds before funding to execute
 };
 
 // ==================== GLOBAL STATE ====================
-let market = { last: 0, spreadPct: 0, status: 'connecting...', totalEquity: 0, equityProfit: 0 };
-let initialTotalEquity = 0; 
+let market = { 
+    last: 0, 
+    spreadPct: 0, 
+    status: 'connecting...', 
+    totalEquity: 0, 
+    initialTotalEquity: 0,
+    fundingRate: 0,
+    fundingTimestamp: 0,
+    nextFundingTime: '',
+    hasChasedFunding: false // Reset every cycle
+};
 let accountStates = {};
 let isProcessing = false;
 
@@ -67,10 +75,22 @@ async function restSync() {
     let totalPnl = 0;
     let currentTotalWallet = 0;
 
+    // Fetch Funding Rate
+    const fundRes = await axios.get(`https://${config.restHost}/linear-swap-api/v1/swap_funding_rate?contract_code=${config.symbol}`);
+    if (fundRes.data?.status === 'ok') {
+        market.fundingRate = parseFloat(fundRes.data.data.funding_rate) * 100;
+        market.fundingTimestamp = parseInt(fundRes.data.data.funding_time);
+        market.nextFundingTime = new Date(market.fundingTimestamp).toLocaleTimeString();
+        
+        // RESET CHASE FLAG IF NEW CYCLE
+        if (Date.now() < market.fundingTimestamp - 60000) {
+            market.hasChasedFunding = false;
+        }
+    }
+
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
-        
         if (res?.status === 'ok' && res.data) {
             const pos = res.data.find(p => p.direction === state.direction);
             if (pos) {
@@ -78,15 +98,8 @@ async function restSync() {
                 state.volume = Math.floor(parseFloat(pos.volume));
                 state.roi = parseFloat(pos.profit_rate) * 100;
                 state.unrealizedUsdt = parseFloat(pos.profit);
-
-                // STRATEGY: IF ROI <= -2% AND VOLUME IS 5, CLOSE 2 CONTRACTS
-                if (state.roi <= config.reductionTriggerRoi && state.volume >= config.initialOrderSize && !isProcessing) {
-                    market.status = `Reducing ${state.direction} risk (-2% hit)`;
-                    reduceExposure(acc, state);
-                }
             } else { state.avgPrice = 0; state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
         }
-
         const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
         if (accRes?.status === 'ok' && accRes.data) {
             state.wallet = parseFloat(accRes.data[0].margin_balance);
@@ -95,54 +108,70 @@ async function restSync() {
         currentTotalWallet += state.wallet;
     }
     
-    if (initialTotalEquity === 0 && currentTotalWallet > 0) initialTotalEquity = currentTotalWallet;
+    if (market.initialTotalEquity === 0 && currentTotalWallet > 0) market.initialTotalEquity = currentTotalWallet;
     market.totalEquity = currentTotalWallet;
-    market.equityProfit = initialTotalEquity > 0 ? (currentTotalWallet - initialTotalEquity) : 0;
 
-    // AUTO-OPEN LOGIC
+    // AUTO-OPEN INITIAL HEDGE
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
-    if (s1.volume === 0 && s2.volume === 0 && !isProcessing) {
-        if (market.spreadPct > 0 && market.spreadPct <= config.spreadThreshold) {
-            autoOpen();
-        } else {
-            market.status = `Wait for Spread < ${config.spreadThreshold}%`;
+    if (s1.volume === 0 && s2.volume === 0 && !isProcessing && market.spreadPct <= config.spreadThreshold && market.spreadPct > 0) {
+        autoOpen();
+    }
+
+    // AUTO-FUNDING CHASE LOGIC
+    if (config.autoFundingChase && !market.hasChasedFunding && s1.volume > 1 && s2.volume > 1) {
+        const timeToFunding = market.fundingTimestamp - Date.now();
+        if (timeToFunding > 0 && timeToFunding <= (config.chaseLeadTimeSeconds * 1000)) {
+            executeFundingChase();
         }
     }
 }
 
 async function autoOpen() {
     isProcessing = true;
-    market.status = "Opening 5:5 Positions...";
+    market.status = "Opening Hedge...";
     await Promise.all([
-        htxRequest(config.accounts[0], 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.initialOrderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' }),
-        htxRequest(config.accounts[1], 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.initialOrderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' })
+        htxRequest(config.accounts[0], 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: 5, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' }),
+        htxRequest(config.accounts[1], 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: 5, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' })
     ]);
-    setTimeout(() => { isProcessing = false; }, 3000);
+    setTimeout(() => { isProcessing = false; }, 2000);
 }
 
-async function reduceExposure(acc, state) {
+async function executeFundingChase() {
+    market.hasChasedFunding = true;
+    market.status = "AUTO-CHASING FUNDING...";
+    
+    // If Funding (+): Shorts get paid. Reduce LONG.
+    // If Funding (-): Longs get paid. Reduce SHORT.
+    const targetToReduceIdx = (market.fundingRate > 0) ? 0 : 1; 
+    const targetAcc = config.accounts[targetToReduceIdx];
+    const currentVol = accountStates[targetAcc.accountId].volume;
+
+    if (currentVol > 1) {
+        await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+            contract_code: config.symbol, 
+            volume: currentVol - 1, 
+            direction: accountStates[targetAcc.accountId].direction === 'buy' ? 'sell' : 'buy', 
+            offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
+        });
+    }
+}
+
+async function manualChase() {
     isProcessing = true;
-    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-        contract_code: config.symbol, 
-        volume: config.reductionAmount, 
-        direction: state.direction === 'buy' ? 'sell' : 'buy', 
-        offset: 'close', 
-        lever_rate: config.leverage, 
-        order_price_type: 'optimal_5' 
-    });
-    setTimeout(() => { isProcessing = false; }, 5000);
-}
-
-async function addManual(index) {
-    const acc = config.accounts[index];
-    const state = accountStates[acc.accountId];
-    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: 1, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' });
+    const s1 = accountStates[config.accounts[0].accountId];
+    const s2 = accountStates[config.accounts[1].accountId];
+    const loserIdx = (s1.roi < s2.roi) ? 0 : 1;
+    const loserAcc = config.accounts[loserIdx];
+    const currentVol = accountStates[loserAcc.accountId].volume;
+    if (currentVol > 1) {
+        await htxRequest(loserAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: currentVol - 1, direction: accountStates[loserAcc.accountId].direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' });
+    }
+    setTimeout(() => { isProcessing = false; }, 2000);
 }
 
 async function closeAll() {
     isProcessing = true;
-    market.status = "Liquidating...";
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume > 0) {
@@ -171,67 +200,71 @@ function startWS() {
 }
 
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates) }));
-app.post('/api/add/:id', async (req, res) => { await addManual(req.params.id); res.json({status: 'ok'}); });
+app.post('/api/chase', async (req, res) => { await manualChase(); res.json({status: 'ok'}); });
 app.post('/api/close', async (req, res) => { await closeAll(); res.json({status: 'ok'}); });
 
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>ManualSync 5.0</title>
+<html lang="en"><head><meta charset="UTF-8"><title>FundingSync AUTO</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>body{background:#040405;color:#fafafa;font-family:sans-serif;}.glass{background:rgba(255,255,255,0.03);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.05);}</style></head>
-<body class="p-10"><div class="max-w-4xl mx-auto">
+<body class="p-10"><div class="max-w-3xl mx-auto">
     <div class="flex justify-between items-end mb-10">
-        <div><h1 class="text-xl font-bold text-white uppercase tracking-tighter">ManualSync <span class="text-indigo-500">PRO</span></h1><p id="botStatus" class="text-xs text-zinc-500 font-bold uppercase"></p></div>
-        <div class="flex gap-8 text-right">
-            <div><p class="text-[10px] text-zinc-600 font-bold uppercase">Start Profit</p><p id="equityProfit" class="font-mono text-emerald-400 font-bold text-right">+$0.00000000</p></div>
-            <div><p class="text-[10px] text-zinc-600 font-bold uppercase">Total Equity</p><p id="totalEquity" class="font-mono text-white font-bold text-right">$0.00000000</p></div>
-            <div><p class="text-[10px] text-zinc-600 font-bold uppercase">Spread / Price</p><p class="font-mono text-right"><span id="spread" class="text-amber-500 mr-4">0.000%</span><span id="price" class="text-white">0.00000000</span></p></div>
+        <div><h1 class="text-xl font-bold text-white uppercase italic">FundingSync <span class="text-indigo-500">AUTO</span></h1><p id="botStatus" class="text-[10px] text-zinc-500 font-bold uppercase"></p></div>
+        <div class="text-right">
+            <p class="text-[10px] text-zinc-600 uppercase font-bold">Funding Rate</p>
+            <p id="fundingRate" class="font-mono text-xl font-bold text-indigo-400">0.0000%</p>
+            <p id="fundingTime" class="text-[10px] text-zinc-500 font-mono italic">Next: 00:00:00</p>
         </div>
     </div>
+
     <div class="glass rounded-3xl p-8 mb-6 text-center border-t border-indigo-500/20">
         <p class="text-[10px] text-zinc-500 font-bold uppercase mb-2">Net Mirror PnL</p>
-        <h2 id="netPnl" class="text-5xl font-mono font-bold mb-2">$0.00000000</h2>
-        <div class="flex justify-center gap-6 text-xs font-mono">
-            <p>ROI SUM: <span id="roiSum" class="text-white">0.00%</span></p>
-            <p>MIRROR ROI: <span id="mirrorRoi" class="text-indigo-400">0.00%</span></p>
+        <h2 id="netPnl" class="text-6xl font-mono font-bold mb-4">$0.00000000</h2>
+        <div class="flex justify-center gap-4">
+            <button onclick="fetch('/api/chase',{method:'POST'})" class="bg-indigo-600 hover:bg-indigo-500 text-white px-8 py-3 rounded-full text-xs font-black tracking-widest transition-all">MANUAL CHASE</button>
+            <button onclick="fetch('/api/close',{method:'POST'})" class="bg-rose-600 hover:bg-rose-500 text-white px-8 py-3 rounded-full text-xs font-black tracking-widest transition-all">CLOSE ALL</button>
         </div>
     </div>
-    <div class="grid grid-cols-2 gap-4 mb-6">
-        <div class="glass rounded-2xl p-6">
-            <div class="flex justify-between items-start mb-4"><p class="text-[10px] font-bold text-emerald-500 uppercase">Long Account</p><button onclick="add(0)" class="bg-emerald-500/20 text-emerald-500 px-3 py-1 rounded-md text-xs font-bold hover:bg-emerald-500 hover:text-white">+ 1</button></div>
-            <p id="longRoi" class="text-2xl font-mono font-bold mb-1">0.00%</p><p id="longStats" class="text-[10px] text-zinc-500 font-mono italic">Vol: 0 | PnL: $0.00000000</p>
+
+    <div class="grid grid-cols-2 gap-4 mb-6 font-mono text-center">
+        <div class="glass rounded-2xl p-6 border-l-4 border-emerald-500">
+            <p class="text-[10px] text-emerald-500 font-bold uppercase mb-2">Long Account</p>
+            <p id="longRoi" class="text-2xl font-bold mb-1">0.00%</p>
+            <p id="longStats" class="text-[10px] text-zinc-500">Vol: 0</p>
         </div>
-        <div class="glass rounded-2xl p-6">
-            <div class="flex justify-between items-start mb-4"><p class="text-[10px] font-bold text-rose-500 uppercase">Short Account</p><button onclick="add(1)" class="bg-rose-500/20 text-rose-500 px-3 py-1 rounded-md text-xs font-bold hover:bg-rose-500 hover:text-white">+ 1</button></div>
-            <p id="shortRoi" class="text-2xl font-mono font-bold mb-1">0.00%</p><p id="shortStats" class="text-[10px] text-zinc-500 font-mono italic">Vol: 0 | PnL: $0.00000000</p>
+        <div class="glass rounded-2xl p-6 border-l-4 border-rose-500">
+            <p class="text-[10px] text-rose-500 font-bold uppercase mb-2">Short Account</p>
+            <p id="shortRoi" class="text-2xl font-bold mb-1">0.00%</p>
+            <p id="shortStats" class="text-[10px] text-zinc-500">Vol: 0</p>
         </div>
     </div>
-    <button onclick="closeAll()" class="w-full py-4 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl text-xs uppercase tracking-widest transition-all">Emergency Liquidate All</button>
+
+    <div class="flex justify-between items-center px-4 py-2 glass rounded-xl text-xs font-mono">
+        <span class="text-zinc-500 uppercase">Equity Profit: <span id="equityProfit" class="text-emerald-400 ml-2">$0.00000000</span></span>
+        <span class="text-zinc-500 uppercase">Spread: <span id="spread" class="text-amber-500 ml-2">0.000%</span></span>
+    </div>
 </div>
 <script>
-async function add(id){ await fetch('/api/add/'+id,{method:'POST'}); }
-async function closeAll(){ if(confirm("Liquidate all?")) await fetch('/api/close',{method:'POST'}); }
 setInterval(async () => {
     try {
         const r = await fetch('/api/status'); const d = await r.json();
-        document.getElementById('price').innerText = d.market.last.toFixed(8);
+        document.getElementById('fundingRate').innerText = d.market.fundingRate.toFixed(4) + '%';
+        document.getElementById('fundingTime').innerText = 'Next Payment: ' + d.market.nextFundingTime;
         document.getElementById('spread').innerText = d.market.spreadPct.toFixed(3) + '%';
         document.getElementById('botStatus').innerText = d.market.status;
-        document.getElementById('totalEquity').innerText = '$' + d.market.totalEquity.toFixed(8);
-        document.getElementById('equityProfit').innerText = (d.market.equityProfit >= 0 ? '+' : '') + '$' + d.market.equityProfit.toFixed(8);
-        document.getElementById('equityProfit').className = 'font-mono font-bold ' + (d.market.equityProfit >= 0 ? 'text-emerald-400' : 'text-rose-500');
-        let tP=0, tW=0, sumRoi=0;
+        const profit = d.market.totalEquity - d.market.initialTotalEquity;
+        document.getElementById('equityProfit').innerText = (profit>=0?'+':'') + '$'+profit.toFixed(8);
+        let tP=0;
         d.accounts.forEach((a, i) => {
             const pre = i === 0 ? 'long' : 'short';
-            tP += a.unrealizedUsdt; tW += a.wallet; sumRoi += a.roi;
+            tP += a.unrealizedUsdt;
             document.getElementById(pre+'Roi').innerText = (a.roi >= 0 ? '+' : '') + a.roi.toFixed(2)+'%';
-            document.getElementById(pre+'Stats').innerText = 'Vol: '+a.volume+' | PnL: $'+a.unrealizedUsdt.toFixed(8);
-            document.getElementById(pre+'Roi').className = 'text-2xl font-mono font-bold mb-1 ' + (a.roi >= 0 ? 'text-emerald-400' : 'text-rose-500');
+            document.getElementById(pre+'Stats').innerText = 'Vol: '+a.volume+' | PnL: $'+a.unrealizedUsdt.toFixed(4);
+            document.getElementById(pre+'Roi').className = 'text-2xl font-bold ' + (a.roi >= 0 ? 'text-emerald-400' : 'text-rose-500');
         });
         document.getElementById('netPnl').innerText = (tP>=0?'+':'') + '$' + tP.toFixed(8);
-        document.getElementById('netPnl').className = 'text-5xl font-mono font-bold mb-2 ' + (tP>=0?'text-emerald-400':'text-rose-500');
-        document.getElementById('roiSum').innerText = (sumRoi >= 0 ? '+' : '') + sumRoi.toFixed(2)+'%';
-        document.getElementById('mirrorRoi').innerText = (tW > 0 ? (tP/tW*100) : 0).toFixed(4)+'%';
+        document.getElementById('netPnl').className = 'text-6xl font-mono font-bold ' + (tP>=0?'text-emerald-400':'text-rose-500');
     } catch(e) {}
 }, 1000);
 </script></body></html>`);
