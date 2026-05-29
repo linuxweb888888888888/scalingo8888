@@ -32,7 +32,7 @@ const config = {
 };
 
 // ==================== GLOBAL STATE ====================
-let market = { last: 0, spreadPct: 0, status: 'connecting...' };
+let market = { last: 0, spreadPct: 0, status: 'connecting...', totalEquity: 0 };
 let accountStates = {};
 let isProcessing = false;
 
@@ -62,7 +62,7 @@ async function htxRequest(account, method, path, data = {}) {
 
 async function restSync() {
     let totalPnl = 0;
-    let totalWallet = 0;
+    let currentTotalWallet = 0;
 
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
@@ -81,10 +81,11 @@ async function restSync() {
             state.wallet = parseFloat(accRes.data[0].margin_balance);
         }
         totalPnl += state.unrealizedUsdt;
-        totalWallet += state.wallet;
+        currentTotalWallet += state.wallet;
     }
     
-    const currentMirrorRoi = totalWallet > 0 ? (totalPnl / totalWallet) * 100 : 0;
+    market.totalEquity = currentTotalWallet;
+    const currentMirrorRoi = currentTotalWallet > 0 ? (totalPnl / currentTotalWallet) * 100 : 0;
 
     // 1. Check for Take Profit Target
     if (currentMirrorRoi >= config.mirrorRoiTakeProfit && !isProcessing && accountStates[config.accounts[0].accountId].volume > 0) {
@@ -177,9 +178,15 @@ app.get('/', (req, res) => {
 <body class="p-10"><div class="max-w-3xl mx-auto">
     <div class="flex justify-between items-end mb-10">
         <div><h1 class="text-xl font-bold text-white uppercase tracking-tighter">ManualSync <span class="text-indigo-500">PRO</span></h1><p id="botStatus" class="text-xs text-zinc-500 font-bold uppercase"></p></div>
-        <div class="text-right">
-            <p class="text-[10px] text-zinc-600 font-bold uppercase">Spread / Price</p>
-            <p class="font-mono"><span id="spread" class="text-amber-500 mr-4">0.000%</span><span id="price" class="text-white">0.00000000</span></p>
+        <div class="flex gap-8 text-right">
+            <div>
+                <p class="text-[10px] text-zinc-600 font-bold uppercase text-right">Total Equity</p>
+                <p id="totalEquity" class="font-mono text-emerald-400 font-bold text-right">$0.00</p>
+            </div>
+            <div>
+                <p class="text-[10px] text-zinc-600 font-bold uppercase text-right">Spread / Price</p>
+                <p class="font-mono text-right"><span id="spread" class="text-amber-500 mr-4">0.000%</span><span id="price" class="text-white">0.00000000</span></p>
+            </div>
         </div>
     </div>
     <div class="glass rounded-3xl p-8 mb-6 text-center border-t border-indigo-500/20">
@@ -221,6 +228,7 @@ setInterval(async () => {
         document.getElementById('spread').innerText = d.market.spreadPct.toFixed(3) + '%';
         document.getElementById('botStatus').innerText = d.market.status;
         document.getElementById('tpTarget').innerText = d.tp.toFixed(2) + '%';
+        document.getElementById('totalEquity').innerText = '$' + d.market.totalEquity.toFixed(2);
         let tP=0, tW=0, sumRoi=0;
         d.accounts.forEach((a, i) => {
             const pre = i === 0 ? 'long' : 'short';
