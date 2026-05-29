@@ -27,12 +27,12 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    orderSize: 1,                // Higher start size
-    addSize: 1,                  // Powerful correction size to fix 300+ vol positions
+    orderSize: 50,                
+    addSize: 50,                  // Heavy correction to move entry prices
     contractSize: 0,
     pnlTolerance: 0.0001,        
-    roiTolerance: 0.15,           // Higher tolerance to prevent fee bleed
-    maxSpreadPct: 0.20,           // Allow trading during SHIB volatility
+    roiTolerance: 0.05,           // Goal: ROI Sum < 0.05%
+    maxSpreadPct: 0.20,           
     profitRoiTarget: parseFloat(process.env.PROFIT_ROI_TARGET) || 0.25               
 };
 
@@ -129,7 +129,6 @@ function tradeLoop() {
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
 
-    // 1. ATOMIC OPEN
     if (s1.volume < 1 || s2.volume < 1) {
         if (market.spreadPct > config.maxSpreadPct) { market.status = "Spread Lock"; return; }
         market.status = "Atomic Opening...";
@@ -141,26 +140,23 @@ function tradeLoop() {
         return;
     }
 
-    const volGap = s1.volume - s2.volume; 
+    const roiSum = s1.roi + s2.roi;
     const netPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
+    const volGap = s1.volume - s2.volume;
 
     let targetAcc = null;
 
-    // 2. VOLUME SYNC (Only if gap is significant)
-    if (Math.abs(volGap) > (config.addSize * 1.5)) {
-        market.status = "Syncing Volume...";
+    if (Math.abs(volGap) >= config.addSize) {
+        market.status = "Balancing Weights...";
         targetAcc = (volGap < 0) ? config.accounts[0] : config.accounts[1];
     } 
-    // 3. NET PROFIT REPAIR (Highest Priority when Efficiency is low)
+    else if (Math.abs(roiSum) > config.roiTolerance) {
+        market.status = `Zero-Sum Targeting (${roiSum.toFixed(2)}%)`;
+        targetAcc = (s1.roi < s2.roi) ? config.accounts[0] : config.accounts[1];
+    }
     else if (netPnL < -config.pnlTolerance) {
         market.status = "Repairing Net PnL...";
-        // Add to the account that is losing the most USDT to improve its average price
         targetAcc = (s1.unrealizedUsdt < s2.unrealizedUsdt) ? config.accounts[0] : config.accounts[1];
-    }
-    // 4. ROI SYNC
-    else if (Math.abs(s1.roi + s2.roi) > config.roiTolerance) {
-        market.status = "Syncing ROI...";
-        targetAcc = (Math.abs(s1.roi) > Math.abs(s2.roi)) ? config.accounts[0] : config.accounts[1];
     } else {
         market.status = "PERFECT MIRROR";
     }
@@ -176,6 +172,19 @@ function tradeLoop() {
 
 async function closeAll() {
     if (triggeredExit) return;
+    const s1 = { ...accountStates[config.accounts[0].accountId] };
+    const s2 = { ...accountStates[config.accounts[1].accountId] };
+    
+    // Save to history before clearing
+    if (s1.volume > 0 || s2.volume > 0) {
+        tradeHistory.unshift({
+            time: new Date().toLocaleTimeString(),
+            longEntry: s1.avgPrice, shortEntry: s2.avgPrice,
+            longRoi: s1.roi, shortRoi: s2.roi, netPnl: s1.unrealizedUsdt + s2.unrealizedUsdt
+        });
+        if (tradeHistory.length > 15) tradeHistory.pop();
+    }
+
     triggeredExit = true;
     market.status = "LIQUIDATING...";
     config.accounts.forEach(acc => {
@@ -264,6 +273,11 @@ app.get('/', (req, res) => {
                 <div class="flex justify-between items-center"><span class="text-[10px] text-zinc-600 font-bold uppercase tracking-tighter">Volume / PnL</span><span id="shortUsdt" class="text-sm font-bold text-white">0 / $0.0000</span></div>
             </div>
         </div>
+
+        <div class="glass rounded-[2.5rem] p-8">
+            <div class="flex justify-between items-center mb-8"><h3 class="text-[10px] font-bold text-zinc-600 uppercase tracking-[0.3em]">Historical Analysis</h3><div class="text-[10px] text-zinc-600 font-bold uppercase">Total Equity: <span id="totalRealized" class="text-emerald-500 ml-2">+$0.00</span></div></div>
+            <div class="overflow-x-auto"><table class="w-full text-left text-[11px] font-mono border-separate border-spacing-y-4"><thead class="text-zinc-700"><tr><th class="px-4 pb-2">TIME</th><th class="pb-2">L-ENTRY</th><th class="pb-2">S-ENTRY</th><th class="pb-2">L-ROI</th><th class="pb-2">S-ROI</th><th class="text-right px-4 pb-2">NET PNL</th></tr></thead><tbody id="historyBody"></tbody></table></div>
+        </div>
     </div>
 
     <script>
@@ -288,7 +302,7 @@ app.get('/', (req, res) => {
                     document.getElementById(prefix + 'Bar').style.width = Math.min(100, Math.abs(a.roi) * 10) + '%';
                 });
                 document.getElementById('roiSum').innerText = (sumRoi >= 0 ? '+' : '') + sumRoi.toFixed(2) + '%';
-                document.getElementById('roiSum').className = 'text-lg font-bold ' + (sumRoi >= 0 ? 'text-emerald-400' : 'text-rose-500');
+                document.getElementById('roiSum').className = 'text-lg font-bold ' + (Math.abs(sumRoi) < 0.1 ? 'text-emerald-400' : 'text-rose-500');
                 const netRoi = tW > 0 ? (tP / tW) * 100 : 0;
                 const perfectMirror = d.market.efficiency > 95;
                 document.getElementById('syncPct').innerText = perfectMirror ? 'PERFECT MIRROR' : 'REPAIRING...';
@@ -296,6 +310,11 @@ app.get('/', (req, res) => {
                 document.getElementById('netProfit').innerText = (tP >= 0 ? '+' : '') + tP.toFixed(8);
                 document.getElementById('netRoi').innerText = 'MIRROR ROI: ' + (netRoi >= 0 ? '+' : '') + netRoi.toFixed(4) + '%';
                 document.getElementById('netProfit').className = 'text-7xl font-black mb-1 font-mono ' + (tP > 0 ? 'text-emerald-400' : (tP < 0 ? 'text-rose-500' : 'text-zinc-900'));
+
+                // HISTORY TABLE UPDATE
+                document.getElementById('historyBody').innerHTML = d.history.map(h => `
+                    <tr class="bg-white/5"><td class="p-4 rounded-l-2xl text-zinc-500 font-bold">${h.time}</td><td class="p-4 text-zinc-300">${h.longEntry.toFixed(8)}</td><td class="p-4 text-zinc-300">${h.shortEntry.toFixed(8)}</td><td class="p-4 ${h.longRoi >= 0 ? 'text-emerald-500' : 'text-rose-500'}">${h.longRoi.toFixed(2)}%</td><td class="p-4 ${h.shortRoi >= 0 ? 'text-emerald-500' : 'text-rose-500'}">${h.shortRoi.toFixed(2)}%</td><td class="p-4 rounded-r-2xl text-right font-black ${h.netPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}">${h.netPnl.toFixed(4)}</td></tr>
+                `).join('');
             } catch(e) {}
         }, 500);
     </script>
