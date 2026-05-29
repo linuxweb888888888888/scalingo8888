@@ -21,7 +21,7 @@ while (process.env[`HTX_API_KEY_${accountIndex}`]) {
 }
 
 const config = {
-    symbol: (process.env.SYMBOL || 'PEPE-USDT').toUpperCase(), // UPDATED TO PEPE
+    symbol: (process.env.SYMBOL || 'PEPE-USDT').toUpperCase(),
     leverage: parseInt(process.env.LEVERAGE) || 10,
     port: process.env.PORT || 3000,
     restHost: 'api.hbdm.com',
@@ -110,14 +110,12 @@ function instantCheck() {
     const s2 = accountStates[config.accounts[1].accountId];
     if (s1.volume < 1 || s2.volume < 1) return;
 
-    // Instant PnL Math
     const side1 = s1.direction === 'buy' ? 1 : -1;
     const side2 = s2.direction === 'buy' ? 1 : -1;
     const p1 = (market.last - s1.avgPrice) * s1.volume * side1 * config.contractSize;
     const p2 = (market.last - s2.avgPrice) * s2.volume * side2 * config.contractSize;
     const currentPnL = p1 + p2;
 
-    // TARGET: Close the second the value hits positive
     if (currentPnL > 0.00000001) {
         triggeredExit = true; 
         console.log(`🚀 PEPE PROFIT DETECTED ($${currentPnL.toFixed(8)}). EXECUTING FORCE CLOSE.`);
@@ -130,7 +128,6 @@ function tradeLoop() {
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
 
-    // Initialize positions if missing
     if (s1.volume < 1 || s2.volume < 1) {
         isProcessing = true;
         Promise.all([
@@ -178,13 +175,14 @@ async function closeAll() {
         const closeVol = Math.floor(state.volume);
         
         if (closeVol > 0) {
+            console.log(`📡 Sending Close for Acc ${acc.accountId}: ${closeVol} contracts ${state.direction === 'buy' ? 'SELL' : 'BUY'}`);
             htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, 
                 volume: closeVol, 
                 direction: state.direction === 'buy' ? 'sell' : 'buy', 
                 offset: 'close', 
                 lever_rate: config.leverage, 
-                order_price_type: 'lightning' 
+                order_price_type: 'optimal_5' // Switched back from lightning to optimal_5
             }).then(res => {
                 if (res.status === 'ok') state.volume = 0;
             });
