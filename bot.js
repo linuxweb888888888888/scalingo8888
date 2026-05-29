@@ -39,6 +39,7 @@ const config = {
 let market = { last: 0, status: 'initializing' };
 let accountStates = {};
 let isProcessing = false;
+let isExiting = false; // Dedicated flag to prevent exit-looping
 
 config.accounts.forEach((account, idx) => {
     accountStates[account.accountId] = {
@@ -81,7 +82,7 @@ async function restSync() {
             if (pos && parseFloat(pos.volume) > 0) {
                 state.avgPrice = parseFloat(pos.cost_hold);
                 state.volume = Math.floor(parseFloat(pos.volume));
-                state.roi = parseFloat(pos.profit_rate) * 100; // OFFICIAL ROI
+                state.roi = parseFloat(pos.profit_rate) * 100;
                 state.unrealizedUsdt = parseFloat(pos.profit);
             } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
         }
@@ -95,26 +96,30 @@ async function restSync() {
     }
 }
 
+// INSTANT MONITOR: Bypasses isProcessing to ensure we never miss profit
 function instantCheck() {
-    if (isProcessing || market.last === 0 || config.contractSize === 0) return;
+    if (isExiting || market.last === 0 || config.contractSize === 0) return;
+
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
     if (s1.volume < 1 || s2.volume < 1) return;
 
-    // Millisecond calculation for exit only
+    // Millisecond calculation for exit
     const side1 = s1.direction === 'buy' ? 1 : -1;
     const side2 = s2.direction === 'buy' ? 1 : -1;
     const p1 = (market.last - s1.avgPrice) * s1.volume * side1 * config.contractSize;
     const p2 = (market.last - s2.avgPrice) * s2.volume * side2 * config.contractSize;
     
+    // THE EXACT TRIGGER: If calculated profit > 0, close immediately
     if ((p1 + p2) > 0) {
-        market.status = "INSTANT PROFIT EXIT...";
+        isExiting = true; // Block everything else immediately
+        market.status = "PROFIT DETECTED! EXITING...";
         closeAll();
     }
 }
 
 function tradeLoop() {
-    if (isProcessing || market.last === 0) return;
+    if (isProcessing || isExiting || market.last === 0) return;
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
 
@@ -159,7 +164,8 @@ function tradeLoop() {
 }
 
 async function closeAll() {
-    isProcessing = true;
+    isExiting = true;
+    console.log("🚀 EXECUTING EMERGENCY PROFIT EXIT...");
     await Promise.all(config.accounts.map(acc => {
         const state = accountStates[acc.accountId];
         if (state.volume <= 0) return Promise.resolve();
@@ -169,7 +175,8 @@ async function closeAll() {
             offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
         });
     }));
-    setTimeout(() => { isProcessing = false; }, 10000);
+    // Cool down for 15 seconds to allow exchange state to reset
+    setTimeout(() => { isExiting = false; isProcessing = false; }, 15000);
 }
 
 // ==================== WS & DASHBOARD ====================
@@ -182,7 +189,7 @@ function startWS() {
             const msg = JSON.parse(dec.toString());
             if (msg.tick) {
                 market.last = (msg.tick.bid[0] + msg.tick.ask[0]) / 2;
-                instantCheck(); 
+                instantCheck(); // Runs on every single price update
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
         });
