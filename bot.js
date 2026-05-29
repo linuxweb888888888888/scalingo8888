@@ -27,12 +27,12 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    orderSize: 1,                
-    addSize: 1,                  
+    orderSize: 5,                // Optimization: Larger initial orders
+    addSize: 5,                  // Optimization: Stronger correction power
     contractSize: 0,
     pnlTolerance: 0.0001,        
-    roiTolerance: 0.01,          
-    maxSpreadPct: 0.05,          
+    roiTolerance: 0.05,          // Optimization: Reduced churn fees
+    maxSpreadPct: 0.15,          // Optimization: Prevent spread-lock on SHIB
     profitRoiTarget: parseFloat(process.env.PROFIT_ROI_TARGET) || 0.25               
 };
 
@@ -138,6 +138,7 @@ function tradeLoop() {
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
 
+    // ATOMIC OPENING
     if (s1.volume < 1 || s2.volume < 1) {
         if (market.spreadPct > config.maxSpreadPct) {
             market.status = `Spread Lock`;
@@ -163,12 +164,15 @@ function tradeLoop() {
     if (Math.abs(volGap) >= config.addSize) {
         market.status = "Syncing Volume...";
         targetAcc = (volGap < 0) ? config.accounts[0] : config.accounts[1];
-    } else if (Math.abs(roiMagGap) > config.roiTolerance) {
+    } 
+    // RECOVERY LOGIC: Priority to fix negative Net PnL
+    else if (netPnL < -config.pnlTolerance) {
+        market.status = "Recovering Net PnL...";
+        targetAcc = (s1.unrealizedUsdt < s2.unrealizedUsdt) ? config.accounts[0] : config.accounts[1];
+    }
+    else if (Math.abs(roiMagGap) > config.roiTolerance) {
         market.status = "Syncing ROI...";
         targetAcc = (roiMag1 > roiMag2) ? config.accounts[0] : config.accounts[1];
-    } else if (Math.abs(netPnL) > config.pnlTolerance && netPnL < 0) {
-        market.status = "Syncing PnL...";
-        targetAcc = (s1.unrealizedUsdt < s2.unrealizedUsdt) ? config.accounts[0] : config.accounts[1];
     } else if (netPnL <= 0) {
         market.status = "Pushing Profit...";
         targetAcc = (s1.roi > s2.roi) ? config.accounts[0] : config.accounts[1];
