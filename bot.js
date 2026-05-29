@@ -30,7 +30,10 @@ const config = {
     orderSize: 1,                
     addSize: 1,                  
     contractSize: 0,
-    pnlSyncThreshold: 0.005,      // Sync if PnL gap exceeds 0.005 USDT
+    // THRESHOLDS FOR SYNC
+    pnlThreshold: 0.005,         // Sync if Net PnL gap > 0.005 USDT
+    roiThreshold: 0.05,          // Sync if ROI gap > 0.05%
+    volThreshold: 1,             // Sync if Volume gap > 1 contract
     maxVolGap: 1000,
     maxSpreadPct: 0.05, 
     profitRoiTarget: parseFloat(process.env.PROFIT_ROI_TARGET) || 0.25               
@@ -129,7 +132,7 @@ function tradeLoop() {
             market.status = `Wait Spread`;
             return;
         }
-        market.status = "Opening...";
+        market.status = "Opening Mirror...";
         isProcessing = true;
         const orders = [];
         if(s1.volume < 1) orders.push(htxRequest(config.accounts[0], 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' }));
@@ -138,40 +141,43 @@ function tradeLoop() {
         return;
     }
 
-    // 2. PNL SYNC LOGIC (Highest Priority)
-    // We calculate which side's USDT value is weighing down the net mirror
-    const netPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
+    // 2. UNIFIED SYNC (VOL + PNL + ROI)
+    const volGap = Math.abs(s1.volume - s2.volume);
+    const pnlGap = Math.abs(s1.unrealizedUsdt + s2.unrealizedUsdt);
+    const roiGap = Math.abs(Math.abs(s1.roi) - Math.abs(s2.roi));
 
-    if (Math.abs(netPnL) > config.pnlSyncThreshold) {
-        market.status = "Syncing PnL...";
-        // If netPnL is negative, we add to the side that is losing MORE money
-        // to improve its entry price (DCA) and balance the mirror.
-        const target = (s1.unrealizedUsdt < s2.unrealizedUsdt) ? config.accounts[0] : config.accounts[1];
+    // Decision Logic: Which side is objectively weaker?
+    let targetAcc = null;
+
+    if (volGap > config.volThreshold || pnlGap > config.pnlThreshold || roiGap > config.roiThreshold) {
+        market.status = "Unified Syncing...";
         
-        if (Math.abs(s1.volume - s2.volume) > config.maxVolGap) {
-            market.status = "Max Vol Gap!";
-            return;
+        // Priority 1: Lower Volume side always needs balancing
+        if (s1.volume < s2.volume) targetAcc = config.accounts[0];
+        else if (s2.volume < s1.volume) targetAcc = config.accounts[1];
+        // Priority 2: Side with the worse Unrealized PnL (dragging the mirror down)
+        else if (s1.unrealizedUsdt < s2.unrealizedUsdt) targetAcc = config.accounts[0];
+        else targetAcc = config.accounts[1];
+    } else {
+        // 3. PROFIT PUSH (If balanced but net PnL is negative)
+        if ((s1.unrealizedUsdt + s2.unrealizedUsdt) <= 0) {
+            market.status = "Pushing Profit...";
+            targetAcc = (s1.roi > s2.roi) ? config.accounts[0] : config.accounts[1];
+        } else {
+            market.status = "Mirror Balanced";
         }
-
-        isProcessing = true;
-        htxRequest(target, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-            contract_code: config.symbol, volume: config.addSize, direction: accountStates[target.accountId].direction, 
-            offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
-        }).finally(() => { setTimeout(() => { isProcessing = false; }, 3500); });
-        return;
     }
 
-    // 3. PROFIT PUSH
-    if (netPnL <= 0) {
-        market.status = "Pushing Profit...";
-        const target = (s1.roi > s2.roi) ? config.accounts[0] : config.accounts[1];
+    if (targetAcc) {
+        if (Math.abs(s1.volume - s2.volume) > config.maxVolGap) {
+            market.status = "Max Gap Reached";
+            return;
+        }
         isProcessing = true;
-        htxRequest(target, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-            contract_code: config.symbol, volume: config.addSize, direction: accountStates[target.accountId].direction, 
+        htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+            contract_code: config.symbol, volume: config.addSize, direction: accountStates[targetAcc.accountId].direction, 
             offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
-        }).finally(() => { setTimeout(() => { isProcessing = false; }, 4000); });
-    } else {
-        market.status = "PnL Balanced";
+        }).finally(() => { setTimeout(() => { isProcessing = false; }, 3500); });
     }
 }
 
@@ -259,11 +265,11 @@ app.get('/', (req, res) => {
 
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative border-indigo-500/20 text-center">
             <button onclick="triggerClose()" class="absolute top-6 right-6 bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-black px-5 py-2.5 rounded-full transition-all active:scale-90">CLOSE ALL</button>
-            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net USDT PnL</p>
+            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Mirror PnL (Unified)</p>
             <h2 id="netProfit" class="text-6xl font-black mb-1 font-mono text-zinc-500">+$0.00000000</h2>
             <p id="netRoi" class="text-sm font-bold text-indigo-400 mb-4 font-mono tracking-widest">NET ROI: 0.0000%</p>
             <div class="inline-flex items-center gap-2 bg-black/40 px-4 py-2 rounded-full border border-white/5">
-                <span class="text-[10px] font-bold text-zinc-500 uppercase">PnL Sync Status:</span><span id="syncPct" class="text-xs font-mono font-bold text-indigo-400 text-emerald-400">Stable</span>
+                <span class="text-[10px] font-bold text-zinc-500 uppercase">Mirror Health:</span><span id="syncPct" class="text-xs font-mono font-bold text-indigo-400 text-emerald-400">Stable</span>
             </div>
         </div>
 
@@ -309,10 +315,10 @@ app.get('/', (req, res) => {
                 document.getElementById('marketSpread').className = d.market.spreadPct > 0.05 ? 'text-lg font-bold text-rose-500' : 'text-lg font-bold text-emerald-500';
                 document.getElementById('botStatus').innerText = d.market.status;
                 
-                let tP = 0, tR = 0, tW = 0;
+                let tP = 0, tR = 0, tW = 0, v = [];
                 d.accounts.forEach(a => {
                     const prefix = a.direction === 'buy' ? 'long' : 'short';
-                    tP += a.unrealizedUsdt; tR += a.realizedProfit; tW += a.wallet;
+                    tP += a.unrealizedUsdt; tR += a.realizedProfit; tW += a.wallet; v.push(a.volume);
                     document.getElementById(prefix + 'Roi').innerText = (a.roi >= 0 ? '+' : '') + a.roi.toFixed(2) + '%';
                     document.getElementById(prefix + 'Entry').innerText = a.avgPrice.toFixed(8);
                     document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(4);
@@ -320,8 +326,10 @@ app.get('/', (req, res) => {
                 });
 
                 const netRoi = tW > 0 ? (tP / tW) * 100 : 0;
-                document.getElementById('syncPct').innerText = Math.abs(tP) < d.config.pnlSyncThreshold ? 'Stable' : 'Syncing...';
-                document.getElementById('syncPct').className = 'text-xs font-mono font-bold ' + (Math.abs(tP) < d.config.pnlSyncThreshold ? 'text-emerald-400' : 'text-amber-500');
+                const isSync = Math.abs(tP) < d.config.pnlThreshold && Math.abs(v[0]-v[1]) <= d.config.volThreshold;
+                
+                document.getElementById('syncPct').innerText = isSync ? 'Perfect Mirror' : 'Syncing Metrics...';
+                document.getElementById('syncPct').className = 'text-xs font-mono font-bold ' + (isSync ? 'text-emerald-400' : 'text-amber-500');
                 
                 document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(4);
                 document.getElementById('netProfit').innerText = (tP >= 0 ? '+' : '') + tP.toFixed(8);
