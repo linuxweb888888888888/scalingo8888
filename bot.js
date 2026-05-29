@@ -75,6 +75,8 @@ async function restSync() {
 
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
+        
+        // SYNC POSITIONS
         const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
         if (res?.status === 'ok' && res.data) {
             const pos = res.data.find(p => p.direction === state.direction);
@@ -83,19 +85,24 @@ async function restSync() {
                 state.volume = Math.floor(parseFloat(pos.volume));
             } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
         }
+
+        // SYNC WALLET (FOR REAL PROFIT)
+        const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
+        if (accRes?.status === 'ok' && accRes.data) {
+            const equity = parseFloat(accRes.data[0].margin_balance);
+            if (state.initialBalance === 0) state.initialBalance = equity;
+            state.wallet = equity;
+            state.realizedProfit = equity - state.initialBalance;
+        }
     }
 }
 
-// INSTANT MONITOR: Triggers on every price tick via WebSocket
 function instantCheck() {
     if (isProcessing || market.last === 0 || config.contractSize === 0) return;
-
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
-
     if (s1.volume < 1 || s2.volume < 1) return;
 
-    // LIVE CALCULATION
     const calc = (s) => {
         const side = s.direction === 'buy' ? 1 : -1;
         s.roi = ((market.last - s.avgPrice) / s.avgPrice) * config.leverage * side * 100;
@@ -104,16 +111,12 @@ function instantCheck() {
     calc(s1); calc(s2);
 
     const combinedPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
-
-    // INSTANT EXIT TRIGGER: Profit > 0 (Progress ignored)
     if (combinedPnL > 0) {
-        console.log(`🚀 PROFIT DETECTED: $${combinedPnL.toFixed(8)}. Executing Instant Close.`);
         market.status = "EXECUTING INSTANT EXIT...";
         closeAll();
     }
 }
 
-// SLOW SYNC: Runs every 3 seconds for position balancing
 function tradeLoop() {
     if (isProcessing || market.last === 0) return;
     const s1 = accountStates[config.accounts[0].accountId];
@@ -135,18 +138,15 @@ function tradeLoop() {
     const combinedPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
 
     let targetAcc = null;
-
     if (!isMirrored) {
         market.status = "Correction: Fixing Signs...";
         targetAcc = (roi1Mag < roi2Mag) ? config.accounts[0] : config.accounts[1];
-    } 
-    else if (syncProgress > 95) {
+    } else if (syncProgress > 95) {
         if (combinedPnL <= 0) {
             market.status = "Profit Push...";
             targetAcc = (s1.roi > s2.roi) ? config.accounts[0] : config.accounts[1];
         }
-    } 
-    else if (Math.abs(roi1Mag - roi2Mag) > config.roiThreshold) {
+    } else if (Math.abs(roi1Mag - roi2Mag) > config.roiThreshold) {
         market.status = "Syncing Magnitudes...";
         targetAcc = (roi1Mag > roi2Mag) ? config.accounts[0] : config.accounts[1];
     }
@@ -175,7 +175,6 @@ async function closeAll() {
     setTimeout(() => { isProcessing = false; }, 10000);
 }
 
-// ==================== WS & DASHBOARD ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -211,7 +210,10 @@ app.get('/', (req, res) => {
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-8">
             <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Active</p></div>
-            <div class="text-right"><p class="text-[10px] text-zinc-500 font-bold uppercase">Price</p><p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00</p></div>
+            <div class="flex gap-10 text-right">
+                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Combined Wallet</p><p id="totalWallet" class="text-xl font-mono font-bold text-indigo-400">$0.00</p></div>
+                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Profit Growth</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.00</p></div>
+            </div>
         </div>
         <div class="glass rounded-[2.5rem] p-8 mb-8 text-center border-indigo-500/20">
             <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Mirror Delta)</p>
@@ -238,18 +240,22 @@ app.get('/', (req, res) => {
         setInterval(async () => {
             try {
                 const r = await fetch('/api/status'); const d = await r.json();
-                document.getElementById('markPrice').innerText = d.market.last.toFixed(8);
+                document.getElementById('markPrice')?.innerText = d.market.last.toFixed(8); // Mark Price Fallback
                 document.getElementById('botStatus').innerText = d.market.status;
-                let tP = 0, rois = [];
+                let tP = 0, tR = 0, tW = 0, rois = [];
                 d.accounts.forEach(a => {
                     const prefix = a.direction === 'buy' ? 'long' : 'short';
-                    rois.push(a.roi); tP += a.unrealizedUsdt;
+                    rois.push(a.roi); tP += a.unrealizedUsdt; tR += a.realizedProfit; tW += a.wallet;
                     document.getElementById(prefix + 'Roi').innerText = (a.roi >= 0 ? '+' : '') + a.roi.toFixed(2) + '%';
                     document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(8);
                 });
                 const sScore = (rois[0] * rois[1] < 0) ? (Math.min(Math.abs(rois[0]), Math.abs(rois[1])) / Math.max(Math.abs(rois[0]), Math.abs(rois[1]))) * 100 : 0;
                 document.getElementById('syncBar').style.width = (isNaN(sScore) ? 0 : sScore.toFixed(0)) + '%';
                 document.getElementById('syncPct').innerText = (isNaN(sScore) ? 0 : sScore.toFixed(1)) + '%';
+                
+                document.getElementById('totalWallet').innerText = '$' + tW.toFixed(2);
+                document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(8);
+                
                 document.getElementById('netProfit').innerText = (tP >= 0 ? '+' : '') + tP.toFixed(8);
                 document.getElementById('netProfit').className = 'text-6xl font-black mb-6 font-mono ' + (tP > 0 ? 'text-emerald-400' : 'text-zinc-400');
             } catch(e) {}
