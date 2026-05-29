@@ -31,8 +31,8 @@ const config = {
     addSize: 1,                  
     feeRate: 0.0006,             
     contractSize: 0,
-    roiThreshold: 0.1,           // Difference in % ROI to trigger sync
-    maxVolGap: 300               // Safety volume cap
+    roiThreshold: 0.1,           
+    maxVolGap: 500               
 };
 
 // ==================== GLOBAL STATE ====================
@@ -64,7 +64,6 @@ async function htxRequest(account, method, path, data = {}) {
 
 // ==================== CORE LOGIC ====================
 
-// PRIMARY DATA SOURCE: Official HTX Data
 async function restSync() {
     if (config.contractSize === 0) {
         const info = await htxRequest(config.accounts[0], 'GET', '/linear-swap-api/v1/swap_contract_info');
@@ -84,7 +83,7 @@ async function restSync() {
                 state.avgPrice = parseFloat(pos.cost_hold);
                 state.volume = Math.floor(parseFloat(pos.volume));
                 state.unrealizedUsdt = parseFloat(pos.profit);
-                state.roi = parseFloat(pos.profit_rate) * 100; // DIRECT FROM HTX
+                state.roi = parseFloat(pos.profit_rate) * 100;
             } else { 
                 state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; 
             }
@@ -117,18 +116,32 @@ function tradeLoop() {
         syncProgress = Math.max(roi1Mag, roi2Mag) === 0 ? 0 : (Math.min(roi1Mag, roi2Mag) / Math.max(roi1Mag, roi2Mag)) * 100;
     }
 
-    // EXIT TRIGGER
+    // 1. EXIT TRIGGER
     if (combinedPnL > 0 && syncProgress >= 95 && isMirroredSigns) {
-        market.status = "PROFIT EXIT TRIGGERED";
+        market.status = "PROFIT TARGET MET (SYNCED)";
         closeAll(); return;
     }
 
-    // SYNCING MAGNITUDES LOGIC (Using HTX ROI)
+    // 2. PROFIT PUSH & SYNC LOGIC
     let targetAcc = null;
+
     if (!isMirroredSigns) {
-        market.status = "Fixing Signs...";
+        // Recovery: Force flip signs
+        market.status = "Sign Correction...";
         targetAcc = (roi1Mag < roi2Mag) ? config.accounts[0] : config.accounts[1];
-    } else if (Math.abs(roi1Mag - roi2Mag) > config.roiThreshold) {
+    } 
+    else if (syncProgress > 95) {
+        // --- NEW PROFIT PUSH LOGIC ---
+        // If synced > 95% and combined profit is still negative, add to the winner
+        if (combinedPnL <= 0) {
+            market.status = "Profit Push: Adding to Winner...";
+            targetAcc = (s1.roi > s2.roi) ? config.accounts[0] : config.accounts[1];
+        } else {
+            market.status = "Perfect Mirror (Waiting for Target)";
+        }
+    } 
+    else if (Math.abs(roi1Mag - roi2Mag) > config.roiThreshold) {
+        // Standard Sync: Pull magnitude back
         market.status = "Syncing Magnitudes...";
         targetAcc = (roi1Mag > roi2Mag) ? config.accounts[0] : config.accounts[1];
     }
@@ -140,10 +153,9 @@ function tradeLoop() {
             contract_code: config.symbol, volume: config.addSize, direction: accountStates[targetAcc.accountId].direction, 
             offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
         }).finally(() => { 
-            // Wait 4 seconds for HTX to update ROI in their system before we allow another order
             setTimeout(() => { isProcessing = false; }, 4000); 
         });
-    } else { market.status = "Stable Mirror"; }
+    }
 }
 
 async function closeAll() {
@@ -164,9 +176,7 @@ function startWS() {
         zlib.gunzip(data, (err, dec) => {
             if (err) return;
             const msg = JSON.parse(dec.toString());
-            if (msg.tick) { 
-                market.last = (msg.tick.bid[0] + msg.tick.ask[0]) / 2; 
-            }
+            if (msg.tick) market.last = (msg.tick.bid[0] + msg.tick.ask[0]) / 2;
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
         });
     });
@@ -199,9 +209,9 @@ app.get('/', (req, res) => {
             <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Mirror Delta)</p>
             <h2 id="netProfit" class="text-6xl font-black mb-6 font-mono">+$0.00</h2>
             <div class="max-w-md mx-auto mb-2">
-                <div class="flex justify-between text-[10px] font-bold uppercase text-zinc-500 mb-2"><span>Sync Progress (Mirroring Goal)</span><span id="syncPct">0%</span></div>
+                <div class="flex justify-between text-[10px] font-bold uppercase text-zinc-500 mb-2"><span>Sync Progress (Goal: 95%+)</span><span id="syncPct">0%</span></div>
                 <div class="w-full bg-zinc-900 h-3 rounded-full border border-zinc-800 overflow-hidden p-0.5">
-                    <div id="syncBar" class="progress-bar h-full bg-indigo-500 rounded-full shadow-[0_0_15px_rgba(99,102,241,0.5)]" style="width: 0%"></div>
+                    <div id="syncBar" class="progress-bar h-full bg-indigo-500 rounded-full" style="width: 0%"></div>
                 </div>
             </div>
         </div>
