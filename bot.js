@@ -27,8 +27,8 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    orderSize: 20,                // Higher start size
-    addSize: 25,                  // Powerful correction size to fix 300+ vol positions
+    orderSize: 1,                // Higher start size
+    addSize: 1,                  // Powerful correction size to fix 300+ vol positions
     contractSize: 0,
     pnlTolerance: 0.0001,        
     roiTolerance: 0.15,           // Higher tolerance to prevent fee bleed
