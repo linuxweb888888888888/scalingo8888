@@ -42,8 +42,8 @@ let market = {
     spreadPct: 0, 
     status: 'initializing', 
     lastNetPnL: 0, 
-    improvement: 0,
-    efficiency: 0
+    improvement: 0, // Convergence rate
+    efficiency: 0   // Sync percentage
 };
 let accountStates = {};
 let tradeHistory = []; 
@@ -118,15 +118,17 @@ function instantCheck() {
     const netPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
     const currentCombinedRoi = totalWallet > 0 ? (netPnL / totalWallet) * 100 : 0;
 
-    // Efficiency Calculation: How much PnL is successfully canceled out?
-    const totalAbsPnL = Math.abs(s1.unrealizedUsdt) + Math.abs(s2.unrealizedUsdt);
-    market.efficiency = totalAbsPnL > 0 ? (1 - (Math.abs(netPnL) / totalAbsPnL)) * 100 : 0;
+    // EFFICIENCY: How much of the total movement is successfully canceled out
+    const totalExposure = Math.abs(s1.unrealizedUsdt) + Math.abs(s2.unrealizedUsdt);
+    market.efficiency = totalExposure > 0 ? (1 - (Math.abs(netPnL) / totalExposure)) * 100 : 0;
 
-    // Improvement Calculation
+    // IMPROVEMENT: How fast the absolute gap is shrinking
     if (market.lastNetPnL !== 0) {
         const prevGap = Math.abs(market.lastNetPnL);
         const currGap = Math.abs(netPnL);
-        market.improvement = prevGap !== 0 ? ((prevGap - currGap) / prevGap) * 100 : 0;
+        if (prevGap > 0) {
+            market.improvement = ((prevGap - currGap) / prevGap) * 100;
+        }
     }
     market.lastNetPnL = netPnL;
 
@@ -145,7 +147,7 @@ function tradeLoop() {
             market.status = `Spread Lock`;
             return;
         }
-        market.status = "Atomic Opening...";
+        market.status = "Establishing Mirror...";
         isProcessing = true;
         const orders = [];
         if(s1.volume < 1) orders.push(htxRequest(config.accounts[0], 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' }));
@@ -175,7 +177,7 @@ function tradeLoop() {
         market.status = "Pushing Profit...";
         targetAcc = (s1.roi > s2.roi) ? config.accounts[0] : config.accounts[1];
     } else {
-        market.status = "PERFECT MIRROR";
+        market.status = "MIRROR SYNCED";
     }
 
     if (targetAcc) {
@@ -200,7 +202,7 @@ async function closeAll() {
         if (tradeHistory.length > 15) tradeHistory.pop();
     }
     triggeredExit = true;
-    market.status = "LIQUIDATING...";
+    market.status = "CLOSING SYSTEM...";
     config.accounts.forEach(acc => {
         const state = accountStates[acc.accountId];
         if (state.volume > 0) {
@@ -241,7 +243,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>AtomicSync Perfect</title>
+    <meta charset="UTF-8"><title>AtomicSync Elite</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&display=swap" rel="stylesheet">
     <style>
@@ -254,18 +256,18 @@ app.get('/', (req, res) => {
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-10">
             <div><h1 class="text-2xl font-black tracking-tighter text-white uppercase italic">AtomicSync<span class="text-indigo-500">Perfect</span></h1><p id="botStatus" class="text-[10px] font-bold text-indigo-400 uppercase tracking-[0.4em]">SYNCING...</p></div>
-            <div class="flex gap-10 text-right font-mono">
+            <div class="flex gap-12 text-right font-mono">
                 <div><p class="text-[10px] text-zinc-600 font-bold uppercase">Improvement</p><p id="pnlImprovement" class="text-lg font-bold text-emerald-400">0.00%</p></div>
-                <div><p class="text-[10px] text-zinc-600 font-bold uppercase">Efficiency</p><p id="mirrorEfficiency" class="text-lg font-bold text-indigo-400">0.00%</p></div>
-                <div><p class="text-[10px] text-zinc-600 font-bold uppercase">Price</p><p id="markPrice" class="text-lg font-bold text-white">0.00000000</p></div>
+                <div><p class="text-[10px] text-zinc-600 font-bold uppercase">Sync Efficiency</p><p id="mirrorEfficiency" class="text-lg font-bold text-indigo-400">0.00%</p></div>
+                <div><p class="text-[10px] text-zinc-600 font-bold uppercase">Current Price</p><p id="markPrice" class="text-lg font-bold text-white">0.00000000</p></div>
             </div>
         </div>
 
-        <div class="glass rounded-[3rem] p-10 mb-8 relative text-center border-t border-indigo-500/20">
-            <button onclick="triggerClose()" class="absolute top-8 right-8 bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-black px-6 py-3 rounded-full shadow-lg">EMERGENCY EXIT</button>
-            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Mirror PnL (Unified)</p>
-            <h2 id="netProfit" class="text-7xl font-black mb-1 font-mono text-zinc-800">+$0.00000000</h2>
-            <p id="netRoi" class="text-md font-bold text-indigo-500/60 mb-6 font-mono tracking-widest uppercase">Mirror ROI: 0.0000%</p>
+        <div class="glass rounded-[3rem] p-10 mb-8 relative text-center border-t border-indigo-500/20 shadow-2xl">
+            <button onclick="triggerClose()" class="absolute top-8 right-8 bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-black px-6 py-3 rounded-full shadow-lg active:scale-95 transition-all">SYSTEM KILL</button>
+            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Unified Mirror Delta (PnL Sum)</p>
+            <h2 id="netProfit" class="text-7xl font-black mb-1 font-mono text-zinc-900">+$0.00000000</h2>
+            <p id="netRoi" class="text-md font-bold text-indigo-500/50 mb-6 font-mono tracking-widest uppercase">Mirror ROI: 0.0000%</p>
             <div id="healthBadge" class="inline-flex items-center gap-3 bg-black/50 px-6 py-3 rounded-full border border-white/5">
                 <span class="text-[10px] font-bold text-zinc-500 uppercase">Integrity Status:</span><span id="syncPct" class="text-xs font-mono font-bold text-indigo-400">WAITING</span>
             </div>
@@ -280,7 +282,7 @@ app.get('/', (req, res) => {
             </div>
             <div class="glass rounded-[2.5rem] p-8 border-l-4 border-rose-500">
                 <div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold text-rose-500 uppercase tracking-widest italic">Short Account</span><span id="shortRoi" class="text-2xl font-black text-rose-400">0.00%</span></div>
-                <div class="mb-6"><p class="text-[10px] text-zinc-600 font-bold">ENTRY</p><p id="shortEntry" class="text-md font-bold text-zinc-200">0.00000000</p></div>
+                <div class="mb-4 text-zinc-600"><p class="text-[10px] font-bold uppercase">Entry</p><p id="shortEntry" class="text-md font-bold text-zinc-200">0.00000000</p></div>
                 <div class="w-full bg-white/5 h-2 rounded-full overflow-hidden mb-6"><div id="shortBar" class="roi-bar bg-rose-500 h-full shadow-[0_0_20px_rgba(244,63,94,0.4)]"></div></div>
                 <div class="flex justify-between items-center"><span class="text-[10px] text-zinc-600 font-bold uppercase tracking-tighter">Volume / PnL</span><span id="shortUsdt" class="text-sm font-bold text-white">0 / $0.0000</span></div>
             </div>
@@ -293,14 +295,18 @@ app.get('/', (req, res) => {
     </div>
 
     <script>
-        async function triggerClose() { if(confirm("Terminate System?")) await fetch('/api/close', { method: 'POST' }); }
+        async function triggerClose() { if(confirm("Terminate Mirror?")) await fetch('/api/close', { method: 'POST' }); }
 
         setInterval(async () => {
             try {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('markPrice').innerText = d.market.last.toFixed(8);
-                document.getElementById('pnlImprovement').innerText = (d.market.improvement >= 0 ? '+' : '') + d.market.improvement.toFixed(2) + '%';
-                document.getElementById('pnlImprovement').className = 'text-lg font-bold ' + (d.market.improvement >= 0 ? 'text-emerald-400' : 'text-rose-500');
+                
+                // UPDATE IMPROVEMENT DISPLAY
+                const imp = d.market.improvement;
+                document.getElementById('pnlImprovement').innerText = (imp >= 0 ? '↑ ' : '↓ ') + Math.abs(imp).toFixed(2) + '%';
+                document.getElementById('pnlImprovement').className = 'text-lg font-bold ' + (imp >= 0 ? 'text-emerald-400' : 'text-rose-500');
+                
                 document.getElementById('mirrorEfficiency').innerText = d.market.efficiency.toFixed(2) + '%';
                 document.getElementById('botStatus').innerText = d.market.status;
                 
@@ -315,7 +321,7 @@ app.get('/', (req, res) => {
                 });
 
                 const netRoi = tW > 0 ? (tP / tW) * 100 : 0;
-                const perfectMirror = d.market.efficiency > 98;
+                const perfectMirror = d.market.efficiency > 99;
                 document.getElementById('syncPct').innerText = perfectMirror ? 'PERFECT MIRROR' : 'CALIBRATING...';
                 document.getElementById('syncPct').className = 'text-xs font-mono font-bold ' + (perfectMirror ? 'text-emerald-400' : 'text-amber-500');
                 document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(4);
