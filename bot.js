@@ -28,10 +28,11 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     orderSize: 1,                
-    maxSyncBatch: 100,           
+    addSize: 1,                  // SLOW SYNC: Add only 1 contract at a time
     feeRate: 0.0006,             
     contractSize: 0,
-    roiThreshold: 0.05           
+    roiThreshold: 0.1,           // Sync if ROI magnitude difference > 0.1%
+    maxVolDifference: 50         // Safety: Don't let one side get 50+ contracts ahead of the other
 };
 
 // ==================== GLOBAL STATE ====================
@@ -102,9 +103,10 @@ async function tradeLoop() {
     const s1 = accountStates[acc1.accountId];
     const s2 = accountStates[acc2.accountId];
 
-    // 1. Ensure Hedge is open
+    // 1. Initial Hedge Open (Ensures basic 1v1)
     if (s1.volume < 1 || s2.volume < 1) {
         isProcessing = true;
+        market.status = 'Opening Initial Hedge...';
         if (s1.volume < 1) await htxRequest(acc1, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' });
         if (s2.volume < 1) await htxRequest(acc2, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' });
         setTimeout(() => { isProcessing = false; }, 3000);
@@ -126,32 +128,40 @@ async function tradeLoop() {
         return;
     }
 
-    // 4. PRECISE MIRROR SYNC LOGIC
-    const roiDiff = Math.abs(roi1Mag - roi2Mag);
-    if (roiDiff > config.roiThreshold) {
-        const targetAccIdx = roi1Mag > roi2Mag ? 0 : 1;
-        const anchorAccIdx = targetAccIdx === 0 ? 1 : 0;
+    // 4. SLOW INCREMENTAL SYNC LOGIC
+    // Only proceed if the ROI magnitude difference is notable
+    if (Math.abs(roi1Mag - roi2Mag) > config.roiThreshold) {
         
-        const targetAcc = config.accounts[targetAccIdx];
-        const targetState = accountStates[targetAcc.accountId];
-        const anchorState = accountStates[config.accounts[anchorAccIdx].accountId];
+        let targetAcc = null;
+        
+        // Strategy: Add to the side with the HIGHER ROI magnitude (the side that is losing more or winning more)
+        // This moves the Average Entry Price closer to the current market price.
+        if (roi1Mag > roi2Mag) {
+            // Account 1 needs adjustment. BUT check safety: don't let it get too huge.
+            if (s1.volume - s2.volume < config.maxVolDifference) targetAcc = acc1;
+            else targetAcc = acc2; // Volume safety: add to the other side instead
+        } else {
+            // Account 2 needs adjustment.
+            if (s2.volume - s1.volume < config.maxVolDifference) targetAcc = acc2;
+            else targetAcc = acc1;
+        }
 
-        // Calc amount to move Entry Price to the Anchor's ROI level
-        const sideFactor = targetState.direction === 'buy' ? 1 : -1;
-        const targetRoiDecimal = Math.abs(anchorState.roi) / (config.leverage * 100);
-        const pTarget = market.last / (1 + (sideFactor * targetRoiDecimal));
-
-        let amountToAdd = Math.ceil(targetState.volume * (targetState.avgPrice - pTarget) / (pTarget - market.last));
-        if (isNaN(amountToAdd) || amountToAdd <= 0) amountToAdd = 1;
-        amountToAdd = Math.min(amountToAdd, config.maxSyncBatch); 
-
-        isProcessing = true;
-        market.status = `Syncing: Adding ${amountToAdd} to ${targetState.direction}`;
-        await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-            contract_code: config.symbol, volume: amountToAdd, direction: targetState.direction, 
-            offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
-        });
-        setTimeout(() => { isProcessing = false; }, 4000);
+        if (targetAcc) {
+            isProcessing = true;
+            const targetState = accountStates[targetAcc.accountId];
+            market.status = `Balancing: Adding ${config.addSize} to ${targetState.direction}`;
+            
+            await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, 
+                volume: config.addSize, 
+                direction: targetState.direction, 
+                offset: 'open', 
+                lever_rate: config.leverage, 
+                order_price_type: 'optimal_5' 
+            });
+            // Longer timeout to let the ROI settle
+            setTimeout(() => { isProcessing = false; }, 5000);
+        }
     } else {
         market.status = "Mirrored (ROI & PnL Synced)";
     }
@@ -256,7 +266,7 @@ app.get('/', (req, res) => {
                 document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(8);
                 const pElem = document.getElementById('netProfit');
                 pElem.innerText = (tP >= 0 ? '+' : '') + tP.toFixed(8);
-                pElem.className = 'text-6xl font-black mb-6 font-mono ' + (tP >= 0 && syncScore >= 95 ? 'text-emerald-400' : 'text-zinc-400');
+                pElem.className = 'text-6xl font-black mb-6 font-mono ' + (tP >= 0 && syncScore >= 95 ? 'text-indigo-400' : 'text-zinc-400');
             } catch(e) {}
         }
         setInterval(update, 1000);
