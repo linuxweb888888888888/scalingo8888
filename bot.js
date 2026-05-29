@@ -28,11 +28,12 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     spreadThreshold: 0.05,        // Only opens if spread < 0.05%
-    mirrorRoiTakeProfit: 0.0005     // AUTO-CLOSE when Mirror ROI hits 0.05%
+    mirrorRoiTakeProfit: 0.05     // AUTO-CLOSE when Mirror ROI hits 0.05%
 };
 
 // ==================== GLOBAL STATE ====================
-let market = { last: 0, spreadPct: 0, status: 'connecting...', totalEquity: 0 };
+let market = { last: 0, spreadPct: 0, status: 'connecting...', totalEquity: 0, equityProfit: 0 };
+let initialTotalEquity = 0; // Tracks the balance from the first sync
 let accountStates = {};
 let isProcessing = false;
 
@@ -40,7 +41,7 @@ config.accounts.forEach((account, idx) => {
     accountStates[account.accountId] = {
         direction: idx === 0 ? 'buy' : 'sell',
         avgPrice: 0, roi: 0, volume: 0,
-        unrealizedUsdt: 0, wallet: 0
+        unrealizedUsdt: 0, wallet: 0, initialBalance: 0
     };
 });
 
@@ -79,12 +80,20 @@ async function restSync() {
         const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
         if (accRes?.status === 'ok' && accRes.data) {
             state.wallet = parseFloat(accRes.data[0].margin_balance);
+            if (state.initialBalance === 0) state.initialBalance = state.wallet;
         }
         totalPnl += state.unrealizedUsdt;
         currentTotalWallet += state.wallet;
     }
     
+    // Capture starting equity snapshot
+    if (initialTotalEquity === 0 && currentTotalWallet > 0) {
+        initialTotalEquity = currentTotalWallet;
+    }
+
     market.totalEquity = currentTotalWallet;
+    market.equityProfit = initialTotalEquity > 0 ? (currentTotalWallet - initialTotalEquity) : 0;
+    
     const currentMirrorRoi = currentTotalWallet > 0 ? (totalPnl / currentTotalWallet) * 100 : 0;
 
     // 1. Check for Take Profit Target
@@ -180,8 +189,12 @@ app.get('/', (req, res) => {
         <div><h1 class="text-xl font-bold text-white uppercase tracking-tighter">ManualSync <span class="text-indigo-500">PRO</span></h1><p id="botStatus" class="text-xs text-zinc-500 font-bold uppercase"></p></div>
         <div class="flex gap-8 text-right">
             <div>
+                <p class="text-[10px] text-zinc-600 font-bold uppercase text-right">Start Profit</p>
+                <p id="equityProfit" class="font-mono text-emerald-400 font-bold text-right">+$0.00</p>
+            </div>
+            <div>
                 <p class="text-[10px] text-zinc-600 font-bold uppercase text-right">Total Equity</p>
-                <p id="totalEquity" class="font-mono text-emerald-400 font-bold text-right">$0.00</p>
+                <p id="totalEquity" class="font-mono text-white font-bold text-right">$0.00</p>
             </div>
             <div>
                 <p class="text-[10px] text-zinc-600 font-bold uppercase text-right">Spread / Price</p>
@@ -229,6 +242,9 @@ setInterval(async () => {
         document.getElementById('botStatus').innerText = d.market.status;
         document.getElementById('tpTarget').innerText = d.tp.toFixed(2) + '%';
         document.getElementById('totalEquity').innerText = '$' + d.market.totalEquity.toFixed(2);
+        document.getElementById('equityProfit').innerText = (d.market.equityProfit >= 0 ? '+' : '') + '$' + d.market.equityProfit.toFixed(2);
+        document.getElementById('equityProfit').className = 'font-mono font-bold text-right ' + (d.market.equityProfit >= 0 ? 'text-emerald-400' : 'text-rose-500');
+        
         let tP=0, tW=0, sumRoi=0;
         d.accounts.forEach((a, i) => {
             const pre = i === 0 ? 'long' : 'short';
