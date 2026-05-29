@@ -21,7 +21,7 @@ while (process.env[`HTX_API_KEY_${accountIndex}`]) {
 }
 
 const config = {
-    symbol: (process.env.SYMBOL || 'LUNA-USDT').toUpperCase(), // UPDATED TO LUNA
+    symbol: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase(), // UPDATED BACK TO SHIB
     leverage: parseInt(process.env.LEVERAGE) || 10,
     port: process.env.PORT || 3000,
     restHost: 'api.hbdm.com',
@@ -58,15 +58,12 @@ async function htxRequest(account, method, path, data = {}) {
     const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
-        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 5000 });
+        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 2000 });
         if (res.data.status !== 'ok') {
             console.log(`❌ [Acc ${account.accountId}] Error: ${res.data['err_msg'] || JSON.stringify(res.data)}`);
         }
         return res.data;
-    } catch (e) { 
-        console.log(`❌ [Acc ${account.accountId}] Request Failed: ${e.message}`);
-        return { status: 'error' }; 
-    }
+    } catch (e) { return { status: 'error' }; }
 }
 
 // ==================== CORE LOGIC ====================
@@ -110,17 +107,17 @@ function instantCheck() {
     const s2 = accountStates[config.accounts[1].accountId];
     if (s1.volume < 1 || s2.volume < 1) return;
 
-    // Instant PnL Math using Mark Price
+    // Instant PnL Math using WS price
     const side1 = s1.direction === 'buy' ? 1 : -1;
     const side2 = s2.direction === 'buy' ? 1 : -1;
     const p1 = (market.last - s1.avgPrice) * s1.volume * side1 * config.contractSize;
     const p2 = (market.last - s2.avgPrice) * s2.volume * side2 * config.contractSize;
     const currentPnL = p1 + p2;
 
-    // TARGET: Close the second the value hits green
-    if (currentPnL > 0.0001) {
+    // TRIGGER AT FIRST SIGHT OF GREEN
+    if (currentPnL > 0.00000001) {
         triggeredExit = true; 
-        console.log(`🚀 LUNA PROFIT DETECTED ($${currentPnL.toFixed(4)}). EXECUTING FORCE CLOSE.`);
+        console.log(`🚀 SHIB PROFIT DETECTED ($${currentPnL.toFixed(8)}). EXECUTING FORCE CLOSE.`);
         closeAll();
     }
 }
@@ -130,7 +127,7 @@ function tradeLoop() {
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
 
-    // Initialize 1v1 positions if empty
+    // Open initial 1v1 hedge
     if (s1.volume < 1 || s2.volume < 1) {
         isProcessing = true;
         Promise.all([
@@ -150,6 +147,7 @@ function tradeLoop() {
         market.status = "Sign Recovery...";
         targetAcc = (roi1Mag < roi2Mag) ? config.accounts[0] : config.accounts[1];
     } else if (syncProgress > 95) {
+        // Profit Push: Sync is perfect, so add to winner to push PnL green
         if ((s1.unrealizedUsdt + s2.unrealizedUsdt) <= 0) {
             market.status = "Profit Push...";
             targetAcc = (s1.roi > s2.roi) ? config.accounts[0] : config.accounts[1];
@@ -178,7 +176,6 @@ async function closeAll() {
         const closeVol = Math.floor(state.volume);
         
         if (closeVol > 0) {
-            console.log(`📡 Sending Close for Acc ${acc.accountId}: ${closeVol} LUNA ${state.direction === 'buy' ? 'SELL' : 'BUY'}`);
             htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, 
                 volume: closeVol, 
@@ -192,8 +189,8 @@ async function closeAll() {
         }
     });
 
-    // Wait for 30s to let exchange data settle before restarting
-    setTimeout(() => { triggeredExit = false; isProcessing = false; }, 30000);
+    // 20-second cooldown after exit
+    setTimeout(() => { triggeredExit = false; isProcessing = false; }, 20000);
 }
 
 // ==================== WS & DASHBOARD ====================
@@ -219,7 +216,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>AtomicSync Pro | LUNA</title>
+    <meta charset="UTF-8"><title>AtomicSync Pro | SHIB</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&display=swap" rel="stylesheet">
     <style>
@@ -231,15 +228,15 @@ app.get('/', (req, res) => {
 <body class="p-4 md:p-10">
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-8">
-            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white uppercase">Atomic<span class="text-indigo-500">Sync</span> LUNA</h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Active</p></div>
+            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white uppercase">Atomic<span class="text-indigo-500">Sync</span> SHIB</h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Active</p></div>
             <div class="flex gap-10 text-right">
-                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">LUNA Price</p><p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.0000</p></div>
-                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Growth</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.0000</p></div>
+                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Price</p><p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p></div>
+                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Profit Growth</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.0000</p></div>
             </div>
         </div>
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20 text-center">
             <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Mirror Delta)</p>
-            <h2 id="netProfit" class="text-6xl font-black mb-4 font-mono">+$0.0000</h2>
+            <h2 id="netProfit" class="text-6xl font-black mb-4 font-mono">+$0.00000000</h2>
             <div class="inline-flex items-center gap-2 bg-zinc-900 px-4 py-2 rounded-full border border-zinc-800">
                 <span class="text-[10px] font-bold text-zinc-500 uppercase">Mirroring Goal:</span><span id="syncPct" class="text-xs font-mono font-bold text-indigo-400">0%</span>
             </div>
@@ -248,12 +245,12 @@ app.get('/', (req, res) => {
             <div class="glass rounded-[2rem] p-6 border-l-4 border-emerald-500">
                 <div class="flex justify-between items-center mb-4"><span class="text-xs font-bold text-emerald-500 uppercase tracking-widest">Long Side (Acc 1)</span><span id="longRoi" class="text-xl font-black text-emerald-400">0.00%</span></div>
                 <div class="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden mb-4"><div id="longBar" class="roi-bar bg-emerald-500 h-full" style="width: 0%"></div></div>
-                <div class="flex justify-between items-center"><span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL</span><span id="longUsdt" class="text-sm font-mono font-bold text-white">0 / $0.0000</span></div>
+                <div class="flex justify-between items-center"><span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL (USDT)</span><span id="longUsdt" class="text-sm font-mono font-bold text-white">0 / $0.00000000</span></div>
             </div>
             <div class="glass rounded-[2rem] p-6 border-l-4 border-rose-500">
                 <div class="flex justify-between items-center mb-4"><span class="text-xs font-bold text-rose-500 uppercase tracking-widest">Short Side (Acc 2)</span><span id="shortRoi" class="text-xl font-black text-rose-400">0.00%</span></div>
                 <div class="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden mb-4"><div id="shortBar" class="roi-bar bg-rose-500 h-full" style="width: 0%"></div></div>
-                <div class="flex justify-between items-center"><span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL</span><span id="shortUsdt" class="text-sm font-mono font-bold text-white">0 / $0.0000</span></div>
+                <div class="flex justify-between items-center"><span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL (USDT)</span><span id="shortUsdt" class="text-sm font-mono font-bold text-white">0 / $0.00000000</span></div>
             </div>
         </div>
     </div>
@@ -261,20 +258,20 @@ app.get('/', (req, res) => {
         setInterval(async () => {
             try {
                 const r = await fetch('/api/status'); const d = await r.json();
-                document.getElementById('markPrice').innerText = d.market.last.toFixed(4);
+                document.getElementById('markPrice').innerText = d.market.last.toFixed(8);
                 document.getElementById('botStatus').innerText = d.market.status;
                 let tP = 0, tR = 0, rois = [];
                 d.accounts.forEach(a => {
                     const prefix = a.direction === 'buy' ? 'long' : 'short';
                     rois.push(a.roi); tP += a.unrealizedUsdt; tR += a.realizedProfit;
                     document.getElementById(prefix + 'Roi').innerText = (a.roi >= 0 ? '+' : '') + a.roi.toFixed(2) + '%';
-                    document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(4);
+                    document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(8);
                     document.getElementById(prefix + 'Bar').style.width = Math.min(100, Math.abs(a.roi) * 10) + '%';
                 });
                 const sScore = (rois[0] * rois[1] < 0) ? (Math.min(Math.abs(rois[0]), Math.abs(rois[1])) / Math.max(Math.abs(rois[0]), Math.abs(rois[1]))) * 100 : 0;
                 document.getElementById('syncPct').innerText = (isNaN(sScore) ? 0 : sScore.toFixed(1)) + '%';
                 document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(4);
-                document.getElementById('netProfit').innerText = (tP >= 0 ? '+' : '') + tP.toFixed(4);
+                document.getElementById('netProfit').innerText = (tP >= 0 ? '+' : '') + tP.toFixed(8);
                 document.getElementById('netProfit').className = 'text-6xl font-black mb-4 font-mono ' + (tP > 0 ? 'text-emerald-400' : 'text-zinc-400');
             } catch(e) {}
         }, 500);
