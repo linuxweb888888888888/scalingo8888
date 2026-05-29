@@ -35,7 +35,7 @@ const config = {
     profitRoiTarget: parseFloat(process.env.PROFIT_ROI_TARGET) || 0.40               
 };
 
-// ==================== GLOBAL STATE (AI ENHANCED) ====================
+// ==================== GLOBAL STATE ====================
 let market = { 
     last: 0, 
     spreadPct: 0, 
@@ -76,20 +76,11 @@ async function htxRequest(account, method, path, data = {}) {
 
 function updateAI() {
     if (market.priceHistory.length < 5) return;
-    const startPrice = market.priceHistory[0];
-    const endPrice = market.last;
-    const change = endPrice - startPrice;
-    
-    if (change > 0) market.sentiment = 'BULLISH';
-    else if (change < 0) market.sentiment = 'BEARISH';
-    else market.sentiment = 'STABLE';
-
+    const change = market.last - market.priceHistory[0];
+    market.sentiment = change > 0 ? 'BULLISH' : (change < 0 ? 'BEARISH' : 'STABLE');
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
-    const roiSum = s1.roi + s2.roi;
-
-    // AI Scaling: The worse the sum, the harder it trades
-    market.aggression = Math.min(3.5, 1.0 + (Math.abs(roiSum) * 5));
+    market.aggression = Math.min(3.5, 1.0 + (Math.abs(s1.roi + s2.roi) * 5));
 }
 
 async function restSync() {
@@ -118,6 +109,18 @@ function tradeLoop() {
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
 
+    // 1. URGENT PROFIT CHECK (PRIORITY #1)
+    const totalWallet = s1.wallet + s2.wallet;
+    const netPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
+    const currentMirrorRoi = (netPnL / totalWallet) * 100;
+
+    if (currentMirrorRoi >= config.profitRoiTarget && s1.volume > 0) {
+        market.status = "TARGET REACHED! EXITING...";
+        closeAll();
+        return;
+    }
+
+    // 2. ATOMIC OPEN
     if (s1.volume < 1 || s2.volume < 1) {
         isProcessing = true;
         Promise.all([
@@ -128,27 +131,23 @@ function tradeLoop() {
     }
 
     const roiSum = s1.roi + s2.roi;
-    const netPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
-    const aiAddSize = Math.floor(Math.max(30, (Math.max(s1.volume, s2.volume) * 0.12)) * market.aggression);
+    const volGap = s1.volume - s2.volume;
+    const aiAddSize = Math.floor(Math.max(50, (Math.max(s1.volume, s2.volume) * 0.15)) * market.aggression);
 
     let targetAcc = null;
 
-    if (roiSum < -config.roiTolerance) {
-        market.status = `AI: SYNCING ROI (${market.sentiment})`;
+    // 3. IMBALANCE GUARD (If one side is 2x the other, force sync)
+    if (Math.abs(volGap) > Math.min(s1.volume, s2.volume)) {
+        market.status = "GUARD: Correcting Volume Imbalance";
+        targetAcc = (volGap > 0) ? config.accounts[1] : config.accounts[0];
+    }
+    // 4. ROI REPAIR
+    else if (Math.abs(roiSum) > config.roiTolerance) {
+        market.status = `AI: Syncing ROI (${market.sentiment})`;
         if (market.sentiment === 'BULLISH') targetAcc = config.accounts[0];
         else if (market.sentiment === 'BEARISH') targetAcc = config.accounts[1];
         else targetAcc = (s1.roi < s2.roi) ? config.accounts[0] : config.accounts[1];
     } 
-    else if (netPnL < -config.pnlTolerance) {
-        market.status = "AI: REPAIRING PNL";
-        targetAcc = (s1.unrealizedUsdt < s2.unrealizedUsdt) ? config.accounts[0] : config.accounts[1];
-    }
-    else if ((netPnL / (s1.wallet + s2.wallet)) * 100 >= config.profitRoiTarget) {
-        closeAll();
-        return;
-    } else {
-        market.status = "AI: OPTIMIZED";
-    }
 
     if (targetAcc) {
         isProcessing = true;
@@ -161,15 +160,26 @@ function tradeLoop() {
 
 async function closeAll() {
     if (triggeredExit) return;
-    const s1 = accountStates[config.accounts[0].accountId];
-    const s2 = accountStates[config.accounts[1].accountId];
+    const s1 = { ...accountStates[config.accounts[0].accountId] };
+    const s2 = { ...accountStates[config.accounts[1].accountId] };
+    
     tradeHistory.unshift({ time: new Date().toLocaleTimeString(), longEntry: s1.avgPrice, shortEntry: s2.avgPrice, netPnl: s1.unrealizedUsdt + s2.unrealizedUsdt });
+    if (tradeHistory.length > 10) tradeHistory.pop();
+
     triggeredExit = true;
-    market.status = "AI: EXITING PROFIT";
-    config.accounts.forEach(acc => {
-        htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: accountStates[acc.accountId].volume, direction: accountStates[acc.accountId].direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' });
-    });
-    setTimeout(() => { triggeredExit = false; isProcessing = false; }, 10000);
+    market.status = "LIQUIDATING ALL...";
+    
+    for (const acc of config.accounts) {
+        const state = accountStates[acc.accountId];
+        if (state.volume > 0) {
+            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+                contract_code: config.symbol, volume: state.volume, 
+                direction: state.direction === 'buy' ? 'sell' : 'buy', 
+                offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
+            });
+        }
+    }
+    setTimeout(() => { triggeredExit = false; isProcessing = false; }, 15000);
 }
 
 // ==================== WS & DASHBOARD ====================
@@ -226,6 +236,13 @@ app.get('/', (req, res) => {
             <p id="shortUsdt" class="text-sm font-bold text-white">0 / $0.0000</p>
         </div>
     </div>
+    <!-- HISTORY TABLE RESTORED -->
+    <div class="glass rounded-[2.5rem] p-8"><h3 class="text-[10px] font-bold text-zinc-600 uppercase mb-4">Historical Analysis</h3>
+        <table class="w-full text-left text-[11px] font-mono">
+            <thead><tr class="text-zinc-500"><th>TIME</th><th>L-ENTRY</th><th>S-ENTRY</th><th class="text-right">PNL</th></tr></thead>
+            <tbody id="historyBody"></tbody>
+        </table>
+    </div>
 </div>
 <script>
 setInterval(async () => {
@@ -243,10 +260,11 @@ setInterval(async () => {
         });
         const netRoi = tW > 0 ? (tP / tW) * 100 : 0;
         document.getElementById('roiSum').innerText = sumRoi.toFixed(2) + '%';
-        document.getElementById('roiSum').className = 'text-lg font-bold ' + (Math.abs(sumRoi) < 0.05 ? 'text-emerald-400' : 'text-rose-500');
+        document.getElementById('roiSum').className = 'text-lg font-bold ' + (Math.abs(sumRoi) < 0.1 ? 'text-emerald-400' : 'text-rose-500');
         document.getElementById('netProfit').innerText = (tP >= 0 ? '+' : '') + tP.toFixed(8);
         document.getElementById('netRoi').innerText = 'MIRROR ROI: ' + (netRoi >= 0 ? '+' : '') + netRoi.toFixed(4) + '%';
         document.getElementById('netProfit').className = 'text-7xl font-black mb-1 font-mono ' + (tP >= 0 ? 'text-emerald-400' : 'text-rose-500');
+        document.getElementById('historyBody').innerHTML = d.history.map(h => `<tr class="border-b border-white/5"><td class="py-2 text-zinc-500">${h.time}</td><td class="text-zinc-300">${h.longEntry.toFixed(8)}</td><td class="text-zinc-300">${h.shortEntry.toFixed(8)}</td><td class="text-right font-bold ${h.netPnl >= 0 ? 'text-emerald-400' : 'text-rose-500'}">${h.netPnl.toFixed(4)}</td></tr>`).join('');
     } catch(e) {}
 }, 500);
 </script></body></html>`);
