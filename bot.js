@@ -28,17 +28,16 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     orderSize: 1,                
-    triggerRoi: 50,             // ROI Target to trigger an addition
-    addSize: 1,                  // Add 1 contract to winner
-    feeRate: 0.0006,             // Conservative fee estimate (0.06%)
-    contractSize: 0              
+    addSize: 1,                  // Add 1 contract at a time to balance
+    feeRate: 0.0006,             
+    contractSize: 0,
+    balanceThreshold: 0.00000001 // How close to "the same" we want the PnL
 };
 
 // ==================== GLOBAL STATE ====================
 let market = { last: 0, status: 'initializing' };
 let accountStates = {};
 let isProcessing = false;
-let hasAddedThisCycle = false; 
 
 config.accounts.forEach((account, idx) => {
     accountStates[account.accountId] = {
@@ -111,85 +110,59 @@ async function tradeLoop() {
     const s1 = accountStates[acc1.accountId];
     const s2 = accountStates[acc2.accountId];
 
-    // 1. OPEN INITIAL HEDGE (1v1)
+    // 1. OPEN INITIAL 1v1 HEDGE
     if (s1.volume < 1 || s2.volume < 1) {
         isProcessing = true;
-        market.status = 'Opening Hedge...';
+        market.status = 'Opening Initial Hedge...';
         const tasks = [];
         if (s1.volume < 1) tasks.push(htxRequest(acc1, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' }));
         if (s2.volume < 1) tasks.push(htxRequest(acc2, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' }));
         await Promise.all(tasks);
-        hasAddedThisCycle = false;
         setTimeout(() => { isProcessing = false; }, 3000);
         return;
     }
 
-    // 2. CALCULATE NET PROFIT
-    const totalVol = s1.volume + s2.volume;
-    const estExitFees = (totalVol * config.contractSize * market.last) * config.feeRate;
-    const combinedPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
-    const netProfit = combinedPnL - estExitFees;
+    // 2. CALCULATE PNL DIFFERENCE (Net balance)
+    const pnl1 = s1.unrealizedUsdt;
+    const pnl2 = s2.unrealizedUsdt;
+    const pnlCombined = pnl1 + pnl2; // If zero, they are mirror images (e.g. 0.0004 + -0.0004 = 0)
 
-    // 3. EXIT TRIGGER (Close if net profit > 0 and we have added size)
-    if (netProfit > 0 && totalVol > (config.orderSize * 2)) {
-        market.status = `EXITING: +$${netProfit.toFixed(8)}`;
-        console.log(`✅ Profit Target Met: $${netProfit}. Executing Close All.`);
-        await closeAll();
-        return;
-    }
+    // 3. ADJUSTMENT LOGIC
+    // We check if the sum is significantly different from zero
+    if (Math.abs(pnlCombined) > config.balanceThreshold) {
+        let targetAcc = null;
 
-    // 4. ADD ONE CONTRACT EACH TIME TO THE SIDE BRINGING UP PROFIT
-    let winnerAcc = null;
-    if (s1.roi >= config.triggerRoi && s1.unrealizedUsdt > s2.unrealizedUsdt) {
-        winnerAcc = acc1;
-    } else if (s2.roi >= config.triggerRoi && s2.unrealizedUsdt > s1.unrealizedUsdt) {
-        winnerAcc = acc2;
-    }
-
-    if (winnerAcc) {
-        isProcessing = true; // Prevent spamming multiple orders in one go
-        market.status = `Scaling into profit...`;
-        const result = await htxRequest(winnerAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-            contract_code: config.symbol, 
-            volume: config.addSize, 
-            direction: accountStates[winnerAcc.accountId].direction, 
-            offset: 'open', 
-            lever_rate: config.leverage, 
-            order_price_type: 'optimal_5' 
-        });
-
-        if (result && result.status === 'ok') {
-            console.log(`🚀 Added ${config.addSize} contract to help bring up net profit.`);
-            hasAddedThisCycle = true;
+        // If pnlCombined is positive, side 1 (Long) is "winning more" than side 2 (Short) is losing.
+        // Or Side 2 is "losing more" than side 1 is winning.
+        // We add 1 contract to the account with the SMALLER ABSOLUTE PnL to help it catch up.
+        if (Math.abs(pnl1) < Math.abs(pnl2)) {
+            targetAcc = acc1;
+        } else {
+            targetAcc = acc2;
         }
-        // Wait 5 seconds for sync to update ROI before allowing another addition
-        setTimeout(() => { isProcessing = false; }, 5000);
-    } else {
-        market.status = `Running: Waiting ${config.triggerRoi}%`;
-    }
-}
 
-async function closeAll() {
-    isProcessing = true;
-    console.log("🚀 SENDING MARKET CLOSE ORDERS...");
-    await Promise.all(config.accounts.map(acc => {
-        const state = accountStates[acc.accountId];
-        const contractCount = Math.floor(state.volume);
-        
-        if (contractCount > 0) {
-            return htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+        if (targetAcc) {
+            isProcessing = true;
+            const targetState = accountStates[targetAcc.accountId];
+            market.status = `Balancing: Adding 1 to ${targetState.direction}...`;
+            
+            console.log(`⚖️ Balancing PnL: Acc1(${pnl1.toFixed(8)}) Acc2(${pnl2.toFixed(8)}). Adding to ${targetState.direction}`);
+            
+            await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, 
-                volume: contractCount, 
-                direction: state.direction === 'buy' ? 'sell' : 'buy', 
-                offset: 'close', 
+                volume: config.addSize, 
+                direction: targetState.direction, 
+                offset: 'open', 
                 lever_rate: config.leverage, 
                 order_price_type: 'optimal_5' 
             });
+
+            // Wait for sync to catch the new average price before checking again
+            setTimeout(() => { isProcessing = false; }, 4000);
         }
-        return Promise.resolve();
-    }));
-    hasAddedThisCycle = false;
-    setTimeout(() => { isProcessing = false; }, 5000);
+    } else {
+        market.status = "Perfectly Balanced";
+    }
 }
 
 // ==================== WS & DASHBOARD ====================
@@ -207,46 +180,45 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), config, hasAddedThisCycle }));
+app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), config }));
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>AtomicSync Pro</title>
+    <meta charset="UTF-8"><title>AtomicSync Mirror</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&display=swap" rel="stylesheet">
     <style>
         body { font-family: 'Plus Jakarta Sans', sans-serif; background: #09090b; color: #fafafa; }
         .glass { background: rgba(24, 24, 27, 0.8); backdrop-filter: blur(12px); border: 1px solid rgba(63, 63, 70, 0.5); }
-        .roi-bar { transition: width 0.4s ease; }
     </style>
 </head>
 <body class="p-4 md:p-10">
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-8">
-            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Running...</p></div>
-            <div class="flex gap-10 text-right">
-                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p><p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p></div>
-                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Total Equity Growth</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.00000000</p></div>
+            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Mirror Mode Active</p></div>
+            <div class="text-right">
+                <p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p>
+                <p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p>
             </div>
         </div>
-        <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20 text-center">
-            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (All Fees Included)</p>
-            <h2 id="netProfit" class="text-6xl font-black mb-4 font-mono">+$0.00000000</h2>
-            <div class="inline-flex items-center gap-2 bg-zinc-900 px-4 py-2 rounded-full border border-zinc-800">
-                <span class="text-[10px] font-bold text-zinc-500 uppercase">Scale Active:</span><span id="addFlag" class="text-xs font-mono font-bold text-indigo-400">Yes (Multi-Add)</span>
-            </div>
+        
+        <div class="glass rounded-[2.5rem] p-8 mb-8 text-center border-indigo-500/20">
+            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">PnL Combined (Gap to Zero)</p>
+            <h2 id="netProfit" class="text-6xl font-black mb-4 font-mono">0.00000000</h2>
+            <p class="text-zinc-400 text-sm">Bot is adding 1 contract at a time to keep accounts mirrored.</p>
         </div>
+
         <div class="grid md:grid-cols-2 gap-6">
             <div class="glass rounded-[2rem] p-6 border-l-4 border-emerald-500">
-                <div class="flex justify-between items-center mb-4"><span class="text-xs font-bold text-emerald-500 uppercase tracking-widest">Long Side (Acc 1)</span><span id="longRoi" class="text-xl font-black text-emerald-400">0.00%</span></div>
-                <div class="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden mb-4"><div id="longBar" class="roi-bar bg-emerald-500 h-full" style="width: 0%"></div></div>
-                <div class="flex justify-between items-center"><span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL (USDT)</span><span id="longUsdt" class="text-sm font-mono font-bold text-white">0 / $0.00000000</span></div>
+                <span class="text-xs font-bold text-emerald-500 uppercase tracking-widest">Account 1 (Long)</span>
+                <div id="longUsdt" class="text-2xl font-mono font-bold mt-2 text-white">$0.00000000</div>
+                <div id="longVol" class="text-xs text-zinc-500 mt-1">Size: 0 contracts</div>
             </div>
             <div class="glass rounded-[2rem] p-6 border-l-4 border-rose-500">
-                <div class="flex justify-between items-center mb-4"><span class="text-xs font-bold text-rose-500 uppercase tracking-widest">Short Side (Acc 2)</span><span id="shortRoi" class="text-xl font-black text-rose-400">0.00%</span></div>
-                <div class="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden mb-4"><div id="shortBar" class="roi-bar bg-rose-500 h-full" style="width: 0%"></div></div>
-                <div class="flex justify-between items-center"><span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL (USDT)</span><span id="shortUsdt" class="text-sm font-mono font-bold text-white">0 / $0.00000000</span></div>
+                <span class="text-xs font-bold text-rose-500 uppercase tracking-widest">Account 2 (Short)</span>
+                <div id="shortUsdt" class="text-2xl font-mono font-bold mt-2 text-white">$0.00000000</div>
+                <div id="shortVol" class="text-xs text-zinc-500 mt-1">Size: 0 contracts</div>
             </div>
         </div>
     </div>
@@ -256,21 +228,16 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('markPrice').innerText = d.market.last.toFixed(8);
                 document.getElementById('botStatus').innerText = d.market.status;
-                let tC = 0, tP = 0, tR = 0;
+                let sum = 0;
                 d.accounts.forEach(a => {
                     const prefix = a.direction === 'buy' ? 'long' : 'short';
-                    document.getElementById(prefix + 'Roi').innerText = a.roi.toFixed(2) + '%';
-                    document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(8);
-                    document.getElementById(prefix + 'Bar').style.width = Math.min(100, Math.abs(a.roi) * (100 / d.config.triggerRoi)) + '%';
-                    tC += a.volume; tP += a.unrealizedUsdt; tR += a.realizedProfit;
+                    document.getElementById(prefix + 'Usdt').innerText = (a.unrealizedUsdt >= 0 ? '+' : '') + a.unrealizedUsdt.toFixed(8);
+                    document.getElementById(prefix + 'Vol').innerText = 'Size: ' + a.volume + ' contracts';
+                    sum += a.unrealizedUsdt;
                 });
-                document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(8);
-                const cSize = d.config.contractSize || 1;
-                const realNotional = tC * cSize * d.market.last;
-                const projected = tP - (realNotional * d.config.feeRate);
-                const pElem = document.getElementById('netProfit');
-                pElem.innerText = (projected >= 0 ? '+' : '') + '$' + projected.toFixed(8);
-                pElem.className = 'text-6xl font-black mb-4 font-mono ' + (projected >= 0 ? 'text-emerald-400' : 'text-rose-500');
+                const nElem = document.getElementById('netProfit');
+                nElem.innerText = (sum >= 0 ? '+' : '') + sum.toFixed(8);
+                nElem.className = 'text-6xl font-black mb-4 font-mono ' + (Math.abs(sum) < 0.00001 ? 'text-indigo-400' : 'text-zinc-400');
             } catch(e) {}
         }
         setInterval(update, 1000);
@@ -280,4 +247,4 @@ app.get('/', (req, res) => {
 });
 
 startWS(); setInterval(sync, 2000); setInterval(tradeLoop, 3000); app.listen(config.port, '0.0.0.0');
-console.log(`AtomicSync Dashboard Running on Port ${config.port}`);
+console.log(`Mirror Sync Running on Port ${config.port}`);
