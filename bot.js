@@ -33,13 +33,14 @@ const config = {
     contractSize: 0,
     roiThreshold: 0.1,           
     maxVolGap: 500,
-    maxSpreadPct: 0.05, // Only open if spread < 0.05%
+    maxSpreadPct: 0.05, 
     profitRoiTarget: parseFloat(process.env.PROFIT_ROI_TARGET) || 0.25               
 };
 
 // ==================== GLOBAL STATE ====================
 let market = { last: 0, spreadPct: 0, status: 'initializing' };
 let accountStates = {};
+let tradeHistory = []; // STORE CLOSED TRADES HERE
 let isProcessing = false;
 let triggeredExit = false; 
 
@@ -85,7 +86,6 @@ async function restSync() {
             if (pos && parseFloat(pos.volume) > 0) {
                 state.avgPrice = parseFloat(pos.cost_hold);
                 state.volume = Math.floor(parseFloat(pos.volume));
-                // DIRECT FROM EXCHANGE ROI
                 state.roi = parseFloat(pos.profit_rate) * 100;
                 state.unrealizedUsdt = parseFloat(pos.profit);
             } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.avgPrice = 0; }
@@ -102,18 +102,13 @@ async function restSync() {
 
 function instantCheck() {
     if (triggeredExit || market.last === 0 || config.contractSize === 0) return;
-
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
     if (s1.volume < 1 || s2.volume < 1) return;
-
-    // Use exchange ROI for logic if available, otherwise fallback to tick math for speed
     const totalWallet = s1.wallet + s2.wallet;
     const currentCombinedRoi = totalWallet > 0 ? ((s1.unrealizedUsdt + s2.unrealizedUsdt) / totalWallet) * 100 : 0;
-
     if (currentCombinedRoi >= config.profitRoiTarget) {
         triggeredExit = true; 
-        console.log(`💰 ROI TARGET MET (${currentCombinedRoi.toFixed(4)}%). FIRING EXIT.`);
         closeAll();
     }
 }
@@ -123,13 +118,11 @@ function tradeLoop() {
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
 
-    // SPREAD PROTECTION ON OPENING
     if (s1.volume < 1 || s2.volume < 1) {
         if (market.spreadPct > config.maxSpreadPct) {
             market.status = `High Spread: ${market.spreadPct.toFixed(4)}%`;
             return;
         }
-
         isProcessing = true;
         Promise.all([
             s1.volume < 1 ? htxRequest(config.accounts[0], 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' }) : null,
@@ -168,19 +161,31 @@ function tradeLoop() {
 }
 
 async function closeAll() {
+    // SNAPSHOT FOR HISTORY
+    const s1 = accountStates[config.accounts[0].accountId];
+    const s2 = accountStates[config.accounts[1].accountId];
+    if (s1.volume > 0 || s2.volume > 0) {
+        tradeHistory.unshift({
+            time: new Date().toLocaleTimeString(),
+            longEntry: s1.avgPrice,
+            shortEntry: s2.avgPrice,
+            longRoi: s1.roi,
+            shortRoi: s2.roi,
+            netPnl: s1.unrealizedUsdt + s2.unrealizedUsdt
+        });
+        if (tradeHistory.length > 10) tradeHistory.pop();
+    }
+
     triggeredExit = true;
     market.status = "CLOSE ORDER SENT";
     config.accounts.forEach(acc => {
         const state = accountStates[acc.accountId];
         if (state.volume > 0) {
             htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, 
-                volume: state.volume, 
+                contract_code: config.symbol, volume: state.volume, 
                 direction: state.direction === 'buy' ? 'sell' : 'buy', 
-                offset: 'close', 
-                lever_rate: config.leverage, 
-                order_price_type: 'optimal_5' 
-            }).then(res => console.log(`Account ${acc.accountId} close result: ${res.status}`));
+                offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
+            });
         }
     });
     setTimeout(() => { triggeredExit = false; isProcessing = false; }, 20000);
@@ -195,8 +200,7 @@ function startWS() {
             if (err) return;
             const msg = JSON.parse(dec.toString());
             if (msg.tick) {
-                const bid = msg.tick.bid[0];
-                const ask = msg.tick.ask[0];
+                const bid = msg.tick.bid[0]; const ask = msg.tick.ask[0];
                 market.last = (bid + ask) / 2;
                 market.spreadPct = ((ask - bid) / bid) * 100;
                 instantCheck(); 
@@ -207,11 +211,8 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), config }));
-app.post('/api/close', async (req, res) => {
-    await closeAll();
-    res.json({ status: 'ok' });
-});
+app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), history: tradeHistory, config }));
+app.post('/api/close', async (req, res) => { await closeAll(); res.json({ status: 'ok' }); });
 
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
@@ -224,47 +225,76 @@ app.get('/', (req, res) => {
         body { font-family: 'Plus Jakarta Sans', sans-serif; background: #09090b; color: #fafafa; }
         .glass { background: rgba(24, 24, 27, 0.8); backdrop-filter: blur(12px); border: 1px solid rgba(63, 63, 70, 0.5); }
         .roi-bar { transition: width 0.4s ease; }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 10px; }
     </style>
 </head>
 <body class="p-4 md:p-10">
     <div class="max-w-4xl mx-auto">
+        <!-- TOP BAR -->
         <div class="flex justify-between items-center mb-8">
             <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Running...</p></div>
             <div class="flex gap-8 text-right">
                 <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Spread</p><p id="marketSpread" class="text-lg font-mono font-bold text-amber-400">0.0000%</p></div>
                 <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p><p id="markPrice" class="text-lg font-mono font-bold text-indigo-400">0.00000000</p></div>
-                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Equity Growth</p><p id="totalRealized" class="text-lg font-mono font-bold text-emerald-400">+$0.00</p></div>
             </div>
         </div>
+
+        <!-- MAIN PROFIT PANEL -->
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20 text-center">
             <button onclick="triggerClose()" class="absolute top-4 right-4 bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-black px-4 py-2 rounded-full transition-all active:scale-95">CLOSE ALL</button>
-            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Mirror Delta)</p>
+            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit</p>
             <h2 id="netProfit" class="text-6xl font-black mb-1 font-mono">+$0.00000000</h2>
             <p id="netRoi" class="text-lg font-bold text-indigo-400 mb-4 font-mono">ROI: 0.0000%</p>
             <div class="inline-flex items-center gap-2 bg-zinc-900 px-4 py-2 rounded-full border border-zinc-800">
                 <span class="text-[10px] font-bold text-zinc-500 uppercase">Mirroring Goal:</span><span id="syncPct" class="text-xs font-mono font-bold text-indigo-400">0%</span>
             </div>
         </div>
-        <div class="grid md:grid-cols-2 gap-6">
+
+        <!-- ACCOUNT GRID -->
+        <div class="grid md:grid-cols-2 gap-6 mb-8">
             <div class="glass rounded-[2rem] p-6 border-l-4 border-emerald-500">
-                <div class="flex justify-between items-center mb-2"><span class="text-xs font-bold text-emerald-500 uppercase tracking-widest">Long Side (Acc 1)</span><span id="longRoi" class="text-xl font-black text-emerald-400">0.00%</span></div>
+                <div class="flex justify-between items-center mb-2"><span class="text-xs font-bold text-emerald-500 uppercase tracking-widest">Long Side</span><span id="longRoi" class="text-xl font-black text-emerald-400">0.00%</span></div>
                 <div class="mb-4"><p class="text-[10px] text-zinc-500 font-bold uppercase">Entry Price</p><p id="longEntry" class="text-sm font-mono font-bold text-zinc-300">0.00000000</p></div>
                 <div class="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden mb-4"><div id="longBar" class="roi-bar bg-emerald-500 h-full" style="width: 0%"></div></div>
-                <div class="flex justify-between items-center"><span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL (USDT)</span><span id="longUsdt" class="text-sm font-mono font-bold text-white">0 / $0.00000000</span></div>
+                <div class="flex justify-between items-center"><span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL (USDT)</span><span id="longUsdt" class="text-sm font-mono font-bold text-white">0 / $0.00</span></div>
             </div>
             <div class="glass rounded-[2rem] p-6 border-l-4 border-rose-500">
-                <div class="flex justify-between items-center mb-2"><span class="text-xs font-bold text-rose-500 uppercase tracking-widest">Short Side (Acc 2)</span><span id="shortRoi" class="text-xl font-black text-rose-400">0.00%</span></div>
+                <div class="flex justify-between items-center mb-2"><span class="text-xs font-bold text-rose-500 uppercase tracking-widest">Short Side</span><span id="shortRoi" class="text-xl font-black text-rose-400">0.00%</span></div>
                 <div class="mb-4"><p class="text-[10px] text-zinc-500 font-bold uppercase">Entry Price</p><p id="shortEntry" class="text-sm font-mono font-bold text-zinc-300">0.00000000</p></div>
                 <div class="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden mb-4"><div id="shortBar" class="roi-bar bg-rose-500 h-full" style="width: 0%"></div></div>
-                <div class="flex justify-between items-center"><span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL (USDT)</span><span id="shortUsdt" class="text-sm font-mono font-bold text-white">0 / $0.00000000</span></div>
+                <div class="flex justify-between items-center"><span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL (USDT)</span><span id="shortUsdt" class="text-sm font-mono font-bold text-white">0 / $0.00</span></div>
+            </div>
+        </div>
+
+        <!-- CLOSED TRADES HISTORY -->
+        <div class="glass rounded-[2rem] p-6 overflow-hidden">
+            <div class="flex justify-between items-center mb-6">
+                <h3 class="text-xs font-bold text-zinc-400 uppercase tracking-[0.2em]">Closed Trade History (Last 10)</h3>
+                <div class="text-[10px] text-zinc-600 font-bold uppercase">Realized Profit: <span id="totalRealized" class="text-emerald-500 ml-1">+$0.00</span></div>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-[11px] font-mono">
+                    <thead class="text-zinc-600 border-b border-zinc-800/50">
+                        <tr>
+                            <th class="pb-3">TIME</th>
+                            <th class="pb-3">L-ENTRY</th>
+                            <th class="pb-3">S-ENTRY</th>
+                            <th class="pb-3">L-ROI</th>
+                            <th class="pb-3">S-ROI</th>
+                            <th class="pb-3 text-right">NET PNL</th>
+                        </tr>
+                    </thead>
+                    <tbody id="historyBody" class="text-zinc-400">
+                        <!-- Rows injected here -->
+                    </tbody>
+                </table>
             </div>
         </div>
     </div>
+
     <script>
-        async function triggerClose() {
-            if(!confirm("Close all positions immediately?")) return;
-            await fetch('/api/close', { method: 'POST' });
-        }
+        async function triggerClose() { if(confirm("Close all positions?")) await fetch('/api/close', { method: 'POST' }); }
 
         setInterval(async () => {
             try {
@@ -273,22 +303,38 @@ app.get('/', (req, res) => {
                 document.getElementById('marketSpread').innerText = d.market.spreadPct.toFixed(4) + '%';
                 document.getElementById('marketSpread').className = 'text-lg font-mono font-bold ' + (d.market.spreadPct > 0.05 ? 'text-rose-500' : 'text-emerald-400');
                 document.getElementById('botStatus').innerText = d.market.status;
+                
                 let tP = 0, tR = 0, tW = 0, rois = [];
                 d.accounts.forEach(a => {
                     const prefix = a.direction === 'buy' ? 'long' : 'short';
                     rois.push(a.roi); tP += a.unrealizedUsdt; tR += a.realizedProfit; tW += a.wallet;
                     document.getElementById(prefix + 'Roi').innerText = (a.roi >= 0 ? '+' : '') + a.roi.toFixed(2) + '%';
                     document.getElementById(prefix + 'Entry').innerText = a.avgPrice.toFixed(8);
-                    document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(8);
+                    document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(4);
                     document.getElementById(prefix + 'Bar').style.width = Math.min(100, Math.abs(a.roi) * 10) + '%';
                 });
+
                 const netRoi = tW > 0 ? (tP / tW) * 100 : 0;
                 const sScore = (rois[0] * rois[1] < 0) ? (Math.min(Math.abs(rois[0]), Math.abs(rois[1])) / Math.max(Math.abs(rois[0]), Math.abs(rois[1]))) * 100 : 0;
                 document.getElementById('syncPct').innerText = (isNaN(sScore) ? 0 : sScore.toFixed(1)) + '%';
-                document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(2);
+                document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(4);
                 document.getElementById('netProfit').innerText = (tP >= 0 ? '+' : '') + tP.toFixed(8);
                 document.getElementById('netRoi').innerText = 'ROI: ' + (netRoi >= 0 ? '+' : '') + netRoi.toFixed(4) + '%';
                 document.getElementById('netProfit').className = 'text-6xl font-black mb-1 font-mono ' + (tP > 0 ? 'text-emerald-400' : 'text-zinc-400');
+
+                // HISTORY TABLE UPDATE
+                const historyHtml = d.history.map(h => \`
+                    <tr class="border-b border-zinc-900/50">
+                        <td class="py-3 text-zinc-500">\${h.time}</td>
+                        <td class="py-3 text-zinc-300">\${h.longEntry.toFixed(8)}</td>
+                        <td class="py-3 text-zinc-300">\${h.shortEntry.toFixed(8)}</td>
+                        <td class="py-3 \${h.longRoi >= 0 ? 'text-emerald-500' : 'text-rose-500'}">\${h.longRoi.toFixed(2)}%</td>
+                        <td class="py-3 \${h.shortRoi >= 0 ? 'text-emerald-500' : 'text-rose-500'}">\${h.shortRoi.toFixed(2)}%</td>
+                        <td class="py-3 text-right font-bold \${h.netPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}">\${h.netPnl >= 0 ? '+' : ''}\${h.netPnl.toFixed(4)}</td>
+                    </tr>
+                \`).join('');
+                document.getElementById('historyBody').innerHTML = historyHtml;
+
             } catch(e) {}
         }, 500);
     </script>
