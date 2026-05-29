@@ -102,6 +102,7 @@ async function tradeLoop() {
     const s1 = accountStates[acc1.accountId];
     const s2 = accountStates[acc2.accountId];
 
+    // 1. Ensure Hedge is open
     if (s1.volume < 1 || s2.volume < 1) {
         isProcessing = true;
         if (s1.volume < 1) await htxRequest(acc1, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' });
@@ -110,34 +111,32 @@ async function tradeLoop() {
         return;
     }
 
-    // 1. CALCULATE EXIT CONDITIONS
+    // 2. Metrics for Exit and Progress
     const roi1Mag = Math.abs(s1.roi);
     const roi2Mag = Math.abs(s2.roi);
     const minRoi = Math.min(roi1Mag, roi2Mag);
     const maxRoi = Math.max(roi1Mag, roi2Mag);
     const syncProgress = maxRoi === 0 ? 0 : (minRoi / maxRoi) * 100;
+    const combinedPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
 
-    const totalVol = s1.volume + s2.volume;
-    const estExitFees = (totalVol * config.contractSize * market.last) * config.feeRate;
-    const netProfit = (s1.unrealizedUsdt + s2.unrealizedUsdt) - estExitFees;
-
-    // 2. PROFIT EXIT TRIGGER
-    if (netProfit > 0 && syncProgress > 95) {
-        market.status = `PROFIT TARGET MET: $${netProfit.toFixed(8)} @ ${syncProgress.toFixed(1)}%`;
-        console.log(`💰 EXIT CONDITION MET: Net Profit $${netProfit.toFixed(8)}, Sync ${syncProgress.toFixed(1)}%. Closing All.`);
+    // 3. EXIT CONDITION (Combined PnL > 0 AND Sync > 95%)
+    if (combinedPnL > 0 && syncProgress >= 95) {
+        market.status = `EXITING: +$${combinedPnL.toFixed(8)} @ ${syncProgress.toFixed(1)}%`;
         await closeAll();
         return;
     }
 
-    // 3. PRECISE SYNC LOGIC
+    // 4. PRECISE MIRROR SYNC LOGIC
     const roiDiff = Math.abs(roi1Mag - roi2Mag);
     if (roiDiff > config.roiThreshold) {
         const targetAccIdx = roi1Mag > roi2Mag ? 0 : 1;
         const anchorAccIdx = targetAccIdx === 0 ? 1 : 0;
+        
         const targetAcc = config.accounts[targetAccIdx];
         const targetState = accountStates[targetAcc.accountId];
         const anchorState = accountStates[config.accounts[anchorAccIdx].accountId];
 
+        // Calc amount to move Entry Price to the Anchor's ROI level
         const sideFactor = targetState.direction === 'buy' ? 1 : -1;
         const targetRoiDecimal = Math.abs(anchorState.roi) / (config.leverage * 100);
         const pTarget = market.last / (1 + (sideFactor * targetRoiDecimal));
@@ -147,7 +146,7 @@ async function tradeLoop() {
         amountToAdd = Math.min(amountToAdd, config.maxSyncBatch); 
 
         isProcessing = true;
-        market.status = `Balancing: Adding ${amountToAdd}...`;
+        market.status = `Syncing: Adding ${amountToAdd} to ${targetState.direction}`;
         await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
             contract_code: config.symbol, volume: amountToAdd, direction: targetState.direction, 
             offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
@@ -160,23 +159,21 @@ async function tradeLoop() {
 
 async function closeAll() {
     isProcessing = true;
-    console.log("🚀 EXECUTING PROFIT EXIT...");
+    console.log("🚀 PROFIT TARGET HIT. CLOSING ALL POSITIONS...");
     await Promise.all(config.accounts.map(acc => {
         const state = accountStates[acc.accountId];
         if (state.volume > 0) {
             return htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, 
-                volume: state.volume, 
+                contract_code: config.symbol, volume: state.volume, 
                 direction: state.direction === 'buy' ? 'sell' : 'buy', 
-                offset: 'close', 
-                lever_rate: config.leverage, 
-                order_price_type: 'optimal_5' 
+                offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
             });
         }
     }));
-    setTimeout(() => { isProcessing = false; }, 10000); // 10s wait after exit
+    setTimeout(() => { isProcessing = false; }, 10000);
 }
 
+// ==================== WS & DASHBOARD ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -219,7 +216,7 @@ app.get('/', (req, res) => {
             <h2 id="netProfit" class="text-6xl font-black mb-6 font-mono">+$0.00000000</h2>
             <div class="max-w-md mx-auto mb-2">
                 <div class="flex justify-between text-[10px] font-bold uppercase text-zinc-500 mb-2">
-                    <span>Sync Progress (Exit Goal: 95%+)</span>
+                    <span>Sync Progress (Goal: 95%+)</span>
                     <span id="syncPct">0%</span>
                 </div>
                 <div class="w-full bg-zinc-900 h-3 rounded-full border border-zinc-800 overflow-hidden p-0.5">
@@ -244,26 +241,22 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('markPrice').innerText = d.market.last.toFixed(8);
                 document.getElementById('botStatus').innerText = d.market.status;
-                let tC = 0, tP = 0, tR = 0, rois = [];
+                let tP = 0, tR = 0, rois = [];
                 d.accounts.forEach(a => {
                     const prefix = a.direction === 'buy' ? 'long' : 'short';
                     rois.push(Math.abs(a.roi));
                     document.getElementById(prefix + 'Roi').innerText = (a.roi >= 0 ? '+' : '') + a.roi.toFixed(2) + '%';
                     document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(8);
-                    tP += a.unrealizedUsdt; tR += a.realizedProfit; tC += a.volume;
+                    tP += a.unrealizedUsdt; tR += a.realizedProfit;
                 });
                 const minRoi = Math.min(...rois); const maxRoi = Math.max(...rois);
                 const syncScore = maxRoi === 0 ? 0 : (minRoi / maxRoi) * 100;
                 document.getElementById('syncBar').style.width = syncScore.toFixed(0) + '%';
                 document.getElementById('syncPct').innerText = syncScore.toFixed(1) + '%';
                 document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(8);
-                
-                const cSize = d.config.contractSize || 1;
-                const estFees = (tC * cSize * d.market.last) * d.config.feeRate;
-                const netProfit = tP - estFees;
                 const pElem = document.getElementById('netProfit');
-                pElem.innerText = (netProfit >= 0 ? '+' : '') + netProfit.toFixed(8);
-                pElem.className = 'text-6xl font-black mb-6 font-mono ' + (netProfit >= 0 && syncScore > 95 ? 'text-indigo-400' : 'text-zinc-400');
+                pElem.innerText = (tP >= 0 ? '+' : '') + tP.toFixed(8);
+                pElem.className = 'text-6xl font-black mb-6 font-mono ' + (tP >= 0 && syncScore >= 95 ? 'text-emerald-400' : 'text-zinc-400');
             } catch(e) {}
         }
         setInterval(update, 1000);
