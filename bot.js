@@ -34,7 +34,7 @@ const config = {
     roiThreshold: 0.1,           
     maxVolGap: 500,
     maxSpreadPct: 0.05, 
-    profitRoiTarget: parseFloat(process.env.PROFIT_ROI_TARGET) || 0.01               
+    profitRoiTarget: parseFloat(process.env.PROFIT_ROI_TARGET) || 0.025               
 };
 
 // ==================== GLOBAL STATE ====================
