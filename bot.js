@@ -28,11 +28,11 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     orderSize: 1,                
-    addSize: 1,                  // Add 1 contract to sync
+    addSize: 1,                  // Adding 1 to balance
     feeRate: 0.0006,             
     contractSize: 0,
-    roiThreshold: 0.5,           // Sync if ROI difference is > 0.5%
-    pnlThreshold: 0.00001        // Sync if PnL difference is > 0.00001
+    roiThreshold: 0.1,           // Tightened: Sync if ROI diff > 0.1%
+    pnlThreshold: 0.000005       // Tightened: Sync if PnL diff > 0.000005
 };
 
 // ==================== GLOBAL STATE ====================
@@ -58,12 +58,8 @@ async function htxRequest(account, method, path, data = {}) {
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
         const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 5000 });
-        if (res.data.status !== 'ok') console.log(`❌ HTX ERROR: ${JSON.stringify(res.data)}`);
         return res.data;
-    } catch (e) { 
-        console.log(`❌ REQUEST FAILED: ${e.message}`);
-        return { status: 'error' }; 
-    }
+    } catch (e) { return { status: 'error' }; }
 }
 
 // ==================== CORE LOGIC ====================
@@ -80,7 +76,6 @@ async function sync() {
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
-        
         if (res?.status === 'ok' && res.data) {
             const pos = res.data.find(p => p.direction === state.direction);
             if (pos && parseFloat(pos.volume) > 0) {
@@ -89,14 +84,6 @@ async function sync() {
                 state.unrealizedUsdt = parseFloat(pos.profit);
                 state.roi = parseFloat(pos.profit_rate) * 100;
             } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
-        }
-
-        const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
-        if (accRes?.status === 'ok' && accRes.data) {
-            const equity = parseFloat(accRes.data[0].margin_balance);
-            if (state.initialBalance === 0) state.initialBalance = equity;
-            state.wallet = equity;
-            state.realizedProfit = equity - state.initialBalance;
         }
     }
 }
@@ -109,41 +96,39 @@ async function tradeLoop() {
     const s1 = accountStates[acc1.accountId];
     const s2 = accountStates[acc2.accountId];
 
-    // 1. OPEN INITIAL 1v1 HEDGE
+    // 1. Ensure initial positions exist
     if (s1.volume < 1 || s2.volume < 1) {
         isProcessing = true;
-        market.status = 'Initializing Sync...';
-        const tasks = [];
-        if (s1.volume < 1) tasks.push(htxRequest(acc1, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' }));
-        if (s2.volume < 1) tasks.push(htxRequest(acc2, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' }));
-        await Promise.all(tasks);
+        if (s1.volume < 1) await htxRequest(acc1, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' });
+        if (s2.volume < 1) await htxRequest(acc2, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' });
         setTimeout(() => { isProcessing = false; }, 3000);
         return;
     }
 
-    // 2. MIRROR CALCULATION
-    // Goal: roi1 + roi2 = 0 and pnl1 + pnl2 = 0
-    const roiCombined = s1.roi + s2.roi;
-    const pnlCombined = s1.unrealizedUsdt + s2.unrealizedUsdt;
+    // 2. MIRROR ADJUSTMENT LOGIC
+    // We want |ROI1| to equal |ROI2| and |PnL1| to equal |PnL2|
+    const roiDiff = Math.abs(Math.abs(s1.roi) - Math.abs(s2.roi));
+    const pnlDiff = Math.abs(Math.abs(s1.unrealizedUsdt) - Math.abs(s2.unrealizedUsdt));
 
-    // 3. ADJUSTMENT TRIGGER
-    // If the combined values are far from zero, one side is "lacking magnitude"
-    if (Math.abs(roiCombined) > config.roiThreshold || Math.abs(pnlCombined) > config.pnlThreshold) {
+    if (roiDiff > config.roiThreshold || pnlDiff > config.pnlThreshold) {
         
         let targetAcc = null;
-        // Logic: Add to the side that has the smaller absolute ROI (the side that is lagging)
-        if (Math.abs(s1.roi) < Math.abs(s2.roi)) {
-            targetAcc = acc1;
+
+        // NEW LOGIC: 
+        // If s2 (Short) has a bigger magnitude (e.g. 1.69% vs 0.55%), 
+        // add to s2 to average its price closer to market and reduce that 1.69%.
+        if (Math.abs(s1.roi) > Math.abs(s2.roi)) {
+            targetAcc = acc1; // Long is further away, add to Long
         } else {
-            targetAcc = acc2;
+            targetAcc = acc2; // Short is further away, add to Short
         }
 
         if (targetAcc) {
             isProcessing = true;
             const targetState = accountStates[targetAcc.accountId];
-            market.status = `Syncing ROI: Adding 1 to ${targetState.direction}...`;
+            market.status = `Balancing ${targetState.direction.toUpperCase()} (ROI: ${targetState.roi.toFixed(2)}%)`;
             
-            console.log(`⚖️ Syncing ROI/PnL: Acc1(${s1.roi.toFixed(2)}%) Acc2(${s2.roi.toFixed(2)}%). Adding to ${targetState.direction}`);
+            console.log(`⚖️ Syncing: Adding 1 to ${targetState.direction} to reduce ROI gap.`);
             
             await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, 
@@ -154,11 +139,10 @@ async function tradeLoop() {
                 order_price_type: 'optimal_5' 
             });
 
-            // Wait for position to update before next loop
             setTimeout(() => { isProcessing = false; }, 4000);
         }
     } else {
-        market.status = "ROI & PnL Fully Synced";
+        market.status = "Mirrored (ROI & PnL Synced)";
     }
 }
 
@@ -182,39 +166,29 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>AtomicSync Mirror</title>
+    <meta charset="UTF-8"><title>Mirror Sync Pro</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&display=swap" rel="stylesheet">
-    <style>
-        body { font-family: 'Plus Jakarta Sans', sans-serif; background: #09090b; color: #fafafa; }
-        .glass { background: rgba(24, 24, 27, 0.8); backdrop-filter: blur(12px); border: 1px solid rgba(63, 63, 70, 0.5); }
-    </style>
+    <style>body { font-family: 'Plus Jakarta Sans', sans-serif; background: #09090b; color: #fafafa; }</style>
 </head>
-<body class="p-4 md:p-10">
+<body class="p-10">
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-8">
-            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Mirror ROI Mode</p></div>
+            <div><h1 class="text-2xl font-extrabold text-white">MIRROR<span class="text-indigo-500">SYNC</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Active</p></div>
             <div class="text-right">
-                <p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p>
+                <p class="text-[10px] text-zinc-500 font-bold uppercase">Price</p>
                 <p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p>
             </div>
         </div>
-        
-        <div class="glass rounded-[2.5rem] p-8 mb-8 text-center border-indigo-500/20">
-            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Sync Delta (Combined ROI)</p>
-            <h2 id="roiDelta" class="text-6xl font-black mb-4 font-mono">0.00%</h2>
-            <p class="text-zinc-400 text-sm">Targeting perfect opposite ROI and PnL values.</p>
-        </div>
-
         <div class="grid md:grid-cols-2 gap-6">
-            <div class="glass rounded-[2rem] p-6 border-l-4 border-emerald-500">
-                <div class="flex justify-between"><span class="text-xs font-bold text-emerald-500 uppercase">Long Acc</span><span id="longRoi" class="font-bold text-emerald-400">0.00%</span></div>
-                <div id="longUsdt" class="text-2xl font-mono font-bold mt-2 text-white">$0.00000000</div>
+            <div class="bg-zinc-900/50 p-6 rounded-3xl border border-emerald-500/20">
+                <div class="flex justify-between"><span class="text-xs font-bold text-emerald-500 uppercase">Long</span><span id="longRoi" class="font-bold text-emerald-400">0.00%</span></div>
+                <div id="longUsdt" class="text-2xl font-mono font-bold mt-2">$0.00000000</div>
                 <div id="longVol" class="text-xs text-zinc-500 mt-1">Size: 0</div>
             </div>
-            <div class="glass rounded-[2rem] p-6 border-l-4 border-rose-500">
-                <div class="flex justify-between"><span class="text-xs font-bold text-rose-500 uppercase">Short Acc</span><span id="shortRoi" class="font-bold text-rose-400">0.00%</span></div>
-                <div id="shortUsdt" class="text-2xl font-mono font-bold mt-2 text-white">$0.00000000</div>
+            <div class="bg-zinc-900/50 p-6 rounded-3xl border border-rose-500/20">
+                <div class="flex justify-between"><span class="text-xs font-bold text-rose-500 uppercase">Short</span><span id="shortRoi" class="font-bold text-rose-400">0.00%</span></div>
+                <div id="shortUsdt" class="text-2xl font-mono font-bold mt-2">$0.00000000</div>
                 <div id="shortVol" class="text-xs text-zinc-500 mt-1">Size: 0</div>
             </div>
         </div>
@@ -225,17 +199,12 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('markPrice').innerText = d.market.last.toFixed(8);
                 document.getElementById('botStatus').innerText = d.market.status;
-                let roiSum = 0;
                 d.accounts.forEach(a => {
                     const prefix = a.direction === 'buy' ? 'long' : 'short';
                     document.getElementById(prefix + 'Roi').innerText = (a.roi >= 0 ? '+' : '') + a.roi.toFixed(2) + '%';
                     document.getElementById(prefix + 'Usdt').innerText = (a.unrealizedUsdt >= 0 ? '+' : '') + a.unrealizedUsdt.toFixed(8);
                     document.getElementById(prefix + 'Vol').innerText = 'Size: ' + a.volume;
-                    roiSum += a.roi;
                 });
-                const rElem = document.getElementById('roiDelta');
-                rElem.innerText = (roiSum >= 0 ? '+' : '') + roiSum.toFixed(2) + '%';
-                rElem.className = 'text-6xl font-black mb-4 font-mono ' + (Math.abs(roiSum) < 1 ? 'text-indigo-400' : 'text-zinc-400');
             } catch(e) {}
         }
         setInterval(update, 1000);
@@ -245,4 +214,3 @@ app.get('/', (req, res) => {
 });
 
 startWS(); setInterval(sync, 2000); setInterval(tradeLoop, 3000); app.listen(config.port, '0.0.0.0');
-console.log(`ROI Mirror Sync Running on Port ${config.port}`);
