@@ -28,8 +28,7 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     spreadThreshold: 0.05,
-    autoFundingChase: true,       // ENABLED: Auto-harvest funding
-    chaseLeadTimeSeconds: 30      // Seconds before funding to execute
+    contractSize: 0 // Will be fetched automatically
 };
 
 // ==================== GLOBAL STATE ====================
@@ -42,7 +41,7 @@ let market = {
     fundingRate: 0,
     fundingTimestamp: 0,
     nextFundingTime: '',
-    hasChasedFunding: false // Reset every cycle
+    projections: { next: 0, daily: 0, monthly: 0, yearly: 0 }
 };
 let accountStates = {};
 let isProcessing = false;
@@ -72,21 +71,25 @@ async function htxRequest(account, method, path, data = {}) {
 // ==================== CORE LOGIC ====================
 
 async function restSync() {
-    let totalPnl = 0;
-    let currentTotalWallet = 0;
-
-    // Fetch Funding Rate
-    const fundRes = await axios.get(`https://${config.restHost}/linear-swap-api/v1/swap_funding_rate?contract_code=${config.symbol}`);
-    if (fundRes.data?.status === 'ok') {
-        market.fundingRate = parseFloat(fundRes.data.data.funding_rate) * 100;
-        market.fundingTimestamp = parseInt(fundRes.data.data.funding_time);
-        market.nextFundingTime = new Date(market.fundingTimestamp).toLocaleTimeString();
-        
-        // RESET CHASE FLAG IF NEW CYCLE
-        if (Date.now() < market.fundingTimestamp - 60000) {
-            market.hasChasedFunding = false;
+    // 1. Fetch Contract Info (Size) if missing
+    if (config.contractSize === 0) {
+        const info = await htxRequest(config.accounts[0], 'GET', '/linear-swap-api/v1/swap_contract_info');
+        if (info?.status === 'ok') {
+            const contract = info.data.find(c => c.contract_code === config.symbol);
+            if (contract) config.contractSize = parseFloat(contract.contract_size);
         }
     }
+
+    // 2. Fetch Funding Rate
+    const fundRes = await axios.get(`https://${config.restHost}/linear-swap-api/v1/swap_funding_rate?contract_code=${config.symbol}`);
+    if (fundRes.data?.status === 'ok') {
+        market.fundingRate = parseFloat(fundRes.data.data.funding_rate); // Decimal form
+        market.fundingTimestamp = parseInt(fundRes.data.data.funding_time);
+        market.nextFundingTime = new Date(market.fundingTimestamp).toLocaleTimeString();
+    }
+
+    let totalPnl = 0;
+    let currentTotalWallet = 0;
 
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
@@ -111,20 +114,38 @@ async function restSync() {
     if (market.initialTotalEquity === 0 && currentTotalWallet > 0) market.initialTotalEquity = currentTotalWallet;
     market.totalEquity = currentTotalWallet;
 
-    // AUTO-OPEN INITIAL HEDGE
+    // 3. Calculate Funding Projections
+    calculateProjections();
+
+    // Auto-Open 5:5
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
     if (s1.volume === 0 && s2.volume === 0 && !isProcessing && market.spreadPct <= config.spreadThreshold && market.spreadPct > 0) {
         autoOpen();
     }
+}
 
-    // AUTO-FUNDING CHASE LOGIC
-    if (config.autoFundingChase && !market.hasChasedFunding && s1.volume > 1 && s2.volume > 1) {
-        const timeToFunding = market.fundingTimestamp - Date.now();
-        if (timeToFunding > 0 && timeToFunding <= (config.chaseLeadTimeSeconds * 1000)) {
-            executeFundingChase();
-        }
-    }
+function calculateProjections() {
+    const s1 = accountStates[config.accounts[0].accountId]; // Long
+    const s2 = accountStates[config.accounts[1].accountId]; // Short
+    
+    if (config.contractSize === 0 || market.last === 0) return;
+
+    // Position Values = Vol * Size * Price
+    const longValue = s1.volume * config.contractSize * market.last;
+    const shortValue = s2.volume * config.contractSize * market.last;
+
+    // Next Payout (8 hours)
+    // Long pays short if rate is positive
+    const longPayout = -(longValue * market.fundingRate);
+    const shortPayout = (shortValue * market.fundingRate);
+    
+    const netNext = longPayout + shortPayout;
+    
+    market.projections.next = netNext;
+    market.projections.daily = netNext * 3;
+    market.projections.monthly = netNext * 3 * 30;
+    market.projections.yearly = netNext * 3 * 365;
 }
 
 async function autoOpen() {
@@ -137,27 +158,7 @@ async function autoOpen() {
     setTimeout(() => { isProcessing = false; }, 2000);
 }
 
-async function executeFundingChase() {
-    market.hasChasedFunding = true;
-    market.status = "AUTO-CHASING FUNDING...";
-    
-    // If Funding (+): Shorts get paid. Reduce LONG.
-    // If Funding (-): Longs get paid. Reduce SHORT.
-    const targetToReduceIdx = (market.fundingRate > 0) ? 0 : 1; 
-    const targetAcc = config.accounts[targetToReduceIdx];
-    const currentVol = accountStates[targetAcc.accountId].volume;
-
-    if (currentVol > 1) {
-        await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-            contract_code: config.symbol, 
-            volume: currentVol - 1, 
-            direction: accountStates[targetAcc.accountId].direction === 'buy' ? 'sell' : 'buy', 
-            offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
-        });
-    }
-}
-
-async function manualChase() {
+async function chaseWinner() {
     isProcessing = true;
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
@@ -200,21 +201,32 @@ function startWS() {
 }
 
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates) }));
-app.post('/api/chase', async (req, res) => { await manualChase(); res.json({status: 'ok'}); });
+app.post('/api/chase', async (req, res) => { await chaseWinner(); res.json({status: 'ok'}); });
 app.post('/api/close', async (req, res) => { await closeAll(); res.json({status: 'ok'}); });
 
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>FundingSync AUTO</title>
+<html lang="en"><head><meta charset="UTF-8"><title>FundingSync PRO</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>body{background:#040405;color:#fafafa;font-family:sans-serif;}.glass{background:rgba(255,255,255,0.03);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.05);}</style></head>
-<body class="p-10"><div class="max-w-3xl mx-auto">
+<body class="p-10"><div class="max-w-4xl mx-auto">
     <div class="flex justify-between items-end mb-10">
-        <div><h1 class="text-xl font-bold text-white uppercase italic">FundingSync <span class="text-indigo-500">AUTO</span></h1><p id="botStatus" class="text-[10px] text-zinc-500 font-bold uppercase"></p></div>
+        <div><h1 class="text-xl font-bold text-white uppercase italic">FundingSync <span class="text-indigo-500">PRO</span></h1><p id="botStatus" class="text-[10px] text-zinc-500 font-bold uppercase"></p></div>
         <div class="text-right">
             <p class="text-[10px] text-zinc-600 uppercase font-bold">Funding Rate</p>
             <p id="fundingRate" class="font-mono text-xl font-bold text-indigo-400">0.0000%</p>
-            <p id="fundingTime" class="text-[10px] text-zinc-500 font-mono italic">Next: 00:00:00</p>
+            <p id="fundingTime" class="text-[10px] text-zinc-500 font-mono italic">Payout: 00:00:00</p>
+        </div>
+    </div>
+
+    <!-- FUNDING PROJECTIONS TABLE -->
+    <div class="glass rounded-3xl p-6 mb-6 border-b border-indigo-500/10">
+        <h3 class="text-[10px] text-zinc-500 font-bold uppercase mb-4 tracking-widest text-center">Net Funding Projections (Total Accounts)</h3>
+        <div class="grid grid-cols-4 gap-4 text-center">
+            <div><p class="text-[10px] text-zinc-600 uppercase">Next Cycle</p><p id="projNext" class="font-mono text-lg font-bold text-white">+$0.00000000</p></div>
+            <div><p class="text-[10px] text-zinc-600 uppercase">Daily Est.</p><p id="projDaily" class="font-mono text-lg font-bold text-white">+$0.00000000</p></div>
+            <div><p class="text-[10px] text-zinc-600 uppercase">Monthly Est.</p><p id="projMonthly" class="font-mono text-lg font-bold text-white">+$0.00000000</p></div>
+            <div><p class="text-[10px] text-zinc-600 uppercase">Yearly Est.</p><p id="projYearly" class="font-mono text-lg font-bold text-white">+$0.00000000</p></div>
         </div>
     </div>
 
@@ -222,8 +234,8 @@ app.get('/', (req, res) => {
         <p class="text-[10px] text-zinc-500 font-bold uppercase mb-2">Net Mirror PnL</p>
         <h2 id="netPnl" class="text-6xl font-mono font-bold mb-4">$0.00000000</h2>
         <div class="flex justify-center gap-4">
-            <button onclick="fetch('/api/chase',{method:'POST'})" class="bg-indigo-600 hover:bg-indigo-500 text-white px-8 py-3 rounded-full text-xs font-black tracking-widest transition-all">MANUAL CHASE</button>
-            <button onclick="fetch('/api/close',{method:'POST'})" class="bg-rose-600 hover:bg-rose-500 text-white px-8 py-3 rounded-full text-xs font-black tracking-widest transition-all">CLOSE ALL</button>
+            <button onclick="fetch('/api/chase',{method:'POST'})" class="bg-indigo-600 hover:bg-indigo-500 text-white px-8 py-3 rounded-full text-xs font-black tracking-widest transition-all">CHASE WINNER</button>
+            <button onclick="fetch('/api/close',{method:'POST'})" class="bg-rose-600 hover:bg-rose-700 text-white px-8 py-3 rounded-full text-xs font-black tracking-widest transition-all">CLOSE ALL</button>
         </div>
     </div>
 
@@ -241,7 +253,8 @@ app.get('/', (req, res) => {
     </div>
 
     <div class="flex justify-between items-center px-4 py-2 glass rounded-xl text-xs font-mono">
-        <span class="text-zinc-500 uppercase">Equity Profit: <span id="equityProfit" class="text-emerald-400 ml-2">$0.00000000</span></span>
+        <span class="text-zinc-500 uppercase">Start Profit: <span id="equityProfit" class="text-emerald-400 ml-2">$0.00000000</span></span>
+        <span class="text-zinc-500 uppercase">Price: <span id="price" class="text-white ml-2">0.00000000</span></span>
         <span class="text-zinc-500 uppercase">Spread: <span id="spread" class="text-amber-500 ml-2">0.000%</span></span>
     </div>
 </div>
@@ -249,10 +262,21 @@ app.get('/', (req, res) => {
 setInterval(async () => {
     try {
         const r = await fetch('/api/status'); const d = await r.json();
-        document.getElementById('fundingRate').innerText = d.market.fundingRate.toFixed(4) + '%';
-        document.getElementById('fundingTime').innerText = 'Next Payment: ' + d.market.nextFundingTime;
+        document.getElementById('fundingRate').innerText = (d.market.fundingRate * 100).toFixed(4) + '%';
+        document.getElementById('fundingTime').innerText = 'Next Payout: ' + d.market.nextFundingTime;
+        document.getElementById('price').innerText = d.market.last.toFixed(8);
         document.getElementById('spread').innerText = d.market.spreadPct.toFixed(3) + '%';
         document.getElementById('botStatus').innerText = d.market.status;
+
+        // Funding Projections Update
+        const projKeys = ['next', 'daily', 'monthly', 'yearly'];
+        projKeys.forEach(k => {
+            const val = d.market.projections[k];
+            const el = document.getElementById('proj' + k.charAt(0).toUpperCase() + k.slice(1));
+            el.innerText = (val >= 0 ? '+' : '') + '$' + val.toFixed(8);
+            el.className = 'font-mono text-lg font-bold ' + (val >= 0 ? 'text-emerald-400' : 'text-rose-500');
+        });
+
         const profit = d.market.totalEquity - d.market.initialTotalEquity;
         document.getElementById('equityProfit').innerText = (profit>=0?'+':'') + '$'+profit.toFixed(8);
         let tP=0;
@@ -264,7 +288,7 @@ setInterval(async () => {
             document.getElementById(pre+'Roi').className = 'text-2xl font-bold ' + (a.roi >= 0 ? 'text-emerald-400' : 'text-rose-500');
         });
         document.getElementById('netPnl').innerText = (tP>=0?'+':'') + '$' + tP.toFixed(8);
-        document.getElementById('netPnl').className = 'text-6xl font-mono font-bold ' + (tP>=0?'text-emerald-400':'text-rose-500');
+        document.getElementById('netPnl').className = 'text-6xl font-mono font-bold mb-2 ' + (tP>=0?'text-emerald-400':'text-rose-500');
     } catch(e) {}
 }, 1000);
 </script></body></html>`);
