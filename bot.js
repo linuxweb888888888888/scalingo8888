@@ -57,6 +57,7 @@ async function htxRequest(account, method, path, data = {}) {
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
         const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 5000 });
+        if (res.data.status !== 'ok') console.log(`❌ HTX ERROR: ${JSON.stringify(res.data)}`);
         return res.data;
     } catch (e) { return { status: 'error' }; }
 }
@@ -85,6 +86,14 @@ async function sync() {
                 state.roi = parseFloat(pos.profit_rate) * 100;
             } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
         }
+
+        const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
+        if (accRes?.status === 'ok' && accRes.data) {
+            const equity = parseFloat(accRes.data[0].margin_balance);
+            if (state.initialBalance === 0) state.initialBalance = equity;
+            state.wallet = equity;
+            state.realizedProfit = equity - state.initialBalance;
+        }
     }
 }
 
@@ -96,22 +105,23 @@ async function tradeLoop() {
     const s1 = accountStates[acc1.accountId];
     const s2 = accountStates[acc2.accountId];
 
-    // 1. Initial Hedge Open
+    // 1. Initial Position check
     if (s1.volume < 1 || s2.volume < 1) {
         isProcessing = true;
+        market.status = 'Opening Initial Hedge...';
         if (s1.volume < 1) await htxRequest(acc1, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' });
         if (s2.volume < 1) await htxRequest(acc2, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' });
         setTimeout(() => { isProcessing = false; }, 3000);
         return;
     }
 
-    // 2. PRECISE CALCULATION
+    // 2. Precise Mirror Logic
     const roi1Mag = Math.abs(s1.roi);
     const roi2Mag = Math.abs(s2.roi);
     const roiDiff = Math.abs(roi1Mag - roi2Mag);
 
     if (roiDiff > config.roiThreshold) {
-        // Find the side with the LARGER magnitude (the one that needs adjusting)
+        // Target the "Outlier" (the one with higher ROI magnitude) to pull it back to the "Anchor"
         const targetAccIdx = roi1Mag > roi2Mag ? 0 : 1;
         const anchorAccIdx = targetAccIdx === 0 ? 1 : 0;
         
@@ -119,28 +129,26 @@ async function tradeLoop() {
         const targetState = accountStates[targetAcc.accountId];
         const anchorState = accountStates[config.accounts[anchorAccIdx].accountId];
 
-        // Solve for X (precise contracts to add to move average price to target ROI)
-        // P_target = Market / (1 + (Side * Target_ROI / (Leverage * 100)))
+        // Solve for X using Target Average Price
         const sideFactor = targetState.direction === 'buy' ? 1 : -1;
         const targetRoiDecimal = Math.abs(anchorState.roi) / (config.leverage * 100);
         const pTarget = market.last / (1 + (sideFactor * targetRoiDecimal));
 
-        // Required Volume X = CurrentVolume * (CurrentAvg - TargetAvg) / (TargetAvg - MarketPrice)
-        let preciseX = Math.ceil(
+        // Volume to Add X = CurrentVol * (CurrentAvg - TargetAvg) / (TargetAvg - MarketPrice)
+        let amountToAdd = Math.ceil(
             targetState.volume * (targetState.avgPrice - pTarget) / (pTarget - market.last)
         );
 
-        // Filter valid precise amount
-        if (isNaN(preciseX) || preciseX <= 0) preciseX = 1;
-        preciseX = Math.min(preciseX, config.maxSyncBatch); 
+        if (isNaN(amountToAdd) || amountToAdd <= 0) amountToAdd = 1;
+        amountToAdd = Math.min(amountToAdd, config.maxSyncBatch); 
 
         isProcessing = true;
-        market.status = `Precise Sync: Adding ${preciseX} to ${targetState.direction}`;
-        console.log(`⚖️ BALANCING: Adding ${preciseX} to ${targetState.direction} to match ${anchorState.roi.toFixed(2)}%`);
+        market.status = `Balancing: Adding ${amountToAdd} to ${targetState.direction}`;
+        console.log(`⚖️ BALANCING: Adding ${amountToAdd} to ${targetState.direction} to match ${anchorState.roi.toFixed(2)}% ROI`);
 
         await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
             contract_code: config.symbol, 
-            volume: preciseX, 
+            volume: amountToAdd, 
             direction: targetState.direction, 
             offset: 'open', 
             lever_rate: config.leverage, 
@@ -149,7 +157,7 @@ async function tradeLoop() {
 
         setTimeout(() => { isProcessing = false; }, 4000);
     } else {
-        market.status = "Mirror Synced";
+        market.status = "Mirrored (ROI & PnL Synced)";
     }
 }
 
@@ -173,29 +181,38 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>Precise Mirror Sync</title>
+    <meta charset="UTF-8"><title>AtomicSync Pro</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <style>body { font-family: sans-serif; background: #09090b; color: #fafafa; }</style>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Plus Jakarta Sans', sans-serif; background: #09090b; color: #fafafa; }
+        .glass { background: rgba(24, 24, 27, 0.8); backdrop-filter: blur(12px); border: 1px solid rgba(63, 63, 70, 0.5); }
+    </style>
 </head>
-<body class="p-10">
+<body class="p-4 md:p-10">
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-8">
-            <div><h1 class="text-2xl font-bold">PRECISE<span class="text-indigo-500">SYNC</span></h1><p id="botStatus" class="text-xs text-zinc-500 uppercase tracking-widest">Status</p></div>
-            <div class="text-right">
-                <p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p>
-                <p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p>
+            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Running...</p></div>
+            <div class="flex gap-10 text-right">
+                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p><p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p></div>
+                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Total Equity Growth</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.00000000</p></div>
+            </div>
+        </div>
+        <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20 text-center">
+            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">PnL Combined (Mirror Delta)</p>
+            <h2 id="netProfit" class="text-6xl font-black mb-4 font-mono">+$0.00000000</h2>
+            <div class="inline-flex items-center gap-2 bg-zinc-900 px-4 py-2 rounded-full border border-zinc-800">
+                <span class="text-[10px] font-bold text-zinc-500 uppercase">Mode:</span><span class="text-xs font-mono font-bold text-indigo-400">Precise Mirror Sync</span>
             </div>
         </div>
         <div class="grid md:grid-cols-2 gap-6">
-            <div class="bg-zinc-900 p-6 rounded-3xl border border-emerald-500/20">
-                <div class="flex justify-between"><span class="text-xs font-bold text-emerald-500 uppercase">Long Acc</span><span id="longRoi" class="font-bold text-emerald-400">0.00%</span></div>
-                <div id="longUsdt" class="text-2xl font-mono font-bold mt-2 text-white">$0.00000000</div>
-                <div id="longVol" class="text-xs text-zinc-500 mt-1">Size: 0</div>
+            <div class="glass rounded-[2rem] p-6 border-l-4 border-emerald-500">
+                <div class="flex justify-between items-center mb-4"><span class="text-xs font-bold text-emerald-500 uppercase tracking-widest">Long Side (Acc 1)</span><span id="longRoi" class="text-xl font-black text-emerald-400">0.00%</span></div>
+                <div class="flex justify-between items-center"><span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL (USDT)</span><span id="longUsdt" class="text-sm font-mono font-bold text-white">0 / $0.00000000</span></div>
             </div>
-            <div class="bg-zinc-900 p-6 rounded-3xl border border-rose-500/20">
-                <div class="flex justify-between"><span class="text-xs font-bold text-rose-500 uppercase">Short Acc</span><span id="shortRoi" class="font-bold text-rose-400">0.00%</span></div>
-                <div id="shortUsdt" class="text-2xl font-mono font-bold mt-2 text-white">$0.00000000</div>
-                <div id="shortVol" class="text-xs text-zinc-500 mt-1">Size: 0</div>
+            <div class="glass rounded-[2rem] p-6 border-l-4 border-rose-500">
+                <div class="flex justify-between items-center mb-4"><span class="text-xs font-bold text-rose-500 uppercase tracking-widest">Short Side (Acc 2)</span><span id="shortRoi" class="text-xl font-black text-rose-400">0.00%</span></div>
+                <div class="flex justify-between items-center"><span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL (USDT)</span><span id="shortUsdt" class="text-sm font-mono font-bold text-white">0 / $0.00000000</span></div>
             </div>
         </div>
     </div>
@@ -205,12 +222,17 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('markPrice').innerText = d.market.last.toFixed(8);
                 document.getElementById('botStatus').innerText = d.market.status;
+                let tP = 0, tR = 0;
                 d.accounts.forEach(a => {
                     const prefix = a.direction === 'buy' ? 'long' : 'short';
                     document.getElementById(prefix + 'Roi').innerText = (a.roi >= 0 ? '+' : '') + a.roi.toFixed(2) + '%';
-                    document.getElementById(prefix + 'Usdt').innerText = (a.unrealizedUsdt >= 0 ? '+' : '') + a.unrealizedUsdt.toFixed(8);
-                    document.getElementById(prefix + 'Vol').innerText = 'Size: ' + a.volume;
+                    document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(8);
+                    tP += a.unrealizedUsdt; tR += a.realizedProfit;
                 });
+                document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(8);
+                const pElem = document.getElementById('netProfit');
+                pElem.innerText = (tP >= 0 ? '+' : '') + tP.toFixed(8);
+                pElem.className = 'text-6xl font-black mb-4 font-mono ' + (Math.abs(tP) < 0.0001 ? 'text-indigo-400' : 'text-zinc-400');
             } catch(e) {}
         }
         setInterval(update, 1000);
@@ -220,3 +242,4 @@ app.get('/', (req, res) => {
 });
 
 startWS(); setInterval(sync, 2000); setInterval(tradeLoop, 3000); app.listen(config.port, '0.0.0.0');
+console.log(`AtomicSync Pro (Mirror Mode) running on Port ${config.port}`);
