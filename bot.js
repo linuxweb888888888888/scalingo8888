@@ -28,11 +28,11 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     orderSize: 1,                
-    addSize: 1,                  // SLOW SYNC: Add only 1 contract at a time
+    addSize: 1,                  // Controlled slow balancing
     feeRate: 0.0006,             
     contractSize: 0,
     roiThreshold: 0.1,           // Sync if ROI magnitude difference > 0.1%
-    maxVolDifference: 50         // Safety: Don't let one side get 50+ contracts ahead of the other
+    maxVolGap: 100               // Safety: prevents one side from getting too huge
 };
 
 // ==================== GLOBAL STATE ====================
@@ -103,10 +103,9 @@ async function tradeLoop() {
     const s1 = accountStates[acc1.accountId];
     const s2 = accountStates[acc2.accountId];
 
-    // 1. Initial Hedge Open (Ensures basic 1v1)
+    // 1. Initial Position Setup
     if (s1.volume < 1 || s2.volume < 1) {
         isProcessing = true;
-        market.status = 'Opening Initial Hedge...';
         if (s1.volume < 1) await htxRequest(acc1, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' });
         if (s2.volume < 1) await htxRequest(acc2, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' });
         setTimeout(() => { isProcessing = false; }, 3000);
@@ -116,60 +115,61 @@ async function tradeLoop() {
     // 2. Metrics for Exit and Progress
     const roi1Mag = Math.abs(s1.roi);
     const roi2Mag = Math.abs(s2.roi);
-    const minRoi = Math.min(roi1Mag, roi2Mag);
-    const maxRoi = Math.max(roi1Mag, roi2Mag);
-    const syncProgress = maxRoi === 0 ? 0 : (minRoi / maxRoi) * 100;
+    const syncProgress = Math.max(roi1Mag, roi2Mag) === 0 ? 0 : (Math.min(roi1Mag, roi2Mag) / Math.max(roi1Mag, roi2Mag)) * 100;
     const combinedPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
 
-    // 3. EXIT CONDITION (Combined PnL > 0 AND Sync > 95%)
-    if (combinedPnL > 0 && syncProgress >= 95) {
-        market.status = `EXITING: +$${combinedPnL.toFixed(8)} @ ${syncProgress.toFixed(1)}%`;
+    // 3. EXIT CONDITION
+    if (combinedPnL > 0 && syncProgress >= 95 && (s1.roi * s2.roi < 0)) {
+        market.status = `PROFIT EXIT: $${combinedPnL.toFixed(8)}`;
         await closeAll();
         return;
     }
 
-    // 4. SLOW INCREMENTAL SYNC LOGIC
-    // Only proceed if the ROI magnitude difference is notable
-    if (Math.abs(roi1Mag - roi2Mag) > config.roiThreshold) {
-        
-        let targetAcc = null;
-        
-        // Strategy: Add to the side with the HIGHER ROI magnitude (the side that is losing more or winning more)
-        // This moves the Average Entry Price closer to the current market price.
-        if (roi1Mag > roi2Mag) {
-            // Account 1 needs adjustment. BUT check safety: don't let it get too huge.
-            if (s1.volume - s2.volume < config.maxVolDifference) targetAcc = acc1;
-            else targetAcc = acc2; // Volume safety: add to the other side instead
-        } else {
-            // Account 2 needs adjustment.
-            if (s2.volume - s1.volume < config.maxVolDifference) targetAcc = acc2;
-            else targetAcc = acc1;
+    // 4. MIRROR RECOVERY & SYNC LOGIC
+    let targetAcc = null;
+
+    if (s1.roi < 0 && s2.roi < 0) {
+        // Both Negative: Add to the "Least Loser" to flip it into profit
+        market.status = "Fixing Double Negative...";
+        targetAcc = (s1.roi > s2.roi) ? acc1 : acc2;
+    } 
+    else if (s1.roi > 0 && s2.roi > 0) {
+        // Both Positive: Add to the one closer to 0 to balance
+        market.status = "Balancing Double Positive...";
+        targetAcc = (s1.roi < s2.roi) ? acc1 : acc2;
+    }
+    else {
+        // Standard Mirror Mode (One +, One -)
+        if (Math.abs(roi1Mag - roi2Mag) > config.roiThreshold) {
+            market.status = "Mirror Syncing...";
+            // Add to the side with higher magnitude to reduce it
+            targetAcc = (roi1Mag > roi2Mag) ? acc1 : acc2;
+        }
+    }
+
+    // Safety: prevent extreme volume gaps
+    if (targetAcc) {
+        const gap = Math.abs(s1.volume - s2.volume);
+        if (gap > config.maxVolGap) {
+             market.status = "Volume Safety: Throttled";
+             return;
         }
 
-        if (targetAcc) {
-            isProcessing = true;
-            const targetState = accountStates[targetAcc.accountId];
-            market.status = `Balancing: Adding ${config.addSize} to ${targetState.direction}`;
-            
-            await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, 
-                volume: config.addSize, 
-                direction: targetState.direction, 
-                offset: 'open', 
-                lever_rate: config.leverage, 
-                order_price_type: 'optimal_5' 
-            });
-            // Longer timeout to let the ROI settle
-            setTimeout(() => { isProcessing = false; }, 5000);
-        }
+        isProcessing = true;
+        await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+            contract_code: config.symbol, 
+            volume: config.addSize, 
+            direction: accountStates[targetAcc.accountId].direction, 
+            offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
+        });
+        setTimeout(() => { isProcessing = false; }, 5000);
     } else {
-        market.status = "Mirrored (ROI & PnL Synced)";
+        market.status = "Perfectly Mirrored";
     }
 }
 
 async function closeAll() {
     isProcessing = true;
-    console.log("🚀 PROFIT TARGET HIT. CLOSING ALL POSITIONS...");
     await Promise.all(config.accounts.map(acc => {
         const state = accountStates[acc.accountId];
         if (state.volume > 0) {
@@ -226,7 +226,7 @@ app.get('/', (req, res) => {
             <h2 id="netProfit" class="text-6xl font-black mb-6 font-mono">+$0.00000000</h2>
             <div class="max-w-md mx-auto mb-2">
                 <div class="flex justify-between text-[10px] font-bold uppercase text-zinc-500 mb-2">
-                    <span>Sync Progress (Goal: 95%+)</span>
+                    <span>Sync Progress (Mirroring Goal)</span>
                     <span id="syncPct">0%</span>
                 </div>
                 <div class="w-full bg-zinc-900 h-3 rounded-full border border-zinc-800 overflow-hidden p-0.5">
@@ -266,7 +266,7 @@ app.get('/', (req, res) => {
                 document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(8);
                 const pElem = document.getElementById('netProfit');
                 pElem.innerText = (tP >= 0 ? '+' : '') + tP.toFixed(8);
-                pElem.className = 'text-6xl font-black mb-6 font-mono ' + (tP >= 0 && syncScore >= 95 ? 'text-indigo-400' : 'text-zinc-400');
+                pElem.className = 'text-6xl font-black mb-6 font-mono ' + (tP >= 0 && syncScore >= 95 ? 'text-emerald-400' : 'text-zinc-400');
             } catch(e) {}
         }
         setInterval(update, 1000);
