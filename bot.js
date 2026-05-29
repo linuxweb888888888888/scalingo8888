@@ -28,11 +28,11 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     orderSize: 1,                
-    addSize: 1,                  // Controlled slow balancing
+    addSize: 1,                  
     feeRate: 0.0006,             
     contractSize: 0,
-    roiThreshold: 0.1,           // Sync if ROI magnitude difference > 0.1%
-    maxVolGap: 100               // Safety: prevents one side from getting too huge
+    roiThreshold: 0.1,           
+    maxVolGap: 150               
 };
 
 // ==================== GLOBAL STATE ====================
@@ -103,7 +103,6 @@ async function tradeLoop() {
     const s1 = accountStates[acc1.accountId];
     const s2 = accountStates[acc2.accountId];
 
-    // 1. Initial Position Setup
     if (s1.volume < 1 || s2.volume < 1) {
         isProcessing = true;
         if (s1.volume < 1) await htxRequest(acc1, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' });
@@ -112,59 +111,47 @@ async function tradeLoop() {
         return;
     }
 
-    // 2. Metrics for Exit and Progress
+    // MIRROR CALCULATION
     const roi1Mag = Math.abs(s1.roi);
     const roi2Mag = Math.abs(s2.roi);
-    const syncProgress = Math.max(roi1Mag, roi2Mag) === 0 ? 0 : (Math.min(roi1Mag, roi2Mag) / Math.max(roi1Mag, roi2Mag)) * 100;
+    const isMirroredSigns = (s1.roi * s2.roi < 0);
+    
+    let syncProgress = 0;
+    if (isMirroredSigns) {
+        syncProgress = Math.max(roi1Mag, roi2Mag) === 0 ? 0 : (Math.min(roi1Mag, roi2Mag) / Math.max(roi1Mag, roi2Mag)) * 100;
+    }
+
     const combinedPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
 
-    // 3. EXIT CONDITION
-    if (combinedPnL > 0 && syncProgress >= 95 && (s1.roi * s2.roi < 0)) {
-        market.status = `PROFIT EXIT: $${combinedPnL.toFixed(8)}`;
+    // EXIT LOGIC
+    if (combinedPnL > 0 && syncProgress >= 95 && isMirroredSigns) {
+        market.status = "PROFIT TARGET MET (SYNCED)";
         await closeAll();
         return;
     }
 
-    // 4. MIRROR RECOVERY & SYNC LOGIC
+    // SLOW SYNC LOGIC
     let targetAcc = null;
-
-    if (s1.roi < 0 && s2.roi < 0) {
-        // Both Negative: Add to the "Least Loser" to flip it into profit
-        market.status = "Fixing Double Negative...";
-        targetAcc = (s1.roi > s2.roi) ? acc1 : acc2;
-    } 
-    else if (s1.roi > 0 && s2.roi > 0) {
-        // Both Positive: Add to the one closer to 0 to balance
-        market.status = "Balancing Double Positive...";
-        targetAcc = (s1.roi < s2.roi) ? acc1 : acc2;
-    }
-    else {
-        // Standard Mirror Mode (One +, One -)
-        if (Math.abs(roi1Mag - roi2Mag) > config.roiThreshold) {
-            market.status = "Mirror Syncing...";
-            // Add to the side with higher magnitude to reduce it
-            targetAcc = (roi1Mag > roi2Mag) ? acc1 : acc2;
-        }
+    if (!isMirroredSigns) {
+        // Recovery: If both are same sign, add to the one closest to 0% to flip it
+        market.status = "Recovery: Flipping Signs...";
+        targetAcc = (roi1Mag < roi2Mag) ? acc1 : acc2;
+    } else if (Math.abs(roi1Mag - roi2Mag) > config.roiThreshold) {
+        // Standard Sync: Add to side with higher magnitude to shrink it
+        market.status = "Syncing Magnitudes...";
+        targetAcc = (roi1Mag > roi2Mag) ? acc1 : acc2;
     }
 
-    // Safety: prevent extreme volume gaps
     if (targetAcc) {
-        const gap = Math.abs(s1.volume - s2.volume);
-        if (gap > config.maxVolGap) {
-             market.status = "Volume Safety: Throttled";
-             return;
-        }
-
+        if (Math.abs(s1.volume - s2.volume) > config.maxVolGap) return;
         isProcessing = true;
         await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-            contract_code: config.symbol, 
-            volume: config.addSize, 
-            direction: accountStates[targetAcc.accountId].direction, 
+            contract_code: config.symbol, volume: config.addSize, direction: accountStates[targetAcc.accountId].direction, 
             offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
         });
         setTimeout(() => { isProcessing = false; }, 5000);
     } else {
-        market.status = "Perfectly Mirrored";
+        market.status = "Mirror Stable";
     }
 }
 
@@ -183,7 +170,6 @@ async function closeAll() {
     setTimeout(() => { isProcessing = false; }, 10000);
 }
 
-// ==================== WS & DASHBOARD ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -209,7 +195,7 @@ app.get('/', (req, res) => {
     <style>
         body { font-family: 'Plus Jakarta Sans', sans-serif; background: #09090b; color: #fafafa; }
         .glass { background: rgba(24, 24, 27, 0.8); backdrop-filter: blur(12px); border: 1px solid rgba(63, 63, 70, 0.5); }
-        .progress-bar { transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1); }
+        .progress-bar { transition: width 0.6s ease; }
     </style>
 </head>
 <body class="p-4 md:p-10">
@@ -221,7 +207,7 @@ app.get('/', (req, res) => {
                 <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Total Equity Growth</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.00000000</p></div>
             </div>
         </div>
-        <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20 text-center">
+        <div class="glass rounded-[2.5rem] p-8 mb-8 relative border-indigo-500/20 text-center">
             <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Mirror Delta)</p>
             <h2 id="netProfit" class="text-6xl font-black mb-6 font-mono">+$0.00000000</h2>
             <div class="max-w-md mx-auto mb-2">
@@ -230,7 +216,7 @@ app.get('/', (req, res) => {
                     <span id="syncPct">0%</span>
                 </div>
                 <div class="w-full bg-zinc-900 h-3 rounded-full border border-zinc-800 overflow-hidden p-0.5">
-                    <div id="syncBar" class="progress-bar h-full bg-indigo-500 rounded-full shadow-[0_0_15px_rgba(99,102,241,0.5)]" style="width: 0%"></div>
+                    <div id="syncBar" class="progress-bar h-full bg-indigo-500 rounded-full" style="width: 0%"></div>
                 </div>
             </div>
         </div>
@@ -251,18 +237,25 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('markPrice').innerText = d.market.last.toFixed(8);
                 document.getElementById('botStatus').innerText = d.market.status;
-                let tP = 0, tR = 0, rois = [];
+                let tP = 0, tR = 0, roiList = [];
                 d.accounts.forEach(a => {
                     const prefix = a.direction === 'buy' ? 'long' : 'short';
-                    rois.push(Math.abs(a.roi));
+                    roiList.push(a.roi);
                     document.getElementById(prefix + 'Roi').innerText = (a.roi >= 0 ? '+' : '') + a.roi.toFixed(2) + '%';
                     document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(8);
                     tP += a.unrealizedUsdt; tR += a.realizedProfit;
                 });
-                const minRoi = Math.min(...rois); const maxRoi = Math.max(...rois);
-                const syncScore = maxRoi === 0 ? 0 : (minRoi / maxRoi) * 100;
+                
+                // MIRROR SYNC PROGRESS
+                const [r1, r2] = roiList;
+                let syncScore = 0;
+                if (r1 * r2 < 0) { // Opposite signs
+                    const m1 = Math.abs(r1), m2 = Math.abs(r2);
+                    syncScore = Math.max(m1, m2) === 0 ? 0 : (Math.min(m1, m2) / Math.max(m1, m2)) * 100;
+                }
                 document.getElementById('syncBar').style.width = syncScore.toFixed(0) + '%';
                 document.getElementById('syncPct').innerText = syncScore.toFixed(1) + '%';
+                
                 document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(8);
                 const pElem = document.getElementById('netProfit');
                 pElem.innerText = (tP >= 0 ? '+' : '') + tP.toFixed(8);
