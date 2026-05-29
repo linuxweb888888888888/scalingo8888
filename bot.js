@@ -33,11 +33,12 @@ const config = {
     contractSize: 0,
     roiThreshold: 0.1,           
     maxVolGap: 500,
+    maxSpreadPct: 0.05, // Only open if spread < 0.05%
     profitRoiTarget: parseFloat(process.env.PROFIT_ROI_TARGET) || 0.25               
 };
 
 // ==================== GLOBAL STATE ====================
-let market = { last: 0, status: 'initializing' };
+let market = { last: 0, spreadPct: 0, status: 'initializing' };
 let accountStates = {};
 let isProcessing = false;
 let triggeredExit = false; 
@@ -84,6 +85,7 @@ async function restSync() {
             if (pos && parseFloat(pos.volume) > 0) {
                 state.avgPrice = parseFloat(pos.cost_hold);
                 state.volume = Math.floor(parseFloat(pos.volume));
+                // DIRECT FROM EXCHANGE ROI
                 state.roi = parseFloat(pos.profit_rate) * 100;
                 state.unrealizedUsdt = parseFloat(pos.profit);
             } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.avgPrice = 0; }
@@ -105,18 +107,13 @@ function instantCheck() {
     const s2 = accountStates[config.accounts[1].accountId];
     if (s1.volume < 1 || s2.volume < 1) return;
 
-    const side1 = s1.direction === 'buy' ? 1 : -1;
-    const side2 = s2.direction === 'buy' ? 1 : -1;
-    const p1 = (market.last - s1.avgPrice) * s1.volume * side1 * config.contractSize;
-    const p2 = (market.last - s2.avgPrice) * s2.volume * side2 * config.contractSize;
-    const currentPnL = p1 + p2;
-    
+    // Use exchange ROI for logic if available, otherwise fallback to tick math for speed
     const totalWallet = s1.wallet + s2.wallet;
-    const currentCombinedRoi = totalWallet > 0 ? (currentPnL / totalWallet) * 100 : 0;
+    const currentCombinedRoi = totalWallet > 0 ? ((s1.unrealizedUsdt + s2.unrealizedUsdt) / totalWallet) * 100 : 0;
 
     if (currentCombinedRoi >= config.profitRoiTarget) {
         triggeredExit = true; 
-        console.log(`💰 ROI TARGET MET (${currentCombinedRoi.toFixed(4)}%). FIRING EXIT NOW.`);
+        console.log(`💰 ROI TARGET MET (${currentCombinedRoi.toFixed(4)}%). FIRING EXIT.`);
         closeAll();
     }
 }
@@ -126,7 +123,13 @@ function tradeLoop() {
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
 
+    // SPREAD PROTECTION ON OPENING
     if (s1.volume < 1 || s2.volume < 1) {
+        if (market.spreadPct > config.maxSpreadPct) {
+            market.status = `High Spread: ${market.spreadPct.toFixed(4)}%`;
+            return;
+        }
+
         isProcessing = true;
         Promise.all([
             s1.volume < 1 ? htxRequest(config.accounts[0], 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' }) : null,
@@ -192,7 +195,10 @@ function startWS() {
             if (err) return;
             const msg = JSON.parse(dec.toString());
             if (msg.tick) {
-                market.last = (msg.tick.bid[0] + msg.tick.ask[0]) / 2;
+                const bid = msg.tick.bid[0];
+                const ask = msg.tick.ask[0];
+                market.last = (bid + ask) / 2;
+                market.spreadPct = ((ask - bid) / bid) * 100;
                 instantCheck(); 
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
@@ -224,13 +230,14 @@ app.get('/', (req, res) => {
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-8">
             <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Running...</p></div>
-            <div class="flex gap-10 text-right">
-                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p><p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p></div>
-                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Total Equity Growth</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.00000000</p></div>
+            <div class="flex gap-8 text-right">
+                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Spread</p><p id="marketSpread" class="text-lg font-mono font-bold text-amber-400">0.0000%</p></div>
+                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p><p id="markPrice" class="text-lg font-mono font-bold text-indigo-400">0.00000000</p></div>
+                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Equity Growth</p><p id="totalRealized" class="text-lg font-mono font-bold text-emerald-400">+$0.00</p></div>
             </div>
         </div>
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20 text-center">
-            <button onclick="triggerClose()" class="absolute top-4 right-4 bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-black px-4 py-2 rounded-full transition-all active:scale-95">CLOSE ALL POSITIONS</button>
+            <button onclick="triggerClose()" class="absolute top-4 right-4 bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-black px-4 py-2 rounded-full transition-all active:scale-95">CLOSE ALL</button>
             <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Mirror Delta)</p>
             <h2 id="netProfit" class="text-6xl font-black mb-1 font-mono">+$0.00000000</h2>
             <p id="netRoi" class="text-lg font-bold text-indigo-400 mb-4 font-mono">ROI: 0.0000%</p>
@@ -255,7 +262,7 @@ app.get('/', (req, res) => {
     </div>
     <script>
         async function triggerClose() {
-            if(!confirm("Are you sure you want to close all positions immediately?")) return;
+            if(!confirm("Close all positions immediately?")) return;
             await fetch('/api/close', { method: 'POST' });
         }
 
@@ -263,6 +270,8 @@ app.get('/', (req, res) => {
             try {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('markPrice').innerText = d.market.last.toFixed(8);
+                document.getElementById('marketSpread').innerText = d.market.spreadPct.toFixed(4) + '%';
+                document.getElementById('marketSpread').className = 'text-lg font-mono font-bold ' + (d.market.spreadPct > 0.05 ? 'text-rose-500' : 'text-emerald-400');
                 document.getElementById('botStatus').innerText = d.market.status;
                 let tP = 0, tR = 0, tW = 0, rois = [];
                 d.accounts.forEach(a => {
@@ -276,7 +285,7 @@ app.get('/', (req, res) => {
                 const netRoi = tW > 0 ? (tP / tW) * 100 : 0;
                 const sScore = (rois[0] * rois[1] < 0) ? (Math.min(Math.abs(rois[0]), Math.abs(rois[1])) / Math.max(Math.abs(rois[0]), Math.abs(rois[1]))) * 100 : 0;
                 document.getElementById('syncPct').innerText = (isNaN(sScore) ? 0 : sScore.toFixed(1)) + '%';
-                document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(8);
+                document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(2);
                 document.getElementById('netProfit').innerText = (tP >= 0 ? '+' : '') + tP.toFixed(8);
                 document.getElementById('netRoi').innerText = 'ROI: ' + (netRoi >= 0 ? '+' : '') + netRoi.toFixed(4) + '%';
                 document.getElementById('netProfit').className = 'text-6xl font-black mb-1 font-mono ' + (tP > 0 ? 'text-emerald-400' : 'text-zinc-400');
