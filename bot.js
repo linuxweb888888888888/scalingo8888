@@ -32,7 +32,8 @@ const config = {
     feeRate: 0.0006,             
     contractSize: 0,
     roiThreshold: 0.1,           
-    maxVolGap: 500               
+    maxVolGap: 500,
+    profitRoiTarget: parseFloat(process.env.PROFIT_ROI_TARGET) || 0.25 // Exit when total ROI hits 0.005%               
 };
 
 // ==================== GLOBAL STATE ====================
@@ -111,11 +112,15 @@ function instantCheck() {
     const p1 = (market.last - s1.avgPrice) * s1.volume * side1 * config.contractSize;
     const p2 = (market.last - s2.avgPrice) * s2.volume * side2 * config.contractSize;
     const currentPnL = p1 + p2;
+    
+    // ROI CALCULATION
+    const totalWallet = s1.wallet + s2.wallet;
+    const currentCombinedRoi = totalWallet > 0 ? (currentPnL / totalWallet) * 100 : 0;
 
-    // TRIGGER AT FIRST SIGHT OF GREEN
-    if (currentPnL > 0.00000001) {
+    // TRIGGER AT ROI SETTING
+    if (currentCombinedRoi >= config.profitRoiTarget) {
         triggeredExit = true; 
-        console.log(`💰 GREEN DETECTED ($${currentPnL.toFixed(8)}). FIRING EXIT NOW.`);
+        console.log(`💰 ROI TARGET MET (${currentCombinedRoi.toFixed(4)}%). FIRING EXIT NOW.`);
         closeAll();
     }
 }
@@ -226,7 +231,8 @@ app.get('/', (req, res) => {
         </div>
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20 text-center">
             <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Mirror Delta)</p>
-            <h2 id="netProfit" class="text-6xl font-black mb-4 font-mono">+$0.00000000</h2>
+            <h2 id="netProfit" class="text-6xl font-black mb-1 font-mono">+$0.00000000</h2>
+            <p id="netRoi" class="text-lg font-bold text-indigo-400 mb-4 font-mono">ROI: 0.0000%</p>
             <div class="inline-flex items-center gap-2 bg-zinc-900 px-4 py-2 rounded-full border border-zinc-800">
                 <span class="text-[10px] font-bold text-zinc-500 uppercase">Mirroring Goal:</span><span id="syncPct" class="text-xs font-mono font-bold text-indigo-400">0%</span>
             </div>
@@ -250,19 +256,21 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('markPrice').innerText = d.market.last.toFixed(8);
                 document.getElementById('botStatus').innerText = d.market.status;
-                let tP = 0, tR = 0, rois = [];
+                let tP = 0, tR = 0, tW = 0, rois = [];
                 d.accounts.forEach(a => {
                     const prefix = a.direction === 'buy' ? 'long' : 'short';
-                    rois.push(a.roi); tP += a.unrealizedUsdt; tR += a.realizedProfit;
+                    rois.push(a.roi); tP += a.unrealizedUsdt; tR += a.realizedProfit; tW += a.wallet;
                     document.getElementById(prefix + 'Roi').innerText = (a.roi >= 0 ? '+' : '') + a.roi.toFixed(2) + '%';
                     document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(8);
                     document.getElementById(prefix + 'Bar').style.width = Math.min(100, Math.abs(a.roi) * 10) + '%';
                 });
+                const netRoi = tW > 0 ? (tP / tW) * 100 : 0;
                 const sScore = (rois[0] * rois[1] < 0) ? (Math.min(Math.abs(rois[0]), Math.abs(rois[1])) / Math.max(Math.abs(rois[0]), Math.abs(rois[1]))) * 100 : 0;
                 document.getElementById('syncPct').innerText = (isNaN(sScore) ? 0 : sScore.toFixed(1)) + '%';
                 document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(8);
                 document.getElementById('netProfit').innerText = (tP >= 0 ? '+' : '') + tP.toFixed(8);
-                document.getElementById('netProfit').className = 'text-6xl font-black mb-4 font-mono ' + (tP > 0 ? 'text-emerald-400' : 'text-zinc-400');
+                document.getElementById('netRoi').innerText = 'ROI: ' + (netRoi >= 0 ? '+' : '') + netRoi.toFixed(4) + '%';
+                document.getElementById('netProfit').className = 'text-6xl font-black mb-1 font-mono ' + (tP > 0 ? 'text-emerald-400' : 'text-zinc-400');
             } catch(e) {}
         }, 500);
     </script>
