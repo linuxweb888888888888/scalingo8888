@@ -118,11 +118,9 @@ function instantCheck() {
     const netPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
     const currentCombinedRoi = totalWallet > 0 ? (netPnL / totalWallet) * 100 : 0;
 
-    // Efficiency Calculation: How much PnL is successfully canceled out?
     const totalAbsPnL = Math.abs(s1.unrealizedUsdt) + Math.abs(s2.unrealizedUsdt);
     market.efficiency = totalAbsPnL > 0 ? (1 - (Math.abs(netPnL) / totalAbsPnL)) * 100 : 0;
 
-    // Improvement Calculation
     if (market.lastNetPnL !== 0) {
         const prevGap = Math.abs(market.lastNetPnL);
         const currGap = Math.abs(netPnL);
@@ -257,6 +255,7 @@ app.get('/', (req, res) => {
             <div class="flex gap-10 text-right font-mono">
                 <div><p class="text-[10px] text-zinc-600 font-bold uppercase">Improvement</p><p id="pnlImprovement" class="text-lg font-bold text-emerald-400">0.00%</p></div>
                 <div><p class="text-[10px] text-zinc-600 font-bold uppercase">Efficiency</p><p id="mirrorEfficiency" class="text-lg font-bold text-indigo-400">0.00%</p></div>
+                <div><p class="text-[10px] text-zinc-600 font-bold uppercase">Spread</p><p id="spreadPct" class="text-lg font-bold text-amber-400">0.00%</p></div>
                 <div><p class="text-[10px] text-zinc-600 font-bold uppercase">Price</p><p id="markPrice" class="text-lg font-bold text-white">0.00000000</p></div>
             </div>
         </div>
@@ -299,6 +298,7 @@ app.get('/', (req, res) => {
             try {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('markPrice').innerText = d.market.last.toFixed(8);
+                document.getElementById('spreadPct').innerText = d.market.spreadPct.toFixed(3) + '%';
                 document.getElementById('pnlImprovement').innerText = (d.market.improvement >= 0 ? '+' : '') + d.market.improvement.toFixed(2) + '%';
                 document.getElementById('pnlImprovement').className = 'text-lg font-bold ' + (d.market.improvement >= 0 ? 'text-emerald-400' : 'text-rose-500');
                 document.getElementById('mirrorEfficiency').innerText = d.market.efficiency.toFixed(2) + '%';
