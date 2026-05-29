@@ -28,10 +28,11 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     orderSize: 1,                
-    addSize: 1,                  // Add 1 contract at a time to balance
+    addSize: 1,                  // Add 1 contract to sync
     feeRate: 0.0006,             
     contractSize: 0,
-    balanceThreshold: 0.00000001 // How close to "the same" we want the PnL
+    roiThreshold: 0.5,           // Sync if ROI difference is > 0.5%
+    pnlThreshold: 0.00001        // Sync if PnL difference is > 0.00001
 };
 
 // ==================== GLOBAL STATE ====================
@@ -57,9 +58,7 @@ async function htxRequest(account, method, path, data = {}) {
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
         const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 5000 });
-        if (res.data.status !== 'ok') {
-            console.log(`❌ HTX ERROR: ${JSON.stringify(res.data)}`);
-        }
+        if (res.data.status !== 'ok') console.log(`❌ HTX ERROR: ${JSON.stringify(res.data)}`);
         return res.data;
     } catch (e) { 
         console.log(`❌ REQUEST FAILED: ${e.message}`);
@@ -113,7 +112,7 @@ async function tradeLoop() {
     // 1. OPEN INITIAL 1v1 HEDGE
     if (s1.volume < 1 || s2.volume < 1) {
         isProcessing = true;
-        market.status = 'Opening Initial Hedge...';
+        market.status = 'Initializing Sync...';
         const tasks = [];
         if (s1.volume < 1) tasks.push(htxRequest(acc1, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' }));
         if (s2.volume < 1) tasks.push(htxRequest(acc2, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: config.orderSize, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' }));
@@ -122,20 +121,18 @@ async function tradeLoop() {
         return;
     }
 
-    // 2. CALCULATE PNL DIFFERENCE (Net balance)
-    const pnl1 = s1.unrealizedUsdt;
-    const pnl2 = s2.unrealizedUsdt;
-    const pnlCombined = pnl1 + pnl2; // If zero, they are mirror images (e.g. 0.0004 + -0.0004 = 0)
+    // 2. MIRROR CALCULATION
+    // Goal: roi1 + roi2 = 0 and pnl1 + pnl2 = 0
+    const roiCombined = s1.roi + s2.roi;
+    const pnlCombined = s1.unrealizedUsdt + s2.unrealizedUsdt;
 
-    // 3. ADJUSTMENT LOGIC
-    // We check if the sum is significantly different from zero
-    if (Math.abs(pnlCombined) > config.balanceThreshold) {
+    // 3. ADJUSTMENT TRIGGER
+    // If the combined values are far from zero, one side is "lacking magnitude"
+    if (Math.abs(roiCombined) > config.roiThreshold || Math.abs(pnlCombined) > config.pnlThreshold) {
+        
         let targetAcc = null;
-
-        // If pnlCombined is positive, side 1 (Long) is "winning more" than side 2 (Short) is losing.
-        // Or Side 2 is "losing more" than side 1 is winning.
-        // We add 1 contract to the account with the SMALLER ABSOLUTE PnL to help it catch up.
-        if (Math.abs(pnl1) < Math.abs(pnl2)) {
+        // Logic: Add to the side that has the smaller absolute ROI (the side that is lagging)
+        if (Math.abs(s1.roi) < Math.abs(s2.roi)) {
             targetAcc = acc1;
         } else {
             targetAcc = acc2;
@@ -144,9 +141,9 @@ async function tradeLoop() {
         if (targetAcc) {
             isProcessing = true;
             const targetState = accountStates[targetAcc.accountId];
-            market.status = `Balancing: Adding 1 to ${targetState.direction}...`;
+            market.status = `Syncing ROI: Adding 1 to ${targetState.direction}...`;
             
-            console.log(`⚖️ Balancing PnL: Acc1(${pnl1.toFixed(8)}) Acc2(${pnl2.toFixed(8)}). Adding to ${targetState.direction}`);
+            console.log(`⚖️ Syncing ROI/PnL: Acc1(${s1.roi.toFixed(2)}%) Acc2(${s2.roi.toFixed(2)}%). Adding to ${targetState.direction}`);
             
             await htxRequest(targetAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, 
@@ -157,11 +154,11 @@ async function tradeLoop() {
                 order_price_type: 'optimal_5' 
             });
 
-            // Wait for sync to catch the new average price before checking again
+            // Wait for position to update before next loop
             setTimeout(() => { isProcessing = false; }, 4000);
         }
     } else {
-        market.status = "Perfectly Balanced";
+        market.status = "ROI & PnL Fully Synced";
     }
 }
 
@@ -196,7 +193,7 @@ app.get('/', (req, res) => {
 <body class="p-4 md:p-10">
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-8">
-            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Mirror Mode Active</p></div>
+            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Mirror ROI Mode</p></div>
             <div class="text-right">
                 <p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p>
                 <p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p>
@@ -204,21 +201,21 @@ app.get('/', (req, res) => {
         </div>
         
         <div class="glass rounded-[2.5rem] p-8 mb-8 text-center border-indigo-500/20">
-            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">PnL Combined (Gap to Zero)</p>
-            <h2 id="netProfit" class="text-6xl font-black mb-4 font-mono">0.00000000</h2>
-            <p class="text-zinc-400 text-sm">Bot is adding 1 contract at a time to keep accounts mirrored.</p>
+            <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Sync Delta (Combined ROI)</p>
+            <h2 id="roiDelta" class="text-6xl font-black mb-4 font-mono">0.00%</h2>
+            <p class="text-zinc-400 text-sm">Targeting perfect opposite ROI and PnL values.</p>
         </div>
 
         <div class="grid md:grid-cols-2 gap-6">
             <div class="glass rounded-[2rem] p-6 border-l-4 border-emerald-500">
-                <span class="text-xs font-bold text-emerald-500 uppercase tracking-widest">Account 1 (Long)</span>
+                <div class="flex justify-between"><span class="text-xs font-bold text-emerald-500 uppercase">Long Acc</span><span id="longRoi" class="font-bold text-emerald-400">0.00%</span></div>
                 <div id="longUsdt" class="text-2xl font-mono font-bold mt-2 text-white">$0.00000000</div>
-                <div id="longVol" class="text-xs text-zinc-500 mt-1">Size: 0 contracts</div>
+                <div id="longVol" class="text-xs text-zinc-500 mt-1">Size: 0</div>
             </div>
             <div class="glass rounded-[2rem] p-6 border-l-4 border-rose-500">
-                <span class="text-xs font-bold text-rose-500 uppercase tracking-widest">Account 2 (Short)</span>
+                <div class="flex justify-between"><span class="text-xs font-bold text-rose-500 uppercase">Short Acc</span><span id="shortRoi" class="font-bold text-rose-400">0.00%</span></div>
                 <div id="shortUsdt" class="text-2xl font-mono font-bold mt-2 text-white">$0.00000000</div>
-                <div id="shortVol" class="text-xs text-zinc-500 mt-1">Size: 0 contracts</div>
+                <div id="shortVol" class="text-xs text-zinc-500 mt-1">Size: 0</div>
             </div>
         </div>
     </div>
@@ -228,16 +225,17 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('markPrice').innerText = d.market.last.toFixed(8);
                 document.getElementById('botStatus').innerText = d.market.status;
-                let sum = 0;
+                let roiSum = 0;
                 d.accounts.forEach(a => {
                     const prefix = a.direction === 'buy' ? 'long' : 'short';
+                    document.getElementById(prefix + 'Roi').innerText = (a.roi >= 0 ? '+' : '') + a.roi.toFixed(2) + '%';
                     document.getElementById(prefix + 'Usdt').innerText = (a.unrealizedUsdt >= 0 ? '+' : '') + a.unrealizedUsdt.toFixed(8);
-                    document.getElementById(prefix + 'Vol').innerText = 'Size: ' + a.volume + ' contracts';
-                    sum += a.unrealizedUsdt;
+                    document.getElementById(prefix + 'Vol').innerText = 'Size: ' + a.volume;
+                    roiSum += a.roi;
                 });
-                const nElem = document.getElementById('netProfit');
-                nElem.innerText = (sum >= 0 ? '+' : '') + sum.toFixed(8);
-                nElem.className = 'text-6xl font-black mb-4 font-mono ' + (Math.abs(sum) < 0.00001 ? 'text-indigo-400' : 'text-zinc-400');
+                const rElem = document.getElementById('roiDelta');
+                rElem.innerText = (roiSum >= 0 ? '+' : '') + roiSum.toFixed(2) + '%';
+                rElem.className = 'text-6xl font-black mb-4 font-mono ' + (Math.abs(roiSum) < 1 ? 'text-indigo-400' : 'text-zinc-400');
             } catch(e) {}
         }
         setInterval(update, 1000);
@@ -247,4 +245,4 @@ app.get('/', (req, res) => {
 });
 
 startWS(); setInterval(sync, 2000); setInterval(tradeLoop, 3000); app.listen(config.port, '0.0.0.0');
-console.log(`Mirror Sync Running on Port ${config.port}`);
+console.log(`ROI Mirror Sync Running on Port ${config.port}`);
