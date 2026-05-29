@@ -21,7 +21,7 @@ while (process.env[`HTX_API_KEY_${accountIndex}`]) {
 }
 
 const config = {
-    symbol: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase(), // UPDATED BACK TO SHIB
+    symbol: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase(),
     leverage: parseInt(process.env.LEVERAGE) || 10,
     port: process.env.PORT || 3000,
     restHost: 'api.hbdm.com',
@@ -32,14 +32,14 @@ const config = {
     feeRate: 0.0006,             
     contractSize: 0,
     roiThreshold: 0.1,           
-    maxVolGap: 1000               
+    maxVolGap: 500               
 };
 
 // ==================== GLOBAL STATE ====================
 let market = { last: 0, status: 'initializing' };
 let accountStates = {};
 let isProcessing = false;
-let triggeredExit = false; 
+let triggeredExit = false; // Emergency hardware-level lock
 
 config.accounts.forEach((account, idx) => {
     accountStates[account.accountId] = {
@@ -59,9 +59,6 @@ async function htxRequest(account, method, path, data = {}) {
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
         const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 2000 });
-        if (res.data.status !== 'ok') {
-            console.log(`❌ [Acc ${account.accountId}] Error: ${res.data['err_msg'] || JSON.stringify(res.data)}`);
-        }
         return res.data;
     } catch (e) { return { status: 'error' }; }
 }
@@ -69,7 +66,7 @@ async function htxRequest(account, method, path, data = {}) {
 // ==================== CORE LOGIC ====================
 
 async function restSync() {
-    if (triggeredExit) return; 
+    if (triggeredExit) return; // Stop syncing if we are exiting
     if (config.contractSize === 0) {
         const info = await htxRequest(config.accounts[0], 'GET', '/linear-swap-api/v1/swap_contract_info');
         if (info?.status === 'ok') {
@@ -100,6 +97,7 @@ async function restSync() {
     }
 }
 
+// THE MACHINE GUN EXIT: Fires on every single WS tick
 function instantCheck() {
     if (triggeredExit || market.last === 0 || config.contractSize === 0) return;
 
@@ -107,7 +105,7 @@ function instantCheck() {
     const s2 = accountStates[config.accounts[1].accountId];
     if (s1.volume < 1 || s2.volume < 1) return;
 
-    // Instant PnL Math using WS price
+    // Direct math check
     const side1 = s1.direction === 'buy' ? 1 : -1;
     const side2 = s2.direction === 'buy' ? 1 : -1;
     const p1 = (market.last - s1.avgPrice) * s1.volume * side1 * config.contractSize;
@@ -117,7 +115,7 @@ function instantCheck() {
     // TRIGGER AT FIRST SIGHT OF GREEN
     if (currentPnL > 0.00000001) {
         triggeredExit = true; 
-        console.log(`🚀 SHIB PROFIT DETECTED ($${currentPnL.toFixed(8)}). EXECUTING FORCE CLOSE.`);
+        console.log(`💰 GREEN DETECTED ($${currentPnL.toFixed(8)}). FIRING EXIT NOW.`);
         closeAll();
     }
 }
@@ -127,7 +125,6 @@ function tradeLoop() {
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
 
-    // Open initial 1v1 hedge
     if (s1.volume < 1 || s2.volume < 1) {
         isProcessing = true;
         Promise.all([
@@ -147,7 +144,6 @@ function tradeLoop() {
         market.status = "Sign Recovery...";
         targetAcc = (roi1Mag < roi2Mag) ? config.accounts[0] : config.accounts[1];
     } else if (syncProgress > 95) {
-        // Profit Push: Sync is perfect, so add to winner to push PnL green
         if ((s1.unrealizedUsdt + s2.unrealizedUsdt) <= 0) {
             market.status = "Profit Push...";
             targetAcc = (s1.roi > s2.roi) ? config.accounts[0] : config.accounts[1];
@@ -168,28 +164,22 @@ function tradeLoop() {
 }
 
 async function closeAll() {
-    triggeredExit = true;
-    market.status = "FORCE CLOSING...";
-    
+    market.status = "CLOSE ORDER SENT";
+    // Fire both independently and as fast as possible
     config.accounts.forEach(acc => {
         const state = accountStates[acc.accountId];
-        const closeVol = Math.floor(state.volume);
-        
-        if (closeVol > 0) {
+        if (state.volume > 0) {
             htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, 
-                volume: closeVol, 
+                volume: state.volume, 
                 direction: state.direction === 'buy' ? 'sell' : 'buy', 
                 offset: 'close', 
                 lever_rate: config.leverage, 
                 order_price_type: 'optimal_5' 
-            }).then(res => {
-                if (res.status === 'ok') state.volume = 0;
-            });
+            }).then(res => console.log(`Account ${acc.accountId} close result: ${res.status}`));
         }
     });
-
-    // 20-second cooldown after exit
+    // Lock bot for 20 seconds to prevent re-opening during exchange update
     setTimeout(() => { triggeredExit = false; isProcessing = false; }, 20000);
 }
 
@@ -216,7 +206,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>AtomicSync Pro | SHIB</title>
+    <meta charset="UTF-8"><title>AtomicSync Pro</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&display=swap" rel="stylesheet">
     <style>
@@ -228,10 +218,10 @@ app.get('/', (req, res) => {
 <body class="p-4 md:p-10">
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-8">
-            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white uppercase">Atomic<span class="text-indigo-500">Sync</span> SHIB</h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Active</p></div>
+            <div><h1 class="text-2xl font-extrabold tracking-tighter text-white">ATOMIC<span class="text-indigo-500">SYNC</span></h1><p id="botStatus" class="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Running...</p></div>
             <div class="flex gap-10 text-right">
-                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Price</p><p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p></div>
-                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Profit Growth</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.0000</p></div>
+                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Mark Price</p><p id="markPrice" class="text-xl font-mono font-bold text-indigo-400">0.00000000</p></div>
+                <div><p class="text-[10px] text-zinc-500 font-bold uppercase">Total Equity Growth</p><p id="totalRealized" class="text-xl font-mono font-bold text-emerald-400">+$0.00000000</p></div>
             </div>
         </div>
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20 text-center">
@@ -270,7 +260,7 @@ app.get('/', (req, res) => {
                 });
                 const sScore = (rois[0] * rois[1] < 0) ? (Math.min(Math.abs(rois[0]), Math.abs(rois[1])) / Math.max(Math.abs(rois[0]), Math.abs(rois[1]))) * 100 : 0;
                 document.getElementById('syncPct').innerText = (isNaN(sScore) ? 0 : sScore.toFixed(1)) + '%';
-                document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(4);
+                document.getElementById('totalRealized').innerText = (tR >= 0 ? '+' : '') + '$' + tR.toFixed(8);
                 document.getElementById('netProfit').innerText = (tP >= 0 ? '+' : '') + tP.toFixed(8);
                 document.getElementById('netProfit').className = 'text-6xl font-black mb-4 font-mono ' + (tP > 0 ? 'text-emerald-400' : 'text-zinc-400');
             } catch(e) {}
