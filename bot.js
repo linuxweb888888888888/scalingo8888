@@ -33,14 +33,14 @@ const config = {
     contractSize: 0,
     roiThreshold: 0.1,           
     maxVolGap: 500,
-    profitRoiTarget: parseFloat(process.env.PROFIT_ROI_TARGET) || 0.25 // Exit when total ROI hits 0.005%               
+    profitRoiTarget: parseFloat(process.env.PROFIT_ROI_TARGET) || 0.25               
 };
 
 // ==================== GLOBAL STATE ====================
 let market = { last: 0, status: 'initializing' };
 let accountStates = {};
 let isProcessing = false;
-let triggeredExit = false; // Emergency hardware-level lock
+let triggeredExit = false; 
 
 config.accounts.forEach((account, idx) => {
     accountStates[account.accountId] = {
@@ -67,7 +67,7 @@ async function htxRequest(account, method, path, data = {}) {
 // ==================== CORE LOGIC ====================
 
 async function restSync() {
-    if (triggeredExit) return; // Stop syncing if we are exiting
+    if (triggeredExit) return; 
     if (config.contractSize === 0) {
         const info = await htxRequest(config.accounts[0], 'GET', '/linear-swap-api/v1/swap_contract_info');
         if (info?.status === 'ok') {
@@ -86,7 +86,7 @@ async function restSync() {
                 state.volume = Math.floor(parseFloat(pos.volume));
                 state.roi = parseFloat(pos.profit_rate) * 100;
                 state.unrealizedUsdt = parseFloat(pos.profit);
-            } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
+            } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.avgPrice = 0; }
         }
         const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
         if (accRes?.status === 'ok' && accRes.data) {
@@ -98,7 +98,6 @@ async function restSync() {
     }
 }
 
-// THE MACHINE GUN EXIT: Fires on every single WS tick
 function instantCheck() {
     if (triggeredExit || market.last === 0 || config.contractSize === 0) return;
 
@@ -106,18 +105,15 @@ function instantCheck() {
     const s2 = accountStates[config.accounts[1].accountId];
     if (s1.volume < 1 || s2.volume < 1) return;
 
-    // Direct math check
     const side1 = s1.direction === 'buy' ? 1 : -1;
     const side2 = s2.direction === 'buy' ? 1 : -1;
     const p1 = (market.last - s1.avgPrice) * s1.volume * side1 * config.contractSize;
     const p2 = (market.last - s2.avgPrice) * s2.volume * side2 * config.contractSize;
     const currentPnL = p1 + p2;
     
-    // ROI CALCULATION
     const totalWallet = s1.wallet + s2.wallet;
     const currentCombinedRoi = totalWallet > 0 ? (currentPnL / totalWallet) * 100 : 0;
 
-    // TRIGGER AT ROI SETTING
     if (currentCombinedRoi >= config.profitRoiTarget) {
         triggeredExit = true; 
         console.log(`💰 ROI TARGET MET (${currentCombinedRoi.toFixed(4)}%). FIRING EXIT NOW.`);
@@ -169,8 +165,8 @@ function tradeLoop() {
 }
 
 async function closeAll() {
+    triggeredExit = true;
     market.status = "CLOSE ORDER SENT";
-    // Fire both independently and as fast as possible
     config.accounts.forEach(acc => {
         const state = accountStates[acc.accountId];
         if (state.volume > 0) {
@@ -184,7 +180,6 @@ async function closeAll() {
             }).then(res => console.log(`Account ${acc.accountId} close result: ${res.status}`));
         }
     });
-    // Lock bot for 20 seconds to prevent re-opening during exchange update
     setTimeout(() => { triggeredExit = false; isProcessing = false; }, 20000);
 }
 
@@ -207,6 +202,11 @@ function startWS() {
 }
 
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), config }));
+app.post('/api/close', async (req, res) => {
+    await closeAll();
+    res.json({ status: 'ok' });
+});
+
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -230,6 +230,7 @@ app.get('/', (req, res) => {
             </div>
         </div>
         <div class="glass rounded-[2.5rem] p-8 mb-8 relative overflow-hidden border-indigo-500/20 text-center">
+            <button onclick="triggerClose()" class="absolute top-4 right-4 bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-black px-4 py-2 rounded-full transition-all active:scale-95">CLOSE ALL POSITIONS</button>
             <p class="text-xs font-bold text-zinc-500 uppercase tracking-widest mb-2">Net Exit Profit (Mirror Delta)</p>
             <h2 id="netProfit" class="text-6xl font-black mb-1 font-mono">+$0.00000000</h2>
             <p id="netRoi" class="text-lg font-bold text-indigo-400 mb-4 font-mono">ROI: 0.0000%</p>
@@ -239,18 +240,25 @@ app.get('/', (req, res) => {
         </div>
         <div class="grid md:grid-cols-2 gap-6">
             <div class="glass rounded-[2rem] p-6 border-l-4 border-emerald-500">
-                <div class="flex justify-between items-center mb-4"><span class="text-xs font-bold text-emerald-500 uppercase tracking-widest">Long Side (Acc 1)</span><span id="longRoi" class="text-xl font-black text-emerald-400">0.00%</span></div>
+                <div class="flex justify-between items-center mb-2"><span class="text-xs font-bold text-emerald-500 uppercase tracking-widest">Long Side (Acc 1)</span><span id="longRoi" class="text-xl font-black text-emerald-400">0.00%</span></div>
+                <div class="mb-4"><p class="text-[10px] text-zinc-500 font-bold uppercase">Entry Price</p><p id="longEntry" class="text-sm font-mono font-bold text-zinc-300">0.00000000</p></div>
                 <div class="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden mb-4"><div id="longBar" class="roi-bar bg-emerald-500 h-full" style="width: 0%"></div></div>
                 <div class="flex justify-between items-center"><span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL (USDT)</span><span id="longUsdt" class="text-sm font-mono font-bold text-white">0 / $0.00000000</span></div>
             </div>
             <div class="glass rounded-[2rem] p-6 border-l-4 border-rose-500">
-                <div class="flex justify-between items-center mb-4"><span class="text-xs font-bold text-rose-500 uppercase tracking-widest">Short Side (Acc 2)</span><span id="shortRoi" class="text-xl font-black text-rose-400">0.00%</span></div>
+                <div class="flex justify-between items-center mb-2"><span class="text-xs font-bold text-rose-500 uppercase tracking-widest">Short Side (Acc 2)</span><span id="shortRoi" class="text-xl font-black text-rose-400">0.00%</span></div>
+                <div class="mb-4"><p class="text-[10px] text-zinc-500 font-bold uppercase">Entry Price</p><p id="shortEntry" class="text-sm font-mono font-bold text-zinc-300">0.00000000</p></div>
                 <div class="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden mb-4"><div id="shortBar" class="roi-bar bg-rose-500 h-full" style="width: 0%"></div></div>
                 <div class="flex justify-between items-center"><span class="text-xs text-zinc-500 uppercase font-bold">Vol / PnL (USDT)</span><span id="shortUsdt" class="text-sm font-mono font-bold text-white">0 / $0.00000000</span></div>
             </div>
         </div>
     </div>
     <script>
+        async function triggerClose() {
+            if(!confirm("Are you sure you want to close all positions immediately?")) return;
+            await fetch('/api/close', { method: 'POST' });
+        }
+
         setInterval(async () => {
             try {
                 const r = await fetch('/api/status'); const d = await r.json();
@@ -261,6 +269,7 @@ app.get('/', (req, res) => {
                     const prefix = a.direction === 'buy' ? 'long' : 'short';
                     rois.push(a.roi); tP += a.unrealizedUsdt; tR += a.realizedProfit; tW += a.wallet;
                     document.getElementById(prefix + 'Roi').innerText = (a.roi >= 0 ? '+' : '') + a.roi.toFixed(2) + '%';
+                    document.getElementById(prefix + 'Entry').innerText = a.avgPrice.toFixed(8);
                     document.getElementById(prefix + 'Usdt').innerText = a.volume + ' / $' + a.unrealizedUsdt.toFixed(8);
                     document.getElementById(prefix + 'Bar').style.width = Math.min(100, Math.abs(a.roi) * 10) + '%';
                 });
