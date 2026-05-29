@@ -39,7 +39,7 @@ const config = {
 let market = { last: 0, status: 'initializing' };
 let accountStates = {};
 let isProcessing = false;
-let isExiting = false; // Dedicated flag to prevent exit-looping
+let triggeredExit = false; // Emergency hardware-level lock
 
 config.accounts.forEach((account, idx) => {
     accountStates[account.accountId] = {
@@ -66,6 +66,7 @@ async function htxRequest(account, method, path, data = {}) {
 // ==================== CORE LOGIC ====================
 
 async function restSync() {
+    if (triggeredExit) return; // Stop syncing if we are exiting
     if (config.contractSize === 0) {
         const info = await htxRequest(config.accounts[0], 'GET', '/linear-swap-api/v1/swap_contract_info');
         if (info?.status === 'ok') {
@@ -96,30 +97,31 @@ async function restSync() {
     }
 }
 
-// INSTANT MONITOR: Bypasses isProcessing to ensure we never miss profit
+// THE MACHINE GUN EXIT: Fires on every single WS tick
 function instantCheck() {
-    if (isExiting || market.last === 0 || config.contractSize === 0) return;
+    if (triggeredExit || market.last === 0 || config.contractSize === 0) return;
 
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
     if (s1.volume < 1 || s2.volume < 1) return;
 
-    // Millisecond calculation for exit
+    // Direct math check
     const side1 = s1.direction === 'buy' ? 1 : -1;
     const side2 = s2.direction === 'buy' ? 1 : -1;
     const p1 = (market.last - s1.avgPrice) * s1.volume * side1 * config.contractSize;
     const p2 = (market.last - s2.avgPrice) * s2.volume * side2 * config.contractSize;
-    
-    // THE EXACT TRIGGER: If calculated profit > 0, close immediately
-    if ((p1 + p2) > 0) {
-        isExiting = true; // Block everything else immediately
-        market.status = "PROFIT DETECTED! EXITING...";
+    const currentPnL = p1 + p2;
+
+    // TRIGGER AT FIRST SIGHT OF GREEN
+    if (currentPnL > 0.00000001) {
+        triggeredExit = true; 
+        console.log(`💰 GREEN DETECTED ($${currentPnL.toFixed(8)}). FIRING EXIT NOW.`);
         closeAll();
     }
 }
 
 function tradeLoop() {
-    if (isProcessing || isExiting || market.last === 0) return;
+    if (isProcessing || triggeredExit || market.last === 0) return;
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
 
@@ -136,15 +138,13 @@ function tradeLoop() {
     const roi2Mag = Math.abs(s2.roi);
     const isMirrored = (s1.roi * s2.roi < 0);
     const syncProgress = isMirrored ? (Math.min(roi1Mag, roi2Mag) / Math.max(roi1Mag, roi2Mag)) * 100 : 0;
-    const combinedPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
 
     let targetAcc = null;
-
     if (!isMirrored) {
         market.status = "Sign Recovery...";
         targetAcc = (roi1Mag < roi2Mag) ? config.accounts[0] : config.accounts[1];
     } else if (syncProgress > 95) {
-        if (combinedPnL <= 0) {
+        if ((s1.unrealizedUsdt + s2.unrealizedUsdt) <= 0) {
             market.status = "Profit Push...";
             targetAcc = (s1.roi > s2.roi) ? config.accounts[0] : config.accounts[1];
         }
@@ -164,19 +164,23 @@ function tradeLoop() {
 }
 
 async function closeAll() {
-    isExiting = true;
-    console.log("🚀 EXECUTING EMERGENCY PROFIT EXIT...");
-    await Promise.all(config.accounts.map(acc => {
+    market.status = "CLOSE ORDER SENT";
+    // Fire both independently and as fast as possible
+    config.accounts.forEach(acc => {
         const state = accountStates[acc.accountId];
-        if (state.volume <= 0) return Promise.resolve();
-        return htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-            contract_code: config.symbol, volume: state.volume, 
-            direction: state.direction === 'buy' ? 'sell' : 'buy', 
-            offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
-        });
-    }));
-    // Cool down for 15 seconds to allow exchange state to reset
-    setTimeout(() => { isExiting = false; isProcessing = false; }, 15000);
+        if (state.volume > 0) {
+            htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, 
+                volume: state.volume, 
+                direction: state.direction === 'buy' ? 'sell' : 'buy', 
+                offset: 'close', 
+                lever_rate: config.leverage, 
+                order_price_type: 'optimal_5' 
+            }).then(res => console.log(`Account ${acc.accountId} close result: ${res.status}`));
+        }
+    });
+    // Lock bot for 20 seconds to prevent re-opening during exchange update
+    setTimeout(() => { triggeredExit = false; isProcessing = false; }, 20000);
 }
 
 // ==================== WS & DASHBOARD ====================
@@ -189,7 +193,7 @@ function startWS() {
             const msg = JSON.parse(dec.toString());
             if (msg.tick) {
                 market.last = (msg.tick.bid[0] + msg.tick.ask[0]) / 2;
-                instantCheck(); // Runs on every single price update
+                instantCheck(); 
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
         });
