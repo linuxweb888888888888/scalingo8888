@@ -27,10 +27,9 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    // --- Trading Strategy ---
     takeProfitPct: 1.5,
     stopLossPct: -5.0,
-    orderVolume: 100 // Set this according to symbol requirements
+    orderVolume: 100 
 };
 
 // ==================== GLOBAL STATE ====================
@@ -43,34 +42,23 @@ config.accounts.forEach((account, idx) => {
         avgPrice: 0, roi: 0, volume: 0,
         unrealizedUsdt: 0, wallet: 0,
         lastAction: 'Initializing...',
-        isProcessing: false // Lock to prevent order spam
+        isProcessing: false,
+        leverageSet: false // Flag to ensure we only set leverage once
     };
 });
 
 // ==================== API HANDLER ====================
 async function htxRequest(account, method, path, data = {}) {
     const timestamp = new Date().toISOString().split('.')[0];
-    const params = { 
-        AccessKeyId: account.apiKey, 
-        SignatureMethod: 'HmacSHA256', 
-        SignatureVersion: '2', 
-        Timestamp: timestamp 
-    };
-    
+    const params = { AccessKeyId: account.apiKey, SignatureMethod: 'HmacSHA256', SignatureVersion: '2', Timestamp: timestamp };
     const query = Object.keys(params).sort().map(k => `${k}=${encodeURIComponent(params[k])}`).join('&');
     const payload = [method.toUpperCase(), config.restHost, path, query].join('\n');
     const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     
     try {
-        const res = await axios({ 
-            method, url, 
-            data: method === 'POST' ? data : null, 
-            headers: { 'Content-Type': 'application/json' }, 
-            timeout: 5000 
-        });
-
-        if (res.data.status !== 'ok') {
+        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 5000 });
+        if (res.data.status !== 'ok' && res.data['err_code'] !== 1046) { // Ignore 1046 (leverage already set)
             console.error(`🔴 API REJECTION [Acc ${account.accountId}]:`, JSON.stringify(res.data));
         }
         return res.data;
@@ -85,45 +73,48 @@ async function runAutoLogic() {
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         
-        // 1. Sync Data
         await syncPositionAndBalance(acc, state);
 
-        // 2. Decide Action
         if (state.isProcessing) continue;
 
         if (state.volume === 0) {
-            // OPEN POSITION
             state.isProcessing = true;
-            console.log(`[Acc ${acc.accountId}] Auto-Opening ${state.direction} for ${config.symbol}`);
-            
+
+            // FIX: SET LEVERAGE BEFORE OPENING
+            if (!state.leverageSet) {
+                console.log(`[Acc ${acc.accountId}] Syncing leverage to ${config.leverage}x...`);
+                await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_switch_lever_rate', {
+                    contract_code: config.symbol,
+                    lever_rate: config.leverage
+                });
+                state.leverageSet = true;
+            }
+
+            console.log(`[Acc ${acc.accountId}] Auto-Opening ${state.direction}...`);
             const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol,
                 volume: config.orderVolume,
                 direction: state.direction,
                 offset: 'open',
                 lever_rate: config.leverage,
-                order_price_type: 'optimal_20' // Aggressive fill
+                order_price_type: 'optimal_20'
             });
 
             if (res.status === 'ok') {
                 state.lastAction = `Opened ${state.direction}`;
             } else {
-                state.lastAction = `Order Failed: ${res['err-msg'] || 'Check Balance'}`;
-                // Delay next attempt by 5 seconds on failure
+                state.lastAction = `Order Failed: ${res['err_msg'] || 'Check Balance'}`;
                 await new Promise(r => setTimeout(r, 5000));
             }
             state.isProcessing = false;
 
         } else {
-            // MONITOR FOR EXIT (TP/SL)
+            // Check TP/SL
             const shouldTP = state.roi >= config.takeProfitPct;
             const shouldSL = state.roi <= config.stopLossPct;
 
             if (shouldTP || shouldSL) {
                 state.isProcessing = true;
-                const reason = shouldTP ? 'Take Profit' : 'Stop Loss';
-                state.lastAction = `Closing for ${reason}...`;
-                
                 const closeDir = state.direction === 'buy' ? 'sell' : 'buy';
                 const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol,
@@ -135,9 +126,8 @@ async function runAutoLogic() {
                 });
 
                 if (res.status === 'ok') {
-                    state.lastAction = `Closed via ${reason}`;
-                } else {
-                    state.lastAction = `Close Failed: ${res['err-msg']}`;
+                    state.lastAction = `Closed (${shouldTP ? 'TP' : 'SL'})`;
+                    state.leverageSet = false; // Reset leverage flag for next trade
                 }
                 state.isProcessing = false;
             } else {
@@ -149,7 +139,6 @@ async function runAutoLogic() {
 }
 
 async function syncPositionAndBalance(acc, state) {
-    // Sync Position Info
     const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
     if (posRes?.status === 'ok' && posRes.data) {
         const pos = posRes.data.find(p => p.direction === state.direction && p.contract_code === config.symbol);
@@ -162,8 +151,6 @@ async function syncPositionAndBalance(acc, state) {
             state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0;
         }
     }
-
-    // Sync Wallet Info
     const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
     if (accRes?.status === 'ok' && accRes.data) {
         state.wallet = parseFloat(accRes.data[0].margin_balance);
@@ -211,10 +198,7 @@ app.get('/', (req, res) => {
 <body class="p-10"><div class="max-w-4xl mx-auto">
     <div class="flex justify-between items-end mb-10">
         <div><h1 class="text-xl font-bold text-white uppercase tracking-tighter">Hedge Bot <span class="text-indigo-500">Auto</span></h1><p id="botStatus" class="text-xs text-zinc-500 font-bold uppercase"></p></div>
-        <div class="text-right">
-            <p class="text-[10px] text-zinc-600 font-bold uppercase">Price</p>
-            <p id="price" class="font-mono text-white text-2xl font-bold">0.00</p>
-        </div>
+        <div class="text-right"><p class="text-[10px] text-zinc-600 font-bold uppercase">Price</p><p id="price" class="font-mono text-white text-2xl font-bold">0.00</p></div>
     </div>
     <div class="glass rounded-3xl p-8 mb-6 text-center border-t border-indigo-500/10">
         <p class="text-[10px] text-zinc-500 font-bold uppercase mb-2">Net Unrealized PnL</p>
@@ -228,12 +212,12 @@ app.get('/', (req, res) => {
         <div class="glass rounded-2xl p-6">
             <p class="text-[10px] font-bold text-emerald-500 uppercase mb-4">Account 1 (Long)</p>
             <p id="longRoi" class="text-3xl font-mono font-bold mb-1">0.00%</p>
-            <p id="longStats" class="text-[11px] text-zinc-400 font-mono italic">Waiting for update...</p>
+            <p id="longStats" class="text-[11px] text-zinc-400 font-mono italic">Syncing...</p>
         </div>
         <div class="glass rounded-2xl p-6">
             <p class="text-[10px] font-bold text-rose-500 uppercase mb-4">Account 2 (Short)</p>
             <p id="shortRoi" class="text-3xl font-mono font-bold mb-1">0.00%</p>
-            <p id="shortStats" class="text-[11px] text-zinc-400 font-mono italic">Waiting for update...</p>
+            <p id="shortStats" class="text-[11px] text-zinc-400 font-mono italic">Syncing...</p>
         </div>
     </div>
     <button onclick="closeAll()" class="w-full py-4 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl text-xs uppercase tracking-widest transition-all">Emergency Close All</button>
@@ -260,7 +244,6 @@ setInterval(async () => {
 </script></body></html>`);
 });
 
-// ==================== START ====================
 startWS();
-setInterval(runAutoLogic, 3000); // Main logic loop every 3 seconds
-app.listen(config.port, '0.0.0.0', () => console.log(`🚀 Bot live on port ${config.port}`));
+setInterval(runAutoLogic, 3000); 
+app.listen(config.port, '0.0.0.0');
