@@ -27,7 +27,6 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    // Removed takeProfitPct as we are using the 95% balance bar logic instead
     baseVolume: 1,
     microStep: 1,        
     targetRatio: 1.5,     
@@ -71,62 +70,45 @@ async function syncAccount(acc, state) {
 }
 
 async function closeAll() {
-    if (market.status.includes("LIQUIDATING")) return; // Prevent double triggers
-
-    console.log("🎯 TARGET REACHED: LIQUIDATING ALL POSITIONS");
+    if (market.status.includes("LIQUIDATING")) return;
     market.status = "LIQUIDATING (95%)...";
     
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         await syncAccount(acc, state);
-        
         if (state.volume > 0) {
             const closeDir = state.direction === 'buy' ? 'sell' : 'buy';
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-                contract_code: config.symbol, 
-                volume: state.volume, 
-                direction: closeDir, 
-                offset: 'close', 
-                lever_rate: config.leverage, 
-                order_price_type: 'optimal_20' // Aggressive fill
+                contract_code: config.symbol, volume: state.volume, 
+                direction: closeDir, offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
             });
         }
     }
-    market.status = "Completed. Restarting...";
+    market.status = "COMPLETED";
     setTimeout(() => { market.status = "Active"; }, 5000);
 }
 
 async function runSlowLogic() {
     for (const acc of config.accounts) { await syncAccount(acc, accountStates[acc.accountId]); }
-    
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
-    
     const winVal = Math.max(Math.abs(s1.unrealizedUsdt), Math.abs(s2.unrealizedUsdt));
     const loseVal = Math.min(Math.abs(s1.unrealizedUsdt), Math.abs(s2.unrealizedUsdt));
     
     market.netPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
+    if (loseVal < 0.01) market.balancePct = 0;
+    else market.balancePct = Math.min(100, ((winVal / loseVal) / config.targetRatio) * 100);
 
-    // Calculate Progress Bar %
-    if (loseVal < 0.01) {
-        market.balancePct = 0;
-    } else {
-        market.balancePct = Math.min(100, ((winVal / loseVal) / config.targetRatio) * 100);
-    }
-
-    // --- NEW AUTO-CLOSE LOGIC ---
-    // If progress bar reaches 95% and we have active positions, close everything
+    // AUTO-CLOSE AT 95%
     if (market.balancePct >= 95 && (s1.volume > 0 || s2.volume > 0)) {
         await closeAll();
-        return; // Stop further logic this cycle
+        return;
     }
 
-    // Determine Winners/Losers for Nudging
     const winner = s1.roi > s2.roi ? s1 : s2;
     const loser = s1.roi > s2.roi ? s2 : s1;
     const winnerAcc = config.accounts.find(a => a.accountId === (s1.roi > s2.roi ? config.accounts[0].accountId : config.accounts[1].accountId));
 
-    // Winner Nudge Logic
     if (winner.volume > 0 && loser.volume > 0 && !winner.isLocked && market.balancePct < 95) {
         if (winVal < (loseVal * config.targetRatio)) {
             winner.isLocked = true;
@@ -139,7 +121,6 @@ async function runSlowLogic() {
         }
     }
 
-    // Re-entry logic if side is empty
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume === 0 && !state.isLocked && !market.status.includes("LIQUIDATING")) {
@@ -152,57 +133,120 @@ async function runSlowLogic() {
     }
 }
 
-// API & UI (unchanged logic, just fetching the updated market object)
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates) }));
 app.post('/api/close', async (req, res) => { await closeAll(); res.json({status: 'ok'}); });
 
+// ==================== UI DESIGN (WHITE/ROBOTO) ====================
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>Micro Balancer</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<style>body{background:#030304;color:#f0f0f0;font-family:monospace;}.glass{background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.05);}</style></head>
-<body class="p-10"><div class="max-w-3xl mx-auto">
-    <div class="flex justify-between items-end mb-10 border-b border-white/10 pb-4">
-        <div><h1 class="text-lg font-bold uppercase">Micro-Hedge</h1><p id="botStatus" class="text-[9px] text-indigo-500 font-bold uppercase"></p></div>
-        <div class="text-right"><p class="text-[10px] text-zinc-600 font-bold uppercase">Net Gain</p><p id="netPnL" class="text-2xl font-bold">$0.0000</p></div>
-    </div>
-    <div class="glass rounded-2xl p-8 mb-6">
-        <div class="flex justify-between text-[10px] mb-2 uppercase font-bold text-zinc-500"><span>Target Progress (Exit at 95%)</span><span id="balPct">0%</span></div>
-        <div class="w-full bg-white/5 h-1 rounded-full mb-8"><div id="balBar" class="bg-indigo-500 h-1 rounded-full transition-all duration-500" style="width:0%"></div></div>
-        <div class="grid grid-cols-2 gap-10">
-            <div><p class="text-[10px] text-emerald-500 font-bold mb-2 uppercase">Long</p><p id="lRoi" class="text-3xl font-bold mb-1">0.00%</p><p id="lPnl" class="text-sm text-zinc-500">$0.00</p><p id="lVol" class="text-[9px] text-zinc-600 mt-2"></p></div>
-            <div class="text-right"><p class="text-[10px] text-rose-500 font-bold mb-2 uppercase">Short</p><p id="sRoi" class="text-3xl font-bold mb-1">0.00%</p><p id="sPnl" class="text-sm text-zinc-500">$0.00</p><p id="sVol" class="text-[9px] text-zinc-600 mt-2"></p></div>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HTX Hedge Monitor</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700;900&display=swap" rel="stylesheet">
+    <style>
+        body { background-color: #f8fafc; color: #1e293b; font-family: 'Roboto', sans-serif; }
+        .card { background: white; border: 1px solid #e2e8f0; border-radius: 24px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }
+        .progress-container { background: #f1f5f9; border-radius: 999px; height: 12px; overflow: hidden; }
+        .btn-liquidate { background: #ef4444; transition: all 0.2s; }
+        .btn-liquidate:hover { background: #dc2626; transform: translateY(-1px); }
+    </style>
+</head>
+<body class="p-4 md:p-10">
+    <div class="max-w-2xl mx-auto">
+        <!-- Header -->
+        <div class="flex justify-between items-center mb-8">
+            <div>
+                <h1 class="text-3xl font-black tracking-tighter text-slate-900 uppercase">Hedge-Bot</h1>
+                <div class="flex items-center gap-2">
+                    <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                    <p id="botStatus" class="text-xs font-bold text-slate-400 uppercase tracking-widest">Active</p>
+                </div>
+            </div>
+            <div class="text-right">
+                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Total Net PnL</p>
+                <p id="netPnL" class="text-4xl font-black text-slate-900 leading-none">$0.0000</p>
+            </div>
         </div>
+
+        <!-- Main Card -->
+        <div class="card p-8 mb-6">
+            <div class="flex justify-between items-end mb-4">
+                <h2 class="text-xs font-black text-slate-400 uppercase tracking-widest">Target Progress (Close @ 95%)</h2>
+                <span id="balPct" class="text-2xl font-black text-indigo-600">0.0%</span>
+            </div>
+            
+            <div class="progress-container mb-10">
+                <div id="balBar" class="bg-indigo-600 h-full w-0 transition-all duration-700 ease-out"></div>
+            </div>
+
+            <div class="grid grid-cols-2 gap-8">
+                <div class="border-r border-slate-100 pr-4">
+                    <p class="text-[10px] font-black text-emerald-600 uppercase tracking-widest mb-2">Long Position</p>
+                    <p id="lRoi" class="text-4xl font-black text-slate-900 mb-1">0.00%</p>
+                    <p id="lPnl" class="text-lg font-medium text-slate-400">$0.00</p>
+                    <div class="mt-4 pt-4 border-t border-slate-50">
+                        <p id="lVol" class="text-[10px] font-bold text-slate-400 uppercase italic"></p>
+                    </div>
+                </div>
+                <div class="text-right">
+                    <p class="text-[10px] font-black text-rose-600 uppercase tracking-widest mb-2">Short Position</p>
+                    <p id="sRoi" class="text-4xl font-black text-slate-900 mb-1">0.00%</p>
+                    <p id="sPnl" class="text-lg font-medium text-slate-400">$0.00</p>
+                    <div class="mt-4 pt-4 border-t border-slate-50">
+                        <p id="sVol" class="text-[10px] font-bold text-slate-400 uppercase italic"></p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Action Button -->
+        <button onclick="triggerClose()" class="w-full py-5 rounded-2xl btn-liquidate text-white font-black uppercase tracking-[0.2em] shadow-lg shadow-rose-200">
+            Emergency Liquidation
+        </button>
+
+        <p class="text-center mt-6 text-[10px] text-slate-300 font-bold uppercase tracking-widest">System Online • ${config.symbol} • ${config.leverage}x</p>
     </div>
-    <button id="closeBtn" onclick="triggerClose()" class="w-full py-4 bg-rose-900/10 hover:bg-rose-600 text-rose-500 hover:text-white border border-rose-900/30 rounded-xl text-[10px] font-bold uppercase tracking-[0.2em] transition-all">
-        MANUAL LIQUIDATE
-    </button>
-</div>
+
 <script>
-async function triggerClose() {
-    if(!confirm("Liquidate all positions?")) return;
-    await fetch('/api/close', { method: 'POST' });
-}
-setInterval(async () => {
-    try {
-        const r = await fetch('/api/status'); const d = await r.json();
-        document.getElementById('botStatus').innerText = d.market.status;
-        document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
-        document.getElementById('balBar').style.width = d.market.balancePct + '%';
-        if(d.market.balancePct >= 90) document.getElementById('balBar').className = "bg-orange-500 h-1 rounded-full transition-all duration-500";
-        else document.getElementById('balBar').className = "bg-indigo-500 h-1 rounded-full transition-all duration-500";
-        document.getElementById('netPnL').innerText = d.market.netPnL.toFixed(5);
-        document.getElementById('netPnL').className = 'text-2xl font-bold ' + (d.market.netPnL >= 0 ? 'text-emerald-400' : 'text-rose-500');
-        d.accounts.forEach((a, i) => {
-            const pre = i === 0 ? 'l' : 's';
-            document.getElementById(pre+'Roi').innerText = a.roi.toFixed(2)+'%';
-            document.getElementById(pre+'Pnl').innerText = '$'+a.unrealizedUsdt.toFixed(5);
-            document.getElementById(pre+'Vol').innerText = 'VOL: '+a.volume + ' | ' + a.lastAction;
-            document.getElementById(pre+'Roi').className = 'text-3xl font-bold mb-1 ' + (a.roi >= 0 ? 'text-emerald-400' : 'text-rose-500');
-        });
-    } catch(e) {}
-}, 1000);
-</script></body></html>`);
+    async function triggerClose() {
+        if(!confirm("Are you sure you want to exit all positions?")) return;
+        await fetch('/api/close', { method: 'POST' });
+    }
+
+    setInterval(async () => {
+        try {
+            const r = await fetch('/api/status'); 
+            const d = await r.json();
+            
+            document.getElementById('botStatus').innerText = d.market.status;
+            document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
+            
+            const bar = document.getElementById('balBar');
+            bar.style.width = d.market.balancePct + '%';
+            if(d.market.balancePct >= 90) bar.style.backgroundColor = '#f97316';
+            else bar.style.backgroundColor = '#4f46e5';
+
+            const net = document.getElementById('netPnL');
+            net.innerText = (d.market.netPnL >= 0 ? '+' : '') + d.market.netPnL.toFixed(4);
+            net.className = 'text-4xl font-black leading-none ' + (d.market.netPnL >= 0 ? 'text-emerald-500' : 'text-rose-500');
+
+            d.accounts.forEach((a, i) => {
+                const pre = i === 0 ? 'l' : 's';
+                const roiEl = document.getElementById(pre+'Roi');
+                roiEl.innerText = (a.roi >= 0 ? '+' : '') + a.roi.toFixed(2)+'%';
+                roiEl.className = 'text-4xl font-black mb-1 ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
+                
+                document.getElementById(pre+'Pnl').innerText = '$' + a.unrealizedUsdt.toFixed(4);
+                document.getElementById(pre+'Vol').innerText = 'VOL: ' + a.volume + ' | ' + a.lastAction;
+            });
+        } catch(e) {}
+    }, 1000);
+</script>
+</body>
+</html>`);
 });
 
 function startWS() {
@@ -221,4 +265,4 @@ function startWS() {
 
 startWS();
 setInterval(runSlowLogic, 4000);
-app.listen(config.port, '0.0.0.0', () => console.log(`Bot running on port ${config.port}`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Monitor running at http://localhost:${config.port}`));
