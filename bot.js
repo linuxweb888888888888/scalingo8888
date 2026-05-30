@@ -29,7 +29,8 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 5, 
     microStep: parseInt(process.env.MICRO_STEP) || 2,   
-    targetRatio: 1.5,
+    targetRatio: 1.5, // 100% mark
+    autoClosePct: parseInt(process.env.AUTO_CLOSE_PCT) || 150, // Default 150%
     cooldownMs: 2500,
     pollInterval: 3000
 };
@@ -38,8 +39,8 @@ const config = {
 let market = { 
     status: 'Initializing...', 
     balancePct: 0, 
-    totalNetGain: 0,    // (Current Total Equity - Initial Total Equity) -> Includes Fees
-    realizedSessPnl: 0, // Profit locked in (Fees + Closed trades)
+    totalNetGain: 0,
+    realizedSessPnl: 0,
     growthPct: 0,       
     initialTotalEquity: 0 
 };
@@ -69,7 +70,6 @@ async function htxRequest(account, method, path, data = {}) {
 }
 
 async function syncAccount(acc, state) {
-    // 1. Sync Position Info
     const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
     if (posRes?.status === 'ok' && posRes.data) {
         const pos = posRes.data.find(p => p.direction === state.direction);
@@ -79,16 +79,11 @@ async function syncAccount(acc, state) {
             state.unrealizedUsdt = parseFloat(pos.profit);
         } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
     }
-
-    // 2. Sync Equity (Wallet + Unrealized)
     const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
     if (accRes?.status === 'ok' && accRes.data?.[0]) {
         const data = accRes.data[0];
-        const equity = parseFloat(data.margin_balance); // Actual current value of account
-        
-        if (state.initialEquity === null) {
-            state.initialEquity = equity;
-        }
+        const equity = parseFloat(data.margin_balance);
+        if (state.initialEquity === null) state.initialEquity = equity;
         state.currentEquity = equity;
     }
 }
@@ -98,7 +93,6 @@ async function closeAll() {
     market.status = "LIQUIDATING";
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
-        await syncAccount(acc, state);
         if (state.volume > 0) {
             const closeDir = state.direction === 'buy' ? 'sell' : 'buy';
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
@@ -114,24 +108,17 @@ async function closeAll() {
 // ==================== MAIN LOGIC LOOP ====================
 async function runLogic() {
     for (const acc of config.accounts) { await syncAccount(acc, accountStates[acc.accountId]); }
-    
     const s1 = accountStates[1];
     const s2 = accountStates[2];
 
-    // CALCULATE REAL BOTTOM LINE (Current Equity vs Start Equity)
     const totalCurrentEquity = s1.currentEquity + s2.currentEquity;
     const totalStartEquity = s1.initialEquity + s2.initialEquity;
-    
     if (market.initialTotalEquity === 0) market.initialTotalEquity = totalStartEquity;
 
-    // Total Net Gain (Floating PnL + Realized PnL - Fees)
     market.totalNetGain = totalCurrentEquity - totalStartEquity;
     market.growthPct = (market.totalNetGain / totalStartEquity) * 100;
-    
-    // Realized Session PnL (Total gain minus current unrealized)
     market.realizedSessPnl = market.totalNetGain - (s1.unrealizedUsdt + s2.unrealizedUsdt);
 
-    // Hedge Logic
     const winner = s1.roi > s2.roi ? s1 : s2;
     const loser = s1.roi > s2.roi ? s2 : s1;
     const winnerAcc = config.accounts.find(a => a.accountId === (s1.roi > s2.roi ? 1 : 2));
@@ -139,12 +126,19 @@ async function runLogic() {
     const winVal = Math.abs(winner.unrealizedUsdt);
     const loseVal = Math.abs(loser.unrealizedUsdt);
     const effectiveLoseVal = Math.max(loseVal, 0.00000001); 
-    market.balancePct = Math.min(100, ((winVal / effectiveLoseVal) / config.targetRatio) * 100);
+    
+    // balancePct is now allowed to exceed 100
+    market.balancePct = ((winVal / effectiveLoseVal) / config.targetRatio) * 100;
 
-    if (market.balancePct >= 95 && (s1.volume > 0 || s2.volume > 0)) { await closeAll(); return; }
-    if (market.status !== "Active") market.status = "Active";
+    // AUTO-CLOSE CHECK
+    if (market.balancePct >= config.autoClosePct && (s1.volume > 0 || s2.volume > 0)) {
+        await closeAll();
+        return;
+    }
 
-    // Parity Nudge
+    if (market.status !== "Active" && market.status !== "LIQUIDATING") market.status = "Active";
+
+    // Parity Nudge Logic
     if (winner.volume > 0 && loser.volume > 0 && !winner.isLocked && market.status === "Active") {
         if (winVal < loseVal) {
             winner.isLocked = true;
@@ -170,19 +164,21 @@ async function runLogic() {
 }
 
 // ==================== DASHBOARD UI ====================
-app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates) }));
+app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), config: { autoClosePct: config.autoClosePct } }));
 app.post('/api/close', async (req, res) => { await closeAll(); res.json({status: 'ok'}); });
 
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>Hedge Ultra Monitor</title>
+    <meta charset="UTF-8"><title>Hedge Ultra 200</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700;900&display=swap" rel="stylesheet">
     <style>
         body { background: #f8fafc; color: #0f172a; font-family: 'Roboto', sans-serif; }
-        .card { background: white; border-radius: 32px; border: 1px solid #e2e8f0; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.05); }
+        .card { background: white; border-radius: 32px; border: 1px solid #e2e8f0; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.05); position: relative; overflow: hidden; }
+        .target-line { position: absolute; top: 0; bottom: 0; width: 2px; background: #ef4444; z-index: 10; }
+        .target-label { position: absolute; top: -20px; transform: translateX(-50%); font-size: 9px; font-weight: 900; color: #ef4444; text-transform: uppercase; }
     </style>
 </head>
 <body class="p-4 md:p-10">
@@ -202,13 +198,23 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <div class="card p-10 mb-8">
+        <div class="card p-10 pt-14 mb-8">
             <div class="flex justify-between items-end mb-4">
-                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Progress to 95% Liquidate</p>
+                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Strategy Progress (Scaled to 200%)</p>
                 <p id="balPct" class="text-3xl font-black text-slate-900">0.0%</p>
             </div>
-            <div class="w-full bg-slate-100 h-3 rounded-full overflow-hidden mb-12">
-                <div id="balBar" class="bg-indigo-600 h-full w-0 transition-all duration-700 ease-out"></div>
+            
+            <div class="relative w-full bg-slate-100 h-4 rounded-full mb-12">
+                <!-- Progress Bar -->
+                <div id="balBar" class="bg-indigo-600 h-full w-0 rounded-full transition-all duration-700 ease-out relative z-0"></div>
+                
+                <!-- Target Liquidation Marker -->
+                <div id="targetMarker" class="target-line" style="left: 75%;">
+                    <span id="targetLabel" class="target-label">Close @ 150%</span>
+                </div>
+                
+                <!-- 100% Mark -->
+                <div style="left: 50%;" class="absolute top-0 bottom-0 border-l border-slate-300 border-dashed"></div>
             </div>
 
             <div class="grid grid-cols-2 gap-10">
@@ -244,15 +250,27 @@ app.get('/', (req, res) => {
                 growth.className = 'text-[10px] font-black px-2 py-0.5 rounded uppercase ' + (d.market.growthPct >= 0 ? 'bg-emerald-100 text-emerald-600' : 'bg-rose-100 text-rose-600');
                 
                 document.getElementById('realizedPnl').innerText = 'Realized (Inc. Fees): $' + d.market.realizedSessPnl.toFixed(5);
-
                 const mainGain = document.getElementById('totalNetGain');
                 mainGain.innerText = (d.market.totalNetGain >= 0 ? '+' : '') + d.market.totalNetGain.toFixed(5);
                 mainGain.className = 'text-4xl font-black leading-none ' + (d.market.totalNetGain >= 0 ? 'text-emerald-500' : 'text-rose-500');
                 
-                document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
+                // Progress Bar Logic (0-200% mapped to 0-100% width)
+                const currentPct = d.market.balancePct;
+                document.getElementById('balPct').innerText = currentPct.toFixed(1) + '%';
+                
+                const barWidth = Math.min(100, (currentPct / 200) * 100);
                 const bar = document.getElementById('balBar');
-                bar.style.width = d.market.balancePct + '%';
-                bar.className = d.market.balancePct > 80 ? "bg-orange-500 h-full transition-all duration-700" : "bg-indigo-600 h-full transition-all duration-700";
+                bar.style.width = barWidth + '%';
+                
+                // Marker placement
+                const targetMarker = document.getElementById('targetMarker');
+                const targetPos = (d.config.autoClosePct / 200) * 100;
+                targetMarker.style.left = targetPos + '%';
+                document.getElementById('targetLabel').innerText = 'Close @ ' + d.config.autoClosePct + '%';
+
+                if(currentPct >= d.config.autoClosePct) bar.className = "bg-rose-500 h-full rounded-full transition-all duration-700";
+                else if(currentPct >= 100) bar.className = "bg-orange-500 h-full rounded-full transition-all duration-700";
+                else bar.className = "bg-indigo-600 h-full rounded-full transition-all duration-700";
 
                 d.accounts.forEach((a, i) => {
                     const p = i === 0 ? 'l' : 's';
