@@ -39,7 +39,6 @@ const config = {
             name: 'HTX',
             restHost: 'api.huobi.pro',  // Using spot API for simplicity
             wsHost: 'wss://api.huobi.pro/ws',
-            // In paper mode, API keys are optional
             apiKey: process.env.HTX_API_KEY || 'PAPER_MODE',
             secretKey: process.env.HTX_SECRET_KEY || 'PAPER_MODE'
         },
@@ -55,22 +54,15 @@ const config = {
 
 // ==================== PAPER TRADING STATE ====================
 const paperState = {
-    // Balances
     balances: {
         htx: { USDT: 10000, SHIB: 0 },
         phemex: { USDT: 10000, SHIB: 0 }
     },
-    
-    // Open arbitrage positions
     openPositions: [],
-    
-    // Price data
     prices: {
         htx: { bid: 0, ask: 0, last: 0, timestamp: 0 },
         phemex: { bid: 0, ask: 0, last: 0, timestamp: 0 }
     },
-    
-    // Statistics
     stats: {
         totalTrades: 0,
         winningTrades: 0,
@@ -79,15 +71,12 @@ const paperState = {
         maxDrawdown: 0,
         startTime: Date.now()
     },
-    
-    // Status
     status: 'Initializing...',
     isPaperTrading: true
 };
 
-// ==================== PRICE FETCHING (Real Data, Paper Execution) ====================
+// ==================== PRICE FETCHING ====================
 
-// Fetch HTX price
 async function getHTXPrice() {
     try {
         const response = await axios.get(`https://${config.exchanges.htx.restHost}/market/ticker?symbol=shibusdt`, {
@@ -110,7 +99,6 @@ async function getHTXPrice() {
     return null;
 }
 
-// Fetch Phemex price
 async function getPhemexPrice() {
     try {
         const response = await axios.get(`https://${config.exchanges.phemex.restHost}/public/products/${config.symbol}`, {
@@ -128,7 +116,6 @@ async function getPhemexPrice() {
             return paperState.prices.phemex;
         }
     } catch (error) {
-        // Try alternative endpoint for Phemex
         try {
             const response2 = await axios.get(`https://${config.exchanges.phemex.restHost}/md/spot/ticker/24hr?symbol=${config.symbol}`, {
                 timeout: config.orderTimeoutMs
@@ -150,17 +137,12 @@ async function getPhemexPrice() {
     return null;
 }
 
-// ==================== PAPER TRADING EXECUTION ====================
-
-// Calculate SHIB quantity for a given USDT amount
 function calculateQuantity(price, usdtAmount) {
     if (!price || price <= 0) return 0;
     const rawQuantity = usdtAmount / price;
-    // Round to proper increment for SHIB (usually 1000 SHIB minimum)
     return Math.floor(rawQuantity / 1000) * 1000;
 }
 
-// Paper trade execution
 async function executePaperTrade(action, exchange, side, price, quantity) {
     const timestamp = new Date().toISOString();
     const tradeId = `${exchange}_${side}_${Date.now()}`;
@@ -173,7 +155,6 @@ async function executePaperTrade(action, exchange, side, price, quantity) {
     console.log(`   Quantity: ${quantity.toLocaleString()} SHIB`);
     console.log(`   Value: $${(price * quantity).toFixed(2)}`);
     
-    // Update paper balances
     const value = price * quantity;
     
     if (exchange === 'htx') {
@@ -197,9 +178,7 @@ async function executePaperTrade(action, exchange, side, price, quantity) {
     return { tradeId, success: true, price, quantity };
 }
 
-// Open new arbitrage position
 async function openArbitragePosition() {
-    // Check if we have too many open positions
     if (paperState.openPositions.length >= config.maxOpenPositions) {
         paperState.status = `Max positions (${config.maxOpenPositions}) reached`;
         return false;
@@ -212,22 +191,17 @@ async function openArbitragePosition() {
         return false;
     }
     
-    // Calculate spread
     const spreadPct = ((htxPrice - phemexPrice) / phemexPrice) * 100;
-    const spreadAbs = Math.abs(spreadPct);
     
-    // Determine arbitrage direction
     let buyExchange, sellExchange, buyPrice, sellPrice, expectedProfit;
     
     if (htxPrice < phemexPrice) {
-        // HTX cheaper -> Buy on HTX, Sell on Phemex
         buyExchange = 'htx';
         sellExchange = 'phemex';
         buyPrice = htxPrice;
         sellPrice = phemexPrice;
         expectedProfit = (sellPrice - buyPrice) / buyPrice * 100;
     } else {
-        // Phemex cheaper -> Buy on Phemex, Sell on HTX
         buyExchange = 'phemex';
         sellExchange = 'htx';
         buyPrice = phemexPrice;
@@ -235,7 +209,6 @@ async function openArbitragePosition() {
         expectedProfit = (sellPrice - buyPrice) / buyPrice * 100;
     }
     
-    // Check if spread meets minimum requirement
     if (expectedProfit < config.minSpreadPercent) {
         return false;
     }
@@ -246,14 +219,12 @@ async function openArbitragePosition() {
     console.log(`   Expected Profit: ${expectedProfit.toFixed(4)}%`);
     console.log(`   Action: Buy on ${buyExchange.toUpperCase()}, Sell on ${sellExchange.toUpperCase()}`);
     
-    // Calculate position size
     const quantity = calculateQuantity(buyPrice, config.positionSizeUSDT);
     if (quantity <= 0) {
         console.log(`   ❌ Quantity too small: ${quantity}`);
         return false;
     }
     
-    // Execute paper trades
     const buyResult = await executePaperTrade('open_buy', buyExchange, 'buy', buyPrice, quantity);
     const sellResult = await executePaperTrade('open_sell', sellExchange, 'sell', sellPrice, quantity);
     
@@ -282,7 +253,6 @@ async function openArbitragePosition() {
     return false;
 }
 
-// Check and close positions when spread collapses
 async function checkClosePositions() {
     const htxCurrent = paperState.prices.htx.bid;
     const phemexCurrent = paperState.prices.phemex.ask;
@@ -293,48 +263,35 @@ async function checkClosePositions() {
         const pos = paperState.openPositions[i];
         if (pos.status !== 'open') continue;
         
-        // Calculate current spread between exchanges
-        let currentSpread, profitPct;
+        let profitPct;
         
         if (pos.buyExchange === 'htx' && pos.sellExchange === 'phemex') {
-            // Long HTX, Short Phemex
-            currentSpread = ((htxCurrent - phemexCurrent) / phemexCurrent) * 100;
             profitPct = ((phemexCurrent - pos.buyPrice) / pos.buyPrice) * 100;
         } else {
-            // Long Phemex, Short HTX
-            currentSpread = ((phemexCurrent - htxCurrent) / htxCurrent) * 100;
             profitPct = ((htxCurrent - pos.buyPrice) / pos.buyPrice) * 100;
         }
         
-        // Check if we should close
         let shouldClose = false;
         let closeReason = '';
         
-        // Close when spread collapses
         if (profitPct <= config.closeSpreadPercent && profitPct > 0) {
             shouldClose = true;
             closeReason = 'Target profit reached';
-        }
-        // Stop loss
-        else if (profitPct <= -config.maxLossPercent) {
+        } else if (profitPct <= -config.maxLossPercent) {
             shouldClose = true;
             closeReason = 'Stop loss triggered';
-        }
-        // Time-based close (30 minutes)
-        else if (Date.now() - pos.openTime > 30 * 60 * 1000) {
+        } else if (Date.now() - pos.openTime > 30 * 60 * 1000) {
             shouldClose = true;
             closeReason = 'Maximum hold time (30 min)';
         }
         
         if (shouldClose) {
-            // Close positions
             const closeBuyPrice = pos.buyExchange === 'htx' ? htxCurrent : phemexCurrent;
             const closeSellPrice = pos.sellExchange === 'htx' ? htxCurrent : phemexCurrent;
             
             await executePaperTrade('close_buy', pos.buyExchange, 'sell', closeBuyPrice, pos.quantity);
             await executePaperTrade('close_sell', pos.sellExchange, 'buy', closeSellPrice, pos.quantity);
             
-            // Calculate actual profit
             const buyValue = pos.buyPrice * pos.quantity;
             const sellValue = pos.sellPrice * pos.quantity;
             const expectedUsdtProfit = sellValue - buyValue;
@@ -343,7 +300,6 @@ async function checkClosePositions() {
             const closeSellValue = closeSellPrice * pos.quantity;
             const actualUsdtProfit = closeSellValue - closeBuyValue;
             
-            // Update statistics
             paperState.stats.totalTrades++;
             if (actualUsdtProfit > 0) {
                 paperState.stats.winningTrades++;
@@ -352,12 +308,10 @@ async function checkClosePositions() {
             }
             paperState.stats.totalProfit += actualUsdtProfit;
             
-            // Update max drawdown
             if (paperState.stats.totalProfit < -paperState.stats.maxDrawdown) {
                 paperState.stats.maxDrawdown = Math.abs(paperState.stats.totalProfit);
             }
             
-            // Mark position as closed
             pos.status = 'closed';
             pos.closeTime = Date.now();
             pos.closeReason = closeReason;
@@ -369,7 +323,6 @@ async function checkClosePositions() {
             console.log(`   Actual Profit: $${actualUsdtProfit.toFixed(4)}`);
             console.log(`   Total Profit: $${paperState.stats.totalProfit.toFixed(4)}`);
             
-            // Remove from open positions array
             paperState.openPositions.splice(i, 1);
             i--;
             
@@ -378,7 +331,7 @@ async function checkClosePositions() {
     }
 }
 
-// ==================== WEBSOCKET FOR REAL-TIME PRICES ====================
+// ==================== WEBSOCKET ====================
 
 let htxWs = null;
 let phemexWs = null;
@@ -390,7 +343,6 @@ function startHTXWebSocket() {
     
     htxWs.on('open', () => {
         console.log('[HTX] WebSocket connected');
-        // Subscribe to SHIB market data
         const subMsg = JSON.stringify({
             sub: `market.shibusdt.ticker`,
             id: 'shib_ticker'
@@ -433,7 +385,6 @@ function startPhemexWebSocket() {
     
     phemexWs.on('open', () => {
         console.log('[PHEMEX] WebSocket connected');
-        // Subscribe to SHIB ticker
         const subMsg = JSON.stringify({
             method: "subscribe",
             params: [`spot.ticker.${config.symbol}`],
@@ -466,9 +417,8 @@ function startPhemexWebSocket() {
     });
 }
 
-// ==================== REST API ENDPOINTS ====================
+// ==================== API ENDPOINTS ====================
 
-// Get status
 app.get('/api/status', (req, res) => {
     const currentSpread = paperState.prices.htx.ask && paperState.prices.phemex.bid
         ? ((paperState.prices.htx.ask - paperState.prices.phemex.bid) / paperState.prices.phemex.bid) * 100
@@ -519,14 +469,12 @@ app.get('/api/status', (req, res) => {
     });
 });
 
-// Force check arbitrage
 app.post('/api/scan', async (req, res) => {
     await updatePrices();
     const executed = await openArbitragePosition();
     res.json({ scanned: true, executed });
 });
 
-// Reset paper trading
 app.post('/api/reset', (req, res) => {
     paperState.balances = {
         htx: { USDT: 10000, SHIB: 0 },
@@ -545,29 +493,18 @@ app.post('/api/reset', (req, res) => {
     res.json({ reset: true });
 });
 
-// Update config
 app.post('/api/config', (req, res) => {
     if (req.body.minSpreadPercent) config.minSpreadPercent = req.body.minSpreadPercent;
     if (req.body.positionSizeUSDT) config.positionSizeUSDT = req.body.positionSizeUSDT;
     if (req.body.maxOpenPositions) config.maxOpenPositions = req.body.maxOpenPositions;
-    if (req.body.maxLossPercent) config.maxLossPercent = req.body.maxLossPercent;
     res.json({ config });
 });
 
-// Update prices manually
 async function updatePrices() {
     await Promise.all([
         getHTXPrice(),
         getPhemexPrice()
     ]);
-}
-
-// ==================== MAIN LOOP ====================
-
-async function mainLoop() {
-    await updatePrices();
-    await checkClosePositions();
-    await openArbitragePosition();
 }
 
 // ==================== WEB DASHBOARD ====================
@@ -580,11 +517,9 @@ app.get('/', (req, res) => {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Arbitrage Bot - HTX vs Phemex (Paper Trading)</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body { background: #0a0a0f; color: #e5e5e5; font-family: 'Inter', sans-serif; }
         .glass { background: rgba(15, 25, 35, 0.7); backdrop-filter: blur(10px); border: 1px solid rgba(0, 255, 255, 0.1); border-radius: 16px; }
-        .glow-text { text-shadow: 0 0 10px rgba(0, 255, 255, 0.3); }
         .profit-positive { color: #00ff88; }
         .profit-negative { color: #ff4466; }
         .card { transition: all 0.3s ease; }
@@ -595,7 +530,6 @@ app.get('/', (req, res) => {
 </head>
 <body class="p-6">
     <div class="max-w-7xl mx-auto">
-        <!-- Header -->
         <div class="flex justify-between items-center mb-8">
             <div>
                 <h1 class="text-3xl font-bold bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent">
@@ -613,23 +547,17 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- Main Stats Grid -->
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-            <!-- Total Profit Card -->
             <div class="glass p-6 card">
                 <p class="text-gray-400 text-sm uppercase tracking-wider">Total Profit (Paper)</p>
                 <p id="totalProfit" class="text-3xl font-bold mt-2 profit-positive">$0.00</p>
                 <p class="text-xs text-gray-500 mt-2">Win Rate: <span id="winRate">0</span>%</p>
             </div>
-            
-            <!-- Open Positions Card -->
             <div class="glass p-6 card">
                 <p class="text-gray-400 text-sm uppercase tracking-wider">Open Positions</p>
                 <p id="openPositions" class="text-3xl font-bold mt-2 text-cyan-400">0</p>
                 <p class="text-xs text-gray-500 mt-2">Max: <span id="maxPositions">3</span></p>
             </div>
-            
-            <!-- Total Trades Card -->
             <div class="glass p-6 card">
                 <p class="text-gray-400 text-sm uppercase tracking-wider">Total Trades</p>
                 <p id="totalTrades" class="text-3xl font-bold mt-2 text-white">0</p>
@@ -637,14 +565,12 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- Price & Spread -->
         <div class="glass p-6 mb-8">
             <h2 class="text-lg font-semibold mb-4 flex items-center gap-2">
                 <span class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
                 Live Market Data
             </h2>
             <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-                <!-- HTX Price -->
                 <div class="bg-black/30 rounded-xl p-4">
                     <div class="flex items-center justify-between">
                         <span class="font-bold text-orange-400">HTX</span>
@@ -656,15 +582,11 @@ app.get('/', (req, res) => {
                         <span class="text-gray-500">Ask: <span id="htxAsk">0</span></span>
                     </div>
                 </div>
-                
-                <!-- Spread Arrow -->
                 <div class="flex flex-col items-center justify-center">
                     <div class="text-4xl" id="spreadArrow">↔️</div>
                     <p class="text-2xl font-mono font-bold mt-2" id="spreadValue">0.00%</p>
                     <p class="text-xs text-gray-500 mt-1" id="spreadStatus">Waiting for spread</p>
                 </div>
-                
-                <!-- Phemex Price -->
                 <div class="bg-black/30 rounded-xl p-4">
                     <div class="flex items-center justify-between">
                         <span class="font-bold text-blue-400">PHEMEX</span>
@@ -679,7 +601,6 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- Open Positions Table -->
         <div class="glass p-6 mb-8">
             <h2 class="text-lg font-semibold mb-4">📊 Open Arbitrage Positions</h2>
             <div class="overflow-x-auto">
@@ -705,7 +626,6 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- Balance & Config -->
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
             <div class="glass p-6">
                 <h2 class="text-lg font-semibold mb-4">💰 Paper Balances</h2>
@@ -749,7 +669,6 @@ app.get('/', (req, res) => {
             </div>
         </div>
         
-        <!-- Status -->
         <div class="mt-8 text-center text-xs text-gray-500">
             <p id="statusMsg">Initializing...</p>
             <p class="mt-2">⚠️ PAPER TRADING MODE - No real funds are being used</p>
@@ -757,7 +676,6 @@ app.get('/', (req, res) => {
     </div>
 
     <script>
-        // Auto-refresh every second
         setInterval(fetchStatus, 1000);
         
         async function fetchStatus() {
@@ -765,7 +683,6 @@ app.get('/', (req, res) => {
                 const response = await fetch('/api/status');
                 const data = await response.json();
                 
-                // Update prices
                 document.getElementById('htxPrice').innerText = '$' + data.prices.htx.last.toFixed(8);
                 document.getElementById('htxBid').innerText = data.prices.htx.bid.toFixed(8);
                 document.getElementById('htxAsk').innerText = data.prices.htx.ask.toFixed(8);
@@ -773,7 +690,6 @@ app.get('/', (req, res) => {
                 document.getElementById('phemexBid').innerText = data.prices.phemex.bid.toFixed(8);
                 document.getElementById('phemexAsk').innerText = data.prices.phemex.ask.toFixed(8);
                 
-                // Update timestamps
                 if (data.prices.htx.timestamp) {
                     document.getElementById('htxTime').innerText = new Date(data.prices.htx.timestamp).toLocaleTimeString();
                 }
@@ -781,7 +697,6 @@ app.get('/', (req, res) => {
                     document.getElementById('phemexTime').innerText = new Date(data.prices.phemex.timestamp).toLocaleTimeString();
                 }
                 
-                // Update spread
                 const spreadValue = parseFloat(data.prices.spreadPercent);
                 document.getElementById('spreadValue').innerText = spreadValue.toFixed(4) + '%';
                 if (spreadValue > 0) {
@@ -797,7 +712,6 @@ app.get('/', (req, res) => {
                     document.getElementById('spreadStatus').innerHTML = 'No spread';
                 }
                 
-                // Update stats
                 document.getElementById('totalProfit').innerHTML = (data.stats.totalProfit >= 0 ? '+' : '') + '$' + parseFloat(data.stats.totalProfit).toFixed(4);
                 document.getElementById('totalProfit').className = 'text-3xl font-bold mt-2 ' + (data.stats.totalProfit >= 0 ? 'profit-positive' : 'profit-negative');
                 document.getElementById('winRate').innerText = data.stats.winRate;
@@ -807,35 +721,30 @@ app.get('/', (req, res) => {
                 document.getElementById('losses').innerText = data.stats.losingTrades;
                 document.getElementById('maxPositions').innerText = data.positions.maxAllowed;
                 
-                // Update balances
                 document.getElementById('htxUSDT').innerHTML = '$' + data.balances.htx.USDT.toFixed(2);
                 document.getElementById('htxSHIB').innerHTML = Math.floor(data.balances.htx.SHIB).toLocaleString() + ' SHIB';
                 document.getElementById('phemexUSDT').innerHTML = '$' + data.balances.phemex.USDT.toFixed(2);
                 document.getElementById('phemexSHIB').innerHTML = Math.floor(data.balances.phemex.SHIB).toLocaleString() + ' SHIB';
                 
-                // Update positions table
                 const positionsTable = document.getElementById('positionsTable');
                 if (data.openPositionsDetails && data.openPositionsDetails.length > 0) {
-                    positionsTable.innerHTML = data.openPositionsDetails.map(pos => `
-                        <tr class="border-b border-gray-800">
-                            <td class="py-2 font-mono text-xs">${pos.id}</td>
-                            <td class="py-2">${pos.openTime}</td>
-                            <td class="py-2 text-orange-400">${pos.buyExchange.toUpperCase()}</td>
-                            <td class="py-2 text-blue-400">${pos.sellExchange.toUpperCase()}</td>
-                            <td class="py-2 font-mono">$${pos.buyPrice}</td>
-                            <td class="py-2 font-mono">$${pos.sellPrice}</td>
-                            <td class="py-2 profit-positive">+${pos.expectedProfit}%</td>
-                            <td class="py-2">${parseInt(pos.quantity).toLocaleString()}</td>
-                        </tr>
-                    `).join('');
+                    positionsTable.innerHTML = data.openPositionsDetails.map(pos => {
+                        return '<tr class="border-b border-gray-800">' +
+                            '<td class="py-2 font-mono text-xs">' + pos.id + '</td>' +
+                            '<td class="py-2">' + pos.openTime + '</td>' +
+                            '<td class="py-2 text-orange-400">' + pos.buyExchange.toUpperCase() + '</td>' +
+                            '<td class="py-2 text-blue-400">' + pos.sellExchange.toUpperCase() + '</td>' +
+                            '<td class="py-2 font-mono">$' + pos.buyPrice + '</td>' +
+                            '<td class="py-2 font-mono">$' + pos.sellPrice + '</td>' +
+                            '<td class="py-2 profit-positive">+' + pos.expectedProfit + '%</td>' +
+                            '<td class="py-2">' + parseInt(pos.quantity).toLocaleString() + '</td>' +
+                        '</tr>';
+                    }).join('');
                 } else {
                     positionsTable.innerHTML = '<tr><td colspan="8" class="text-center text-gray-500 py-4">No open positions</td></tr>';
                 }
                 
-                // Update status
                 document.getElementById('statusMsg').innerHTML = data.status;
-                
-                // Update config inputs
                 document.getElementById('minSpread').value = data.config.minSpreadPercent;
                 document.getElementById('positionSize').value = data.config.positionSizeUSDT;
                 document.getElementById('maxPos').value = data.config.maxOpenPositions;
@@ -860,7 +769,7 @@ app.get('/', (req, res) => {
         }
         
         async function updateConfig() {
-            const config = {
+            const configData = {
                 minSpreadPercent: parseFloat(document.getElementById('minSpread').value),
                 positionSizeUSDT: parseFloat(document.getElementById('positionSize').value),
                 maxOpenPositions: parseInt(document.getElementById('maxPos').value)
@@ -869,20 +778,25 @@ app.get('/', (req, res) => {
             await fetch('/api/config', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(config)
+                body: JSON.stringify(configData)
             });
             
             alert('Configuration updated');
         }
         
-        // Initial fetch
         fetchStatus();
     </script>
 </body>
 </html>`);
 });
 
-// ==================== START BOT ====================
+// ==================== MAIN LOOP ====================
+
+async function mainLoop() {
+    await updatePrices();
+    await checkClosePositions();
+    await openArbitragePosition();
+}
 
 async function start() {
     console.log('\n' + '='.repeat(60));
@@ -898,22 +812,18 @@ async function start() {
     console.log(`\n⚠️  PAPER TRADING MODE - No real funds used`);
     console.log(`📊 Web Dashboard: http://localhost:${config.port}\n`);
     
-    // Start WebSockets
     startHTXWebSocket();
     startPhemexWebSocket();
     
-    // Start HTTP server
-    app.listen(config.port, () => {
+    app.listen(config.port, '0.0.0.0', () => {
         console.log(`✅ Dashboard running at http://localhost:${config.port}`);
     });
     
-    // Main arbitrage loop - every 2 seconds
     setInterval(mainLoop, 2000);
     
     paperState.status = 'Running - Scanning for arbitrage opportunities';
 }
 
-// Handle graceful shutdown
 process.on('SIGINT', () => {
     console.log('\n\n🛑 Shutting down bot...');
     if (htxWs) htxWs.close();
@@ -921,5 +831,4 @@ process.on('SIGINT', () => {
     process.exit();
 });
 
-// Start the bot
 start();
