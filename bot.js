@@ -28,10 +28,11 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1, 
-    resetTriggerRoi: 2.0, // 2% Reset
-    autoClosePct: 150, 
+    resetTriggerRoi: 2.0, 
+    maxSpreadPct: 0.1,    // STRICT OPENING FILTER
+    autoClosePct: 150,
     roiThreshold: 1.5,
-    pollInterval: 2000,   // Fast sync
+    pollInterval: 2000,
     resetCooldownMs: 3000,
     historySize: 30
 };
@@ -43,8 +44,7 @@ let market = {
     growthPct: 0, initialTotalEquity: 0, resetUsed: false 
 };
 
-let priceHistory = [];
-let tradeHistory = [];
+let tradeHistory = []; 
 let accountStates = {};
 
 config.accounts.forEach((account, idx) => {
@@ -90,13 +90,21 @@ async function syncAccount(acc, state) {
 }
 
 function logTrade(side, roi, pnl, type) {
-    tradeHistory.unshift({ time: new Date().toLocaleTimeString(), side: side.toUpperCase(), roi: roi.toFixed(2) + '%', pnl: pnl.toFixed(5), type: type });
+    // Current total profit at time of closing
+    const runningTotal = market.totalNetGain;
+    tradeHistory.unshift({ 
+        time: new Date().toLocaleTimeString(), 
+        side: side.toUpperCase(), 
+        roi: roi.toFixed(2) + '%', 
+        pnl: pnl.toFixed(5), 
+        total: runningTotal.toFixed(5), // Combined Realized
+        type: type 
+    });
     if (tradeHistory.length > 10) tradeHistory.pop();
 }
 
 async function flashReset(accIdxToReset) {
     if (market.resetUsed) return;
-    
     const acc = config.accounts[accIdxToReset];
     const state = accountStates[acc.accountId];
     if (state.isLocked || state.volume === 0) return;
@@ -105,16 +113,13 @@ async function flashReset(accIdxToReset) {
     market.resetUsed = true;
     state.lastAction = "⚡ FLASH RESET";
     
-    console.log(`[FORCE RESET] Closing ${state.direction} because other side hit ${config.resetTriggerRoi}%`);
-
     logTrade(state.direction, state.roi, state.unrealizedUsdt, 'RESET');
 
-    // 1. Close current loser
+    // Resetting ignores spread filter to ensure speed
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
         contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
         offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
     });
-    // 2. Reopen loser at current price
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
         contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, 
         offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
@@ -134,17 +139,14 @@ function startWS() {
             if (msg.tick) {
                 market.bid = msg.tick.bid[0];
                 market.ask = msg.tick.ask[0];
-                market.lastPrice = (market.bid + market.ask) / 2;
                 market.spread = ((market.ask - market.bid) / market.bid) * 100;
                 
-                // TRIGGER: WebSocket Price Check
                 if (!market.resetUsed) {
                     const l = accountStates[1]; const s = accountStates[2];
                     const liveLongRoi = l.entryPrice > 0 ? ((market.bid - l.entryPrice) / l.entryPrice) * config.leverage * 100 : 0;
                     const liveShortRoi = s.entryPrice > 0 ? ((s.entryPrice - market.ask) / s.entryPrice) * config.leverage * 100 : 0;
-                    
-                    if (liveLongRoi >= config.resetTriggerRoi) flashReset(1); // Long wins, reset Short (Idx 1)
-                    if (liveShortRoi >= config.resetTriggerRoi) flashReset(0); // Short wins, reset Long (Idx 0)
+                    if (liveLongRoi >= config.resetTriggerRoi) flashReset(1);
+                    if (liveShortRoi >= config.resetTriggerRoi) flashReset(0);
                 }
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
@@ -161,14 +163,14 @@ async function backgroundLoop() {
     const totalCurrentEquity = s1.currentEquity + s2.currentEquity;
     const totalStartEquity = (s1.initialEquity || 0) + (s2.initialEquity || 0);
     if (market.initialTotalEquity === 0 && totalStartEquity > 0) market.initialTotalEquity = totalStartEquity;
+    
     market.totalNetGain = totalCurrentEquity - totalStartEquity;
     market.growthPct = totalStartEquity > 0 ? (market.totalNetGain / totalStartEquity) * 100 : 0;
     market.realizedSessPnl = market.totalNetGain - (s1.unrealizedUsdt + s2.unrealizedUsdt);
 
-    // --- URGENT RESET TRIGGER (Check ROI from REST API) ---
     if (!market.resetUsed) {
-        if (s1.roi >= config.resetTriggerRoi) await flashReset(1); // Reset Account 2 (Short)
-        else if (s2.roi >= config.resetTriggerRoi) await flashReset(0); // Reset Account 1 (Long)
+        if (s1.roi >= config.resetTriggerRoi) await flashReset(1);
+        else if (s2.roi >= config.resetTriggerRoi) await flashReset(0);
     }
 
     const winVal = Math.max(Math.abs(s1.unrealizedUsdt), Math.abs(s2.unrealizedUsdt));
@@ -179,15 +181,17 @@ async function backgroundLoop() {
         await manualClose('TARGET EXIT');
     }
 
-    // Standard Refill
+    // OPENING FILTER: Only refill positions if spread < 0.1%
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume === 0 && !state.isLocked && market.status === "Active") {
-            state.isLocked = true;
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
-            });
-            setTimeout(() => { state.isLocked = false; }, 3000);
+            if (market.spread < config.maxSpreadPct) {
+                state.isLocked = true;
+                await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                    contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
+                });
+                setTimeout(() => { state.isLocked = false; }, 3000);
+            } else { state.lastAction = "Waiting Spread < 0.1%"; }
         }
     }
 }
@@ -207,7 +211,7 @@ async function manualClose(type = 'MANUAL') {
     setTimeout(() => { market.status = "Active"; }, 5000);
 }
 
-// ==================== UI ====================
+// ==================== UI DASHBOARD ====================
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), tradeHistory, config }));
 app.post('/api/close', async (req, res) => { await manualClose(); res.json({status: 'ok'}); });
 
@@ -239,13 +243,13 @@ app.get('/', (req, res) => {
             <div class="text-right">
                 <p id="growthPct" class="text-[10px] font-black px-2 py-0.5 rounded bg-slate-100 inline-block text-slate-600 uppercase mb-1">0.00%</p>
                 <p id="totalNetGain" class="text-4xl font-black leading-none text-slate-900">$0.0000</p>
-                <p id="realizedPnl" class="text-[10px] font-black text-slate-400 mt-2 uppercase tracking-widest">Realized Sess: $0.0000</p>
+                <p id="realizedPnl" class="text-[10px] font-black text-slate-400 mt-2 uppercase tracking-widest">Realized Combined: $0.0000</p>
             </div>
         </div>
 
         <div class="card p-10 pt-14 mb-8 relative overflow-hidden">
             <div class="flex justify-between items-end mb-4">
-                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Progress (150% Exit)</p>
+                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Progress (150% Target Exit)</p>
                 <p id="balPct" class="text-3xl font-black text-slate-900">0.0%</p>
             </div>
             <div class="relative w-full bg-slate-100 h-3 rounded-full mb-12">
@@ -271,7 +275,7 @@ app.get('/', (req, res) => {
         <div class="card mb-8 overflow-hidden">
             <div class="p-6 border-b border-slate-50"><h2 class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Session Trade History</h2></div>
             <table class="w-full">
-                <thead><tr><th>Time</th><th>Action</th><th>Side</th><th>Closing ROI</th><th>PnL ($)</th></tr></thead>
+                <thead><tr><th>Time</th><th>Type</th><th>Side</th><th>ROI</th><th>PnL</th><th>Net Total</th></tr></thead>
                 <tbody id="historyBody"></tbody>
             </table>
         </div>
@@ -288,12 +292,16 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('botStatus').innerText = d.market.status;
                 document.getElementById('mSpread').innerText = d.market.spread.toFixed(3) + '%';
+                document.getElementById('mSpread').className = d.market.spread >= 0.1 ? 'text-rose-500' : 'text-indigo-600';
+                
                 document.getElementById('resetStatus').innerText = 'RESET: ' + (d.market.resetUsed ? 'USED' : 'READY');
                 document.getElementById('resetStatus').className = d.market.resetUsed ? 'text-rose-400 font-black' : 'text-emerald-500 font-black';
+
                 document.getElementById('growthPct').innerText = (d.market.growthPct >= 0 ? '+' : '') + d.market.growthPct.toFixed(2) + '%';
                 document.getElementById('totalNetGain').innerText = (d.market.totalNetGain >= 0 ? '+' : '') + d.market.totalNetGain.toFixed(5);
                 document.getElementById('totalNetGain').className = 'text-4xl font-black leading-none ' + (d.market.totalNetGain >= 0 ? 'text-emerald-500' : 'text-rose-500');
-                document.getElementById('realizedPnl').innerText = 'Realized Sess: $' + d.market.realizedSessPnl.toFixed(5);
+                document.getElementById('realizedPnl').innerText = 'Realized Combined: $' + d.market.realizedSessPnl.toFixed(5);
+                
                 document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
                 document.getElementById('balBar').style.width = Math.min(100, (d.market.balancePct / 200) * 100) + '%';
 
@@ -312,6 +320,7 @@ app.get('/', (req, res) => {
                         <td>\${h.side}</td>
                         <td class="\${parseFloat(h.roi) >= 0 ? 'text-emerald-500' : 'text-rose-500'}">\${h.roi}</td>
                         <td class="\${parseFloat(h.pnl) >= 0 ? 'text-emerald-500' : 'text-rose-500'}">\$\${h.pnl}</td>
+                        <td class="font-black">\$\${h.total}</td>
                     </tr>\`).join('');
             } catch(e) {}
         }, 1000);
