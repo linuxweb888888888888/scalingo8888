@@ -1,264 +1,228 @@
-// server.js - Full version with HTX trading
+require('dotenv').config();
 const express = require('express');
-const axios = require('axios');
 const crypto = require('crypto');
+const axios = require('axios');
+const WebSocket = require('ws');
+const zlib = require('zlib');
 
 const app = express();
 app.use(express.json());
 
-// ============ CONFIGURATION ============
-const CONFIG = {
-    feeRate: 0.0015,
-    minProfitPercent: 0.55,
-    minTradeAmount: 10,
-    maxTradeAmount: 1000,
-    capital: 5000,
-    opportunityTimeout: 500,
-    workerHeartbeat: 60000,
-    port: process.env.PORT || 8080
-};
-
-// HTX API credentials (set in Scalingo environment variables)
-const HTX = {
-    rest: 'https://api.htx.com',
-    accessKey: process.env.HTX_API_KEY,
-    secretKey: process.env.HTX_SECRET_KEY,
-    accountId: process.env.HTX_ACCOUNT_ID
-};
-
-// ============ STATE ============
-let workers = new Map();
-let activeOpportunities = [];
-let executing = false;
-let totalProfit = 0;
-let totalTrades = 0;
-let startTime = Date.now();
-
-// ============ HTX API FUNCTIONS ============
-function htxRequest(method, endpoint, params = {}, signed = false) {
-    const url = `${HTX.rest}${endpoint}`;
-    const headers = { 'Content-Type': 'application/json' };
-    
-    if (signed && HTX.accessKey && HTX.secretKey) {
-        const timestamp = Date.now();
-        const signature = crypto
-            .createHmac('sha256', HTX.secretKey)
-            .update(timestamp + method + endpoint + JSON.stringify(params))
-            .digest('hex');
-        
-        headers['AccessKeyId'] = HTX.accessKey;
-        headers['Signature'] = signature;
-        headers['Timestamp'] = timestamp;
-    }
-    
-    return axios({ method, url, headers, params: method === 'GET' ? params : undefined, data: method !== 'GET' ? params : undefined });
-}
-
-async function executeTriangle(triangle, amount) {
-    const trades = [];
-    let currentAmount = amount;
-    
-    try {
-        for (const step of triangle.steps) {
-            const order = await placeOrder(step.symbol, step.side, currentAmount);
-            if (!order || order.error) throw new Error(`Trade failed on ${step.symbol}`);
-            trades.push(order);
-            currentAmount = order.filled * (step.side === 'buy' ? 1 : (1 - CONFIG.feeRate));
-        }
-        
-        const profit = currentAmount - amount;
-        totalProfit += profit;
-        totalTrades++;
-        
-        console.log(`✅ Executed: $${profit.toFixed(4)} profit`);
-        return { success: true, profit };
-        
-    } catch (error) {
-        console.error('❌ Execution failed:', error.message);
-        await reverseTrades(trades);
-        return { success: false, error: error.message };
-    }
-}
-
-async function placeOrder(symbol, side, amount) {
-    try {
-        const response = await htxRequest('POST', '/v1/order/orders', {
-            'account-id': HTX.accountId,
-            symbol: symbol,
-            type: `${side}-market`,
-            amount: amount.toString()
-        }, true);
-        
-        await new Promise(r => setTimeout(r, 1000));
-        return { orderId: response.data.data, filled: amount, symbol, side };
-    } catch (error) {
-        return { error: error.message };
-    }
-}
-
-async function reverseTrades(trades) {
-    for (let i = trades.length - 1; i >= 0; i--) {
-        const trade = trades[i];
-        await placeOrder(trade.symbol, trade.side === 'buy' ? 'sell' : 'buy', trade.filled);
-        await new Promise(r => setTimeout(r, 500));
-    }
-}
-
-// ============ API ENDPOINTS ============
-
-app.post('/addworker', async (req, res) => {
-    const { workerId, symbolsScanned, trianglesScanned, opportunitiesFound, cpu, memory, status } = req.body;
-    
-    if (!workerId) {
-        return res.status(400).json({ error: 'workerId required' });
-    }
-    
-    workers.set(workerId, {
-        workerId,
-        ip: req.ip || req.socket.remoteAddress,
-        lastHeartbeat: Date.now(),
-        symbolsScanned: symbolsScanned || 0,
-        trianglesScanned: trianglesScanned || 0,
-        opportunitiesFound: opportunitiesFound || 0,
-        cpu: cpu || 0,
-        memory: memory || 0,
-        status: status || 'online'
+// ==================== CONFIGURATION ====================
+const apiAccounts = [];
+let accountIndex = 1;
+while (process.env[`HTX_API_KEY_${accountIndex}`]) {
+    apiAccounts.push({
+        apiKey: process.env[`HTX_API_KEY_${accountIndex}`],
+        secretKey: process.env[`HTX_SECRET_KEY_${accountIndex}`],
+        accountId: accountIndex
     });
-    
-    console.log(`✅ Worker registered: ${workerId} (${workers.size} total)`);
-    res.json({ success: true, workerCount: workers.size });
-});
+    accountIndex++;
+}
 
-app.post('/opportunity', async (req, res) => {
-    const { workerId, triangle, profitPercent, timestamp } = req.body;
-    
-    if (profitPercent < CONFIG.minProfitPercent) {
-        return res.json({ accepted: false, reason: 'profit too low' });
-    }
-    
-    const opportunity = {
-        id: Date.now() + '-' + workerId,
-        workerId,
-        triangle,
-        profitPercent,
-        timestamp: timestamp || Date.now(),
-        expiresAt: Date.now() + CONFIG.opportunityTimeout
+const config = {
+    symbol: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase(),
+    leverage: parseInt(process.env.LEVERAGE) || 10,
+    port: process.env.PORT || 3000,
+    restHost: 'api.hbdm.com',
+    wsHost: 'wss://api.hbdm.com/linear-swap-ws',
+    accounts: apiAccounts
+};
+
+// ==================== GLOBAL STATE ====================
+let market = { last: 0, spreadPct: 0, status: 'Manual Mode Active', totalEquity: 0, equityProfit: 0 };
+let initialTotalEquity = 0;
+let accountStates = {};
+
+config.accounts.forEach((account, idx) => {
+    accountStates[account.accountId] = {
+        direction: idx === 0 ? 'buy' : 'sell',
+        avgPrice: 0, roi: 0, volume: 0,
+        unrealizedUsdt: 0, wallet: 0, initialBalance: 0
     };
-    
-    activeOpportunities.push(opportunity);
-    activeOpportunities = activeOpportunities.filter(o => o.expiresAt > Date.now());
-    
-    if (!executing) {
-        executing = true;
-        const amount = Math.min(CONFIG.maxTradeAmount, CONFIG.capital * 0.1);
-        const result = await executeTriangle(triangle, amount);
-        executing = false;
-        return res.json({ accepted: true, executed: result.success, profit: result.profit });
+});
+
+// ==================== API HANDLER ====================
+async function htxRequest(account, method, path, data = {}) {
+    const timestamp = new Date().toISOString().split('.')[0];
+    const params = { AccessKeyId: account.apiKey, SignatureMethod: 'HmacSHA256', SignatureVersion: '2', Timestamp: timestamp };
+    const query = Object.keys(params).sort().map(k => `${k}=${encodeURIComponent(params[k])}`).join('&');
+    const payload = [method.toUpperCase(), config.restHost, path, query].join('\n');
+    const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
+    const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
+    try {
+        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 2000 });
+        return res.data;
+    } catch (e) { return { status: 'error' }; }
+}
+
+// ==================== CORE SYNC (READ ONLY) ====================
+
+async function restSync() {
+    let totalPnl = 0;
+    let currentTotalWallet = 0;
+
+    for (const acc of config.accounts) {
+        const state = accountStates[acc.accountId];
+        
+        // Sync Positions
+        const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
+        if (res?.status === 'ok' && res.data) {
+            const pos = res.data.find(p => p.direction === state.direction);
+            if (pos) {
+                state.avgPrice = parseFloat(pos.cost_hold);
+                state.volume = Math.floor(parseFloat(pos.volume));
+                state.roi = parseFloat(pos.profit_rate) * 100;
+                state.unrealizedUsdt = parseFloat(pos.profit);
+            } else { state.avgPrice = 0; state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
+        }
+
+        // Sync Account Balance
+        const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
+        if (accRes?.status === 'ok' && accRes.data) {
+            state.wallet = parseFloat(accRes.data[0].margin_balance);
+            if (state.initialBalance === 0) state.initialBalance = state.wallet;
+        }
+        totalPnl += state.unrealizedUsdt;
+        currentTotalWallet += state.wallet;
     }
     
-    res.json({ accepted: true, executed: false, reason: 'queued' });
-});
+    if (initialTotalEquity === 0 && currentTotalWallet > 0) initialTotalEquity = currentTotalWallet;
+    market.totalEquity = currentTotalWallet;
+    market.equityProfit = initialTotalEquity > 0 ? (currentTotalWallet - initialTotalEquity) : 0;
+}
 
-app.get('/workers', (req, res) => {
-    const workerList = Array.from(workers.values()).map(w => ({
-        ...w,
-        lastHeartbeatAgo: Date.now() - w.lastHeartbeat,
-        isActive: (Date.now() - w.lastHeartbeat) < CONFIG.workerHeartbeat
-    }));
-    res.json(workerList);
-});
+// ==================== MANUAL ACTIONS ====================
 
-app.get('/metrics', (req, res) => {
-    const activeWorkers = Array.from(workers.values()).filter(w => 
-        (Date.now() - w.lastHeartbeat) < CONFIG.workerHeartbeat
-    ).length;
-    
-    res.json({
-        uptime: Math.floor((Date.now() - startTime) / 1000),
-        totalWorkers: workers.size,
-        activeWorkers,
-        totalProfit: totalProfit.toFixed(4),
-        totalTrades,
-        activeOpportunities: activeOpportunities.length
+async function addManual(index) {
+    const acc = config.accounts[index];
+    const state = accountStates[acc.accountId];
+    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+        contract_code: config.symbol, volume: 1, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
     });
-});
+}
 
-// Dashboard
-app.get('/', (req, res) => {
-    res.send(`
-<!DOCTYPE html>
-<html>
-<head>
-    <title>HTX Arbitrage Dashboard</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: monospace; background: #0a0e27; color: #00ffcc; padding: 20px; }
-        .card { background: #11152a; border: 1px solid #00ffcc33; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
-        .stat { font-size: 32px; font-weight: bold; }
-        .worker { background: #0a0e27; padding: 10px; margin: 5px 0; border-left: 3px solid #00ffcc; }
-        .profit { color: #00ff66; }
-    </style>
-</head>
-<body>
-    <h1>🔺 HTX Triangular Arbitrage</h1>
-    <p>Workers: <span id="workerCount">0</span> | Profit: $<span id="totalProfit">0</span> | Trades: <span id="totalTrades">0</span></p>
-    
-    <div class="card">
-        <h3>📊 Metrics</h3>
-        <div>Active Workers: <span id="activeWorkers">0</span></div>
-        <div>Uptime: <span id="uptime">0</span>s</div>
-    </div>
-    
-    <div class="card">
-        <h3>🖥️ Workers (<span id="workerListCount">0</span>)</h3>
-        <div id="workersList"></div>
-    </div>
+async function reduceManual(index) {
+    const acc = config.accounts[index];
+    const state = accountStates[acc.accountId];
+    if (state.volume <= 0) return;
+    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+        contract_code: config.symbol, volume: 1, 
+        direction: state.direction === 'buy' ? 'sell' : 'buy', 
+        offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
+    });
+}
 
-    <script>
-        function fetchMetrics() {
-            fetch('/metrics').then(r => r.json()).then(data => {
-                document.getElementById('workerCount').innerText = data.totalWorkers;
-                document.getElementById('activeWorkers').innerText = data.activeWorkers;
-                document.getElementById('totalProfit').innerText = data.totalProfit;
-                document.getElementById('totalTrades').innerText = data.totalTrades;
-                document.getElementById('uptime').innerText = data.uptime;
+async function closeAll() {
+    market.status = "Manual Liquidation in progress...";
+    for (const acc of config.accounts) {
+        const state = accountStates[acc.accountId];
+        if (state.volume > 0) {
+            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+                contract_code: config.symbol, volume: state.volume, 
+                direction: state.direction === 'buy' ? 'sell' : 'buy', 
+                offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
             });
-        }
-        
-        function fetchWorkers() {
-            fetch('/workers').then(r => r.json()).then(workers => {
-                document.getElementById('workerListCount').innerText = workers.length;
-                const html = workers.map(w => \`
-                    <div class="worker">
-                        <strong>\${w.workerId}</strong> | Last: \${Math.floor((Date.now() - w.lastHeartbeat)/1000)}s ago<br>
-                        Scans: \${w.trianglesScanned || 0} | Found: \${w.opportunitiesFound || 0}<br>
-                        CPU: \${(w.cpu || 0).toFixed(1)}% | RAM: \${(w.memory || 0).toFixed(1)}%
-                    </div>
-                \`).join('');
-                document.getElementById('workersList').innerHTML = html || '<p>No workers</p>';
-            });
-        }
-        
-        setInterval(fetchMetrics, 3000);
-        setInterval(fetchWorkers, 5000);
-        fetchMetrics(); fetchWorkers();
-    </script>
-</body>
-</html>
-    `);
-});
-
-// Clean dead workers
-setInterval(() => {
-    const now = Date.now();
-    for (const [id, worker] of workers.entries()) {
-        if (now - worker.lastHeartbeat > CONFIG.workerHeartbeat * 2) {
-            workers.delete(id);
         }
     }
-}, 60000);
+    setTimeout(() => { market.status = "Manual Mode Active"; }, 3000);
+}
 
-app.listen(CONFIG.port, '0.0.0.0', () => {
-    console.log(`✅ Server running on port ${CONFIG.port}`);
-    console.log(`📊 Dashboard: http://localhost:${CONFIG.port}`);
+// ==================== WS & DASHBOARD ====================
+function startWS() {
+    const ws = new WebSocket(config.wsHost);
+    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
+    ws.on('message', (data) => {
+        zlib.gunzip(data, (err, dec) => {
+            if (err) return;
+            const msg = JSON.parse(dec.toString());
+            if (msg.tick) {
+                const bid = msg.tick.bid[0]; const ask = msg.tick.ask[0];
+                market.last = (bid + ask) / 2;
+                market.spreadPct = ((ask - bid) / bid) * 100;
+            }
+            if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
+        });
+    });
+    ws.on('close', () => setTimeout(startWS, 5000));
+}
+
+app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates) }));
+app.post('/api/add/:id', async (req, res) => { await addManual(req.params.id); res.json({status: 'ok'}); });
+app.post('/api/reduce/:id', async (req, res) => { await reduceManual(req.params.id); res.json({status: 'ok'}); });
+app.post('/api/close', async (req, res) => { await closeAll(); res.json({status: 'ok'}); });
+
+app.get('/', (req, res) => {
+    res.send(`<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Manual Terminal</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>body{background:#040405;color:#fafafa;font-family:sans-serif;}.glass{background:rgba(255,255,255,0.03);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.05);}</style></head>
+<body class="p-10"><div class="max-w-4xl mx-auto">
+    <div class="flex justify-between items-end mb-10">
+        <div><h1 class="text-xl font-bold text-white uppercase tracking-tighter">Manual Terminal <span class="text-indigo-500">PRO</span></h1><p id="botStatus" class="text-xs text-zinc-500 font-bold uppercase"></p></div>
+        <div class="flex gap-8 text-right">
+            <div><p class="text-[10px] text-zinc-600 font-bold uppercase text-right">Session Profit</p><p id="equityProfit" class="font-mono text-emerald-400 font-bold">+$0.00</p></div>
+            <div><p class="text-[10px] text-zinc-600 font-bold uppercase text-right">Spread</p><p id="spread" class="font-mono text-amber-500">0.00%</p></div>
+            <div><p class="text-[10px] text-zinc-600 font-bold uppercase text-right">Price</p><p id="price" class="font-mono text-white">0.00</p></div>
+        </div>
+    </div>
+    <div class="glass rounded-3xl p-8 mb-6 text-center border-t border-indigo-500/20">
+        <p class="text-[10px] text-zinc-500 font-bold uppercase mb-2">Net Mirror PnL</p>
+        <h2 id="netPnl" class="text-5xl font-mono font-bold mb-2">$0.00</h2>
+        <p class="text-zinc-400 text-xs font-mono">MIRROR ROI: <span id="mirrorRoi" class="text-indigo-400">0.00%</span></p>
+    </div>
+    <div class="grid grid-cols-2 gap-4 mb-6">
+        <div class="glass rounded-2xl p-6">
+            <div class="flex justify-between items-start mb-4">
+                <p class="text-[10px] font-bold text-emerald-500 uppercase">Long Account</p>
+                <div class="flex gap-2">
+                    <button onclick="reduce(0)" class="bg-zinc-800 text-zinc-400 px-3 py-1 rounded-md text-xs font-bold hover:bg-zinc-700">- 1</button>
+                    <button onclick="add(0)" class="bg-emerald-500/20 text-emerald-500 px-3 py-1 rounded-md text-xs font-bold hover:bg-emerald-500 hover:text-white">+ 1</button>
+                </div>
+            </div>
+            <p id="longRoi" class="text-2xl font-mono font-bold mb-1">0.00%</p>
+            <p id="longStats" class="text-[10px] text-zinc-500 font-mono italic">Vol: 0 | PnL: $0.00</p>
+        </div>
+        <div class="glass rounded-2xl p-6">
+            <div class="flex justify-between items-start mb-4">
+                <p class="text-[10px] font-bold text-rose-500 uppercase">Short Account</p>
+                <div class="flex gap-2">
+                    <button onclick="reduce(1)" class="bg-zinc-800 text-zinc-400 px-3 py-1 rounded-md text-xs font-bold hover:bg-zinc-700">- 1</button>
+                    <button onclick="add(1)" class="bg-rose-500/20 text-rose-500 px-3 py-1 rounded-md text-xs font-bold hover:bg-rose-500 hover:text-white">+ 1</button>
+                </div>
+            </div>
+            <p id="shortRoi" class="text-2xl font-mono font-bold mb-1">0.00%</p>
+            <p id="shortStats" class="text-[10px] text-zinc-500 font-mono italic">Vol: 0 | PnL: $0.00</p>
+        </div>
+    </div>
+    <button onclick="closeAll()" class="w-full py-4 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl text-xs uppercase tracking-widest transition-all">Emergency Liquidate All</button>
+</div>
+<script>
+async function add(id){ await fetch('/api/add/'+id,{method:'POST'}); }
+async function reduce(id){ await fetch('/api/reduce/'+id,{method:'POST'}); }
+async function closeAll(){ if(confirm("Liquidate all positions?")) await fetch('/api/close',{method:'POST'}); }
+setInterval(async () => {
+    try {
+        const r = await fetch('/api/status'); const d = await r.json();
+        document.getElementById('price').innerText = d.market.last.toFixed(8);
+        document.getElementById('spread').innerText = d.market.spreadPct.toFixed(3) + '%';
+        document.getElementById('botStatus').innerText = d.market.status;
+        document.getElementById('equityProfit').innerText = (d.market.equityProfit >= 0 ? '+' : '') + '$' + d.market.equityProfit.toFixed(4);
+        
+        let tP=0, tW=0;
+        d.accounts.forEach((a, i) => {
+            const pre = i === 0 ? 'long' : 'short';
+            tP += a.unrealizedUsdt; tW += a.wallet;
+            document.getElementById(pre+'Roi').innerText = (a.roi >= 0 ? '+' : '') + a.roi.toFixed(2)+'%';
+            document.getElementById(pre+'Stats').innerText = 'Vol: '+a.volume+' | PnL: $'+a.unrealizedUsdt.toFixed(4);
+            document.getElementById(pre+'Roi').className = 'text-2xl font-mono font-bold mb-1 ' + (a.roi >= 0 ? 'text-emerald-400' : 'text-rose-500');
+        });
+        document.getElementById('netPnl').innerText = (tP>=0?'+':'') + '$' + tP.toFixed(4);
+        document.getElementById('netPnl').className = 'text-5xl font-mono font-bold mb-2 ' + (tP>=0?'text-emerald-400':'text-rose-500');
+        document.getElementById('mirrorRoi').innerText = (tW > 0 ? (tP/tW*100) : 0).toFixed(4)+'%';
+    } catch(e) {}
+}, 1000);
+</script></body></html>`);
 });
+
+startWS(); setInterval(restSync, 2000); app.listen(config.port, '0.0.0.0');
