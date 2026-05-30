@@ -28,8 +28,8 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     takeProfitPct: 1.5,
-    baseVolume: 100,
-    microStep: 10,        
+    baseVolume: 1,
+    microStep: 1,        
     targetRatio: 1.5,     
     cooldownMs: 5000      
 };
