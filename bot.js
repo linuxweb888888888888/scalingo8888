@@ -31,7 +31,7 @@ const config = {
     resetTriggerRoi: 2.0, 
     maxSpreadPct: 0.1,    // STRICT OPENING FILTER
     autoClosePct: 150,
-    roiThreshold: 1.5,
+    roiThreshold: 6,
     pollInterval: 2000,
     resetCooldownMs: 3000,
     historySize: 30
