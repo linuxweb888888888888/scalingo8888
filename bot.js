@@ -28,13 +28,11 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1, 
-    resetTriggerRoi: 1.0, // TRIGGER: 1% ROI
-    targetRatio: 1.5,
-    autoClosePct: 150,
-    roiThreshold: 1.5,
-    maxSpreadPct: 0.1, 
-    pollInterval: 4000,
-    resetCooldownMs: 3000,
+    resetTriggerRoi: 1.0,  // TRIGGER: 1% ROI
+    autoClosePct: 150,     // Progress for auto-exit
+    roiThreshold: 1.5,     // ROI for auto-exit
+    pollInterval: 2000,    // Background sync every 2 seconds
+    resetCooldownMs: 2000, // Safety buffer
     historySize: 30
 };
 
@@ -68,7 +66,7 @@ async function htxRequest(account, method, path, data = {}) {
     const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
-        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 2500 });
+        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 2000 });
         return res.data;
     } catch (e) { return { status: 'error' }; }
 }
@@ -79,7 +77,7 @@ async function syncAccount(acc, state) {
         const pos = posRes.data.find(p => p.direction === state.direction);
         if (pos) {
             state.volume = Math.floor(parseFloat(pos.volume));
-            state.entryPrice = parseFloat(pos.last_price || pos.cost_open);
+            state.entryPrice = parseFloat(pos.cost_open || pos.last_price);
             state.roi = parseFloat(pos.profit_rate) * 100;
             state.unrealizedUsdt = parseFloat(pos.profit);
         } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.entryPrice = 0; }
@@ -100,6 +98,7 @@ async function flashReset(accIdx) {
     state.isLocked = true;
     state.lastAction = "⚡ FLASH RESET";
     
+    // Immediate execution: Close then Reopen
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
         contract_code: config.symbol, volume: state.volume, 
         direction: state.direction === 'buy' ? 'sell' : 'buy', 
@@ -113,7 +112,7 @@ async function flashReset(accIdx) {
     setTimeout(() => { state.isLocked = false; state.lastAction = "Idle"; }, config.resetCooldownMs);
 }
 
-// ==================== WS ENGINE ====================
+// ==================== WS ENGINE (INSTANT TRIGGER) ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -127,24 +126,29 @@ function startWS() {
                 market.lastPrice = (market.bid + market.ask) / 2;
                 market.spread = ((market.ask - market.bid) / market.bid) * 100;
                 
+                // Track Price Buffer
                 priceHistory.push(market.lastPrice);
                 if (priceHistory.length > config.historySize) priceHistory.shift();
                 
-                // Tech Metrics
+                // Real-time Metrics
                 const avg = priceHistory.reduce((a, b) => a + b, 0) / priceHistory.length;
                 market.volatility = Math.sqrt(priceHistory.map(p => Math.pow(p - avg, 2)).reduce((a, b) => a + b, 0) / priceHistory.length);
                 market.atr = Math.max(...priceHistory) - Math.min(...priceHistory);
 
-                // --- 1% FLASH TRIGGER ---
-                const l = accountStates[1]; const s = accountStates[2];
-                if (market.spread < config.maxSpreadPct) {
-                    // Check if Long ROI >= 1% -> Reset Short
-                    const liveLongRoi = l.entryPrice > 0 ? ((market.bid - l.entryPrice) / l.entryPrice) * config.leverage * 100 : 0;
-                    if (liveLongRoi >= config.resetTriggerRoi && !s.isLocked) flashReset(1);
+                // --- INSTANT RESET TRIGGER (NO SPREAD FILTER) ---
+                const l = accountStates[1]; 
+                const s = accountStates[2];
+                
+                // If Long ROI >= 1% -> Reset Short side immediately
+                const liveLongRoi = l.entryPrice > 0 ? ((market.bid - l.entryPrice) / l.entryPrice) * config.leverage * 100 : 0;
+                if (liveLongRoi >= config.resetTriggerRoi && !s.isLocked) {
+                    flashReset(1); // Index 1 is the second account (Short)
+                }
 
-                    // Check if Short ROI >= 1% -> Reset Long
-                    const liveShortRoi = s.entryPrice > 0 ? ((s.entryPrice - market.ask) / s.entryPrice) * config.leverage * 100 : 0;
-                    if (liveShortRoi >= config.resetTriggerRoi && !l.isLocked) flashReset(0);
+                // If Short ROI >= 1% -> Reset Long side immediately
+                const liveShortRoi = s.entryPrice > 0 ? ((s.entryPrice - market.ask) / s.entryPrice) * config.leverage * 100 : 0;
+                if (liveShortRoi >= config.resetTriggerRoi && !l.isLocked) {
+                    flashReset(0); // Index 0 is the first account (Long)
                 }
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
@@ -153,7 +157,7 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-// ==================== SYNC LOOP ====================
+// ==================== BACKGROUND LOOP ====================
 async function backgroundLoop() {
     for (const acc of config.accounts) { await syncAccount(acc, accountStates[acc.accountId]); }
     
@@ -168,20 +172,7 @@ async function backgroundLoop() {
 
     const winVal = Math.max(Math.abs(s1.unrealizedUsdt), Math.abs(s2.unrealizedUsdt));
     const loseVal = Math.abs(s1.unrealizedUsdt + s2.unrealizedUsdt - winVal);
-    market.balancePct = ((winVal / Math.max(loseVal, 0.00000001)) / config.targetRatio) * 100;
-
-    // Auto Liquidation
-    if (market.balancePct >= config.autoClosePct && (s1.roi > config.roiThreshold || s2.roi > config.roiThreshold) && winVal > loseVal) {
-        market.status = "LIQUIDATING";
-        for (const acc of config.accounts) {
-            const st = accountStates[acc.accountId];
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-                contract_code: config.symbol, volume: st.volume, direction: st.direction === 'buy' ? 'sell' : 'buy', 
-                offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
-            });
-        }
-        setTimeout(() => { market.status = "Active"; }, 5000);
-    }
+    market.balancePct = ((winVal / Math.max(loseVal, 0.00000001)) / 1.5) * 100;
 
     // Refill Safety
     for (const acc of config.accounts) {
@@ -233,12 +224,11 @@ app.get('/', (req, res) => {
     <div class="max-w-2xl mx-auto">
         <div class="flex justify-between items-start mb-10">
             <div>
-                <p id="botStatus" class="text-[10px] font-black text-indigo-500 uppercase tracking-widest mb-1">FLASH RESET ACTIVE (> 1%)</p>
+                <p id="botStatus" class="text-[10px] font-black text-indigo-500 uppercase tracking-widest mb-1">INSTANT FLASH TRIGGER ACTIVE</p>
                 <h1 class="text-4xl font-black text-slate-900 tracking-tighter uppercase leading-none">Ultra-Hedge</h1>
                 <div class="flex gap-4 mt-4 font-black uppercase text-[9px] text-slate-400">
                     <p>Spread: <span id="mSpread">0.00%</span></p>
                     <p>Volat: <span id="mVolat">0.00</span></p>
-                    <p>ATR: <span id="mATR">0.00</span></p>
                 </div>
             </div>
             <div class="text-right">
@@ -247,13 +237,13 @@ app.get('/', (req, res) => {
                     <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Growth</p>
                 </div>
                 <p id="totalNetGain" class="text-4xl font-black leading-none text-slate-900">$0.0000</p>
-                <p id="realizedPnl" class="text-[10px] font-black text-slate-400 mt-2 uppercase tracking-widest italic">Realized Sess: $0.0000</p>
+                <p id="realizedPnl" class="text-[10px] font-black text-slate-400 mt-2 uppercase tracking-widest leading-none">Realized: $0.0000</p>
             </div>
         </div>
 
         <div class="card p-10 pt-14 mb-8">
             <div class="flex justify-between items-end mb-4">
-                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Target: ${config.autoClosePct}% Progress (Winner Covers Loser)</p>
+                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Strategy Progress (150% Target)</p>
                 <p id="balPct" class="text-3xl font-black text-slate-900">0.0%</p>
             </div>
             <div class="relative w-full bg-slate-100 h-3 rounded-full mb-12">
@@ -291,7 +281,6 @@ app.get('/', (req, res) => {
                 document.getElementById('botStatus').innerText = d.market.status;
                 document.getElementById('mSpread').innerText = d.market.spread.toFixed(3) + '%';
                 document.getElementById('mVolat').innerText = d.market.volatility.toFixed(10);
-                document.getElementById('mATR').innerText = d.market.atr.toFixed(10);
                 document.getElementById('growthPct').innerText = (d.market.growthPct >= 0 ? '+' : '') + d.market.growthPct.toFixed(2) + '%';
                 document.getElementById('realizedPnl').innerText = 'Realized Sess (Inc. Fees): $' + d.market.realizedSessPnl.toFixed(5);
                 const gain = document.getElementById('totalNetGain');
@@ -318,4 +307,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Ultra-Hedge Pro Active on ${config.port}`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Monitor running`));
