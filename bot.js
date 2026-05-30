@@ -27,29 +27,24 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    // --- Dynamic Micro-Hedge Strategy ---
-    winnerRatio: 1.25,        // Goal: Winner PnL is 25% higher (1.25x) than Loser
-    minExitPnL: 0.00075,      // Minimum PnL to trigger Balanced Exit
-    minExitRoi: 0.75,         // Minimum ROI to trigger Balanced Exit
-    baseVolume: 1,            // START WITH 1 CONTRACT
-    microStep: 1,             // INCREMENT BY ONLY 1
-    cooldownMs: 4000          // Delay between 1-contract nudges
+    takeProfitPct: 9999,
+    baseVolume: 1,
+    microStep: 1,        
+    targetRatio: 1.5,     
+    cooldownMs: 5000      
 };
 
-// ==================== GLOBAL STATE ====================
-let market = { last: 0, spreadPct: 0, status: 'Active', advantagePct: 0, netPnL: 0, totalEquity: 0, sessionProfit: 0 };
-let initialTotalEquity = 0;
+let market = { last: 0, status: 'Active', balancePct: 0, netPnL: 0 };
 let accountStates = {};
 
 config.accounts.forEach((account, idx) => {
     accountStates[account.accountId] = {
         direction: idx === 0 ? 'buy' : 'sell',
-        roi: 0, volume: 0, unrealizedUsdt: 0, wallet: 0,
-        lastAction: 'Syncing', isLocked: false
+        roi: 0, volume: 0, unrealizedUsdt: 0,
+        lastAction: 'Idle', isLocked: false
     };
 });
 
-// ==================== API HANDLER ====================
 async function htxRequest(account, method, path, data = {}) {
     const timestamp = new Date().toISOString().split('.')[0];
     const params = { AccessKeyId: account.apiKey, SignatureMethod: 'HmacSHA256', SignatureVersion: '2', Timestamp: timestamp };
@@ -63,76 +58,6 @@ async function htxRequest(account, method, path, data = {}) {
     } catch (e) { return { status: 'error' }; }
 }
 
-// ==================== CORE DYNAMIC LOGIC ====================
-async function runLogic() {
-    let currentTotalWallet = 0;
-    for (const acc of config.accounts) { 
-        await syncAccount(acc, accountStates[acc.accountId]); 
-        currentTotalWallet += accountStates[acc.accountId].wallet;
-    }
-
-    // Session Metrics
-    if (initialTotalEquity === 0 && currentTotalWallet > 0) initialTotalEquity = currentTotalWallet;
-    market.totalEquity = currentTotalWallet;
-    market.sessionProfit = currentTotalWallet - initialTotalEquity;
-
-    const s1 = accountStates[config.accounts[0].accountId];
-    const s2 = accountStates[config.accounts[1].accountId];
-    const winner = s1.roi > s2.roi ? s1 : s2;
-    const loser = s1.roi > s2.roi ? s2 : s1;
-    const winnerAcc = config.accounts.find(a => a.accountId === winner.accountId);
-    
-    market.netPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
-
-    // 1. Calculate Dynamic Advantage Progress
-    const winAbs = Math.abs(winner.unrealizedUsdt);
-    const loseAbs = Math.abs(loser.unrealizedUsdt);
-    if (loseAbs === 0) market.advantagePct = 0;
-    else {
-        const currentRatio = winAbs / loseAbs;
-        market.advantagePct = Math.min(100, (currentRatio / config.winnerRatio) * 100);
-    }
-
-    // 2. CHECK FOR BALANCED EXIT
-    const targetPnLMet = winAbs >= config.minExitPnL;
-    const targetRoiMet = Math.abs(winner.roi) >= config.minExitRoi;
-    const isAdvantaged = winAbs >= (loseAbs * config.winnerRatio);
-
-    if (targetPnLMet && targetRoiMet && isAdvantaged && winner.volume > 0) {
-        market.status = "TARGET REACHED: BALANCED EXIT";
-        await closeAll();
-        return;
-    }
-
-    // 3. SLOW MICRO-ADJUSTMENT (1 contract increments)
-    if (winner.volume > 0 && loser.volume > 0 && !winner.isLocked) {
-        if (!isAdvantaged) {
-            winner.isLocked = true;
-            winner.lastAction = `Micro-Nudge (+${config.microStep})`;
-            await htxRequest(winnerAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: config.microStep, 
-                direction: winner.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
-            });
-            setTimeout(() => { winner.isLocked = false; }, config.cooldownMs);
-        } else {
-            winner.lastAction = "Balanced Advantage";
-        }
-    }
-
-    // 4. INITIAL ENTRY (Start with 1)
-    for (const acc of config.accounts) {
-        const state = accountStates[acc.accountId];
-        if (state.volume === 0 && !state.isLocked) {
-            state.isLocked = true;
-            state.lastAction = "Initial Entry (1)";
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
-            });
-            setTimeout(() => { state.isLocked = false; }, 3000);
-        }
-    }
-}
-
 async function syncAccount(acc, state) {
     const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
     if (res?.status === 'ok' && res.data) {
@@ -143,26 +68,152 @@ async function syncAccount(acc, state) {
             state.unrealizedUsdt = parseFloat(pos.profit);
         } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
     }
-    const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
-    if (accRes?.status === 'ok' && accRes.data) {
-        state.wallet = parseFloat(accRes.data[0].margin_balance);
-    }
 }
 
+// IMPROVED CLOSE ALL LOGIC
 async function closeAll() {
+    console.log("⚠️ EMERGENCY LIQUIDATION TRIGGERED");
+    market.status = "LIQUIDATING...";
+    
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
+        
+        // We sync one last time to be sure we have the volume
+        await syncAccount(acc, state);
+        
         if (state.volume > 0) {
+            console.log(`Closing Acc ${acc.accountId}: ${state.volume} units`);
             const closeDir = state.direction === 'buy' ? 'sell' : 'buy';
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-                contract_code: config.symbol, volume: state.volume, direction: closeDir, 
-                offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_10' 
+            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+                contract_code: config.symbol, 
+                volume: state.volume, 
+                direction: closeDir, 
+                offset: 'close', 
+                lever_rate: config.leverage, 
+                order_price_type: 'optimal_10' 
             });
+            console.log(`Acc ${acc.accountId} Close Result:`, res.status);
+        } else {
+            console.log(`Acc ${acc.accountId} has no volume to close.`);
+        }
+    }
+    market.status = "Liquidation Complete";
+    setTimeout(() => { market.status = "Active"; }, 3000);
+}
+
+async function runSlowLogic() {
+    for (const acc of config.accounts) { await syncAccount(acc, accountStates[acc.accountId]); }
+    const s1 = accountStates[config.accounts[0].accountId];
+    const s2 = accountStates[config.accounts[1].accountId];
+    const winner = s1.roi > s2.roi ? s1 : s2;
+    const loser = s1.roi > s2.roi ? s2 : s1;
+    const winnerAcc = config.accounts.find(a => a.accountId === (s1.roi > s2.roi ? config.accounts[0].accountId : config.accounts[1].accountId));
+    
+    const winVal = Math.abs(winner.unrealizedUsdt);
+    const loseVal = Math.abs(loser.unrealizedUsdt);
+    market.netPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
+
+    if (loseVal === 0) market.balancePct = 100;
+    else market.balancePct = Math.min(100, ((winVal / loseVal) / config.targetRatio) * 100);
+
+    if (winner.volume > 0 && loser.volume > 0 && !winner.isLocked && winVal < (loseVal * config.targetRatio)) {
+        winner.isLocked = true;
+        winner.lastAction = `Nudge (+${config.microStep})`;
+        await htxRequest(winnerAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+            contract_code: config.symbol, volume: config.microStep, 
+            direction: winner.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
+        });
+        setTimeout(() => { winner.isLocked = false; }, config.cooldownMs);
+    }
+
+    for (const acc of config.accounts) {
+        const state = accountStates[acc.accountId];
+        if (state.volume === 0 && !state.isLocked) {
+            state.isLocked = true;
+            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
+            });
+            setTimeout(() => { state.isLocked = false; }, 3000);
+        }
+        if (state.roi >= config.takeProfitPct) {
+            console.log("Target ROI hit, auto-closing...");
+            await closeAll();
         }
     }
 }
 
-// ==================== DASHBOARD & WS ====================
+// API ENDPOINTS
+app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates) }));
+app.post('/api/close', async (req, res) => { 
+    console.log("API: Close request received");
+    await closeAll(); 
+    res.json({status: 'ok'}); 
+});
+
+app.get('/', (req, res) => {
+    res.send(`<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Micro Balancer</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>body{background:#030304;color:#f0f0f0;font-family:monospace;}.glass{background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.05);}</style></head>
+<body class="p-10"><div class="max-w-3xl mx-auto">
+    <div class="flex justify-between items-end mb-10 border-b border-white/10 pb-4">
+        <div><h1 class="text-lg font-bold uppercase">Micro-Hedge</h1><p id="botStatus" class="text-[9px] text-indigo-500 font-bold uppercase"></p></div>
+        <div class="text-right"><p class="text-[10px] text-zinc-600 font-bold uppercase">Net Gain</p><p id="netPnL" class="text-2xl font-bold">$0.0000</p></div>
+    </div>
+
+    <div class="glass rounded-2xl p-8 mb-6">
+        <div class="flex justify-between text-[10px] mb-2 uppercase font-bold text-zinc-500"><span>Advantage</span><span id="balPct">0%</span></div>
+        <div class="w-full bg-white/5 h-1 rounded-full mb-8"><div id="balBar" class="bg-indigo-500 h-1 rounded-full" style="width:0%"></div></div>
+        <div class="grid grid-cols-2 gap-10">
+            <div><p class="text-[10px] text-emerald-500 font-bold mb-2 uppercase">Long</p><p id="lRoi" class="text-3xl font-bold mb-1">0.00%</p><p id="lPnl" class="text-sm text-zinc-500">$0.00</p><p id="lVol" class="text-[9px] text-zinc-600 mt-2"></p></div>
+            <div class="text-right"><p class="text-[10px] text-rose-500 font-bold mb-2 uppercase">Short</p><p id="sRoi" class="text-3xl font-bold mb-1">0.00%</p><p id="sPnl" class="text-sm text-zinc-500">$0.00</p><p id="sVol" class="text-[9px] text-zinc-600 mt-2"></p></div>
+        </div>
+    </div>
+
+    <!-- UPDATED BUTTON LOGIC -->
+    <button id="closeBtn" onclick="triggerClose()" class="w-full py-4 bg-rose-900/10 hover:bg-rose-600 text-rose-500 hover:text-white border border-rose-900/30 rounded-xl text-[10px] font-bold uppercase tracking-[0.2em] transition-all">
+        CLOSE ALL & LIQUIDATE
+    </button>
+</div>
+<script>
+async function triggerClose() {
+    if(!confirm("Liquidate all positions?")) return;
+    const btn = document.getElementById('closeBtn');
+    btn.innerText = "SENDING COMMAND...";
+    btn.disabled = true;
+    try {
+        const res = await fetch('/api/close', { method: 'POST' });
+        const data = await res.json();
+        console.log("Server responded:", data);
+    } catch(e) {
+        console.error("Fetch error:", e);
+    }
+    setTimeout(() => {
+        btn.innerText = "CLOSE ALL & LIQUIDATE";
+        btn.disabled = false;
+    }, 5000);
+}
+
+setInterval(async () => {
+    try {
+        const r = await fetch('/api/status'); const d = await r.json();
+        document.getElementById('botStatus').innerText = d.market.status;
+        document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
+        document.getElementById('balBar').style.width = d.market.balancePct + '%';
+        document.getElementById('netPnL').innerText = d.market.netPnL.toFixed(5);
+        document.getElementById('netPnL').className = 'text-2xl font-bold ' + (d.market.netPnL >= 0 ? 'text-emerald-400' : 'text-rose-500');
+        d.accounts.forEach((a, i) => {
+            const pre = i === 0 ? 'l' : 's';
+            document.getElementById(pre+'Roi').innerText = a.roi.toFixed(2)+'%';
+            document.getElementById(pre+'Pnl').innerText = '$'+a.unrealizedUsdt.toFixed(5);
+            document.getElementById(pre+'Vol').innerText = 'VOL: '+a.volume + ' | ' + a.lastAction;
+            document.getElementById(pre+'Roi').className = 'text-3xl font-bold mb-1 ' + (a.roi >= 0 ? 'text-emerald-400' : 'text-rose-500');
+        });
+    } catch(e) {}
+}, 1000);
+</script></body></html>`);
+});
+
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -170,96 +221,13 @@ function startWS() {
         zlib.gunzip(data, (err, dec) => {
             if (err) return;
             const msg = JSON.parse(dec.toString());
-            if (msg.tick) {
-                market.last = (msg.tick.bid[0] + msg.tick.ask[0]) / 2;
-                market.spreadPct = ((msg.tick.ask[0] - msg.tick.bid[0]) / msg.tick.bid[0]) * 100;
-            }
+            if (msg.tick) market.last = (msg.tick.bid[0] + msg.tick.ask[0]) / 2;
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
         });
     });
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates) }));
-app.post('/api/close', async (req, res) => { await closeAll(); res.json({status: 'ok'}); });
-
-app.get('/', (req, res) => {
-    res.send(`<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>Micro-Balance Terminal</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<style>body{background:#040405;color:#fafafa;font-family:sans-serif;}.glass{background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.05);}</style></head>
-<body class="p-10"><div class="max-w-4xl mx-auto">
-    <div class="flex justify-between items-end mb-10 border-b border-white/5 pb-6">
-        <div><h1 class="text-xl font-bold tracking-tighter uppercase">Advantage <span class="text-indigo-500">Skew</span></h1><p id="botStatus" class="text-[10px] text-zinc-500 font-bold uppercase"></p></div>
-        <div class="flex gap-10 text-right">
-            <div><p class="text-[10px] text-zinc-600 font-bold uppercase">Session</p><p id="sessionProfit" class="font-mono text-emerald-400 font-bold">$0.00</p></div>
-            <div><p class="text-[10px] text-zinc-600 font-bold uppercase">Spread</p><p id="spread" class="font-mono text-amber-500">0.00%</p></div>
-            <div><p class="text-[10px] text-zinc-600 font-bold uppercase">Price</p><p id="price" class="font-mono text-white">0.00</p></div>
-        </div>
-    </div>
-
-    <div class="glass rounded-3xl p-8 mb-6 text-center">
-        <div class="flex justify-between text-[10px] font-bold uppercase mb-2">
-            <span class="text-zinc-500">25% Advantage Progress</span>
-            <span id="advPct" class="text-indigo-400">0%</span>
-        </div>
-        <div class="w-full bg-white/5 h-1.5 rounded-full mb-8">
-            <div id="advBar" class="bg-indigo-500 h-1.5 rounded-full transition-all duration-1000" style="width:0%"></div>
-        </div>
-        <p class="text-[10px] text-zinc-500 font-bold uppercase mb-1">Net Unrealized PnL</p>
-        <h2 id="netPnL" class="text-6xl font-mono font-bold">$0.0000</h2>
-    </div>
-
-    <div class="grid grid-cols-2 gap-4 mb-6">
-        <div class="glass rounded-2xl p-6">
-            <p class="text-[10px] font-bold text-emerald-500 uppercase mb-4">Long Account</p>
-            <p id="lRoi" class="text-3xl font-mono font-bold mb-1">0.00%</p>
-            <p id="lPnl" class="text-sm font-mono text-zinc-400">$0.00000</p>
-            <div class="flex justify-between mt-6 pt-4 border-t border-white/5 text-[10px] font-mono text-zinc-500">
-                <span id="lVol">VOL: 0</span>
-                <span id="lWallet">BAL: $0.00</span>
-            </div>
-            <p id="lAct" class="text-[9px] text-indigo-400 font-bold mt-2 uppercase tracking-widest"></p>
-        </div>
-        <div class="glass rounded-2xl p-6">
-            <p class="text-[10px] font-bold text-rose-500 uppercase mb-4">Short Account</p>
-            <p id="sRoi" class="text-3xl font-mono font-bold mb-1">0.00%</p>
-            <p id="sPnl" class="text-sm font-mono text-zinc-400">$0.00000</p>
-            <div class="flex justify-between mt-6 pt-4 border-t border-white/5 text-[10px] font-mono text-zinc-500">
-                <span id="sVol">VOL: 0</span>
-                <span id="sWallet">BAL: $0.00</span>
-            </div>
-            <p id="sAct" class="text-[9px] text-indigo-400 font-bold mt-2 uppercase tracking-widest"></p>
-        </div>
-    </div>
-    <button onclick="if(confirm('Liquidate everything?')) fetch('/api/close',{method:'POST'})" class="w-full py-4 bg-rose-600/10 hover:bg-rose-600 text-rose-500 hover:text-white font-bold rounded-xl text-xs uppercase tracking-widest border border-rose-500/20 transition-all">Emergency Close All</button>
-</div>
-<script>
-setInterval(async () => {
-    try {
-        const r = await fetch('/api/status'); const d = await r.json();
-        document.getElementById('price').innerText = d.market.last.toFixed(8);
-        document.getElementById('spread').innerText = d.market.spreadPct.toFixed(3) + '%';
-        document.getElementById('botStatus').innerText = d.market.status;
-        document.getElementById('sessionProfit').innerText = (d.market.sessionProfit >= 0 ? '+' : '') + '$' + d.market.sessionProfit.toFixed(4);
-        document.getElementById('advPct').innerText = d.market.advantagePct.toFixed(1) + '%';
-        document.getElementById('advBar').style.width = d.market.advantagePct + '%';
-        document.getElementById('netPnL').innerText = (d.market.netPnL >= 0 ? '+' : '') + '$' + d.market.netPnL.toFixed(5);
-        document.getElementById('netPnL').className = 'text-6xl font-mono font-bold ' + (d.market.netPnL >= 0 ? 'text-emerald-400' : 'text-rose-500');
-        d.accounts.forEach((a, i) => {
-            const pre = i === 0 ? 'l' : 's';
-            document.getElementById(pre+'Roi').innerText = a.roi.toFixed(2)+'%';
-            document.getElementById(pre+'Pnl').innerText = '$'+a.unrealizedUsdt.toFixed(5);
-            document.getElementById(pre+'Vol').innerText = 'VOL: '+a.volume;
-            document.getElementById(pre+'Wallet').innerText = 'BAL: $'+a.wallet.toFixed(2);
-            document.getElementById(pre+'Act').innerText = a.lastAction;
-            document.getElementById(pre+'Roi').className = 'text-3xl font-mono font-bold mb-1 ' + (a.roi >= 0 ? 'text-emerald-400' : 'text-rose-500');
-        });
-    } catch(e) {}
-}, 1000);
-</script></body></html>`);
-});
-
 startWS();
-setInterval(runLogic, 4000);
-app.listen(config.port, '0.0.0.0');
+setInterval(runSlowLogic, 4000);
+app.listen(config.port, '0.0.0.0', () => console.log(`Bot running on port ${config.port}`));
