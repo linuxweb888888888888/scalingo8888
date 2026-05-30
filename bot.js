@@ -33,7 +33,8 @@ const config = {
     roiThreshold: 1.5,
     maxSpreadPct: 0.1, 
     pollInterval: 4000,
-    resetCooldownMs: 3000 // Protection against order spam
+    resetCooldownMs: 3000,
+    historySize: 30
 };
 
 // ==================== DATA TRACKING ====================
@@ -90,7 +91,6 @@ async function syncAccount(acc, state) {
     }
 }
 
-// ⚡ THE INSTANT TRIGGER
 async function flashReset(accIdx) {
     const acc = config.accounts[accIdx];
     const state = accountStates[acc.accountId];
@@ -99,13 +99,11 @@ async function flashReset(accIdx) {
     state.isLocked = true;
     state.lastAction = "⚡ FLASH RESET";
     
-    // Immediate Close
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
         contract_code: config.symbol, volume: state.volume, 
         direction: state.direction === 'buy' ? 'sell' : 'buy', 
         offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
     });
-    // Immediate Re-open
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
         contract_code: config.symbol, volume: config.baseVolume, 
         direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
@@ -114,7 +112,7 @@ async function flashReset(accIdx) {
     setTimeout(() => { state.isLocked = false; state.lastAction = "Idle"; }, config.resetCooldownMs);
 }
 
-// ==================== WEBSOCKET ENGINE ====================
+// ==================== WS ENGINE ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -128,27 +126,19 @@ function startWS() {
                 market.lastPrice = (market.bid + market.ask) / 2;
                 market.spread = ((market.ask - market.bid) / market.bid) * 100;
                 
-                // Track Price for Volatility
                 priceHistory.push(market.lastPrice);
-                if (priceHistory.length > 30) priceHistory.shift();
-                market.atr = Math.max(...priceHistory) - Math.min(...priceHistory);
+                if (priceHistory.length > config.historySize) priceHistory.shift();
+                
+                // Metrics
                 const avg = priceHistory.reduce((a, b) => a + b, 0) / priceHistory.length;
                 market.volatility = Math.sqrt(priceHistory.map(p => Math.pow(p - avg, 2)).reduce((a, b) => a + b, 0) / priceHistory.length);
+                market.atr = Math.max(...priceHistory) - Math.min(...priceHistory);
 
-                // --- INSTANT PROFIT CHECK ---
-                const long = accountStates[1];
-                const short = accountStates[2];
-
-                // If Spread is clean (< 0.1%)
+                // --- INSTANT FLASH TRIGGER ---
+                const l = accountStates[1]; const s = accountStates[2];
                 if (market.spread < config.maxSpreadPct) {
-                    // Check Long: If Price > Entry, Long is above zero -> Reset Short
-                    if (long.entryPrice > 0 && market.bid > long.entryPrice && !short.isLocked) {
-                        flashReset(1); // Index 1 = Short Account
-                    }
-                    // Check Short: If Price < Entry, Short is above zero -> Reset Long
-                    if (short.entryPrice > 0 && market.ask < short.entryPrice && !long.isLocked) {
-                        flashReset(0); // Index 0 = Long Account
-                    }
+                    if (l.entryPrice > 0 && market.bid > l.entryPrice && !s.isLocked) flashReset(1); // Long wins, Reset Short
+                    if (s.entryPrice > 0 && market.ask < s.entryPrice && !l.isLocked) flashReset(0); // Short wins, Reset Long
                 }
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
@@ -157,7 +147,7 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-// ==================== BACKGROUND SYNC ====================
+// ==================== SYNC LOOP ====================
 async function backgroundLoop() {
     for (const acc of config.accounts) { await syncAccount(acc, accountStates[acc.accountId]); }
     
@@ -171,11 +161,11 @@ async function backgroundLoop() {
     market.realizedSessPnl = market.totalNetGain - (s1.unrealizedUsdt + s2.unrealizedUsdt);
 
     const winVal = Math.max(Math.abs(s1.unrealizedUsdt), Math.abs(s2.unrealizedUsdt));
-    const loseVal = Math.min(Math.abs(s1.unrealizedUsdt), Math.abs(s2.unrealizedUsdt));
-    market.balancePct = ((winVal / Math.max(loseVal, 0.00000001)) / config.targetRatio) * 100;
+    const loseVal = Math.abs(s1.unrealizedUsdt + s2.unrealizedUsdt - (s1.unrealizedUsdt > s2.unrealizedUsdt ? s1.unrealizedUsdt : s2.unrealizedUsdt));
+    market.balancePct = ((winVal / Math.max(Math.abs(s1.unrealizedUsdt + s2.unrealizedUsdt - winVal), 0.00000001)) / config.targetRatio) * 100;
 
-    // AUTO-LIQUIDATION CONDITION
-    if (market.balancePct >= config.autoClosePct && (s1.roi > config.roiThreshold || s2.roi > config.roiThreshold) && winVal > loseVal) {
+    // AUTO LIQUIDATE
+    if (market.balancePct >= config.autoClosePct && (s1.roi > config.roiThreshold || s2.roi > config.roiThreshold) && winVal > Math.abs(market.netPnL - winVal)) {
         market.status = "LIQUIDATING";
         for (const acc of config.accounts) {
             const st = accountStates[acc.accountId];
@@ -184,14 +174,13 @@ async function backgroundLoop() {
                 offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
             });
         }
-        market.status = "CLEARED";
         setTimeout(() => { market.status = "Active"; }, 5000);
     }
 
-    // BASE REFILL (If accidentally closed or bot start)
+    // BASE REFILL
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
-        if (state.volume === 0 && !state.isLocked && market.status === "Active") {
+        if (state.volume === 0 && !state.isLocked) {
             state.isLocked = true;
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
@@ -212,10 +201,12 @@ app.get('/', (req, res) => {
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700;900&display=swap" rel="stylesheet">
     <style>
         body { background: #f8fafc; color: #0f172a; font-family: 'Roboto', sans-serif; }
-        .card { background: white; border-radius: 32px; border: 1px solid #e2e8f0; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.05); }
+        .card { background: white; border-radius: 32px; border: 1px solid #e2e8f0; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.05); position: relative; overflow: hidden; }
+        .target-line { position: absolute; top: 0; bottom: 0; width: 2px; background: #ef4444; z-index: 10; }
+        .target-label { position: absolute; top: -20px; transform: translateX(-50%); font-size: 9px; font-weight: 900; color: #ef4444; text-transform: uppercase; }
     </style>
 </head>
-<body class="p-6 md:p-12">
+<body class="p-4 md:p-10">
     <div class="max-w-2xl mx-auto">
         <div class="flex justify-between items-start mb-10">
             <div>
@@ -227,33 +218,38 @@ app.get('/', (req, res) => {
                 </div>
             </div>
             <div class="text-right">
-                <p id="growthPct" class="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Growth: 0.00%</p>
+                <div class="flex items-center justify-end gap-2 mb-1">
+                    <p id="growthPct" class="text-[10px] font-black px-2 py-0.5 rounded bg-slate-100 text-slate-600 uppercase">0.00%</p>
+                    <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Growth</p>
+                </div>
                 <p id="totalNetGain" class="text-4xl font-black leading-none text-slate-900">$0.0000</p>
-                <p id="realizedPnl" class="text-[10px] font-black text-slate-400 mt-2 uppercase tracking-widest italic">Realized: $0.0000</p>
+                <p id="realizedPnl" class="text-[10px] font-black text-slate-400 mt-2 uppercase tracking-widest italic">Realized Sess: $0.0000</p>
             </div>
         </div>
 
         <div class="card p-10 pt-14 mb-8">
             <div class="flex justify-between items-end mb-4">
-                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Progress to Auto-Exit</p>
+                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Target: ${config.autoClosePct}% + ROI > ${config.roiThreshold}%</p>
                 <p id="balPct" class="text-3xl font-black text-slate-900">0.0%</p>
             </div>
-            <div class="w-full bg-slate-100 h-2 rounded-full overflow-hidden mb-12">
-                <div id="balBar" class="bg-indigo-600 h-full w-0 transition-all duration-700 ease-out"></div>
+            <div class="relative w-full bg-slate-100 h-3 rounded-full mb-12">
+                <div id="balBar" class="bg-indigo-600 h-full w-0 rounded-full transition-all duration-700 ease-out relative z-0"></div>
+                <div id="targetMarker" class="target-line" style="left: 75%;"><span class="target-label">EXIT</span></div>
+                <div style="left: 50%;" class="absolute top-0 bottom-0 border-l border-slate-300 border-dashed"></div>
             </div>
 
             <div class="grid grid-cols-2 gap-10">
-                <div class="border-r border-slate-100">
+                <div class="border-r border-slate-50">
                     <p class="text-[10px] font-black text-emerald-500 uppercase tracking-widest mb-2">Long Position</p>
                     <p id="lRoi" class="text-4xl font-black mb-1">0.00%</p>
-                    <p id="lPnl" class="text-sm font-bold text-slate-400 mb-4">$0.00</p>
-                    <p id="lStatus" class="text-[9px] font-black text-slate-300 uppercase italic">Idle</p>
+                    <p id="lPnl" class="text-sm font-bold text-slate-400 mb-6">$0.00</p>
+                    <p id="lVol" class="text-[9px] px-3 py-1 bg-slate-100 rounded-full font-black text-slate-500 uppercase"></p>
                 </div>
                 <div class="text-right">
                     <p class="text-[10px] font-black text-rose-500 uppercase tracking-widest mb-2">Short Position</p>
                     <p id="sRoi" class="text-4xl font-black mb-1">0.00%</p>
-                    <p id="sPnl" class="text-sm font-bold text-slate-400 mb-4">$0.00</p>
-                    <p id="sStatus" class="text-[9px] font-black text-slate-300 uppercase italic">Idle</p>
+                    <p id="sPnl" class="text-sm font-bold text-slate-400 mb-6">$0.00</p>
+                    <p id="sVol" class="text-[9px] px-3 py-1 bg-slate-100 rounded-full font-black text-slate-500 uppercase"></p>
                 </div>
             </div>
         </div>
@@ -266,16 +262,17 @@ app.get('/', (req, res) => {
                 document.getElementById('mVolat').innerText = d.market.volatility.toFixed(10);
                 document.getElementById('totalNetGain').innerText = (d.market.totalNetGain >= 0 ? '+' : '') + d.market.totalNetGain.toFixed(5);
                 document.getElementById('totalNetGain').className = 'text-4xl font-black leading-none ' + (d.market.totalNetGain >= 0 ? 'text-emerald-500' : 'text-rose-500');
-                document.getElementById('growthPct').innerText = 'Growth: ' + d.market.growthPct.toFixed(2) + '%';
+                document.getElementById('growthPct').innerText = (d.market.growthPct >= 0 ? '+' : '') + d.market.growthPct.toFixed(2) + '%';
                 document.getElementById('realizedPnl').innerText = 'Realized Sess: $' + d.market.realizedSessPnl.toFixed(5);
                 document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
                 document.getElementById('balBar').style.width = Math.min(100, (d.market.balancePct / 200) * 100) + '%';
+                document.getElementById('targetMarker').style.left = (d.config.autoClosePct / 200) * 100 + '%';
                 d.accounts.forEach((a, i) => {
                     const p = i === 0 ? 'l' : 's';
                     document.getElementById(p+'Roi').innerText = a.roi.toFixed(2)+'%';
                     document.getElementById(p+'Roi').className = 'text-4xl font-black mb-1 ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
                     document.getElementById(p+'Pnl').innerText = '$'+a.unrealizedUsdt.toFixed(6);
-                    document.getElementById(p+'Status').innerText = a.lastAction;
+                    document.getElementById(p+'Vol').innerText = a.volume + ' CT | ' + a.lastAction;
                 });
             } catch(e) {}
         }, 1000);
