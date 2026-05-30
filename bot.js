@@ -27,14 +27,14 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    targetProfit: parseFloat(process.env.TARGET_PROFIT) || 0.00075,  // Target net profit in USDT
-    baseVolume: 1,
-    microStep: 1,        
+    takeProfitPct: 1.5,
+    baseVolume: 100,
+    microStep: 10,        
     targetRatio: 1.5,     
     cooldownMs: 5000      
 };
 
-let market = { last: 0, status: 'Active', netPnL: 0 };
+let market = { last: 0, status: 'Active', balancePct: 0, netPnL: 0 };
 let accountStates = {};
 
 config.accounts.forEach((account, idx) => {
@@ -70,18 +70,21 @@ async function syncAccount(acc, state) {
     }
 }
 
-// SIMPLIFIED CLOSE ALL - NO EXTRA LOGS OR CONDITIONS
-async function closeAll(reason = 'Take Profit') {
-    console.log(`🎯 ${reason} - Closing all positions`);
-    market.status = "CLOSING...";
+// IMPROVED CLOSE ALL LOGIC
+async function closeAll() {
+    console.log("⚠️ EMERGENCY LIQUIDATION TRIGGERED");
+    market.status = "LIQUIDATING...";
     
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
+        
+        // We sync one last time to be sure we have the volume
         await syncAccount(acc, state);
         
         if (state.volume > 0) {
+            console.log(`Closing Acc ${acc.accountId}: ${state.volume} units`);
             const closeDir = state.direction === 'buy' ? 'sell' : 'buy';
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
                 contract_code: config.symbol, 
                 volume: state.volume, 
                 direction: closeDir, 
@@ -89,49 +92,30 @@ async function closeAll(reason = 'Take Profit') {
                 lever_rate: config.leverage, 
                 order_price_type: 'optimal_10' 
             });
-            console.log(`✓ Closed Acc ${acc.accountId} (${state.direction})`);
+            console.log(`Acc ${acc.accountId} Close Result:`, res.status);
+        } else {
+            console.log(`Acc ${acc.accountId} has no volume to close.`);
         }
     }
-    
-    market.status = `Closed: ${reason}`;
-    
-    // Reset after 5 seconds
-    setTimeout(() => { 
-        market.status = "Active";
-        console.log("🟢 Ready for new cycle");
-    }, 5000);
+    market.status = "Liquidation Complete";
+    setTimeout(() => { market.status = "Active"; }, 3000);
 }
 
 async function runSlowLogic() {
-    // Sync all accounts
-    for (const acc of config.accounts) { 
-        await syncAccount(acc, accountStates[acc.accountId]); 
-    }
-    
+    for (const acc of config.accounts) { await syncAccount(acc, accountStates[acc.accountId]); }
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
-    
-    // Calculate net P&L (e.g., 0.00075 + -0.0005 = 0.00025)
-    market.netPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
-    
-    // ========== ONLY TAKE PROFIT CONDITION ==========
-    // Close when net profit reaches target (no stop loss)
-    if (market.netPnL >= config.targetProfit) {
-        console.log(`✅ Take profit triggered! Net PnL: ${market.netPnL.toFixed(6)} USDT (Target: ${config.targetProfit})`);
-        console.log(`   Long ROI: ${s1.roi.toFixed(2)}% | Short ROI: ${s2.roi.toFixed(2)}%`);
-        await closeAll(`Take Profit (${market.netPnL.toFixed(6)} USDT)`);
-        return; // Exit early - no further actions after closing
-    }
-    
-    // ========== HEDGING LOGIC (only if not closed) ==========
     const winner = s1.roi > s2.roi ? s1 : s2;
     const loser = s1.roi > s2.roi ? s2 : s1;
     const winnerAcc = config.accounts.find(a => a.accountId === (s1.roi > s2.roi ? config.accounts[0].accountId : config.accounts[1].accountId));
     
     const winVal = Math.abs(winner.unrealizedUsdt);
     const loseVal = Math.abs(loser.unrealizedUsdt);
-    
-    // Balance ratio logic
+    market.netPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
+
+    if (loseVal === 0) market.balancePct = 100;
+    else market.balancePct = Math.min(100, ((winVal / loseVal) / config.targetRatio) * 100);
+
     if (winner.volume > 0 && loser.volume > 0 && !winner.isLocked && winVal < (loseVal * config.targetRatio)) {
         winner.isLocked = true;
         winner.lastAction = `Nudge (+${config.microStep})`;
@@ -141,16 +125,19 @@ async function runSlowLogic() {
         });
         setTimeout(() => { winner.isLocked = false; }, config.cooldownMs);
     }
-    
-    // Reopen zero positions
+
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
-        if (state.volume === 0 && !state.isLocked && market.status === 'Active') {
+        if (state.volume === 0 && !state.isLocked) {
             state.isLocked = true;
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
             });
             setTimeout(() => { state.isLocked = false; }, 3000);
+        }
+        if (state.roi >= config.takeProfitPct) {
+            console.log("Target ROI hit, auto-closing...");
+            await closeAll();
         }
     }
 }
@@ -158,173 +145,73 @@ async function runSlowLogic() {
 // API ENDPOINTS
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates) }));
 app.post('/api/close', async (req, res) => { 
-    console.log("🔴 Manual close requested");
-    await closeAll('Manual Close'); 
-    res.json({status: 'ok', message: 'All positions closed'}); 
+    console.log("API: Close request received");
+    await closeAll(); 
+    res.json({status: 'ok'}); 
 });
 
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>Micro Balancer - Take Profit Only</title>
+<html lang="en"><head><meta charset="UTF-8"><title>Micro Balancer</title>
 <script src="https://cdn.tailwindcss.com"></script>
-<style>
-    body{background:#030304;color:#f0f0f0;font-family:monospace;}
-    .glass{background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.05);}
-    @keyframes pulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.5; }
-    }
-    .animate-pulse-custom {
-        animation: pulse 1s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-    }
-</style>
-</head>
+<style>body{background:#030304;color:#f0f0f0;font-family:monospace;}.glass{background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.05);}</style></head>
 <body class="p-10"><div class="max-w-3xl mx-auto">
     <div class="flex justify-between items-end mb-10 border-b border-white/10 pb-4">
-        <div>
-            <h1 class="text-lg font-bold uppercase">Micro-Hedge</h1>
-            <p id="botStatus" class="text-[9px] text-indigo-500 font-bold uppercase mt-1"></p>
-        </div>
-        <div class="text-right">
-            <p class="text-[10px] text-zinc-600 font-bold uppercase">Net PnL (USDT)</p>
-            <p id="netPnL" class="text-2xl font-bold">$0.00000</p>
-            <p id="targetInfo" class="text-[9px] text-zinc-600 mt-1">Target: ${config.targetProfit.toFixed(6)} USDT</p>
-        </div>
-    </div>
-
-    <!-- PROGRESS BAR SECTION -->
-    <div class="glass rounded-2xl p-6 mb-6">
-        <div class="flex justify-between text-[10px] mb-2 uppercase font-bold">
-            <span class="text-zinc-500">PROGRESS TO TARGET</span>
-            <span id="progressPercent" class="text-indigo-500">0%</span>
-        </div>
-        <div class="w-full bg-white/5 h-3 rounded-full mb-2 overflow-hidden">
-            <div id="progressBar" class="bg-gradient-to-r from-indigo-500 to-emerald-500 h-3 rounded-full transition-all duration-500" style="width:0%"></div>
-        </div>
-        <div class="flex justify-between text-[9px] text-zinc-600">
-            <span>$0</span>
-            <span id="currentTarget">$${config.targetProfit.toFixed(6)}</span>
-        </div>
-        <div id="targetAlert" class="mt-3 hidden">
-            <div class="bg-emerald-500/20 border border-emerald-500/50 rounded-lg p-2 text-center animate-pulse-custom">
-                <p class="text-emerald-400 text-[10px] font-bold uppercase tracking-wider">🎯 TARGET REACHED! CLOSING POSITIONS...</p>
-            </div>
-        </div>
+        <div><h1 class="text-lg font-bold uppercase">Micro-Hedge</h1><p id="botStatus" class="text-[9px] text-indigo-500 font-bold uppercase"></p></div>
+        <div class="text-right"><p class="text-[10px] text-zinc-600 font-bold uppercase">Net Gain</p><p id="netPnL" class="text-2xl font-bold">$0.0000</p></div>
     </div>
 
     <div class="glass rounded-2xl p-8 mb-6">
+        <div class="flex justify-between text-[10px] mb-2 uppercase font-bold text-zinc-500"><span>Advantage</span><span id="balPct">0%</span></div>
+        <div class="w-full bg-white/5 h-1 rounded-full mb-8"><div id="balBar" class="bg-indigo-500 h-1 rounded-full" style="width:0%"></div></div>
         <div class="grid grid-cols-2 gap-10">
-            <div>
-                <p class="text-[10px] text-emerald-500 font-bold mb-2 uppercase">Long</p>
-                <p id="lRoi" class="text-3xl font-bold mb-1">0.00%</p>
-                <p id="lPnl" class="text-sm text-zinc-500">$0.00000</p>
-                <p id="lVol" class="text-[9px] text-zinc-600 mt-2"></p>
-            </div>
-            <div class="text-right">
-                <p class="text-[10px] text-rose-500 font-bold mb-2 uppercase">Short</p>
-                <p id="sRoi" class="text-3xl font-bold mb-1">0.00%</p>
-                <p id="sPnl" class="text-sm text-zinc-500">$0.00000</p>
-                <p id="sVol" class="text-[9px] text-zinc-600 mt-2"></p>
-            </div>
-        </div>
-        <div class="mt-6 pt-6 border-t border-white/10">
-            <div class="flex justify-between text-[10px] mb-2 font-bold">
-                <span class="text-emerald-500">Long: $<span id="lUsdt">0</span></span>
-                <span class="text-rose-500">Short: $<span id="sUsdt">0</span></span>
-                <span class="text-indigo-500">Net: $<span id="netUsdt">0</span></span>
-            </div>
+            <div><p class="text-[10px] text-emerald-500 font-bold mb-2 uppercase">Long</p><p id="lRoi" class="text-3xl font-bold mb-1">0.00%</p><p id="lPnl" class="text-sm text-zinc-500">$0.00</p><p id="lVol" class="text-[9px] text-zinc-600 mt-2"></p></div>
+            <div class="text-right"><p class="text-[10px] text-rose-500 font-bold mb-2 uppercase">Short</p><p id="sRoi" class="text-3xl font-bold mb-1">0.00%</p><p id="sPnl" class="text-sm text-zinc-500">$0.00</p><p id="sVol" class="text-[9px] text-zinc-600 mt-2"></p></div>
         </div>
     </div>
 
+    <!-- UPDATED BUTTON LOGIC -->
     <button id="closeBtn" onclick="triggerClose()" class="w-full py-4 bg-rose-900/10 hover:bg-rose-600 text-rose-500 hover:text-white border border-rose-900/30 rounded-xl text-[10px] font-bold uppercase tracking-[0.2em] transition-all">
-        CLOSE ALL POSITIONS
+        CLOSE ALL & LIQUIDATE
     </button>
 </div>
 <script>
 async function triggerClose() {
-    if(!confirm("Close all positions?")) return;
+    if(!confirm("Liquidate all positions?")) return;
     const btn = document.getElementById('closeBtn');
-    btn.innerText = "CLOSING...";
+    btn.innerText = "SENDING COMMAND...";
     btn.disabled = true;
     try {
         const res = await fetch('/api/close', { method: 'POST' });
         const data = await res.json();
-        console.log("Close result:", data);
+        console.log("Server responded:", data);
     } catch(e) {
-        console.error("Error:", e);
+        console.error("Fetch error:", e);
     }
     setTimeout(() => {
-        btn.innerText = "CLOSE ALL POSITIONS";
+        btn.innerText = "CLOSE ALL & LIQUIDATE";
         btn.disabled = false;
-    }, 3000);
+    }, 5000);
 }
 
 setInterval(async () => {
     try {
-        const r = await fetch('/api/status'); 
-        const d = await r.json();
-        
+        const r = await fetch('/api/status'); const d = await r.json();
         document.getElementById('botStatus').innerText = d.market.status;
-        document.getElementById('netPnL').innerHTML = '$' + d.market.netPnL.toFixed(6);
-        
-        // Calculate progress percentage towards target
-        const target = ${config.targetProfit};
-        const currentPnL = d.market.netPnL;
-        let progressPercent = 0;
-        
-        if (currentPnL > 0) {
-            progressPercent = Math.min(100, (currentPnL / target) * 100);
-        }
-        
-        // Update progress bar
-        document.getElementById('progressBar').style.width = progressPercent + '%';
-        document.getElementById('progressPercent').innerText = progressPercent.toFixed(1) + '%';
-        
-        // Change progress bar color based on progress
-        const progressBar = document.getElementById('progressBar');
-        if (progressPercent >= 100) {
-            progressBar.classList.remove('bg-gradient-to-r', 'from-indigo-500', 'to-emerald-500');
-            progressBar.classList.add('bg-gradient-to-r', 'from-emerald-500', 'to-green-500');
-            document.getElementById('targetAlert').classList.remove('hidden');
-        } else if (progressPercent >= 75) {
-            progressBar.classList.remove('bg-gradient-to-r', 'from-indigo-500', 'to-emerald-500');
-            progressBar.classList.add('bg-gradient-to-r', 'from-yellow-500', 'to-orange-500');
-        } else {
-            if (!progressBar.classList.contains('bg-gradient-to-r')) {
-                progressBar.classList.add('bg-gradient-to-r', 'from-indigo-500', 'to-emerald-500');
-            }
-            if (progressPercent < 75) {
-                progressBar.classList.remove('bg-gradient-to-r', 'from-yellow-500', 'to-orange-500');
-                progressBar.classList.add('bg-gradient-to-r', 'from-indigo-500', 'to-emerald-500');
-            }
-            document.getElementById('targetAlert').classList.add('hidden');
-        }
-        
-        // Color based on profit
-        const netColor = d.market.netPnL >= 0 ? 'text-emerald-400' : 'text-rose-500';
-        document.getElementById('netPnL').className = 'text-2xl font-bold ' + netColor;
-        
+        document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
+        document.getElementById('balBar').style.width = d.market.balancePct + '%';
+        document.getElementById('netPnL').innerText = d.market.netPnL.toFixed(5);
+        document.getElementById('netPnL').className = 'text-2xl font-bold ' + (d.market.netPnL >= 0 ? 'text-emerald-400' : 'text-rose-500');
         d.accounts.forEach((a, i) => {
             const pre = i === 0 ? 'l' : 's';
             document.getElementById(pre+'Roi').innerText = a.roi.toFixed(2)+'%';
-            document.getElementById(pre+'Pnl').innerHTML = '$'+a.unrealizedUsdt.toFixed(6);
-            document.getElementById(pre+'Vol').innerHTML = 'VOL: '+a.volume + ' | ' + a.lastAction;
+            document.getElementById(pre+'Pnl').innerText = '$'+a.unrealizedUsdt.toFixed(5);
+            document.getElementById(pre+'Vol').innerText = 'VOL: '+a.volume + ' | ' + a.lastAction;
             document.getElementById(pre+'Roi').className = 'text-3xl font-bold mb-1 ' + (a.roi >= 0 ? 'text-emerald-400' : 'text-rose-500');
-            document.getElementById(pre+'Usdt').innerText = a.unrealizedUsdt.toFixed(6);
         });
-        
-        document.getElementById('netUsdt').innerText = d.market.netPnL.toFixed(6);
-        document.getElementById('netUsdt').className = d.market.netPnL >= 0 ? 'text-emerald-400' : 'text-rose-500';
-        
-        // Update current target display
-        document.getElementById('currentTarget').innerHTML = 'Target: $' + target.toFixed(6);
-        
-    } catch(e) {
-        console.error("Status fetch error:", e);
-    }
+    } catch(e) {}
 }, 1000);
-</script>
-</body></html>`);
+</script></body></html>`);
 });
 
 function startWS() {
@@ -343,4 +230,4 @@ function startWS() {
 
 startWS();
 setInterval(runSlowLogic, 4000);
-app.listen(config.port, '0.0.0.0', () => console.log(`🎯 Bot running - Take profit at ${config.targetProfit} USDT`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Bot running on port ${config.port}`));
