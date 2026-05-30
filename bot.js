@@ -29,10 +29,10 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1, 
     resetTriggerRoi: 1.0,  // TRIGGER: 1% ROI
-    autoClosePct: 150,     // Progress for auto-exit
-    roiThreshold: 1.5,     // ROI for auto-exit
+    autoClosePct: 150,
+    roiThreshold: 1.5,
     pollInterval: 2000,    // Background sync every 2 seconds
-    resetCooldownMs: 2000, // Safety buffer
+    resetCooldownMs: 2500, 
     historySize: 30
 };
 
@@ -97,8 +97,8 @@ async function flashReset(accIdx) {
 
     state.isLocked = true;
     state.lastAction = "⚡ FLASH RESET";
-    
-    // Immediate execution: Close then Reopen
+    console.log(`[TRIGGER] Resetting ${state.direction} due to ROI condition.`);
+
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
         contract_code: config.symbol, volume: state.volume, 
         direction: state.direction === 'buy' ? 'sell' : 'buy', 
@@ -112,7 +112,7 @@ async function flashReset(accIdx) {
     setTimeout(() => { state.isLocked = false; state.lastAction = "Idle"; }, config.resetCooldownMs);
 }
 
-// ==================== WS ENGINE (INSTANT TRIGGER) ====================
+// ==================== WS ENGINE (INSTANT) ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -125,30 +125,18 @@ function startWS() {
                 market.ask = msg.tick.ask[0];
                 market.lastPrice = (market.bid + market.ask) / 2;
                 market.spread = ((market.ask - market.bid) / market.bid) * 100;
-                
-                // Track Price Buffer
                 priceHistory.push(market.lastPrice);
                 if (priceHistory.length > config.historySize) priceHistory.shift();
                 
-                // Real-time Metrics
-                const avg = priceHistory.reduce((a, b) => a + b, 0) / priceHistory.length;
-                market.volatility = Math.sqrt(priceHistory.map(p => Math.pow(p - avg, 2)).reduce((a, b) => a + b, 0) / priceHistory.length);
-                market.atr = Math.max(...priceHistory) - Math.min(...priceHistory);
-
-                // --- INSTANT RESET TRIGGER (NO SPREAD FILTER) ---
-                const l = accountStates[1]; 
-                const s = accountStates[2];
-                
-                // If Long ROI >= 1% -> Reset Short side immediately
-                const liveLongRoi = l.entryPrice > 0 ? ((market.bid - l.entryPrice) / l.entryPrice) * config.leverage * 100 : 0;
-                if (liveLongRoi >= config.resetTriggerRoi && !s.isLocked) {
-                    flashReset(1); // Index 1 is the second account (Short)
+                // Live Logic
+                const l = accountStates[1]; const s = accountStates[2];
+                if (l.entryPrice > 0 && !s.isLocked) {
+                    const liveLongRoi = ((market.bid - l.entryPrice) / l.entryPrice) * config.leverage * 100;
+                    if (liveLongRoi >= config.resetTriggerRoi) flashReset(1); // Reset Short
                 }
-
-                // If Short ROI >= 1% -> Reset Long side immediately
-                const liveShortRoi = s.entryPrice > 0 ? ((s.entryPrice - market.ask) / s.entryPrice) * config.leverage * 100 : 0;
-                if (liveShortRoi >= config.resetTriggerRoi && !l.isLocked) {
-                    flashReset(0); // Index 0 is the first account (Long)
+                if (s.entryPrice > 0 && !l.isLocked) {
+                    const liveShortRoi = ((s.entryPrice - market.ask) / s.entryPrice) * config.leverage * 100;
+                    if (liveShortRoi >= config.resetTriggerRoi) flashReset(0); // Reset Long
                 }
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
@@ -157,7 +145,7 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-// ==================== BACKGROUND LOOP ====================
+// ==================== BACKGROUND LOOP (SAFETY TRIGGER) ====================
 async function backgroundLoop() {
     for (const acc of config.accounts) { await syncAccount(acc, accountStates[acc.accountId]); }
     
@@ -170,11 +158,16 @@ async function backgroundLoop() {
     market.growthPct = totalStartEquity > 0 ? (market.totalNetGain / totalStartEquity) * 100 : 0;
     market.realizedSessPnl = market.totalNetGain - (s1.unrealizedUsdt + s2.unrealizedUsdt);
 
+    // --- SAFETY TRIGGER: Check ROI here too in case WS was quiet ---
+    if (s1.roi >= config.resetTriggerRoi && !s2.isLocked) await flashReset(1);
+    if (s2.roi >= config.resetTriggerRoi && !s1.isLocked) await flashReset(0);
+
+    // Ratio and Metrics
     const winVal = Math.max(Math.abs(s1.unrealizedUsdt), Math.abs(s2.unrealizedUsdt));
     const loseVal = Math.abs(s1.unrealizedUsdt + s2.unrealizedUsdt - winVal);
     market.balancePct = ((winVal / Math.max(loseVal, 0.00000001)) / 1.5) * 100;
 
-    // Refill Safety
+    // Standard Refill
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume === 0 && !state.isLocked && market.status === "Active") {
@@ -187,24 +180,21 @@ async function backgroundLoop() {
     }
 }
 
-async function manualClose() {
+// ==================== UI DASHBOARD ====================
+app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), config }));
+app.post('/api/close', async (req, res) => {
     market.status = "LIQUIDATING";
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume > 0) {
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-                contract_code: config.symbol, volume: state.volume, 
-                direction: state.direction === 'buy' ? 'sell' : 'buy', 
-                offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
+                contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
             });
         }
     }
     setTimeout(() => { market.status = "Active"; }, 5000);
-}
-
-// ==================== DASHBOARD UI ====================
-app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), config }));
-app.post('/api/close', async (req, res) => { await manualClose(); res.json({status: 'ok'}); });
+    res.json({status: 'ok'});
+});
 
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
@@ -224,7 +214,7 @@ app.get('/', (req, res) => {
     <div class="max-w-2xl mx-auto">
         <div class="flex justify-between items-start mb-10">
             <div>
-                <p id="botStatus" class="text-[10px] font-black text-indigo-500 uppercase tracking-widest mb-1">INSTANT FLASH TRIGGER ACTIVE</p>
+                <p id="botStatus" class="text-[10px] font-black text-indigo-500 uppercase tracking-widest mb-1">DUAL-TRIGGER RESET ACTIVE</p>
                 <h1 class="text-4xl font-black text-slate-900 tracking-tighter uppercase leading-none">Ultra-Hedge</h1>
                 <div class="flex gap-4 mt-4 font-black uppercase text-[9px] text-slate-400">
                     <p>Spread: <span id="mSpread">0.00%</span></p>
@@ -243,7 +233,7 @@ app.get('/', (req, res) => {
 
         <div class="card p-10 pt-14 mb-8">
             <div class="flex justify-between items-end mb-4">
-                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Strategy Progress (150% Target)</p>
+                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Progress to 150% Target</p>
                 <p id="balPct" class="text-3xl font-black text-slate-900">0.0%</p>
             </div>
             <div class="relative w-full bg-slate-100 h-3 rounded-full mb-12">
