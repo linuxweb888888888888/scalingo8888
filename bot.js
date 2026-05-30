@@ -29,9 +29,9 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 5, 
     microStep: parseInt(process.env.MICRO_STEP) || 2,   
-    targetRatio: 1.5, 
-    autoClosePct: 150, // Progress bar threshold
-    roiThreshold: 1.5, // Winner ROI threshold
+    targetRatio: 1.5, // 100% on the progress bar
+    autoClosePct: 150, // Progress threshold
+    roiThreshold: 1.5, // ROI threshold
     cooldownMs: 2500,
     pollInterval: 3000
 };
@@ -40,8 +40,8 @@ const config = {
 let market = { 
     status: 'Initializing...', 
     balancePct: 0, 
-    totalNetGain: 0,
-    realizedSessPnl: 0,
+    totalNetGain: 0,    // Real Profit (Inc. Fees)
+    realizedSessPnl: 0, 
     growthPct: 0,       
     initialTotalEquity: 0 
 };
@@ -71,6 +71,7 @@ async function htxRequest(account, method, path, data = {}) {
 }
 
 async function syncAccount(acc, state) {
+    // Position Sync
     const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
     if (posRes?.status === 'ok' && posRes.data) {
         const pos = posRes.data.find(p => p.direction === state.direction);
@@ -80,6 +81,7 @@ async function syncAccount(acc, state) {
             state.unrealizedUsdt = parseFloat(pos.profit);
         } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
     }
+    // Equity Sync (Fees tracking)
     const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
     if (accRes?.status === 'ok' && accRes.data?.[0]) {
         const data = accRes.data[0];
@@ -92,7 +94,7 @@ async function syncAccount(acc, state) {
 async function closeAll() {
     if (market.status === "LIQUIDATING") return;
     market.status = "LIQUIDATING";
-    console.log(`🎯 TARGET REACHED (Progress >= 150% & ROI > 1.5%). Closing all.`);
+    console.log("🎯 ALL CONDITIONS MET: LIQUIDATING AT PROFIT");
     
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
@@ -115,11 +117,11 @@ async function runLogic() {
     const s2 = accountStates[2];
 
     const totalCurrentEquity = s1.currentEquity + s2.currentEquity;
-    const totalStartEquity = s1.initialEquity + s2.initialEquity;
+    const totalStartEquity = (s1.initialEquity || 0) + (s2.initialEquity || 0);
     if (market.initialTotalEquity === 0) market.initialTotalEquity = totalStartEquity;
 
     market.totalNetGain = totalCurrentEquity - totalStartEquity;
-    market.growthPct = (market.totalNetGain / totalStartEquity) * 100;
+    market.growthPct = totalStartEquity > 0 ? (market.totalNetGain / totalStartEquity) * 100 : 0;
     market.realizedSessPnl = market.totalNetGain - (s1.unrealizedUsdt + s2.unrealizedUsdt);
 
     const winner = s1.roi > s2.roi ? s1 : s2;
@@ -132,17 +134,21 @@ async function runLogic() {
     
     market.balancePct = ((winVal / effectiveLoseVal) / config.targetRatio) * 100;
 
-    // ==================== DUAL CONDITION AUTO-CLOSE ====================
-    // 1. Progress Bar (Ratio) must be over 150%
-    // 2. Winner ROI must be over 1.5%
-    if (market.balancePct >= config.autoClosePct && winner.roi > config.roiThreshold && (s1.volume > 0 || s2.volume > 0)) {
+    // ==================== TRIPLE-CHECK AUTO-CLOSE ====================
+    // 1. Progress Bar >= 150%
+    // 2. Winner ROI > 1.5%
+    // 3. Winner $ Gain > Loser $ Loss
+    if (market.balancePct >= config.autoClosePct && 
+        winner.roi > config.roiThreshold && 
+        winVal > loseVal && 
+        (s1.volume > 0 || s2.volume > 0)) {
         await closeAll();
         return;
     }
 
     if (market.status !== "Active" && market.status !== "LIQUIDATING") market.status = "Active";
 
-    // Parity Nudge Logic (Stops when winVal >= loseVal)
+    // Parity Nudge Logic (Stops nudging once winVal >= loseVal)
     if (winner.volume > 0 && loser.volume > 0 && !winner.isLocked && market.status === "Active") {
         if (winVal < loseVal) {
             winner.isLocked = true;
@@ -151,10 +157,12 @@ async function runLogic() {
                 contract_code: config.symbol, volume: config.microStep, direction: winner.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
             });
             setTimeout(() => { winner.isLocked = false; }, config.cooldownMs);
-        } else { winner.lastAction = "Winner Leading"; }
+        } else {
+            winner.lastAction = "Winner Leading";
+        }
     }
 
-    // Re-entry
+    // Re-entry Logic
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume === 0 && !state.isLocked && market.status === "Active") {
@@ -175,7 +183,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>Hedge Ultra Monitor</title>
+    <meta charset="UTF-8"><title>Ultra-Hedge Monitor</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700;900&display=swap" rel="stylesheet">
     <style>
@@ -204,13 +212,13 @@ app.get('/', (req, res) => {
 
         <div class="card p-10 pt-14 mb-8">
             <div class="flex justify-between items-end mb-4">
-                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Progress (Close @ 150% + Winner ROI > 1.5%)</p>
+                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Target: 150% + Winner ROI > 1.5% + Net Profit</p>
                 <p id="balPct" class="text-3xl font-black text-slate-900">0.0%</p>
             </div>
             <div class="relative w-full bg-slate-100 h-4 rounded-full mb-12">
                 <div id="balBar" class="bg-indigo-600 h-full w-0 rounded-full transition-all duration-700 ease-out relative z-0"></div>
                 <div id="targetMarker" class="target-line" style="left: 75%;">
-                    <span id="targetLabel" class="target-label">CLOSE TARGET</span>
+                    <span class="target-label">EXIT TARGET</span>
                 </div>
                 <div style="left: 50%;" class="absolute top-0 bottom-0 border-l border-slate-300 border-dashed"></div>
             </div>
@@ -256,8 +264,7 @@ app.get('/', (req, res) => {
                 const bar = document.getElementById('balBar');
                 bar.style.width = barWidth + '%';
                 
-                const targetMarker = document.getElementById('targetMarker');
-                targetMarker.style.left = (d.config.autoClosePct / 200) * 100 + '%';
+                document.getElementById('targetMarker').style.left = (d.config.autoClosePct / 200) * 100 + '%';
 
                 if(currentPct >= d.config.autoClosePct) bar.className = "bg-rose-500 h-full rounded-full transition-all duration-700";
                 else if(currentPct >= 100) bar.className = "bg-orange-500 h-full rounded-full transition-all duration-700";
