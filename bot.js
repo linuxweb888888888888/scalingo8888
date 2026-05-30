@@ -28,7 +28,8 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1, 
-    resetTriggerRoi: 1.0, 
+    resetTriggerRoi: 2.0,  // NEW TRIGGER: 2%
+    maxSpreadPct: 0.1,     // Entry Filter: 0.1%
     autoClosePct: 150,
     roiThreshold: 1.5,
     pollInterval: 2000,
@@ -36,14 +37,14 @@ const config = {
     historySize: 30
 };
 
-// ==================== SESSION DATA ====================
+// ==================== DATA TRACKING ====================
 let market = { 
     status: 'Active', 
     bid: 0, ask: 0, spread: 0, lastPrice: 0,
     atr: 0, volatility: 0,
     balancePct: 0, totalNetGain: 0, realizedSessPnl: 0, 
     growthPct: 0, initialTotalEquity: 0,
-    resetUsedInCurrentCycle: false // NEW: Track if we already reset once
+    resetUsed: false 
 };
 
 let priceHistory = [];
@@ -92,17 +93,16 @@ async function syncAccount(acc, state) {
 }
 
 async function flashReset(accIdx) {
-    // Check if we already used our one reset for this cycle
-    if (market.resetUsedInCurrentCycle) return;
+    if (market.resetUsed) return; // Only once per cycle
 
     const acc = config.accounts[accIdx];
     const state = accountStates[acc.accountId];
     if (state.isLocked || state.volume === 0) return;
 
     state.isLocked = true;
-    market.resetUsedInCurrentCycle = true; // LOCK THE RESET FOR THIS CYCLE
-    state.lastAction = "⚡ ONE-SHOT RESET";
-    
+    market.resetUsed = true;
+    state.lastAction = "⚡ FLASH RESET";
+
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
         contract_code: config.symbol, volume: state.volume, 
         direction: state.direction === 'buy' ? 'sell' : 'buy', 
@@ -113,10 +113,10 @@ async function flashReset(accIdx) {
         direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
     });
 
-    setTimeout(() => { state.isLocked = false; }, config.resetCooldownMs);
+    setTimeout(() => { state.isLocked = false; state.lastAction = "Idle"; }, config.resetCooldownMs);
 }
 
-// ==================== WS TRIGGER ====================
+// ==================== WS ENGINE ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -132,17 +132,20 @@ function startWS() {
                 
                 priceHistory.push(market.lastPrice);
                 if (priceHistory.length > config.historySize) priceHistory.shift();
+                
+                // Metrics
                 const avg = priceHistory.reduce((a, b) => a + b, 0) / priceHistory.length;
                 market.volatility = Math.sqrt(priceHistory.map(p => Math.pow(p - avg, 2)).reduce((a, b) => a + b, 0) / priceHistory.length);
                 market.atr = Math.max(...priceHistory) - Math.min(...priceHistory);
 
-                // --- ONE-SHOT FLASH TRIGGER ---
-                const l = accountStates[1]; const s = accountStates[2];
-                if (!market.resetUsedInCurrentCycle) {
+                // --- INSTANT 2% RESET TRIGGER ---
+                if (!market.resetUsed) {
+                    const l = accountStates[1]; const s = accountStates[2];
                     const liveLongRoi = l.entryPrice > 0 ? ((market.bid - l.entryPrice) / l.entryPrice) * config.leverage * 100 : 0;
-                    if (liveLongRoi >= config.resetTriggerRoi) flashReset(1);
                     const liveShortRoi = s.entryPrice > 0 ? ((s.entryPrice - market.ask) / s.entryPrice) * config.leverage * 100 : 0;
-                    if (liveShortRoi >= config.resetTriggerRoi) flashReset(0);
+
+                    if (liveLongRoi >= config.resetTriggerRoi && !s.isLocked) flashReset(1);
+                    if (liveShortRoi >= config.resetTriggerRoi && !l.isLocked) flashReset(0);
                 }
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
@@ -151,7 +154,7 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-// ==================== LOOP ====================
+// ==================== BACKGROUND SYNC ====================
 async function backgroundLoop() {
     for (const acc of config.accounts) { await syncAccount(acc, accountStates[acc.accountId]); }
     
@@ -168,56 +171,56 @@ async function backgroundLoop() {
     const loseVal = Math.abs(s1.unrealizedUsdt + s2.unrealizedUsdt - winVal);
     market.balancePct = ((winVal / Math.max(loseVal, 0.00000001)) / 1.5) * 100;
 
-    // AUTO-CLOSE CHECK
+    // AUTO-CLOSE
     if (market.balancePct >= config.autoClosePct && (s1.roi > config.roiThreshold || s2.roi > config.roiThreshold) && winVal > loseVal) {
-        await closeAll();
+        await manualClose();
     }
 
-    // Refill logic
+    // ENTRY / REFILL (Spread Filter Applied here)
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume === 0 && !state.isLocked && market.status === "Active") {
-            state.isLocked = true;
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
-            });
-            setTimeout(() => { state.isLocked = false; }, 3000);
+            if (market.spread < config.maxSpreadPct) {
+                state.isLocked = true;
+                await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                    contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
+                });
+                setTimeout(() => { state.isLocked = false; }, 3000);
+            } else {
+                state.lastAction = "Waiting Spread < 0.1%";
+            }
         }
     }
 }
 
-async function closeAll() {
-    if (market.status === "LIQUIDATING") return;
+async function manualClose() {
     market.status = "LIQUIDATING";
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume > 0) {
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-                contract_code: config.symbol, volume: state.volume, 
-                direction: state.direction === 'buy' ? 'sell' : 'buy', 
-                offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
+                contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
             });
         }
     }
-    market.resetUsedInCurrentCycle = false; // RESET THE ONE-SHOT LOCK FOR THE NEXT TRADE
-    market.status = "CLEARED";
+    market.resetUsed = false; // Prepare for next cycle
     setTimeout(() => { market.status = "Active"; }, 5000);
 }
 
-// ==================== UI DASHBOARD ====================
+// ==================== UI ====================
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), config }));
-app.post('/api/close', async (req, res) => { await closeAll(); res.json({status: 'ok'}); });
+app.post('/api/close', async (req, res) => { await manualClose(); res.json({status: 'ok'}); });
 
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>Ultra-Hedge One-Shot</title>
+    <meta charset="UTF-8"><title>Ultra-Hedge Flash Pro</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700;900&display=swap" rel="stylesheet">
     <style>
         body { background: #f8fafc; color: #0f172a; font-family: 'Roboto', sans-serif; }
-        .card { background: white; border-radius: 32px; border: 1px solid #e2e8f0; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.05); position: relative; overflow: hidden; }
+        .card { background: white; border-radius: 32px; border: 1px solid #e2e8f0; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.05); position: relative; }
         .target-line { position: absolute; top: 0; bottom: 0; width: 2px; background: #ef4444; z-index: 10; }
         .target-label { position: absolute; top: -20px; transform: translateX(-50%); font-size: 9px; font-weight: 900; color: #ef4444; text-transform: uppercase; }
     </style>
@@ -226,9 +229,12 @@ app.get('/', (req, res) => {
     <div class="max-w-2xl mx-auto">
         <div class="flex justify-between items-start mb-10">
             <div>
-                <p id="botStatus" class="text-[10px] font-black text-indigo-500 uppercase tracking-widest mb-1">ONE-SHOT RESET MODE</p>
+                <p id="botStatus" class="text-[10px] font-black text-indigo-500 uppercase tracking-widest mb-1">PRO MODE: 2% TRIGGER</p>
                 <h1 class="text-4xl font-black text-slate-900 tracking-tighter uppercase leading-none">Ultra-Hedge</h1>
-                <p id="resetIndicator" class="text-[9px] font-black mt-2 uppercase text-slate-400 tracking-widest">Reset Availability: Ready</p>
+                <div class="flex gap-4 mt-4 font-black uppercase text-[9px] text-slate-400">
+                    <p>Spread: <span id="mSpread">0.00%</span></p>
+                    <p id="resetStatus" class="text-emerald-500">RESET: READY</p>
+                </div>
             </div>
             <div class="text-right">
                 <div class="flex items-center justify-end gap-2 mb-1">
@@ -278,17 +284,21 @@ app.get('/', (req, res) => {
             try {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('botStatus').innerText = d.market.status;
-                document.getElementById('resetIndicator').innerText = 'Reset Availability: ' + (d.market.resetUsedInCurrentCycle ? 'USED (Cycle Locked)' : 'READY');
-                document.getElementById('resetIndicator').className = d.market.resetUsedInCurrentCycle ? 'text-[9px] font-black mt-2 uppercase text-rose-400 tracking-widest' : 'text-[9px] font-black mt-2 uppercase text-emerald-400 tracking-widest';
+                document.getElementById('mSpread').innerText = d.market.spread.toFixed(3) + '%';
+                document.getElementById('mSpread').className = d.market.spread >= 0.1 ? 'text-rose-500' : 'text-indigo-600';
                 
+                const rs = document.getElementById('resetStatus');
+                rs.innerText = 'RESET: ' + (d.market.resetUsed ? 'USED' : 'READY');
+                rs.className = d.market.resetUsed ? 'text-rose-400' : 'text-emerald-500';
+
                 document.getElementById('growthPct').innerText = (d.market.growthPct >= 0 ? '+' : '') + d.market.growthPct.toFixed(2) + '%';
+                document.getElementById('realizedPnl').innerText = 'Realized Sess: $' + d.market.realizedSessPnl.toFixed(5);
                 document.getElementById('totalNetGain').innerText = (d.market.totalNetGain >= 0 ? '+' : '') + d.market.totalNetGain.toFixed(5);
                 document.getElementById('totalNetGain').className = 'text-4xl font-black leading-none ' + (d.market.totalNetGain >= 0 ? 'text-emerald-500' : 'text-rose-500');
                 
-                const cur = d.market.balancePct;
-                document.getElementById('balPct').innerText = cur.toFixed(1) + '%';
-                document.getElementById('balBar').style.width = Math.min(100, (cur / 200) * 100) + '%';
-                
+                document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
+                document.getElementById('balBar').style.width = Math.min(100, (d.market.balancePct / 200) * 100) + '%';
+
                 d.accounts.forEach((a, i) => {
                     const p = i === 0 ? 'l' : 's';
                     document.getElementById(p+'Roi').innerText = a.roi.toFixed(2)+'%';
@@ -304,4 +314,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Ultra-Hedge One-Shot Active`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Hedge-Flash 2% Active`));
