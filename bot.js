@@ -29,7 +29,7 @@ const config = {
     accounts: apiAccounts,
     takeProfitPct: 1.5,
     stopLossPct: -5.0,
-    orderVolume: 100 
+    orderVolume: 1
 };
 
 // ==================== GLOBAL STATE ====================
