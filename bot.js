@@ -41,7 +41,7 @@ let botState = {
         baseOrder: 1,        
         priceDrop: 0.1,      
         volumeMult: 1.2,     
-        takeProfit: 1.5, // 1.5% target
+        takeProfit: 1, // 1.5% target
         maxSteps: 999        
     },
     estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
