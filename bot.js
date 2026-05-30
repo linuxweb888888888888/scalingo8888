@@ -26,7 +26,7 @@ let botState = {
     startTime: Date.now(),
     currentPrice: 0,
     avgPrice: 0,
-    roi: 0,
+    roi: 0, // This will hold the Exchange's profit_rate
     realizedProfit: 0,
     profitPct: 0,
     walletBalance: 0,
@@ -39,9 +39,9 @@ let botState = {
     profitShibLeveraged: 0, 
     settings: {
         baseOrder: 1,        
-        priceDrop: 0.1,      // 0.1% Drop
-        volumeMult: 1.2,     // 1.2x Multiplier
-        takeProfit: 1,     // 1.5% TP
+        priceDrop: 0.1,      
+        volumeMult: 1.2,     
+        takeProfit: 1.5, // 1.5% target
         maxSteps: 999        
     },
     estimates: { hr: 0, day: 0, week: 0, month: 0, dgr: 0 },
@@ -76,7 +76,6 @@ function calculateMaxPossibleSteps(balance, leverage, baseOrder, multiplier, pri
         let totalValueWithNextStep = (totalContractsAccumulated + nextOrderSize) * price * 1000;
         if (totalValueWithNextStep > buyingPower) break;
         totalContractsAccumulated += nextOrderSize;
-        // CHANGED TO CEIL: Ensures volume actually grows
         nextOrderSize = Math.ceil(nextOrderSize * multiplier);
         steps++;
         if (steps > 500) break; 
@@ -89,7 +88,6 @@ function calculateCurrentStep(totalVol, baseVol, multiplier) {
     let step = 0; let runningTotal = baseVol; let lastOrder = baseVol;
     while (runningTotal < totalVol && step < 100) {
         step++;
-        // CHANGED TO CEIL: Matches buying logic
         lastOrder = Math.ceil(lastOrder * multiplier);
         runningTotal += lastOrder;
         if (Math.abs(runningTotal - totalVol) / totalVol < 0.05) return step;
@@ -101,6 +99,7 @@ function calculateCurrentStep(totalVol, baseVol, multiplier) {
 // ==================== DATA SYNC ====================
 async function syncData() {
     try {
+        // 1. Sync Account/Balance
         const accRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
         if (accRes?.data) {
             const acc = accRes.data.find(a => a.margin_asset === 'USDT');
@@ -125,8 +124,6 @@ async function syncData() {
             if (botState.currentPrice > 0) {
                 botState.profitShibLeveraged = (botState.realizedProfit * 10) / botState.currentPrice;
                 const profitContracts = Math.floor(botState.profitShibLeveraged / 1000);
-                
-                // Base Order = 1 + Profit Units
                 botState.settings.baseOrder = Math.max(1, 1 + profitContracts);
 
                 botState.maxAffordableSteps = calculateMaxPossibleSteps(
@@ -139,12 +136,15 @@ async function syncData() {
             }
         }
 
+        // 2. Sync Position & Direct Exchange ROI
         const posRes = await htxRequest('POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
         const pos = posRes?.data?.find(p => parseFloat(p.volume) > 0 && p.direction === 'buy');
 
         if (pos) {
             botState.avgPrice = parseFloat(pos.cost_hold);
-            botState.roi = parseFloat(pos.profit_rate) * 100;
+            // DIRECT FROM EXCHANGE: profit_rate is the ROI as reported by HTX
+            botState.roi = parseFloat(pos.profit_rate) * 100; 
+            
             botState.openPosition = { volume: parseFloat(pos.volume), direction: pos.direction, costHold: botState.avgPrice };
             botState.safetyOrdersFilled = calculateCurrentStep(botState.openPosition.volume, botState.settings.baseOrder, botState.settings.volumeMult);
             const currentDrop = ((botState.avgPrice - botState.currentPrice) / botState.avgPrice) * 100;
@@ -166,6 +166,8 @@ async function checkTrades() {
     botState.isTrading = true;
     try {
         const hasPos = botState.openPosition.volume > 0;
+        
+        // Uses the direct ROI from the exchange sync
         if (hasPos && botState.roi >= botState.settings.takeProfit) {
             await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: botState.openPosition.volume,
@@ -175,7 +177,6 @@ async function checkTrades() {
         } else if (hasPos) {
             const currentDrop = ((botState.avgPrice - botState.currentPrice) / botState.avgPrice) * 100;
             if (currentDrop >= botState.settings.priceDrop) {
-                // CHANGED TO CEIL: Ensures step size actually grows (1, 2, 3, 4, 6...)
                 const nextVol = Math.max(1, Math.ceil(botState.settings.baseOrder * Math.pow(botState.settings.volumeMult, botState.safetyOrdersFilled + 1)));
                 await htxRequest('POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: nextVol,
@@ -216,7 +217,7 @@ app.get('/', (req, res) => {
             <div>
                 <h1 class="text-3xl font-bold tracking-tight">COMPOUND<span class="gradient-text">_BOT</span></h1>
                 <p class="text-[10px] text-gray-400 uppercase tracking-widest mt-1">${config.symbol} | ${config.leverage}X LEVERAGE</p>
-                <p class="text-[10px] text-emerald-600 font-bold mt-2">🎯 1 CONTRACT START + MATH.CEIL GROWTH</p>
+                <p class="text-[10px] text-emerald-600 font-bold mt-2">🎯 DIRECT EXCHANGE ROI TRACKING</p>
             </div>
             <div class="text-right">
                 <p id="dgrText" class="text-3xl font-bold text-emerald-600">0.00%</p>
@@ -236,7 +237,7 @@ app.get('/', (req, res) => {
                 <p class="text-[10px] font-bold text-gray-400 mt-1 uppercase">Units</p>
             </div>
             <div class="card p-6 rounded-2xl">
-                <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Open ROI</p>
+                <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-2">Open ROI (HTX)</p>
                 <p id="roi" class="text-2xl font-bold stat-number">0.00%</p>
                 <p id="distText" class="text-[10px] font-bold text-orange-500 mt-1">NEXT STEP: 0.100%</p>
             </div>
@@ -264,11 +265,11 @@ app.get('/', (req, res) => {
                 </div>
                 <div>
                     <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Take Profit</p>
-                    <p class="text-xl font-bold text-emerald-600">1.5%</p>
+                    <p class="text-xl font-bold text-emerald-600">${botState.settings.takeProfit}%</p>
                 </div>
                 <div>
                     <p class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Step Multiplier</p>
-                    <p class="text-xl font-bold text-purple-600">1.2x</p>
+                    <p class="text-xl font-bold text-purple-600">${botState.settings.volumeMult}x</p>
                 </div>
             </div>
         </div>
