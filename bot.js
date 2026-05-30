@@ -29,19 +29,28 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 5, 
     microStep: parseInt(process.env.MICRO_STEP) || 2,   
-    targetRatio: 1.5,     // The mathematical goal for the Progress Bar
-    cooldownMs: 2500,     // Frequency of nudges
-    pollInterval: 3000    // Logic loop frequency
+    targetRatio: 1.5,
+    cooldownMs: 2500,
+    pollInterval: 3000
 };
 
-let market = { status: 'Active', balancePct: 0, netPnL: 0 };
-let accountStates = {};
+// ==================== SESSION TRACKING ====================
+let market = { 
+    status: 'Initializing...', 
+    balancePct: 0, 
+    netPnL: 0, 
+    realizedSessPnl: 0, // Realized profit since bot start
+    growthPct: 0,       // % Change in total equity
+    totalInitialEquity: 0 
+};
 
-config.accounts.forEach((account, idx) => {
+let accountStates = {};
+config.accounts.forEach((account) => {
     accountStates[account.accountId] = {
-        direction: idx === 0 ? 'buy' : 'sell',
+        direction: account.accountId === 1 ? 'buy' : 'sell',
         roi: 0, volume: 0, unrealizedUsdt: 0,
-        lastAction: 'Idle', isLocked: false
+        marginBalance: 0, realizedStart: null,
+        lastAction: 'Waiting...', isLocked: false
     };
 });
 
@@ -60,22 +69,37 @@ async function htxRequest(account, method, path, data = {}) {
 }
 
 async function syncAccount(acc, state) {
-    const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
-    if (res?.status === 'ok' && res.data) {
-        const pos = res.data.find(p => p.direction === state.direction);
+    // 1. Sync Positions
+    const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
+    if (posRes?.status === 'ok' && posRes.data) {
+        const pos = posRes.data.find(p => p.direction === state.direction);
         if (pos) {
             state.volume = Math.floor(parseFloat(pos.volume));
             state.roi = parseFloat(pos.profit_rate) * 100;
             state.unrealizedUsdt = parseFloat(pos.profit);
         } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
     }
+
+    // 2. Sync Account Balance/Equity
+    const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
+    if (accRes?.status === 'ok' && accRes.data?.[0]) {
+        const data = accRes.data[0];
+        const currentEquity = parseFloat(data.margin_balance); // Balance + Unrealized
+        const currentRealized = currentEquity - state.unrealizedUsdt; // The "Locked-in" balance
+        
+        state.marginBalance = currentEquity;
+        
+        // Capture starting balance to track Realized PnL since session start
+        if (state.realizedStart === null) {
+            state.realizedStart = currentRealized;
+        }
+        state.sessRealized = currentRealized - state.realizedStart;
+    }
 }
 
 async function closeAll() {
     if (market.status === "LIQUIDATING") return;
     market.status = "LIQUIDATING";
-    console.log("🎯 TARGET REACHED: LIQUIDATING ALL POSITIONS");
-    
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         await syncAccount(acc, state);
@@ -87,39 +111,40 @@ async function closeAll() {
             });
         }
     }
-    market.status = "COMPLETED - RESTARTING";
+    market.status = "TARGET HIT: RESETTING";
     setTimeout(() => { market.status = "Active"; }, 5000);
 }
 
 // ==================== MAIN LOGIC LOOP ====================
 async function runLogic() {
-    // 1. Sync data from exchange
     for (const acc of config.accounts) { await syncAccount(acc, accountStates[acc.accountId]); }
     
-    const s1 = accountStates[config.accounts[0].accountId];
-    const s2 = accountStates[config.accounts[1].accountId];
+    const s1 = accountStates[1];
+    const s2 = accountStates[2];
 
-    // Determine current winner/loser by ROI
+    // Global session PnL and Growth calculations
+    const totalEquity = s1.marginBalance + s2.marginBalance;
+    if (market.totalInitialEquity === 0 && totalEquity > 0) market.totalInitialEquity = totalEquity;
+    
+    market.growthPct = market.totalInitialEquity > 0 ? ((totalEquity / market.totalInitialEquity) - 1) * 100 : 0;
+    market.realizedSessPnl = (s1.sessRealized || 0) + (s2.sessRealized || 0);
+    market.netPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
+
+    // Hedge Ratio Math
     const winner = s1.roi > s2.roi ? s1 : s2;
     const loser = s1.roi > s2.roi ? s2 : s1;
-    const winnerAcc = config.accounts.find(a => a.accountId === (s1.roi > s2.roi ? config.accounts[0].accountId : config.accounts[1].accountId));
+    const winnerAcc = config.accounts.find(a => a.accountId === (s1.roi > s2.roi ? 1 : 2));
 
     const winVal = Math.abs(winner.unrealizedUsdt);
     const loseVal = Math.abs(loser.unrealizedUsdt);
-    market.netPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
-
-    // Calculate Progress towards the 1.5x ratio goal
     const effectiveLoseVal = Math.max(loseVal, 0.00000001); 
     market.balancePct = Math.min(100, ((winVal / effectiveLoseVal) / config.targetRatio) * 100);
 
-    // 2. CHECK FOR 95% AUTO-EXIT
-    if (market.balancePct >= 95 && (s1.volume > 0 || s2.volume > 0)) {
-        await closeAll();
-        return;
-    }
+    // Automations
+    if (market.balancePct >= 95 && (s1.volume > 0 || s2.volume > 0)) { await closeAll(); return; }
+    if (market.status !== "Active") market.status = "Active";
 
-    // 3. PARITY NUDGE LOGIC
-    // Only nudge if Winner PnL < Loser PnL (Winner hasn't covered the loser yet)
+    // Nudge Logic (Parity Nudge)
     if (winner.volume > 0 && loser.volume > 0 && !winner.isLocked && market.status === "Active") {
         if (winVal < loseVal) {
             winner.isLocked = true;
@@ -129,17 +154,14 @@ async function runLogic() {
                 direction: winner.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
             });
             setTimeout(() => { winner.isLocked = false; }, config.cooldownMs);
-        } else {
-            winner.lastAction = "Winner Leading (Nudging Paused)";
-        }
+        } else { winner.lastAction = "Winner Leading"; }
     }
 
-    // 4. RE-ENTRY SAFETY (If a side is empty)
+    // Re-entry Logic
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume === 0 && !state.isLocked && market.status === "Active") {
             state.isLocked = true;
-            state.lastAction = "Re-entry";
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
             });
@@ -172,8 +194,12 @@ app.get('/', (req, res) => {
                 <h1 class="text-4xl font-black text-slate-900 tracking-tighter uppercase">Ultra-Hedge</h1>
             </div>
             <div class="text-right">
-                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Total Net Gain</p>
+                <div class="flex items-center justify-end gap-2 mb-1">
+                    <p id="growthPct" class="text-[10px] font-black px-2 py-0.5 rounded bg-emerald-100 text-emerald-600 uppercase">+0.00%</p>
+                    <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Growth</p>
+                </div>
                 <p id="netPnL" class="text-4xl font-black leading-none">$0.0000</p>
+                <p id="realizedPnl" class="text-xs font-bold text-slate-400 mt-2">Realized: $0.0000</p>
             </div>
         </div>
 
@@ -188,13 +214,13 @@ app.get('/', (req, res) => {
 
             <div class="grid grid-cols-2 gap-10">
                 <div class="border-r border-slate-50">
-                    <p class="text-[10px] font-black text-emerald-500 uppercase tracking-widest mb-2">Long ROI</p>
+                    <p class="text-[10px] font-black text-emerald-500 uppercase tracking-widest mb-2">Long Position</p>
                     <p id="lRoi" class="text-4xl font-black mb-1">0.00%</p>
                     <p id="lPnl" class="text-sm font-bold text-slate-400 mb-6">$0.00</p>
                     <p id="lVol" class="text-[9px] px-3 py-1 bg-slate-100 rounded-full font-black text-slate-500 uppercase"></p>
                 </div>
                 <div class="text-right">
-                    <p class="text-[10px] font-black text-rose-500 uppercase tracking-widest mb-2">Short ROI</p>
+                    <p class="text-[10px] font-black text-rose-500 uppercase tracking-widest mb-2">Short Position</p>
                     <p id="sRoi" class="text-4xl font-black mb-1">0.00%</p>
                     <p id="sPnl" class="text-sm font-bold text-slate-400 mb-6">$0.00</p>
                     <p id="sVol" class="text-[9px] px-3 py-1 bg-slate-100 rounded-full font-black text-slate-500 uppercase"></p>
@@ -205,18 +231,22 @@ app.get('/', (req, res) => {
         <button onclick="triggerClose()" class="w-full py-6 rounded-3xl bg-slate-900 text-white font-black uppercase tracking-[0.3em] hover:bg-rose-600 transition-all shadow-xl active:scale-[0.98]">
             Manual Liquidation
         </button>
-        
-        <p class="text-center mt-8 text-[10px] font-black text-slate-300 uppercase tracking-widest italic">
-            Strategy: Catch-up Nudge • Target Ratio: ${config.targetRatio} • Pair: ${config.symbol}
-        </p>
     </div>
 
     <script>
-        async function triggerClose() { if(confirm("Liquidate all positions?")) fetch('/api/close', {method:'POST'}); }
+        async function triggerClose() { if(confirm("Liquidate all?")) fetch('/api/close', {method:'POST'}); }
         setInterval(async () => {
             try {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('botStatus').innerText = d.market.status;
+                
+                // Realized and Growth updates
+                const growth = document.getElementById('growthPct');
+                growth.innerText = (d.market.growthPct >= 0 ? '+' : '') + d.market.growthPct.toFixed(2) + '%';
+                growth.className = 'text-[10px] font-black px-2 py-0.5 rounded uppercase ' + (d.market.growthPct >= 0 ? 'bg-emerald-100 text-emerald-600' : 'bg-rose-100 text-rose-600');
+                
+                document.getElementById('realizedPnl').innerText = 'Realized Sess PnL: $' + d.market.realizedSessPnl.toFixed(5);
+
                 const net = document.getElementById('netPnL');
                 net.innerText = (d.market.netPnL >= 0 ? '+' : '') + d.market.netPnL.toFixed(5);
                 net.className = 'text-4xl font-black leading-none ' + (d.market.netPnL >= 0 ? 'text-emerald-500' : 'text-rose-500');
@@ -224,14 +254,12 @@ app.get('/', (req, res) => {
                 document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
                 const bar = document.getElementById('balBar');
                 bar.style.width = d.market.balancePct + '%';
-                if(d.market.balancePct > 80) bar.className = "bg-orange-500 h-full w-0 transition-all duration-700";
-                else bar.className = "bg-indigo-600 h-full w-0 transition-all duration-700";
+                bar.className = d.market.balancePct > 80 ? "bg-orange-500 h-full transition-all duration-700" : "bg-indigo-600 h-full transition-all duration-700";
 
                 d.accounts.forEach((a, i) => {
                     const p = i === 0 ? 'l' : 's';
-                    const roiEl = document.getElementById(p+'Roi');
-                    roiEl.innerText = a.roi.toFixed(2)+'%';
-                    roiEl.className = 'text-4xl font-black mb-1 ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
+                    document.getElementById(p+'Roi').innerText = a.roi.toFixed(2)+'%';
+                    document.getElementById(p+'Roi').className = 'text-4xl font-black mb-1 ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
                     document.getElementById(p+'Pnl').innerText = '$'+a.unrealizedUsdt.toFixed(6);
                     document.getElementById(p+'Vol').innerText = a.volume + ' CT | ' + a.lastAction;
                 });
@@ -241,6 +269,5 @@ app.get('/', (req, res) => {
 </body></html>`);
 });
 
-// Initialization
 setInterval(runLogic, config.pollInterval);
 app.listen(config.port, '0.0.0.0', () => console.log(`Monitor running at http://localhost:${config.port}`));
