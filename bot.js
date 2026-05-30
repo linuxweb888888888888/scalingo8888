@@ -26,27 +26,19 @@ const config = {
     port: process.env.PORT || 3000,
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
-    accounts: apiAccounts,
-    spreadThreshold: 0.05,
-    mirrorRoiTakeProfit: 0.08,
-    avgTriggerPct: -1.5,
-    avgVolume: 1,
-    maxVolumePerSide: 50,
-    avgCooldownMs: 10000
+    accounts: apiAccounts
 };
 
 // ==================== GLOBAL STATE ====================
-let market = { last: 0, spreadPct: 0, status: 'connecting...', totalEquity: 0, equityProfit: 0 };
+let market = { last: 0, spreadPct: 0, status: 'Manual Mode Active', totalEquity: 0, equityProfit: 0 };
 let initialTotalEquity = 0;
 let accountStates = {};
-let isProcessing = false;
 
 config.accounts.forEach((account, idx) => {
     accountStates[account.accountId] = {
         direction: idx === 0 ? 'buy' : 'sell',
         avgPrice: 0, roi: 0, volume: 0,
-        unrealizedUsdt: 0, wallet: 0, initialBalance: 0,
-        lastAvgTime: 0
+        unrealizedUsdt: 0, wallet: 0, initialBalance: 0
     };
 });
 
@@ -64,7 +56,7 @@ async function htxRequest(account, method, path, data = {}) {
     } catch (e) { return { status: 'error' }; }
 }
 
-// ==================== CORE LOGIC ====================
+// ==================== CORE SYNC (READ ONLY) ====================
 
 async function restSync() {
     let totalPnl = 0;
@@ -72,6 +64,8 @@ async function restSync() {
 
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
+        
+        // Sync Positions
         const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
         if (res?.status === 'ok' && res.data) {
             const pos = res.data.find(p => p.direction === state.direction);
@@ -82,6 +76,8 @@ async function restSync() {
                 state.unrealizedUsdt = parseFloat(pos.profit);
             } else { state.avgPrice = 0; state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
         }
+
+        // Sync Account Balance
         const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
         if (accRes?.status === 'ok' && accRes.data) {
             state.wallet = parseFloat(accRes.data[0].margin_balance);
@@ -94,48 +90,9 @@ async function restSync() {
     if (initialTotalEquity === 0 && currentTotalWallet > 0) initialTotalEquity = currentTotalWallet;
     market.totalEquity = currentTotalWallet;
     market.equityProfit = initialTotalEquity > 0 ? (currentTotalWallet - initialTotalEquity) : 0;
-    
-    const currentMirrorRoi = currentTotalWallet > 0 ? (totalPnl / currentTotalWallet) * 100 : 0;
-
-    if (currentMirrorRoi >= config.mirrorRoiTakeProfit && !isProcessing && accountStates[config.accounts[0].accountId].volume > 0) {
-        market.status = "TARGET REACHED!";
-        await closeAll();
-        return;
-    }
-
-    const s1 = accountStates[config.accounts[0].accountId];
-    const s2 = accountStates[config.accounts[1].accountId];
-    if (s1.volume === 0 && s2.volume === 0 && !isProcessing) {
-        if (market.spreadPct > 0 && market.spreadPct <= config.spreadThreshold) autoOpen();
-        else market.status = `Wait for Spread < ${config.spreadThreshold}%`;
-    } else if (!isProcessing) {
-        market.status = "Monitoring & Averaging Active";
-        for (const acc of config.accounts) {
-            const state = accountStates[acc.accountId];
-            const now = Date.now();
-            if (state.volume > 0 && state.roi <= config.avgTriggerPct && state.volume < config.maxVolumePerSide && (now - state.lastAvgTime) > config.avgCooldownMs) {
-                state.lastAvgTime = now;
-                smartAverage(acc, state);
-            }
-        }
-    }
 }
 
-async function autoOpen() {
-    isProcessing = true;
-    market.status = "Opening 1:1...";
-    await Promise.all([
-        htxRequest(config.accounts[0], 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: 1, direction: 'buy', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' }),
-        htxRequest(config.accounts[1], 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: 1, direction: 'sell', offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' })
-    ]);
-    setTimeout(() => { isProcessing = false; }, 2000);
-}
-
-async function smartAverage(account, state) {
-    await htxRequest(account, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-        contract_code: config.symbol, volume: config.avgVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
-    });
-}
+// ==================== MANUAL ACTIONS ====================
 
 async function addManual(index) {
     const acc = config.accounts[index];
@@ -145,7 +102,6 @@ async function addManual(index) {
     });
 }
 
-// NEW: REDUCE FUNCTION
 async function reduceManual(index) {
     const acc = config.accounts[index];
     const state = accountStates[acc.accountId];
@@ -158,17 +114,18 @@ async function reduceManual(index) {
 }
 
 async function closeAll() {
-    isProcessing = true;
-    market.status = "Closing All...";
+    market.status = "Manual Liquidation in progress...";
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume > 0) {
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-                contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
+                contract_code: config.symbol, volume: state.volume, 
+                direction: state.direction === 'buy' ? 'sell' : 'buy', 
+                offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
             });
         }
     }
-    setTimeout(() => { isProcessing = false; }, 5000);
+    setTimeout(() => { market.status = "Manual Mode Active"; }, 3000);
 }
 
 // ==================== WS & DASHBOARD ====================
@@ -190,21 +147,21 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), tp: config.mirrorRoiTakeProfit, avg: config.avgTriggerPct }));
+app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates) }));
 app.post('/api/add/:id', async (req, res) => { await addManual(req.params.id); res.json({status: 'ok'}); });
 app.post('/api/reduce/:id', async (req, res) => { await reduceManual(req.params.id); res.json({status: 'ok'}); });
 app.post('/api/close', async (req, res) => { await closeAll(); res.json({status: 'ok'}); });
 
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>ManualSync PRO</title>
+<html lang="en"><head><meta charset="UTF-8"><title>Manual Terminal</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>body{background:#040405;color:#fafafa;font-family:sans-serif;}.glass{background:rgba(255,255,255,0.03);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.05);}</style></head>
 <body class="p-10"><div class="max-w-4xl mx-auto">
     <div class="flex justify-between items-end mb-10">
-        <div><h1 class="text-xl font-bold text-white uppercase tracking-tighter">ManualSync <span class="text-indigo-500">PRO</span></h1><p id="botStatus" class="text-xs text-zinc-500 font-bold uppercase"></p></div>
+        <div><h1 class="text-xl font-bold text-white uppercase tracking-tighter">Manual Terminal <span class="text-indigo-500">PRO</span></h1><p id="botStatus" class="text-xs text-zinc-500 font-bold uppercase"></p></div>
         <div class="flex gap-8 text-right">
-            <div><p class="text-[10px] text-zinc-600 font-bold uppercase text-right">Start Profit</p><p id="equityProfit" class="font-mono text-emerald-400 font-bold">+$0.00</p></div>
+            <div><p class="text-[10px] text-zinc-600 font-bold uppercase text-right">Session Profit</p><p id="equityProfit" class="font-mono text-emerald-400 font-bold">+$0.00</p></div>
             <div><p class="text-[10px] text-zinc-600 font-bold uppercase text-right">Spread</p><p id="spread" class="font-mono text-amber-500">0.00%</p></div>
             <div><p class="text-[10px] text-zinc-600 font-bold uppercase text-right">Price</p><p id="price" class="font-mono text-white">0.00</p></div>
         </div>
@@ -212,11 +169,7 @@ app.get('/', (req, res) => {
     <div class="glass rounded-3xl p-8 mb-6 text-center border-t border-indigo-500/20">
         <p class="text-[10px] text-zinc-500 font-bold uppercase mb-2">Net Mirror PnL</p>
         <h2 id="netPnl" class="text-5xl font-mono font-bold mb-2">$0.00</h2>
-        <div class="flex justify-center gap-6 text-xs font-mono">
-            <p class="text-zinc-400">MIRROR ROI: <span id="mirrorRoi" class="text-indigo-400">0.00%</span></p>
-            <p class="text-zinc-500">TARGET: <span id="tpTarget">0.00%</span></p>
-            <p class="text-zinc-500">AVG: <span id="avgTarget">0.00%</span></p>
-        </div>
+        <p class="text-zinc-400 text-xs font-mono">MIRROR ROI: <span id="mirrorRoi" class="text-indigo-400">0.00%</span></p>
     </div>
     <div class="grid grid-cols-2 gap-4 mb-6">
         <div class="glass rounded-2xl p-6">
@@ -242,20 +195,18 @@ app.get('/', (req, res) => {
             <p id="shortStats" class="text-[10px] text-zinc-500 font-mono italic">Vol: 0 | PnL: $0.00</p>
         </div>
     </div>
-    <button onclick="closeAll()" class="w-full py-4 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl text-xs uppercase tracking-widest transition-all shadow-lg">Emergency Liquidate All</button>
+    <button onclick="closeAll()" class="w-full py-4 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl text-xs uppercase tracking-widest transition-all">Emergency Liquidate All</button>
 </div>
 <script>
 async function add(id){ await fetch('/api/add/'+id,{method:'POST'}); }
 async function reduce(id){ await fetch('/api/reduce/'+id,{method:'POST'}); }
-async function closeAll(){ if(confirm("Liquidate all?")) await fetch('/api/close',{method:'POST'}); }
+async function closeAll(){ if(confirm("Liquidate all positions?")) await fetch('/api/close',{method:'POST'}); }
 setInterval(async () => {
     try {
         const r = await fetch('/api/status'); const d = await r.json();
         document.getElementById('price').innerText = d.market.last.toFixed(8);
         document.getElementById('spread').innerText = d.market.spreadPct.toFixed(3) + '%';
         document.getElementById('botStatus').innerText = d.market.status;
-        document.getElementById('tpTarget').innerText = d.tp.toFixed(3) + '%';
-        document.getElementById('avgTarget').innerText = d.avg.toFixed(2) + '%';
         document.getElementById('equityProfit').innerText = (d.market.equityProfit >= 0 ? '+' : '') + '$' + d.market.equityProfit.toFixed(4);
         
         let tP=0, tW=0;
