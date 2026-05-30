@@ -38,10 +38,10 @@ const config = {
 let market = { 
     status: 'Initializing...', 
     balancePct: 0, 
-    netPnL: 0, 
-    realizedSessPnl: 0, // Realized profit since bot start
-    growthPct: 0,       // % Change in total equity
-    totalInitialEquity: 0 
+    totalNetGain: 0,    // (Current Total Equity - Initial Total Equity) -> Includes Fees
+    realizedSessPnl: 0, // Profit locked in (Fees + Closed trades)
+    growthPct: 0,       
+    initialTotalEquity: 0 
 };
 
 let accountStates = {};
@@ -49,7 +49,7 @@ config.accounts.forEach((account) => {
     accountStates[account.accountId] = {
         direction: account.accountId === 1 ? 'buy' : 'sell',
         roi: 0, volume: 0, unrealizedUsdt: 0,
-        marginBalance: 0, realizedStart: null,
+        currentEquity: 0, initialEquity: null,
         lastAction: 'Waiting...', isLocked: false
     };
 });
@@ -69,7 +69,7 @@ async function htxRequest(account, method, path, data = {}) {
 }
 
 async function syncAccount(acc, state) {
-    // 1. Sync Positions
+    // 1. Sync Position Info
     const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
     if (posRes?.status === 'ok' && posRes.data) {
         const pos = posRes.data.find(p => p.direction === state.direction);
@@ -80,20 +80,16 @@ async function syncAccount(acc, state) {
         } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
     }
 
-    // 2. Sync Account Balance/Equity
+    // 2. Sync Equity (Wallet + Unrealized)
     const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
     if (accRes?.status === 'ok' && accRes.data?.[0]) {
         const data = accRes.data[0];
-        const currentEquity = parseFloat(data.margin_balance); // Balance + Unrealized
-        const currentRealized = currentEquity - state.unrealizedUsdt; // The "Locked-in" balance
+        const equity = parseFloat(data.margin_balance); // Actual current value of account
         
-        state.marginBalance = currentEquity;
-        
-        // Capture starting balance to track Realized PnL since session start
-        if (state.realizedStart === null) {
-            state.realizedStart = currentRealized;
+        if (state.initialEquity === null) {
+            state.initialEquity = equity;
         }
-        state.sessRealized = currentRealized - state.realizedStart;
+        state.currentEquity = equity;
     }
 }
 
@@ -111,7 +107,7 @@ async function closeAll() {
             });
         }
     }
-    market.status = "TARGET HIT: RESETTING";
+    market.status = "CLEARED";
     setTimeout(() => { market.status = "Active"; }, 5000);
 }
 
@@ -122,15 +118,20 @@ async function runLogic() {
     const s1 = accountStates[1];
     const s2 = accountStates[2];
 
-    // Global session PnL and Growth calculations
-    const totalEquity = s1.marginBalance + s2.marginBalance;
-    if (market.totalInitialEquity === 0 && totalEquity > 0) market.totalInitialEquity = totalEquity;
+    // CALCULATE REAL BOTTOM LINE (Current Equity vs Start Equity)
+    const totalCurrentEquity = s1.currentEquity + s2.currentEquity;
+    const totalStartEquity = s1.initialEquity + s2.initialEquity;
     
-    market.growthPct = market.totalInitialEquity > 0 ? ((totalEquity / market.totalInitialEquity) - 1) * 100 : 0;
-    market.realizedSessPnl = (s1.sessRealized || 0) + (s2.sessRealized || 0);
-    market.netPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
+    if (market.initialTotalEquity === 0) market.initialTotalEquity = totalStartEquity;
 
-    // Hedge Ratio Math
+    // Total Net Gain (Floating PnL + Realized PnL - Fees)
+    market.totalNetGain = totalCurrentEquity - totalStartEquity;
+    market.growthPct = (market.totalNetGain / totalStartEquity) * 100;
+    
+    // Realized Session PnL (Total gain minus current unrealized)
+    market.realizedSessPnl = market.totalNetGain - (s1.unrealizedUsdt + s2.unrealizedUsdt);
+
+    // Hedge Logic
     const winner = s1.roi > s2.roi ? s1 : s2;
     const loser = s1.roi > s2.roi ? s2 : s1;
     const winnerAcc = config.accounts.find(a => a.accountId === (s1.roi > s2.roi ? 1 : 2));
@@ -140,24 +141,22 @@ async function runLogic() {
     const effectiveLoseVal = Math.max(loseVal, 0.00000001); 
     market.balancePct = Math.min(100, ((winVal / effectiveLoseVal) / config.targetRatio) * 100);
 
-    // Automations
     if (market.balancePct >= 95 && (s1.volume > 0 || s2.volume > 0)) { await closeAll(); return; }
     if (market.status !== "Active") market.status = "Active";
 
-    // Nudge Logic (Parity Nudge)
+    // Parity Nudge
     if (winner.volume > 0 && loser.volume > 0 && !winner.isLocked && market.status === "Active") {
         if (winVal < loseVal) {
             winner.isLocked = true;
-            winner.lastAction = `Catching Up (+${config.microStep})`;
+            winner.lastAction = `Catching Up`;
             await htxRequest(winnerAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: config.microStep, 
-                direction: winner.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
+                contract_code: config.symbol, volume: config.microStep, direction: winner.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
             });
             setTimeout(() => { winner.isLocked = false; }, config.cooldownMs);
         } else { winner.lastAction = "Winner Leading"; }
     }
 
-    // Re-entry Logic
+    // Re-entry
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume === 0 && !state.isLocked && market.status === "Active") {
@@ -191,15 +190,15 @@ app.get('/', (req, res) => {
         <div class="flex justify-between items-end mb-10">
             <div>
                 <p id="botStatus" class="text-[10px] font-black text-indigo-500 uppercase tracking-widest mb-1">SYSTEM ONLINE</p>
-                <h1 class="text-4xl font-black text-slate-900 tracking-tighter uppercase">Ultra-Hedge</h1>
+                <h1 class="text-4xl font-black text-slate-900 tracking-tighter uppercase leading-none">Ultra-Hedge</h1>
             </div>
             <div class="text-right">
                 <div class="flex items-center justify-end gap-2 mb-1">
-                    <p id="growthPct" class="text-[10px] font-black px-2 py-0.5 rounded bg-emerald-100 text-emerald-600 uppercase">+0.00%</p>
+                    <p id="growthPct" class="text-[10px] font-black px-2 py-0.5 rounded bg-slate-100 text-slate-600 uppercase">0.00%</p>
                     <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Growth</p>
                 </div>
-                <p id="netPnL" class="text-4xl font-black leading-none">$0.0000</p>
-                <p id="realizedPnl" class="text-xs font-bold text-slate-400 mt-2">Realized: $0.0000</p>
+                <p id="totalNetGain" class="text-4xl font-black leading-none text-slate-900">$0.0000</p>
+                <p id="realizedPnl" class="text-[10px] font-black text-slate-400 mt-2 uppercase tracking-widest">Realized (Inc. Fees): $0.0000</p>
             </div>
         </div>
 
@@ -240,16 +239,15 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('botStatus').innerText = d.market.status;
                 
-                // Realized and Growth updates
                 const growth = document.getElementById('growthPct');
                 growth.innerText = (d.market.growthPct >= 0 ? '+' : '') + d.market.growthPct.toFixed(2) + '%';
                 growth.className = 'text-[10px] font-black px-2 py-0.5 rounded uppercase ' + (d.market.growthPct >= 0 ? 'bg-emerald-100 text-emerald-600' : 'bg-rose-100 text-rose-600');
                 
-                document.getElementById('realizedPnl').innerText = 'Realized Sess PnL: $' + d.market.realizedSessPnl.toFixed(5);
+                document.getElementById('realizedPnl').innerText = 'Realized (Inc. Fees): $' + d.market.realizedSessPnl.toFixed(5);
 
-                const net = document.getElementById('netPnL');
-                net.innerText = (d.market.netPnL >= 0 ? '+' : '') + d.market.netPnL.toFixed(5);
-                net.className = 'text-4xl font-black leading-none ' + (d.market.netPnL >= 0 ? 'text-emerald-500' : 'text-rose-500');
+                const mainGain = document.getElementById('totalNetGain');
+                mainGain.innerText = (d.market.totalNetGain >= 0 ? '+' : '') + d.market.totalNetGain.toFixed(5);
+                mainGain.className = 'text-4xl font-black leading-none ' + (d.market.totalNetGain >= 0 ? 'text-emerald-500' : 'text-rose-500');
                 
                 document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
                 const bar = document.getElementById('balBar');
