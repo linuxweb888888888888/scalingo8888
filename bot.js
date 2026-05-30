@@ -29,9 +29,10 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 5, 
     microStep: parseInt(process.env.MICRO_STEP) || 2,   
-    targetRatio: 1.5, // 100% on the progress bar
-    autoClosePct: 150, // Progress threshold
-    roiThreshold: 1.5, // ROI threshold
+    targetRatio: 1.5,
+    autoClosePct: 150,
+    roiThreshold: 1.5,
+    maxSpreadPct: 0.1, // SPREAD FILTER (0.1%)
     cooldownMs: 2500,
     pollInterval: 3000
 };
@@ -39,8 +40,9 @@ const config = {
 // ==================== SESSION TRACKING ====================
 let market = { 
     status: 'Initializing...', 
+    bid: 0, ask: 0, spread: 0, // Market Data
     balancePct: 0, 
-    totalNetGain: 0,    // Real Profit (Inc. Fees)
+    totalNetGain: 0,
     realizedSessPnl: 0, 
     growthPct: 0,       
     initialTotalEquity: 0 
@@ -71,7 +73,6 @@ async function htxRequest(account, method, path, data = {}) {
 }
 
 async function syncAccount(acc, state) {
-    // Position Sync
     const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
     if (posRes?.status === 'ok' && posRes.data) {
         const pos = posRes.data.find(p => p.direction === state.direction);
@@ -81,7 +82,6 @@ async function syncAccount(acc, state) {
             state.unrealizedUsdt = parseFloat(pos.profit);
         } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
     }
-    // Equity Sync (Fees tracking)
     const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
     if (accRes?.status === 'ok' && accRes.data?.[0]) {
         const data = accRes.data[0];
@@ -94,8 +94,6 @@ async function syncAccount(acc, state) {
 async function closeAll() {
     if (market.status === "LIQUIDATING") return;
     market.status = "LIQUIDATING";
-    console.log("🎯 ALL CONDITIONS MET: LIQUIDATING AT PROFIT");
-    
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume > 0) {
@@ -131,46 +129,48 @@ async function runLogic() {
     const winVal = Math.abs(winner.unrealizedUsdt);
     const loseVal = Math.abs(loser.unrealizedUsdt);
     const effectiveLoseVal = Math.max(loseVal, 0.00000001); 
-    
     market.balancePct = ((winVal / effectiveLoseVal) / config.targetRatio) * 100;
 
-    // ==================== TRIPLE-CHECK AUTO-CLOSE ====================
-    // 1. Progress Bar >= 150%
-    // 2. Winner ROI > 1.5%
-    // 3. Winner $ Gain > Loser $ Loss
-    if (market.balancePct >= config.autoClosePct && 
-        winner.roi > config.roiThreshold && 
-        winVal > loseVal && 
-        (s1.volume > 0 || s2.volume > 0)) {
+    // AUTO-CLOSE CHECK (Triple Check)
+    if (market.balancePct >= config.autoClosePct && winner.roi > config.roiThreshold && winVal > loseVal && (s1.volume > 0 || s2.volume > 0)) {
         await closeAll();
         return;
     }
 
     if (market.status !== "Active" && market.status !== "LIQUIDATING") market.status = "Active";
 
-    // Parity Nudge Logic (Stops nudging once winVal >= loseVal)
+    // CHECK SPREAD CONDITION FOR ORDERS
+    const isSpreadOk = market.spread < config.maxSpreadPct;
+
+    // Parity Nudge
     if (winner.volume > 0 && loser.volume > 0 && !winner.isLocked && market.status === "Active") {
         if (winVal < loseVal) {
-            winner.isLocked = true;
-            winner.lastAction = `Catching Up`;
-            await htxRequest(winnerAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: config.microStep, direction: winner.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
-            });
-            setTimeout(() => { winner.isLocked = false; }, config.cooldownMs);
-        } else {
-            winner.lastAction = "Winner Leading";
-        }
+            if (isSpreadOk) {
+                winner.isLocked = true;
+                winner.lastAction = `Catching Up`;
+                await htxRequest(winnerAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                    contract_code: config.symbol, volume: config.microStep, direction: winner.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
+                });
+                setTimeout(() => { winner.isLocked = false; }, config.cooldownMs);
+            } else {
+                winner.lastAction = "Spread High (Paused)";
+            }
+        } else { winner.lastAction = "Winner Leading"; }
     }
 
     // Re-entry Logic
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume === 0 && !state.isLocked && market.status === "Active") {
-            state.isLocked = true;
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
-            });
-            setTimeout(() => { state.isLocked = false; }, 3000);
+            if (isSpreadOk) {
+                state.isLocked = true;
+                await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                    contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
+                });
+                setTimeout(() => { state.isLocked = false; }, 3000);
+            } else {
+                state.lastAction = "Spread High (Paused)";
+            }
         }
     }
 }
@@ -195,10 +195,16 @@ app.get('/', (req, res) => {
 </head>
 <body class="p-4 md:p-10">
     <div class="max-w-2xl mx-auto">
-        <div class="flex justify-between items-end mb-10">
+        <!-- Market Ticker & Header -->
+        <div class="flex justify-between items-start mb-10">
             <div>
                 <p id="botStatus" class="text-[10px] font-black text-indigo-500 uppercase tracking-widest mb-1">SYSTEM ONLINE</p>
                 <h1 class="text-4xl font-black text-slate-900 tracking-tighter uppercase leading-none">Ultra-Hedge</h1>
+                <div class="flex gap-4 mt-4 font-black uppercase text-[10px] text-slate-400">
+                    <p>Bid: <span id="mBid" class="text-slate-900">0.00</span></p>
+                    <p>Ask: <span id="mAsk" class="text-slate-900">0.00</span></p>
+                    <p>Spread: <span id="mSpread" class="text-indigo-600">0.00%</span></p>
+                </div>
             </div>
             <div class="text-right">
                 <div class="flex items-center justify-end gap-2 mb-1">
@@ -212,7 +218,7 @@ app.get('/', (req, res) => {
 
         <div class="card p-10 pt-14 mb-8">
             <div class="flex justify-between items-end mb-4">
-                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Target: 150% + Winner ROI > 1.5% + Net Profit</p>
+                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Exit Target: 150% Ratio | ROI > 1.5%</p>
                 <p id="balPct" class="text-3xl font-black text-slate-900">0.0%</p>
             </div>
             <div class="relative w-full bg-slate-100 h-4 rounded-full mb-12">
@@ -250,9 +256,18 @@ app.get('/', (req, res) => {
             try {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('botStatus').innerText = d.market.status;
+                
+                // Market Data
+                document.getElementById('mBid').innerText = d.market.bid.toFixed(6);
+                document.getElementById('mAsk').innerText = d.market.ask.toFixed(6);
+                const sEl = document.getElementById('mSpread');
+                sEl.innerText = d.market.spread.toFixed(3) + '%';
+                sEl.className = d.market.spread >= 0.1 ? 'text-rose-500' : 'text-indigo-600';
+
                 const growth = document.getElementById('growthPct');
                 growth.innerText = (d.market.growthPct >= 0 ? '+' : '') + d.market.growthPct.toFixed(2) + '%';
                 growth.className = 'text-[10px] font-black px-2 py-0.5 rounded uppercase ' + (d.market.growthPct >= 0 ? 'bg-emerald-100 text-emerald-600' : 'bg-rose-100 text-rose-600');
+                
                 document.getElementById('realizedPnl').innerText = 'Realized Sess (Inc. Fees): $' + d.market.realizedSessPnl.toFixed(5);
                 const mainGain = document.getElementById('totalNetGain');
                 mainGain.innerText = (d.market.totalNetGain >= 0 ? '+' : '') + d.market.totalNetGain.toFixed(5);
@@ -283,5 +298,25 @@ app.get('/', (req, res) => {
 </body></html>`);
 });
 
+// WebSocket for Prices & Spread
+function startWS() {
+    const ws = new WebSocket(config.wsHost);
+    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
+    ws.on('message', (data) => {
+        zlib.gunzip(data, (err, dec) => {
+            if (err) return;
+            const msg = JSON.parse(dec.toString());
+            if (msg.tick) {
+                market.bid = msg.tick.bid[0];
+                market.ask = msg.tick.ask[0];
+                market.spread = ((market.ask - market.bid) / market.bid) * 100;
+            }
+            if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
+        });
+    });
+    ws.on('close', () => setTimeout(startWS, 5000));
+}
+
+startWS();
 setInterval(runLogic, config.pollInterval);
 app.listen(config.port, '0.0.0.0', () => console.log(`Monitor running at http://localhost:${config.port}`));
