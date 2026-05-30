@@ -27,7 +27,7 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    takeProfitPct: 9999,
+    // Removed takeProfitPct as we are using the 95% balance bar logic instead
     baseVolume: 1,
     microStep: 1,        
     targetRatio: 1.5,     
@@ -70,85 +70,91 @@ async function syncAccount(acc, state) {
     }
 }
 
-// IMPROVED CLOSE ALL LOGIC
 async function closeAll() {
-    console.log("⚠️ EMERGENCY LIQUIDATION TRIGGERED");
-    market.status = "LIQUIDATING...";
+    if (market.status.includes("LIQUIDATING")) return; // Prevent double triggers
+
+    console.log("🎯 TARGET REACHED: LIQUIDATING ALL POSITIONS");
+    market.status = "LIQUIDATING (95%)...";
     
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
-        
-        // We sync one last time to be sure we have the volume
         await syncAccount(acc, state);
         
         if (state.volume > 0) {
-            console.log(`Closing Acc ${acc.accountId}: ${state.volume} units`);
             const closeDir = state.direction === 'buy' ? 'sell' : 'buy';
-            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
                 contract_code: config.symbol, 
                 volume: state.volume, 
                 direction: closeDir, 
                 offset: 'close', 
                 lever_rate: config.leverage, 
-                order_price_type: 'optimal_10' 
+                order_price_type: 'optimal_20' // Aggressive fill
             });
-            console.log(`Acc ${acc.accountId} Close Result:`, res.status);
-        } else {
-            console.log(`Acc ${acc.accountId} has no volume to close.`);
         }
     }
-    market.status = "Liquidation Complete";
-    setTimeout(() => { market.status = "Active"; }, 3000);
+    market.status = "Completed. Restarting...";
+    setTimeout(() => { market.status = "Active"; }, 5000);
 }
 
 async function runSlowLogic() {
     for (const acc of config.accounts) { await syncAccount(acc, accountStates[acc.accountId]); }
+    
     const s1 = accountStates[config.accounts[0].accountId];
     const s2 = accountStates[config.accounts[1].accountId];
+    
+    const winVal = Math.max(Math.abs(s1.unrealizedUsdt), Math.abs(s2.unrealizedUsdt));
+    const loseVal = Math.min(Math.abs(s1.unrealizedUsdt), Math.abs(s2.unrealizedUsdt));
+    
+    market.netPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
+
+    // Calculate Progress Bar %
+    if (loseVal < 0.01) {
+        market.balancePct = 0;
+    } else {
+        market.balancePct = Math.min(100, ((winVal / loseVal) / config.targetRatio) * 100);
+    }
+
+    // --- NEW AUTO-CLOSE LOGIC ---
+    // If progress bar reaches 95% and we have active positions, close everything
+    if (market.balancePct >= 95 && (s1.volume > 0 || s2.volume > 0)) {
+        await closeAll();
+        return; // Stop further logic this cycle
+    }
+
+    // Determine Winners/Losers for Nudging
     const winner = s1.roi > s2.roi ? s1 : s2;
     const loser = s1.roi > s2.roi ? s2 : s1;
     const winnerAcc = config.accounts.find(a => a.accountId === (s1.roi > s2.roi ? config.accounts[0].accountId : config.accounts[1].accountId));
-    
-    const winVal = Math.abs(winner.unrealizedUsdt);
-    const loseVal = Math.abs(loser.unrealizedUsdt);
-    market.netPnL = s1.unrealizedUsdt + s2.unrealizedUsdt;
 
-    if (loseVal === 0) market.balancePct = 100;
-    else market.balancePct = Math.min(100, ((winVal / loseVal) / config.targetRatio) * 100);
-
-    if (winner.volume > 0 && loser.volume > 0 && !winner.isLocked && winVal < (loseVal * config.targetRatio)) {
-        winner.isLocked = true;
-        winner.lastAction = `Nudge (+${config.microStep})`;
-        await htxRequest(winnerAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-            contract_code: config.symbol, volume: config.microStep, 
-            direction: winner.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
-        });
-        setTimeout(() => { winner.isLocked = false; }, config.cooldownMs);
+    // Winner Nudge Logic
+    if (winner.volume > 0 && loser.volume > 0 && !winner.isLocked && market.balancePct < 95) {
+        if (winVal < (loseVal * config.targetRatio)) {
+            winner.isLocked = true;
+            winner.lastAction = `Nudge (+${config.microStep})`;
+            await htxRequest(winnerAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: config.microStep, 
+                direction: winner.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
+            });
+            setTimeout(() => { winner.isLocked = false; }, config.cooldownMs);
+        }
     }
 
+    // Re-entry logic if side is empty
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
-        if (state.volume === 0 && !state.isLocked) {
+        if (state.volume === 0 && !state.isLocked && !market.status.includes("LIQUIDATING")) {
             state.isLocked = true;
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
             });
             setTimeout(() => { state.isLocked = false; }, 3000);
         }
-        if (state.roi >= config.takeProfitPct) {
-            console.log("Target ROI hit, auto-closing...");
-            await closeAll();
-        }
     }
 }
 
-// API ENDPOINTS
+// API & UI (unchanged logic, just fetching the updated market object)
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates) }));
-app.post('/api/close', async (req, res) => { 
-    console.log("API: Close request received");
-    await closeAll(); 
-    res.json({status: 'ok'}); 
-});
+app.post('/api/close', async (req, res) => { await closeAll(); res.json({status: 'ok'}); });
 
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
@@ -160,46 +166,31 @@ app.get('/', (req, res) => {
         <div><h1 class="text-lg font-bold uppercase">Micro-Hedge</h1><p id="botStatus" class="text-[9px] text-indigo-500 font-bold uppercase"></p></div>
         <div class="text-right"><p class="text-[10px] text-zinc-600 font-bold uppercase">Net Gain</p><p id="netPnL" class="text-2xl font-bold">$0.0000</p></div>
     </div>
-
     <div class="glass rounded-2xl p-8 mb-6">
-        <div class="flex justify-between text-[10px] mb-2 uppercase font-bold text-zinc-500"><span>Advantage</span><span id="balPct">0%</span></div>
-        <div class="w-full bg-white/5 h-1 rounded-full mb-8"><div id="balBar" class="bg-indigo-500 h-1 rounded-full" style="width:0%"></div></div>
+        <div class="flex justify-between text-[10px] mb-2 uppercase font-bold text-zinc-500"><span>Target Progress (Exit at 95%)</span><span id="balPct">0%</span></div>
+        <div class="w-full bg-white/5 h-1 rounded-full mb-8"><div id="balBar" class="bg-indigo-500 h-1 rounded-full transition-all duration-500" style="width:0%"></div></div>
         <div class="grid grid-cols-2 gap-10">
             <div><p class="text-[10px] text-emerald-500 font-bold mb-2 uppercase">Long</p><p id="lRoi" class="text-3xl font-bold mb-1">0.00%</p><p id="lPnl" class="text-sm text-zinc-500">$0.00</p><p id="lVol" class="text-[9px] text-zinc-600 mt-2"></p></div>
             <div class="text-right"><p class="text-[10px] text-rose-500 font-bold mb-2 uppercase">Short</p><p id="sRoi" class="text-3xl font-bold mb-1">0.00%</p><p id="sPnl" class="text-sm text-zinc-500">$0.00</p><p id="sVol" class="text-[9px] text-zinc-600 mt-2"></p></div>
         </div>
     </div>
-
-    <!-- UPDATED BUTTON LOGIC -->
     <button id="closeBtn" onclick="triggerClose()" class="w-full py-4 bg-rose-900/10 hover:bg-rose-600 text-rose-500 hover:text-white border border-rose-900/30 rounded-xl text-[10px] font-bold uppercase tracking-[0.2em] transition-all">
-        CLOSE ALL & LIQUIDATE
+        MANUAL LIQUIDATE
     </button>
 </div>
 <script>
 async function triggerClose() {
     if(!confirm("Liquidate all positions?")) return;
-    const btn = document.getElementById('closeBtn');
-    btn.innerText = "SENDING COMMAND...";
-    btn.disabled = true;
-    try {
-        const res = await fetch('/api/close', { method: 'POST' });
-        const data = await res.json();
-        console.log("Server responded:", data);
-    } catch(e) {
-        console.error("Fetch error:", e);
-    }
-    setTimeout(() => {
-        btn.innerText = "CLOSE ALL & LIQUIDATE";
-        btn.disabled = false;
-    }, 5000);
+    await fetch('/api/close', { method: 'POST' });
 }
-
 setInterval(async () => {
     try {
         const r = await fetch('/api/status'); const d = await r.json();
         document.getElementById('botStatus').innerText = d.market.status;
         document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
         document.getElementById('balBar').style.width = d.market.balancePct + '%';
+        if(d.market.balancePct >= 90) document.getElementById('balBar').className = "bg-orange-500 h-1 rounded-full transition-all duration-500";
+        else document.getElementById('balBar').className = "bg-indigo-500 h-1 rounded-full transition-all duration-500";
         document.getElementById('netPnL').innerText = d.market.netPnL.toFixed(5);
         document.getElementById('netPnL').className = 'text-2xl font-bold ' + (d.market.netPnL >= 0 ? 'text-emerald-400' : 'text-rose-500');
         d.accounts.forEach((a, i) => {
