@@ -128,7 +128,7 @@ async function flashReset(accIdxToReset) {
     }, config.resetCooldownMs);
 }
 
-// ==================== WS ENGINE (EXACT MATH REFINED) ====================
+// ==================== WS ENGINE (FIXED MATH) ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -141,23 +141,25 @@ function startWS() {
                 market.ask = msg.tick.ask[0];
                 market.spread = ((market.ask - market.bid) / market.bid) * 100;
                 
-                // BOX 2: Reset Penalty
+                // Box 2: Penalty (Spread * Leverage)
                 market.resetPenalty = -(market.spread * config.leverage);
 
                 const s1 = accountStates[1]; 
                 const s2 = accountStates[2];
                 
+                // Calculate Live ROIs
                 const lRoi = s1.entryPrice > 0 ? ((market.bid - s1.entryPrice) / s1.entryPrice) * config.leverage * 100 : 0;
                 const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : 0;
                 
                 const winRoi = Math.max(lRoi, sRoi);
                 const loseRoi = Math.min(lRoi, sRoi);
 
-                // FORMULA: Lose ROI / |Reset Penalty|
+                // Ratio: Lose ROI divided by Penalty magnitude
                 market.currentRatio = Math.abs(market.resetPenalty) > 0.001 ? (loseRoi / Math.abs(market.resetPenalty)) : 0;
                 
-                // FORMULA: (Win ROI if >= 0, else 0) + Reset Penalty
-                market.diffSum = (winRoi >= 0 ? winRoi : 0) + market.resetPenalty;
+                // FIXED SUM: Winner's actual ROI + Reset Penalty
+                // If Winner is 0.55 and Penalty is -1.09, this results in -0.54
+                market.diffSum = winRoi + market.resetPenalty;
 
                 const roiDifference = Math.abs(lRoi - sRoi);
 
@@ -183,7 +185,6 @@ async function backgroundLoop() {
     market.totalNetGain = totalCurrentEquity - market.initialTotalEquity;
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
     
-    // Symmetry tracks progress toward positive ratio target
     market.balancePct = market.currentRatio > 0 ? (market.currentRatio / config.winLossRatio) * 100 : 0;
 
     if (market.balancePct >= config.autoClosePct && (s1.roi > config.roiThreshold || s2.roi > config.roiThreshold)) {
