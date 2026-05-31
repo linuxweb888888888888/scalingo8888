@@ -31,7 +31,7 @@ const config = {
     winLossRatio: 1.5,        // The "Multiplier": Coverage must be 1.5x total losses
     maxStartSpread: 0.1,      
     roiThreshold: 2.0,        // Minimum ROI on winner before considering exit
-    autoClosePct: 110,        // 110% means "Covered all losses plus 10% profit"
+    autoClosePct: 150,        // 110% means "Covered all losses plus 10% profit"
     autoExitRoi: 5.0,         
     pollInterval: 1000,
     resetCooldownMs: 3000,
