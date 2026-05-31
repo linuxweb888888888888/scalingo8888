@@ -32,7 +32,7 @@ const config = {
     maxStartSpread: 0.1,      
     roiThreshold: 5.0,        
     autoClosePct: 150,
-    autoExitRoi: 2.0,         // Exit all if any side hits 3% after a reset
+    autoExitRoi: 3.0,         // Exit all if any side hits 3% after a reset
     pollInterval: 2000,
     resetCooldownMs: 3000,
     resetDiffThreshold: 1.5   
