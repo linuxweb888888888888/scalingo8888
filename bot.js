@@ -28,10 +28,13 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 100, 
-    resetTriggerRoi: 3.0, 
-    maxSpreadPct: 0.1,    // STRICT OPENING FILTER
+    
+    // NEW SYMMETRY LOGIC
+    winLossRatio: 1.5,        // 75/50 ratio (Win must be 1.5x larger than Loss)
+    maxStartLossRoi: 0.50,    // New position must open with better than -0.50% ROI (Spread * Lev)
+    
     autoClosePct: 150,
-    roiThreshold: 6,
+    roiThreshold: 2.0,        // Minimum winning ROI to even consider a reset
     pollInterval: 2000,
     resetCooldownMs: 3000,
     historySize: 30
@@ -90,14 +93,13 @@ async function syncAccount(acc, state) {
 }
 
 function logTrade(side, roi, pnl, type) {
-    // Current total profit at time of closing
     const runningTotal = market.totalNetGain;
     tradeHistory.unshift({ 
         time: new Date().toLocaleTimeString(), 
         side: side.toUpperCase(), 
         roi: roi.toFixed(2) + '%', 
         pnl: pnl.toFixed(5), 
-        total: runningTotal.toFixed(5), // Combined Realized
+        total: runningTotal.toFixed(5), 
         type: type 
     });
     if (tradeHistory.length > 10) tradeHistory.pop();
@@ -115,7 +117,6 @@ async function flashReset(accIdxToReset) {
     
     logTrade(state.direction, state.roi, state.unrealizedUsdt, 'RESET');
 
-    // Resetting ignores spread filter to ensure speed
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
         contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
         offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
@@ -145,8 +146,24 @@ function startWS() {
                     const l = accountStates[1]; const s = accountStates[2];
                     const liveLongRoi = l.entryPrice > 0 ? ((market.bid - l.entryPrice) / l.entryPrice) * config.leverage * 100 : 0;
                     const liveShortRoi = s.entryPrice > 0 ? ((s.entryPrice - market.ask) / s.entryPrice) * config.leverage * 100 : 0;
-                    if (liveLongRoi >= config.resetTriggerRoi) flashReset(1);
-                    if (liveShortRoi >= config.resetTriggerRoi) flashReset(0);
+                    
+                    // Calculation of current "Opening Penalty" (Spread * Leverage)
+                    const instantOpeningLoss = market.spread * config.leverage;
+
+                    // Trigger Logic:
+                    // 1. Winning side must be above minimum threshold
+                    // 2. Win/Loss Ratio must be >= 1.5 (75/50)
+                    // 3. Opening penalty must be less than 0.50% ROI
+                    if (instantOpeningLoss <= config.maxStartLossRoi) {
+                        // If Long is winning
+                        if (liveLongRoi >= config.roiThreshold && liveLongRoi / Math.max(Math.abs(liveShortRoi), 0.1) >= config.winLossRatio) {
+                            flashReset(0);
+                        }
+                        // If Short is winning
+                        else if (liveShortRoi >= config.roiThreshold && liveShortRoi / Math.max(Math.abs(liveLongRoi), 0.1) >= config.winLossRatio) {
+                            flashReset(1);
+                        }
+                    }
                 }
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
@@ -168,11 +185,6 @@ async function backgroundLoop() {
     market.growthPct = totalStartEquity > 0 ? (market.totalNetGain / totalStartEquity) * 100 : 0;
     market.realizedSessPnl = market.totalNetGain - (s1.unrealizedUsdt + s2.unrealizedUsdt);
 
-    if (!market.resetUsed) {
-        if (s1.roi >= config.resetTriggerRoi) await flashReset(1);
-        else if (s2.roi >= config.resetTriggerRoi) await flashReset(0);
-    }
-
     const winVal = Math.max(Math.abs(s1.unrealizedUsdt), Math.abs(s2.unrealizedUsdt));
     const loseVal = Math.abs(s1.unrealizedUsdt + s2.unrealizedUsdt - winVal);
     market.balancePct = ((winVal / Math.max(loseVal, 0.00000001)) / 1.5) * 100;
@@ -181,17 +193,17 @@ async function backgroundLoop() {
         await manualClose('TARGET EXIT');
     }
 
-    // OPENING FILTER: Only refill positions if spread < 0.1%
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume === 0 && !state.isLocked && market.status === "Active") {
-            if (market.spread < config.maxSpreadPct) {
+            // Initial Entry check: Only open if starting ROI is better than -0.50%
+            if ((market.spread * config.leverage) <= config.maxStartLossRoi) {
                 state.isLocked = true;
                 await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
                 });
                 setTimeout(() => { state.isLocked = false; }, 3000);
-            } else { state.lastAction = "Waiting Spread < 0.1%"; }
+            } else { state.lastAction = "Waiting Spread for -0.50% Entry"; }
         }
     }
 }
@@ -233,7 +245,7 @@ app.get('/', (req, res) => {
     <div class="max-w-3xl mx-auto">
         <div class="flex justify-between items-start mb-10">
             <div>
-                <p id="botStatus" class="text-[10px] font-black text-indigo-500 uppercase tracking-widest mb-1">Dual-Trigger Engine Active</p>
+                <p id="botStatus" class="text-[10px] font-black text-indigo-500 uppercase tracking-widest mb-1">Ratio-Hedge Engine Active</p>
                 <h1 class="text-4xl font-black text-slate-900 tracking-tighter uppercase leading-none">Ultra-Hedge</h1>
                 <div class="flex gap-4 mt-4 font-black uppercase text-[9px] text-slate-400">
                     <p>Spread: <span id="mSpread">0.00%</span></p>
@@ -249,7 +261,7 @@ app.get('/', (req, res) => {
 
         <div class="card p-10 pt-14 mb-8 relative overflow-hidden">
             <div class="flex justify-between items-end mb-4">
-                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Progress (150% Target Exit)</p>
+                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Ratio Lock (Target 1.5x)</p>
                 <p id="balPct" class="text-3xl font-black text-slate-900">0.0%</p>
             </div>
             <div class="relative w-full bg-slate-100 h-3 rounded-full mb-12">
@@ -292,7 +304,6 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('botStatus').innerText = d.market.status;
                 document.getElementById('mSpread').innerText = d.market.spread.toFixed(3) + '%';
-                document.getElementById('mSpread').className = d.market.spread >= 0.1 ? 'text-rose-500' : 'text-indigo-600';
                 
                 document.getElementById('resetStatus').innerText = 'RESET: ' + (d.market.resetUsed ? 'USED' : 'READY');
                 document.getElementById('resetStatus').className = d.market.resetUsed ? 'text-rose-400 font-black' : 'text-emerald-500 font-black';
