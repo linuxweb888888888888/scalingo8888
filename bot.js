@@ -105,10 +105,6 @@ function logTrade(side, roi, pnl, type) {
     if (tradeHistory.length > 15) tradeHistory.pop();
 }
 
-/**
- * MODIFIED: LEG-DROP RESET
- * Closes the losing side and lets the winner run alone.
- */
 async function flashReset(accIdxToReset) {
     if (market.status !== 'Active' || market.resetUsed) return;
     const acc = config.accounts[accIdxToReset];
@@ -116,22 +112,21 @@ async function flashReset(accIdxToReset) {
     if (state.isLocked || state.volume === 0) return;
 
     state.isLocked = true;
-    market.resetUsed = true; // Mark as reset so it doesn't try to close the second leg until profit
+    market.resetUsed = true; 
 
-    const feeCost = (state.volume * market.bid * config.takerFeeRate);
-    // Track the actual realized loss of the dropped leg
+    // Calculate Realized Loss for this session (PnL + Fees)
+    const feeCost = (state.volume * (accIdxToReset === 0 ? market.bid : market.ask) * config.takerFeeRate);
     market.sessionResetLoss = Math.abs(state.unrealizedUsdt) + feeCost;
 
     state.lastAction = "💀 LEG DROP";
     logTrade(state.direction, state.roi, state.unrealizedUsdt, 'DROP');
 
-    // Close the losing side only
+    // ONLY CLOSE - DO NOT RE-OPEN
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
         contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
         offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
     });
 
-    // We do NOT open a new position. The backgroundLoop logic will handle the solo winner.
     setTimeout(() => { state.isLocked = false; state.lastAction = "Idle"; }, config.resetCooldownMs);
 }
 
@@ -164,7 +159,7 @@ function startWS() {
                 market.estExitFees = fee1 + fee2;
 
                 const winPnl = Math.max(s1.unrealizedUsdt, s2.unrealizedUsdt);
-                // Total Debt is now the realized loss from the drop + remaining exit fees
+                // Debt is now the realized loss from the drop + remaining fees
                 const totalDebt = market.sessionResetLoss + market.estExitFees;
                 
                 market.currentRatio = totalDebt > 0 ? (winPnl / totalDebt) : 0;
@@ -196,16 +191,15 @@ async function backgroundLoop() {
     market.balancePct = market.currentRatio > 0 ? (market.currentRatio / config.winLossRatio) * 100 : 0;
 
     if (market.status === 'Active') {
-        // Exit strategy: Only exit if Net Session is positive and target reached
+        // Exit strategy: Close winner once session net is positive and target reached
         if (market.balancePct >= config.autoClosePct && market.netSessionUsdt > 0) {
             await manualClose('TARGET EXIT');
             return;
         }
 
-        // Only start a NEW dual-hedge if both sides are empty AND reset is NOT currently active
+        // Only open new hedge if both empty AND we aren't currently in a "Solo Run" (resetUsed)
         if (s1.volume === 0 && s2.volume === 0 && !s1.isLocked && !s2.isLocked && !market.resetUsed) {
             if (market.spread > 0 && market.spread <= config.maxStartSpread) {
-                console.log("Opening New Hedge Session...");
                 for (const acc of config.accounts) {
                     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                         contract_code: config.symbol, volume: config.baseVolume, direction: accountStates[acc.accountId].direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
@@ -229,7 +223,6 @@ async function manualClose(type = 'MANUAL') {
             });
         }
     }
-    // Clean up session variables so backgroundLoop can start a new hedge
     market.resetUsed = false;
     market.sessionResetLoss = 0;
     setTimeout(() => {
@@ -246,7 +239,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>Leg-Drop Hedge Engine</title>
+    <meta charset="UTF-8"><title>Ratio Hedge Engine</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap" rel="stylesheet">
     <style>
@@ -259,8 +252,8 @@ app.get('/', (req, res) => {
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-10">
             <div>
-                <h1 class="text-3xl font-black tracking-tighter uppercase italic">DOGE-Hedge <span class="text-indigo-500">Solo-Runner</span></h1>
-                <p id="botStatus" class="text-[10px] font-bold text-emerald-500 uppercase tracking-widest mt-1">Leg-Drop Mode Active</p>
+                <h1 class="text-3xl font-black tracking-tighter uppercase italic">DOGE-Hedge <span class="text-indigo-500">Pro</span></h1>
+                <p id="botStatus" class="text-[10px] font-bold text-emerald-500 uppercase tracking-widest mt-1">Engine Online</p>
             </div>
             <div class="text-right">
                 <p id="totalNetGain" class="text-3xl font-black text-white">$0.00000</p>
@@ -278,7 +271,7 @@ app.get('/', (req, res) => {
                 <p class="stat-label mb-1">Realized Leg Loss</p>
                 <p id="uiPenalty" class="text-3xl font-black text-rose-400">$0.00</p>
                 <div class="mt-2 pt-2 border-t border-slate-700">
-                   <p class="stat-label text-[9px]">Reset Threshold: ${config.resetDiffThreshold}%</p>
+                   <p class="stat-label text-[9px]">Difference Sum (Trigger: ${config.resetDiffThreshold}%)</p>
                    <p id="uiDiffSum" class="text-lg font-black text-emerald-400">+0.00%</p>
                 </div>
             </div>
@@ -381,4 +374,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Leg-Drop Solo Runner Mode)`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Solo-Runner Mode Enabled)`));
