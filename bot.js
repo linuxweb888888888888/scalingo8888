@@ -27,14 +27,14 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
+    baseVolume: parseInt(process.env.BASE_VOLUME) || 100,
     winLossRatio: 1.5,
     maxStartSpread: 0.15,
     autoClosePct: 110,
     pollInterval: 1000,
-    resetCooldownMs: 5000,
-    resetDiffThreshold: 2.5, 
-    takerFeeRate: 0.0005 // 0.05%
+    resetCooldownMs: 3000,
+    resetDiffThreshold: 2.5,  // TRIGGER: Difference Sum must reach this value
+    takerFeeRate: 0.0005
 };
 
 let market = {
@@ -42,7 +42,7 @@ let market = {
     currentRatio: 0, resetPenalty: 0, diffSum: 0,
     balancePct: 0, totalNetGain: 0, growthPct: 0,
     initialTotalEquity: 0, resetUsed: false,
-    sessionResetLoss: 0, 
+    sessionResetLoss: 0,
     netSessionUsdt: 0,
     estExitFees: 0
 };
@@ -104,41 +104,28 @@ function logTrade(side, roi, pnl, type) {
     if (tradeHistory.length > 15) tradeHistory.pop();
 }
 
-// MODIFIED: Flash Add with STRICTOR Profit Validation
-async function flashAdd(accIdxToReset) {
+async function flashReset(accIdxToReset) {
     if (market.status !== 'Active' || market.resetUsed) return;
-
     const acc = config.accounts[accIdxToReset];
     const state = accountStates[acc.accountId];
-    if (state.isLocked) return;
-
-    // 1. Calculate cost of action (Open Fee + Future Exit Fee)
-    const currentPrice = accIdxToReset === 0 ? market.ask : market.bid;
-    const addFee = (config.baseVolume * currentPrice * config.takerFeeRate);
-    const roundTripCost = addFee * 2; // Entry + eventual Exit
-
-    // 2. ONLY ADD IF THE SESSION REMAINS IN PROFIT AFTER FEES
-    const predictedNet = market.netSessionUsdt - roundTripCost;
-    
-    if (predictedNet <= 0) {
-        state.lastAction = `Profit too low ($${market.netSessionUsdt.toFixed(5)})`;
-        return; 
-    }
+    if (state.isLocked || state.volume === 0) return;
 
     state.isLocked = true;
     market.resetUsed = true; 
 
-    market.sessionResetLoss += addFee; 
-    state.lastAction = "⚡ FLASH ADD";
-    logTrade(state.direction, state.roi, state.unrealizedUsdt, 'VOL-ADD');
+    const feeCost = (state.volume * market.bid * config.takerFeeRate * 2);
+    market.sessionResetLoss += (Math.abs(state.unrealizedUsdt) + feeCost);
+
+    state.lastAction = "⚡ RESET";
+    logTrade(state.direction, state.roi, state.unrealizedUsdt, 'RESET');
 
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-        contract_code: config.symbol, 
-        volume: config.baseVolume, 
-        direction: state.direction, 
-        offset: 'open', 
-        lever_rate: config.leverage, 
-        order_price_type: 'optimal_5' 
+        contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
+        offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
+    });
+    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+        contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, 
+        offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
     });
 
     setTimeout(() => { state.isLocked = false; state.lastAction = "Idle"; }, config.resetCooldownMs);
@@ -166,6 +153,8 @@ function startWS() {
                 const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : s2.roi;
                 
                 const winRoi = Math.max(lRoi, sRoi);
+                
+                // CORE LOGIC: Difference Sum = Winner ROI + (Spread * Leverage)
                 market.diffSum = winRoi + market.resetPenalty;
 
                 const fee1 = s1.volume > 0 ? (s1.volume * market.bid * config.takerFeeRate) : 0;
@@ -178,9 +167,10 @@ function startWS() {
                 market.currentRatio = totalDebt > 0 ? (winPnl / totalDebt) : 0;
                 market.netSessionUsdt = (s1.unrealizedUsdt + s2.unrealizedUsdt) - market.sessionResetLoss - market.estExitFees;
 
+                // RESET TRIGGER: Strictly triggered only when Difference Sum reaches target (e.g. 2.5%)
                 if (market.status === 'Active' && !market.resetUsed) {
                     if (market.diffSum >= config.resetDiffThreshold) {
-                        lRoi < sRoi ? flashAdd(0) : flashAdd(1);
+                        lRoi < sRoi ? flashReset(0) : flashReset(1);
                     }
                 }
             }
@@ -278,11 +268,11 @@ app.get('/', (req, res) => {
                 <p id="uiRatio" class="text-3xl font-black text-white">0.00x</p>
                 <p class="text-[9px] text-slate-500 mt-1">Target: ${config.winLossRatio}x</p>
             </div>
-            <div class="card p-6 border-l-4 border-amber-500">
-                <p class="stat-label mb-1">ROI Penalty If Add</p>
-                <p id="uiPenalty" class="text-3xl font-black text-amber-400">-0.00%</p>
+            <div class="card p-6 border-l-4 border-rose-500">
+                <p class="stat-label mb-1">ROI If Reset Now</p>
+                <p id="uiPenalty" class="text-3xl font-black text-rose-400">-0.00%</p>
                 <div class="mt-2 pt-2 border-t border-slate-700">
-                   <p class="stat-label text-[9px]">Diff Sum (Add Trigger: ${config.resetDiffThreshold}%)</p>
+                   <p class="stat-label text-[9px]">Difference Sum (Trigger: ${config.resetDiffThreshold}%)</p>
                    <p id="uiDiffSum" class="text-lg font-black text-emerald-400">+0.00%</p>
                 </div>
             </div>
@@ -295,10 +285,7 @@ app.get('/', (req, res) => {
 
         <div class="card p-8 mb-8">
             <div class="flex justify-between items-end mb-4">
-                <div class="stat-label flex flex-col">
-                    <span>Recovery Progress (Exit @ ${config.autoClosePct}%)</span>
-                    <span id="netLabel" class="text-indigo-400 font-bold lowercase text-[14px]">Net: $0.00</span>
-                </div>
+                <p class="stat-label">Recovery Progress (Exit @ ${config.autoClosePct}%) <span id="netLabel" class="ml-2 text-indigo-400 font-bold lowercase">Net: $0.00</span></p>
                 <p id="balPct" class="text-2xl font-black text-white">0.0%</p>
             </div>
             <div class="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
@@ -309,13 +296,11 @@ app.get('/', (req, res) => {
                     <p class="stat-label text-emerald-500">Long Position</p>
                     <p id="lRoi" class="text-4xl font-black">0.00%</p>
                     <p id="lPnl" class="text-sm font-bold text-slate-500">$0.00000</p>
-                    <p id="lAction" class="text-[9px] text-indigo-400 font-bold mt-1">Idle</p>
                 </div>
                 <div class="text-right">
                     <p class="stat-label text-rose-500">Short Position</p>
                     <p id="sRoi" class="text-4xl font-black">0.00%</p>
                     <p id="sPnl" class="text-sm font-bold text-slate-500">$0.00000</p>
-                    <p id="sAction" class="text-[9px] text-indigo-400 font-bold mt-1">Idle</p>
                 </div>
             </div>
         </div>
@@ -350,7 +335,7 @@ app.get('/', (req, res) => {
                 
                 document.getElementById('uiRatio').innerText = d.market.currentRatio.toFixed(2) + 'x';
                 document.getElementById('uiPenalty').innerText = d.market.resetPenalty.toFixed(2) + '%';
-                document.getElementById('marketStatus').innerText = (d.market.resetUsed ? 'ADDED VOL' : d.market.status);
+                document.getElementById('marketStatus').innerText = (d.market.resetUsed ? 'RESET USED' : d.market.status);
                 
                 document.getElementById('uiDiffSum').innerText = (d.market.diffSum >= 0 ? '+' : '') + d.market.diffSum.toFixed(2) + '%';
                 document.getElementById('uiDiffSum').className = 'text-lg font-black ' + (d.market.diffSum >= d.config.resetDiffThreshold ? 'text-emerald-400' : 'text-indigo-400');
@@ -360,24 +345,20 @@ app.get('/', (req, res) => {
                 document.getElementById('growthPct').innerText = 'Total Profit: ' + d.market.growthPct.toFixed(2) + '%';
                 document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
                 document.getElementById('balBar').style.width = Math.min(100, d.market.balancePct) + '%';
-                
-                const netElem = document.getElementById('netLabel');
-                netElem.innerText = 'Net: $' + d.market.netSessionUsdt.toFixed(5);
-                netElem.className = (d.market.netSessionUsdt >= 0 ? 'text-emerald-400' : 'text-rose-400') + ' font-bold text-[14px]';
+                document.getElementById('netLabel').innerText = 'Net: $' + d.market.netSessionUsdt.toFixed(5);
 
                 d.accounts.forEach(function(a, i) {
                     const p = i === 0 ? 'l' : 's';
                     document.getElementById(p+'Roi').innerText = a.roi.toFixed(2)+'%';
                     document.getElementById(p+'Roi').className = 'text-4xl font-black ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
                     document.getElementById(p+'Pnl').innerText = (a.unrealizedUsdt >= 0 ? '$' : '-$') + Math.abs(a.unrealizedUsdt).toFixed(5);
-                    document.getElementById(p+'Action').innerText = a.lastAction;
                 });
 
                 let tableHtml = '';
                 d.tradeHistory.forEach(function(h) {
                     tableHtml += '<tr>' +
                         '<td class="p-4 text-slate-400 font-bold">' + h.time + '</td>' +
-                        '<td class="p-4 text-amber-400 font-black italic">' + h.type + '</td>' +
+                        '<td class="p-4 text-indigo-400 font-black italic">' + h.type + '</td>' +
                         '<td class="p-4 font-bold">' + h.side + '</td>' +
                         '<td class="p-4 ' + (parseFloat(h.roi) >= 0 ? 'text-emerald-400' : 'text-rose-400') + ' font-black">' + h.roi + '</td>' +
                         '<td class="p-4 font-bold">$' + h.pnl + '</td>' +
@@ -389,9 +370,10 @@ app.get('/', (req, res) => {
             } catch(e) { console.log(e); }
         }, 1000);
     </script>
+
 </body></html>`);
 });
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Strict Positive-Profit Add Mode)`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Strict Difference Sum Mode)`));
