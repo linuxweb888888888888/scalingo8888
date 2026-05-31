@@ -34,7 +34,7 @@ const config = {
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1, 
     
     winLossRatio: 1.5,
-    maxStartSpread: 0.10, // DOGE spread is tighter than SHIB
+    maxStartSpread: 0.15, // DOGE spread is tighter than SHIB
     autoClosePct: 110,
     pollInterval: 1000,
     resetCooldownMs: 3000,
