@@ -28,7 +28,7 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1, 
-    resetTriggerRoi: 2.0, 
+    resetTriggerRoi: 3.0, 
     maxSpreadPct: 0.1,    // STRICT OPENING FILTER
     autoClosePct: 150,
     roiThreshold: 6,
