@@ -34,32 +34,28 @@ const config = {
     pollInterval: 1000,       
     resetCooldownMs: 3000,
     threshold1: 2.5,          
-    threshold2: 5.0,          // NEXT TRIGGER
+    threshold2: 5.0,          
     maxResets: 2,             
     takerFeeRate: 0.0005      
 };
 
-// ==================== UPDATED INITIAL STATE ====================
+// ==================== UPDATED INITIAL STATE (SYNCED) ====================
 let market = { 
     status: 'Active', bid: 0, ask: 0, spread: 0,
     currentRatio: 0, resetPenalty: 0, diffSum: 0,
     balancePct: 0, totalNetGain: 0, growthPct: 0, 
     initialTotalEquity: 0, 
-    resetCount: 1,            // UPDATED: Already performed 1 reset
-    sessionResetLoss: 0.00195,// UPDATED: Realized loss from previous reset
+    resetCount: 2,            // SYNCED: 2 Resets performed
+    sessionResetLoss: 0.00575,// SYNCED: Total realized debt ($0.00195 + $0.00380)
     netSessionUsdt: 0,         
     estExitFees: 0
 };
 
-// Log the previous reset into history manually so it shows in the UI
-let tradeHistory = [{
-    time: "02:13:35 PM",
-    type: "RESET",
-    side: "BUY",
-    roi: "-3.54%",
-    pnl: "-0.00195",
-    total: "0.00000"
-}]; 
+// Manual history sync for your UI
+let tradeHistory = [
+    { time: "02:28:45 PM", type: "RESET 2", side: "BUY", roi: "-6.91%", pnl: "-0.00380", total: "0.00000" },
+    { time: "02:13:35 PM", type: "RESET 1", side: "BUY", roi: "-3.54%", pnl: "-0.00195", total: "0.00000" }
+]; 
 
 let accountStates = {};
 
@@ -93,9 +89,8 @@ async function syncAccount(acc, state) {
         if (pos) {
             state.volume = Math.floor(parseFloat(pos.volume));
             state.entryPrice = parseFloat(pos.cost_open || pos.last_price);
-            state.roi = parseFloat(pos.profit_rate) * 100;
             state.unrealizedUsdt = parseFloat(pos.profit);
-        } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.entryPrice = 0; }
+        } else { state.volume = 0; state.unrealizedUsdt = 0; state.entryPrice = 0; }
     }
     const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
     if (accRes?.status === 'ok' && accRes.data?.[0]) {
@@ -144,7 +139,7 @@ async function flashReset(accIdxToReset) {
     setTimeout(() => { state.isLocked = false; state.lastAction = "Idle"; }, config.resetCooldownMs);
 }
 
-// ==================== WS ENGINE ====================
+// ==================== WS ENGINE (LIVE ROI) ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -162,10 +157,11 @@ function startWS() {
                 const s2 = accountStates[2];
                 if (!s1 || !s2) return;
                 
-                const lRoi = s1.entryPrice > 0 ? ((market.bid - s1.entryPrice) / s1.entryPrice) * config.leverage * 100 : s1.roi;
-                const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : s2.roi;
+                // LIVE ROI CALCULATIONS (NOT FROM EXCHANGE)
+                s1.roi = s1.entryPrice > 0 ? ((market.bid - s1.entryPrice) / s1.entryPrice) * config.leverage * 100 : 0;
+                s2.roi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : 0;
                 
-                const winRoi = Math.max(lRoi, sRoi);
+                const winRoi = Math.max(s1.roi, s2.roi);
                 market.diffSum = winRoi + market.resetPenalty;
 
                 const fee1 = s1.volume > 0 ? (s1.volume * market.bid * config.takerFeeRate) : 0;
@@ -178,12 +174,11 @@ function startWS() {
                 market.currentRatio = totalDebt > 0 ? (winPnl / totalDebt) : 0;
                 market.netSessionUsdt = (s1.unrealizedUsdt + s2.unrealizedUsdt) - market.sessionResetLoss - market.estExitFees;
 
-                // TRIGGER LOGIC
                 if (market.status === 'Active') {
                     if (market.resetCount === 0 && market.diffSum >= config.threshold1) {
-                        lRoi < sRoi ? flashReset(0) : flashReset(1);
+                        s1.roi < s2.roi ? flashReset(0) : flashReset(1);
                     } else if (market.resetCount === 1 && market.diffSum >= config.threshold2) {
-                        lRoi < sRoi ? flashReset(0) : flashReset(1);
+                        s1.roi < s2.roi ? flashReset(0) : flashReset(1);
                     }
                 }
             }
@@ -388,4 +383,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Synchronized State Mode)`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Synchronized Live ROI Mode)`));
