@@ -29,12 +29,12 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 100, 
     winLossRatio: 1.5,        
-    maxStartSpread: 0.1,      
+    maxStartSpread: 0.15,      
     autoClosePct: 110,        
     pollInterval: 1000,       
     resetCooldownMs: 3000,
-    resetDiffThreshold: 2.5,
-    takerFeeRate: 0.0005      // 0.05% Taker Fee
+    resetDiffThreshold: 2.5,  // TRIGGER: Difference Sum must reach this value
+    takerFeeRate: 0.0005      
 };
 
 let market = { 
@@ -43,8 +43,8 @@ let market = {
     balancePct: 0, totalNetGain: 0, growthPct: 0, 
     initialTotalEquity: 0, resetUsed: false,
     sessionResetLoss: 0,
-    estExitFees: 0,           // ADDED: For fee tracking
-    netSessionUsdt: 0         // ADDED: Real PnL after fees
+    netSessionUsdt: 0,         
+    estExitFees: 0
 };
 
 let tradeHistory = []; 
@@ -113,9 +113,8 @@ async function flashReset(accIdxToReset) {
     state.isLocked = true;
     market.resetUsed = true; 
     
-    // Calculate realized loss + fees for closing and opening (2 trades)
-    const commissionCost = (state.volume * market.bid * config.takerFeeRate * 2);
-    market.sessionResetLoss += (Math.abs(state.unrealizedUsdt) + commissionCost);
+    const feeCost = (state.volume * market.bid * config.takerFeeRate * 2);
+    market.sessionResetLoss += (Math.abs(state.unrealizedUsdt) + feeCost);
     
     state.lastAction = "⚡ RESET";
     logTrade(state.direction, state.roi, state.unrealizedUsdt, 'RESET');
@@ -129,10 +128,7 @@ async function flashReset(accIdxToReset) {
         offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
     });
 
-    setTimeout(() => { 
-        state.isLocked = false; 
-        state.lastAction = "Idle";
-    }, config.resetCooldownMs);
+    setTimeout(() => { state.isLocked = false; state.lastAction = "Idle"; }, config.resetCooldownMs);
 }
 
 // ==================== WS ENGINE ====================
@@ -157,23 +153,23 @@ function startWS() {
                 const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : s2.roi;
                 
                 const winRoi = Math.max(lRoi, sRoi);
+                
+                // CORE LOGIC: Difference Sum = Winner ROI + (Spread * Leverage)
                 market.diffSum = winRoi + market.resetPenalty;
 
-                // FEE ESTIMATION
                 const fee1 = s1.volume > 0 ? (s1.volume * market.bid * config.takerFeeRate) : 0;
                 const fee2 = s2.volume > 0 ? (s2.volume * market.ask * config.takerFeeRate) : 0;
                 market.estExitFees = fee1 + fee2;
 
-                // REAL PNL CALCULATION
                 const winPnl = Math.max(s1.unrealizedUsdt, s2.unrealizedUsdt);
                 const totalDebt = Math.abs(Math.min(s1.unrealizedUsdt, s2.unrealizedUsdt)) + market.sessionResetLoss + market.estExitFees;
                 
                 market.currentRatio = totalDebt > 0 ? (winPnl / totalDebt) : 0;
                 market.netSessionUsdt = (s1.unrealizedUsdt + s2.unrealizedUsdt) - market.sessionResetLoss - market.estExitFees;
 
-                const roiDifference = Math.abs(lRoi - sRoi);
-                if (market.status === 'Active' && !market.resetUsed && market.spread <= config.maxStartSpread) {
-                    if (roiDifference >= config.resetDiffThreshold) {
+                // RESET TRIGGER: Strictly triggered only when Difference Sum reaches target (e.g. 2.5%)
+                if (market.status === 'Active' && !market.resetUsed) {
+                    if (market.diffSum >= config.resetDiffThreshold) {
                         lRoi < sRoi ? flashReset(0) : flashReset(1);
                     }
                 }
@@ -198,21 +194,17 @@ async function backgroundLoop() {
     market.balancePct = market.currentRatio > 0 ? (market.currentRatio / config.winLossRatio) * 100 : 0;
 
     if (market.status === 'Active') {
-        // FEE-AWARE AUTO EXIT: Only if covered debt AND net profit > 0 after fees
         if (market.balancePct >= config.autoClosePct && market.netSessionUsdt > 0) {
             await manualClose('TARGET EXIT');
             return;
         }
 
-        for (const acc of config.accounts) {
-            const state = accountStates[acc.accountId];
-            if (state.volume === 0 && !state.isLocked && s1.volume === 0 && s2.volume === 0) {
-                if (market.spread > 0 && market.spread <= config.maxStartSpread) {
-                    state.isLocked = true;
+        if (s1.volume === 0 && s2.volume === 0 && !s1.isLocked && !s2.isLocked) {
+            if (market.spread > 0 && market.spread <= config.maxStartSpread) {
+                for (const acc of config.accounts) {
                     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                        contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
+                        contract_code: config.symbol, volume: config.baseVolume, direction: accountStates[acc.accountId].direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
                     });
-                    setTimeout(() => { state.isLocked = false; }, 2000);
                 }
             }
         }
@@ -222,10 +214,9 @@ async function backgroundLoop() {
 async function manualClose(type = 'MANUAL') {
     if (market.status === "LIQUIDATING") return; 
     market.status = "LIQUIDATING";
-    config.accounts.forEach(acc => { accountStates[acc.accountId].isLocked = true; });
-
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
+        state.isLocked = true;
         if (state.volume > 0) {
             logTrade(state.direction, state.roi, state.unrealizedUsdt, type);
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
@@ -233,10 +224,8 @@ async function manualClose(type = 'MANUAL') {
             });
         }
     }
-    
     market.resetUsed = false;
     market.sessionResetLoss = 0;
-    
     setTimeout(() => { 
         config.accounts.forEach(acc => { accountStates[acc.accountId].isLocked = false; });
         market.status = "Active"; 
@@ -283,7 +272,7 @@ app.get('/', (req, res) => {
                 <p class="stat-label mb-1">ROI If Reset Now</p>
                 <p id="uiPenalty" class="text-3xl font-black text-rose-400">-0.00%</p>
                 <div class="mt-2 pt-2 border-t border-slate-700">
-                   <p class="stat-label text-[9px]">Difference Sum (Win + Reset ROI)</p>
+                   <p class="stat-label text-[9px]">Difference Sum (Trigger: ${config.resetDiffThreshold}%)</p>
                    <p id="uiDiffSum" class="text-lg font-black text-emerald-400">+0.00%</p>
                 </div>
             </div>
@@ -296,7 +285,7 @@ app.get('/', (req, res) => {
 
         <div class="card p-8 mb-8">
             <div class="flex justify-between items-end mb-4">
-                <p class="stat-label">Recovery Progress (Exit @ ${config.autoClosePct}%)</p>
+                <p class="stat-label">Recovery Progress (Exit @ ${config.autoClosePct}%) <span id="netLabel" class="ml-2 text-indigo-400 font-bold lowercase">Net: $0.00</span></p>
                 <p id="balPct" class="text-2xl font-black text-white">0.0%</p>
             </div>
             <div class="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
@@ -349,13 +338,14 @@ app.get('/', (req, res) => {
                 document.getElementById('marketStatus').innerText = (d.market.resetUsed ? 'RESET USED' : d.market.status);
                 
                 document.getElementById('uiDiffSum').innerText = (d.market.diffSum >= 0 ? '+' : '') + d.market.diffSum.toFixed(2) + '%';
-                document.getElementById('uiDiffSum').className = 'text-lg font-black ' + (d.market.diffSum >= 0 ? 'text-emerald-400' : 'text-rose-400');
+                document.getElementById('uiDiffSum').className = 'text-lg font-black ' + (d.market.diffSum >= d.config.resetDiffThreshold ? 'text-emerald-400' : 'text-indigo-400');
                 
                 document.getElementById('uiSpread').innerText = d.market.spread.toFixed(3) + '%';
                 document.getElementById('totalNetGain').innerText = (d.market.totalNetGain >= 0 ? '$' : '-$') + Math.abs(d.market.totalNetGain).toFixed(5);
                 document.getElementById('growthPct').innerText = 'Total Profit: ' + d.market.growthPct.toFixed(2) + '%';
                 document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
                 document.getElementById('balBar').style.width = Math.min(100, d.market.balancePct) + '%';
+                document.getElementById('netLabel').innerText = 'Net: $' + d.market.netSessionUsdt.toFixed(5);
 
                 d.accounts.forEach(function(a, i) {
                     const p = i === 0 ? 'l' : 's';
@@ -385,4 +375,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Strict Fee-Aware Mode)`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Strict Difference Sum Mode)`));
