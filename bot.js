@@ -34,15 +34,14 @@ const config = {
     autoClosePct: 150,
     pollInterval: 2000,
     resetCooldownMs: 3000,
-    historySize: 30,
     resetDiffThreshold: 1.5   
 };
 
 let market = { 
     status: 'Active', bid: 0, ask: 0, spread: 0,
     currentRatio: 0, resetPenalty: 0, diffSum: 0,
-    balancePct: 0, totalNetGain: 0, realizedSessPnl: 0, 
-    growthPct: 0, initialTotalEquity: 0, resetUsed: false 
+    balancePct: 0, totalNetGain: 0, growthPct: 0, 
+    initialTotalEquity: 0, resetUsed: false 
 };
 
 let tradeHistory = []; 
@@ -129,7 +128,7 @@ async function flashReset(accIdxToReset) {
     }, config.resetCooldownMs);
 }
 
-// ==================== WS ENGINE (FIXED CALCULATIONS) ====================
+// ==================== WS ENGINE (CALCULATION UPDATE) ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -141,27 +140,32 @@ function startWS() {
                 market.bid = msg.tick.bid[0];
                 market.ask = msg.tick.ask[0];
                 market.spread = ((market.ask - market.bid) / market.bid) * 100;
-                market.resetPenalty = (market.spread * config.leverage);
-
-                const l = accountStates[1]; const s = accountStates[2];
-                const liveLongRoi = l.entryPrice > 0 ? ((market.bid - l.entryPrice) / l.entryPrice) * config.leverage * 100 : 0;
-                const liveShortRoi = s.entryPrice > 0 ? ((s.entryPrice - market.ask) / s.entryPrice) * config.leverage * 100 : 0;
                 
-                const winRoi = Math.max(liveLongRoi, liveShortRoi);
-                const loseRoi = Math.min(liveLongRoi, liveShortRoi);
+                // BOX 2: ROI If Reset Now (The spread cost as a negative penalty)
+                market.resetPenalty = -(market.spread * config.leverage);
 
-                // FIXED: Current Ratio (How many times the winner covers the loser)
-                // If loser is -0.18 and winner is 0.00, ratio is 0.
-                market.currentRatio = Math.abs(loseRoi) > 0.001 ? (winRoi / Math.abs(loseRoi)) : winRoi;
+                const s1 = accountStates[1]; 
+                const s2 = accountStates[2];
                 
-                // FIXED: Difference Sum = Winning Side ROI minus the Cost to Reset the Loser
-                market.diffSum = winRoi - market.resetPenalty;
+                if (s1.entryPrice > 0 && s2.entryPrice > 0) {
+                    const lRoi = ((market.bid - s1.entryPrice) / s1.entryPrice) * config.leverage * 100;
+                    const sRoi = ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100;
+                    
+                    const winRoi = Math.max(lRoi, sRoi);
+                    const loseRoi = Math.min(lRoi, sRoi);
 
-                const roiDifference = Math.abs(liveLongRoi - liveShortRoi);
+                    // Win/Loss Ratio Calculation
+                    market.currentRatio = Math.abs(loseRoi) > 0.01 ? (winRoi / Math.abs(loseRoi)) : 0;
+                    
+                    // BOX 3: Difference Sum (Winner ROI + Reset ROI/Penalty)
+                    market.diffSum = winRoi + market.resetPenalty;
 
-                if (!market.resetUsed && market.spread <= config.maxStartSpread) {
-                    if (roiDifference >= config.resetDiffThreshold) {
-                        liveLongRoi < liveShortRoi ? flashReset(0) : flashReset(1);
+                    const roiDifference = Math.abs(lRoi - sRoi);
+
+                    if (!market.resetUsed && market.spread <= config.maxStartSpread) {
+                        if (roiDifference >= config.resetDiffThreshold) {
+                            lRoi < sRoi ? flashReset(0) : flashReset(1);
+                        }
                     }
                 }
             }
@@ -181,8 +185,7 @@ async function backgroundLoop() {
     market.totalNetGain = totalCurrentEquity - market.initialTotalEquity;
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
     
-    // FIXED: System Symmetry logic
-    // Maps currentRatio (e.g. 0.75x) against the target (e.g. 1.5x)
+    // System Symmetry progress
     market.balancePct = market.currentRatio > 0 ? (market.currentRatio / config.winLossRatio) * 100 : 0;
 
     if (market.balancePct >= config.autoClosePct && (s1.roi > config.roiThreshold || s2.roi > config.roiThreshold)) {
@@ -321,11 +324,15 @@ app.get('/', (req, res) => {
                 document.getElementById('uiRatio').innerText = d.market.currentRatio.toFixed(2) + 'x';
                 document.getElementById('uiRatio').className = 'text-3xl font-black ' + (d.market.currentRatio >= 1.5 ? 'text-emerald-400' : 'text-white');
                 
-                document.getElementById('uiPenalty').innerText = '-' + d.market.resetPenalty.toFixed(2) + '%';
+                // Box 2: Penalty (negative)
+                document.getElementById('uiPenalty').innerText = d.market.resetPenalty.toFixed(2) + '%';
+                
+                // Box 3: Winner + Penalty
                 document.getElementById('uiDiffSum').innerText = (d.market.diffSum >= 0 ? '+' : '') + d.market.diffSum.toFixed(2) + '%';
+                document.getElementById('uiDiffSum').className = 'text-lg font-black ' + (d.market.diffSum >= 0 ? 'text-emerald-400' : 'text-rose-400');
                 
                 document.getElementById('uiSpread').innerText = d.market.spread.toFixed(3) + '%';
-                document.getElementById('totalNetGain').innerText = '$' + d.market.totalNetGain.toFixed(5);
+                document.getElementById('totalNetGain').innerText = (d.market.totalNetGain >= 0 ? '$' : '-$') + Math.abs(d.market.totalNetGain).toFixed(5);
                 document.getElementById('growthPct').innerText = 'Total Profit: ' + d.market.growthPct.toFixed(2) + '%';
                 
                 document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
@@ -335,7 +342,7 @@ app.get('/', (req, res) => {
                     const p = i === 0 ? 'l' : 's';
                     document.getElementById(p+'Roi').innerText = a.roi.toFixed(2)+'%';
                     document.getElementById(p+'Roi').className = 'text-4xl font-black ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
-                    document.getElementById(p+'Pnl').innerText = '$'+a.unrealizedUsdt.toFixed(5);
+                    document.getElementById(p+'Pnl').innerText = (a.unrealizedUsdt >= 0 ? '$' : '-$') + Math.abs(a.unrealizedUsdt).toFixed(5);
                 });
 
                 document.getElementById('historyBody').innerHTML = d.tradeHistory.map(h => \`
