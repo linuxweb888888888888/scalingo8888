@@ -28,12 +28,9 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 100, 
-    
-    // SYMMETRY & TRIGGER LOGIC
-    winLossRatio: 1.5,        // The 75/50 Ratio requirement
-    maxStartLossRoi: 0.50,    // New pos must open with ROI better than -0.50%
-    roiThreshold: 2.0,        // Minimum winning ROI to consider a reset
-    
+    winLossRatio: 1.5,        
+    maxStartLossRoi: 0.50,    
+    roiThreshold: 2.0,        
     autoClosePct: 150,
     pollInterval: 2000,
     resetCooldownMs: 3000,
@@ -43,7 +40,7 @@ const config = {
 // ==================== DATA TRACKING ====================
 let market = { 
     status: 'Active', bid: 0, ask: 0, spread: 0,
-    currentRatio: 0, resetPenalty: 0,
+    currentRatio: 0, resetPenalty: 0, diffSum: 0,
     balancePct: 0, totalNetGain: 0, realizedSessPnl: 0, 
     growthPct: 0, initialTotalEquity: 0, resetUsed: false 
 };
@@ -117,7 +114,6 @@ async function flashReset(accIdxToReset) {
     
     logTrade(state.direction, state.roi, state.unrealizedUsdt, 'RESET');
 
-    // Close winning side and re-open
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
         contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
         offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
@@ -144,20 +140,20 @@ function startWS() {
                 market.spread = ((market.ask - market.bid) / market.bid) * 100;
                 market.resetPenalty = (market.spread * config.leverage);
 
-                if (!market.resetUsed) {
-                    const l = accountStates[1]; const s = accountStates[2];
-                    const liveLongRoi = l.entryPrice > 0 ? ((market.bid - l.entryPrice) / l.entryPrice) * config.leverage * 100 : 0;
-                    const liveShortRoi = s.entryPrice > 0 ? ((s.entryPrice - market.ask) / s.entryPrice) * config.leverage * 100 : 0;
-                    
-                    const winRoi = Math.max(liveLongRoi, liveShortRoi);
-                    const loseRoi = Math.abs(Math.min(liveLongRoi, liveShortRoi));
-                    market.currentRatio = loseRoi > 0 ? (winRoi / loseRoi) : 0;
+                const l = accountStates[1]; const s = accountStates[2];
+                const liveLongRoi = l.entryPrice > 0 ? ((market.bid - l.entryPrice) / l.entryPrice) * config.leverage * 100 : 0;
+                const liveShortRoi = s.entryPrice > 0 ? ((s.entryPrice - market.ask) / s.entryPrice) * config.leverage * 100 : 0;
+                
+                const winRoi = Math.max(liveLongRoi, liveShortRoi);
+                const loseRoi = Math.abs(Math.min(liveLongRoi, liveShortRoi));
+                market.currentRatio = loseRoi > 0 ? (winRoi / loseRoi) : 0;
 
-                    // TRIGGER: Only if Opening Penalty is within limits AND Ratio is met
-                    if (market.resetPenalty <= config.maxStartLossRoi) {
-                        if (winRoi >= config.roiThreshold && market.currentRatio >= config.winLossRatio) {
-                            liveLongRoi > liveShortRoi ? flashReset(0) : flashReset(1);
-                        }
+                // LOGIC: SUM OF WINNING ROI AND RESET ROI (RESET ROI IS NEGATIVE)
+                market.diffSum = winRoi - market.resetPenalty;
+
+                if (!market.resetUsed && market.resetPenalty <= config.maxStartLossRoi) {
+                    if (winRoi >= config.roiThreshold && market.currentRatio >= config.winLossRatio) {
+                        liveLongRoi > liveShortRoi ? flashReset(0) : flashReset(1);
                     }
                 }
             }
@@ -170,12 +166,10 @@ function startWS() {
 // ==================== MAIN LOOP ====================
 async function backgroundLoop() {
     for (const acc of config.accounts) { await syncAccount(acc, accountStates[acc.accountId]); }
-    
     const s1 = accountStates[1]; const s2 = accountStates[2];
     const totalCurrentEquity = s1.currentEquity + s2.currentEquity;
     const totalStartEquity = (s1.initialEquity || 0) + (s2.initialEquity || 0);
     if (market.initialTotalEquity === 0 && totalStartEquity > 0) market.initialTotalEquity = totalStartEquity;
-    
     market.totalNetGain = totalCurrentEquity - totalStartEquity;
     market.growthPct = totalStartEquity > 0 ? (market.totalNetGain / totalStartEquity) * 100 : 0;
     market.realizedSessPnl = market.totalNetGain - (s1.unrealizedUsdt + s2.unrealizedUsdt);
@@ -188,7 +182,6 @@ async function backgroundLoop() {
         await manualClose('TARGET EXIT');
     }
 
-    // FILL LOGIC
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume === 0 && !state.isLocked && market.status === "Active") {
@@ -226,7 +219,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>Ultra-Hedge Flash Ratio</title>
+    <meta charset="UTF-8"><title>Ratio Hedge Engine</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap" rel="stylesheet">
     <style>
@@ -248,7 +241,6 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- SIGNAL CARDS -->
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
             <div class="card p-6 border-l-4 border-indigo-500">
                 <p class="stat-label mb-1">Win/Loss Ratio</p>
@@ -258,7 +250,10 @@ app.get('/', (req, res) => {
             <div class="card p-6 border-l-4 border-rose-500">
                 <p class="stat-label mb-1">ROI If Reset Now</p>
                 <p id="uiPenalty" class="text-3xl font-black text-rose-400">-0.00%</p>
-                <p class="text-[9px] text-slate-500 mt-1">Penalty Cap: -${config.maxStartLossRoi}%</p>
+                <div class="mt-2 pt-2 border-t border-slate-700">
+                   <p class="stat-label text-[9px]">Difference Sum (Win + Reset ROI)</p>
+                   <p id="uiDiffSum" class="text-lg font-black text-emerald-400">+0.00%</p>
+                </div>
             </div>
             <div class="card p-6 border-l-4 border-slate-500">
                 <p class="stat-label mb-1">Market Spread</p>
@@ -316,20 +311,16 @@ app.get('/', (req, res) => {
             try {
                 const r = await fetch('/api/status'); const d = await r.json();
                 
-                // Signal Cards
                 document.getElementById('uiRatio').innerText = d.market.currentRatio.toFixed(2) + 'x';
                 document.getElementById('uiRatio').className = 'text-3xl font-black ' + (d.market.currentRatio >= 1.5 ? 'text-emerald-400' : 'text-white');
                 
                 document.getElementById('uiPenalty').innerText = '-' + d.market.resetPenalty.toFixed(2) + '%';
-                document.getElementById('uiPenalty').className = 'text-3xl font-black ' + (d.market.resetPenalty <= 0.5 ? 'text-emerald-400' : 'text-rose-400');
+                document.getElementById('uiDiffSum').innerText = (d.market.diffSum >= 0 ? '+' : '') + d.market.diffSum.toFixed(2) + '%';
                 
                 document.getElementById('uiSpread').innerText = d.market.spread.toFixed(3) + '%';
-                
-                // Header Stats
                 document.getElementById('totalNetGain').innerText = '$' + d.market.totalNetGain.toFixed(5);
                 document.getElementById('growthPct').innerText = 'Total Profit: ' + d.market.growthPct.toFixed(2) + '%';
                 
-                // Position Stats
                 document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
                 document.getElementById('balBar').style.width = Math.min(100, (d.market.balancePct / 150) * 100) + '%';
 
@@ -357,4 +348,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online: Ratio Hedge Pro`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online`));
