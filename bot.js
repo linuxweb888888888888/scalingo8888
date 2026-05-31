@@ -32,7 +32,7 @@ const config = {
     maxStartSpread: 0.1,      
     roiThreshold: 5.0,        
     autoClosePct: 150,
-    autoExitRoi: 3.0,         // <--- NEW: Close all if any side hits this % after reset
+    autoExitRoi: 3.0,         // Exit all if any side hits 3% after a reset
     pollInterval: 2000,
     resetCooldownMs: 3000,
     resetDiffThreshold: 1.5   
@@ -181,7 +181,7 @@ async function backgroundLoop() {
     
     market.balancePct = market.currentRatio > 0 ? (market.currentRatio / config.winLossRatio) * 100 : 0;
 
-    // --- EXIT CONDITION AFTER RESET ---
+    // --- NEW EXIT CONDITION AFTER RESET ---
     if (market.resetUsed) {
         if (s1.roi >= config.autoExitRoi || s2.roi >= config.autoExitRoi) {
             await manualClose('AUTO EXIT');
@@ -319,7 +319,9 @@ app.get('/', (req, res) => {
         async function triggerClose() { if(confirm("Liquidate all?")) fetch('/api/close', {method:'POST'}); }
         setInterval(async () => {
             try {
-                const r = await fetch('/api/status'); const d = await r.json();
+                const r = await fetch('/api/status'); 
+                const d = await r.json();
+                
                 document.getElementById('uiRatio').innerText = d.market.currentRatio.toFixed(2) + 'x';
                 document.getElementById('uiPenalty').innerText = d.market.resetPenalty.toFixed(2) + '%';
                 document.getElementById('uiDiffSum').innerText = (d.market.diffSum >= 0 ? '+' : '') + d.market.diffSum.toFixed(2) + '%';
@@ -329,22 +331,28 @@ app.get('/', (req, res) => {
                 document.getElementById('growthPct').innerText = 'Total Profit: ' + d.market.growthPct.toFixed(2) + '%';
                 document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
                 document.getElementById('balBar').style.width = Math.min(100, d.market.balancePct) + '%';
-                d.accounts.forEach((a, i) => {
+
+                d.accounts.forEach(function(a, i) {
                     const p = i === 0 ? 'l' : 's';
                     document.getElementById(p+'Roi').innerText = a.roi.toFixed(2)+'%';
                     document.getElementById(p+'Roi').className = 'text-4xl font-black ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
                     document.getElementById(p+'Pnl').innerText = (a.unrealizedUsdt >= 0 ? '$' : '-$') + Math.abs(a.unrealizedUsdt).toFixed(5);
                 });
-                document.getElementById('historyBody').innerHTML = d.tradeHistory.map(h => `
-                    <tr>
-                        <td class="p-4 text-slate-400 font-bold">${h.time}</td>
-                        <td class="p-4 text-indigo-400 font-black italic">${h.type}</td>
-                        <td class="p-4 font-bold">${h.side}</td>
-                        <td class="p-4 ${parseFloat(h.roi) >= 0 ? 'text-emerald-400' : 'text-rose-400'} font-black">${h.roi}</td>
-                        <td class="p-4 font-bold">$${h.pnl}</td>
-                        <td class="p-4 font-black text-white">$${h.total}</td>
-                    </tr>`).join('');
-            } catch(e) {}
+
+                let tableHtml = '';
+                d.tradeHistory.forEach(function(h) {
+                    tableHtml += '<tr>' +
+                        '<td class="p-4 text-slate-400 font-bold">' + h.time + '</td>' +
+                        '<td class="p-4 text-indigo-400 font-black italic">' + h.type + '</td>' +
+                        '<td class="p-4 font-bold">' + h.side + '</td>' +
+                        '<td class="p-4 ' + (parseFloat(h.roi) >= 0 ? 'text-emerald-400' : 'text-rose-400') + ' font-black">' + h.roi + '</td>' +
+                        '<td class="p-4 font-bold">$' + h.pnl + '</td>' +
+                        '<td class="p-4 font-black text-white">$' + h.total + '</td>' +
+                        '</tr>';
+                });
+                document.getElementById('historyBody').innerHTML = tableHtml;
+
+            } catch(e) { console.log(e); }
         }, 1000);
     </script>
 </body></html>`);
