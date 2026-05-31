@@ -34,7 +34,7 @@ const config = {
     autoClosePct: 110,        
     pollInterval: 1000,       
     resetCooldownMs: 3000,
-    resetDiffThreshold: 2.0   // UPDATED: Trigger reset at 2% difference
+    resetDiffThreshold: 2.5   // UPDATED: Trigger reset at 2% difference
 };
 
 let market = { 
