@@ -29,12 +29,12 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 100, 
     
-    // NEW SYMMETRY LOGIC
-    winLossRatio: 1.5,        // 75/50 ratio (Win must be 1.5x larger than Loss)
-    maxStartLossRoi: 0.50,    // New position must open with better than -0.50% ROI (Spread * Lev)
+    // SYMMETRY & TRIGGER LOGIC
+    winLossRatio: 1.5,        // The 75/50 Ratio requirement
+    maxStartLossRoi: 0.50,    // New pos must open with ROI better than -0.50%
+    roiThreshold: 2.0,        // Minimum winning ROI to consider a reset
     
     autoClosePct: 150,
-    roiThreshold: 2.0,        // Minimum winning ROI to even consider a reset
     pollInterval: 2000,
     resetCooldownMs: 3000,
     historySize: 30
@@ -42,7 +42,8 @@ const config = {
 
 // ==================== DATA TRACKING ====================
 let market = { 
-    status: 'Active', bid: 0, ask: 0, spread: 0, lastPrice: 0,
+    status: 'Active', bid: 0, ask: 0, spread: 0,
+    currentRatio: 0, resetPenalty: 0,
     balancePct: 0, totalNetGain: 0, realizedSessPnl: 0, 
     growthPct: 0, initialTotalEquity: 0, resetUsed: false 
 };
@@ -93,16 +94,15 @@ async function syncAccount(acc, state) {
 }
 
 function logTrade(side, roi, pnl, type) {
-    const runningTotal = market.totalNetGain;
     tradeHistory.unshift({ 
         time: new Date().toLocaleTimeString(), 
         side: side.toUpperCase(), 
         roi: roi.toFixed(2) + '%', 
         pnl: pnl.toFixed(5), 
-        total: runningTotal.toFixed(5), 
+        total: market.totalNetGain.toFixed(5), 
         type: type 
     });
-    if (tradeHistory.length > 10) tradeHistory.pop();
+    if (tradeHistory.length > 15) tradeHistory.pop();
 }
 
 async function flashReset(accIdxToReset) {
@@ -117,6 +117,7 @@ async function flashReset(accIdxToReset) {
     
     logTrade(state.direction, state.roi, state.unrealizedUsdt, 'RESET');
 
+    // Close winning side and re-open
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
         contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
         offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
@@ -141,27 +142,21 @@ function startWS() {
                 market.bid = msg.tick.bid[0];
                 market.ask = msg.tick.ask[0];
                 market.spread = ((market.ask - market.bid) / market.bid) * 100;
-                
+                market.resetPenalty = (market.spread * config.leverage);
+
                 if (!market.resetUsed) {
                     const l = accountStates[1]; const s = accountStates[2];
                     const liveLongRoi = l.entryPrice > 0 ? ((market.bid - l.entryPrice) / l.entryPrice) * config.leverage * 100 : 0;
                     const liveShortRoi = s.entryPrice > 0 ? ((s.entryPrice - market.ask) / s.entryPrice) * config.leverage * 100 : 0;
                     
-                    // Calculation of current "Opening Penalty" (Spread * Leverage)
-                    const instantOpeningLoss = market.spread * config.leverage;
+                    const winRoi = Math.max(liveLongRoi, liveShortRoi);
+                    const loseRoi = Math.abs(Math.min(liveLongRoi, liveShortRoi));
+                    market.currentRatio = loseRoi > 0 ? (winRoi / loseRoi) : 0;
 
-                    // Trigger Logic:
-                    // 1. Winning side must be above minimum threshold
-                    // 2. Win/Loss Ratio must be >= 1.5 (75/50)
-                    // 3. Opening penalty must be less than 0.50% ROI
-                    if (instantOpeningLoss <= config.maxStartLossRoi) {
-                        // If Long is winning
-                        if (liveLongRoi >= config.roiThreshold && liveLongRoi / Math.max(Math.abs(liveShortRoi), 0.1) >= config.winLossRatio) {
-                            flashReset(0);
-                        }
-                        // If Short is winning
-                        else if (liveShortRoi >= config.roiThreshold && liveShortRoi / Math.max(Math.abs(liveLongRoi), 0.1) >= config.winLossRatio) {
-                            flashReset(1);
+                    // TRIGGER: Only if Opening Penalty is within limits AND Ratio is met
+                    if (market.resetPenalty <= config.maxStartLossRoi) {
+                        if (winRoi >= config.roiThreshold && market.currentRatio >= config.winLossRatio) {
+                            liveLongRoi > liveShortRoi ? flashReset(0) : flashReset(1);
                         }
                     }
                 }
@@ -193,17 +188,17 @@ async function backgroundLoop() {
         await manualClose('TARGET EXIT');
     }
 
+    // FILL LOGIC
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume === 0 && !state.isLocked && market.status === "Active") {
-            // Initial Entry check: Only open if starting ROI is better than -0.50%
-            if ((market.spread * config.leverage) <= config.maxStartLossRoi) {
+            if (market.resetPenalty <= config.maxStartLossRoi) {
                 state.isLocked = true;
                 await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
                 });
                 setTimeout(() => { state.isLocked = false; }, 3000);
-            } else { state.lastAction = "Waiting Spread for -0.50% Entry"; }
+            }
         }
     }
 }
@@ -231,68 +226,86 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>Ultra-Hedge Flash Pro</title>
+    <meta charset="UTF-8"><title>Ultra-Hedge Flash Ratio</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700;900&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap" rel="stylesheet">
     <style>
-        body { background: #f8fafc; color: #0f172a; font-family: 'Roboto', sans-serif; }
-        .card { background: white; border-radius: 32px; border: 1px solid #e2e8f0; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }
-        th { font-size: 10px; text-transform: uppercase; color: #94a3b8; padding: 12px; text-align: left; }
-        td { font-size: 11px; padding: 12px; border-top: 1px solid #f1f5f9; font-weight: 700; }
+        body { background: #0f172a; color: white; font-family: 'Inter', sans-serif; }
+        .card { background: #1e293b; border-radius: 20px; border: 1px solid #334155; }
+        .stat-label { font-size: 10px; font-weight: 900; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.1em; }
     </style>
 </head>
 <body class="p-4 md:p-10">
-    <div class="max-w-3xl mx-auto">
-        <div class="flex justify-between items-start mb-10">
+    <div class="max-w-4xl mx-auto">
+        <div class="flex justify-between items-center mb-10">
             <div>
-                <p id="botStatus" class="text-[10px] font-black text-indigo-500 uppercase tracking-widest mb-1">Ratio-Hedge Engine Active</p>
-                <h1 class="text-4xl font-black text-slate-900 tracking-tighter uppercase leading-none">Ultra-Hedge</h1>
-                <div class="flex gap-4 mt-4 font-black uppercase text-[9px] text-slate-400">
-                    <p>Spread: <span id="mSpread">0.00%</span></p>
-                    <p id="resetStatus" class="text-emerald-500 font-black">RESET: READY</p>
-                </div>
+                <h1 class="text-3xl font-black tracking-tighter uppercase italic">Ratio-Hedge <span class="text-indigo-500">Pro</span></h1>
+                <p id="botStatus" class="text-[10px] font-bold text-emerald-500 uppercase tracking-widest mt-1">Engine Online</p>
             </div>
             <div class="text-right">
-                <p id="growthPct" class="text-[10px] font-black px-2 py-0.5 rounded bg-slate-100 inline-block text-slate-600 uppercase mb-1">0.00%</p>
-                <p id="totalNetGain" class="text-4xl font-black leading-none text-slate-900">$0.0000</p>
-                <p id="realizedPnl" class="text-[10px] font-black text-slate-400 mt-2 uppercase tracking-widest">Realized Combined: $0.0000</p>
+                <p id="totalNetGain" class="text-3xl font-black text-white">$0.0000</p>
+                <p id="growthPct" class="stat-label text-emerald-400">Total Profit: 0.00%</p>
             </div>
         </div>
 
-        <div class="card p-10 pt-14 mb-8 relative overflow-hidden">
+        <!-- SIGNAL CARDS -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+            <div class="card p-6 border-l-4 border-indigo-500">
+                <p class="stat-label mb-1">Win/Loss Ratio</p>
+                <p id="uiRatio" class="text-3xl font-black text-white">0.00x</p>
+                <p class="text-[9px] text-slate-500 mt-1">Target: ${config.winLossRatio}x (75/50)</p>
+            </div>
+            <div class="card p-6 border-l-4 border-rose-500">
+                <p class="stat-label mb-1">ROI If Reset Now</p>
+                <p id="uiPenalty" class="text-3xl font-black text-rose-400">-0.00%</p>
+                <p class="text-[9px] text-slate-500 mt-1">Penalty Cap: -${config.maxStartLossRoi}%</p>
+            </div>
+            <div class="card p-6 border-l-4 border-slate-500">
+                <p class="stat-label mb-1">Market Spread</p>
+                <p id="uiSpread" class="text-3xl font-black text-white">0.000%</p>
+                <p class="text-[9px] text-slate-500 mt-1">Direct Exchange Gap</p>
+            </div>
+        </div>
+
+        <div class="card p-8 mb-8">
             <div class="flex justify-between items-end mb-4">
-                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Ratio Lock (Target 1.5x)</p>
-                <p id="balPct" class="text-3xl font-black text-slate-900">0.0%</p>
+                <p class="stat-label">System Symmetry (Exit @ 150%)</p>
+                <p id="balPct" class="text-2xl font-black text-white">0.0%</p>
             </div>
-            <div class="relative w-full bg-slate-100 h-3 rounded-full mb-12">
-                <div id="balBar" class="bg-indigo-600 h-full w-0 rounded-full transition-all duration-700 ease-out"></div>
-                <div style="left: 75%;" class="absolute top-0 bottom-0 border-l-2 border-rose-500 border-dashed"></div>
+            <div class="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
+                <div id="balBar" class="bg-indigo-500 h-full w-0 transition-all duration-500"></div>
             </div>
-            <div class="grid grid-cols-2 gap-10">
-                <div class="border-r border-slate-50 pr-5">
-                    <p class="text-[10px] font-black text-emerald-500 uppercase tracking-widest mb-2">Long Position</p>
-                    <p id="lRoi" class="text-4xl font-black mb-1">0.00%</p>
-                    <p id="lPnl" class="text-sm font-bold text-slate-400 mb-6">$0.00</p>
-                    <p id="lVol" class="text-[9px] px-3 py-1 bg-slate-100 rounded-full font-black text-slate-500 uppercase"></p>
+            <div class="grid grid-cols-2 gap-10 mt-8">
+                <div>
+                    <p class="stat-label text-emerald-500">Long Position</p>
+                    <p id="lRoi" class="text-4xl font-black">0.00%</p>
+                    <p id="lPnl" class="text-sm font-bold text-slate-500">$0.0000</p>
                 </div>
-                <div class="text-right pl-5">
-                    <p class="text-[10px] font-black text-rose-500 uppercase tracking-widest mb-2">Short Position</p>
-                    <p id="sRoi" class="text-4xl font-black mb-1">0.00%</p>
-                    <p id="sPnl" class="text-sm font-bold text-slate-400 mb-6">$0.00</p>
-                    <p id="sVol" class="text-[9px] px-3 py-1 bg-slate-100 rounded-full font-black text-slate-500 uppercase"></p>
+                <div class="text-right">
+                    <p class="stat-label text-rose-500">Short Position</p>
+                    <p id="sRoi" class="text-4xl font-black">0.00%</p>
+                    <p id="sPnl" class="text-sm font-bold text-slate-500">$0.0000</p>
                 </div>
             </div>
         </div>
 
-        <div class="card mb-8 overflow-hidden">
-            <div class="p-6 border-b border-slate-50"><h2 class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Session Trade History</h2></div>
-            <table class="w-full">
-                <thead><tr><th>Time</th><th>Type</th><th>Side</th><th>ROI</th><th>PnL</th><th>Net Total</th></tr></thead>
-                <tbody id="historyBody"></tbody>
+        <div class="card overflow-hidden mb-8">
+            <table class="w-full text-left text-[11px]">
+                <thead class="bg-slate-800/50">
+                    <tr>
+                        <th class="p-4 stat-label">Time</th>
+                        <th class="p-4 stat-label">Type</th>
+                        <th class="p-4 stat-label">Side</th>
+                        <th class="p-4 stat-label">ROI</th>
+                        <th class="p-4 stat-label">PnL</th>
+                        <th class="p-4 stat-label">Session Total</th>
+                    </tr>
+                </thead>
+                <tbody id="historyBody" class="divide-y divide-slate-700"></tbody>
             </table>
         </div>
 
-        <button onclick="triggerClose()" class="w-full py-6 rounded-3xl bg-slate-900 text-white font-black uppercase tracking-[0.3em] hover:bg-rose-600 transition-all shadow-xl active:scale-95">
+        <button onclick="triggerClose()" class="w-full py-5 rounded-2xl bg-white text-black font-black uppercase tracking-widest hover:bg-rose-500 hover:text-white transition-all shadow-2xl active:scale-95">
             Emergency Liquidation
         </button>
     </div>
@@ -302,36 +315,39 @@ app.get('/', (req, res) => {
         setInterval(async () => {
             try {
                 const r = await fetch('/api/status'); const d = await r.json();
-                document.getElementById('botStatus').innerText = d.market.status;
-                document.getElementById('mSpread').innerText = d.market.spread.toFixed(3) + '%';
                 
-                document.getElementById('resetStatus').innerText = 'RESET: ' + (d.market.resetUsed ? 'USED' : 'READY');
-                document.getElementById('resetStatus').className = d.market.resetUsed ? 'text-rose-400 font-black' : 'text-emerald-500 font-black';
-
-                document.getElementById('growthPct').innerText = (d.market.growthPct >= 0 ? '+' : '') + d.market.growthPct.toFixed(2) + '%';
-                document.getElementById('totalNetGain').innerText = (d.market.totalNetGain >= 0 ? '+' : '') + d.market.totalNetGain.toFixed(5);
-                document.getElementById('totalNetGain').className = 'text-4xl font-black leading-none ' + (d.market.totalNetGain >= 0 ? 'text-emerald-500' : 'text-rose-500');
-                document.getElementById('realizedPnl').innerText = 'Realized Combined: $' + d.market.realizedSessPnl.toFixed(5);
+                // Signal Cards
+                document.getElementById('uiRatio').innerText = d.market.currentRatio.toFixed(2) + 'x';
+                document.getElementById('uiRatio').className = 'text-3xl font-black ' + (d.market.currentRatio >= 1.5 ? 'text-emerald-400' : 'text-white');
                 
+                document.getElementById('uiPenalty').innerText = '-' + d.market.resetPenalty.toFixed(2) + '%';
+                document.getElementById('uiPenalty').className = 'text-3xl font-black ' + (d.market.resetPenalty <= 0.5 ? 'text-emerald-400' : 'text-rose-400');
+                
+                document.getElementById('uiSpread').innerText = d.market.spread.toFixed(3) + '%';
+                
+                // Header Stats
+                document.getElementById('totalNetGain').innerText = '$' + d.market.totalNetGain.toFixed(5);
+                document.getElementById('growthPct').innerText = 'Total Profit: ' + d.market.growthPct.toFixed(2) + '%';
+                
+                // Position Stats
                 document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
-                document.getElementById('balBar').style.width = Math.min(100, (d.market.balancePct / 200) * 100) + '%';
+                document.getElementById('balBar').style.width = Math.min(100, (d.market.balancePct / 150) * 100) + '%';
 
                 d.accounts.forEach((a, i) => {
                     const p = i === 0 ? 'l' : 's';
                     document.getElementById(p+'Roi').innerText = a.roi.toFixed(2)+'%';
                     document.getElementById(p+'Roi').className = 'text-4xl font-black ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
-                    document.getElementById(p+'Pnl').innerText = '$'+a.unrealizedUsdt.toFixed(6);
-                    document.getElementById(p+'Vol').innerText = a.volume + ' CT | ' + a.lastAction;
+                    document.getElementById(p+'Pnl').innerText = '$'+a.unrealizedUsdt.toFixed(5);
                 });
 
                 document.getElementById('historyBody').innerHTML = d.tradeHistory.map(h => \`
                     <tr>
-                        <td class="text-slate-400">\${h.time}</td>
-                        <td class="text-indigo-500">\${h.type}</td>
-                        <td>\${h.side}</td>
-                        <td class="\${parseFloat(h.roi) >= 0 ? 'text-emerald-500' : 'text-rose-500'}">\${h.roi}</td>
-                        <td class="\${parseFloat(h.pnl) >= 0 ? 'text-emerald-500' : 'text-rose-500'}">\$\${h.pnl}</td>
-                        <td class="font-black">\$\${h.total}</td>
+                        <td class="p-4 text-slate-400 font-bold">\${h.time}</td>
+                        <td class="p-4 text-indigo-400 font-black italic">\${h.type}</td>
+                        <td class="p-4 font-bold">\${h.side}</td>
+                        <td class="p-4 \${parseFloat(h.roi) >= 0 ? 'text-emerald-400' : 'text-rose-400'} font-black">\${h.roi}</td>
+                        <td class="p-4 font-bold">\$\${h.pnl}</td>
+                        <td class="p-4 font-black text-white">\$\${h.total}</td>
                     </tr>\`).join('');
             } catch(e) {}
         }, 1000);
@@ -341,4 +357,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online: Ratio Hedge Pro`));
