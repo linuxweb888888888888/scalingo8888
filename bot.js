@@ -29,16 +29,15 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 100, 
     winLossRatio: 1.5,        
-    maxStartSpread: 0.1,      // TRIGGER: Open if spread is below 0.1%
+    maxStartSpread: 0.1,      
     roiThreshold: 5.0,        
     autoClosePct: 150,
     pollInterval: 2000,
     resetCooldownMs: 3000,
     historySize: 30,
-    resetDiffThreshold: 1.5   // Reset loser if 1% difference
+    resetDiffThreshold: 1.5   
 };
 
-// ==================== DATA TRACKING ====================
 let market = { 
     status: 'Active', bid: 0, ask: 0, spread: 0,
     currentRatio: 0, resetPenalty: 0, diffSum: 0,
@@ -111,7 +110,7 @@ async function flashReset(accIdxToReset) {
 
     state.isLocked = true;
     market.resetUsed = true;
-    state.lastAction = "⚡ RESET (ONE-TIME)";
+    state.lastAction = "⚡ RESET";
     
     logTrade(state.direction, state.roi, state.unrealizedUsdt, 'RESET');
 
@@ -130,7 +129,7 @@ async function flashReset(accIdxToReset) {
     }, config.resetCooldownMs);
 }
 
-// ==================== WS ENGINE ====================
+// ==================== WS ENGINE (FIXED CALCULATIONS) ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -150,12 +149,15 @@ function startWS() {
                 
                 const winRoi = Math.max(liveLongRoi, liveShortRoi);
                 const loseRoi = Math.min(liveLongRoi, liveShortRoi);
-                market.currentRatio = Math.abs(loseRoi) > 0 ? (winRoi / Math.abs(loseRoi)) : 0;
-                market.diffSum = winRoi - market.resetPenalty;
+
+                // FIXED: Ratio now uses absolute values for a clean multiplier
+                market.currentRatio = Math.abs(loseRoi) > 0.01 ? (winRoi / Math.abs(loseRoi)) : winRoi;
+                
+                // FIXED: Difference Sum = Net ROI of both sides - Reset Penalty
+                market.diffSum = (liveLongRoi + liveShortRoi) - market.resetPenalty;
 
                 const roiDifference = Math.abs(liveLongRoi - liveShortRoi);
 
-                // RESET Condition using the 0.1% Spread threshold
                 if (!market.resetUsed && market.spread <= config.maxStartSpread) {
                     if (roiDifference >= config.resetDiffThreshold) {
                         liveLongRoi < liveShortRoi ? flashReset(0) : flashReset(1);
@@ -174,20 +176,20 @@ async function backgroundLoop() {
     const s1 = accountStates[1]; const s2 = accountStates[2];
     const totalCurrentEquity = s1.currentEquity + s2.currentEquity;
     const totalStartEquity = (s1.initialEquity || 0) + (s2.initialEquity || 0);
+    
     if (market.initialTotalEquity === 0 && totalStartEquity > 0) market.initialTotalEquity = totalStartEquity;
-    market.totalNetGain = totalCurrentEquity - totalStartEquity;
-    market.growthPct = totalStartEquity > 0 ? (market.totalNetGain / totalStartEquity) * 100 : 0;
-    market.realizedSessPnl = market.totalNetGain - (s1.unrealizedUsdt + s2.unrealizedUsdt);
-
+    market.totalNetGain = totalCurrentEquity - market.initialTotalEquity;
+    market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
+    
+    // System Symmetry Logic
     const winVal = Math.max(Math.abs(s1.unrealizedUsdt), Math.abs(s2.unrealizedUsdt));
-    const loseVal = Math.abs(s1.unrealizedUsdt + s2.unrealizedUsdt - winVal);
-    market.balancePct = ((winVal / Math.max(loseVal, 0.00000001)) / 1.5) * 100;
+    const loseVal = Math.min(Math.abs(s1.unrealizedUsdt), Math.abs(s2.unrealizedUsdt));
+    market.balancePct = loseVal > 0 ? ((winVal / loseVal) / config.winLossRatio) * 100 : 0;
 
-    if (market.balancePct >= config.autoClosePct && (s1.roi > config.roiThreshold || s2.roi > config.roiThreshold) && winVal > loseVal) {
+    if (market.balancePct >= config.autoClosePct && (s1.roi > config.roiThreshold || s2.roi > config.roiThreshold)) {
         await manualClose('TARGET EXIT');
     }
 
-    // INITIAL OPEN Condition using the 0.1% Spread threshold
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume === 0 && !state.isLocked && market.status === "Active") {
