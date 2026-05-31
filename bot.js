@@ -27,29 +27,27 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    baseVolume: parseInt(process.env.BASE_VOLUME) || 100, 
-    contractsToAddAfterReset: parseInt(process.env.CONTRACTS_TO_ADD) || 25, // SETTING: How many to add to EACH side
-    winLossRatio: 1.5,        
-    maxStartSpread: 0.15,      
-    autoClosePct: 110,        
-    pollInterval: 1000,       
+    baseVolume: parseInt(process.env.BASE_VOLUME) || 100,
+    winLossRatio: 1.5,
+    maxStartSpread: 0.15,
+    autoClosePct: 110,
+    pollInterval: 1000,
     resetCooldownMs: 3000,
-    resetDiffThreshold: 2.5,  
-    takerFeeRate: 0.0005      
+    resetDiffThreshold: 2.5,  // TRIGGER: Difference Sum must reach this value
+    takerFeeRate: 0.0005
 };
 
-let market = { 
+let market = {
     status: 'Active', bid: 0, ask: 0, spread: 0,
     currentRatio: 0, resetPenalty: 0, diffSum: 0,
-    balancePct: 0, totalNetGain: 0, growthPct: 0, 
+    balancePct: 0, totalNetGain: 0, growthPct: 0,
     initialTotalEquity: 0, resetUsed: false,
     sessionResetLoss: 0,
-    netSessionUsdt: 0,         
-    estExitFees: 0,
-    currentSessionVolume: config.baseVolume // Track volume scaling here
+    netSessionUsdt: 0,
+    estExitFees: 0
 };
 
-let tradeHistory = []; 
+let tradeHistory = [];
 let accountStates = {};
 
 config.accounts.forEach((account, idx) => {
@@ -95,61 +93,42 @@ async function syncAccount(acc, state) {
 }
 
 function logTrade(side, roi, pnl, type) {
-    tradeHistory.unshift({ 
-        time: new Date().toLocaleTimeString(), 
-        side: side.toUpperCase(), 
-        roi: roi.toFixed(2) + '%', 
-        pnl: pnl.toFixed(5), 
-        total: market.totalNetGain.toFixed(5), 
-        type: type 
+    tradeHistory.unshift({
+        time: new Date().toLocaleTimeString(),
+        side: side.toUpperCase(),
+        roi: roi.toFixed(2) + '%',
+        pnl: pnl.toFixed(5),
+        total: market.totalNetGain.toFixed(5),
+        type: type
     });
     if (tradeHistory.length > 15) tradeHistory.pop();
 }
 
 async function flashReset(accIdxToReset) {
     if (market.status !== 'Active' || market.resetUsed) return;
-    const winnerAcc = config.accounts[accIdxToReset];
-    const loserAcc = config.accounts[accIdxToReset === 0 ? 1 : 0];
-    
-    const winnerState = accountStates[winnerAcc.accountId];
-    const loserState = accountStates[loserAcc.accountId];
+    const acc = config.accounts[accIdxToReset];
+    const state = accountStates[acc.accountId];
+    if (state.isLocked || state.volume === 0) return;
 
-    if (winnerState.isLocked || winnerState.volume === 0) return;
-
-    winnerState.isLocked = true;
+    state.isLocked = true;
     market.resetUsed = true; 
-    
-    // Calculate fee based on current volume
-    const feeCost = (winnerState.volume * market.bid * config.takerFeeRate * 2);
-    market.sessionResetLoss += (Math.abs(winnerState.unrealizedUsdt) + feeCost);
-    
-    winnerState.lastAction = "⚡ RESET+SCALE";
-    logTrade(winnerState.direction, winnerState.roi, winnerState.unrealizedUsdt, 'RESET');
 
-    // 1. Close the winning position
-    await htxRequest(winnerAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-        contract_code: config.symbol, volume: winnerState.volume, direction: winnerState.direction === 'buy' ? 'sell' : 'buy', 
+    const feeCost = (state.volume * market.bid * config.takerFeeRate * 2);
+    market.sessionResetLoss += (Math.abs(state.unrealizedUsdt) + feeCost);
+
+    state.lastAction = "⚡ RESET";
+    logTrade(state.direction, state.roi, state.unrealizedUsdt, 'RESET');
+
+    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+        contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
         offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
     });
-
-    // 2. Increase the session volume for BOTH sides
-    market.currentSessionVolume += config.contractsToAddAfterReset;
-
-    // 3. Re-open the winner at the NEW increased volume
-    await htxRequest(winnerAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-        contract_code: config.symbol, volume: market.currentSessionVolume, direction: winnerState.direction, 
+    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+        contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, 
         offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
     });
 
-    // 4. Add the extra contracts to the LOSER side to keep hedge balanced
-    if (config.contractsToAddAfterReset > 0) {
-        await htxRequest(loserAcc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-            contract_code: config.symbol, volume: config.contractsToAddAfterReset, direction: loserState.direction, 
-            offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
-        });
-    }
-
-    setTimeout(() => { winnerState.isLocked = false; winnerState.lastAction = "Idle"; }, config.resetCooldownMs);
+    setTimeout(() => { state.isLocked = false; state.lastAction = "Idle"; }, config.resetCooldownMs);
 }
 
 // ==================== WS ENGINE ====================
@@ -174,6 +153,8 @@ function startWS() {
                 const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : s2.roi;
                 
                 const winRoi = Math.max(lRoi, sRoi);
+                
+                // CORE LOGIC: Difference Sum = Winner ROI + (Spread * Leverage)
                 market.diffSum = winRoi + market.resetPenalty;
 
                 const fee1 = s1.volume > 0 ? (s1.volume * market.bid * config.takerFeeRate) : 0;
@@ -186,6 +167,7 @@ function startWS() {
                 market.currentRatio = totalDebt > 0 ? (winPnl / totalDebt) : 0;
                 market.netSessionUsdt = (s1.unrealizedUsdt + s2.unrealizedUsdt) - market.sessionResetLoss - market.estExitFees;
 
+                // RESET TRIGGER: Strictly triggered only when Difference Sum reaches target (e.g. 2.5%)
                 if (market.status === 'Active' && !market.resetUsed) {
                     if (market.diffSum >= config.resetDiffThreshold) {
                         lRoi < sRoi ? flashReset(0) : flashReset(1);
@@ -208,7 +190,7 @@ async function backgroundLoop() {
     if (market.initialTotalEquity === 0 && totalCurrentEquity > 0) market.initialTotalEquity = totalCurrentEquity;
     market.totalNetGain = totalCurrentEquity - market.initialTotalEquity;
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
-    
+
     market.balancePct = market.currentRatio > 0 ? (market.currentRatio / config.winLossRatio) * 100 : 0;
 
     if (market.status === 'Active') {
@@ -219,8 +201,6 @@ async function backgroundLoop() {
 
         if (s1.volume === 0 && s2.volume === 0 && !s1.isLocked && !s2.isLocked) {
             if (market.spread > 0 && market.spread <= config.maxStartSpread) {
-                // Initialize session at base volume
-                market.currentSessionVolume = config.baseVolume;
                 for (const acc of config.accounts) {
                     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                         contract_code: config.symbol, volume: config.baseVolume, direction: accountStates[acc.accountId].direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
@@ -232,24 +212,23 @@ async function backgroundLoop() {
 }
 
 async function manualClose(type = 'MANUAL') {
-    if (market.status === "LIQUIDATING") return; 
+    if (market.status === "LIQUIDATING") return;
     market.status = "LIQUIDATING";
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         state.isLocked = true;
         if (state.volume > 0) {
             logTrade(state.direction, state.roi, state.unrealizedUsdt, type);
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-                contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
+            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20'
             });
         }
     }
     market.resetUsed = false;
     market.sessionResetLoss = 0;
-    market.currentSessionVolume = config.baseVolume; // Reset volume to base for next session
-    setTimeout(() => { 
+    setTimeout(() => {
         config.accounts.forEach(acc => { accountStates[acc.accountId].isLocked = false; });
-        market.status = "Active"; 
+        market.status = "Active";
     }, 5000);
 }
 
@@ -298,9 +277,9 @@ app.get('/', (req, res) => {
                 </div>
             </div>
             <div class="card p-6 border-l-4 border-slate-500">
-                <p class="stat-label mb-1">Current Session Volume</p>
-                <p id="uiVol" class="text-3xl font-black text-white">${config.baseVolume}</p>
-                <p class="text-[9px] text-slate-500 mt-1">Scaling: +${config.contractsToAddAfterReset} per reset</p>
+                <p class="stat-label mb-1">Market Spread</p>
+                <p id="uiSpread" class="text-3xl font-black text-white">0.000%</p>
+                <p class="text-[9px] text-slate-500 mt-1">Status: <span id="marketStatus">Active</span></p>
             </div>
         </div>
 
@@ -356,11 +335,12 @@ app.get('/', (req, res) => {
                 
                 document.getElementById('uiRatio').innerText = d.market.currentRatio.toFixed(2) + 'x';
                 document.getElementById('uiPenalty').innerText = d.market.resetPenalty.toFixed(2) + '%';
-                document.getElementById('uiVol').innerText = d.market.currentSessionVolume;
+                document.getElementById('marketStatus').innerText = (d.market.resetUsed ? 'RESET USED' : d.market.status);
                 
                 document.getElementById('uiDiffSum').innerText = (d.market.diffSum >= 0 ? '+' : '') + d.market.diffSum.toFixed(2) + '%';
                 document.getElementById('uiDiffSum').className = 'text-lg font-black ' + (d.market.diffSum >= d.config.resetDiffThreshold ? 'text-emerald-400' : 'text-indigo-400');
                 
+                document.getElementById('uiSpread').innerText = d.market.spread.toFixed(3) + '%';
                 document.getElementById('totalNetGain').innerText = (d.market.totalNetGain >= 0 ? '$' : '-$') + Math.abs(d.market.totalNetGain).toFixed(5);
                 document.getElementById('growthPct').innerText = 'Total Profit: ' + d.market.growthPct.toFixed(2) + '%';
                 document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
@@ -390,9 +370,10 @@ app.get('/', (req, res) => {
             } catch(e) { console.log(e); }
         }, 1000);
     </script>
+
 </body></html>`);
 });
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Auto-Scaling Mode: +${config.contractsToAddAfterReset} per reset)`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Strict Difference Sum Mode)`));
