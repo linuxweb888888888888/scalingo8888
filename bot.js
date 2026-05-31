@@ -128,7 +128,7 @@ async function flashReset(accIdxToReset) {
     }, config.resetCooldownMs);
 }
 
-// ==================== WS ENGINE (CALCULATION UPDATE) ====================
+// ==================== WS ENGINE (EXACT MATH REFINED) ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -141,31 +141,29 @@ function startWS() {
                 market.ask = msg.tick.ask[0];
                 market.spread = ((market.ask - market.bid) / market.bid) * 100;
                 
-                // BOX 2: ROI If Reset Now (The spread cost as a negative penalty)
+                // BOX 2: Reset Penalty
                 market.resetPenalty = -(market.spread * config.leverage);
 
                 const s1 = accountStates[1]; 
                 const s2 = accountStates[2];
                 
-                if (s1.entryPrice > 0 && s2.entryPrice > 0) {
-                    const lRoi = ((market.bid - s1.entryPrice) / s1.entryPrice) * config.leverage * 100;
-                    const sRoi = ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100;
-                    
-                    const winRoi = Math.max(lRoi, sRoi);
-                    const loseRoi = Math.min(lRoi, sRoi);
+                const lRoi = s1.entryPrice > 0 ? ((market.bid - s1.entryPrice) / s1.entryPrice) * config.leverage * 100 : 0;
+                const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : 0;
+                
+                const winRoi = Math.max(lRoi, sRoi);
+                const loseRoi = Math.min(lRoi, sRoi);
 
-                    // Win/Loss Ratio Calculation
-                    market.currentRatio = Math.abs(loseRoi) > 0.01 ? (winRoi / Math.abs(loseRoi)) : 0;
-                    
-                    // BOX 3: Difference Sum (Winner ROI + Reset ROI/Penalty)
-                    market.diffSum = winRoi + market.resetPenalty;
+                // FORMULA: Lose ROI / |Reset Penalty|
+                market.currentRatio = Math.abs(market.resetPenalty) > 0.001 ? (loseRoi / Math.abs(market.resetPenalty)) : 0;
+                
+                // FORMULA: (Win ROI if >= 0, else 0) + Reset Penalty
+                market.diffSum = (winRoi >= 0 ? winRoi : 0) + market.resetPenalty;
 
-                    const roiDifference = Math.abs(lRoi - sRoi);
+                const roiDifference = Math.abs(lRoi - sRoi);
 
-                    if (!market.resetUsed && market.spread <= config.maxStartSpread) {
-                        if (roiDifference >= config.resetDiffThreshold) {
-                            lRoi < sRoi ? flashReset(0) : flashReset(1);
-                        }
+                if (!market.resetUsed && market.spread <= config.maxStartSpread) {
+                    if (roiDifference >= config.resetDiffThreshold) {
+                        lRoi < sRoi ? flashReset(0) : flashReset(1);
                     }
                 }
             }
@@ -185,7 +183,7 @@ async function backgroundLoop() {
     market.totalNetGain = totalCurrentEquity - market.initialTotalEquity;
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
     
-    // System Symmetry progress
+    // Symmetry tracks progress toward positive ratio target
     market.balancePct = market.currentRatio > 0 ? (market.currentRatio / config.winLossRatio) * 100 : 0;
 
     if (market.balancePct >= config.autoClosePct && (s1.roi > config.roiThreshold || s2.roi > config.roiThreshold)) {
@@ -246,7 +244,7 @@ app.get('/', (req, res) => {
                 <p id="botStatus" class="text-[10px] font-bold text-emerald-500 uppercase tracking-widest mt-1">Engine Online</p>
             </div>
             <div class="text-right">
-                <p id="totalNetGain" class="text-3xl font-black text-white">$0.0000</p>
+                <p id="totalNetGain" class="text-3xl font-black text-white">$0.00000</p>
                 <p id="growthPct" class="stat-label text-emerald-400">Total Profit: 0.00%</p>
             </div>
         </div>
@@ -284,12 +282,12 @@ app.get('/', (req, res) => {
                 <div>
                     <p class="stat-label text-emerald-500">Long Position</p>
                     <p id="lRoi" class="text-4xl font-black">0.00%</p>
-                    <p id="lPnl" class="text-sm font-bold text-slate-500">$0.0000</p>
+                    <p id="lPnl" class="text-sm font-bold text-slate-500">$0.00000</p>
                 </div>
                 <div class="text-right">
                     <p class="stat-label text-rose-500">Short Position</p>
                     <p id="sRoi" class="text-4xl font-black">0.00%</p>
-                    <p id="sPnl" class="text-sm font-bold text-slate-500">$0.0000</p>
+                    <p id="sPnl" class="text-sm font-bold text-slate-500">$0.00000</p>
                 </div>
             </div>
         </div>
@@ -322,12 +320,9 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); const d = await r.json();
                 
                 document.getElementById('uiRatio').innerText = d.market.currentRatio.toFixed(2) + 'x';
-                document.getElementById('uiRatio').className = 'text-3xl font-black ' + (d.market.currentRatio >= 1.5 ? 'text-emerald-400' : 'text-white');
                 
-                // Box 2: Penalty (negative)
                 document.getElementById('uiPenalty').innerText = d.market.resetPenalty.toFixed(2) + '%';
                 
-                // Box 3: Winner + Penalty
                 document.getElementById('uiDiffSum').innerText = (d.market.diffSum >= 0 ? '+' : '') + d.market.diffSum.toFixed(2) + '%';
                 document.getElementById('uiDiffSum').className = 'text-lg font-black ' + (d.market.diffSum >= 0 ? 'text-emerald-400' : 'text-rose-400');
                 
