@@ -15,7 +15,7 @@ const config = {
     
     // CONTRACT FACE VALUES (Tokens per 1 contract)
     faceValueA: 1000,          // Your SHIB spec: 1 contract = 1,000 tokens
-    faceValueB: 10000000,      // HTX BONK-USDT spec: 1 contract is usually 10M tokens. VERIFY THIS.
+    faceValueB: 100000,      // HTX BONK-USDT spec: 1 contract is usually 10M tokens. VERIFY THIS.
     
     anchorB: 1,                // Logic: Open exactly 1 contract of BONK
     leverage: parseInt(process.env.LEVERAGE) || 10,
