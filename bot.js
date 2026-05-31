@@ -27,22 +27,23 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    baseVolume: parseInt(process.env.BASE_VOLUME) || 100, 
-    winLossRatio: 1.5,        
+    baseVolume: parseInt(process.env.BASE_VOLUME) || 1, 
+    winLossRatio: 1.5,        // The "Multiplier": Coverage must be 1.5x total losses
     maxStartSpread: 0.1,      
-    roiThreshold: 5.0,        
-    autoClosePct: 150,
-    autoExitRoi: 3.0,         
-    pollInterval: 2000,
+    roiThreshold: 2.0,        // Minimum ROI on winner before considering exit
+    autoClosePct: 110,        // 110% means "Covered all losses plus 10% profit"
+    autoExitRoi: 5.0,         
+    pollInterval: 1000,
     resetCooldownMs: 3000,
-    resetDiffThreshold: 1.5   
+    resetDiffThreshold: 1.2   
 };
 
 let market = { 
     status: 'Active', bid: 0, ask: 0, spread: 0,
     currentRatio: 0, resetPenalty: 0, diffSum: 0,
     balancePct: 0, totalNetGain: 0, growthPct: 0, 
-    initialTotalEquity: 0, resetUsed: false 
+    initialTotalEquity: 0, resetUsed: false,
+    sessionResetLoss: 0       // NEW: Tracks USDT lost in resets this session
 };
 
 let tradeHistory = []; 
@@ -66,7 +67,7 @@ async function htxRequest(account, method, path, data = {}) {
     const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
-        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 2000 });
+        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 1500 });
         return res.data;
     } catch (e) { return { status: 'error' }; }
 }
@@ -103,8 +104,7 @@ function logTrade(side, roi, pnl, type) {
 }
 
 async function flashReset(accIdxToReset) {
-    // FIX: Block reset if bot is already liquidating/exiting
-    if (market.status !== 'Active' || market.resetUsed) return;
+    if (market.status !== 'Active') return;
 
     const acc = config.accounts[accIdxToReset];
     const state = accountStates[acc.accountId];
@@ -113,6 +113,9 @@ async function flashReset(accIdxToReset) {
     state.isLocked = true;
     market.resetUsed = true;
     state.lastAction = "⚡ RESET";
+    
+    // Add the loss of this specific reset to the session total
+    market.sessionResetLoss += Math.abs(state.unrealizedUsdt);
     
     logTrade(state.direction, state.roi, state.unrealizedUsdt, 'RESET');
 
@@ -152,16 +155,19 @@ function startWS() {
                 const lRoi = s1.entryPrice > 0 ? ((market.bid - s1.entryPrice) / s1.entryPrice) * config.leverage * 100 : s1.roi;
                 const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : s2.roi;
                 
-                const winRoi = Math.max(lRoi, sRoi);
-                const loseRoi = Math.min(lRoi, sRoi);
+                const winPnl = Math.max(s1.unrealizedUsdt, s2.unrealizedUsdt);
+                const losePnl = Math.min(s1.unrealizedUsdt, s2.unrealizedUsdt);
 
-                market.currentRatio = Math.abs(market.resetPenalty) > 0.001 ? (loseRoi / Math.abs(market.resetPenalty)) : 0;
-                market.diffSum = winRoi + market.resetPenalty;
+                // NEW MULTIPLIER MATH: Coverage of current loss + all previous reset losses
+                const totalDebt = Math.abs(losePnl) + market.sessionResetLoss;
+                market.currentRatio = totalDebt > 0 ? (winPnl / totalDebt) : 0;
+                
+                // Difference Sum: Absolute Net USDT for the session
+                market.diffSum = (s1.unrealizedUsdt + s2.unrealizedUsdt) - market.sessionResetLoss;
 
                 const roiDifference = Math.abs(lRoi - sRoi);
 
-                // FIX: Only trigger reset if status is explicitly 'Active'
-                if (market.status === 'Active' && !market.resetUsed && market.spread <= config.maxStartSpread) {
+                if (market.status === 'Active' && market.spread <= config.maxStartSpread) {
                     if (roiDifference >= config.resetDiffThreshold) {
                         lRoi < sRoi ? flashReset(0) : flashReset(1);
                     }
@@ -175,45 +181,37 @@ function startWS() {
 
 // ==================== MAIN LOOP ====================
 async function backgroundLoop() {
-    // Speed up sync by running all accounts in parallel
     await Promise.all(config.accounts.map(acc => syncAccount(acc, accountStates[acc.accountId])));
 
     const s1 = accountStates[1]; const s2 = accountStates[2];
     if (!s1 || !s2) return;
 
     const totalCurrentEquity = s1.currentEquity + s2.currentEquity;
-    
     if (market.initialTotalEquity === 0 && totalCurrentEquity > 0) market.initialTotalEquity = totalCurrentEquity;
+    
     market.totalNetGain = totalCurrentEquity - market.initialTotalEquity;
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
     
+    // BalancePct shows progress toward the WinLossRatio coverage
     market.balancePct = market.currentRatio > 0 ? (market.currentRatio / config.winLossRatio) * 100 : 0;
 
-    // --- EXIT LOGIC ---
     if (market.status === 'Active') {
-        if (market.resetUsed) {
-            if (s1.roi >= config.autoExitRoi || s2.roi >= config.autoExitRoi) {
-                await manualClose('AUTO EXIT');
-                return; // Stop loop here if we exit
-            }
-        }
-
-        if (market.balancePct >= config.autoClosePct && (s1.roi > config.roiThreshold || s2.roi > config.roiThreshold)) {
-            await manualClose('TARGET EXIT');
+        // EXIT ONLY if coverage is reached AND we are net profitable for the session
+        if (market.balancePct >= config.autoClosePct && market.diffSum > 0) {
+            await manualClose('RECOVERY EXIT');
             return;
         }
-    }
 
-    // --- OPENING LOGIC ---
-    for (const acc of config.accounts) {
-        const state = accountStates[acc.accountId];
-        if (state.volume === 0 && !state.isLocked && market.status === "Active") {
-            if (market.spread > 0 && market.spread <= config.maxStartSpread) {
-                state.isLocked = true;
-                await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
-                });
-                setTimeout(() => { state.isLocked = false; }, 3000);
+        for (const acc of config.accounts) {
+            const state = accountStates[acc.accountId];
+            if (state.volume === 0 && !state.isLocked) {
+                if (market.spread > 0 && market.spread <= config.maxStartSpread) {
+                    state.isLocked = true;
+                    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                        contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
+                    });
+                    setTimeout(() => { state.isLocked = false; }, 2000);
+                }
             }
         }
     }
@@ -222,8 +220,6 @@ async function backgroundLoop() {
 async function manualClose(type = 'MANUAL') {
     if (market.status === "LIQUIDATING") return; 
     market.status = "LIQUIDATING";
-
-    // Lock account states to prevent backgroundLoop from doing anything
     config.accounts.forEach(acc => { accountStates[acc.accountId].isLocked = true; });
 
     for (const acc of config.accounts) {
@@ -235,8 +231,8 @@ async function manualClose(type = 'MANUAL') {
             });
         }
     }
-
     market.resetUsed = false;
+    market.sessionResetLoss = 0; // RESET session debt after successful exit
     setTimeout(() => { 
         config.accounts.forEach(acc => { accountStates[acc.accountId].isLocked = false; });
         market.status = "Active"; 
@@ -275,28 +271,28 @@ app.get('/', (req, res) => {
 
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
             <div class="card p-6 border-l-4 border-indigo-500">
-                <p class="stat-label mb-1">Win/Loss Ratio</p>
+                <p class="stat-label mb-1">Debt Coverage Multiplier</p>
                 <p id="uiRatio" class="text-3xl font-black text-white">0.00x</p>
-                <p class="text-[9px] text-slate-500 mt-1">Target: ${config.winLossRatio}x (75/50)</p>
+                <p class="text-[9px] text-slate-500 mt-1">Target: ${config.winLossRatio}x (Win / All Losses)</p>
             </div>
             <div class="card p-6 border-l-4 border-rose-500">
-                <p class="stat-label mb-1">ROI If Reset Now</p>
-                <p id="uiPenalty" class="text-3xl font-black text-rose-400">-0.00%</p>
+                <p class="stat-label mb-1">Session Reset Debt</p>
+                <p id="uiDebt" class="text-3xl font-black text-rose-400">$0.00</p>
                 <div class="mt-2 pt-2 border-t border-slate-700">
-                   <p class="stat-label text-[9px]">Difference Sum (Win + Reset ROI)</p>
-                   <p id="uiDiffSum" class="text-lg font-black text-emerald-400">+0.00%</p>
+                   <p class="stat-label text-[9px]">Live Session PnL (Net)</p>
+                   <p id="uiDiffSum" class="text-lg font-black text-emerald-400">+$0.00</p>
                 </div>
             </div>
             <div class="card p-6 border-l-4 border-slate-500">
                 <p class="stat-label mb-1">Market Spread</p>
                 <p id="uiSpread" class="text-3xl font-black text-white">0.000%</p>
-                <p class="text-[9px] text-slate-500 mt-1">Exit Trigger: ${config.autoExitRoi}%</p>
+                <p class="text-[9px] text-slate-500 mt-1">Status: <span id="marketStatus">Active</span></p>
             </div>
         </div>
 
         <div class="card p-8 mb-8">
             <div class="flex justify-between items-end mb-4">
-                <p class="stat-label">System Symmetry (Exit @ 150%)</p>
+                <p class="stat-label">Recovery Progress (Exit @ ${config.autoClosePct}%)</p>
                 <p id="balPct" class="text-2xl font-black text-white">0.0%</p>
             </div>
             <div class="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
@@ -345,9 +341,12 @@ app.get('/', (req, res) => {
                 const d = await r.json();
                 
                 document.getElementById('uiRatio').innerText = d.market.currentRatio.toFixed(2) + 'x';
-                document.getElementById('uiPenalty').innerText = d.market.resetPenalty.toFixed(2) + '%';
-                document.getElementById('uiDiffSum').innerText = (d.market.diffSum >= 0 ? '+' : '') + d.market.diffSum.toFixed(2) + '%';
+                document.getElementById('uiDebt').innerText = '$' + d.market.sessionResetLoss.toFixed(5);
+                document.getElementById('marketStatus').innerText = d.market.status;
+                
+                document.getElementById('uiDiffSum').innerText = (d.market.diffSum >= 0 ? '+$' : '-$') + Math.abs(d.market.diffSum).toFixed(5);
                 document.getElementById('uiDiffSum').className = 'text-lg font-black ' + (d.market.diffSum >= 0 ? 'text-emerald-400' : 'text-rose-400');
+                
                 document.getElementById('uiSpread').innerText = d.market.spread.toFixed(3) + '%';
                 document.getElementById('totalNetGain').innerText = (d.market.totalNetGain >= 0 ? '$' : '-$') + Math.abs(d.market.totalNetGain).toFixed(5);
                 document.getElementById('growthPct').innerText = 'Total Profit: ' + d.market.growthPct.toFixed(2) + '%';
@@ -382,4 +381,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Debt-Tracking Mode)`));
