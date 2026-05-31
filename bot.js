@@ -29,7 +29,7 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 100, 
     winLossRatio: 1.5,        
-    maxStartSpread: 0.15,      
+    maxStartSpread: 0.1,      
     autoClosePct: 110,        
     pollInterval: 1000,       
     resetCooldownMs: 3000,
