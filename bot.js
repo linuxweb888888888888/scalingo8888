@@ -35,7 +35,7 @@ const config = {
     pollInterval: 2000,
     resetCooldownMs: 3000,
     historySize: 30,
-    resetDiffThreshold: 1.0 // THE 1% ROI DIFFERENCE CHANGE
+    resetDiffThreshold: 1.0 // 1% difference trigger
 };
 
 // ==================== DATA TRACKING ====================
@@ -104,14 +104,16 @@ function logTrade(side, roi, pnl, type) {
 }
 
 async function flashReset(accIdxToReset) {
+    // Only allow one reset per cycle
     if (market.resetUsed) return;
+    
     const acc = config.accounts[accIdxToReset];
     const state = accountStates[acc.accountId];
     if (state.isLocked || state.volume === 0) return;
 
     state.isLocked = true;
-    market.resetUsed = true;
-    state.lastAction = "⚡ LOSER RESET";
+    market.resetUsed = true; // Set to true and stay true until trade finishes
+    state.lastAction = "⚡ RESET (ONE-TIME)";
     
     logTrade(state.direction, state.roi, state.unrealizedUsdt, 'RESET');
 
@@ -127,7 +129,6 @@ async function flashReset(accIdxToReset) {
     setTimeout(() => { 
         state.isLocked = false; 
         state.lastAction = "Idle";
-        market.resetUsed = false; // Allow reset again after cooldown
     }, config.resetCooldownMs);
 }
 
@@ -151,17 +152,14 @@ function startWS() {
                 
                 const winRoi = Math.max(liveLongRoi, liveShortRoi);
                 const loseRoi = Math.min(liveLongRoi, liveShortRoi);
-                const absLoseRoi = Math.abs(loseRoi);
-                
-                market.currentRatio = absLoseRoi > 0 ? (winRoi / absLoseRoi) : 0;
+                market.currentRatio = Math.abs(loseRoi) > 0 ? (winRoi / Math.abs(loseRoi)) : 0;
                 market.diffSum = winRoi - market.resetPenalty;
 
-                // LOGIC CHANGE: Check for 1% difference and reset the LOSER
+                // LOGIC: Reset LOSER only if difference > 1% and hasn't been reset yet this cycle
                 const roiDifference = Math.abs(liveLongRoi - liveShortRoi);
 
                 if (!market.resetUsed && market.resetPenalty <= config.maxStartLossRoi) {
                     if (roiDifference >= config.resetDiffThreshold) {
-                        // Reset the one with the lower ROI (the loser)
                         liveLongRoi < liveShortRoi ? flashReset(0) : flashReset(1);
                     }
                 }
@@ -216,6 +214,7 @@ async function manualClose(type = 'MANUAL') {
             });
         }
     }
+    // RESET the flag so a new reset can occur in the next trade cycle
     market.resetUsed = false;
     setTimeout(() => { market.status = "Active"; }, 5000);
 }
