@@ -21,21 +21,15 @@ while (process.env[`HTX_API_KEY_${accountIndex}`]) {
 }
 
 const config = {
-    // 1. SYMBOL changed to DOGE
     symbol: (process.env.SYMBOL || 'DOGE-USDT').toUpperCase(),
     leverage: parseInt(process.env.LEVERAGE) || 50,
     port: process.env.PORT || 3000,
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    
-    // 2. VOLUME: Set to 1. HTX interprets "1" as "1 contract" (which is 100 DOGE).
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1, 
-    
     winLossRatio: 1.5,
-    // 3. SPREAD: Increased to 0.20. If DOGE spread is 0.16 and this is 0.15, it won't open.
     maxStartSpread: 0.20, 
-    
     autoClosePct: 110,
     pollInterval: 1000,
     resetCooldownMs: 3000,
@@ -75,7 +69,6 @@ async function htxRequest(account, method, path, data = {}) {
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
         const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 1500 });
-        // LOG ERRORS so you know if the API rejects the "1 contract" order
         if(res.data.status !== 'ok') console.log(`API Error Account ${account.accountId}:`, res.data['err-msg'] || res.data);
         return res.data;
     } catch (e) { return { status: 'error' }; }
@@ -112,6 +105,10 @@ function logTrade(side, roi, pnl, type) {
     if (tradeHistory.length > 15) tradeHistory.pop();
 }
 
+/**
+ * MODIFIED: LEG-DROP RESET
+ * Closes the losing side and lets the winner run alone.
+ */
 async function flashReset(accIdxToReset) {
     if (market.status !== 'Active' || market.resetUsed) return;
     const acc = config.accounts[accIdxToReset];
@@ -119,23 +116,22 @@ async function flashReset(accIdxToReset) {
     if (state.isLocked || state.volume === 0) return;
 
     state.isLocked = true;
-    market.resetUsed = true; 
+    market.resetUsed = true; // Mark as reset so it doesn't try to close the second leg until profit
 
-    const feeCost = (state.volume * market.bid * config.takerFeeRate * 2);
-    market.sessionResetLoss += (Math.abs(state.unrealizedUsdt) + feeCost);
+    const feeCost = (state.volume * market.bid * config.takerFeeRate);
+    // Track the actual realized loss of the dropped leg
+    market.sessionResetLoss = Math.abs(state.unrealizedUsdt) + feeCost;
 
-    state.lastAction = "⚡ RESET";
-    logTrade(state.direction, state.roi, state.unrealizedUsdt, 'RESET');
+    state.lastAction = "💀 LEG DROP";
+    logTrade(state.direction, state.roi, state.unrealizedUsdt, 'DROP');
 
+    // Close the losing side only
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
         contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
         offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
     });
-    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-        contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, 
-        offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
-    });
 
+    // We do NOT open a new position. The backgroundLoop logic will handle the solo winner.
     setTimeout(() => { state.isLocked = false; state.lastAction = "Idle"; }, config.resetCooldownMs);
 }
 
@@ -157,11 +153,10 @@ function startWS() {
                 const s2 = accountStates[2];
                 if (!s1 || !s2) return;
                 
-                const lRoi = s1.entryPrice > 0 ? ((market.bid - s1.entryPrice) / s1.entryPrice) * config.leverage * 100 : s1.roi;
-                const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : s2.roi;
+                const lRoi = s1.entryPrice > 0 ? ((market.bid - s1.entryPrice) / s1.entryPrice) * config.leverage * 100 : 0;
+                const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : 0;
                 
                 const winRoi = Math.max(lRoi, sRoi);
-                
                 market.diffSum = winRoi + market.resetPenalty;
 
                 const fee1 = s1.volume > 0 ? (s1.volume * market.bid * config.takerFeeRate) : 0;
@@ -169,7 +164,8 @@ function startWS() {
                 market.estExitFees = fee1 + fee2;
 
                 const winPnl = Math.max(s1.unrealizedUsdt, s2.unrealizedUsdt);
-                const totalDebt = Math.abs(Math.min(s1.unrealizedUsdt, s2.unrealizedUsdt)) + market.sessionResetLoss + market.estExitFees;
+                // Total Debt is now the realized loss from the drop + remaining exit fees
+                const totalDebt = market.sessionResetLoss + market.estExitFees;
                 
                 market.currentRatio = totalDebt > 0 ? (winPnl / totalDebt) : 0;
                 market.netSessionUsdt = (s1.unrealizedUsdt + s2.unrealizedUsdt) - market.sessionResetLoss - market.estExitFees;
@@ -200,16 +196,16 @@ async function backgroundLoop() {
     market.balancePct = market.currentRatio > 0 ? (market.currentRatio / config.winLossRatio) * 100 : 0;
 
     if (market.status === 'Active') {
+        // Exit strategy: Only exit if Net Session is positive and target reached
         if (market.balancePct >= config.autoClosePct && market.netSessionUsdt > 0) {
             await manualClose('TARGET EXIT');
             return;
         }
 
-        if (s1.volume === 0 && s2.volume === 0 && !s1.isLocked && !s2.isLocked) {
-            // DEBUG LOG: This will show in your terminal every second why it isn't opening
-            if (market.bid > 0) console.log(`Current Spread: ${market.spread.toFixed(4)}% | Limit: ${config.maxStartSpread}%`);
-
+        // Only start a NEW dual-hedge if both sides are empty AND reset is NOT currently active
+        if (s1.volume === 0 && s2.volume === 0 && !s1.isLocked && !s2.isLocked && !market.resetUsed) {
             if (market.spread > 0 && market.spread <= config.maxStartSpread) {
+                console.log("Opening New Hedge Session...");
                 for (const acc of config.accounts) {
                     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                         contract_code: config.symbol, volume: config.baseVolume, direction: accountStates[acc.accountId].direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
@@ -233,6 +229,7 @@ async function manualClose(type = 'MANUAL') {
             });
         }
     }
+    // Clean up session variables so backgroundLoop can start a new hedge
     market.resetUsed = false;
     market.sessionResetLoss = 0;
     setTimeout(() => {
@@ -249,7 +246,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>Ratio Hedge Engine</title>
+    <meta charset="UTF-8"><title>Leg-Drop Hedge Engine</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap" rel="stylesheet">
     <style>
@@ -262,8 +259,8 @@ app.get('/', (req, res) => {
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-10">
             <div>
-                <h1 class="text-3xl font-black tracking-tighter uppercase italic">DOGE-Hedge <span class="text-indigo-500">Pro</span></h1>
-                <p id="botStatus" class="text-[10px] font-bold text-emerald-500 uppercase tracking-widest mt-1">Engine Online</p>
+                <h1 class="text-3xl font-black tracking-tighter uppercase italic">DOGE-Hedge <span class="text-indigo-500">Solo-Runner</span></h1>
+                <p id="botStatus" class="text-[10px] font-bold text-emerald-500 uppercase tracking-widest mt-1">Leg-Drop Mode Active</p>
             </div>
             <div class="text-right">
                 <p id="totalNetGain" class="text-3xl font-black text-white">$0.00000</p>
@@ -278,10 +275,10 @@ app.get('/', (req, res) => {
                 <p class="text-[9px] text-slate-500 mt-1">Target: ${config.winLossRatio}x</p>
             </div>
             <div class="card p-6 border-l-4 border-rose-500">
-                <p class="stat-label mb-1">ROI If Reset Now</p>
-                <p id="uiPenalty" class="text-3xl font-black text-rose-400">-0.00%</p>
+                <p class="stat-label mb-1">Realized Leg Loss</p>
+                <p id="uiPenalty" class="text-3xl font-black text-rose-400">$0.00</p>
                 <div class="mt-2 pt-2 border-t border-slate-700">
-                   <p class="stat-label text-[9px]">Difference Sum (Trigger: ${config.resetDiffThreshold}%)</p>
+                   <p class="stat-label text-[9px]">Reset Threshold: ${config.resetDiffThreshold}%</p>
                    <p id="uiDiffSum" class="text-lg font-black text-emerald-400">+0.00%</p>
                 </div>
             </div>
@@ -343,8 +340,8 @@ app.get('/', (req, res) => {
                 const d = await r.json();
                 
                 document.getElementById('uiRatio').innerText = d.market.currentRatio.toFixed(2) + 'x';
-                document.getElementById('uiPenalty').innerText = d.market.resetPenalty.toFixed(2) + '%';
-                document.getElementById('marketStatus').innerText = (d.market.resetUsed ? 'RESET USED' : d.market.status);
+                document.getElementById('uiPenalty').innerText = '$' + d.market.sessionResetLoss.toFixed(4);
+                document.getElementById('marketStatus').innerText = (d.market.resetUsed ? 'LEG DROPPED' : d.market.status);
                 
                 document.getElementById('uiDiffSum').innerText = (d.market.diffSum >= 0 ? '+' : '') + d.market.diffSum.toFixed(2) + '%';
                 document.getElementById('uiDiffSum').className = 'text-lg font-black ' + (d.market.diffSum >= d.config.resetDiffThreshold ? 'text-emerald-400' : 'text-indigo-400');
@@ -354,7 +351,7 @@ app.get('/', (req, res) => {
                 document.getElementById('growthPct').innerText = 'Total Profit: ' + d.market.growthPct.toFixed(2) + '%';
                 document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
                 document.getElementById('balBar').style.width = Math.min(100, d.market.balancePct) + '%';
-                document.getElementById('netLabel').innerText = 'Net: $' + d.market.netSessionUsdt.toFixed(5);
+                document.getElementById('netLabel').innerText = 'Net Session: $' + d.market.netSessionUsdt.toFixed(5);
 
                 d.accounts.forEach(function(a, i) {
                     const p = i === 0 ? 'l' : 's';
@@ -379,10 +376,9 @@ app.get('/', (req, res) => {
             } catch(e) { console.log(e); }
         }, 1000);
     </script>
-
 </body></html>`);
 });
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (DOGE Contract Mode: 1 unit = 100 coins)`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Leg-Drop Solo Runner Mode)`));
