@@ -30,7 +30,7 @@ const config = {
     baseVolume: parseInt(process.env.BASE_VOLUME) || 100, 
     winLossRatio: 1.5,        
     maxStartSpread: 0.1,      
-    autoClosePct: 110,        
+    autoClosePct: 150,        
     pollInterval: 1000,       
     resetCooldownMs: 3000,
     resetDiffThreshold: 2.5,  // TRIGGER: Difference Sum must reach this value
