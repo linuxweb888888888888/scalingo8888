@@ -32,9 +32,9 @@ const config = {
     maxStartSpread: 0.1,      
     roiThreshold: 2.0,        
     autoClosePct: 110,        
-    pollInterval: 1000,       // Fast 1s updates
+    pollInterval: 1000,       
     resetCooldownMs: 3000,
-    resetDiffThreshold: 1.2   
+    resetDiffThreshold: 2.0   // UPDATED: Trigger reset at 2% difference
 };
 
 let market = { 
@@ -103,13 +103,15 @@ function logTrade(side, roi, pnl, type) {
 }
 
 async function flashReset(accIdxToReset) {
-    if (market.status !== 'Active') return;
+    // RESTRICTION: market.resetUsed prevents a second reset until the strategy exits
+    if (market.status !== 'Active' || market.resetUsed) return;
+
     const acc = config.accounts[accIdxToReset];
     const state = accountStates[acc.accountId];
     if (state.isLocked || state.volume === 0) return;
 
     state.isLocked = true;
-    market.resetUsed = true;
+    market.resetUsed = true; // Lock reset for the rest of this session
     market.sessionResetLoss += Math.abs(state.unrealizedUsdt);
     state.lastAction = "⚡ RESET";
     
@@ -142,8 +144,6 @@ function startWS() {
                 market.bid = msg.tick.bid[0];
                 market.ask = msg.tick.ask[0];
                 market.spread = ((market.ask - market.bid) / market.bid) * 100;
-                
-                // RESTORED: Reset Penalty (Cost of spread * leverage)
                 market.resetPenalty = -(market.spread * config.leverage);
 
                 const s1 = accountStates[1]; 
@@ -154,19 +154,19 @@ function startWS() {
                 const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : s2.roi;
                 
                 const winRoi = Math.max(lRoi, sRoi);
-                const loseRoi = Math.min(lRoi, sRoi);
-
-                // RESTORED: Difference Sum = Win ROI + Reset ROI (Penalty)
+                
+                // UI METRIC: Sum Difference = Winning ROI + Reset Penalty ROI
                 market.diffSum = winRoi + market.resetPenalty;
 
-                // Debt Tracking Logic (Internal)
-                const totalDebt = Math.abs(Math.min(s1.unrealizedUsdt, s2.unrealizedUsdt)) + market.sessionResetLoss;
+                // INTERNAL: Recovery Multiplier
                 const winPnl = Math.max(s1.unrealizedUsdt, s2.unrealizedUsdt);
+                const totalDebt = Math.abs(Math.min(s1.unrealizedUsdt, s2.unrealizedUsdt)) + market.sessionResetLoss;
                 market.currentRatio = totalDebt > 0 ? (winPnl / totalDebt) : 0;
 
                 const roiDifference = Math.abs(lRoi - sRoi);
 
-                if (market.status === 'Active' && market.spread <= config.maxStartSpread) {
+                // RESET TRIGGER: Only if diff > 2.0% and haven't used the one reset yet
+                if (market.status === 'Active' && !market.resetUsed && market.spread <= config.maxStartSpread) {
                     if (roiDifference >= config.resetDiffThreshold) {
                         lRoi < sRoi ? flashReset(0) : flashReset(1);
                     }
@@ -193,8 +193,10 @@ async function backgroundLoop() {
 
     if (market.status === 'Active') {
         const netUsdtSession = (s1.unrealizedUsdt + s2.unrealizedUsdt) - market.sessionResetLoss;
+        
+        // AUTO EXIT: Only if covered debt and net profitable
         if (market.balancePct >= config.autoClosePct && netUsdtSession > 0) {
-            await manualClose('RECOVERY EXIT');
+            await manualClose('TARGET EXIT');
             return;
         }
 
@@ -217,6 +219,7 @@ async function manualClose(type = 'MANUAL') {
     if (market.status === "LIQUIDATING") return; 
     market.status = "LIQUIDATING";
     config.accounts.forEach(acc => { accountStates[acc.accountId].isLocked = true; });
+
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume > 0) {
@@ -226,8 +229,11 @@ async function manualClose(type = 'MANUAL') {
             });
         }
     }
+    
+    // RESET SESSION DATA
     market.resetUsed = false;
     market.sessionResetLoss = 0;
+    
     setTimeout(() => { 
         config.accounts.forEach(acc => { accountStates[acc.accountId].isLocked = false; });
         market.status = "Active"; 
@@ -268,7 +274,7 @@ app.get('/', (req, res) => {
             <div class="card p-6 border-l-4 border-indigo-500">
                 <p class="stat-label mb-1">Debt Coverage Ratio</p>
                 <p id="uiRatio" class="text-3xl font-black text-white">0.00x</p>
-                <p class="text-[9px] text-slate-500 mt-1">Target: ${config.winLossRatio}x (Win/All Losses)</p>
+                <p class="text-[9px] text-slate-500 mt-1">Target: ${config.winLossRatio}x</p>
             </div>
             <div class="card p-6 border-l-4 border-rose-500">
                 <p class="stat-label mb-1">ROI If Reset Now</p>
@@ -337,7 +343,7 @@ app.get('/', (req, res) => {
                 
                 document.getElementById('uiRatio').innerText = d.market.currentRatio.toFixed(2) + 'x';
                 document.getElementById('uiPenalty').innerText = d.market.resetPenalty.toFixed(2) + '%';
-                document.getElementById('marketStatus').innerText = d.market.status;
+                document.getElementById('marketStatus').innerText = (d.market.resetUsed ? 'RESET USED' : d.market.status);
                 
                 document.getElementById('uiDiffSum').innerText = (d.market.diffSum >= 0 ? '+' : '') + d.market.diffSum.toFixed(2) + '%';
                 document.getElementById('uiDiffSum').className = 'text-lg font-black ' + (d.market.diffSum >= 0 ? 'text-emerald-400' : 'text-rose-400');
@@ -376,4 +382,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (ROI + Debt Mode)`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Strict 1-Reset Mode)`));
