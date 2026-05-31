@@ -29,7 +29,7 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 100, 
     
-    // THE 1% RULE
+    // THE 1% RULE:
     minDiffSum: 1.0, 
     
     pollInterval: 2000,
@@ -41,8 +41,7 @@ const config = {
 let market = { 
     status: 'Active', bid: 0, ask: 0, spread: 0,
     resetPenalty: 0, diffSum: 0, losingSide: 'None',
-    totalNetGain: 0, realizedSessPnl: 0, 
-    growthPct: 0, initialTotalEquity: 0, resetUsed: false 
+    totalNetGain: 0, growthPct: 0, initialTotalEquity: 0, resetUsed: false 
 };
 
 let tradeHistory = []; 
@@ -150,7 +149,7 @@ function startWS() {
                 const winRoi = Math.max(liveLongRoi, liveShortRoi);
                 market.losingSide = liveLongRoi < liveShortRoi ? 'Long' : 'Short';
 
-                // THE CALCULATION: Current Profit + Re-open Loss
+                // LOGIC: Current Win ROI + Re-open Loss ROI
                 market.diffSum = winRoi + market.resetPenalty;
 
                 // TRIGGER: Reset LOSING side if diff sum > 1.0%
@@ -175,7 +174,7 @@ async function backgroundLoop() {
     market.totalNetGain = totalCurrentEquity - (market.initialTotalEquity || totalStartEquity);
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
 
-    // Position Guard
+    // Guard: Ensure positions exist
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume === 0 && !state.isLocked && market.status === "Active") {
@@ -225,7 +224,7 @@ app.get('/', (req, res) => {
                 <h1 class="text-4xl font-black text-slate-900 tracking-tighter uppercase leading-none">Ultra-Hedge</h1>
                 <div class="flex gap-4 mt-4 font-black uppercase text-[9px] text-slate-400">
                     <p>Penalty: <span id="mPenalty" class="text-rose-500">-0.00%</span></p>
-                    <p id="resetTarget" class="text-indigo-500 font-black italic">Target: None</p>
+                    <p id="resetTarget" class="text-indigo-500 font-black italic">Targeting Loser: None</p>
                 </div>
             </div>
             <div class="text-right">
@@ -236,7 +235,7 @@ app.get('/', (req, res) => {
 
         <div class="card p-10 pt-14 mb-8 relative overflow-hidden">
             <div class="flex justify-between items-end mb-4">
-                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Difference Sum (Win + Penalty)</p>
+                <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Difference Sum (Profit - Penalty)</p>
                 <p id="diffSum" class="text-5xl font-black text-slate-900">+0.00%</p>
             </div>
             <div class="relative w-full bg-slate-100 h-3 rounded-full mb-12">
@@ -256,7 +255,7 @@ app.get('/', (req, res) => {
         </div>
 
         <div class="card mb-8 overflow-hidden">
-            <div class="p-6 border-b border-slate-50"><h2 class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Session Trade History</h2></div>
+            <div class="p-6 border-b border-slate-50"><h2 class="text-[10px] font-black text-slate-400 uppercase tracking-widest">Reset History</h2></div>
             <table class="w-full">
                 <thead><tr><th>Time</th><th>Type</th><th>Side</th><th>ROI</th><th>Net Total</th></tr></thead>
                 <tbody id="historyBody"></tbody>
@@ -274,13 +273,13 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('botStatus').innerText = 'Status: ' + d.market.status;
                 document.getElementById('mPenalty').innerText = d.market.resetPenalty.toFixed(2) + '%';
-                document.getElementById('resetTarget').innerText = 'Losing Side: ' + d.market.losingSide.toUpperCase();
+                document.getElementById('resetTarget').innerText = 'Resetting Loser: ' + d.market.losingSide.toUpperCase();
                 
                 document.getElementById('growthPct').innerText = (d.market.growthPct >= 0 ? '+' : '') + d.market.growthPct.toFixed(2) + '%';
                 document.getElementById('totalNetGain').innerText = '$' + d.market.totalNetGain.toFixed(4);
                 
                 document.getElementById('diffSum').innerText = (d.market.diffSum >= 0 ? '+' : '') + d.market.diffSum.toFixed(2) + '%';
-                document.getElementById('diffSum').className = 'text-5xl font-black ' + (d.market.diffSum >= 1.0 ? 'text-indigo-600' : 'text-slate-300');
+                document.getElementById('diffSum').className = 'text-5xl font-black ' + (d.market.diffSum >= 1.0 ? 'text-emerald-500' : 'text-slate-300');
                 
                 // Visual bar for 1.5% max scale
                 document.getElementById('diffBar').style.width = Math.min(100, (d.market.diffSum / 1.5) * 100) + '%';
@@ -307,4 +306,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Ultra-Hedge 1% Pro Engine Online`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Ultra-Hedge 1% Pro Online`));
