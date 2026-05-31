@@ -27,13 +27,13 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    baseVolume: 1, // Start with 1 to generate ROI, then sync takes over
+    baseVolume: parseInt(process.env.BASE_VOLUME) || 100,
     winLossRatio: 1.5,
     maxStartSpread: 0.15,
     autoClosePct: 110,
     pollInterval: 1000,
     resetCooldownMs: 3000,
-    resetDiffThreshold: 2.5,
+    resetDiffThreshold: 2.5,  // TRIGGER: Difference Sum must reach this value
     takerFeeRate: 0.0005
 };
 
@@ -153,6 +153,8 @@ function startWS() {
                 const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : s2.roi;
                 
                 const winRoi = Math.max(lRoi, sRoi);
+                
+                // CORE LOGIC: Difference Sum = Winner ROI + (Spread * Leverage)
                 market.diffSum = winRoi + market.resetPenalty;
 
                 const fee1 = s1.volume > 0 ? (s1.volume * market.bid * config.takerFeeRate) : 0;
@@ -165,6 +167,7 @@ function startWS() {
                 market.currentRatio = totalDebt > 0 ? (winPnl / totalDebt) : 0;
                 market.netSessionUsdt = (s1.unrealizedUsdt + s2.unrealizedUsdt) - market.sessionResetLoss - market.estExitFees;
 
+                // RESET TRIGGER: Strictly triggered only when Difference Sum reaches target (e.g. 2.5%)
                 if (market.status === 'Active' && !market.resetUsed) {
                     if (market.diffSum >= config.resetDiffThreshold) {
                         lRoi < sRoi ? flashReset(0) : flashReset(1);
@@ -177,38 +180,17 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-// ==================== MAIN LOOP (DYNAMIC SYNC) ====================
+// ==================== MAIN LOOP ====================
 async function backgroundLoop() {
     await Promise.all(config.accounts.map(acc => syncAccount(acc, accountStates[acc.accountId])));
     const s1 = accountStates[1]; const s2 = accountStates[2];
     if (!s1 || !s2) return;
 
-    // --- DYNAMIC VOLUME SYNC LOGIC ---
-    // Formula: Floor(|ROI| * 10) -> 1.84% = 18 contracts | 0.68% = 6 contracts | -2.34% = 23 contracts
-    for (const acc of config.accounts) {
-        const state = accountStates[acc.accountId];
-        if (state.isLocked || market.status !== 'Active') continue;
-
-        const targetVol = Math.floor(Math.abs(state.roi) * 10);
-        
-        // If target volume changes, adjust contracts
-        if (targetVol > state.volume) {
-            const diff = targetVol - state.volume;
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: diff, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
-            });
-        } else if (targetVol < state.volume && targetVol > 0) {
-            const diff = state.volume - targetVol;
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: diff, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5'
-            });
-        }
-    }
-
     const totalCurrentEquity = s1.currentEquity + s2.currentEquity;
     if (market.initialTotalEquity === 0 && totalCurrentEquity > 0) market.initialTotalEquity = totalCurrentEquity;
     market.totalNetGain = totalCurrentEquity - market.initialTotalEquity;
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
+
     market.balancePct = market.currentRatio > 0 ? (market.currentRatio / config.winLossRatio) * 100 : 0;
 
     if (market.status === 'Active') {
@@ -217,7 +199,6 @@ async function backgroundLoop() {
             return;
         }
 
-        // Entry Logic: Start with 1 contract to get ROI moving
         if (s1.volume === 0 && s2.volume === 0 && !s1.isLocked && !s2.isLocked) {
             if (market.spread > 0 && market.spread <= config.maxStartSpread) {
                 for (const acc of config.accounts) {
@@ -395,4 +376,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Strict ROI Sync Mode)`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Strict Difference Sum Mode)`));
