@@ -150,11 +150,12 @@ function startWS() {
                 const winRoi = Math.max(liveLongRoi, liveShortRoi);
                 const loseRoi = Math.min(liveLongRoi, liveShortRoi);
 
-                // FIXED: Ratio now uses absolute values for a clean multiplier
-                market.currentRatio = Math.abs(loseRoi) > 0.01 ? (winRoi / Math.abs(loseRoi)) : winRoi;
+                // FIXED: Current Ratio (How many times the winner covers the loser)
+                // If loser is -0.18 and winner is 0.00, ratio is 0.
+                market.currentRatio = Math.abs(loseRoi) > 0.001 ? (winRoi / Math.abs(loseRoi)) : winRoi;
                 
-                // FIXED: Difference Sum = Net ROI of both sides - Reset Penalty
-                market.diffSum = (liveLongRoi + liveShortRoi) - market.resetPenalty;
+                // FIXED: Difference Sum = Winning Side ROI minus the Cost to Reset the Loser
+                market.diffSum = winRoi - market.resetPenalty;
 
                 const roiDifference = Math.abs(liveLongRoi - liveShortRoi);
 
@@ -175,16 +176,14 @@ async function backgroundLoop() {
     for (const acc of config.accounts) { await syncAccount(acc, accountStates[acc.accountId]); }
     const s1 = accountStates[1]; const s2 = accountStates[2];
     const totalCurrentEquity = s1.currentEquity + s2.currentEquity;
-    const totalStartEquity = (s1.initialEquity || 0) + (s2.initialEquity || 0);
     
-    if (market.initialTotalEquity === 0 && totalStartEquity > 0) market.initialTotalEquity = totalStartEquity;
+    if (market.initialTotalEquity === 0 && totalCurrentEquity > 0) market.initialTotalEquity = totalCurrentEquity;
     market.totalNetGain = totalCurrentEquity - market.initialTotalEquity;
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
     
-    // System Symmetry Logic
-    const winVal = Math.max(Math.abs(s1.unrealizedUsdt), Math.abs(s2.unrealizedUsdt));
-    const loseVal = Math.min(Math.abs(s1.unrealizedUsdt), Math.abs(s2.unrealizedUsdt));
-    market.balancePct = loseVal > 0 ? ((winVal / loseVal) / config.winLossRatio) * 100 : 0;
+    // FIXED: System Symmetry logic
+    // Maps currentRatio (e.g. 0.75x) against the target (e.g. 1.5x)
+    market.balancePct = market.currentRatio > 0 ? (market.currentRatio / config.winLossRatio) * 100 : 0;
 
     if (market.balancePct >= config.autoClosePct && (s1.roi > config.roiThreshold || s2.roi > config.roiThreshold)) {
         await manualClose('TARGET EXIT');
@@ -330,7 +329,7 @@ app.get('/', (req, res) => {
                 document.getElementById('growthPct').innerText = 'Total Profit: ' + d.market.growthPct.toFixed(2) + '%';
                 
                 document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
-                document.getElementById('balBar').style.width = Math.min(100, (d.market.balancePct / 150) * 100) + '%';
+                document.getElementById('balBar').style.width = Math.min(100, d.market.balancePct) + '%';
 
                 d.accounts.forEach((a, i) => {
                     const p = i === 0 ? 'l' : 's';
