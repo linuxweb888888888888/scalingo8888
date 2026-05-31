@@ -21,7 +21,7 @@ while (process.env[`HTX_API_KEY_${accountIndex}`]) {
 }
 
 const config = {
-    // UPDATED: Defaulted to DOGE-USDT
+    // 1. SYMBOL changed to DOGE
     symbol: (process.env.SYMBOL || 'DOGE-USDT').toUpperCase(),
     leverage: parseInt(process.env.LEVERAGE) || 10,
     port: process.env.PORT || 3000,
@@ -29,16 +29,17 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     
-    // UPDATED: 1 Contract of DOGE = 100 DOGE. 
-    // BASE_VOLUME 10 = 1,000 DOGE position per side.
+    // 2. VOLUME: Set to 1. HTX interprets "1" as "1 contract" (which is 100 DOGE).
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1, 
     
     winLossRatio: 1.5,
-    maxStartSpread: 0.15, // DOGE spread is tighter than SHIB
+    // 3. SPREAD: Increased to 0.20. If DOGE spread is 0.16 and this is 0.15, it won't open.
+    maxStartSpread: 0.20, 
+    
     autoClosePct: 110,
     pollInterval: 1000,
     resetCooldownMs: 3000,
-    resetDiffThreshold: 2.5,  // Difference Sum target for reset
+    resetDiffThreshold: 2.5,
     takerFeeRate: 0.0005
 };
 
@@ -74,6 +75,8 @@ async function htxRequest(account, method, path, data = {}) {
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
         const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 1500 });
+        // LOG ERRORS so you know if the API rejects the "1 contract" order
+        if(res.data.status !== 'ok') console.log(`API Error Account ${account.accountId}:`, res.data['err-msg'] || res.data);
         return res.data;
     } catch (e) { return { status: 'error' }; }
 }
@@ -203,6 +206,9 @@ async function backgroundLoop() {
         }
 
         if (s1.volume === 0 && s2.volume === 0 && !s1.isLocked && !s2.isLocked) {
+            // DEBUG LOG: This will show in your terminal every second why it isn't opening
+            if (market.bid > 0) console.log(`Current Spread: ${market.spread.toFixed(4)}% | Limit: ${config.maxStartSpread}%`);
+
             if (market.spread > 0 && market.spread <= config.maxStartSpread) {
                 for (const acc of config.accounts) {
                     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
@@ -243,7 +249,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>DOGE Ratio Hedge</title>
+    <meta charset="UTF-8"><title>Ratio Hedge Engine</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap" rel="stylesheet">
     <style>
@@ -256,7 +262,7 @@ app.get('/', (req, res) => {
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-10">
             <div>
-                <h1 class="text-3xl font-black tracking-tighter uppercase italic">DOGE-Hedge <span class="text-yellow-500">Pro</span></h1>
+                <h1 class="text-3xl font-black tracking-tighter uppercase italic">DOGE-Hedge <span class="text-indigo-500">Pro</span></h1>
                 <p id="botStatus" class="text-[10px] font-bold text-emerald-500 uppercase tracking-widest mt-1">Engine Online</p>
             </div>
             <div class="text-right">
@@ -280,7 +286,7 @@ app.get('/', (req, res) => {
                 </div>
             </div>
             <div class="card p-6 border-l-4 border-slate-500">
-                <p class="stat-label mb-1">DOGE Spread</p>
+                <p class="stat-label mb-1">Market Spread</p>
                 <p id="uiSpread" class="text-3xl font-black text-white">0.000%</p>
                 <p class="text-[9px] text-slate-500 mt-1">Status: <span id="marketStatus">Active</span></p>
             </div>
@@ -296,12 +302,12 @@ app.get('/', (req, res) => {
             </div>
             <div class="grid grid-cols-2 gap-10 mt-8">
                 <div>
-                    <p class="stat-label text-emerald-500">DOGE Long</p>
+                    <p class="stat-label text-emerald-500">Long Position</p>
                     <p id="lRoi" class="text-4xl font-black">0.00%</p>
                     <p id="lPnl" class="text-sm font-bold text-slate-500">$0.00000</p>
                 </div>
                 <div class="text-right">
-                    <p class="stat-label text-rose-500">DOGE Short</p>
+                    <p class="stat-label text-rose-500">Short Position</p>
                     <p id="sRoi" class="text-4xl font-black">0.00%</p>
                     <p id="sPnl" class="text-sm font-bold text-slate-500">$0.00000</p>
                 </div>
@@ -379,4 +385,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`DOGE Hedge Online (Contract Size: 100 DOGE/unit)`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (DOGE Contract Mode: 1 unit = 100 coins)`));
