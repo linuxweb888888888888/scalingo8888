@@ -29,13 +29,13 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 100, 
     winLossRatio: 1.5,        
-    maxStartLossRoi: 0.50,    
+    maxStartSpread: 0.1,      // TRIGGER: Open if spread is below 0.1%
     roiThreshold: 2.0,        
     autoClosePct: 150,
     pollInterval: 2000,
     resetCooldownMs: 3000,
     historySize: 30,
-    resetDiffThreshold: 1.0 // 1% difference trigger
+    resetDiffThreshold: 1.0   // Reset loser if 1% difference
 };
 
 // ==================== DATA TRACKING ====================
@@ -104,15 +104,13 @@ function logTrade(side, roi, pnl, type) {
 }
 
 async function flashReset(accIdxToReset) {
-    // Only allow one reset per cycle
     if (market.resetUsed) return;
-    
     const acc = config.accounts[accIdxToReset];
     const state = accountStates[acc.accountId];
     if (state.isLocked || state.volume === 0) return;
 
     state.isLocked = true;
-    market.resetUsed = true; // Set to true and stay true until trade finishes
+    market.resetUsed = true;
     state.lastAction = "⚡ RESET (ONE-TIME)";
     
     logTrade(state.direction, state.roi, state.unrealizedUsdt, 'RESET');
@@ -155,10 +153,10 @@ function startWS() {
                 market.currentRatio = Math.abs(loseRoi) > 0 ? (winRoi / Math.abs(loseRoi)) : 0;
                 market.diffSum = winRoi - market.resetPenalty;
 
-                // LOGIC: Reset LOSER only if difference > 1% and hasn't been reset yet this cycle
                 const roiDifference = Math.abs(liveLongRoi - liveShortRoi);
 
-                if (!market.resetUsed && market.resetPenalty <= config.maxStartLossRoi) {
+                // RESET Condition using the 0.1% Spread threshold
+                if (!market.resetUsed && market.spread <= config.maxStartSpread) {
                     if (roiDifference >= config.resetDiffThreshold) {
                         liveLongRoi < liveShortRoi ? flashReset(0) : flashReset(1);
                     }
@@ -189,10 +187,11 @@ async function backgroundLoop() {
         await manualClose('TARGET EXIT');
     }
 
+    // INITIAL OPEN Condition using the 0.1% Spread threshold
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume === 0 && !state.isLocked && market.status === "Active") {
-            if (market.resetPenalty <= config.maxStartLossRoi) {
+            if (market.spread > 0 && market.spread <= config.maxStartSpread) {
                 state.isLocked = true;
                 await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                     contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
@@ -214,7 +213,6 @@ async function manualClose(type = 'MANUAL') {
             });
         }
     }
-    // RESET the flag so a new reset can occur in the next trade cycle
     market.resetUsed = false;
     setTimeout(() => { market.status = "Active"; }, 5000);
 }
