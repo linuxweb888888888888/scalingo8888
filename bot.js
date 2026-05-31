@@ -30,11 +30,10 @@ const config = {
     baseVolume: parseInt(process.env.BASE_VOLUME) || 100, 
     winLossRatio: 1.5,        
     maxStartSpread: 0.1,      
-    roiThreshold: 2.0,        
     autoClosePct: 110,        
     pollInterval: 1000,       
     resetCooldownMs: 3000,
-    resetDiffThreshold: 2.0   // UPDATED: Trigger reset at 2% difference
+    winningRoiTrigger: 2.0    // TRIGGER: Reset when winning side hits 2.0%
 };
 
 let market = { 
@@ -103,7 +102,6 @@ function logTrade(side, roi, pnl, type) {
 }
 
 async function flashReset(accIdxToReset) {
-    // RESTRICTION: market.resetUsed prevents a second reset until the strategy exits
     if (market.status !== 'Active' || market.resetUsed) return;
 
     const acc = config.accounts[accIdxToReset];
@@ -111,7 +109,7 @@ async function flashReset(accIdxToReset) {
     if (state.isLocked || state.volume === 0) return;
 
     state.isLocked = true;
-    market.resetUsed = true; // Lock reset for the rest of this session
+    market.resetUsed = true; 
     market.sessionResetLoss += Math.abs(state.unrealizedUsdt);
     state.lastAction = "⚡ RESET";
     
@@ -154,20 +152,16 @@ function startWS() {
                 const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : s2.roi;
                 
                 const winRoi = Math.max(lRoi, sRoi);
-                
-                // UI METRIC: Sum Difference = Winning ROI + Reset Penalty ROI
                 market.diffSum = winRoi + market.resetPenalty;
 
-                // INTERNAL: Recovery Multiplier
                 const winPnl = Math.max(s1.unrealizedUsdt, s2.unrealizedUsdt);
                 const totalDebt = Math.abs(Math.min(s1.unrealizedUsdt, s2.unrealizedUsdt)) + market.sessionResetLoss;
                 market.currentRatio = totalDebt > 0 ? (winPnl / totalDebt) : 0;
 
-                const roiDifference = Math.abs(lRoi - sRoi);
-
-                // RESET TRIGGER: Only if diff > 2.0% and haven't used the one reset yet
+                // NEW TRIGGER LOGIC: Reset when winning side ROI hits 2%
                 if (market.status === 'Active' && !market.resetUsed && market.spread <= config.maxStartSpread) {
-                    if (roiDifference >= config.resetDiffThreshold) {
+                    if (winRoi >= config.winningRoiTrigger) {
+                        // Reset the LOSING side (whichever side is NOT the winning side)
                         lRoi < sRoi ? flashReset(0) : flashReset(1);
                     }
                 }
@@ -193,8 +187,6 @@ async function backgroundLoop() {
 
     if (market.status === 'Active') {
         const netUsdtSession = (s1.unrealizedUsdt + s2.unrealizedUsdt) - market.sessionResetLoss;
-        
-        // AUTO EXIT: Only if covered debt and net profitable
         if (market.balancePct >= config.autoClosePct && netUsdtSession > 0) {
             await manualClose('TARGET EXIT');
             return;
@@ -229,11 +221,8 @@ async function manualClose(type = 'MANUAL') {
             });
         }
     }
-    
-    // RESET SESSION DATA
     market.resetUsed = false;
     market.sessionResetLoss = 0;
-    
     setTimeout(() => { 
         config.accounts.forEach(acc => { accountStates[acc.accountId].isLocked = false; });
         market.status = "Active"; 
@@ -277,16 +266,16 @@ app.get('/', (req, res) => {
                 <p class="text-[9px] text-slate-500 mt-1">Target: ${config.winLossRatio}x</p>
             </div>
             <div class="card p-6 border-l-4 border-rose-500">
-                <p class="stat-label mb-1">ROI If Reset Now</p>
+                <p class="stat-label mb-1">Reset Penalty ROI</p>
                 <p id="uiPenalty" class="text-3xl font-black text-rose-400">-0.00%</p>
                 <div class="mt-2 pt-2 border-t border-slate-700">
-                   <p class="stat-label text-[9px]">Difference Sum (Win + Reset ROI)</p>
+                   <p class="stat-label text-[9px]">Sum ROI (Win + Penalty)</p>
                    <p id="uiDiffSum" class="text-lg font-black text-emerald-400">+0.00%</p>
                 </div>
             </div>
             <div class="card p-6 border-l-4 border-slate-500">
-                <p class="stat-label mb-1">Market Spread</p>
-                <p id="uiSpread" class="text-3xl font-black text-white">0.000%</p>
+                <p class="stat-label mb-1">Reset Trigger</p>
+                <p class="text-3xl font-black text-white">${config.winningRoiTrigger}%</p>
                 <p class="text-[9px] text-slate-500 mt-1">Status: <span id="marketStatus">Active</span></p>
             </div>
         </div>
@@ -382,4 +371,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Strict 1-Reset Mode)`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (2% Winner-Trigger Mode)`));
