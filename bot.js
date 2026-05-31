@@ -23,7 +23,7 @@ while (process.env[`HTX_API_KEY_${accountIndex}`]) {
 const config = {
     // 1. SYMBOL changed to DOGE
     symbol: (process.env.SYMBOL || 'DOGE-USDT').toUpperCase(),
-    leverage: parseInt(process.env.LEVERAGE) || 10,
+    leverage: parseInt(process.env.LEVERAGE) || 50,
     port: process.env.PORT || 3000,
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
