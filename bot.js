@@ -30,12 +30,12 @@ const config = {
     baseVolume: parseInt(process.env.BASE_VOLUME) || 100, 
     winLossRatio: 1.5,        
     maxStartSpread: 0.1,      // TRIGGER: Open if spread is below 0.1%
-    roiThreshold: 2.0,        
+    roiThreshold: 5.0,        
     autoClosePct: 150,
     pollInterval: 2000,
     resetCooldownMs: 3000,
     historySize: 30,
-    resetDiffThreshold: 1.0   // Reset loser if 1% difference
+    resetDiffThreshold: 1.5   // Reset loser if 1% difference
 };
 
 // ==================== DATA TRACKING ====================
