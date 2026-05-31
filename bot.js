@@ -32,6 +32,7 @@ const config = {
     maxStartSpread: 0.1,      
     roiThreshold: 5.0,        
     autoClosePct: 150,
+    autoExitRoi: 3.0,         // <--- NEW: Close all if any side hits this % after reset
     pollInterval: 2000,
     resetCooldownMs: 3000,
     resetDiffThreshold: 1.5   
@@ -128,7 +129,7 @@ async function flashReset(accIdxToReset) {
     }, config.resetCooldownMs);
 }
 
-// ==================== WS ENGINE (SUM FIX) ====================
+// ==================== WS ENGINE ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -140,24 +141,18 @@ function startWS() {
                 market.bid = msg.tick.bid[0];
                 market.ask = msg.tick.ask[0];
                 market.spread = ((market.ask - market.bid) / market.bid) * 100;
-                
-                // BOX 2: Reset Penalty
                 market.resetPenalty = -(market.spread * config.leverage);
 
                 const s1 = accountStates[1]; 
                 const s2 = accountStates[2];
                 
-                // Robust ROI logic: Use Live calculation if entryPrice exists, else fallback to latest Synced ROI
                 const lRoi = s1.entryPrice > 0 ? ((market.bid - s1.entryPrice) / s1.entryPrice) * config.leverage * 100 : s1.roi;
                 const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : s2.roi;
                 
                 const winRoi = Math.max(lRoi, sRoi);
                 const loseRoi = Math.min(lRoi, sRoi);
 
-                // Win/Loss Ratio Calculation
                 market.currentRatio = Math.abs(market.resetPenalty) > 0.001 ? (loseRoi / Math.abs(market.resetPenalty)) : 0;
-                
-                // STICKY SUM: This now forces winRoi to be added to resetPenalty
                 market.diffSum = winRoi + market.resetPenalty;
 
                 const roiDifference = Math.abs(lRoi - sRoi);
@@ -185,6 +180,13 @@ async function backgroundLoop() {
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
     
     market.balancePct = market.currentRatio > 0 ? (market.currentRatio / config.winLossRatio) * 100 : 0;
+
+    // --- EXIT CONDITION AFTER RESET ---
+    if (market.resetUsed) {
+        if (s1.roi >= config.autoExitRoi || s2.roi >= config.autoExitRoi) {
+            await manualClose('AUTO EXIT');
+        }
+    }
 
     if (market.balancePct >= config.autoClosePct && (s1.roi > config.roiThreshold || s2.roi > config.roiThreshold)) {
         await manualClose('TARGET EXIT');
@@ -266,7 +268,7 @@ app.get('/', (req, res) => {
             <div class="card p-6 border-l-4 border-slate-500">
                 <p class="stat-label mb-1">Market Spread</p>
                 <p id="uiSpread" class="text-3xl font-black text-white">0.000%</p>
-                <p class="text-[9px] text-slate-500 mt-1">Direct Exchange Gap</p>
+                <p class="text-[9px] text-slate-500 mt-1">Exit Trigger: ${config.autoExitRoi}%</p>
             </div>
         </div>
 
@@ -318,36 +320,30 @@ app.get('/', (req, res) => {
         setInterval(async () => {
             try {
                 const r = await fetch('/api/status'); const d = await r.json();
-                
                 document.getElementById('uiRatio').innerText = d.market.currentRatio.toFixed(2) + 'x';
                 document.getElementById('uiPenalty').innerText = d.market.resetPenalty.toFixed(2) + '%';
-                
                 document.getElementById('uiDiffSum').innerText = (d.market.diffSum >= 0 ? '+' : '') + d.market.diffSum.toFixed(2) + '%';
                 document.getElementById('uiDiffSum').className = 'text-lg font-black ' + (d.market.diffSum >= 0 ? 'text-emerald-400' : 'text-rose-400');
-                
                 document.getElementById('uiSpread').innerText = d.market.spread.toFixed(3) + '%';
                 document.getElementById('totalNetGain').innerText = (d.market.totalNetGain >= 0 ? '$' : '-$') + Math.abs(d.market.totalNetGain).toFixed(5);
                 document.getElementById('growthPct').innerText = 'Total Profit: ' + d.market.growthPct.toFixed(2) + '%';
-                
                 document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
                 document.getElementById('balBar').style.width = Math.min(100, d.market.balancePct) + '%';
-
                 d.accounts.forEach((a, i) => {
                     const p = i === 0 ? 'l' : 's';
                     document.getElementById(p+'Roi').innerText = a.roi.toFixed(2)+'%';
                     document.getElementById(p+'Roi').className = 'text-4xl font-black ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
                     document.getElementById(p+'Pnl').innerText = (a.unrealizedUsdt >= 0 ? '$' : '-$') + Math.abs(a.unrealizedUsdt).toFixed(5);
                 });
-
-                document.getElementById('historyBody').innerHTML = d.tradeHistory.map(h => \`
+                document.getElementById('historyBody').innerHTML = d.tradeHistory.map(h => `
                     <tr>
-                        <td class="p-4 text-slate-400 font-bold">\${h.time}</td>
-                        <td class="p-4 text-indigo-400 font-black italic">\${h.type}</td>
-                        <td class="p-4 font-bold">\${h.side}</td>
-                        <td class="p-4 \${parseFloat(h.roi) >= 0 ? 'text-emerald-400' : 'text-rose-400'} font-black">\${h.roi}</td>
-                        <td class="p-4 font-bold">\$\${h.pnl}</td>
-                        <td class="p-4 font-black text-white">\$\${h.total}</td>
-                    </tr>\`).join('');
+                        <td class="p-4 text-slate-400 font-bold">${h.time}</td>
+                        <td class="p-4 text-indigo-400 font-black italic">${h.type}</td>
+                        <td class="p-4 font-bold">${h.side}</td>
+                        <td class="p-4 ${parseFloat(h.roi) >= 0 ? 'text-emerald-400' : 'text-rose-400'} font-black">${h.roi}</td>
+                        <td class="p-4 font-bold">$${h.pnl}</td>
+                        <td class="p-4 font-black text-white">$${h.total}</td>
+                    </tr>`).join('');
             } catch(e) {}
         }, 1000);
     </script>
