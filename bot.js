@@ -28,19 +28,20 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 100, 
-    roiDiffThreshold: 1.0,    // NEW LOGIC: Reset if ROI difference > 1%
+    winLossRatio: 1.5,        
     maxStartLossRoi: 0.50,    
     roiThreshold: 2.0,        
     autoClosePct: 150,
     pollInterval: 2000,
     resetCooldownMs: 3000,
-    historySize: 30
+    historySize: 30,
+    resetDiffThreshold: 1.0 // THE 1% ROI DIFFERENCE CHANGE
 };
 
 // ==================== DATA TRACKING ====================
 let market = { 
     status: 'Active', bid: 0, ask: 0, spread: 0,
-    currentRatio: 0, roiDiff: 0, resetPenalty: 0, diffSum: 0,
+    currentRatio: 0, resetPenalty: 0, diffSum: 0,
     balancePct: 0, totalNetGain: 0, realizedSessPnl: 0, 
     growthPct: 0, initialTotalEquity: 0, resetUsed: false 
 };
@@ -125,8 +126,8 @@ async function flashReset(accIdxToReset) {
 
     setTimeout(() => { 
         state.isLocked = false; 
-        state.lastAction = "Idle"; 
-        market.resetUsed = false;
+        state.lastAction = "Idle";
+        market.resetUsed = false; // Allow reset again after cooldown
     }, config.resetCooldownMs);
 }
 
@@ -148,12 +149,19 @@ function startWS() {
                 const liveLongRoi = l.entryPrice > 0 ? ((market.bid - l.entryPrice) / l.entryPrice) * config.leverage * 100 : 0;
                 const liveShortRoi = s.entryPrice > 0 ? ((s.entryPrice - market.ask) / s.entryPrice) * config.leverage * 100 : 0;
                 
-                market.roiDiff = Math.abs(liveLongRoi - liveShortRoi);
+                const winRoi = Math.max(liveLongRoi, liveShortRoi);
+                const loseRoi = Math.min(liveLongRoi, liveShortRoi);
+                const absLoseRoi = Math.abs(loseRoi);
+                
+                market.currentRatio = absLoseRoi > 0 ? (winRoi / absLoseRoi) : 0;
+                market.diffSum = winRoi - market.resetPenalty;
 
-                // LOGIC: Reset the LOSING side if the ROI difference exceeds the threshold
+                // LOGIC CHANGE: Check for 1% difference and reset the LOSER
+                const roiDifference = Math.abs(liveLongRoi - liveShortRoi);
+
                 if (!market.resetUsed && market.resetPenalty <= config.maxStartLossRoi) {
-                    if (market.roiDiff >= config.roiDiffThreshold) {
-                        // Reset whichever side is currently the loser
+                    if (roiDifference >= config.resetDiffThreshold) {
+                        // Reset the one with the lower ROI (the loser)
                         liveLongRoi < liveShortRoi ? flashReset(0) : flashReset(1);
                     }
                 }
@@ -244,16 +252,16 @@ app.get('/', (req, res) => {
 
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
             <div class="card p-6 border-l-4 border-indigo-500">
-                <p class="stat-label mb-1">ROI Difference</p>
-                <p id="uiDiff" class="text-3xl font-black text-white">0.00%</p>
-                <p class="text-[9px] text-slate-500 mt-1">Trigger: > ${config.roiDiffThreshold}% Gap</p>
+                <p class="stat-label mb-1">Win/Loss Ratio</p>
+                <p id="uiRatio" class="text-3xl font-black text-white">0.00x</p>
+                <p class="text-[9px] text-slate-500 mt-1">Target: ${config.winLossRatio}x (75/50)</p>
             </div>
             <div class="card p-6 border-l-4 border-rose-500">
-                <p class="stat-label mb-1">Reset Penalty</p>
+                <p class="stat-label mb-1">ROI If Reset Now</p>
                 <p id="uiPenalty" class="text-3xl font-black text-rose-400">-0.00%</p>
                 <div class="mt-2 pt-2 border-t border-slate-700">
-                   <p class="stat-label text-[9px]">Status</p>
-                   <p id="uiStatusText" class="text-lg font-black text-emerald-400">WAITING GAP</p>
+                   <p class="stat-label text-[9px]">Difference Sum (Win + Reset ROI)</p>
+                   <p id="uiDiffSum" class="text-lg font-black text-emerald-400">+0.00%</p>
                 </div>
             </div>
             <div class="card p-6 border-l-4 border-slate-500">
@@ -312,12 +320,11 @@ app.get('/', (req, res) => {
             try {
                 const r = await fetch('/api/status'); const d = await r.json();
                 
-                document.getElementById('uiDiff').innerText = d.market.roiDiff.toFixed(2) + '%';
-                document.getElementById('uiDiff').className = 'text-3xl font-black ' + (d.market.roiDiff >= 1.0 ? 'text-emerald-400' : 'text-white');
+                document.getElementById('uiRatio').innerText = d.market.currentRatio.toFixed(2) + 'x';
+                document.getElementById('uiRatio').className = 'text-3xl font-black ' + (d.market.currentRatio >= 1.5 ? 'text-emerald-400' : 'text-white');
                 
                 document.getElementById('uiPenalty').innerText = '-' + d.market.resetPenalty.toFixed(2) + '%';
-                document.getElementById('uiStatusText').innerText = d.market.roiDiff >= 1.0 ? 'TARGETING LOSER' : 'WAITING GAP';
-                document.getElementById('uiStatusText').className = 'text-lg font-black ' + (d.market.roiDiff >= 1.0 ? 'text-rose-400' : 'text-emerald-400');
+                document.getElementById('uiDiffSum').innerText = (d.market.diffSum >= 0 ? '+' : '') + d.market.diffSum.toFixed(2) + '%';
                 
                 document.getElementById('uiSpread').innerText = d.market.spread.toFixed(3) + '%';
                 document.getElementById('totalNetGain').innerText = '$' + d.market.totalNetGain.toFixed(5);
