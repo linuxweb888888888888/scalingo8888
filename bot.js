@@ -32,7 +32,7 @@ const config = {
     maxStartSpread: 0.1,      
     roiThreshold: 5.0,        
     autoClosePct: 150,
-    autoExitRoi: 3.0,         // Exit all if any side hits 3% after a reset
+    autoExitRoi: 3.0,         
     pollInterval: 2000,
     resetCooldownMs: 3000,
     resetDiffThreshold: 1.5   
@@ -103,7 +103,9 @@ function logTrade(side, roi, pnl, type) {
 }
 
 async function flashReset(accIdxToReset) {
-    if (market.resetUsed) return;
+    // FIX: Block reset if bot is already liquidating/exiting
+    if (market.status !== 'Active' || market.resetUsed) return;
+
     const acc = config.accounts[accIdxToReset];
     const state = accountStates[acc.accountId];
     if (state.isLocked || state.volume === 0) return;
@@ -145,6 +147,7 @@ function startWS() {
 
                 const s1 = accountStates[1]; 
                 const s2 = accountStates[2];
+                if (!s1 || !s2) return;
                 
                 const lRoi = s1.entryPrice > 0 ? ((market.bid - s1.entryPrice) / s1.entryPrice) * config.leverage * 100 : s1.roi;
                 const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : s2.roi;
@@ -157,7 +160,8 @@ function startWS() {
 
                 const roiDifference = Math.abs(lRoi - sRoi);
 
-                if (!market.resetUsed && market.spread <= config.maxStartSpread) {
+                // FIX: Only trigger reset if status is explicitly 'Active'
+                if (market.status === 'Active' && !market.resetUsed && market.spread <= config.maxStartSpread) {
                     if (roiDifference >= config.resetDiffThreshold) {
                         lRoi < sRoi ? flashReset(0) : flashReset(1);
                     }
@@ -171,8 +175,12 @@ function startWS() {
 
 // ==================== MAIN LOOP ====================
 async function backgroundLoop() {
-    for (const acc of config.accounts) { await syncAccount(acc, accountStates[acc.accountId]); }
+    // Speed up sync by running all accounts in parallel
+    await Promise.all(config.accounts.map(acc => syncAccount(acc, accountStates[acc.accountId])));
+
     const s1 = accountStates[1]; const s2 = accountStates[2];
+    if (!s1 || !s2) return;
+
     const totalCurrentEquity = s1.currentEquity + s2.currentEquity;
     
     if (market.initialTotalEquity === 0 && totalCurrentEquity > 0) market.initialTotalEquity = totalCurrentEquity;
@@ -181,17 +189,22 @@ async function backgroundLoop() {
     
     market.balancePct = market.currentRatio > 0 ? (market.currentRatio / config.winLossRatio) * 100 : 0;
 
-    // --- NEW EXIT CONDITION AFTER RESET ---
-    if (market.resetUsed) {
-        if (s1.roi >= config.autoExitRoi || s2.roi >= config.autoExitRoi) {
-            await manualClose('AUTO EXIT');
+    // --- EXIT LOGIC ---
+    if (market.status === 'Active') {
+        if (market.resetUsed) {
+            if (s1.roi >= config.autoExitRoi || s2.roi >= config.autoExitRoi) {
+                await manualClose('AUTO EXIT');
+                return; // Stop loop here if we exit
+            }
+        }
+
+        if (market.balancePct >= config.autoClosePct && (s1.roi > config.roiThreshold || s2.roi > config.roiThreshold)) {
+            await manualClose('TARGET EXIT');
+            return;
         }
     }
 
-    if (market.balancePct >= config.autoClosePct && (s1.roi > config.roiThreshold || s2.roi > config.roiThreshold)) {
-        await manualClose('TARGET EXIT');
-    }
-
+    // --- OPENING LOGIC ---
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume === 0 && !state.isLocked && market.status === "Active") {
@@ -207,7 +220,12 @@ async function backgroundLoop() {
 }
 
 async function manualClose(type = 'MANUAL') {
+    if (market.status === "LIQUIDATING") return; 
     market.status = "LIQUIDATING";
+
+    // Lock account states to prevent backgroundLoop from doing anything
+    config.accounts.forEach(acc => { accountStates[acc.accountId].isLocked = true; });
+
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.volume > 0) {
@@ -217,8 +235,12 @@ async function manualClose(type = 'MANUAL') {
             });
         }
     }
+
     market.resetUsed = false;
-    setTimeout(() => { market.status = "Active"; }, 5000);
+    setTimeout(() => { 
+        config.accounts.forEach(acc => { accountStates[acc.accountId].isLocked = false; });
+        market.status = "Active"; 
+    }, 5000);
 }
 
 // ==================== UI DASHBOARD ====================
