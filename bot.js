@@ -28,9 +28,9 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 100,
-    winLossRatio: 1.5,
+    winLossRatio: 4,
     maxStartSpread: 0.15,
-    autoClosePct: 110,
+    autoClosePct: 150,
     pollInterval: 1000,
     resetCooldownMs: 3000,
     resetDiffThreshold: 2.5,  // TRIGGER: Difference Sum must reach this value
