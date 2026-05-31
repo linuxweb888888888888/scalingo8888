@@ -11,7 +11,7 @@ app.use(express.json());
 // ==================== CONFIGURATION ====================
 const apiAccounts = [];
 let accountIndex = 1;
-while (process.env[`HTX_API_KEY_${accountIndex}`]) {
+while (process.env[`HTX_API_KEY_${accountIndex}`] && accountIndex <= 2) {
     apiAccounts.push({
         apiKey: process.env[`HTX_API_KEY_${accountIndex}`],
         secretKey: process.env[`HTX_SECRET_KEY_${accountIndex}`],
@@ -29,12 +29,12 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 100, 
     winLossRatio: 1.5,        
-    maxStartSpread: 0.1,      
-    roiThreshold: 2.0,        
-    autoClosePct: 110,        
-    pollInterval: 1000,       
-    resetCooldownMs: 3000,
-    resetDiffThreshold: 2.5   // UPDATED: Trigger reset at 2% difference
+    maxStartSpread: 0.12,      
+    autoClosePct: 115,        // Increased to 115% to ensure fee coverage
+    pollInterval: 2000,       
+    resetCooldownMs: 4000,
+    resetDiffThreshold: 2.5,
+    takerFeeRate: 0.0005      // HTX Standard Taker Fee (0.05%)
 };
 
 let market = { 
@@ -42,7 +42,9 @@ let market = {
     currentRatio: 0, resetPenalty: 0, diffSum: 0,
     balancePct: 0, totalNetGain: 0, growthPct: 0, 
     initialTotalEquity: 0, resetUsed: false,
-    sessionResetLoss: 0       
+    sessionResetLoss: 0,
+    estExitFees: 0,           // NEW: Track estimated fees to close
+    netSessionUsdt: 0         // NEW: True PnL (Unrealized - Reset Loss - Fees)
 };
 
 let tradeHistory = []; 
@@ -66,7 +68,7 @@ async function htxRequest(account, method, path, data = {}) {
     const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
-        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 1500 });
+        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 2500 });
         return res.data;
     } catch (e) { return { status: 'error' }; }
 }
@@ -103,18 +105,19 @@ function logTrade(side, roi, pnl, type) {
 }
 
 async function flashReset(accIdxToReset) {
-    // RESTRICTION: market.resetUsed prevents a second reset until the strategy exits
     if (market.status !== 'Active' || market.resetUsed) return;
-
     const acc = config.accounts[accIdxToReset];
     const state = accountStates[acc.accountId];
     if (state.isLocked || state.volume === 0) return;
 
     state.isLocked = true;
-    market.resetUsed = true; // Lock reset for the rest of this session
+    market.resetUsed = true; 
     market.sessionResetLoss += Math.abs(state.unrealizedUsdt);
-    state.lastAction = "⚡ RESET";
     
+    // Add the fee for closing the loser and re-opening it
+    const resetFee = (state.volume * (market.bid || state.entryPrice) * config.takerFeeRate * 2); 
+    market.sessionResetLoss += resetFee;
+
     logTrade(state.direction, state.roi, state.unrealizedUsdt, 'RESET');
 
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
@@ -126,10 +129,7 @@ async function flashReset(accIdxToReset) {
         offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
     });
 
-    setTimeout(() => { 
-        state.isLocked = false; 
-        state.lastAction = "Idle";
-    }, config.resetCooldownMs);
+    setTimeout(() => { state.isLocked = false; }, config.resetCooldownMs);
 }
 
 // ==================== WS ENGINE ====================
@@ -150,22 +150,24 @@ function startWS() {
                 const s2 = accountStates[2];
                 if (!s1 || !s2) return;
                 
-                const lRoi = s1.entryPrice > 0 ? ((market.bid - s1.entryPrice) / s1.entryPrice) * config.leverage * 100 : s1.roi;
-                const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : s2.roi;
+                const lRoi = s1.entryPrice > 0 ? ((market.bid - s1.entryPrice) / s1.entryPrice) * config.leverage * 100 : 0;
+                const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : 0;
                 
-                const winRoi = Math.max(lRoi, sRoi);
-                
-                // UI METRIC: Sum Difference = Winning ROI + Reset Penalty ROI
-                market.diffSum = winRoi + market.resetPenalty;
+                market.diffSum = Math.max(lRoi, sRoi) + market.resetPenalty;
 
-                // INTERNAL: Recovery Multiplier
+                // FEE CALCULATION: How much will it cost to close what's open right now?
+                // Volume * Price * 0.0005
+                const fee1 = s1.volume > 0 ? (s1.volume * market.bid * config.takerFeeRate) : 0;
+                const fee2 = s2.volume > 0 ? (s2.volume * market.ask * config.takerFeeRate) : 0;
+                market.estExitFees = fee1 + fee2;
+
                 const winPnl = Math.max(s1.unrealizedUsdt, s2.unrealizedUsdt);
-                const totalDebt = Math.abs(Math.min(s1.unrealizedUsdt, s2.unrealizedUsdt)) + market.sessionResetLoss;
+                const totalDebt = Math.abs(Math.min(s1.unrealizedUsdt, s2.unrealizedUsdt)) + market.sessionResetLoss + market.estExitFees;
+                
                 market.currentRatio = totalDebt > 0 ? (winPnl / totalDebt) : 0;
+                market.netSessionUsdt = (s1.unrealizedUsdt + s2.unrealizedUsdt) - market.sessionResetLoss - market.estExitFees;
 
                 const roiDifference = Math.abs(lRoi - sRoi);
-
-                // RESET TRIGGER: Only if diff > 2.0% and haven't used the one reset yet
                 if (market.status === 'Active' && !market.resetUsed && market.spread <= config.maxStartSpread) {
                     if (roiDifference >= config.resetDiffThreshold) {
                         lRoi < sRoi ? flashReset(0) : flashReset(1);
@@ -188,27 +190,22 @@ async function backgroundLoop() {
     if (market.initialTotalEquity === 0 && totalCurrentEquity > 0) market.initialTotalEquity = totalCurrentEquity;
     market.totalNetGain = totalCurrentEquity - market.initialTotalEquity;
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
-    
     market.balancePct = market.currentRatio > 0 ? (market.currentRatio / config.winLossRatio) * 100 : 0;
 
     if (market.status === 'Active') {
-        const netUsdtSession = (s1.unrealizedUsdt + s2.unrealizedUsdt) - market.sessionResetLoss;
-        
-        // AUTO EXIT: Only if covered debt and net profitable
-        if (market.balancePct >= config.autoClosePct && netUsdtSession > 0) {
+        // STRICT EXIT: Only close if the Ratio is met AND the USDT PnL after all fees/resets is positive
+        if (market.balancePct >= config.autoClosePct && market.netSessionUsdt > 0) {
             await manualClose('TARGET EXIT');
             return;
         }
 
         for (const acc of config.accounts) {
             const state = accountStates[acc.accountId];
-            if (state.volume === 0 && !state.isLocked) {
+            if (state.volume === 0 && !state.isLocked && s1.volume === 0 && s2.volume === 0) {
                 if (market.spread > 0 && market.spread <= config.maxStartSpread) {
-                    state.isLocked = true;
                     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                         contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
                     });
-                    setTimeout(() => { state.isLocked = false; }, 2000);
                 }
             }
         }
@@ -218,10 +215,9 @@ async function backgroundLoop() {
 async function manualClose(type = 'MANUAL') {
     if (market.status === "LIQUIDATING") return; 
     market.status = "LIQUIDATING";
-    config.accounts.forEach(acc => { accountStates[acc.accountId].isLocked = true; });
-
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
+        state.isLocked = true;
         if (state.volume > 0) {
             logTrade(state.direction, state.roi, state.unrealizedUsdt, type);
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
@@ -229,152 +225,109 @@ async function manualClose(type = 'MANUAL') {
             });
         }
     }
-    
-    // RESET SESSION DATA
     market.resetUsed = false;
     market.sessionResetLoss = 0;
-    
     setTimeout(() => { 
         config.accounts.forEach(acc => { accountStates[acc.accountId].isLocked = false; });
         market.status = "Active"; 
-    }, 5000);
+    }, 8000);
 }
 
 // ==================== UI DASHBOARD ====================
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), tradeHistory, config }));
 app.post('/api/close', async (req, res) => { await manualClose(); res.json({status: 'ok'}); });
-
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8"><title>Ratio Hedge Engine</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap" rel="stylesheet">
     <style>
-        body { background: #0f172a; color: white; font-family: 'Inter', sans-serif; }
-        .card { background: #1e293b; border-radius: 20px; border: 1px solid #334155; }
-        .stat-label { font-size: 10px; font-weight: 900; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.1em; }
+        body { background: #0f172a; color: white; font-family: sans-serif; }
+        .card { background: #1e293b; border-radius: 15px; border: 1px solid #334155; }
+        .stat-label { font-size: 10px; font-weight: 800; color: #94a3b8; text-transform: uppercase; }
     </style>
 </head>
-<body class="p-4 md:p-10">
+<body class="p-5">
     <div class="max-w-4xl mx-auto">
-        <div class="flex justify-between items-center mb-10">
-            <div>
-                <h1 class="text-3xl font-black tracking-tighter uppercase italic">Ratio-Hedge <span class="text-indigo-500">Pro</span></h1>
-                <p id="botStatus" class="text-[10px] font-bold text-emerald-500 uppercase tracking-widest mt-1">Engine Online</p>
-            </div>
+        <div class="flex justify-between items-center mb-8">
+            <h1 class="text-2xl font-black italic text-indigo-400">FEE-AWARE HEDGE</h1>
             <div class="text-right">
-                <p id="totalNetGain" class="text-3xl font-black text-white">$0.00000</p>
-                <p id="growthPct" class="stat-label text-emerald-400">Total Profit: 0.00%</p>
+                <p id="netSession" class="text-2xl font-black text-emerald-400">$0.00</p>
+                <p class="stat-label">Net Session (After Fees)</p>
             </div>
         </div>
 
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-            <div class="card p-6 border-l-4 border-indigo-500">
-                <p class="stat-label mb-1">Debt Coverage Ratio</p>
-                <p id="uiRatio" class="text-3xl font-black text-white">0.00x</p>
-                <p class="text-[9px] text-slate-500 mt-1">Target: ${config.winLossRatio}x</p>
+        <div class="grid grid-cols-3 gap-4 mb-6">
+            <div class="card p-4">
+                <p class="stat-label">Debt Ratio</p>
+                <p id="uiRatio" class="text-xl font-bold">0.00x</p>
             </div>
-            <div class="card p-6 border-l-4 border-rose-500">
-                <p class="stat-label mb-1">ROI If Reset Now</p>
-                <p id="uiPenalty" class="text-3xl font-black text-rose-400">-0.00%</p>
-                <div class="mt-2 pt-2 border-t border-slate-700">
-                   <p class="stat-label text-[9px]">Difference Sum (Win + Reset ROI)</p>
-                   <p id="uiDiffSum" class="text-lg font-black text-emerald-400">+0.00%</p>
-                </div>
+            <div class="card p-4">
+                <p class="stat-label">Est. Exit Fees</p>
+                <p id="uiFees" class="text-xl font-bold text-rose-400">-$0.00</p>
             </div>
-            <div class="card p-6 border-l-4 border-slate-500">
-                <p class="stat-label mb-1">Market Spread</p>
-                <p id="uiSpread" class="text-3xl font-black text-white">0.000%</p>
-                <p class="text-[9px] text-slate-500 mt-1">Status: <span id="marketStatus">Active</span></p>
+            <div class="card p-4">
+                <p class="stat-label">Session Reset Loss</p>
+                <p id="uiResetLoss" class="text-xl font-bold text-rose-500">-$0.00</p>
             </div>
         </div>
 
-        <div class="card p-8 mb-8">
-            <div class="flex justify-between items-end mb-4">
-                <p class="stat-label">Recovery Progress (Exit @ ${config.autoClosePct}%)</p>
-                <p id="balPct" class="text-2xl font-black text-white">0.0%</p>
+        <div class="card p-6 mb-6">
+            <div class="flex justify-between mb-2">
+                <span class="stat-label">Recovery Progress</span>
+                <span id="balPct" class="font-bold">0%</span>
             </div>
-            <div class="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
-                <div id="balBar" class="bg-indigo-500 h-full w-0 transition-all duration-500"></div>
-            </div>
-            <div class="grid grid-cols-2 gap-10 mt-8">
-                <div>
-                    <p class="stat-label text-emerald-500">Long Position</p>
-                    <p id="lRoi" class="text-4xl font-black">0.00%</p>
-                    <p id="lPnl" class="text-sm font-bold text-slate-500">$0.00000</p>
-                </div>
-                <div class="text-right">
-                    <p class="stat-label text-rose-500">Short Position</p>
-                    <p id="sRoi" class="text-4xl font-black">0.00%</p>
-                    <p id="sPnl" class="text-sm font-bold text-slate-500">$0.00000</p>
-                </div>
+            <div class="w-full bg-slate-800 h-3 rounded-full overflow-hidden">
+                <div id="balBar" class="bg-indigo-500 h-full w-0 transition-all"></div>
             </div>
         </div>
 
-        <div class="card overflow-hidden mb-8">
-            <table class="w-full text-left text-[11px]">
-                <thead class="bg-slate-800/50">
-                    <tr>
-                        <th class="p-4 stat-label">Time</th>
-                        <th class="p-4 stat-label">Type</th>
-                        <th class="p-4 stat-label">Side</th>
-                        <th class="p-4 stat-label">ROI</th>
-                        <th class="p-4 stat-label">PnL</th>
-                        <th class="p-4 stat-label">Session Total</th>
-                    </tr>
+        <div class="grid grid-cols-2 gap-4 mb-6 text-center">
+            <div class="card p-4">
+                <p class="stat-label">Long ROI</p>
+                <p id="lRoi" class="text-3xl font-black">0%</p>
+            </div>
+            <div class="card p-4">
+                <p class="stat-label">Short ROI</p>
+                <p id="sRoi" class="text-3xl font-black">0%</p>
+            </div>
+        </div>
+
+        <div class="card overflow-hidden mb-6">
+            <table class="w-full text-left text-[10px]">
+                <thead class="bg-slate-800">
+                    <tr><th class="p-3">Time</th><th>Type</th><th>Side</th><th>ROI</th><th>PnL</th><th>Session Total</th></tr>
                 </thead>
-                <tbody id="historyBody" class="divide-y divide-slate-700"></tbody>
+                <tbody id="historyBody"></tbody>
             </table>
         </div>
 
-        <button onclick="triggerClose()" class="w-full py-5 rounded-2xl bg-white text-black font-black uppercase tracking-widest hover:bg-rose-500 hover:text-white transition-all shadow-2xl active:scale-95">
-            Emergency Liquidation
-        </button>
+        <button onclick="triggerClose()" class="w-full py-4 rounded-xl bg-rose-600 font-bold uppercase hover:bg-rose-700">Liquidate All</button>
     </div>
 
     <script>
-        async function triggerClose() { if(confirm("Liquidate all?")) fetch('/api/close', {method:'POST'}); }
+        async function triggerClose() { if(confirm("Close all?")) fetch('/api/close', {method:'POST'}); }
         setInterval(async () => {
-            try {
-                const r = await fetch('/api/status'); 
-                const d = await r.json();
-                
-                document.getElementById('uiRatio').innerText = d.market.currentRatio.toFixed(2) + 'x';
-                document.getElementById('uiPenalty').innerText = d.market.resetPenalty.toFixed(2) + '%';
-                document.getElementById('marketStatus').innerText = (d.market.resetUsed ? 'RESET USED' : d.market.status);
-                
-                document.getElementById('uiDiffSum').innerText = (d.market.diffSum >= 0 ? '+' : '') + d.market.diffSum.toFixed(2) + '%';
-                document.getElementById('uiDiffSum').className = 'text-lg font-black ' + (d.market.diffSum >= 0 ? 'text-emerald-400' : 'text-rose-400');
-                
-                document.getElementById('uiSpread').innerText = d.market.spread.toFixed(3) + '%';
-                document.getElementById('totalNetGain').innerText = (d.market.totalNetGain >= 0 ? '$' : '-$') + Math.abs(d.market.totalNetGain).toFixed(5);
-                document.getElementById('growthPct').innerText = 'Total Profit: ' + d.market.growthPct.toFixed(2) + '%';
-                document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
-                document.getElementById('balBar').style.width = Math.min(100, d.market.balancePct) + '%';
+            const r = await fetch('/api/status'); const d = await r.json();
+            document.getElementById('netSession').innerText = '$' + d.market.netSessionUsdt.toFixed(5);
+            document.getElementById('uiRatio').innerText = d.market.currentRatio.toFixed(2) + 'x';
+            document.getElementById('uiFees').innerText = '-$' + d.market.estExitFees.toFixed(5);
+            document.getElementById('uiResetLoss').innerText = '-$' + d.market.sessionResetLoss.toFixed(5);
+            document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
+            document.getElementById('balBar').style.width = Math.min(100, d.market.balancePct) + '%';
+            
+            d.accounts.forEach((a, i) => {
+                const el = document.getElementById(i === 0 ? 'lRoi' : 'sRoi');
+                el.innerText = a.roi.toFixed(2) + '%';
+                el.style.color = a.roi >= 0 ? '#34d399' : '#f87171';
+            });
 
-                d.accounts.forEach(function(a, i) {
-                    const p = i === 0 ? 'l' : 's';
-                    document.getElementById(p+'Roi').innerText = a.roi.toFixed(2)+'%';
-                    document.getElementById(p+'Roi').className = 'text-4xl font-black ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
-                    document.getElementById(p+'Pnl').innerText = (a.unrealizedUsdt >= 0 ? '$' : '-$') + Math.abs(a.unrealizedUsdt).toFixed(5);
-                });
-
-                let tableHtml = '';
-                d.tradeHistory.forEach(function(h) {
-                    tableHtml += '<tr>' +
-                        '<td class="p-4 text-slate-400 font-bold">' + h.time + '</td>' +
-                        '<td class="p-4 text-indigo-400 font-black italic">' + h.type + '</td>' +
-                        '<td class="p-4 font-bold">' + h.side + '</td>' +
-                        '<td class="p-4 ' + (parseFloat(h.roi) >= 0 ? 'text-emerald-400' : 'text-rose-400') + ' font-black">' + h.roi + '</td>' +
-                        '<td class="p-4 font-bold">$' + h.pnl + '</td>' +
-                        '<td class="p-4 font-black text-white">$' + h.total + '</td>' +
-                        '</tr>';
-                });
-                document.getElementById('historyBody').innerHTML = tableHtml;
-
-            } catch(e) { console.log(e); }
+            let html = '';
+            d.tradeHistory.forEach(h => {
+                html += '<tr class="border-t border-slate-700"><td class="p-3">'+h.time+'</td><td class="text-indigo-400">'+h.type+'</td><td>'+h.side+'</td><td class="font-bold">'+h.roi+'</td><td>$'+h.pnl+'</td><td class="font-bold">$'+h.total+'</td></tr>';
+            });
+            document.getElementById('historyBody').innerHTML = html;
         }, 1000);
     </script>
 </body></html>`);
@@ -382,4 +335,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Strict 1-Reset Mode)`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Fee-Aware Engine Online`));
