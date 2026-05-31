@@ -128,7 +128,7 @@ async function flashReset(accIdxToReset) {
     }, config.resetCooldownMs);
 }
 
-// ==================== WS ENGINE (FIXED MATH) ====================
+// ==================== WS ENGINE (SUM FIX) ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -141,24 +141,23 @@ function startWS() {
                 market.ask = msg.tick.ask[0];
                 market.spread = ((market.ask - market.bid) / market.bid) * 100;
                 
-                // Box 2: Penalty (Spread * Leverage)
+                // BOX 2: Reset Penalty
                 market.resetPenalty = -(market.spread * config.leverage);
 
                 const s1 = accountStates[1]; 
                 const s2 = accountStates[2];
                 
-                // Calculate Live ROIs
-                const lRoi = s1.entryPrice > 0 ? ((market.bid - s1.entryPrice) / s1.entryPrice) * config.leverage * 100 : 0;
-                const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : 0;
+                // Robust ROI logic: Use Live calculation if entryPrice exists, else fallback to latest Synced ROI
+                const lRoi = s1.entryPrice > 0 ? ((market.bid - s1.entryPrice) / s1.entryPrice) * config.leverage * 100 : s1.roi;
+                const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : s2.roi;
                 
                 const winRoi = Math.max(lRoi, sRoi);
                 const loseRoi = Math.min(lRoi, sRoi);
 
-                // Ratio: Lose ROI divided by Penalty magnitude
+                // Win/Loss Ratio Calculation
                 market.currentRatio = Math.abs(market.resetPenalty) > 0.001 ? (loseRoi / Math.abs(market.resetPenalty)) : 0;
                 
-                // FIXED SUM: Winner's actual ROI + Reset Penalty
-                // If Winner is 0.55 and Penalty is -1.09, this results in -0.54
+                // STICKY SUM: This now forces winRoi to be added to resetPenalty
                 market.diffSum = winRoi + market.resetPenalty;
 
                 const roiDifference = Math.abs(lRoi - sRoi);
@@ -321,7 +320,6 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); const d = await r.json();
                 
                 document.getElementById('uiRatio').innerText = d.market.currentRatio.toFixed(2) + 'x';
-                
                 document.getElementById('uiPenalty').innerText = d.market.resetPenalty.toFixed(2) + '%';
                 
                 document.getElementById('uiDiffSum').innerText = (d.market.diffSum >= 0 ? '+' : '') + d.market.diffSum.toFixed(2) + '%';
