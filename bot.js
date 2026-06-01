@@ -28,7 +28,8 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
-    takeProfitPct: 2.0, // Set to 2%
+    takeProfitPct: 2.0, 
+    profitToLossRatio: 1.5, // 50% more profit than loss (1.5:1)
     pollInterval: 1500,
     takerFeeRate: 0.0005
 };
@@ -37,7 +38,7 @@ let market = {
     status: 'Active', bid: 0, ask: 0, spread: 0,
     totalNetGain: 0, growthPct: 0,
     initialTotalEquity: 0,
-    sessionRealizedProfit: 0, // Track profit made from TPs
+    sessionRealizedProfit: 0, 
     netSessionUsdt: 0
 };
 
@@ -106,21 +107,14 @@ async function executeAction(accIdx, type) {
     state.isLocked = true;
     state.lastAction = type;
     
-    // Close Position
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
         contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
         offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
     });
 
-    if (type === 'TAKE_PROFIT') {
-        market.sessionRealizedProfit += state.unrealizedUsdt;
-    } else if (type === 'STOP_LOSS') {
-        market.sessionRealizedProfit += state.unrealizedUsdt;
-    }
-
+    market.sessionRealizedProfit += state.unrealizedUsdt;
     logTrade(state.direction, state.roi, state.unrealizedUsdt, type);
 
-    // Re-open fresh position
     setTimeout(async () => {
         await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
             contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, 
@@ -150,17 +144,19 @@ function startWS() {
                 
                 market.netSessionUsdt = (s1.unrealizedUsdt + s2.unrealizedUsdt) + market.sessionRealizedProfit;
 
-                // Individual side logic
                 [s1, s2].forEach((state, idx) => {
                     if (state.volume > 0 && !state.isLocked) {
-                        // 1. Take Profit at 2%
+                        // TAKE PROFIT: Trigger at 2% ROI
                         if (state.roi >= config.takeProfitPct) {
                             executeAction(idx, 'TAKE_PROFIT');
                         }
-                        // 2. Stop Loss only if current loss < total realized profit
+                        // STOP LOSS: Trigger only if loss is less than (Profit / 1.5)
+                        // This ensures profit stays 50% higher than losses.
                         else if (state.roi < 0) {
                             const currentLossAbs = Math.abs(state.unrealizedUsdt);
-                            if (currentLossAbs < market.sessionRealizedProfit && market.sessionRealizedProfit > 0) {
+                            const maxAllowedLoss = market.sessionRealizedProfit / config.profitToLossRatio;
+                            
+                            if (market.sessionRealizedProfit > 0 && currentLossAbs <= maxAllowedLoss) {
                                 executeAction(idx, 'STOP_LOSS');
                             }
                         }
@@ -184,7 +180,6 @@ async function backgroundLoop() {
     market.totalNetGain = totalCurrentEquity - market.initialTotalEquity;
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
 
-    // Auto-initiate positions if empty
     if (market.status === 'Active') {
         if (s1.volume === 0 && s2.volume === 0 && !s1.isLocked && !s2.isLocked) {
             for (const acc of config.accounts) {
@@ -222,18 +217,22 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>TP/SL Hedge Engine</title>
+    <meta charset="UTF-8"><title>1.5x Ratio Engine</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         body { background: #0f172a; color: white; font-family: sans-serif; }
         .card { background: #1e293b; border-radius: 15px; padding: 20px; border: 1px solid #334155; }
         .stat-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; font-weight: bold; }
+        .ratio-badge { background: #4f46e5; padding: 2px 8px; border-radius: 4px; font-size: 10px; }
     </style>
 </head>
 <body class="p-10">
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-8">
-            <h1 class="text-2xl font-bold">Hedge <span class="text-indigo-400">TP/SL</span></h1>
+            <div>
+                <h1 class="text-2xl font-bold">Profit <span class="text-indigo-400">1.5x</span> Loss</h1>
+                <span class="ratio-badge">Targeting 50% More Gains than Losses</span>
+            </div>
             <div class="text-right">
                 <p id="totalNetGain" class="text-2xl font-bold">$0.00</p>
                 <p id="growthPct" class="text-xs text-emerald-400">0.00%</p>
@@ -241,11 +240,12 @@ app.get('/', (req, res) => {
         </div>
 
         <div class="grid grid-cols-2 gap-6 mb-6">
-            <div class="card">
-                <p class="stat-label">Realized Session Profit</p>
+            <div class="card border-l-4 border-indigo-500">
+                <p class="stat-label">Realized (The Shield)</p>
                 <p id="realizedProfit" class="text-3xl font-bold text-emerald-400">$0.00</p>
+                <p class="text-[10px] text-slate-500 mt-1">SL capped at 66% of this value</p>
             </div>
-            <div class="card">
+            <div class="card border-l-4 border-slate-600">
                 <p class="stat-label">Net Session PnL</p>
                 <p id="netSession" class="text-3xl font-bold text-white">$0.00</p>
             </div>
@@ -254,12 +254,12 @@ app.get('/', (req, res) => {
         <div class="card mb-6">
             <div class="grid grid-cols-2 gap-10">
                 <div>
-                    <p class="stat-label text-emerald-500">Long Side</p>
+                    <p class="stat-label text-emerald-500">Long Position</p>
                     <p id="lRoi" class="text-4xl font-bold">0.00%</p>
                     <p id="lPnl" class="text-slate-400">$0.00</p>
                 </div>
                 <div class="text-right">
-                    <p class="stat-label text-rose-500">Short Side</p>
+                    <p class="stat-label text-rose-500">Short Position</p>
                     <p id="sRoi" class="text-4xl font-bold">0.00%</p>
                     <p id="sPnl" class="text-slate-400">$0.00</p>
                 </div>
@@ -291,7 +291,7 @@ app.get('/', (req, res) => {
 
             let html = '';
             d.tradeHistory.forEach(h => {
-                html += '<tr class="border-b border-slate-800/50"><td class="py-2">' + h.time + '</td><td class="font-bold text-indigo-400">' + h.type + '</td><td>' + h.side + '</td><td class="font-bold">' + h.roi + '</td><td>$' + h.pnl + '</td></tr>';
+                html += '<tr class="border-b border-slate-800/50"><td class="py-2">' + h.time + '</td><td class="font-bold text-indigo-400 italic">' + h.type + '</td><td>' + h.side + '</td><td class="font-bold">' + h.roi + '</td><td>$' + h.pnl + '</td></tr>';
             });
             document.getElementById('historyBody').innerHTML = html;
         }, 1000);
@@ -301,4 +301,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`TP/SL Engine Online (TP: 2%)`));
+app.listen(config.port, '0.0.0.0', () => console.log(`1.5x Ratio Engine Online`));
