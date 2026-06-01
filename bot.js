@@ -1,6 +1,5 @@
 require('dotenv').config();
 const express = require('express');
-const crypto = require('crypto');
 const WebSocket = require('ws');
 const zlib = require('zlib');
 
@@ -10,85 +9,81 @@ app.use(express.json());
 // ==================== CONFIGURATION ====================
 const config = {
     symbol: 'DOGE-USDT',
-    leverage: 20, // DOGE moves fast, higher leverage common for hedging
-    port: process.env.PORT || 3000,
+    leverage: 20,
+    port: 3000,
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
-    numAccounts: 50, // Total 50 accounts (25 Long / 25 Short)
-    initialPaperBalance: 1000, // $1,000 per paper account
-    baseVolume: 500, // 500 DOGE contracts per trade
-    winLossRatio: 1.5,
-    resetDiffThreshold: 1.2, // Trigger reset at 1.2% difference
+    totalAccounts: 50,
+    baseVolume: 1000,        // 1000 DOGE per account
+    resetDiffThreshold: 1.5, // Reset trigger percentage
     takerFeeRate: 0.0005,
-    pollInterval: 1000
+    initialBalance: 1000
 };
 
-let market = { 
-    bid: 0, ask: 0, spread: 0,
-    totalNetGain: 0, initialTotalEquity: config.numAccounts * config.initialPaperBalance,
-    status: 'Active'
-};
-
-let accountStates = {};
+let market = { bid: 0, ask: 0, spread: 0, status: 'WAITING FOR DATA', totalNetGain: 0 };
 let tradeHistory = [];
+let accounts = {};
 
-// Initialize 50 Paper Accounts
-for (let i = 1; i <= config.numAccounts; i++) {
-    accountStates[i] = {
+// Initialize 50 Accounts (1-25 are Long, 26-50 are Short)
+for (let i = 1; i <= config.totalAccounts; i++) {
+    accounts[i] = {
         id: i,
-        direction: i <= config.numAccounts / 2 ? 'buy' : 'sell', // Half Long, Half Short
+        direction: i <= 25 ? 'buy' : 'sell',
+        pairId: i <= 25 ? i : i - 25, // Pair 1 is Acc 1 and Acc 26
         volume: 0,
         entryPrice: 0,
         roi: 0,
-        unrealizedUsdt: 0,
-        balance: config.initialPaperBalance,
-        initialEquity: config.initialPaperBalance,
-        lastAction: 'Idle',
-        resetUsed: false,
-        sessionLoss: 0
+        pnl: 0,
+        balance: config.initialBalance,
+        lastAction: 'Idle'
     };
 }
 
-// ==================== VIRTUAL BROKER (PAPER TRADING) ====================
-function executeVirtualOrder(accId, side, type) {
-    const state = accountStates[accId];
-    const price = side === 'buy' ? market.ask : market.bid;
-    const fee = (config.baseVolume * price * config.takerFeeRate);
+// ==================== ENGINE CORE ====================
 
-    if (type === 'open') {
-        state.volume = config.baseVolume;
-        state.entryPrice = price;
-        state.balance -= fee;
-        state.lastAction = 'OPENED ' + side.toUpperCase();
-    } else {
-        // Calculate realized PnL
-        const pnl = state.direction === 'buy' 
-            ? (price - state.entryPrice) * state.volume 
-            : (state.entryPrice - price) * state.volume;
-        
-        state.balance += (pnl - fee);
-        state.volume = 0;
-        state.entryPrice = 0;
-        state.lastAction = 'CLOSED ' + side.toUpperCase();
-        
-        logTrade(state.direction, state.roi, pnl, 'PAPER_EXIT');
-    }
-}
-
-function logTrade(side, roi, pnl, type) {
-    tradeHistory.unshift({ 
-        time: new Date().toLocaleTimeString(), 
-        side: side.toUpperCase(), 
-        roi: roi.toFixed(2) + '%', 
-        pnl: pnl.toFixed(4), 
-        type: type 
+function logTrade(id, type, side, pnl) {
+    tradeHistory.unshift({
+        time: new Date().toLocaleTimeString(),
+        acc: id,
+        type: type,
+        side: side.toUpperCase(),
+        pnl: pnl.toFixed(4)
     });
-    if (tradeHistory.length > 20) tradeHistory.pop();
+    if (tradeHistory.length > 30) tradeHistory.pop();
 }
 
-// ==================== WS ENGINE ====================
+function openPosition(id) {
+    const acc = accounts[id];
+    const price = acc.direction === 'buy' ? market.ask : market.bid;
+    const fee = config.baseVolume * price * config.takerFeeRate;
+    
+    acc.entryPrice = price;
+    acc.volume = config.baseVolume;
+    acc.balance -= fee;
+    acc.lastAction = 'OPEN';
+    // No logging for mass start to keep feed clean, only logging resets
+}
+
+function resetAccount(id) {
+    const acc = accounts[id];
+    const priceClose = acc.direction === 'buy' ? market.bid : market.ask;
+    const pnl = acc.direction === 'buy' 
+        ? (priceClose - acc.entryPrice) * acc.volume 
+        : (acc.entryPrice - priceClose) * acc.volume;
+    const fee = acc.volume * priceClose * config.takerFeeRate;
+    
+    acc.balance += (pnl - fee);
+    logTrade(id, 'RESET', acc.direction, pnl - fee);
+
+    // Re-open at new price
+    const priceOpen = acc.direction === 'buy' ? market.ask : market.bid;
+    const feeOpen = config.baseVolume * priceOpen * config.takerFeeRate;
+    acc.entryPrice = priceOpen;
+    acc.balance -= feeOpen;
+}
+
 function startWS() {
     const ws = new WebSocket(config.wsHost);
-    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'paper_doge' })));
+    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo` })));
     
     ws.on('message', (data) => {
         zlib.gunzip(data, (err, dec) => {
@@ -98,28 +93,41 @@ function startWS() {
                 market.bid = msg.tick.bid[0];
                 market.ask = msg.tick.ask[0];
                 market.spread = ((market.ask - market.bid) / market.bid) * 100;
+                market.status = 'ACTIVE';
 
-                // Update All 50 Accounts
-                let currentTotalEquity = 0;
-                Object.keys(accountStates).forEach(id => {
-                    const s = accountStates[id];
-                    if (s.volume > 0) {
-                        const price = s.direction === 'buy' ? market.bid : market.ask;
-                        s.roi = s.direction === 'buy' 
-                            ? ((price - s.entryPrice) / s.entryPrice) * config.leverage * 100
-                            : ((s.entryPrice - price) / s.entryPrice) * config.leverage * 100;
-                        s.unrealizedUsdt = s.direction === 'buy'
-                            ? (price - s.entryPrice) * s.volume
-                            : (s.entryPrice - price) * s.volume;
+                let tempTotalGain = 0;
+
+                // 1. MASS START & UPDATE STATS
+                for (let i = 1; i <= config.totalAccounts; i++) {
+                    const acc = accounts[i];
+                    
+                    // Trigger "START ALL" if not opened
+                    if (acc.volume === 0) openPosition(i);
+
+                    // Update live ROI and PnL
+                    const curPrice = acc.direction === 'buy' ? market.bid : market.ask;
+                    acc.pnl = acc.direction === 'buy'
+                        ? (curPrice - acc.entryPrice) * acc.volume
+                        : (acc.entryPrice - curPrice) * acc.volume;
+                    acc.roi = (acc.pnl / (acc.entryPrice * acc.volume / config.leverage)) * 100;
+                    
+                    tempTotalGain += (acc.pnl + (acc.balance - config.initialBalance));
+                }
+                market.totalNetGain = tempTotalGain;
+
+                // 2. PAIR RESET LOGIC (Checking 25 pairs)
+                for (let p = 1; p <= 25; p++) {
+                    const longAcc = accounts[p];
+                    const shortAcc = accounts[p + 25];
+
+                    const diffSum = Math.max(longAcc.roi, shortAcc.roi) - (market.spread * config.leverage);
+                    
+                    if (diffSum >= config.resetDiffThreshold) {
+                        // Reset the one with the lower ROI in the pair
+                        const loserId = longAcc.roi < shortAcc.roi ? longAcc.id : shortAcc.id;
+                        resetAccount(loserId);
                     }
-                    currentTotalEquity += (s.balance + s.unrealizedUsdt);
-                });
-                
-                market.totalNetGain = currentTotalEquity - market.initialTotalEquity;
-
-                // Simple Logic: Logic for Pair 1 (Account 1 and 26)
-                // In a production environment, you'd loop through pairs
-                checkLogic(1, 26); 
+                }
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
         });
@@ -127,117 +135,96 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-function checkLogic(longId, shortId) {
-    const s1 = accountStates[longId];
-    const s2 = accountStates[shortId];
+// ==================== DASHBOARD ====================
 
-    if (s1.volume === 0 && s2.volume === 0) {
-        executeVirtualOrder(longId, 'buy', 'open');
-        executeVirtualOrder(shortId, 'sell', 'open');
-    }
-
-    // Reset Logic Example for Pair
-    const diffSum = Math.max(s1.roi, s2.roi) - (market.spread * config.leverage);
-    if (diffSum >= config.resetDiffThreshold && !s1.resetUsed) {
-        const loserId = s1.roi < s2.roi ? longId : shortId;
-        executeVirtualOrder(loserId, accountStates[loserId].direction === 'buy' ? 'sell' : 'buy', 'close');
-        executeVirtualOrder(loserId, accountStates[loserId].direction, 'open');
-        accountStates[loserId].resetUsed = true;
-    }
-}
-
-// ==================== UI DASHBOARD ====================
-app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), tradeHistory, config }));
+app.get('/status', (req, res) => res.json({ market, accounts, tradeHistory }));
 
 app.get('/', (req, res) => {
-    res.send(`<!DOCTYPE html><html><head>
-    <title>50 Account DOGE Paper Engine</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body { background: #020617; color: white; font-family: sans-serif; }
-        .acc-card { background: #0f172a; border: 1px solid #1e293b; padding: 10px; border-radius: 8px; font-size: 11px; }
-    </style>
-</head>
-<body class="p-8">
-    <div class="max-w-7xl mx-auto">
-        <div class="flex justify-between items-center mb-8">
-            <div>
-                <h1 class="text-2xl font-black text-indigo-400">DOGE PAPER-HEDGE CLUSTER</h1>
-                <p class="text-slate-400">Simulating 50 Accounts (25 Pairs) on Real-Time Market Data</p>
-            </div>
-            <div class="text-right">
-                <p class="text-sm text-slate-400 font-bold uppercase">Total Net Cluster PnL</p>
-                <p id="totalNet" class="text-4xl font-black">$0.00</p>
-            </div>
-        </div>
+    res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>50-Acc DOGE Cluster</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <style>
+            body { background: #020617; color: white; font-family: 'Inter', sans-serif; }
+            .grid-container { display: grid; grid-template-columns: repeat(10, 1fr); gap: 8px; }
+            .acc-box { background: #0f172a; border: 1px solid #1e293b; padding: 8px; border-radius: 4px; text-align: center; }
+            .roi-text { font-weight: 900; font-size: 14px; }
+        </head>
+        <body class="p-6">
+            <div class="max-w-7xl mx-auto">
+                <div class="flex justify-between items-end mb-6">
+                    <div>
+                        <h1 class="text-xl font-black text-indigo-500 uppercase tracking-tighter">DOGE Cluster Engine</h1>
+                        <p class="text-xs text-slate-500">50 Virtual Accounts | DOGE-USDT | 20x Leverage</p>
+                    </div>
+                    <div class="text-right">
+                        <p class="text-xs font-bold text-slate-500">CLUSTER NET PNL</p>
+                        <p id="totalNet" class="text-4xl font-black text-white">$0.00</p>
+                    </div>
+                </div>
 
-        <div class="grid grid-cols-2 md:grid-cols-5 lg:grid-cols-10 gap-3 mb-8" id="accountGrid">
-            <!-- 50 accounts will be injected here -->
-        </div>
+                <div class="grid-container mb-8" id="accGrid"></div>
 
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-            <div class="bg-slate-900 p-6 rounded-xl border border-slate-800">
-                <h2 class="font-bold mb-4 uppercase text-slate-500">Live Trade Feed</h2>
-                <div id="feed" class="space-y-2 h-64 overflow-y-auto pr-2"></div>
-            </div>
-            <div class="bg-slate-900 p-6 rounded-xl border border-slate-800">
-                <h2 class="font-bold mb-4 uppercase text-slate-500">Market Metrics</h2>
-                <div class="space-y-4">
-                    <div class="flex justify-between"><span>DOGE Price:</span><span id="price" class="font-mono">0.0000</span></div>
-                    <div class="flex justify-between"><span>Market Spread:</span><span id="spread" class="text-rose-400">0.00%</span></div>
-                    <div class="flex justify-between"><span>Active Accounts:</span><span>50/50</span></div>
+                <div class="grid grid-cols-3 gap-6">
+                    <div class="col-span-2 bg-slate-900/50 p-4 rounded-lg border border-slate-800">
+                        <h3 class="text-xs font-bold text-slate-500 mb-3 uppercase">Reset History</h3>
+                        <div id="logs" class="space-y-1 h-48 overflow-y-auto text-[10px] font-mono"></div>
+                    </div>
+                    <div class="bg-slate-900/50 p-4 rounded-lg border border-slate-800">
+                        <h3 class="text-xs font-bold text-slate-500 mb-3 uppercase">Market Data</h3>
+                        <div class="text-sm space-y-2">
+                            <div class="flex justify-between"><span>DOGE:</span><span id="price" class="text-indigo-400 font-bold">0.0000</span></div>
+                            <div class="flex justify-between"><span>Spread:</span><span id="spread">0.00%</span></div>
+                            <div class="flex justify-between"><span>Status:</span><span id="status" class="text-emerald-400">WAITING</span></div>
+                        </div>
+                    </div>
                 </div>
             </div>
-        </div>
-    </div>
 
-    <script>
-        // Create 50 account slots
-        const grid = document.getElementById('accountGrid');
-        for(let i=1; i<=50; i++) {
-            grid.innerHTML += \`<div id="acc-\${i}" class="acc-card">
-                <div class="flex justify-between border-b border-slate-800 pb-1 mb-1">
-                    <span class="font-bold text-indigo-400">#\${i}</span>
-                    <span id="dir-\${i}" class="uppercase"></span>
-                </div>
-                <div id="roi-\${i}" class="font-black text-lg">0%</div>
-                <div id="bal-\${i}" class="text-slate-500">$\${i}</div>
-            </div>\`;
-        }
+            <script>
+                const grid = document.getElementById('accGrid');
+                for(let i=1; i<=50; i++) {
+                    grid.innerHTML += \`
+                        <div id="box-\${i}" class="acc-box">
+                            <div class="text-[9px] text-slate-500 font-bold">#\${i} \${i<=25?'L':'S'}</div>
+                            <div id="roi-\${i}" class="roi-text">0.0%</div>
+                        </div>
+                    \`;
+                }
 
-        setInterval(async () => {
-            const r = await fetch('/api/status');
-            const d = await r.json();
+                setInterval(async () => {
+                    const res = await fetch('/status');
+                    const d = await res.json();
+                    
+                    document.getElementById('totalNet').innerText = (d.market.totalNetGain >= 0 ? '$' : '-$') + Math.abs(d.market.totalNetGain).toFixed(2);
+                    document.getElementById('totalNet').className = 'text-4xl font-black ' + (d.market.totalNetGain >= 0 ? 'text-emerald-400' : 'text-rose-500');
+                    document.getElementById('price').innerText = d.market.bid;
+                    document.getElementById('spread').innerText = d.market.spread.toFixed(3) + '%';
+                    document.getElementById('status').innerText = d.market.status;
 
-            document.getElementById('totalNet').innerText = '$' + d.market.totalNetGain.toFixed(2);
-            document.getElementById('totalNet').className = 'text-4xl font-black ' + (d.market.totalNetGain >= 0 ? 'text-emerald-400' : 'text-rose-500');
-            document.getElementById('price').innerText = d.market.bid;
-            document.getElementById('spread').innerText = d.market.spread.toFixed(4) + '%';
+                    Object.values(d.accounts).forEach(acc => {
+                        const el = document.getElementById('roi-'+acc.id);
+                        el.innerText = acc.roi.toFixed(1) + '%';
+                        el.className = 'roi-text ' + (acc.roi >= 0 ? 'text-emerald-400' : 'text-rose-500');
+                        document.getElementById('box-'+acc.id).style.borderColor = acc.roi > 5 ? '#10b981' : acc.roi < -5 ? '#f43f5e' : '#1e293b';
+                    });
 
-            d.accounts.forEach(a => {
-                const card = document.getElementById('acc-' + a.id);
-                document.getElementById('roi-' + a.id).innerText = a.roi.toFixed(1) + '%';
-                document.getElementById('roi-' + a.id).className = 'font-black text-lg ' + (a.roi >= 0 ? 'text-emerald-400' : 'text-rose-500');
-                document.getElementById('dir-' + a.id).innerText = a.direction;
-                document.getElementById('bal-' + a.id).innerText = '$' + (a.balance + a.unrealizedUsdt).toFixed(2);
-                
-                if(a.roi > 5) card.style.borderColor = '#10b981';
-                else if(a.roi < -5) card.style.borderColor = '#f43f5e';
-                else card.style.borderColor = '#1e293b';
-            });
-
-            const feed = document.getElementById('feed');
-            feed.innerHTML = d.tradeHistory.map(h => \`
-                <div class="flex justify-between text-[10px] border-b border-slate-800 pb-1">
-                    <span class="text-slate-500">\${h.time}</span>
-                    <span class="font-bold text-indigo-400">\${h.type}</span>
-                    <span class="\${parseFloat(h.roi) > 0 ? 'text-emerald-400' : 'text-rose-400'} font-bold">\${h.roi}</span>
-                </div>
-            \`).join('');
-        }, 1000);
-    </script>
-</body></html>`);
+                    document.getElementById('logs').innerHTML = d.tradeHistory.map(h => \`
+                        <div class="flex justify-between border-b border-slate-800 pb-1">
+                            <span>\${h.time}</span>
+                            <span class="text-indigo-400">ACC #\${h.acc}</span>
+                            <span class="font-bold">\${h.type}</span>
+                            <span class="\${parseFloat(h.pnl) >= 0 ? 'text-emerald-400' : 'text-rose-500'}">\$\${h.pnl}</span>
+                        </div>
+                    \`).join('');
+                }, 1000);
+            </script>
+        </body>
+    </html>
+    `);
 });
 
 startWS();
-app.listen(config.port, '0.0.0.0', () => console.log(`DOGE 50-Account Paper Engine Running on port ${config.port}`));
+app.listen(config.port, () => console.log(`Mass Cluster Online: Port ${config.port}`));
