@@ -31,6 +31,7 @@ const config = {
     multiplier: 1.2,
     stepDistancePct: 0.1,
     takeProfitPct: 1.0,
+    maxStartSpread: 0.1, // NEW: Only open initial trade if spread < 0.1%
     takerFeeRate: 0.0005, 
     pollInterval: 1000 
 };
@@ -38,7 +39,8 @@ const config = {
 let market = { 
     status: 'Active', bid: 0, ask: 0, spread: 0,
     totalNetGain: 0, growthPct: 0, dgr: 0,
-    initialTotalEquity: 0, startTime: Date.now() 
+    initialTotalEquity: 0, startTime: Date.now(),
+    lastPriceUpdate: 0
 };
 
 let tradeHistory = []; 
@@ -49,8 +51,7 @@ config.accounts.forEach((account, idx) => {
         direction: idx === 0 ? 'buy' : 'sell',
         roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
         currentEquity: 0, availableMargin: 0, initialEquity: null,
-        isLocked: false, 
-        lastAction: 'Idle',
+        isLocked: false, lastAction: 'Idle',
         step: 0, lastStepPrice: 0, lastAddedVolume: 0, startTime: null
     };
 });
@@ -69,7 +70,6 @@ async function htxRequest(account, method, path, data = {}) {
     } catch (e) { return { status: 'error' }; }
 }
 
-// REST PRICE SYNC (Priority Fallback)
 async function fetchPriceRest() {
     try {
         const url = `https://${config.restHost}/linear-swap-ex/market/detail/merged?contract_code=${config.symbol}`;
@@ -78,13 +78,13 @@ async function fetchPriceRest() {
             market.bid = res.data.tick.bid[0];
             market.ask = res.data.tick.ask[0];
             market.spread = ((market.ask - market.bid) / market.bid) * 100;
+            market.lastPriceUpdate = Date.now();
         }
     } catch (e) {}
 }
 
 async function syncAccount(acc, state) {
     if (state.isLocked) return; 
-
     const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
     if (posRes?.status === 'ok' && posRes.data) {
         const pos = posRes.data.find(p => p.direction === state.direction);
@@ -110,6 +110,12 @@ async function syncAccount(acc, state) {
 
 function logTradeExchangeStyle(state, exitPrice) {
     const now = new Date();
+    const faceValue = 0.001; 
+    const entryNotional = state.volume * state.entryPrice * faceValue;
+    const exitNotional = state.volume * exitPrice * faceValue;
+    const totalFees = (entryNotional * config.takerFeeRate) + (exitNotional * config.takerFeeRate);
+    const netPnl = state.unrealizedUsdt - totalFees;
+
     tradeHistory.unshift({
         symbol: config.symbol.replace('-', '') + 'Perpetual',
         type: (state.direction === 'buy' ? 'BuyCross' : 'SellCross'),
@@ -117,9 +123,9 @@ function logTradeExchangeStyle(state, exitPrice) {
         closeTime: now.toLocaleString(),
         volume: state.volume,
         entryPrice: state.entryPrice.toFixed(8),
-        exitPrice: parseFloat(exitPrice).toFixed(8),
+        exitPrice: exitPrice.toFixed(8),
         roi: state.roi.toFixed(4) + '%',
-        netPnlUsdt: state.unrealizedUsdt.toFixed(8),
+        netPnlUsdt: netPnl.toFixed(8),
         status: 'All Closed'
     });
     if (tradeHistory.length > 20) tradeHistory.pop();
@@ -128,12 +134,7 @@ function logTradeExchangeStyle(state, exitPrice) {
 // ==================== WS ENGINE ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
-    const subTopic = `market.${config.symbol}.bbo`;
-
-    ws.on('open', () => {
-        ws.send(JSON.stringify({ sub: subTopic, id: "sub1" }));
-    });
-
+    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
     ws.on('message', (data) => {
         zlib.gunzip(data, (err, dec) => {
             if (err) return;
@@ -142,6 +143,7 @@ function startWS() {
                 market.bid = msg.tick.bid[0]; 
                 market.ask = msg.tick.ask[0]; 
                 market.spread = ((market.ask - market.bid) / market.bid) * 100;
+                market.lastPriceUpdate = Date.now();
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
         });
@@ -156,29 +158,36 @@ async function processMartingale() {
         if (state.isLocked || market.bid === 0) continue;
         const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
 
+        // 1. Initial Entry with Spread Check
         if (state.volume === 0) {
+            if (market.spread > config.maxStartSpread) {
+                state.lastAction = "Wait Spread < 0.1%";
+                continue;
+            }
             state.isLocked = true;
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
+            state.lastAction = "Idle";
             state.isLocked = false;
             continue;
         }
 
+        // 2. Take Profit Trigger
         if (state.roi >= config.takeProfitPct) {
-            state.isLocked = true;
-            state.lastAction = "⚡ CLOSING...";
-            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-                contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
+            const v = state.volume;
+            state.isLocked = true; 
+            logTradeExchangeStyle(state, currentPrice);
+            state.volume = 0; 
+            state.roi = 0;
+            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+                contract_code: config.symbol, volume: v, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
             });
-            if (res.status === 'ok') {
-                logTradeExchangeStyle(state, currentPrice);
-                state.volume = 0; state.roi = 0; state.entryPrice = 0;
-                setTimeout(() => { state.isLocked = false; state.lastAction = "Idle"; }, 10000); 
-            } else { state.isLocked = false; }
+            setTimeout(() => { state.isLocked = false; }, 8000);
             continue;
         }
 
+        // 3. Step Logic
         let priceMove = state.direction === 'buy' ? 
             ((state.lastStepPrice - currentPrice) / state.lastStepPrice) * 100 : 
             ((currentPrice - state.lastStepPrice) / state.lastStepPrice) * 100;
@@ -200,9 +209,7 @@ async function processMartingale() {
 }
 
 async function backgroundLoop() {
-    // If WS is providing zero data, force a REST sync
-    if (market.bid === 0) await fetchPriceRest();
-
+    if (Date.now() - market.lastPriceUpdate > 2000) await fetchPriceRest();
     await Promise.all(config.accounts.map(acc => syncAccount(acc, accountStates[acc.accountId])));
     const s1 = accountStates[1]; const s2 = accountStates[2];
     market.totalNetGain = (s1.currentEquity + s2.currentEquity) - market.initialTotalEquity;
