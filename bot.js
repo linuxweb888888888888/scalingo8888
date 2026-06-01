@@ -22,7 +22,7 @@ while (process.env[`HTX_API_KEY_${accountIndex}`]) {
 
 const config = {
     symbol: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase(),
-    leverage: parseInt(process.env.LEVERAGE) || 10,
+    leverage: parseInt(process.env.LEVERAGE) || 1,
     port: process.env.PORT || 3000,
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
