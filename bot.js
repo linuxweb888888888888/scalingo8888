@@ -21,8 +21,8 @@ while (process.env[`HTX_API_KEY_${accountIndex}`]) {
 }
 
 const config = {
-    symbol: (process.env.SYMBOL || 'LUNA-USDT').toUpperCase(), // UPDATED TO LUNA
-    leverage: parseInt(process.env.LEVERAGE) || 10,
+    symbol: (process.env.SYMBOL || 'DOGE-USDT').toUpperCase(), // SET TO DOGE
+    leverage: 75, // SET TO 75x
     port: process.env.PORT || 3000,
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
@@ -30,7 +30,7 @@ const config = {
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
     takeProfitPct: 2.0,
     pollInterval: 2000,
-    contractValue: 10 // 1 Contract = 10 LUNA (HTX Standard)
+    contractValue: 10 // 1 Contract = 10 DOGE on HTX
 };
 
 let market = {
@@ -78,11 +78,8 @@ async function syncAccount(acc) {
         if (pos) {
             state.volume = Math.floor(parseFloat(pos.volume));
             state.entryPrice = parseFloat(pos.cost_open);
-            
-            // DATA DIRECT FROM EXCHANGE SERVERS
             state.roi = parseFloat(pos.profit_rate || 0) * 100;
             state.unrealizedUsdt = parseFloat(pos.profit || 0);
-            
         } else { 
             state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.entryPrice = 0;
         }
@@ -102,19 +99,18 @@ async function openPositionUnique(accId) {
     const acc = config.accounts.find(a => a.id === accId);
     const targetPrice = state.direction === 'buy' ? market.ask : market.bid;
 
-    // UNIQUE PRICE CHECK: Prevents accounts from sharing the same entry price
     const existingPrices = Object.values(accountStates)
         .filter(s => s.volume > 0)
         .map(s => s.entryPrice);
 
     if (existingPrices.includes(targetPrice)) {
-        state.lastAction = "WAIT FOR TICK";
+        state.lastAction = "WAIT TICK (UNIQ)";
         return; 
     }
 
     market.isQueueLocked = true;
     state.isLocked = true;
-    state.lastAction = "OPENING LUNA...";
+    state.lastAction = "OPENING DOGE...";
 
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
         contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, 
@@ -198,7 +194,7 @@ async function backgroundLoop() {
     }
 }
 
-// ==================== UI & ACTIONS ====================
+// ==================== UI DASHBOARD ====================
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), tradeHistory, config }));
 app.post('/api/close-all', async (req, res) => {
     market.status = 'LIQUIDATING';
@@ -222,7 +218,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>LUNA Hedge Control</title>
+    <meta charset="UTF-8"><title>DOGE 75x Hedge</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>body { background: #020617; color: #f8fafc; font-family: monospace; }</style>
 </head>
@@ -230,8 +226,8 @@ app.get('/', (req, res) => {
     <div class="max-w-7xl mx-auto">
         <div class="flex justify-between items-end mb-6">
             <div>
-                <h1 class="text-xl font-bold text-indigo-400 uppercase tracking-widest">LUNA-USDT HEDGE</h1>
-                <p id="statusBadge" class="text-[10px] mt-1 font-bold bg-emerald-500/10 text-emerald-500 px-2 py-0.5 rounded border border-emerald-500/20 uppercase tracking-widest">SYSTEM ACTIVE</p>
+                <h1 class="text-xl font-bold text-indigo-400 uppercase tracking-widest">DOGE-USDT <span class="text-white">75X HEDGE</span></h1>
+                <p id="statusBadge" class="text-[10px] mt-1 font-bold bg-emerald-500/10 text-emerald-500 px-2 py-0.5 rounded border border-emerald-500/20 uppercase">SYSTEM ACTIVE</p>
             </div>
             <div class="flex gap-4 items-center">
                 <button onclick="fetch('/api/close-all', {method:'POST'})" class="bg-rose-900/40 hover:bg-rose-900 text-rose-400 px-3 py-1 rounded text-[10px] border border-rose-500/30 font-bold uppercase">Liquidate All</button>
@@ -243,7 +239,7 @@ app.get('/', (req, res) => {
         </div>
         <div class="grid grid-cols-2 gap-4 mb-6 text-center">
             <div class="bg-slate-900 p-4 border border-slate-800"><p class="text-[9px] text-slate-500 uppercase font-bold">Session Realized Profit</p><p id="realizedProfit" class="text-xl font-bold text-emerald-400">0.00000000</p></div>
-            <div class="bg-slate-900 p-4 border border-slate-800"><p class="text-[9px] text-slate-500 uppercase font-bold">Net Session PnL</p><p id="netSession" class="text-xl font-bold text-white">0.00000000</p></div>
+            <div class="bg-slate-900 p-4 border border-slate-800 text-right"><p class="text-[9px] text-slate-500 uppercase font-bold text-right">Net Session PnL</p><p id="netSession" class="text-xl font-bold text-white">0.00000000</p></div>
         </div>
         <div id="accountGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 mb-6"></div>
         <div class="bg-slate-900 rounded border border-slate-800 p-4">
@@ -279,4 +275,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`LUNA Engine Online.`));
+app.listen(config.port, '0.0.0.0', () => console.log(`DOGE 75x Engine Online.`));
