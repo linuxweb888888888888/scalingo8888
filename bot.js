@@ -28,7 +28,7 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    baseVolume: parseInt(process.env.BASE_VOLUME) || 100, 
+    baseVolume: parseInt(process.env.BASE_VOLUME) || 1, 
     winLossRatio: 1.5,        
     maxStartSpread: 0.1,      
     autoClosePct: 110,        
