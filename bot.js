@@ -27,11 +27,10 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    // MARTINGALE SETTINGS
-    baseVolume: 1,           // Start with 1 contract
-    multiplier: 1.2,         // Multiply volume by 1.2 each step
-    stepDistancePct: 0.1,    // Add safety order every 0.1% drop/rise
-    takeProfitPct: 1.0,      // Close at 1% profit
+    baseVolume: 1,           
+    multiplier: 1.2,         
+    stepDistancePct: 0.1,    // 0.1% movement
+    takeProfitPct: 1.0,      
     pollInterval: 2000
 };
 
@@ -47,9 +46,9 @@ config.accounts.forEach((account, idx) => {
     accountStates[account.accountId] = {
         direction: idx === 0 ? 'buy' : 'sell',
         roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
-        currentEquity: 0, initialEquity: null,
+        currentEquity: 0, availableMargin: 0, initialEquity: null,
         isLocked: false, lastAction: 'Idle',
-        step: 0 // Track Martingale level
+        step: 0, lastStepPrice: 0
     };
 });
 
@@ -77,14 +76,15 @@ async function syncAccount(acc, state) {
             state.roi = parseFloat(pos.profit_rate) * 100;
             state.unrealizedUsdt = parseFloat(pos.profit);
         } else { 
-            state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.entryPrice = 0; state.step = 0;
+            state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.entryPrice = 0; state.step = 0; state.lastStepPrice = 0;
         }
     }
     const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
     if (accRes?.status === 'ok' && accRes.data?.[0]) {
-        const equity = parseFloat(accRes.data[0].margin_balance);
-        if (state.initialEquity === null) state.initialEquity = equity;
-        state.currentEquity = equity;
+        const info = accRes.data[0];
+        state.currentEquity = parseFloat(info.margin_balance);
+        state.availableMargin = parseFloat(info.withdraw_available); // Actual usable USDT
+        if (state.initialEquity === null) state.initialEquity = state.currentEquity;
     }
 }
 
@@ -128,11 +128,11 @@ async function processMartingale() {
         // 1. OPEN INITIAL POSITION
         if (state.volume === 0) {
             state.isLocked = true;
-            console.log(`Opening Step 0 for ${state.direction}`);
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
             });
-            state.step = 0;
+            state.lastStepPrice = state.direction === 'buy' ? market.bid : market.ask;
+            state.lastAction = "Idle";
             state.isLocked = false;
             continue;
         }
@@ -150,23 +150,34 @@ async function processMartingale() {
 
         // 3. CHECK SAFETY ORDER (MARTINGALE STEP)
         let priceDiff = 0;
+        const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
+        
         if (state.direction === 'buy') {
-            priceDiff = ((state.entryPrice - market.bid) / state.entryPrice) * 100;
+            priceDiff = ((state.entryPrice - currentPrice) / state.entryPrice) * 100;
         } else {
-            priceDiff = ((market.ask - state.entryPrice) / state.entryPrice) * 100;
+            priceDiff = ((currentPrice - state.entryPrice) / state.entryPrice) * 100;
         }
 
-        // Trigger if price moved against us by X% multiplied by number of steps
-        const triggerThreshold = config.stepDistancePct; 
-        if (priceDiff >= triggerThreshold) {
-            state.isLocked = true;
-            state.step++;
+        if (priceDiff >= config.stepDistancePct) {
             const nextVolume = Math.max(1, Math.floor(state.volume * config.multiplier));
             
-            console.log(`Adding Safety Order Step ${state.step} for ${state.direction}. Volume: ${nextVolume}`);
+            // MARGIN CHECK: Estimate required USDT for next order
+            // Formula: (Price * Volume * ContractSize) / Leverage. (Approximate as Volume is in contracts)
+            const estimatedCost = (currentPrice * nextVolume * 0.001) / config.leverage; // 0.001 is a buffer for small contract sizes
+
+            if (state.availableMargin < estimatedCost) {
+                state.lastAction = "⚠️ INSUFFICIENT MARGIN";
+                continue; 
+            }
+
+            state.isLocked = true;
+            state.step++;
+            state.lastAction = `Adding Step ${state.step}`;
+            
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: nextVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
             });
+            
             state.isLocked = false;
         }
     }
@@ -175,7 +186,6 @@ async function processMartingale() {
 // ==================== MAIN LOOP ====================
 async function backgroundLoop() {
     await Promise.all(config.accounts.map(acc => syncAccount(acc, accountStates[acc.accountId])));
-    
     const s1 = accountStates[1]; const s2 = accountStates[2];
     if (!s1 || !s2) return;
 
@@ -236,7 +246,7 @@ app.get('/', (req, res) => {
             <div class="card p-6 border-l-4 border-indigo-500">
                 <p class="stat-label mb-1">Target Take Profit</p>
                 <p class="text-3xl font-black text-white">${config.takeProfitPct}%</p>
-                <p class="text-[9px] text-slate-500 mt-1">Per Side Independence</p>
+                <p class="text-[9px] text-slate-500 mt-1">Distance: ${config.stepDistancePct}% | Mult: ${config.multiplier}x</p>
             </div>
             <div class="card p-6 border-l-4 border-slate-500">
                 <p class="stat-label mb-1">Market Spread</p>
@@ -251,16 +261,24 @@ app.get('/', (req, res) => {
                     <p class="stat-label text-emerald-500">Long Position</p>
                     <p id="lRoi" class="text-4xl font-black">0.00%</p>
                     <p id="lPnl" class="text-sm font-bold text-slate-500">$0.0000</p>
-                    <div class="mt-2 bg-emerald-500/10 inline-block px-2 py-1 rounded">
-                        <p id="lStep" class="text-[10px] font-black text-emerald-400 uppercase">STEP: 0</p>
+                    <div class="mt-4 space-y-1">
+                        <p id="lMargin" class="text-[10px] font-bold text-slate-400">Margin: $0.00</p>
+                        <div class="bg-emerald-500/10 inline-block px-2 py-1 rounded">
+                            <p id="lStep" class="text-[10px] font-black text-emerald-400 uppercase">STEP: 0</p>
+                        </div>
+                        <p id="lAction" class="text-[9px] font-bold text-indigo-400 block h-4"></p>
                     </div>
                 </div>
                 <div class="text-right">
                     <p class="stat-label text-rose-500">Short Position</p>
                     <p id="sRoi" class="text-4xl font-black">0.00%</p>
                     <p id="sPnl" class="text-sm font-bold text-slate-500">$0.0000</p>
-                    <div class="mt-2 bg-rose-500/10 inline-block px-2 py-1 rounded">
-                        <p id="sStep" class="text-[10px] font-black text-rose-400 uppercase">STEP: 0</p>
+                    <div class="mt-4 space-y-1">
+                        <p id="sMargin" class="text-[10px] font-bold text-slate-400">Margin: $0.00</p>
+                        <div class="bg-rose-500/10 inline-block px-2 py-1 rounded">
+                            <p id="sStep" class="text-[10px] font-black text-rose-400 uppercase">STEP: 0</p>
+                        </div>
+                        <p id="sAction" class="text-[9px] font-bold text-indigo-400 block h-4"></p>
                     </div>
                 </div>
             </div>
@@ -304,6 +322,10 @@ app.get('/', (req, res) => {
                     document.getElementById(p+'Roi').className = 'text-4xl font-black ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
                     document.getElementById(p+'Pnl').innerText = (a.unrealizedUsdt >= 0 ? '$' : '-$') + Math.abs(a.unrealizedUsdt).toFixed(4);
                     document.getElementById(p+'Step').innerText = 'STEP: ' + a.step;
+                    document.getElementById(p+'Margin').innerText = 'Available: $' + a.availableMargin.toFixed(2);
+                    document.getElementById(p+'Action').innerText = a.lastAction;
+                    if(a.lastAction.includes("MARGIN")) document.getElementById(p+'Action').className = "text-[9px] font-bold text-rose-500 block h-4";
+                    else document.getElementById(p+'Action').className = "text-[9px] font-bold text-indigo-400 block h-4";
                 });
 
                 let tableHtml = '';
@@ -326,4 +348,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Martingale Engine Online - Step: 0.1% | Multiplier: 1.2x`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Martingale Engine Online - Safety Margin Enabled`));
