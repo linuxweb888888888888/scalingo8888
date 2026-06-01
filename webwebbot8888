@@ -83,7 +83,7 @@ async function chaseLimitOrder(account, direction, volume, offset, applyOffset =
     while (!filled && attempts < 10) {
         let price = (direction === 'buy') ? market.bid : market.ask;
         
-        // Apply 0.1% offset for resets: Buy lower or Sell higher
+        // Strategy: Open 0.1% away from market on Resets
         if (applyOffset) {
             price = (direction === 'buy') ? price * (1 - config.resetOffsetPct) : price * (1 + config.resetOffsetPct);
         }
@@ -164,10 +164,7 @@ async function flashReset(accIdxToReset) {
     state.lastAction = "⚡ RESET (CHASE)";
     logTrade(state.direction, state.roi, state.unrealizedUsdt, 'RESET');
 
-    // 1. Close current loser
     await chaseLimitOrder(acc, state.direction === 'buy' ? 'sell' : 'buy', state.volume, 'close', false);
-    
-    // 2. Open new with 0.1% price advantage
     await chaseLimitOrder(acc, state.direction, config.baseVolume, 'open', true);
 
     setTimeout(() => { state.isLocked = false; state.lastAction = "Idle"; }, config.resetCooldownMs);
@@ -383,7 +380,7 @@ app.get('/', (req, res) => {
                 document.getElementById('netLabel').innerText = 'Net: $' + d.market.netSessionUsdt.toFixed(5);
 
                 d.accounts.forEach(function(a, i) {
-                    const p = i === 0 ? 'l' : 's';
+                    const p = i === 1 ? 'l' : 's';
                     document.getElementById(p+'Roi').innerText = a.roi.toFixed(2)+'%';
                     document.getElementById(p+'Roi').className = 'text-4xl font-black ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
                     document.getElementById(p+'Pnl').innerText = (a.unrealizedUsdt >= 0 ? '$' : '-$') + Math.abs(a.unrealizedUsdt).toFixed(5);
