@@ -117,44 +117,29 @@ function logToHistory(accId, direction, roi, pnl, type) {
     tradeHistory.unshift({
         time: new Date().toLocaleTimeString(),
         side: `ACC ${accId} ${direction.toUpperCase()}`,
-        roi: roi.toFixed(2) + '%',
-        pnl: pnl.toFixed(4),
+        roi: roi.toFixed(4) + '%',
+        pnl: pnl.toFixed(8), // 8 Decimals in history
         type: type
     });
-    if (tradeHistory.length > 20) tradeHistory.pop();
+    if (tradeHistory.length > 25) tradeHistory.pop();
 }
 
-// ==================== MANUAL CLOSE ALL ====================
 async function closeAllPositions() {
-    console.log("!!! EMERGENCY CLOSE INITIATED !!!");
     market.status = 'LIQUIDATING';
-
     for (const acc of config.accounts) {
         const state = accountStates[acc.id];
         state.isLocked = true;
-        state.lastAction = "CLOSING ALL";
-        
         if (state.volume > 0) {
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, 
-                volume: state.volume, 
-                direction: state.direction === 'buy' ? 'sell' : 'buy', 
-                offset: 'close', 
-                lever_rate: config.leverage, 
-                order_price_type: 'optimal_20'
+                contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
+                offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20'
             });
             logToHistory(acc.id, state.direction, state.roi, state.unrealizedUsdt, "MANUAL CLOSE");
         }
     }
-
-    // Hold in Liquidating state for 10 seconds, then reset to Active
     setTimeout(() => {
-        config.accounts.forEach(acc => {
-            accountStates[acc.id].isLocked = false;
-            accountStates[acc.id].lastAction = "Idle";
-        });
+        config.accounts.forEach(acc => { accountStates[acc.id].isLocked = false; });
         market.status = 'Active';
-        console.log("System Resumed.");
     }, 10000);
 }
 
@@ -205,97 +190,87 @@ async function backgroundLoop() {
     }
 }
 
-// ==================== ROUTES ====================
+// ==================== UI ====================
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), tradeHistory, config }));
-app.post('/api/close-all', async (req, res) => {
-    await closeAllPositions();
-    res.json({ status: 'ok', message: 'Closing all positions' });
-});
+app.post('/api/close-all', async (req, res) => { await closeAllPositions(); res.json({ status: 'ok' }); });
 
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>Hedge Control</title>
+    <meta charset="UTF-8"><title>Hedge Control 8D</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <style>body { background: #0f172a; color: white; }</style>
+    <style>body { background: #0f172a; color: white; font-family: 'Courier New', monospace; }</style>
 </head>
-<body class="p-10">
-    <div class="max-w-6xl mx-auto">
-        <div class="flex justify-between items-start mb-8">
+<body class="p-6">
+    <div class="max-w-7xl mx-auto">
+        <div class="flex justify-between items-start mb-6">
             <div>
-                <h1 class="text-3xl font-bold text-indigo-400">Hedge Engine</h1>
-                <p id="statusBadge" class="text-[10px] mt-1 font-bold bg-emerald-500/20 text-emerald-400 px-2 py-1 rounded inline-block">SYSTEM ACTIVE</p>
+                <h1 class="text-2xl font-bold text-indigo-400">Hedge Engine <span class="text-white text-xs opacity-50">8-DECIMAL PRECISION</span></h1>
+                <p id="statusBadge" class="text-[10px] mt-1 font-bold bg-emerald-500/20 text-emerald-400 px-2 py-1 rounded inline-block tracking-widest">SYSTEM ACTIVE</p>
             </div>
-            <div class="flex gap-4 items-center">
-                <button onclick="closeAll()" class="bg-rose-600 hover:bg-rose-700 text-white px-4 py-2 rounded-lg font-bold text-sm transition-all shadow-lg shadow-rose-900/20">
-                    EMERGENCY CLOSE ALL
-                </button>
+            <div class="flex gap-6 items-center">
+                <button onclick="closeAll()" class="bg-rose-600 hover:bg-rose-700 text-white px-4 py-2 rounded font-bold text-xs">EMERGENCY CLOSE ALL</button>
                 <div class="text-right">
-                    <p id="totalNetGain" class="text-3xl font-bold">$0.00</p>
-                    <p id="growthPct" class="text-emerald-400 text-sm">0.00%</p>
+                    <p id="totalNetGain" class="text-2xl font-bold text-white">0.00000000</p>
+                    <p id="growthPct" class="text-emerald-400 text-xs">0.0000%</p>
                 </div>
             </div>
         </div>
 
-        <div class="grid grid-cols-2 gap-6 mb-8 text-center">
-            <div class="bg-slate-800 p-6 rounded-xl border border-slate-700">
-                <p class="text-xs text-slate-400 uppercase mb-1">Session Realized</p>
-                <p id="realizedProfit" class="text-3xl font-bold text-emerald-400">$0.00</p>
+        <div class="grid grid-cols-2 gap-4 mb-6">
+            <div class="bg-slate-800 p-4 rounded border border-slate-700">
+                <p class="text-[10px] text-slate-400 uppercase mb-1">Session Realized Profit</p>
+                <p id="realizedProfit" class="text-xl font-bold text-emerald-400">0.00000000</p>
             </div>
-            <div class="bg-slate-800 p-6 rounded-xl border border-slate-700">
-                <p class="text-xs text-slate-400 uppercase mb-1">Live Session PnL</p>
-                <p id="netSession" class="text-3xl font-bold text-white">$0.00</p>
+            <div class="bg-slate-800 p-4 rounded border border-slate-700">
+                <p class="text-[10px] text-slate-400 uppercase mb-1">Live Session Net PnL</p>
+                <p id="netSession" class="text-xl font-bold text-white">0.00000000</p>
             </div>
         </div>
 
-        <div id="accountGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8"></div>
+        <div id="accountGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 mb-6"></div>
 
-        <div class="bg-slate-800 rounded-xl p-6 border border-slate-700">
-            <h2 class="text-sm font-bold mb-4 text-slate-400 uppercase">Trade History</h2>
-            <table class="w-full text-left text-xs">
-                <thead><tr class="text-slate-500 border-b border-slate-700"><th class="pb-2">Time</th><th class="pb-2">Type</th><th class="pb-2">Target</th><th class="pb-2">ROI</th><th class="pb-2">PnL</th></tr></thead>
-                <tbody id="historyBody"></tbody>
+        <div class="bg-slate-800 rounded p-4 border border-slate-700">
+            <h2 class="text-[10px] font-bold mb-3 text-slate-400 uppercase tracking-widest">Activity Log (Last 25)</h2>
+            <table class="w-full text-left text-[11px]">
+                <thead><tr class="text-slate-500 border-b border-slate-700"><th class="pb-2">Time</th><th class="pb-2">Type</th><th class="pb-2">Target</th><th class="pb-2">ROI</th><th class="pb-2 text-right">PnL (USDT)</th></tr></thead>
+                <tbody id="historyBody" class="font-mono"></tbody>
             </table>
         </div>
     </div>
 
     <script>
-        async function closeAll() {
-            if(confirm('Are you sure? This will close ALL positions on ALL accounts.')) {
-                await fetch('/api/close-all', { method: 'POST' });
-            }
-        }
+        async function closeAll() { if(confirm('Confirm Emergency Liquidation?')) await fetch('/api/close-all', { method: 'POST' }); }
 
         setInterval(async () => {
             const r = await fetch('/api/status'); const d = await r.json();
-            document.getElementById('totalNetGain').innerText = '$' + d.market.totalNetGain.toFixed(4);
-            document.getElementById('growthPct').innerText = d.market.growthPct.toFixed(2) + '%';
-            document.getElementById('realizedProfit').innerText = '$' + d.market.sessionRealizedProfit.toFixed(4);
-            document.getElementById('netSession').innerText = '$' + d.market.netSessionUsdt.toFixed(4);
+            document.getElementById('totalNetGain').innerText = d.market.totalNetGain.toFixed(8);
+            document.getElementById('growthPct').innerText = d.market.growthPct.toFixed(4) + '%';
+            document.getElementById('realizedProfit').innerText = d.market.sessionRealizedProfit.toFixed(8);
+            document.getElementById('netSession').innerText = d.market.netSessionUsdt.toFixed(8);
             document.getElementById('statusBadge').innerText = 'SYSTEM ' + d.market.status;
-            document.getElementById('statusBadge').className = 'text-[10px] mt-1 font-bold px-2 py-1 rounded inline-block ' + (d.market.status === 'Active' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400');
             
             let accHtml = '';
             d.accounts.forEach(a => {
                 accHtml += \`
-                <div class="bg-slate-900 p-4 rounded-lg border border-slate-800">
-                    <div class="flex justify-between items-center mb-2">
-                        <span class="text-[10px] bg-slate-700 px-2 py-0.5 rounded text-white">ACC \${a.id}</span>
-                        <span class="text-[10px] font-bold \${a.direction === 'buy' ? 'text-emerald-500' : 'text-rose-500'}">\${a.direction.toUpperCase()}</span>
+                <div class="bg-slate-900 p-3 rounded border border-slate-800">
+                    <div class="flex justify-between items-center mb-1">
+                        <span class="text-[9px] bg-slate-700 px-1.5 rounded text-white font-bold">ACC \${a.id}</span>
+                        <span class="text-[9px] font-bold \${a.direction === 'buy' ? 'text-emerald-500' : 'text-rose-500'}">\${a.direction.toUpperCase()}</span>
                     </div>
-                    <p class="text-2xl font-bold \${a.roi >= 0 ? 'text-emerald-400' : 'text-rose-400'}">\${a.roi.toFixed(2)}%</p>
-                    <p class="text-xs text-slate-500">PnL: $\${a.unrealizedUsdt.toFixed(4)}</p>
-                    <div class="mt-2 text-[10px] text-slate-600 uppercase font-bold">\${a.lastAction}</div>
+                    <p class="text-lg font-bold \${a.roi >= 0 ? 'text-emerald-400' : 'text-rose-400'}">\${a.roi.toFixed(4)}%</p>
+                    <p class="text-[11px] text-slate-400 font-mono">\${a.unrealizedUsdt.toFixed(8)}</p>
+                    <div class="mt-2 text-[9px] text-slate-600 uppercase font-bold">\${a.lastAction}</div>
                 </div>\`;
             });
             document.getElementById('accountGrid').innerHTML = accHtml;
 
-            let historyHtml = '';
+            let hHtml = '';
             d.tradeHistory.forEach(h => {
-                historyHtml += '<tr class="border-b border-slate-800/50"><td class="py-2">' + h.time + '</td><td class="font-bold text-indigo-400">' + h.type + '</td><td>' + h.side + '</td><td class="font-bold">' + h.roi + '</td><td>$' + h.pnl + '</td></tr>';
+                hHtml += '<tr class="border-b border-slate-800/50"><td class="py-1 opacity-60">' + h.time + '</td><td class="font-bold text-indigo-400">' + h.type + '</td><td>' + h.side + '</td><td class="font-bold">' + h.roi + '</td><td class="text-right font-bold ' + (parseFloat(h.pnl) >= 0 ? 'text-emerald-500' : 'text-rose-500') + '">' + h.pnl + '</td></tr>';
             });
-            document.getElementById('historyBody').innerHTML = historyHtml;
+            document.getElementById('historyBody').innerHTML = hHtml;
         }, 1000);
     </script>
 </body></html>`);
@@ -303,4 +278,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Running with ${config.accounts.length} accounts.`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online: 8-Decimal Mode.`));
