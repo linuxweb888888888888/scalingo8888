@@ -1,156 +1,158 @@
 require('dotenv').config();
 const express = require('express');
-const crypto = require('crypto');
-const axios = require('axios');
 const WebSocket = require('ws');
 const zlib = require('zlib');
 
 const app = express();
 app.use(express.json());
 
-// ==================== CONFIGURATION ====================
-const apiAccounts = [];
+// ==================== CONFIGURATION & ENV DETECTION ====================
+const detectedAccounts = [];
 let accountIndex = 1;
 while (process.env[`HTX_API_KEY_${accountIndex}`]) {
-    apiAccounts.push({
-        apiKey: process.env[`HTX_API_KEY_${accountIndex}`],
-        secret_key: process.env[`HTX_SECRET_KEY_${accountIndex}`],
-        id: accountIndex 
+    detectedAccounts.push({
+        id: accountIndex,
+        // Using first 4 chars of key just to visually confirm which "real" account is being simulated
+        label: `REAL_SLOT_${accountIndex}_(${process.env[`HTX_API_KEY_${accountIndex}`].substring(0, 4)}...)`
     });
     accountIndex++;
 }
 
+if (detectedAccounts.length === 0) {
+    console.error("❌ NO REAL ACCOUNTS DETECTED IN .ENV! Please add HTX_API_KEY_1, etc.");
+    process.exit(1);
+}
+
 const config = {
-    symbol: (process.env.SYMBOL || 'DOGE-USDT').toUpperCase(), // SET TO DOGE
-    leverage: 75, // SET TO 75x
+    symbol: (process.env.SYMBOL || 'DOGE-USDT').toUpperCase(),
+    leverage: 75,
     port: process.env.PORT || 3000,
-    restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
-    accounts: apiAccounts,
-    baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
-    takeProfitPct: 2.0,
-    pollInterval: 2000,
-    contractValue: 10 // 1 Contract = 10 DOGE on HTX
+    baseVolume: 10, // Virtual DOGE contracts
+    takeProfitPct: 2.5,
+    contractValue: 10, // 1 Contract = 10 DOGE
+    virtualInitialMargin: 500.0, // Starting fake balance per real account slot
+    takerFee: 0.0005 // 0.05% fee simulation
 };
 
 let market = {
-    status: 'Active', bid: 0, ask: 0, 
-    totalNetGain: 0, growthPct: 0,
-    initialTotalEquity: 0,
+    status: 'VIRTUAL_MODE', 
+    bid: 0, ask: 0, 
+    totalNetGain: 0,
+    initialTotalEquity: detectedAccounts.length * config.virtualInitialMargin,
     sessionRealizedProfit: 0,
-    netSessionUsdt: 0,
-    isQueueLocked: false 
+    netSessionUsdt: 0
 };
 
 let tradeHistory = [];
 let accountStates = {};
 
-config.accounts.forEach((account, idx) => {
-    accountStates[account.id] = {
-        id: account.id,
+// Initialize Paper State for each Real Account detected
+detectedAccounts.forEach((acc, idx) => {
+    accountStates[acc.id] = {
+        id: acc.id,
+        label: acc.label,
         direction: idx % 2 === 0 ? 'buy' : 'sell',
         roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
-        currentEquity: 0, initialEquity: null,
-        isLocked: false, lastAction: 'Idle'
+        currentEquity: config.virtualInitialMargin,
+        availableBalance: config.virtualInitialMargin,
+        lastAction: 'Paper Engine Waiting...',
+        isLocked: false
     };
 });
 
-// ==================== HTX API CORE ====================
-async function htxRequest(account, method, path, data = {}) {
-    const timestamp = new Date().toISOString().split('.')[0];
-    const params = { AccessKeyId: account.apiKey, SignatureMethod: 'HmacSHA256', SignatureVersion: '2', Timestamp: timestamp };
-    const query = Object.keys(params).sort().map(k => `${k}=${encodeURIComponent(params[k])}`).join('&');
-    const payload = [method.toUpperCase(), config.restHost, path, query].join('\n');
-    const signature = crypto.createHmac('sha256', account.secret_key).update(payload).digest('base64');
-    const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
-    try {
-        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 5000 });
-        return res.data;
-    } catch (e) { return { status: 'error' }; }
+// ==================== MOCKED EXECUTION ENGINE ====================
+
+function virtualOpen(accId) {
+    const state = accountStates[accId];
+    if (market.bid === 0 || state.volume > 0) return;
+
+    const fillPrice = state.direction === 'buy' ? market.ask : market.bid;
+    
+    // Safety check: Don't open if someone else just opened at this price
+    const existingPrices = Object.values(accountStates).map(s => s.entryPrice);
+    if (existingPrices.includes(fillPrice)) return;
+
+    const notional = config.baseVolume * config.contractValue * fillPrice;
+    const marginRequired = notional / config.leverage;
+    const fee = notional * config.takerFee;
+
+    if (state.availableBalance < (marginRequired + fee)) {
+        state.lastAction = "VIRTUAL_MARGIN_CALL";
+        return;
+    }
+
+    state.entryPrice = fillPrice;
+    state.volume = config.baseVolume;
+    state.availableBalance -= (marginRequired + fee);
+    state.lastAction = `VIRTUAL OPEN @ ${fillPrice}`;
 }
 
-async function syncAccount(acc) {
-    const state = accountStates[acc.id];
-    const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
+function virtualClose(accId, type) {
+    const state = accountStates[accId];
+    if (state.volume === 0) return;
+
+    const exitPrice = state.direction === 'buy' ? market.bid : market.ask;
+    const directionMult = state.direction === 'buy' ? 1 : -1;
     
-    if (posRes?.status === 'ok' && posRes.data) {
-        const pos = posRes.data.find(p => p.direction === state.direction);
-        if (pos) {
-            state.volume = Math.floor(parseFloat(pos.volume));
-            state.entryPrice = parseFloat(pos.cost_open);
-            state.roi = parseFloat(pos.profit_rate || 0) * 100;
-            state.unrealizedUsdt = parseFloat(pos.profit || 0);
-        } else { 
-            state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.entryPrice = 0;
+    const grossPnl = (exitPrice - state.entryPrice) * directionMult * (state.volume * config.contractValue);
+    const notionalAtExit = state.volume * config.contractValue * exitPrice;
+    const fee = notionalAtExit * config.takerFee;
+    const finalPnl = grossPnl - fee;
+
+    const initialMarginReturned = (state.volume * config.contractValue * state.entryPrice) / config.leverage;
+    
+    state.availableBalance += (initialMarginReturned + finalPnl);
+    state.currentEquity = state.availableBalance;
+    market.sessionRealizedProfit += finalPnl;
+
+    logToHistory(accId, state.direction, state.roi, finalPnl, type);
+
+    // Reset account state
+    state.volume = 0;
+    state.entryPrice = 0;
+    state.roi = 0;
+    state.unrealizedUsdt = 0;
+    state.lastAction = `CLOSED ${type} @ ${exitPrice}`;
+}
+
+function updateAccounting() {
+    let currentTotalEquity = 0;
+    let totalUnrealized = 0;
+
+    Object.values(accountStates).forEach(state => {
+        if (state.volume > 0) {
+            const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
+            const directionMult = state.direction === 'buy' ? 1 : -1;
+            
+            state.unrealizedUsdt = (currentPrice - state.entryPrice) * directionMult * (state.volume * config.contractValue);
+            
+            const marginUsed = (state.volume * config.contractValue * state.entryPrice) / config.leverage;
+            state.roi = (state.unrealizedUsdt / marginUsed) * 100;
+
+            // Logic check
+            if (state.roi >= config.takeProfitPct) virtualClose(state.id, 'TAKE_PROFIT');
+            if (state.roi <= -85.0) virtualClose(state.id, 'LIQUIDATED'); 
         }
-    }
-    
-    const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
-    if (accRes?.status === 'ok' && accRes.data?.[0]) {
-        state.currentEquity = parseFloat(accRes.data[0].margin_balance);
-        if (state.initialEquity === null) state.initialEquity = state.currentEquity;
-    }
-}
-
-async function openPositionUnique(accId) {
-    if (market.isQueueLocked || market.status !== 'Active') return;
-    
-    const state = accountStates[accId];
-    const acc = config.accounts.find(a => a.id === accId);
-    const targetPrice = state.direction === 'buy' ? market.ask : market.bid;
-
-    const existingPrices = Object.values(accountStates)
-        .filter(s => s.volume > 0)
-        .map(s => s.entryPrice);
-
-    if (existingPrices.includes(targetPrice)) {
-        state.lastAction = "WAIT TICK (UNIQ)";
-        return; 
-    }
-
-    market.isQueueLocked = true;
-    state.isLocked = true;
-    state.lastAction = "OPENING DOGE...";
-
-    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-        contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, 
-        offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
+        
+        state.currentEquity = state.availableBalance + (state.unrealizedUsdt || 0);
+        totalUnrealized += state.unrealizedUsdt;
+        currentTotalEquity += state.currentEquity;
     });
 
-    state.isLocked = false;
-    state.lastAction = "Idle";
-    market.isQueueLocked = false;
-}
-
-async function closePosition(accId, type) {
-    const state = accountStates[accId];
-    const acc = config.accounts.find(a => a.id === accId);
-    if (state.isLocked || state.volume === 0) return;
-
-    state.isLocked = true;
-    state.lastAction = type;
-    
-    const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-        contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
-        offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
-    });
-
-    if (res.status === 'ok') {
-        market.sessionRealizedProfit += state.unrealizedUsdt;
-        logToHistory(accId, state.direction, state.roi, state.unrealizedUsdt, type);
-    }
-    state.isLocked = false;
+    market.netSessionUsdt = totalUnrealized + market.sessionRealizedProfit;
+    market.totalNetGain = currentTotalEquity - market.initialTotalEquity;
 }
 
 function logToHistory(accId, direction, roi, pnl, type) {
     tradeHistory.unshift({
         time: new Date().toLocaleTimeString(),
         side: `ACC ${accId} ${direction.toUpperCase()}`,
-        roi: roi.toFixed(4) + '%',
-        pnl: pnl.toFixed(8), 
+        roi: roi.toFixed(2) + '%',
+        pnl: pnl.toFixed(4), 
         type: type
     });
-    if (tradeHistory.length > 25) tradeHistory.pop();
+    if (tradeHistory.length > 20) tradeHistory.pop();
 }
 
 // ==================== WS ENGINE ====================
@@ -161,18 +163,10 @@ function startWS() {
         zlib.gunzip(data, (err, dec) => {
             if (err) return;
             const msg = JSON.parse(dec.toString());
-            if (msg.tick && market.status === 'Active') {
+            if (msg.tick) {
                 market.bid = msg.tick.bid[0];
                 market.ask = msg.tick.ask[0];
-                let totalUnrealized = 0;
-                Object.values(accountStates).forEach((state) => {
-                    totalUnrealized += state.unrealizedUsdt;
-                    if (state.volume > 0 && !state.isLocked) {
-                        if (state.roi >= config.takeProfitPct) closePosition(state.id, 'TAKE_PROFIT');
-                        else if (state.roi < -5.0 && market.sessionRealizedProfit > (Math.abs(state.unrealizedUsdt) * 1.15)) closePosition(state.id, 'STOP_LOSS');
-                    }
-                });
-                market.netSessionUsdt = totalUnrealized + market.sessionRealizedProfit;
+                updateAccounting();
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
         });
@@ -180,71 +174,34 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-async function backgroundLoop() {
-    await Promise.all(config.accounts.map(acc => syncAccount(acc)));
-    const states = Object.values(accountStates);
-    const totalCurrentEquity = states.reduce((sum, s) => sum + s.currentEquity, 0);
-    if (market.initialTotalEquity === 0 && totalCurrentEquity > 0) market.initialTotalEquity = totalCurrentEquity;
-    market.totalNetGain = totalCurrentEquity - market.initialTotalEquity;
-    market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
-
-    if (market.status === 'Active' && !market.isQueueLocked) {
-        const nextToOpen = states.find(s => s.volume === 0 && !s.isLocked);
-        if (nextToOpen) openPositionUnique(nextToOpen.id);
-    }
-}
+// Auto-run loop for entries
+setInterval(() => {
+    if (market.bid === 0) return;
+    Object.values(accountStates).forEach(s => { if (s.volume === 0) virtualOpen(s.id); });
+}, 2000);
 
 // ==================== UI DASHBOARD ====================
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), tradeHistory, config }));
-app.post('/api/close-all', async (req, res) => {
-    market.status = 'LIQUIDATING';
-    for (const acc of config.accounts) {
-        const state = accountStates[acc.id];
-        state.isLocked = true;
-        if (state.volume > 0) {
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20'
-            });
-        }
-    }
-    setTimeout(() => { 
-        Object.values(accountStates).forEach(s => s.isLocked = false);
-        market.status = 'Active'; 
-    }, 15000);
-    res.json({status:'ok'});
-});
 
 app.get('/', (req, res) => {
-    res.send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8"><title>DOGE 75x Hedge</title>
+    res.send(`<!DOCTYPE html><html><head><title>DOGE 75x Mock Engine</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <style>body { background: #020617; color: #f8fafc; font-family: monospace; }</style>
-</head>
-<body class="p-6">
-    <div class="max-w-7xl mx-auto">
+    <style>body { background: #020617; color: #f8fafc; font-family: monospace; }</style></head>
+    <body class="p-6"><div class="max-w-7xl mx-auto">
         <div class="flex justify-between items-end mb-6">
             <div>
-                <h1 class="text-xl font-bold text-indigo-400 uppercase tracking-widest">DOGE-USDT <span class="text-white">75X HEDGE</span></h1>
-                <p id="statusBadge" class="text-[10px] mt-1 font-bold bg-emerald-500/10 text-emerald-500 px-2 py-0.5 rounded border border-emerald-500/20 uppercase">SYSTEM ACTIVE</p>
+                <h1 class="text-xl font-bold text-indigo-400 uppercase tracking-widest">DOGE-USDT <span class="text-white">MOCK HEDGE</span></h1>
+                <p class="text-[10px] mt-1 font-bold bg-indigo-500/10 text-indigo-500 px-2 py-0.5 rounded border border-indigo-500/20 uppercase">MODE: VIRTUAL (SIMULATING ${detectedAccounts.length} REAL ACCOUNTS)</p>
             </div>
-            <div class="flex gap-4 items-center">
-                <button onclick="fetch('/api/close-all', {method:'POST'})" class="bg-rose-900/40 hover:bg-rose-900 text-rose-400 px-3 py-1 rounded text-[10px] border border-rose-500/30 font-bold uppercase">Liquidate All</button>
-                <div class="text-right">
-                    <p id="totalNetGain" class="text-2xl font-bold">0.00000000</p>
-                    <p id="growthPct" class="text-emerald-500 text-[10px] font-bold">0.0000%</p>
-                </div>
+            <div class="text-right">
+                <p id="totalNetGain" class="text-2xl font-bold text-white">0.0000 USDT</p>
+                <p id="growth" class="text-emerald-500 text-[10px] font-bold">MONITORING LIVE FEED</p>
             </div>
-        </div>
-        <div class="grid grid-cols-2 gap-4 mb-6 text-center">
-            <div class="bg-slate-900 p-4 border border-slate-800"><p class="text-[9px] text-slate-500 uppercase font-bold">Session Realized Profit</p><p id="realizedProfit" class="text-xl font-bold text-emerald-400">0.00000000</p></div>
-            <div class="bg-slate-900 p-4 border border-slate-800 text-right"><p class="text-[9px] text-slate-500 uppercase font-bold text-right">Net Session PnL</p><p id="netSession" class="text-xl font-bold text-white">0.00000000</p></div>
         </div>
         <div id="accountGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 mb-6"></div>
         <div class="bg-slate-900 rounded border border-slate-800 p-4">
             <table class="w-full text-left text-[11px]">
-                <thead><tr class="text-slate-600 border-b border-slate-800"><th class="pb-2">Time</th><th class="pb-2">Type</th><th class="pb-2">Target</th><th class="pb-2">ROI</th><th class="pb-2 text-right">PnL (USDT)</th></tr></thead>
+                <thead><tr class="text-slate-600 border-b border-slate-800"><th class="pb-2">Time</th><th class="pb-2">Type</th><th class="pb-2">Target Slot</th><th class="pb-2">ROI</th><th class="pb-2 text-right">Virtual PnL</th></tr></thead>
                 <tbody id="historyBody"></tbody>
             </table>
         </div>
@@ -252,14 +209,10 @@ app.get('/', (req, res) => {
     <script>
         setInterval(async () => {
             const r = await fetch('/api/status'); const d = await r.json();
-            document.getElementById('totalNetGain').innerText = d.market.totalNetGain.toFixed(8);
-            document.getElementById('growthPct').innerText = d.market.growthPct.toFixed(4) + '%';
-            document.getElementById('realizedProfit').innerText = d.market.sessionRealizedProfit.toFixed(8);
-            document.getElementById('netSession').innerText = d.market.netSessionUsdt.toFixed(8);
-            document.getElementById('statusBadge').innerText = 'SYSTEM ' + d.market.status;
+            document.getElementById('totalNetGain').innerText = d.market.totalNetGain.toFixed(4) + ' USDT';
             let accHtml = '';
             d.accounts.forEach(a => {
-                accHtml += '<div class="bg-slate-950 p-3 border border-slate-800"><div class="flex justify-between items-center mb-1"><span class="text-[9px] bg-slate-800 px-1.5 rounded text-slate-400 font-bold">ACC '+a.id+'</span><span class="text-[9px] font-bold '+(a.direction === "buy" ? "text-emerald-500" : "text-rose-500")+'">'+a.direction.toUpperCase()+'</span></div><p class="text-lg font-bold '+(a.roi >= 0 ? "text-emerald-400" : "text-rose-400")+'">'+a.roi.toFixed(4)+'%</p><p class="text-[10px] text-slate-500 font-bold tracking-tighter">PRICE: '+a.entryPrice.toFixed(6)+'</p><p class="text-[11px] text-slate-200 font-bold">'+a.unrealizedUsdt.toFixed(8)+'</p><div class="mt-2 text-[8px] text-slate-600 font-bold uppercase truncate">'+a.lastAction+'</div></div>';
+                accHtml += '<div class="bg-slate-950 p-3 border border-slate-800"><div class="flex justify-between items-center mb-1"><span class="text-[9px] bg-slate-800 px-1.5 rounded text-slate-400 font-bold">'+a.label+'</span><span class="text-[9px] font-bold '+(a.direction === "buy" ? "text-emerald-500" : "text-rose-500")+'">'+a.direction.toUpperCase()+'</span></div><p class="text-lg font-bold '+(a.roi >= 0 ? "text-emerald-400" : "text-rose-400")+'">'+a.roi.toFixed(2)+'%</p><p class="text-[10px] text-slate-500 font-bold">ENTRY: '+a.entryPrice.toFixed(5)+'</p><p class="text-[11px] text-slate-200 font-bold">'+a.unrealizedUsdt.toFixed(4)+'</p><div class="mt-2 text-[8px] text-slate-600 font-bold uppercase truncate">'+a.lastAction+'</div></div>';
             });
             document.getElementById('accountGrid').innerHTML = accHtml;
             let hHtml = '';
@@ -269,10 +222,12 @@ app.get('/', (req, res) => {
             });
             document.getElementById('historyBody').innerHTML = hHtml;
         }, 1000);
-    </script>
-</body></html>`);
+    </script></body></html>`);
 });
 
 startWS();
-setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`DOGE 75x Engine Online.`));
+app.listen(config.port, '0.0.0.0', () => {
+    console.log(`\n🚀 MOCK ENGINE ONLINE`);
+    console.log(`📍 Detected Slots: ${detectedAccounts.length}`);
+    console.log(`🌐 Dashboard: http://localhost:${config.port}\n`);
+});
