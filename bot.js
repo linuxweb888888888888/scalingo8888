@@ -29,9 +29,10 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     baseVolume: parseFloat(process.env.BASE_VOLUME) || 1,
-    takeProfitPct: 2.0, 
-    profitToLossRatio: 1.5, // Target: 50% more profit than loss
-    pollInterval: 1000 // Fast sync with API values
+    // MATHEMATICAL 1.5:1 RATIO
+    takeProfitPct: 2.00, 
+    stopLossPct: -1.3333, // (2.0 / 1.5) This ensures 50% more profit than loss
+    pollInterval: 1000 
 };
 
 let market = {
@@ -76,7 +77,6 @@ async function syncAccount(acc, state) {
         if (pos) {
             state.volume = parseFloat(pos.volume);
             state.entryPrice = parseFloat(pos.cost_open);
-            // DIRECT EXCHANGE VALUES
             state.roi = parseFloat(pos.profit_rate) * 100; 
             state.unrealizedUsdt = parseFloat(pos.profit);
         } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.entryPrice = 0; }
@@ -112,7 +112,6 @@ async function executeAction(accIdx, type) {
     const finalRoi = state.roi;
     const finalPnl = state.unrealizedUsdt;
 
-    // Use optimal_20 to ensure it closes immediately even in high volatility
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
         contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
         offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
@@ -149,19 +148,13 @@ function startWS() {
                     totalUnrealized += state.unrealizedUsdt;
 
                     if (state.volume > 0 && !state.isLocked && market.status === 'Active') {
-                        // TAKE PROFIT
+                        // TAKE PROFIT: Hits 2%
                         if (state.roi >= config.takeProfitPct) {
                             executeAction(idx, 'TAKE_PROFIT');
                         }
-                        // STOP LOSS (Logic Fix: Trigger if loss is >= allowed portion of profit)
-                        else if (state.roi < 0) {
-                            const currentLossAbs = Math.abs(state.unrealizedUsdt);
-                            const maxAllowedLoss = market.sessionRealizedProfit / config.profitToLossRatio;
-                            
-                            // Trigger Stop Loss if loss reaches or exceeds the allowed threshold
-                            if (market.sessionRealizedProfit > 0 && currentLossAbs >= maxAllowedLoss) {
-                                executeAction(idx, 'STOP_LOSS');
-                            }
+                        // STOP LOSS: Hits -1.33% (Instant close, no waiting for buffer)
+                        else if (state.roi <= config.stopLossPct) {
+                            executeAction(idx, 'STOP_LOSS');
                         }
                     }
                 });
@@ -219,7 +212,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>Cluster Precision Engine</title>
+    <meta charset="UTF-8"><title>Hard-Ratio Engine</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         body { background: #0f172a; color: white; font-family: 'JetBrains Mono', monospace; }
@@ -229,34 +222,21 @@ app.get('/', (req, res) => {
 </head>
 <body class="p-4 md:p-8">
     <div class="max-w-6xl mx-auto">
-        <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 gap-4">
+        <div class="flex justify-between items-center mb-8 gap-4">
             <div>
-                <h1 class="text-xl font-black tracking-tighter uppercase italic">Precision <span class="text-indigo-400">Cluster</span></h1>
-                <p id="mStatus" class="text-[10px] font-bold text-emerald-500 uppercase tracking-widest italic">Engine Active</p>
+                <h1 class="text-xl font-black uppercase italic">Cluster <span class="text-indigo-400">Hard-Ratio</span></h1>
+                <p class="text-[10px] text-slate-500 font-bold uppercase tracking-widest mt-1">TP: 2.0% | SL: 1.33% (1.5x Ratio)</p>
             </div>
-            <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 min-w-[320px]">
-                <p class="stat-label">Total Portfolio Net Gain</p>
+            <div class="bg-slate-800 p-4 rounded-xl border border-slate-700">
+                <p class="stat-label">Total Portfolio Gain</p>
                 <p id="totalNetGain" class="text-xl font-black text-white tracking-tighter">$0.00000000</p>
-                <p id="growthPct" class="text-[10px] text-emerald-400 font-bold uppercase tracking-widest mt-1">Growth: 0.00%</p>
             </div>
         </div>
 
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-            <div class="card border-l-4 border-emerald-500">
-                <p class="stat-label text-emerald-500">Session Realized Profit</p>
-                <p id="realizedProfit" class="text-2xl font-black text-emerald-400 tracking-tighter">$0.00000000</p>
-                <p class="text-[9px] text-slate-500 mt-1 uppercase font-bold italic">Shielding next 66% loss</p>
-            </div>
-            <div class="card border-l-4 border-indigo-500">
-                <p class="stat-label text-indigo-400">Net Session PnL</p>
-                <p id="netSession" class="text-2xl font-black text-white tracking-tighter">$0.00000000</p>
-            </div>
-        </div>
-
-        <div id="accountGrid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-8"></div>
+        <div id="accountGrid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8"></div>
 
         <div class="card overflow-hidden mb-6">
-            <p class="stat-label mb-3 px-2">History (Matches Exchange Exactly)</p>
+            <p class="stat-label mb-3 px-2">Global History</p>
             <table class="w-full text-left text-[10px]">
                 <thead class="bg-slate-900/50 uppercase text-slate-500"><tr class="border-b border-slate-700"><th class="p-3">Time</th><th>Source</th><th>Type</th><th>ROI</th><th>PnL (8 Dec)</th></tr></thead>
                 <tbody id="historyBody" class="font-bold"></tbody>
@@ -264,7 +244,7 @@ app.get('/', (req, res) => {
         </div>
 
         <button onclick="triggerClose()" class="w-full py-5 bg-rose-600 hover:bg-rose-500 text-white font-black rounded-xl transition-all shadow-2xl uppercase tracking-widest text-xs">
-            Emergency Liquidate Cluster
+            Liquidate Entire Cluster
         </button>
     </div>
 
@@ -274,9 +254,6 @@ app.get('/', (req, res) => {
             try {
                 const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('totalNetGain').innerText = '$' + d.market.totalNetGain.toFixed(8);
-                document.getElementById('growthPct').innerText = 'Growth: ' + d.market.growthPct.toFixed(2) + '%';
-                document.getElementById('realizedProfit').innerText = '$' + d.market.sessionRealizedProfit.toFixed(8);
-                document.getElementById('netSession').innerText = '$' + d.market.netSessionUsdt.toFixed(8);
 
                 let accHtml = '';
                 d.accounts.forEach(a => {
@@ -284,14 +261,11 @@ app.get('/', (req, res) => {
                     accHtml += \`
                         <div class="card border-t-2 border-slate-700">
                             <div class="flex justify-between items-center mb-2">
-                                <span class="stat-label">Account #\${a.id}</span>
+                                <span class="stat-label">Acc #\${a.id}</span>
                                 <span class="text-[9px] font-black px-2 py-0.5 rounded bg-slate-700 \${sideColor}">\${a.direction.toUpperCase()}</span>
                             </div>
                             <p class="text-2xl font-black \${a.roi >= 0 ? 'text-emerald-400' : 'text-rose-400'}">\${a.roi.toFixed(4)}%</p>
-                            <div class="flex justify-between mt-1">
-                                <span class="text-[10px] text-slate-400 tracking-tighter">$\${a.unrealizedUsdt.toFixed(8)}</span>
-                                <span class="text-[9px] text-indigo-400 font-bold uppercase italic">\${a.lastAction}</span>
-                            </div>
+                            <p class="text-[10px] text-slate-400 tracking-tighter">$\${a.unrealizedUsdt.toFixed(8)}</p>
                         </div>\`;
                 });
                 document.getElementById('accountGrid').innerHTML = accHtml;
@@ -308,4 +282,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Precision Cluster Engine Online.`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Hard-Ratio Engine Online.`));
