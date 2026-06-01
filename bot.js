@@ -31,8 +31,7 @@ const config = {
     takeProfitPct: 2.0,
     pollInterval: 2000,
     takerFeeRate: 0.0005,
-    contractValue: 1000, // 1 Contract = 1000 SHIB
-    staggerDelayMs: 7000 // Wait 7 seconds between each account opening
+    contractValue: 1000 // 1 Contract = 1000 SHIB
 };
 
 let market = {
@@ -41,7 +40,7 @@ let market = {
     initialTotalEquity: 0,
     sessionRealizedProfit: 0,
     netSessionUsdt: 0,
-    isQueueLocked: false // Prevents multiple accounts opening at once
+    isQueueLocked: false 
 };
 
 let tradeHistory = [];
@@ -101,22 +100,29 @@ async function syncAccount(acc) {
     }
 }
 
-async function openPositionSequential(accId) {
+async function openPositionUnique(accId) {
     if (market.isQueueLocked) return;
+    
     const state = accountStates[accId];
     const acc = config.accounts.find(a => a.id === accId);
-    
-    market.isQueueLocked = true; // Block other accounts from opening
+    const targetPrice = state.direction === 'buy' ? market.ask : market.bid;
+
+    // VALIDATION: Check if this price is already used by any other account
+    const existingPrices = Object.values(accountStates)
+        .filter(s => s.volume > 0)
+        .map(s => s.entryPrice);
+
+    if (existingPrices.includes(targetPrice)) {
+        state.lastAction = `WAITING FOR PRICE CHANGE (Current: ${targetPrice.toFixed(8)})`;
+        return; // Exit and wait for next background loop tick
+    }
+
+    // If price is unique, proceed
+    market.isQueueLocked = true;
     state.isLocked = true;
-    state.lastAction = "STAGGERING...";
+    state.lastAction = "OPENING UNIQUE...";
 
-    // Wait for price movement
-    const randomExtra = Math.floor(Math.random() * 3000);
-    await new Promise(r => setTimeout(r, config.staggerDelayMs + randomExtra));
-
-    console.log(`[ORDER] Opening Account ${accId} | Direction: ${state.direction}`);
-    
-    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+    const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
         contract_code: config.symbol, 
         volume: config.baseVolume, 
         direction: state.direction, 
@@ -125,9 +131,13 @@ async function openPositionSequential(accId) {
         order_price_type: 'optimal_5'
     });
 
+    if (res.status === 'ok') {
+        console.log(`[UNIQUE ENTRY] Acc ${accId} filled at ${targetPrice}`);
+    }
+
     state.isLocked = false;
     state.lastAction = "Idle";
-    market.isQueueLocked = false; // Release global queue
+    market.isQueueLocked = false;
 }
 
 async function closePosition(accId, type) {
@@ -147,8 +157,6 @@ async function closePosition(accId, type) {
         market.sessionRealizedProfit += state.unrealizedUsdt;
         logToHistory(accId, state.direction, state.roi, state.unrealizedUsdt, type);
     }
-    
-    // Position is now 0, backgroundLoop will pick it up for sequential re-entry
     state.isLocked = false;
 }
 
@@ -190,7 +198,6 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-// ==================== SEQUENTIAL MONITOR ====================
 async function backgroundLoop() {
     await Promise.all(config.accounts.map(acc => syncAccount(acc)));
     
@@ -201,10 +208,10 @@ async function backgroundLoop() {
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
 
     if (market.status === 'Active' && !market.isQueueLocked) {
-        // Find the FIRST account that needs a position and open it
+        // Only attempt to open the FIRST account in the list that is empty
         const nextToOpen = states.find(s => s.volume === 0 && !s.isLocked);
         if (nextToOpen) {
-            openPositionSequential(nextToOpen.id);
+            openPositionUnique(nextToOpen.id);
         }
     }
 }
@@ -229,7 +236,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>Hedge Engine 8D</title>
+    <meta charset="UTF-8"><title>Hedge Engine UNIQUE</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>body { background: #020617; color: #f8fafc; font-family: monospace; }</style>
 </head>
@@ -237,12 +244,12 @@ app.get('/', (req, res) => {
     <div class="max-w-7xl mx-auto">
         <div class="flex justify-between items-end mb-6">
             <div>
-                <h1 class="text-xl font-bold text-indigo-400">SEQUENTIAL ENGINE <span class="text-white opacity-40">STAGGERED 8D</span></h1>
+                <h1 class="text-xl font-bold text-indigo-400">UNIQUE-PRICE ENGINE</h1>
                 <p id="statusBadge" class="text-[10px] mt-1 font-bold bg-emerald-500/10 text-emerald-500 px-2 py-0.5 rounded border border-emerald-500/20 uppercase tracking-widest">SYSTEM ACTIVE</p>
             </div>
-            <div class="text-right">
-                <p id="totalNetGain" class="text-2xl font-bold">0.00000000</p>
-                <p id="growthPct" class="text-emerald-500 text-[10px]">0.0000%</p>
+            <div class="text-right text-xs">
+                <p class="text-slate-500">MARKET PRICE</p>
+                <p id="marketPrice" class="font-bold text-white text-lg">0.00000000</p>
             </div>
         </div>
         <div class="grid grid-cols-2 gap-4 mb-6">
@@ -251,7 +258,6 @@ app.get('/', (req, res) => {
         </div>
         <div id="accountGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 mb-6"></div>
         <div class="bg-slate-900 rounded border border-slate-800 p-4">
-            <div class="flex justify-between mb-4 border-b border-slate-800 pb-2"><p class="text-[10px] font-bold text-slate-500 uppercase">Recent Exchange Activity</p><button onclick="fetch('/api/close-all', {method:'POST'})" class="text-[9px] text-rose-500 font-bold uppercase">Liquidate All</button></div>
             <table class="w-full text-left text-[11px]">
                 <thead><tr class="text-slate-600"><th class="pb-2">Time</th><th class="pb-2">Type</th><th class="pb-2">Target</th><th class="pb-2">ROI</th><th class="pb-2 text-right">PnL (USDT)</th></tr></thead>
                 <tbody id="historyBody"></tbody>
@@ -261,20 +267,19 @@ app.get('/', (req, res) => {
     <script>
         setInterval(async () => {
             const r = await fetch('/api/status'); const d = await r.json();
-            document.getElementById('totalNetGain').innerText = d.market.totalNetGain.toFixed(8);
-            document.getElementById('growthPct').innerText = d.market.growthPct.toFixed(4) + '%';
+            document.getElementById('marketPrice').innerText = d.market.bid.toFixed(8);
             document.getElementById('realizedProfit').innerText = d.market.sessionRealizedProfit.toFixed(8);
             document.getElementById('netSession').innerText = d.market.netSessionUsdt.toFixed(8);
             document.getElementById('statusBadge').innerText = 'SYSTEM ' + d.market.status;
             let accHtml = '';
             d.accounts.forEach(a => {
-                accHtml += '<div class="bg-slate-950 p-3 border border-slate-800"><div class="flex justify-between items-center mb-1"><span class="text-[9px] bg-slate-800 px-1.5 rounded text-slate-400 font-bold">ACC '+a.id+'</span><span class="text-[9px] font-bold '+(a.direction === "buy" ? "text-emerald-500" : "text-rose-500")+'">'+a.direction.toUpperCase()+'</span></div><p class="text-lg font-bold '+(a.roi >= 0 ? "text-emerald-400" : "text-rose-400")+'">'+a.roi.toFixed(4)+'%</p><p class="text-[10px] text-slate-500 font-bold">Price: '+a.entryPrice.toFixed(8)+'</p><p class="text-[11px] text-slate-200 font-bold">'+a.unrealizedUsdt.toFixed(8)+'</p><div class="mt-2 text-[9px] text-slate-600 font-bold uppercase truncate">'+a.lastAction+'</div></div>';
+                accHtml += '<div class="bg-slate-950 p-3 border border-slate-800"><div class="flex justify-between items-center mb-1"><span class="text-[9px] bg-slate-800 px-1.5 rounded text-slate-400 font-bold">ACC '+a.id+'</span><span class="text-[9px] font-bold '+(a.direction === "buy" ? "text-emerald-500" : "text-rose-500")+'">'+a.direction.toUpperCase()+'</span></div><p class="text-lg font-bold '+(a.roi >= 0 ? "text-emerald-400" : "text-rose-400")+'">'+a.roi.toFixed(4)+'%</p><p class="text-[10px] text-slate-500 font-bold tracking-tighter">ENTRY: '+a.entryPrice.toFixed(8)+'</p><p class="text-[11px] text-slate-200 font-bold">'+a.unrealizedUsdt.toFixed(8)+'</p><div class="mt-2 text-[8px] text-slate-600 font-bold uppercase truncate">'+a.lastAction+'</div></div>';
             });
             document.getElementById('accountGrid').innerHTML = accHtml;
             let hHtml = '';
             d.tradeHistory.forEach(h => {
                 const isNeg = h.pnl.startsWith('-');
-                hHtml += '<tr class="border-b border-slate-800/50"><td class="py-1 text-slate-600">'+h.time+'</td><td class="font-bold text-indigo-400">'+h.type+'</td><td class="text-slate-400 font-bold">'+h.side+'</td><td class="font-bold">'+h.roi+'</td><td class="text-right font-bold '+(isNeg ? "text-rose-500" : "text-emerald-500")+'">'+h.pnl+'</td></tr>';
+                hHtml += '<tr class="border-b border-slate-800/50"><td class="py-1 text-slate-600">'+h.time+'</td><td class="font-bold text-indigo-400">'+h.type+'</td><td class="text-slate-400 font-bold">'+h.side+'</td><td class="font-bold text-slate-200">'+h.roi+'</td><td class="text-right font-bold '+(isNeg ? "text-rose-500" : "text-emerald-500")+'">'+h.pnl+'</td></tr>';
             });
             document.getElementById('historyBody').innerHTML = hHtml;
         }, 1000);
@@ -284,4 +289,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Sequential Engine Running...`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Unique Price Engine Online.`));
