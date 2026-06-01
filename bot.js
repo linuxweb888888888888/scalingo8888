@@ -1,156 +1,86 @@
 require('dotenv').config();
 const express = require('express');
+const crypto = require('crypto');
 const WebSocket = require('ws');
 const zlib = require('zlib');
 
 const app = express();
 app.use(express.json());
 
-// ==================== CONFIGURATION & ENV DETECTION ====================
-const detectedAccounts = [];
-let accountIndex = 1;
-while (process.env[`HTX_API_KEY_${accountIndex}`]) {
-    detectedAccounts.push({
-        id: accountIndex,
-        // Using first 4 chars of key just to visually confirm which "real" account is being simulated
-        label: `REAL_SLOT_${accountIndex}_(${process.env[`HTX_API_KEY_${accountIndex}`].substring(0, 4)}...)`
-    });
-    accountIndex++;
-}
-
-if (detectedAccounts.length === 0) {
-    console.error("❌ NO REAL ACCOUNTS DETECTED IN .ENV! Please add HTX_API_KEY_1, etc.");
-    process.exit(1);
-}
-
+// ==================== CONFIGURATION ====================
 const config = {
-    symbol: (process.env.SYMBOL || 'DOGE-USDT').toUpperCase(),
-    leverage: 75,
+    symbol: 'DOGE-USDT',
+    leverage: 20, // DOGE moves fast, higher leverage common for hedging
     port: process.env.PORT || 3000,
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
-    baseVolume: 10, // Virtual DOGE contracts
-    takeProfitPct: 2.5,
-    contractValue: 10, // 1 Contract = 10 DOGE
-    virtualInitialMargin: 500.0, // Starting fake balance per real account slot
-    takerFee: 0.0005 // 0.05% fee simulation
+    numAccounts: 50, // Total 50 accounts (25 Long / 25 Short)
+    initialPaperBalance: 1000, // $1,000 per paper account
+    baseVolume: 500, // 500 DOGE contracts per trade
+    winLossRatio: 1.5,
+    resetDiffThreshold: 1.2, // Trigger reset at 1.2% difference
+    takerFeeRate: 0.0005,
+    pollInterval: 1000
 };
 
-let market = {
-    status: 'VIRTUAL_MODE', 
-    bid: 0, ask: 0, 
-    totalNetGain: 0,
-    initialTotalEquity: detectedAccounts.length * config.virtualInitialMargin,
-    sessionRealizedProfit: 0,
-    netSessionUsdt: 0
+let market = { 
+    bid: 0, ask: 0, spread: 0,
+    totalNetGain: 0, initialTotalEquity: config.numAccounts * config.initialPaperBalance,
+    status: 'Active'
 };
 
-let tradeHistory = [];
 let accountStates = {};
+let tradeHistory = [];
 
-// Initialize Paper State for each Real Account detected
-detectedAccounts.forEach((acc, idx) => {
-    accountStates[acc.id] = {
-        id: acc.id,
-        label: acc.label,
-        direction: idx % 2 === 0 ? 'buy' : 'sell',
-        roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
-        currentEquity: config.virtualInitialMargin,
-        availableBalance: config.virtualInitialMargin,
-        lastAction: 'Paper Engine Waiting...',
-        isLocked: false
+// Initialize 50 Paper Accounts
+for (let i = 1; i <= config.numAccounts; i++) {
+    accountStates[i] = {
+        id: i,
+        direction: i <= config.numAccounts / 2 ? 'buy' : 'sell', // Half Long, Half Short
+        volume: 0,
+        entryPrice: 0,
+        roi: 0,
+        unrealizedUsdt: 0,
+        balance: config.initialPaperBalance,
+        initialEquity: config.initialPaperBalance,
+        lastAction: 'Idle',
+        resetUsed: false,
+        sessionLoss: 0
     };
-});
-
-// ==================== MOCKED EXECUTION ENGINE ====================
-
-function virtualOpen(accId) {
-    const state = accountStates[accId];
-    if (market.bid === 0 || state.volume > 0) return;
-
-    const fillPrice = state.direction === 'buy' ? market.ask : market.bid;
-    
-    // Safety check: Don't open if someone else just opened at this price
-    const existingPrices = Object.values(accountStates).map(s => s.entryPrice);
-    if (existingPrices.includes(fillPrice)) return;
-
-    const notional = config.baseVolume * config.contractValue * fillPrice;
-    const marginRequired = notional / config.leverage;
-    const fee = notional * config.takerFee;
-
-    if (state.availableBalance < (marginRequired + fee)) {
-        state.lastAction = "VIRTUAL_MARGIN_CALL";
-        return;
-    }
-
-    state.entryPrice = fillPrice;
-    state.volume = config.baseVolume;
-    state.availableBalance -= (marginRequired + fee);
-    state.lastAction = `VIRTUAL OPEN @ ${fillPrice}`;
 }
 
-function virtualClose(accId, type) {
+// ==================== VIRTUAL BROKER (PAPER TRADING) ====================
+function executeVirtualOrder(accId, side, type) {
     const state = accountStates[accId];
-    if (state.volume === 0) return;
+    const price = side === 'buy' ? market.ask : market.bid;
+    const fee = (config.baseVolume * price * config.takerFeeRate);
 
-    const exitPrice = state.direction === 'buy' ? market.bid : market.ask;
-    const directionMult = state.direction === 'buy' ? 1 : -1;
-    
-    const grossPnl = (exitPrice - state.entryPrice) * directionMult * (state.volume * config.contractValue);
-    const notionalAtExit = state.volume * config.contractValue * exitPrice;
-    const fee = notionalAtExit * config.takerFee;
-    const finalPnl = grossPnl - fee;
-
-    const initialMarginReturned = (state.volume * config.contractValue * state.entryPrice) / config.leverage;
-    
-    state.availableBalance += (initialMarginReturned + finalPnl);
-    state.currentEquity = state.availableBalance;
-    market.sessionRealizedProfit += finalPnl;
-
-    logToHistory(accId, state.direction, state.roi, finalPnl, type);
-
-    // Reset account state
-    state.volume = 0;
-    state.entryPrice = 0;
-    state.roi = 0;
-    state.unrealizedUsdt = 0;
-    state.lastAction = `CLOSED ${type} @ ${exitPrice}`;
-}
-
-function updateAccounting() {
-    let currentTotalEquity = 0;
-    let totalUnrealized = 0;
-
-    Object.values(accountStates).forEach(state => {
-        if (state.volume > 0) {
-            const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
-            const directionMult = state.direction === 'buy' ? 1 : -1;
-            
-            state.unrealizedUsdt = (currentPrice - state.entryPrice) * directionMult * (state.volume * config.contractValue);
-            
-            const marginUsed = (state.volume * config.contractValue * state.entryPrice) / config.leverage;
-            state.roi = (state.unrealizedUsdt / marginUsed) * 100;
-
-            // Logic check
-            if (state.roi >= config.takeProfitPct) virtualClose(state.id, 'TAKE_PROFIT');
-            if (state.roi <= -85.0) virtualClose(state.id, 'LIQUIDATED'); 
-        }
+    if (type === 'open') {
+        state.volume = config.baseVolume;
+        state.entryPrice = price;
+        state.balance -= fee;
+        state.lastAction = 'OPENED ' + side.toUpperCase();
+    } else {
+        // Calculate realized PnL
+        const pnl = state.direction === 'buy' 
+            ? (price - state.entryPrice) * state.volume 
+            : (state.entryPrice - price) * state.volume;
         
-        state.currentEquity = state.availableBalance + (state.unrealizedUsdt || 0);
-        totalUnrealized += state.unrealizedUsdt;
-        currentTotalEquity += state.currentEquity;
-    });
-
-    market.netSessionUsdt = totalUnrealized + market.sessionRealizedProfit;
-    market.totalNetGain = currentTotalEquity - market.initialTotalEquity;
+        state.balance += (pnl - fee);
+        state.volume = 0;
+        state.entryPrice = 0;
+        state.lastAction = 'CLOSED ' + side.toUpperCase();
+        
+        logTrade(state.direction, state.roi, pnl, 'PAPER_EXIT');
+    }
 }
 
-function logToHistory(accId, direction, roi, pnl, type) {
-    tradeHistory.unshift({
-        time: new Date().toLocaleTimeString(),
-        side: `ACC ${accId} ${direction.toUpperCase()}`,
-        roi: roi.toFixed(2) + '%',
+function logTrade(side, roi, pnl, type) {
+    tradeHistory.unshift({ 
+        time: new Date().toLocaleTimeString(), 
+        side: side.toUpperCase(), 
+        roi: roi.toFixed(2) + '%', 
         pnl: pnl.toFixed(4), 
-        type: type
+        type: type 
     });
     if (tradeHistory.length > 20) tradeHistory.pop();
 }
@@ -158,7 +88,8 @@ function logToHistory(accId, direction, roi, pnl, type) {
 // ==================== WS ENGINE ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
-    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
+    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'paper_doge' })));
+    
     ws.on('message', (data) => {
         zlib.gunzip(data, (err, dec) => {
             if (err) return;
@@ -166,7 +97,29 @@ function startWS() {
             if (msg.tick) {
                 market.bid = msg.tick.bid[0];
                 market.ask = msg.tick.ask[0];
-                updateAccounting();
+                market.spread = ((market.ask - market.bid) / market.bid) * 100;
+
+                // Update All 50 Accounts
+                let currentTotalEquity = 0;
+                Object.keys(accountStates).forEach(id => {
+                    const s = accountStates[id];
+                    if (s.volume > 0) {
+                        const price = s.direction === 'buy' ? market.bid : market.ask;
+                        s.roi = s.direction === 'buy' 
+                            ? ((price - s.entryPrice) / s.entryPrice) * config.leverage * 100
+                            : ((s.entryPrice - price) / s.entryPrice) * config.leverage * 100;
+                        s.unrealizedUsdt = s.direction === 'buy'
+                            ? (price - s.entryPrice) * s.volume
+                            : (s.entryPrice - price) * s.volume;
+                    }
+                    currentTotalEquity += (s.balance + s.unrealizedUsdt);
+                });
+                
+                market.totalNetGain = currentTotalEquity - market.initialTotalEquity;
+
+                // Simple Logic: Logic for Pair 1 (Account 1 and 26)
+                // In a production environment, you'd loop through pairs
+                checkLogic(1, 26); 
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
         });
@@ -174,60 +127,117 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-// Auto-run loop for entries
-setInterval(() => {
-    if (market.bid === 0) return;
-    Object.values(accountStates).forEach(s => { if (s.volume === 0) virtualOpen(s.id); });
-}, 2000);
+function checkLogic(longId, shortId) {
+    const s1 = accountStates[longId];
+    const s2 = accountStates[shortId];
+
+    if (s1.volume === 0 && s2.volume === 0) {
+        executeVirtualOrder(longId, 'buy', 'open');
+        executeVirtualOrder(shortId, 'sell', 'open');
+    }
+
+    // Reset Logic Example for Pair
+    const diffSum = Math.max(s1.roi, s2.roi) - (market.spread * config.leverage);
+    if (diffSum >= config.resetDiffThreshold && !s1.resetUsed) {
+        const loserId = s1.roi < s2.roi ? longId : shortId;
+        executeVirtualOrder(loserId, accountStates[loserId].direction === 'buy' ? 'sell' : 'buy', 'close');
+        executeVirtualOrder(loserId, accountStates[loserId].direction, 'open');
+        accountStates[loserId].resetUsed = true;
+    }
+}
 
 // ==================== UI DASHBOARD ====================
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), tradeHistory, config }));
 
 app.get('/', (req, res) => {
-    res.send(`<!DOCTYPE html><html><head><title>DOGE 75x Mock Engine</title>
+    res.send(`<!DOCTYPE html><html><head>
+    <title>50 Account DOGE Paper Engine</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <style>body { background: #020617; color: #f8fafc; font-family: monospace; }</style></head>
-    <body class="p-6"><div class="max-w-7xl mx-auto">
-        <div class="flex justify-between items-end mb-6">
+    <style>
+        body { background: #020617; color: white; font-family: sans-serif; }
+        .acc-card { background: #0f172a; border: 1px solid #1e293b; padding: 10px; border-radius: 8px; font-size: 11px; }
+    </style>
+</head>
+<body class="p-8">
+    <div class="max-w-7xl mx-auto">
+        <div class="flex justify-between items-center mb-8">
             <div>
-                <h1 class="text-xl font-bold text-indigo-400 uppercase tracking-widest">DOGE-USDT <span class="text-white">MOCK HEDGE</span></h1>
-                <p class="text-[10px] mt-1 font-bold bg-indigo-500/10 text-indigo-500 px-2 py-0.5 rounded border border-indigo-500/20 uppercase">MODE: VIRTUAL (SIMULATING ${detectedAccounts.length} REAL ACCOUNTS)</p>
+                <h1 class="text-2xl font-black text-indigo-400">DOGE PAPER-HEDGE CLUSTER</h1>
+                <p class="text-slate-400">Simulating 50 Accounts (25 Pairs) on Real-Time Market Data</p>
             </div>
             <div class="text-right">
-                <p id="totalNetGain" class="text-2xl font-bold text-white">0.0000 USDT</p>
-                <p id="growth" class="text-emerald-500 text-[10px] font-bold">MONITORING LIVE FEED</p>
+                <p class="text-sm text-slate-400 font-bold uppercase">Total Net Cluster PnL</p>
+                <p id="totalNet" class="text-4xl font-black">$0.00</p>
             </div>
         </div>
-        <div id="accountGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 mb-6"></div>
-        <div class="bg-slate-900 rounded border border-slate-800 p-4">
-            <table class="w-full text-left text-[11px]">
-                <thead><tr class="text-slate-600 border-b border-slate-800"><th class="pb-2">Time</th><th class="pb-2">Type</th><th class="pb-2">Target Slot</th><th class="pb-2">ROI</th><th class="pb-2 text-right">Virtual PnL</th></tr></thead>
-                <tbody id="historyBody"></tbody>
-            </table>
+
+        <div class="grid grid-cols-2 md:grid-cols-5 lg:grid-cols-10 gap-3 mb-8" id="accountGrid">
+            <!-- 50 accounts will be injected here -->
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div class="bg-slate-900 p-6 rounded-xl border border-slate-800">
+                <h2 class="font-bold mb-4 uppercase text-slate-500">Live Trade Feed</h2>
+                <div id="feed" class="space-y-2 h-64 overflow-y-auto pr-2"></div>
+            </div>
+            <div class="bg-slate-900 p-6 rounded-xl border border-slate-800">
+                <h2 class="font-bold mb-4 uppercase text-slate-500">Market Metrics</h2>
+                <div class="space-y-4">
+                    <div class="flex justify-between"><span>DOGE Price:</span><span id="price" class="font-mono">0.0000</span></div>
+                    <div class="flex justify-between"><span>Market Spread:</span><span id="spread" class="text-rose-400">0.00%</span></div>
+                    <div class="flex justify-between"><span>Active Accounts:</span><span>50/50</span></div>
+                </div>
+            </div>
         </div>
     </div>
+
     <script>
+        // Create 50 account slots
+        const grid = document.getElementById('accountGrid');
+        for(let i=1; i<=50; i++) {
+            grid.innerHTML += \`<div id="acc-\${i}" class="acc-card">
+                <div class="flex justify-between border-b border-slate-800 pb-1 mb-1">
+                    <span class="font-bold text-indigo-400">#\${i}</span>
+                    <span id="dir-\${i}" class="uppercase"></span>
+                </div>
+                <div id="roi-\${i}" class="font-black text-lg">0%</div>
+                <div id="bal-\${i}" class="text-slate-500">$\${i}</div>
+            </div>\`;
+        }
+
         setInterval(async () => {
-            const r = await fetch('/api/status'); const d = await r.json();
-            document.getElementById('totalNetGain').innerText = d.market.totalNetGain.toFixed(4) + ' USDT';
-            let accHtml = '';
+            const r = await fetch('/api/status');
+            const d = await r.json();
+
+            document.getElementById('totalNet').innerText = '$' + d.market.totalNetGain.toFixed(2);
+            document.getElementById('totalNet').className = 'text-4xl font-black ' + (d.market.totalNetGain >= 0 ? 'text-emerald-400' : 'text-rose-500');
+            document.getElementById('price').innerText = d.market.bid;
+            document.getElementById('spread').innerText = d.market.spread.toFixed(4) + '%';
+
             d.accounts.forEach(a => {
-                accHtml += '<div class="bg-slate-950 p-3 border border-slate-800"><div class="flex justify-between items-center mb-1"><span class="text-[9px] bg-slate-800 px-1.5 rounded text-slate-400 font-bold">'+a.label+'</span><span class="text-[9px] font-bold '+(a.direction === "buy" ? "text-emerald-500" : "text-rose-500")+'">'+a.direction.toUpperCase()+'</span></div><p class="text-lg font-bold '+(a.roi >= 0 ? "text-emerald-400" : "text-rose-400")+'">'+a.roi.toFixed(2)+'%</p><p class="text-[10px] text-slate-500 font-bold">ENTRY: '+a.entryPrice.toFixed(5)+'</p><p class="text-[11px] text-slate-200 font-bold">'+a.unrealizedUsdt.toFixed(4)+'</p><div class="mt-2 text-[8px] text-slate-600 font-bold uppercase truncate">'+a.lastAction+'</div></div>';
+                const card = document.getElementById('acc-' + a.id);
+                document.getElementById('roi-' + a.id).innerText = a.roi.toFixed(1) + '%';
+                document.getElementById('roi-' + a.id).className = 'font-black text-lg ' + (a.roi >= 0 ? 'text-emerald-400' : 'text-rose-500');
+                document.getElementById('dir-' + a.id).innerText = a.direction;
+                document.getElementById('bal-' + a.id).innerText = '$' + (a.balance + a.unrealizedUsdt).toFixed(2);
+                
+                if(a.roi > 5) card.style.borderColor = '#10b981';
+                else if(a.roi < -5) card.style.borderColor = '#f43f5e';
+                else card.style.borderColor = '#1e293b';
             });
-            document.getElementById('accountGrid').innerHTML = accHtml;
-            let hHtml = '';
-            d.tradeHistory.forEach(h => {
-                const isNeg = h.pnl.startsWith('-');
-                hHtml += '<tr class="border-b border-slate-800/50"><td class="py-1 text-slate-600">'+h.time+'</td><td class="font-bold text-indigo-400">'+h.type+'</td><td class="text-slate-400 font-bold">'+h.side+'</td><td class="font-bold text-slate-200">'+h.roi+'</td><td class="text-right font-bold '+(isNeg ? "text-rose-500" : "text-emerald-500")+'">'+h.pnl+'</td></tr>';
-            });
-            document.getElementById('historyBody').innerHTML = hHtml;
+
+            const feed = document.getElementById('feed');
+            feed.innerHTML = d.tradeHistory.map(h => \`
+                <div class="flex justify-between text-[10px] border-b border-slate-800 pb-1">
+                    <span class="text-slate-500">\${h.time}</span>
+                    <span class="font-bold text-indigo-400">\${h.type}</span>
+                    <span class="\${parseFloat(h.roi) > 0 ? 'text-emerald-400' : 'text-rose-400'} font-bold">\${h.roi}</span>
+                </div>
+            \`).join('');
         }, 1000);
-    </script></body></html>`);
+    </script>
+</body></html>`);
 });
 
 startWS();
-app.listen(config.port, '0.0.0.0', () => {
-    console.log(`\n🚀 MOCK ENGINE ONLINE`);
-    console.log(`📍 Detected Slots: ${detectedAccounts.length}`);
-    console.log(`🌐 Dashboard: http://localhost:${config.port}\n`);
-});
+app.listen(config.port, '0.0.0.0', () => console.log(`DOGE 50-Account Paper Engine Running on port ${config.port}`));
