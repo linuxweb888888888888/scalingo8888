@@ -28,11 +28,10 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     baseVolume: 1, 
-    multiplier: 1.2,
-    stepDistancePct: 0.1,
+    multiplier: 1.5,
+    stepDistancePct: 0.5,
     takeProfitPct: 1.0,      // Triggers based on Exchange ROI
     maxStartSpread: 0.1, 
-    takerFeeRate: 0.0005, 
     pollInterval: 1000 
 };
 
@@ -96,14 +95,14 @@ async function syncAccount(acc, state) {
             state.pendingOrderId = null;
             state.isLocked = false; 
         } else {
-            state.lastAction = "Waiting Confirmation";
+            state.lastAction = "Syncing Exchange...";
             return;
         }
     }
 
     if (state.isLocked) return; 
 
-    // PULL DIRECTLY FROM EXCHANGE POSITION INFO
+    // SYNC DIRECTLY FROM EXCHANGE POSITION DATA
     const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
     if (posRes?.status === 'ok' && posRes.data) {
         const pos = posRes.data.find(p => p.direction === state.direction);
@@ -111,9 +110,9 @@ async function syncAccount(acc, state) {
             state.volume = Math.floor(parseFloat(pos.volume));
             state.entryPrice = parseFloat(pos.cost_open);
             
-            // EXCHANGE SOURCE OF TRUTH FIELDS:
-            state.roi = parseFloat(pos.profit_rate) * 100; 
-            state.unrealizedUsdt = parseFloat(pos.profit);
+            // EXCHANGE SOURCE OF TRUTH:
+            state.roi = parseFloat(pos.profit_rate) * 100; // Directly from exchange
+            state.unrealizedUsdt = parseFloat(pos.profit); // Directly from exchange
             state.faceValue = parseFloat(pos.contract_size);
 
             if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
@@ -133,8 +132,15 @@ async function syncAccount(acc, state) {
 
 function logTradeExchangeStyle(state, order) {
     const now = new Date();
-    // Realized Net PnL = Profit - Fee (Direct from exchange order data)
-    const netPnl = parseFloat(order.profit) - parseFloat(order.fee);
+    
+    // REALIZED TRUTH: Profit minus Fee
+    const realizedProfit = parseFloat(order.profit || 0);
+    const realizedFee = parseFloat(order.fee || 0);
+    const netPnl = realizedProfit - realizedFee;
+
+    // Calculate Realized ROI based on the net result
+    const marginUsed = (state.volume * state.entryPrice * state.faceValue) / config.leverage;
+    const netRoi = marginUsed > 0 ? (netPnl / marginUsed) * 100 : 0;
 
     tradeHistory.unshift({
         symbol: config.symbol.replace('-', '') + 'Perp',
@@ -144,7 +150,7 @@ function logTradeExchangeStyle(state, order) {
         volume: state.volume,
         entryPrice: state.entryPrice.toFixed(8),
         exitPrice: parseFloat(order.trade_avg_price || 0).toFixed(8),
-        roi: state.roi.toFixed(8) + '%',
+        roi: netRoi.toFixed(8) + '%',
         netPnlUsdt: netPnl.toFixed(8),
         status: 'All Closed'
     });
@@ -180,7 +186,7 @@ async function processMartingale() {
 
         if (state.volume === 0) {
             if (market.spread > config.maxStartSpread) {
-                state.lastAction = "Wait Spread < " + config.maxStartSpread + "%";
+                state.lastAction = "Spread Wait";
                 continue;
             }
             state.isLocked = true;
