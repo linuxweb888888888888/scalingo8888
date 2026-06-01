@@ -29,7 +29,7 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
     takeProfitPct: 2.0, 
-    profitToLossRatio: 1.5, // 1.5:1 ratio (50% more profit than loss)
+    profitToLossRatio: 1.5, 
     pollInterval: 1500,
     takerFeeRate: 0.0005
 };
@@ -92,8 +92,8 @@ function logTrade(side, roi, pnl, type) {
         time: new Date().toLocaleTimeString(),
         side: side.toUpperCase(),
         roi: roi.toFixed(2) + '%',
-        pnl: pnl.toFixed(5),
-        total: market.totalNetGain.toFixed(5),
+        pnl: pnl.toFixed(8),
+        total: market.totalNetGain.toFixed(8),
         type: type
     });
     if (tradeHistory.length > 15) tradeHistory.pop();
@@ -215,10 +215,10 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>1.5x Ratio Engine</title>
+    <meta charset="UTF-8"><title>Hedge Engine Precision</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body { background: #0f172a; color: white; font-family: sans-serif; }
+        body { background: #0f172a; color: white; font-family: 'JetBrains Mono', monospace, sans-serif; }
         .card { background: #1e293b; border-radius: 15px; padding: 20px; border: 1px solid #334155; }
         .stat-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; font-weight: bold; }
     </style>
@@ -227,50 +227,49 @@ app.get('/', (req, res) => {
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-8">
             <div>
-                <h1 class="text-2xl font-bold">Profit <span class="text-indigo-400">1.5x</span> Loss</h1>
-                <p id="mStatus" class="text-[10px] uppercase font-bold text-emerald-500 tracking-widest mt-1 italic">Engine Active</p>
+                <h1 class="text-xl font-black">Ratio Engine <span class="text-indigo-400">1.5x</span></h1>
+                <p id="mStatus" class="text-[10px] uppercase font-bold text-emerald-500 tracking-widest mt-1">Engine Active</p>
             </div>
             <div class="text-right">
-                <p id="totalNetGain" class="text-2xl font-bold">$0.00</p>
-                <p id="growthPct" class="text-xs text-emerald-400">0.00%</p>
+                <p id="totalNetGain" class="text-xl font-black text-white tracking-tighter">$0.00000000</p>
+                <p id="growthPct" class="text-[10px] text-emerald-400 font-bold uppercase tracking-widest">Growth: 0.00%</p>
             </div>
         </div>
 
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
-            <div class="card border-l-4 border-indigo-500">
-                <p class="stat-label">Realized (The Shield)</p>
-                <p id="realizedProfit" class="text-3xl font-bold text-emerald-400">$0.00</p>
-                <p class="text-[10px] text-slate-500 mt-1 italic">SL capped at 66% of this buffer</p>
+            <div class="card border-l-4 border-emerald-500">
+                <p class="stat-label">Session Realized Profit</p>
+                <p id="realizedProfit" class="text-2xl font-black text-emerald-400 tracking-tighter">$0.00000000</p>
+                <p class="text-[9px] text-slate-500 mt-1 uppercase font-bold">Safe Buffer for Stop Loss</p>
             </div>
-            <div class="card border-l-4 border-slate-600">
-                <p class="stat-label">Net Session PnL</p>
-                <p id="netSession" class="text-3xl font-bold text-white">$0.00</p>
+            <div class="card border-l-4 border-indigo-500">
+                <p class="stat-label">Net Session PnL (Unrealized + Realized)</p>
+                <p id="netSession" class="text-2xl font-black text-white tracking-tighter">$0.00000000</p>
             </div>
         </div>
 
         <div class="card mb-6">
             <div class="grid grid-cols-2 gap-10">
                 <div>
-                    <p class="stat-label text-emerald-500">Long Position</p>
-                    <p id="lRoi" class="text-4xl font-bold">0.00%</p>
-                    <p id="lPnl" class="text-slate-400">$0.00</p>
+                    <p class="stat-label text-emerald-500">Long ROI</p>
+                    <p id="lRoi" class="text-4xl font-black">0.00%</p>
+                    <p id="lPnl" class="text-xs font-bold text-slate-400 tracking-tighter">$0.00000000</p>
                 </div>
                 <div class="text-right">
-                    <p class="stat-label text-rose-500">Short Position</p>
-                    <p id="sRoi" class="text-4xl font-bold">0.00%</p>
-                    <p id="sPnl" class="text-slate-400">$0.00</p>
+                    <p class="stat-label text-rose-500">Short ROI</p>
+                    <p id="sRoi" class="text-4xl font-black">0.00%</p>
+                    <p id="sPnl" class="text-xs font-bold text-slate-400 tracking-tighter">$0.00000000</p>
                 </div>
             </div>
         </div>
 
         <div class="card overflow-hidden mb-6">
-            <table class="w-full text-left text-xs">
-                <thead><tr class="text-slate-500 border-b border-slate-700"><th class="pb-2">Time</th><th class="pb-2">Type</th><th class="pb-2">Side</th><th class="pb-2">ROI</th><th class="pb-2">PnL</th></tr></thead>
-                <tbody id="historyBody"></tbody>
+            <table class="w-full text-left text-[10px]">
+                <thead><tr class="text-slate-500 border-b border-slate-700 uppercase"><th class="pb-2">Time</th><th class="pb-2">Type</th><th class="pb-2">Side</th><th class="pb-2">ROI</th><th class="pb-2">PnL (8 Dec)</th></tr></thead>
+                <tbody id="historyBody" class="font-bold"></tbody>
             </table>
         </div>
 
-        <!-- CLOSE ALL BUTTON -->
         <button onclick="triggerClose()" class="w-full py-4 bg-rose-600 hover:bg-rose-500 text-white font-black rounded-xl transition-all active:scale-95 shadow-xl uppercase tracking-widest text-sm">
             Emergency Liquidation (Close All)
         </button>
@@ -291,21 +290,22 @@ app.get('/', (req, res) => {
                 document.getElementById('mStatus').innerText = 'Engine ' + d.market.status;
                 document.getElementById('mStatus').className = 'text-[10px] uppercase font-bold tracking-widest mt-1 italic ' + (d.market.status === 'Active' ? 'text-emerald-500' : 'text-rose-500');
                 
-                document.getElementById('totalNetGain').innerText = '$' + d.market.totalNetGain.toFixed(4);
-                document.getElementById('growthPct').innerText = d.market.growthPct.toFixed(2) + '%';
-                document.getElementById('realizedProfit').innerText = '$' + d.market.sessionRealizedProfit.toFixed(4);
-                document.getElementById('netSession').innerText = '$' + d.market.netSessionUsdt.toFixed(4);
+                // Set to 8 Decimals
+                document.getElementById('totalNetGain').innerText = '$' + d.market.totalNetGain.toFixed(8);
+                document.getElementById('growthPct').innerText = 'Growth: ' + d.market.growthPct.toFixed(2) + '%';
+                document.getElementById('realizedProfit').innerText = '$' + d.market.sessionRealizedProfit.toFixed(8);
+                document.getElementById('netSession').innerText = '$' + d.market.netSessionUsdt.toFixed(8);
                 
                 d.accounts.forEach((a, i) => {
                     const p = i === 0 ? 'l' : 's';
                     document.getElementById(p+'Roi').innerText = a.roi.toFixed(2)+'%';
-                    document.getElementById(p+'Roi').className = 'text-4xl font-bold ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
-                    document.getElementById(p+'Pnl').innerText = '$' + a.unrealizedUsdt.toFixed(4);
+                    document.getElementById(p+'Roi').className = 'text-4xl font-black ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
+                    document.getElementById(p+'Pnl').innerText = '$' + a.unrealizedUsdt.toFixed(8);
                 });
 
                 let html = '';
                 d.tradeHistory.forEach(h => {
-                    html += '<tr class="border-b border-slate-800/50"><td class="py-2">' + h.time + '</td><td class="font-bold text-indigo-400 italic">' + h.type + '</td><td>' + h.side + '</td><td class="font-bold">' + h.roi + '</td><td>$' + h.pnl + '</td></tr>';
+                    html += '<tr class="border-b border-slate-800/50"><td class="py-2">' + h.time + '</td><td class="text-indigo-400 font-black italic">' + h.type + '</td><td>' + h.side + '</td><td class="font-black">' + h.roi + '</td><td>$' + h.pnl + '</td></tr>';
                 });
                 document.getElementById('historyBody').innerHTML = html;
             } catch(e) {}
@@ -316,4 +316,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`1.5x Ratio Engine Online`));
+app.listen(config.port, '0.0.0.0', () => console.log(`8-Decimal Ratio Engine Online`));
