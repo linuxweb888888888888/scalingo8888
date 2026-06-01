@@ -11,7 +11,6 @@ app.use(express.json());
 // ==================== CONFIGURATION ====================
 const apiAccounts = [];
 let accountIndex = 1;
-// Now looks for HTX_API_KEY_1 through HTX_API_KEY_4
 while (process.env[`HTX_API_KEY_${accountIndex}`]) {
     apiAccounts.push({
         apiKey: process.env[`HTX_API_KEY_${accountIndex}`],
@@ -28,7 +27,7 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    baseVolume: parseInt(process.env.BASE_VOLUME) || 1, 
+    baseVolume: parseInt(process.env.BASE_VOLUME) || 100, 
     winLossRatio: 1.5,        
     maxStartSpread: 0.1,      
     autoClosePct: 110,        
@@ -52,9 +51,8 @@ let tradeHistory = [];
 let accountStates = {};
 
 config.accounts.forEach((account, idx) => {
-    // Alternating sides: 1=Buy, 2=Sell, 3=Buy, 4=Sell
     accountStates[account.accountId] = {
-        direction: (idx % 2 === 0) ? 'buy' : 'sell',
+        direction: idx === 0 ? 'buy' : 'sell',
         roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
         currentEquity: 0, initialEquity: null,
         isLocked: false, lastAction: 'Idle'
@@ -103,7 +101,7 @@ function logTrade(side, roi, pnl, type) {
         total: market.totalNetGain.toFixed(5), 
         type: type 
     });
-    if (tradeHistory.length > 20) tradeHistory.pop();
+    if (tradeHistory.length > 15) tradeHistory.pop();
 }
 
 async function flashReset(accIdxToReset) {
@@ -147,53 +145,32 @@ function startWS() {
                 market.spread = ((market.ask - market.bid) / market.bid) * 100;
                 market.resetPenalty = -(market.spread * config.leverage);
 
-                // Group stats for 4 accounts
-                let longRois = [], shortRois = [], totalUnrealized = 0, totalFees = 0, totalLosingPnl = 0;
+                const s1 = accountStates[1]; 
+                const s2 = accountStates[2];
+                if (!s1 || !s2) return;
                 
-                Object.values(accountStates).forEach(s => {
-                    let liveRoi = s.roi;
-                    if (s.entryPrice > 0) {
-                        liveRoi = s.direction === 'buy' 
-                            ? ((market.bid - s.entryPrice) / s.entryPrice) * config.leverage * 100
-                            : ((s.entryPrice - market.ask) / s.entryPrice) * config.leverage * 100;
-                    }
-                    
-                    if (s.direction === 'buy') longRois.push(liveRoi);
-                    else shortRois.push(liveRoi);
+                const lRoi = s1.entryPrice > 0 ? ((market.bid - s1.entryPrice) / s1.entryPrice) * config.leverage * 100 : s1.roi;
+                const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : s2.roi;
+                
+                const winRoi = Math.max(lRoi, sRoi);
+                
+                // CORE LOGIC: Difference Sum = Winner ROI + (Spread * Leverage)
+                market.diffSum = winRoi + market.resetPenalty;
 
-                    totalUnrealized += s.unrealizedUsdt;
-                    totalFees += (s.volume > 0 ? (s.volume * market.bid * config.takerFeeRate) : 0);
-                    if (s.unrealizedUsdt < 0) totalLosingPnl += Math.abs(s.unrealizedUsdt);
-                });
-                
-                const avgLongRoi = longRois.reduce((a,b) => a+b, 0) / longRois.length;
-                const avgShortRoi = shortRois.reduce((a,b) => a+b, 0) / shortRois.length;
-                const bestRoi = Math.max(avgLongRoi, avgShortRoi);
-                
-                // Difference Sum based on the winning group
-                market.diffSum = bestRoi + market.resetPenalty;
+                const fee1 = s1.volume > 0 ? (s1.volume * market.bid * config.takerFeeRate) : 0;
+                const fee2 = s2.volume > 0 ? (s2.volume * market.ask * config.takerFeeRate) : 0;
+                market.estExitFees = fee1 + fee2;
 
-                // Ratio calculation: Total Profit from winning side / (Total Debt from all losing accounts + fees + reset losses)
-                const totalWinningPnl = Object.values(accountStates).reduce((sum, s) => sum + (s.unrealizedUsdt > 0 ? s.unrealizedUsdt : 0), 0);
-                const totalDebt = totalLosingPnl + market.sessionResetLoss + totalFees;
+                const winPnl = Math.max(s1.unrealizedUsdt, s2.unrealizedUsdt);
+                const totalDebt = Math.abs(Math.min(s1.unrealizedUsdt, s2.unrealizedUsdt)) + market.sessionResetLoss + market.estExitFees;
                 
-                market.currentRatio = totalDebt > 0 ? (totalWinningPnl / totalDebt) : 0;
-                market.netSessionUsdt = totalUnrealized - market.sessionResetLoss - totalFees;
-                market.estExitFees = totalFees;
+                market.currentRatio = totalDebt > 0 ? (winPnl / totalDebt) : 0;
+                market.netSessionUsdt = (s1.unrealizedUsdt + s2.unrealizedUsdt) - market.sessionResetLoss - market.estExitFees;
 
-                // Reset Trigger: If Diff Sum > 2.5%, reset the weakest individual account on the losing side
+                // RESET TRIGGER: Strictly triggered only when Difference Sum reaches target (e.g. 2.5%)
                 if (market.status === 'Active' && !market.resetUsed) {
                     if (market.diffSum >= config.resetDiffThreshold) {
-                        // Find account with the lowest individual ROI to reset
-                        let worstAccIdx = -1;
-                        let worstRoi = 999;
-                        config.accounts.forEach((acc, idx) => {
-                            if (accountStates[acc.accountId].roi < worstRoi) {
-                                worstRoi = accountStates[acc.accountId].roi;
-                                worstAccIdx = idx;
-                            }
-                        });
-                        if (worstAccIdx !== -1) flashReset(worstAccIdx);
+                        lRoi < sRoi ? flashReset(0) : flashReset(1);
                     }
                 }
             }
@@ -206,10 +183,10 @@ function startWS() {
 // ==================== MAIN LOOP ====================
 async function backgroundLoop() {
     await Promise.all(config.accounts.map(acc => syncAccount(acc, accountStates[acc.accountId])));
-    
-    let totalCurrentEquity = 0;
-    Object.values(accountStates).forEach(s => totalCurrentEquity += s.currentEquity);
+    const s1 = accountStates[1]; const s2 = accountStates[2];
+    if (!s1 || !s2) return;
 
+    const totalCurrentEquity = s1.currentEquity + s2.currentEquity;
     if (market.initialTotalEquity === 0 && totalCurrentEquity > 0) market.initialTotalEquity = totalCurrentEquity;
     market.totalNetGain = totalCurrentEquity - market.initialTotalEquity;
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
@@ -218,13 +195,11 @@ async function backgroundLoop() {
 
     if (market.status === 'Active') {
         if (market.balancePct >= config.autoClosePct && market.netSessionUsdt > 0) {
-            await manualClose('4-ACC TARGET EXIT');
+            await manualClose('TARGET EXIT');
             return;
         }
 
-        // Open if all accounts are empty
-        const allEmpty = Object.values(accountStates).every(s => s.volume === 0 && !s.isLocked);
-        if (allEmpty) {
+        if (s1.volume === 0 && s2.volume === 0 && !s1.isLocked && !s2.isLocked) {
             if (market.spread > 0 && market.spread <= config.maxStartSpread) {
                 for (const acc of config.accounts) {
                     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
@@ -265,7 +240,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>4-Account Ratio Hedge</title>
+    <meta charset="UTF-8"><title>Ratio Hedge Engine</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap" rel="stylesheet">
     <style>
@@ -278,8 +253,8 @@ app.get('/', (req, res) => {
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-10">
             <div>
-                <h1 class="text-3xl font-black tracking-tighter uppercase italic">Ratio-Hedge <span class="text-indigo-500">4-Acc</span></h1>
-                <p id="botStatus" class="text-[10px] font-bold text-emerald-500 uppercase tracking-widest mt-1">Multi-Account Engine Active</p>
+                <h1 class="text-3xl font-black tracking-tighter uppercase italic">Ratio-Hedge <span class="text-indigo-500">Pro</span></h1>
+                <p id="botStatus" class="text-[10px] font-bold text-emerald-500 uppercase tracking-widest mt-1">Engine Online</p>
             </div>
             <div class="text-right">
                 <p id="totalNetGain" class="text-3xl font-black text-white">$0.00000</p>
@@ -294,7 +269,7 @@ app.get('/', (req, res) => {
                 <p class="text-[9px] text-slate-500 mt-1">Target: ${config.winLossRatio}x</p>
             </div>
             <div class="card p-6 border-l-4 border-rose-500">
-                <p class="stat-label mb-1">Spread Penalty</p>
+                <p class="stat-label mb-1">ROI If Reset Now</p>
                 <p id="uiPenalty" class="text-3xl font-black text-rose-400">-0.00%</p>
                 <div class="mt-2 pt-2 border-t border-slate-700">
                    <p class="stat-label text-[9px]">Difference Sum (Trigger: ${config.resetDiffThreshold}%)</p>
@@ -316,28 +291,16 @@ app.get('/', (req, res) => {
             <div class="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
                 <div id="balBar" class="bg-indigo-500 h-full w-0 transition-all duration-500"></div>
             </div>
-            
-            <!-- 4 Account Display -->
-            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mt-8">
-                <div class="p-4 bg-slate-800/50 rounded-xl">
-                    <p class="stat-label text-emerald-500">Long 1</p>
-                    <p id="roi0" class="text-xl font-black">0.00%</p>
-                    <p id="pnl0" class="text-[10px] text-slate-500">$0.00</p>
+            <div class="grid grid-cols-2 gap-10 mt-8">
+                <div>
+                    <p class="stat-label text-emerald-500">Long Position</p>
+                    <p id="lRoi" class="text-4xl font-black">0.00%</p>
+                    <p id="lPnl" class="text-sm font-bold text-slate-500">$0.00000</p>
                 </div>
-                <div class="p-4 bg-slate-800/50 rounded-xl">
-                    <p class="stat-label text-rose-500">Short 2</p>
-                    <p id="roi1" class="text-xl font-black">0.00%</p>
-                    <p id="pnl1" class="text-[10px] text-slate-500">$0.00</p>
-                </div>
-                <div class="p-4 bg-slate-800/50 rounded-xl">
-                    <p class="stat-label text-emerald-500">Long 3</p>
-                    <p id="roi2" class="text-xl font-black">0.00%</p>
-                    <p id="pnl2" class="text-[10px] text-slate-500">$0.00</p>
-                </div>
-                <div class="p-4 bg-slate-800/50 rounded-xl">
-                    <p class="stat-label text-rose-500">Short 4</p>
-                    <p id="roi3" class="text-xl font-black">0.00%</p>
-                    <p id="pnl3" class="text-[10px] text-slate-500">$0.00</p>
+                <div class="text-right">
+                    <p class="stat-label text-rose-500">Short Position</p>
+                    <p id="sRoi" class="text-4xl font-black">0.00%</p>
+                    <p id="sPnl" class="text-sm font-bold text-slate-500">$0.00000</p>
                 </div>
             </div>
         </div>
@@ -359,12 +322,12 @@ app.get('/', (req, res) => {
         </div>
 
         <button onclick="triggerClose()" class="w-full py-5 rounded-2xl bg-white text-black font-black uppercase tracking-widest hover:bg-rose-500 hover:text-white transition-all shadow-2xl active:scale-95">
-            Emergency Liquidation (All 4)
+            Emergency Liquidation
         </button>
     </div>
 
     <script>
-        async function triggerClose() { if(confirm("Liquidate all 4 accounts?")) fetch('/api/close', {method:'POST'}); }
+        async function triggerClose() { if(confirm("Liquidate all?")) fetch('/api/close', {method:'POST'}); }
         setInterval(async () => {
             try {
                 const r = await fetch('/api/status'); 
@@ -385,9 +348,10 @@ app.get('/', (req, res) => {
                 document.getElementById('netLabel').innerText = 'Net: $' + d.market.netSessionUsdt.toFixed(5);
 
                 d.accounts.forEach(function(a, i) {
-                    document.getElementById('roi'+i).innerText = a.roi.toFixed(2)+'%';
-                    document.getElementById('roi'+i).className = 'text-xl font-black ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
-                    document.getElementById('pnl'+i).innerText = '$' + a.unrealizedUsdt.toFixed(3);
+                    const p = i === 0 ? 'l' : 's';
+                    document.getElementById(p+'Roi').innerText = a.roi.toFixed(2)+'%';
+                    document.getElementById(p+'Roi').className = 'text-4xl font-black ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
+                    document.getElementById(p+'Pnl').innerText = (a.unrealizedUsdt >= 0 ? '$' : '-$') + Math.abs(a.unrealizedUsdt).toFixed(5);
                 });
 
                 let tableHtml = '';
@@ -411,4 +375,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`4-Account Engine Online (Strict Difference Sum Mode)`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Strict Difference Sum Mode)`));
