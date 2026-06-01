@@ -69,8 +69,20 @@ async function htxRequest(account, method, path, data = {}) {
     } catch (e) { return { status: 'error' }; }
 }
 
+// REST PRICE SYNC (Priority Fallback)
+async function fetchPriceRest() {
+    try {
+        const url = `https://${config.restHost}/linear-swap-ex/market/detail/merged?contract_code=${config.symbol}`;
+        const res = await axios.get(url);
+        if (res.data?.tick) {
+            market.bid = res.data.tick.bid[0];
+            market.ask = res.data.tick.ask[0];
+            market.spread = ((market.ask - market.bid) / market.bid) * 100;
+        }
+    } catch (e) {}
+}
+
 async function syncAccount(acc, state) {
-    // IGNORE SYNC IF LOCKED: Prevents exchange lag from showing "ghost" positions
     if (state.isLocked) return; 
 
     const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
@@ -79,7 +91,7 @@ async function syncAccount(acc, state) {
         if (pos) {
             state.volume = Math.floor(parseFloat(pos.volume));
             state.entryPrice = parseFloat(pos.cost_open || pos.last_price);
-            state.roi = parseFloat(pos.profit_rate) * 100; // Directly from exchange
+            state.roi = parseFloat(pos.profit_rate) * 100; 
             state.unrealizedUsdt = parseFloat(pos.profit);
             if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
             if (!state.startTime) state.startTime = new Date().toLocaleString();
@@ -98,7 +110,6 @@ async function syncAccount(acc, state) {
 
 function logTradeExchangeStyle(state, exitPrice) {
     const now = new Date();
-    // Use the exchange's ROI and PnL values at the moment of closure
     tradeHistory.unshift({
         symbol: config.symbol.replace('-', '') + 'Perpetual',
         type: (state.direction === 'buy' ? 'BuyCross' : 'SellCross'),
@@ -116,9 +127,13 @@ function logTradeExchangeStyle(state, exitPrice) {
 
 // ==================== WS ENGINE ====================
 function startWS() {
-    const wsSymbol = config.symbol.replace('-', '').toLowerCase();
     const ws = new WebSocket(config.wsHost);
-    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${wsSymbol}.bbo`, id: 'bbo' })));
+    const subTopic = `market.${config.symbol}.bbo`;
+
+    ws.on('open', () => {
+        ws.send(JSON.stringify({ sub: subTopic, id: "sub1" }));
+    });
+
     ws.on('message', (data) => {
         zlib.gunzip(data, (err, dec) => {
             if (err) return;
@@ -141,51 +156,29 @@ async function processMartingale() {
         if (state.isLocked || market.bid === 0) continue;
         const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
 
-        // 1. Initial Entry
         if (state.volume === 0) {
             state.isLocked = true;
-            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
-            // Unlock only after API confirms success
-            if (res.status === 'ok') {
-                state.lastAction = "Entry Open";
-            }
             state.isLocked = false;
             continue;
         }
 
-        // 2. TAKE PROFIT (WITH CONFIRMATION IGNORE)
         if (state.roi >= config.takeProfitPct) {
-            state.isLocked = true; // LOCK IMMEDIATELY
+            state.isLocked = true;
             state.lastAction = "⚡ CLOSING...";
-
             const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-                contract_code: config.symbol, 
-                volume: state.volume, 
-                direction: state.direction === 'buy' ? 'sell' : 'buy', 
-                offset: 'close', 
-                lever_rate: config.leverage, 
-                order_price_type: 'optimal_20' 
+                contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
             });
-
             if (res.status === 'ok') {
                 logTradeExchangeStyle(state, currentPrice);
-                // WIPE LOCAL MEMORY: Sync loop will ignore exchange data for 10s
-                state.volume = 0;
-                state.roi = 0;
-                state.entryPrice = 0;
-                setTimeout(() => { 
-                    state.isLocked = false; 
-                    state.lastAction = "Idle"; 
-                }, 10000); 
-            } else {
-                state.isLocked = false; // Order failed, unlock to retry
-            }
+                state.volume = 0; state.roi = 0; state.entryPrice = 0;
+                setTimeout(() => { state.isLocked = false; state.lastAction = "Idle"; }, 10000); 
+            } else { state.isLocked = false; }
             continue;
         }
 
-        // 3. Step Logic (Confirmation Required)
         let priceMove = state.direction === 'buy' ? 
             ((state.lastStepPrice - currentPrice) / state.lastStepPrice) * 100 : 
             ((currentPrice - state.lastStepPrice) / state.lastStepPrice) * 100;
@@ -207,6 +200,9 @@ async function processMartingale() {
 }
 
 async function backgroundLoop() {
+    // If WS is providing zero data, force a REST sync
+    if (market.bid === 0) await fetchPriceRest();
+
     await Promise.all(config.accounts.map(acc => syncAccount(acc, accountStates[acc.accountId])));
     const s1 = accountStates[1]; const s2 = accountStates[2];
     market.totalNetGain = (s1.currentEquity + s2.currentEquity) - market.initialTotalEquity;
@@ -317,6 +313,7 @@ app.get('/', (req, res) => {
                 document.getElementById('growthPct').innerText = 'Total Profit: ' + d.market.growthPct.toFixed(2) + '%';
                 document.getElementById('dgrPct').innerText = 'DGR: ' + d.market.dgr.toFixed(2) + '% / DAY';
                 document.getElementById('uiSpread').innerText = d.market.spread.toFixed(3) + '%';
+                document.getElementById('marketStatus').innerText = d.market.status;
 
                 d.accounts.forEach(function(a, i) {
                     const p = i === 0 ? 'l' : 's';
