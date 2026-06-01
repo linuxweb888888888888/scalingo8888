@@ -28,9 +28,9 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     baseVolume: 1, 
-    multiplier: 1.5,
+    multiplier: 1.2,
     stepDistancePct: 0.5,    // Increased for better safety
-    takeProfitPct: 3.0,      // Increased to cover slippage and fees
+    takeProfitPct: 1.0,      // Increased to cover slippage and fees
     maxStartSpread: 0.1, 
     takerFeeRate: 0.0005, 
     pollInterval: 1500 
