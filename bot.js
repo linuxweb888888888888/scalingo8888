@@ -32,7 +32,7 @@ const config = {
     pollInterval: 2000,
     takerFeeRate: 0.0005,
     contractValue: 1000, // FIXED: 1 Contract = 1000 SHIB
-    entryStaggerMs: 4000 // 4 seconds delay between account entries
+    entryStaggerMs: 5000 // 5 seconds between account openings
 };
 
 let market = {
@@ -65,7 +65,7 @@ async function htxRequest(account, method, path, data = {}) {
     const signature = crypto.createHmac('sha256', account.secret_key).update(payload).digest('base64');
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
-        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 3000 });
+        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 4000 });
         return res.data;
     } catch (e) { return { status: 'error' }; }
 }
@@ -83,10 +83,8 @@ async function syncAccount(acc) {
             const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
             if (currentPrice > 0) {
                 const sideMult = state.direction === 'buy' ? 1 : -1;
-                // Match exchange ROI formula
                 state.roi = ((currentPrice - state.entryPrice) / state.entryPrice) * config.leverage * sideMult * 100;
                 
-                // PnL Calculation: (PriceDiff * Vol * 1000) - Taker Fees
                 const grossPnL = (currentPrice - state.entryPrice) * state.volume * config.contractValue * sideMult;
                 const feeEstimate = (state.entryPrice + currentPrice) * state.volume * config.contractValue * config.takerFeeRate;
                 state.unrealizedUsdt = grossPnL - feeEstimate;
@@ -109,7 +107,6 @@ async function executeAction(accId, type) {
     state.isLocked = true;
     state.lastAction = type;
     
-    // 1. Close the current position
     const closeRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
         contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
         offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
@@ -120,40 +117,38 @@ async function executeAction(accId, type) {
         logToHistory(accId, state.direction, state.roi, state.unrealizedUsdt, type);
     }
 
-    // 2. STAGGERED RE-ENTRY: Wait a unique amount of time so the price changes
-    const randomBuffer = Math.floor(Math.random() * 3000); // 0-3 sec extra
-    const totalWait = config.entryStaggerMs + randomBuffer;
-    
-    state.lastAction = `RE-OPENING IN ${Math.round(totalWait/1000)}s...`;
+    // Re-entry with delay
+    const delay = config.entryStaggerMs + Math.floor(Math.random() * 2000);
+    state.lastAction = `RE-OPEN IN ${Math.round(delay/1000)}s`;
 
     setTimeout(async () => {
         if (market.status !== 'Active') { state.isLocked = false; return; }
-        
         await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
             contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, 
             offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
         });
-        
         state.isLocked = false;
         state.lastAction = "Idle";
-    }, totalWait);
+    }, delay);
 }
 
 function logToHistory(accId, direction, roi, pnl, type) {
     tradeHistory.unshift({
         time: new Date().toLocaleTimeString(),
-        side: `ACC \${accId} \${direction.toUpperCase()}`,
+        side: `ACC ${accId} ${direction.toUpperCase()}`,
         roi: roi.toFixed(4) + '%',
         pnl: pnl.toFixed(8), 
         type: type
     });
-    if (tradeHistory.length > 30) tradeHistory.pop();
+    if (tradeHistory.length > 25) tradeHistory.pop();
 }
 
 // ==================== WS ENGINE ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
-    ws.on('open', () => ws.send(JSON.stringify({ sub: \`market.\${config.symbol}.bbo\`, id: 'bbo' })));
+    ws.on('open', () => {
+        ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' }));
+    });
     ws.on('message', (data) => {
         zlib.gunzip(data, (err, dec) => {
             if (err) return;
@@ -188,28 +183,24 @@ async function backgroundLoop() {
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
 
     if (market.status === 'Active') {
-        // Find accounts that have 0 volume and aren't waiting to open
         for (const state of states) {
             if (state.volume === 0 && !state.isLocked) {
-                state.isLocked = true; // Lock immediately to prevent double-firing
+                state.isLocked = true;
                 const acc = config.accounts.find(a => a.id === state.id);
                 
-                console.log(`[STAGGER] Opening Account \${state.id} in \${config.entryStaggerMs}ms...`);
-                
-                // Wait the stagger time before opening
-                await new Promise(r => setTimeout(r, config.entryStaggerMs));
-                
-                await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
-                });
-                
-                state.isLocked = false;
+                // Wait for the price to move slightly before opening this specific account
+                setTimeout(async () => {
+                    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                        contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
+                    });
+                    state.isLocked = false;
+                }, config.entryStaggerMs * state.id); 
             }
         }
     }
 }
 
-// ==================== UI DASHBOARD ====================
+// ==================== DASHBOARD ====================
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), tradeHistory, config }));
 app.post('/api/close-all', async (req, res) => {
     market.status = 'LIQUIDATING';
@@ -221,7 +212,7 @@ app.post('/api/close-all', async (req, res) => {
             });
         }
     }
-    setTimeout(() => { market.status = 'Active'; }, 15000);
+    setTimeout(() => { market.status = 'Active'; }, 10000);
     res.json({status:'ok'});
 });
 
@@ -229,51 +220,35 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>Hedge Engine Staggered</title>
+    <meta charset="UTF-8"><title>Hedge Engine 8D</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body { background: #020617; color: #f8fafc; font-family: monospace; }
-        .stat-card { background: #0f172a; border: 1px solid #1e293b; padding: 1rem; border-radius: 4px; }
-    </style>
+    <style>body { background: #020617; color: #f8fafc; font-family: monospace; }</style>
 </head>
-<body class="p-4">
+<body class="p-6">
     <div class="max-w-7xl mx-auto">
         <div class="flex justify-between items-end mb-6">
             <div>
-                <h1 class="text-xl font-bold text-indigo-400 uppercase">Hedge Engine <span class="text-white opacity-50">Staggered Entry</span></h1>
-                <p id="statusBadge" class="text-[10px] font-bold bg-emerald-500/10 text-emerald-500 px-2 py-0.5 rounded border border-emerald-500/20 uppercase tracking-widest">SYSTEM ACTIVE</p>
+                <h1 class="text-xl font-bold text-indigo-400">HEDGE ENGINE <span class="text-white opacity-40">STAGGERED 8D</span></h1>
+                <p id="statusBadge" class="text-[10px] mt-1 font-bold bg-emerald-500/10 text-emerald-500 px-2 py-0.5 rounded border border-emerald-500/20 uppercase tracking-widest">SYSTEM ACTIVE</p>
             </div>
             <div class="text-right">
                 <p id="totalNetGain" class="text-2xl font-bold">0.00000000</p>
-                <p id="growthPct" class="text-emerald-500 text-[10px] font-bold">0.0000% GROWTH</p>
+                <p id="growthPct" class="text-emerald-500 text-[10px]">0.0000%</p>
             </div>
         </div>
-
         <div class="grid grid-cols-2 gap-4 mb-6">
-            <div class="stat-card">
-                <p class="text-[9px] text-slate-500 uppercase font-bold">Session Realized Profit</p>
-                <p id="realizedProfit" class="text-xl font-bold text-emerald-400">0.00000000</p>
-            </div>
-            <div class="stat-card text-right">
-                <p class="text-[9px] text-slate-500 uppercase font-bold text-right">Live Session Net PnL</p>
-                <p id="netSession" class="text-xl font-bold text-white">0.00000000</p>
-            </div>
+            <div class="bg-slate-900 p-4 border border-slate-800"><p class="text-[9px] text-slate-500 uppercase font-bold">Session Realized</p><p id="realizedProfit" class="text-xl font-bold text-emerald-400">0.00000000</p></div>
+            <div class="bg-slate-900 p-4 border border-slate-800 text-right"><p class="text-[9px] text-slate-500 uppercase font-bold text-right">Net Session PnL</p><p id="netSession" class="text-xl font-bold text-white">0.00000000</p></div>
         </div>
-
         <div id="accountGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 mb-6"></div>
-
-        <div class="bg-[#0f172a] rounded border border-[#1e293b] p-4">
-            <div class="flex justify-between mb-4 border-b border-slate-800 pb-2">
-                 <p class="text-[10px] font-bold text-slate-500 uppercase">Recent Exchange Activity</p>
-                 <button onclick="fetch('/api/close-all', {method:'POST'})" class="text-[9px] text-rose-500 hover:text-white uppercase font-bold">Emergency Liquidation</button>
-            </div>
+        <div class="bg-slate-900 rounded border border-slate-800 p-4">
+            <div class="flex justify-between mb-4 border-b border-slate-800 pb-2"><p class="text-[10px] font-bold text-slate-500 uppercase">Exchange Activity</p><button onclick="fetch('/api/close-all', {method:'POST'})" class="text-[9px] text-rose-500 font-bold uppercase">Liquidate All</button></div>
             <table class="w-full text-left text-[11px]">
-                <thead><tr class="text-slate-600"><th class="pb-2">Time</th><th class="pb-2">Type</th><th class="pb-2">Target</th><th class="pb-2">ROI</th><th class="pb-2 text-right">Net PnL (USDT)</th></tr></thead>
+                <thead><tr class="text-slate-600"><th class="pb-2">Time</th><th class="pb-2">Type</th><th class="pb-2">Target</th><th class="pb-2">ROI</th><th class="pb-2 text-right">PnL (USDT)</th></tr></thead>
                 <tbody id="historyBody"></tbody>
             </table>
         </div>
     </div>
-
     <script>
         setInterval(async () => {
             const r = await fetch('/api/status'); const d = await r.json();
@@ -282,26 +257,15 @@ app.get('/', (req, res) => {
             document.getElementById('realizedProfit').innerText = d.market.sessionRealizedProfit.toFixed(8);
             document.getElementById('netSession').innerText = d.market.netSessionUsdt.toFixed(8);
             document.getElementById('statusBadge').innerText = 'SYSTEM ' + d.market.status;
-            
             let accHtml = '';
             d.accounts.forEach(a => {
-                accHtml += \`
-                <div class="bg-[#0f172a] p-3 border border-[#1e293b]">
-                    <div class="flex justify-between items-center mb-1">
-                        <span class="text-[9px] bg-slate-800 px-1.5 rounded text-slate-400 font-bold">ACC \${a.id}</span>
-                        <span class="text-[9px] font-bold \${a.direction === 'buy' ? 'text-emerald-500' : 'text-rose-500'}">\${a.direction.toUpperCase()}</span>
-                    </div>
-                    <p class="text-lg font-bold \${a.roi >= 0 ? 'text-emerald-400' : 'text-rose-400'}">\${a.roi.toFixed(4)}%</p>
-                    <p class="text-[12px] text-slate-200 font-bold">\${a.unrealizedUsdt.toFixed(8)}</p>
-                    <div class="mt-2 text-[9px] text-slate-500 font-bold uppercase truncate">\${a.lastAction}</div>
-                </div>\`;
+                accHtml += '<div class="bg-slate-950 p-3 border border-slate-800"><div class="flex justify-between items-center mb-1"><span class="text-[9px] bg-slate-800 px-1.5 rounded text-slate-400 font-bold">ACC '+a.id+'</span><span class="text-[9px] font-bold '+(a.direction === "buy" ? "text-emerald-500" : "text-rose-500")+'">'+a.direction.toUpperCase()+'</span></div><p class="text-lg font-bold '+(a.roi >= 0 ? "text-emerald-400" : "text-rose-400")+'">'+a.roi.toFixed(4)+'%</p><p class="text-[11px] text-slate-200 font-bold">'+a.unrealizedUsdt.toFixed(8)+'</p><div class="mt-2 text-[9px] text-slate-600 font-bold uppercase truncate">'+a.lastAction+'</div></div>';
             });
             document.getElementById('accountGrid').innerHTML = accHtml;
-
             let hHtml = '';
             d.tradeHistory.forEach(h => {
                 const isNeg = h.pnl.startsWith('-');
-                hHtml += \`<tr class="border-b border-slate-900/50"><td class="py-1 text-slate-600">\${h.time}</td><td class="font-bold text-indigo-400">\${h.type}</td><td class="text-slate-400 font-bold">\${h.side}</td><td class="font-bold">\${h.roi}</td><td class="text-right font-bold \${isNeg ? 'text-rose-500' : 'text-emerald-500'}">\${h.pnl}</td></tr>\`;
+                hHtml += '<tr class="border-b border-slate-800/50"><td class="py-1 text-slate-600">'+h.time+'</td><td class="font-bold text-indigo-400">'+h.type+'</td><td class="text-slate-400 font-bold">'+h.side+'</td><td class="font-bold">'+h.roi+'</td><td class="text-right font-bold '+(isNeg ? "text-rose-500" : "text-emerald-500")+'">'+h.pnl+'</td></tr>';
             });
             document.getElementById('historyBody').innerHTML = hHtml;
         }, 1000);
@@ -309,7 +273,6 @@ app.get('/', (req, res) => {
 </body></html>`);
 });
 
-// Start Sequence
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Staggered Engine Online: 1 Contract = 1000 SHIB`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Running: 1 Contract = 1000 SHIB`));
