@@ -27,13 +27,13 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
+    baseVolume: 10, // CHANGED: Initial volume set to 10 contracts
     winLossRatio: 4,
     maxStartSpread: 0.15,
     autoClosePct: 150,
     pollInterval: 1000,
     resetCooldownMs: 3000,
-    resetDiffThreshold: 2.5,  // TRIGGER: Difference Sum must reach this value
+    resetDiffThreshold: 2.5,  
     takerFeeRate: 0.0005
 };
 
@@ -113,18 +113,24 @@ async function flashReset(accIdxToReset) {
     state.isLocked = true;
     market.resetUsed = true; 
 
+    // NEW LOGIC: Calculate reduced volume (Divide current by 2, minimum 1)
+    const reducedVolume = Math.max(1, Math.floor(state.volume / 2));
+
     const feeCost = (state.volume * market.bid * config.takerFeeRate * 2);
     market.sessionResetLoss += (Math.abs(state.unrealizedUsdt) + feeCost);
 
     state.lastAction = "⚡ RESET";
-    logTrade(state.direction, state.roi, state.unrealizedUsdt, 'RESET');
+    logTrade(state.direction, state.roi, state.unrealizedUsdt, `RESET (Reduced to ${reducedVolume})`);
 
+    // Close full existing volume
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
         contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
         offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
     });
+
+    // Open with REDUCED volume
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-        contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, 
+        contract_code: config.symbol, volume: reducedVolume, direction: state.direction, 
         offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
     });
 
@@ -153,8 +159,6 @@ function startWS() {
                 const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : s2.roi;
                 
                 const winRoi = Math.max(lRoi, sRoi);
-                
-                // CORE LOGIC: Difference Sum = Winner ROI + (Spread * Leverage)
                 market.diffSum = winRoi + market.resetPenalty;
 
                 const fee1 = s1.volume > 0 ? (s1.volume * market.bid * config.takerFeeRate) : 0;
@@ -167,7 +171,6 @@ function startWS() {
                 market.currentRatio = totalDebt > 0 ? (winPnl / totalDebt) : 0;
                 market.netSessionUsdt = (s1.unrealizedUsdt + s2.unrealizedUsdt) - market.sessionResetLoss - market.estExitFees;
 
-                // RESET TRIGGER: Strictly triggered only when Difference Sum reaches target (e.g. 2.5%)
                 if (market.status === 'Active' && !market.resetUsed) {
                     if (market.diffSum >= config.resetDiffThreshold) {
                         lRoi < sRoi ? flashReset(0) : flashReset(1);
@@ -296,11 +299,13 @@ app.get('/', (req, res) => {
                     <p class="stat-label text-emerald-500">Long Position</p>
                     <p id="lRoi" class="text-4xl font-black">0.00%</p>
                     <p id="lPnl" class="text-sm font-bold text-slate-500">$0.00000</p>
+                    <p id="lVol" class="text-[10px] font-bold text-slate-400 mt-1">Vol: 0</p>
                 </div>
                 <div class="text-right">
                     <p class="stat-label text-rose-500">Short Position</p>
                     <p id="sRoi" class="text-4xl font-black">0.00%</p>
                     <p id="sPnl" class="text-sm font-bold text-slate-500">$0.00000</p>
+                    <p id="sVol" class="text-[10px] font-bold text-slate-400 mt-1">Vol: 0</p>
                 </div>
             </div>
         </div>
@@ -352,6 +357,7 @@ app.get('/', (req, res) => {
                     document.getElementById(p+'Roi').innerText = a.roi.toFixed(2)+'%';
                     document.getElementById(p+'Roi').className = 'text-4xl font-black ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
                     document.getElementById(p+'Pnl').innerText = (a.unrealizedUsdt >= 0 ? '$' : '-$') + Math.abs(a.unrealizedUsdt).toFixed(5);
+                    document.getElementById(p+'Vol').innerText = 'Vol: ' + a.volume;
                 });
 
                 let tableHtml = '';
@@ -376,4 +382,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Strict Difference Sum Mode)`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Initial Vol: 10, Reset: Vol/2)`));
