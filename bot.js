@@ -30,10 +30,11 @@ const config = {
     accounts: apiAccounts,
     minVolume: 1,
     maxVolume: 5,
-    scaleTriggerROI: 0.5, // Add contract at 0.5% ROI
-    takeProfitPct: 2.0, 
-    stopLossPct: -1.0, 
-    pollInterval: 1500
+    // --- STRATEGY ADAPTATION ---
+    scaleTriggerROI: 1.5,  // Add +1 contract only when up 1.5%
+    takeProfitPct: 5.0,    // Target Win
+    stopLossPct: -3.5,     // Hard Stop (Widened to survive SHIB noise)
+    pollInterval: 2000
 };
 
 let market = {
@@ -48,7 +49,7 @@ let accountStates = {};
 config.accounts.forEach((acc) => {
     accountStates[acc.accountId] = {
         id: acc.accountId, direction: acc.direction,
-        roi: 0, volume: 0, unrealizedUsdt: 0,
+        roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
         currentEquity: 0, isLocked: false, 
         lastAction: 'Idle', lastScaleTime: 0
     };
@@ -74,9 +75,10 @@ async function syncAccount(acc, state) {
         const pos = posRes.data.find(p => p.direction === state.direction);
         if (pos) {
             state.volume = parseFloat(pos.volume);
+            state.entryPrice = parseFloat(pos.cost_open);
             state.roi = parseFloat(pos.profit_rate) * 100; 
             state.unrealizedUsdt = parseFloat(pos.profit);
-        } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
+        } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.entryPrice = 0; }
     }
     const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
     if (accRes?.status === 'ok' && accRes.data?.[0]) {
@@ -90,23 +92,22 @@ async function scaleUp(accIdx) {
     const state = accountStates[acc.accountId];
     const now = Date.now();
 
-    if (state.isLocked || state.volume >= config.maxVolume || (now - state.lastScaleTime < 10000)) return;
+    // Only scale if not locked, volume < 5, and 15 seconds have passed since last scale
+    if (state.isLocked || state.volume >= config.maxVolume || (now - state.lastScaleTime < 15000)) return;
 
     state.isLocked = true;
-    state.lastAction = "SCALING +1";
+    state.lastAction = "SCALE +1";
     
-    const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
         contract_code: config.symbol, volume: 1, direction: state.direction, 
         offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
     });
 
-    if (res.status === 'ok') {
-        state.lastScaleTime = now;
-    }
+    state.lastScaleTime = now;
     state.isLocked = false;
 }
 
-async function closeAndReset(accIdx, type) {
+async function executeClose(accIdx, type) {
     const acc = config.accounts[accIdx];
     const state = accountStates[acc.accountId];
     if (state.isLocked || state.volume === 0) return;
@@ -114,12 +115,12 @@ async function closeAndReset(accIdx, type) {
     state.isLocked = true;
     state.lastAction = type;
     
+    // Using optimal_20 for maximum speed to fight slippage
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
         contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
         offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
     });
 
-    market.sessionRealized += state.unrealizedUsdt;
     tradeHistory.unshift({
         time: new Date().toLocaleTimeString(),
         acc: `ACC${acc.accountId}`,
@@ -129,7 +130,7 @@ async function closeAndReset(accIdx, type) {
         pnl: state.unrealizedUsdt.toFixed(8)
     });
 
-    // Auto-Adjust: Re-open at minVolume to restart the cycle
+    // Re-open fresh position after cooldown
     setTimeout(async () => {
         await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
             contract_code: config.symbol, volume: config.minVolume, direction: state.direction, 
@@ -155,17 +156,20 @@ function startWS() {
                 config.accounts.forEach((acc, idx) => {
                     const state = accountStates[acc.accountId];
                     if (state.volume > 0 && !state.isLocked) {
-                        // 1. SMART SCALING: If winning, add to profit
+                        
+                        // 1. SCALING: Add size if trade is proving successful
                         if (state.roi >= config.scaleTriggerROI && state.volume < config.maxVolume) {
                             scaleUp(idx);
                         }
-                        // 2. PROFIT EXIT
+
+                        // 2. PROFIT EXIT: Hit 5% target
                         if (state.roi >= config.takeProfitPct) {
-                            closeAndReset(idx, 'TAKE_PROFIT');
+                            executeClose(idx, 'TAKE_PROFIT');
                         } 
-                        // 3. RISK CUT
+                        
+                        // 3. RISK CUT: Hit -3.5% target
                         else if (state.roi <= config.stopLossPct) {
-                            closeAndReset(idx, 'STOP_LOSS');
+                            executeClose(idx, 'STOP_LOSS');
                         }
                     }
                 });
@@ -183,6 +187,7 @@ async function backgroundLoop() {
     config.accounts.forEach(acc => {
         const state = accountStates[acc.accountId];
         currentTotal += state.currentEquity;
+        // Start up if empty
         if (market.status === 'Active' && state.volume === 0 && !state.isLocked) {
              htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: config.minVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
@@ -198,32 +203,31 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>Dynamic Scaling Cluster</title>
+    <meta charset="UTF-8"><title>Pro-Scaling Cluster</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>body { background: #020617; color: white; font-family: 'JetBrains Mono', monospace; }</style>
 </head>
 <body class="p-6">
     <div class="max-w-6xl mx-auto">
-        <div class="flex justify-between items-center mb-8 bg-slate-900 p-6 rounded-2xl border border-slate-800 shadow-2xl">
+        <div class="flex justify-between items-center mb-8 bg-slate-900 p-6 rounded-2xl border border-slate-800">
             <div>
-                <h1 class="text-2xl font-black italic text-indigo-500">AUTO-SCALING CLUSTER</h1>
-                <p class="text-[10px] text-slate-500 font-bold uppercase tracking-widest">Dynamic Volume: 1-5 Contracts | Auto-Adjusting Weight</p>
+                <h1 class="text-2xl font-black italic text-indigo-400 tracking-tighter">VOLATILITY CLUSTER V2</h1>
+                <p class="text-[10px] text-slate-500 font-bold uppercase tracking-widest mt-1">Mode: Scaled Aggression (Max 5 Units)</p>
             </div>
             <div class="text-right">
-                <p class="text-[10px] text-slate-500 font-bold">NET PORTFOLIO GAIN</p>
+                <p class="text-[10px] text-slate-500 font-bold uppercase">Net Portfolio Gain</p>
                 <p id="totalNetGain" class="text-3xl font-black text-emerald-400 tracking-tighter">$0.00000000</p>
             </div>
         </div>
 
         <div id="accountGrid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8"></div>
 
-        <div class="bg-slate-900 rounded-2xl overflow-hidden border border-slate-800 shadow-xl">
-            <div class="p-4 border-b border-slate-800 flex justify-between items-center">
-                <span class="text-[10px] font-bold text-slate-400 uppercase">Live Scaled History</span>
-                <span class="text-[10px] text-indigo-400 font-bold px-2 py-1 bg-indigo-500/10 rounded">Smart-Ratio: 2:1</span>
+        <div class="bg-slate-900 rounded-2xl overflow-hidden border border-slate-800">
+            <div class="p-4 border-b border-slate-800 bg-slate-950/50">
+                <span class="text-[10px] font-bold text-slate-400 uppercase">Live Performance Log</span>
             </div>
             <table class="w-full text-left text-[10px]">
-                <thead class="bg-slate-950 text-slate-600 uppercase"><tr class="border-b border-slate-800"><th class="p-4">Time</th><th>Source</th><th>Side</th><th>Action</th><th>ROI</th><th>PnL</th></tr></thead>
+                <thead class="bg-slate-950 text-slate-600 uppercase"><tr class="border-b border-slate-800 font-black"><th class="p-4">Time</th><th>Source</th><th>Side</th><th>Action</th><th>ROI</th><th>PnL (8 Dec)</th></tr></thead>
                 <tbody id="historyBody" class="font-bold"></tbody>
             </table>
         </div>
@@ -236,24 +240,24 @@ app.get('/', (req, res) => {
                 let accHtml = '';
                 d.accounts.forEach(a => {
                     const sideColor = a.direction === 'buy' ? 'text-emerald-400' : 'text-rose-400';
-                    const volColor = a.volume > 1 ? 'text-indigo-400' : 'text-slate-500';
+                    const volColor = a.volume > 1 ? 'text-indigo-400' : 'text-slate-600';
                     accHtml += \`
-                        <div class="bg-slate-900 p-5 rounded-xl border border-slate-800 shadow-lg">
-                            <div class="flex justify-between mb-3">
-                                <span class="text-[10px] font-bold text-slate-500">ACC #\${a.id}</span>
+                        <div class="bg-slate-900 p-5 rounded-xl border border-slate-800 shadow-xl">
+                            <div class="flex justify-between mb-3 items-center">
+                                <span class="text-[9px] font-black bg-slate-800 px-2 py-0.5 rounded text-slate-400">ACC #\${a.id}</span>
                                 <span class="text-[10px] font-black \${sideColor}">\${a.direction.toUpperCase()}</span>
                             </div>
                             <p class="text-3xl font-black \${a.roi >= 0 ? 'text-emerald-400' : 'text-rose-400'}">\${a.roi.toFixed(4)}%</p>
-                            <div class="mt-3 pt-3 border-t border-slate-800 flex justify-between items-center">
-                                <span class="text-[10px] font-bold \${volColor}">VOL: \${a.volume}</span>
-                                <span class="text-[9px] text-slate-600 italic font-bold uppercase">\${a.lastAction}</span>
+                            <div class="mt-4 pt-3 border-t border-slate-800/50 flex justify-between items-center">
+                                <span class="text-[11px] font-black \${volColor}">VOL: \${a.volume}</span>
+                                <span class="text-[9px] text-indigo-400 font-bold uppercase italic">\${a.lastAction}</span>
                             </div>
                         </div>\`;
                 });
                 document.getElementById('accountGrid').innerHTML = accHtml;
                 let histHtml = '';
                 d.tradeHistory.forEach(h => {
-                    histHtml += '<tr class="border-b border-slate-800/50"><td class="p-4 text-slate-500">' + h.time + '</td><td>' + h.acc + '</td><td>' + h.side + '</td><td class="text-indigo-400">' + h.type + '</td><td class="' + (parseFloat(h.roi) >= 0 ? 'text-emerald-400' : 'text-rose-400') + '">' + h.roi + '</td><td class="text-white">$' + h.pnl + '</td></tr>';
+                    histHtml += '<tr class="border-b border-slate-800/50"><td class="p-4 text-slate-500">' + h.time + '</td><td>' + h.acc + '</td><td>' + h.side + '</td><td class="text-indigo-400 italic">' + h.type + '</td><td class="' + (parseFloat(h.roi) >= 0 ? 'text-emerald-400' : 'text-rose-400') + '">' + h.roi + '</td><td class="text-white">$' + h.pnl + '</td></tr>';
                 });
                 document.getElementById('historyBody').innerHTML = histHtml;
             } catch(e) {}
@@ -264,4 +268,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Scaling Cluster Engine Active.`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Pro-Scaling Cluster Engine Online.`));
