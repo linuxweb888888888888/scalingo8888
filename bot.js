@@ -8,7 +8,7 @@ const zlib = require('zlib');
 const app = express();
 app.use(express.json());
 
-// ==================== CONFIGURATION (EXACTLY AS FIRST PASTE) ====================
+// ==================== CONFIGURATION ====================
 const apiAccounts = [];
 let accountIndex = 1;
 while (process.env[`HTX_API_KEY_${accountIndex}`]) {
@@ -28,9 +28,9 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     baseVolume: 1, 
-    multiplier: 1.2,          // Original
-    stepDistancePct: 0.1,     // Original
-    takeProfitPct: 1.0,       // Original
+    multiplier: 1.2,          
+    stepDistancePct: 0.1,     
+    takeProfitPct: 1.0,       
     maxStartSpread: 0.1, 
     takerFeeRate: 0.0005, 
     pollInterval: 1000 
@@ -52,7 +52,7 @@ config.accounts.forEach((account, idx) => {
         roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0, faceValue: 0,
         currentEquity: 0, availableMargin: 0, initialEquity: null,
         isLocked: false, 
-        pendingOrderId: null, // Track specific order for advanced confirmation
+        pendingOrderId: null,
         lastAction: 'Idle',
         step: 0, lastStepPrice: 0, lastAddedVolume: 0, startTime: null
     };
@@ -86,19 +86,17 @@ async function fetchPriceRest() {
 }
 
 async function syncAccount(acc, state) {
-    // ADVANCED ORDER CONFIRMATION LOGIC
     if (state.pendingOrderId) {
         const orderRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order_info', {
             contract_code: config.symbol,
             order_id: state.pendingOrderId
         });
-        // status 4 = filled, 6 = partial filled & cancelled, 7 = cancelled
         if (orderRes?.data?.[0]?.status >= 4) {
             state.pendingOrderId = null;
             state.isLocked = false; 
         } else {
             state.lastAction = "Waiting Confirmation";
-            return; // Skip sync until order is confirmed finished
+            return;
         }
     }
 
@@ -112,7 +110,7 @@ async function syncAccount(acc, state) {
             state.entryPrice = parseFloat(pos.cost_open);
             state.roi = parseFloat(pos.profit_rate) * 100; 
             state.unrealizedUsdt = parseFloat(pos.profit);
-            state.faceValue = parseFloat(pos.contract_size);
+            state.faceValue = parseFloat(pos.contract_size); // Critical for PnL
             if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
             if (!state.startTime) state.startTime = new Date().toLocaleString();
         } else { 
@@ -128,23 +126,37 @@ async function syncAccount(acc, state) {
     }
 }
 
-// FIRST PASTED ROI/HISTORY LOGIC
+// ==================== FIXED PNL LOGIC ====================
 function logTradeExchangeStyle(state, exitPrice) {
     const now = new Date();
-    // Logic from paste 1: Calculation based on Fee Rate and Notional
-    const entryNotional = state.volume * state.entryPrice * state.faceValue;
-    const exitNotional = state.volume * exitPrice * state.faceValue;
+    
+    // Use numbers and fallbacks to prevent NaN
+    const vol = Number(state.volume) || 0;
+    const entryPrice = Number(state.entryPrice) || 0;
+    const closePrice = Number(exitPrice) || 0;
+    const faceValue = Number(state.faceValue) || 1; // Default to 1 if faceValue is 0
+
+    // Manual Gross PnL Calculation (Linear Swap Formula)
+    let grossPnl = 0;
+    if (state.direction === 'buy') {
+        grossPnl = (closePrice - entryPrice) * vol * faceValue;
+    } else {
+        grossPnl = (entryPrice - closePrice) * vol * faceValue;
+    }
+
+    const entryNotional = vol * entryPrice * faceValue;
+    const exitNotional = vol * closePrice * faceValue;
     const totalFees = (entryNotional * config.takerFeeRate) + (exitNotional * config.takerFeeRate);
-    const netPnl = state.unrealizedUsdt - totalFees;
+    const netPnl = grossPnl - totalFees;
 
     tradeHistory.unshift({
         symbol: config.symbol.replace('-', '') + 'Perpetual',
         type: (state.direction === 'buy' ? 'BuyCross' : 'SellCross'),
         openTime: state.startTime || now.toLocaleString(),
         closeTime: now.toLocaleString(),
-        volume: state.volume,
-        entryPrice: state.entryPrice.toFixed(8),
-        exitPrice: exitPrice.toFixed(8),
+        volume: vol,
+        entryPrice: entryPrice.toFixed(8),
+        exitPrice: closePrice.toFixed(8),
         roi: state.roi.toFixed(4) + '%',
         netPnlUsdt: netPnl.toFixed(8),
         status: 'All Closed'
@@ -194,8 +206,12 @@ async function processMartingale() {
 
         if (state.roi >= config.takeProfitPct) {
             const v = state.volume;
+            const exitP = currentPrice;
             state.isLocked = true; 
-            logTradeExchangeStyle(state, currentPrice); // First Pasted Logic
+            
+            // Log with the current captured state before resetting
+            logTradeExchangeStyle(state, exitP); 
+
             const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
                 contract_code: config.symbol, volume: v, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
             });
