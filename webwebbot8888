@@ -33,10 +33,8 @@ const config = {
     autoClosePct: 110,        
     pollInterval: 1000,       
     resetCooldownMs: 3000,
-    resetDiffThreshold: 2.5,  
-    takerFeeRate: 0.0005,
-    chaseRetryMs: 2500,        // Time to wait for limit fill before re-pricing
-    resetOffsetPct: 0.001      // The 0.1% price advantage for resets
+    resetDiffThreshold: 2.5,  // TRIGGER: Difference Sum must reach this value
+    takerFeeRate: 0.0005      
 };
 
 let market = { 
@@ -73,55 +71,6 @@ async function htxRequest(account, method, path, data = {}) {
         const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 1500 });
         return res.data;
     } catch (e) { return { status: 'error' }; }
-}
-
-/**
- * SMART LIMIT CHASE: 
- * Places a limit order. If it's a reset, it applies a 0.1% price advantage.
- * If not filled in 2.5s, it cancels and moves the order to the top of the book.
- */
-async function chaseLimitOrder(account, direction, volume, offset, applyOffset = false) {
-    let filled = false;
-    let attempts = 0;
-    let currentVolume = volume;
-
-    while (!filled && attempts < 10) {
-        let price = (direction === 'buy') ? market.bid : market.ask;
-        
-        // Apply the 0.1% price move for Resets to make winner more profitable
-        if (applyOffset) {
-            price = (direction === 'buy') ? price * (1 - config.resetOffsetPct) : price * (1 + config.resetOffsetPct);
-        }
-
-        if (!price) break;
-
-        const order = await htxRequest(account, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-            contract_code: config.symbol, volume: currentVolume, direction, offset, 
-            lever_rate: config.leverage, order_price_type: 'limit', price: price.toFixed(10) 
-        });
-
-        if (order?.status === 'ok') {
-            const orderId = order.data.order_id;
-            await new Promise(r => setTimeout(r, config.chaseRetryMs));
-
-            const info = await htxRequest(account, 'POST', '/linear-swap-api/v1/swap_cross_order_info', { 
-                contract_code: config.symbol, order_id: orderId 
-            });
-
-            if (info?.status === 'ok' && info.data[0].status === 6) {
-                filled = true;
-            } else {
-                // Not filled, cancel and re-price
-                await htxRequest(account, 'POST', '/linear-swap-api/v1/swap_cross_cancel', { 
-                    contract_code: config.symbol, order_id: orderId 
-                });
-                const tradeVol = info?.data ? parseFloat(info.data[0].trade_volume) : 0;
-                currentVolume -= tradeVol;
-                if (currentVolume <= 0) filled = true;
-            }
-        }
-        attempts++;
-    }
 }
 
 async function syncAccount(acc, state) {
@@ -167,13 +116,17 @@ async function flashReset(accIdxToReset) {
     const feeCost = (state.volume * market.bid * config.takerFeeRate * 2);
     market.sessionResetLoss += (Math.abs(state.unrealizedUsdt) + feeCost);
     
-    state.lastAction = "⚡ RESET CHASE";
+    state.lastAction = "⚡ RESET";
     logTrade(state.direction, state.roi, state.unrealizedUsdt, 'RESET');
 
-    // Close loser at market price (Limit Chase)
-    await chaseLimitOrder(acc, state.direction === 'buy' ? 'sell' : 'buy', state.volume, 'close', false);
-    // Re-open with the 0.1% price offset logic
-    await chaseLimitOrder(acc, state.direction, config.baseVolume, 'open', true);
+    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+        contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
+        offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
+    });
+    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+        contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, 
+        offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
+    });
 
     setTimeout(() => { state.isLocked = false; state.lastAction = "Idle"; }, config.resetCooldownMs);
 }
@@ -200,6 +153,8 @@ function startWS() {
                 const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : s2.roi;
                 
                 const winRoi = Math.max(lRoi, sRoi);
+                
+                // CORE LOGIC: Difference Sum = Winner ROI + (Spread * Leverage)
                 market.diffSum = winRoi + market.resetPenalty;
 
                 const fee1 = s1.volume > 0 ? (s1.volume * market.bid * config.takerFeeRate) : 0;
@@ -212,6 +167,7 @@ function startWS() {
                 market.currentRatio = totalDebt > 0 ? (winPnl / totalDebt) : 0;
                 market.netSessionUsdt = (s1.unrealizedUsdt + s2.unrealizedUsdt) - market.sessionResetLoss - market.estExitFees;
 
+                // RESET TRIGGER: Strictly triggered only when Difference Sum reaches target (e.g. 2.5%)
                 if (market.status === 'Active' && !market.resetUsed) {
                     if (market.diffSum >= config.resetDiffThreshold) {
                         lRoi < sRoi ? flashReset(0) : flashReset(1);
@@ -246,7 +202,9 @@ async function backgroundLoop() {
         if (s1.volume === 0 && s2.volume === 0 && !s1.isLocked && !s2.isLocked) {
             if (market.spread > 0 && market.spread <= config.maxStartSpread) {
                 for (const acc of config.accounts) {
-                    chaseLimitOrder(acc, accountStates[acc.accountId].direction, config.baseVolume, 'open', false);
+                    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                        contract_code: config.symbol, volume: config.baseVolume, direction: accountStates[acc.accountId].direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
+                    });
                 }
             }
         }
@@ -261,7 +219,9 @@ async function manualClose(type = 'MANUAL') {
         state.isLocked = true;
         if (state.volume > 0) {
             logTrade(state.direction, state.roi, state.unrealizedUsdt, type);
-            await chaseLimitOrder(acc, state.direction === 'buy' ? 'sell' : 'buy', state.volume, 'close', false);
+            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+                contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
+            });
         }
     }
     market.resetUsed = false;
@@ -415,4 +375,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online with Smart Chase and 0.1% Offset`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Strict Difference Sum Mode)`));
