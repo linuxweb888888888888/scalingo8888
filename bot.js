@@ -15,7 +15,8 @@ while (process.env[`HTX_API_KEY_${accountIndex}`]) {
     apiAccounts.push({
         apiKey: process.env[`HTX_API_KEY_${accountIndex}`],
         secretKey: process.env[`HTX_SECRET_KEY_${accountIndex}`],
-        accountId: accountIndex
+        accountId: accountIndex,
+        direction: (accountIndex % 2 !== 0) ? 'buy' : 'sell' 
     });
     accountIndex++;
 }
@@ -27,15 +28,14 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
+    baseVolume: parseFloat(process.env.BASE_VOLUME) || 1, // Changed to float for precise volume
     takeProfitPct: 2.0, 
     profitToLossRatio: 1.5, 
-    pollInterval: 1500,
-    takerFeeRate: 0.0005
+    pollInterval: 1500
 };
 
 let market = {
-    status: 'Active', bid: 0, ask: 0, spread: 0,
+    status: 'Active', bid: 0, ask: 0,
     totalNetGain: 0, growthPct: 0,
     initialTotalEquity: 0,
     sessionRealizedProfit: 0, 
@@ -45,9 +45,10 @@ let market = {
 let tradeHistory = [];
 let accountStates = {};
 
-config.accounts.forEach((account, idx) => {
+config.accounts.forEach((account) => {
     accountStates[account.accountId] = {
-        direction: idx === 0 ? 'buy' : 'sell',
+        id: account.accountId,
+        direction: account.direction,
         roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
         currentEquity: 0, initialEquity: null,
         isLocked: false, lastAction: 'Idle'
@@ -73,9 +74,10 @@ async function syncAccount(acc, state) {
     if (posRes?.status === 'ok' && posRes.data) {
         const pos = posRes.data.find(p => p.direction === state.direction);
         if (pos) {
-            state.volume = Math.floor(parseFloat(pos.volume));
-            state.entryPrice = parseFloat(pos.cost_open || pos.last_price);
-            state.roi = parseFloat(pos.profit_rate) * 100;
+            state.volume = parseFloat(pos.volume);
+            state.entryPrice = parseFloat(pos.cost_open);
+            // MATCHING EXCHANGE: Use the API's exact Profit Rate and Profit
+            state.roi = parseFloat(pos.profit_rate) * 100; 
             state.unrealizedUsdt = parseFloat(pos.profit);
         } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.entryPrice = 0; }
     }
@@ -87,16 +89,16 @@ async function syncAccount(acc, state) {
     }
 }
 
-function logTrade(side, roi, pnl, type) {
+function logTrade(side, roi, pnl, type, accId) {
     tradeHistory.unshift({
         time: new Date().toLocaleTimeString(),
-        side: side.toUpperCase(),
-        roi: roi.toFixed(2) + '%',
-        pnl: pnl.toFixed(8),
+        side: `ACC${accId}-${side.toUpperCase()}`,
+        roi: roi.toFixed(4) + '%', // Matches Exchange 4-decimal ROI
+        pnl: pnl.toFixed(8),       // Matches Exchange high-precision USDT
         total: market.totalNetGain.toFixed(8),
         type: type
     });
-    if (tradeHistory.length > 15) tradeHistory.pop();
+    if (tradeHistory.length > 25) tradeHistory.pop();
 }
 
 async function executeAction(accIdx, type) {
@@ -113,7 +115,7 @@ async function executeAction(accIdx, type) {
     });
 
     market.sessionRealizedProfit += state.unrealizedUsdt;
-    logTrade(state.direction, state.roi, state.unrealizedUsdt, type);
+    logTrade(state.direction, state.roi, state.unrealizedUsdt, type, acc.accountId);
 
     setTimeout(async () => {
         await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
@@ -136,15 +138,12 @@ function startWS() {
             if (msg.tick) {
                 market.bid = msg.tick.bid[0];
                 market.ask = msg.tick.ask[0];
-                market.spread = ((market.ask - market.bid) / market.bid) * 100;
 
-                const s1 = accountStates[1]; 
-                const s2 = accountStates[2];
-                if (!s1 || !s2) return;
-                
-                market.netSessionUsdt = (s1.unrealizedUsdt + s2.unrealizedUsdt) + market.sessionRealizedProfit;
+                let totalUnrealized = 0;
+                config.accounts.forEach((acc, idx) => {
+                    const state = accountStates[acc.accountId];
+                    totalUnrealized += state.unrealizedUsdt;
 
-                [s1, s2].forEach((state, idx) => {
                     if (state.volume > 0 && !state.isLocked && market.status === 'Active') {
                         if (state.roi >= config.takeProfitPct) {
                             executeAction(idx, 'TAKE_PROFIT');
@@ -158,6 +157,7 @@ function startWS() {
                         }
                     }
                 });
+                market.netSessionUsdt = totalUnrealized + market.sessionRealizedProfit;
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
         });
@@ -168,23 +168,19 @@ function startWS() {
 // ==================== MAIN LOOP ====================
 async function backgroundLoop() {
     await Promise.all(config.accounts.map(acc => syncAccount(acc, accountStates[acc.accountId])));
-    const s1 = accountStates[1]; const s2 = accountStates[2];
-    if (!s1 || !s2) return;
-
-    const totalCurrentEquity = s1.currentEquity + s2.currentEquity;
-    if (market.initialTotalEquity === 0 && totalCurrentEquity > 0) market.initialTotalEquity = totalCurrentEquity;
-    market.totalNetGain = totalCurrentEquity - market.initialTotalEquity;
-    market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
-
-    if (market.status === 'Active') {
-        if (s1.volume === 0 && s2.volume === 0 && !s1.isLocked && !s2.isLocked) {
-            for (const acc of config.accounts) {
-                await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol, volume: config.baseVolume, direction: accountStates[acc.accountId].direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
-                });
-            }
+    let currentTotalEquity = 0;
+    config.accounts.forEach(acc => {
+        const state = accountStates[acc.accountId];
+        currentTotalEquity += state.currentEquity;
+        if (market.status === 'Active' && state.volume === 0 && !state.isLocked) {
+             htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
+            });
         }
-    }
+    });
+    if (market.initialTotalEquity === 0 && currentTotalEquity > 0) market.initialTotalEquity = currentTotalEquity;
+    market.totalNetGain = currentTotalEquity - market.initialTotalEquity;
+    market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
 }
 
 async function manualClose() {
@@ -194,7 +190,7 @@ async function manualClose() {
         const state = accountStates[acc.accountId];
         state.isLocked = true;
         if (state.volume > 0) {
-            logTrade(state.direction, state.roi, state.unrealizedUsdt, 'MANUAL_CLOSE');
+            logTrade(state.direction, state.roi, state.unrealizedUsdt, 'MANUAL_CLOSE', acc.accountId);
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20'
             });
@@ -215,105 +211,96 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>Hedge Engine Precision</title>
+    <meta charset="UTF-8"><title>Exchange Precision Engine</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body { background: #0f172a; color: white; font-family: 'JetBrains Mono', monospace, sans-serif; }
-        .card { background: #1e293b; border-radius: 15px; padding: 20px; border: 1px solid #334155; }
-        .stat-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; font-weight: bold; }
+        body { background: #0f172a; color: white; font-family: 'JetBrains Mono', monospace; }
+        .card { background: #1e293b; border-radius: 12px; padding: 15px; border: 1px solid #334155; }
+        .stat-label { font-size: 10px; color: #94a3b8; text-transform: uppercase; font-weight: bold; }
     </style>
 </head>
-<body class="p-6 md:p-10">
-    <div class="max-w-4xl mx-auto">
-        <div class="flex justify-between items-center mb-8">
+<body class="p-4 md:p-8">
+    <div class="max-w-6xl mx-auto">
+        <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 gap-4">
             <div>
-                <h1 class="text-xl font-black">Ratio Engine <span class="text-indigo-400">1.5x</span></h1>
-                <p id="mStatus" class="text-[10px] uppercase font-bold text-emerald-500 tracking-widest mt-1">Engine Active</p>
+                <h1 class="text-xl font-black tracking-tighter uppercase">Cluster <span class="text-indigo-400">Precision</span></h1>
+                <p id="mStatus" class="text-[10px] font-bold text-emerald-500 uppercase tracking-widest italic">Engine Active</p>
             </div>
-            <div class="text-right">
+            <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 min-w-[300px]">
+                <p class="stat-label">Total Portfolio Net Gain</p>
                 <p id="totalNetGain" class="text-xl font-black text-white tracking-tighter">$0.00000000</p>
-                <p id="growthPct" class="text-[10px] text-emerald-400 font-bold uppercase tracking-widest">Growth: 0.00%</p>
+                <p id="growthPct" class="text-[10px] text-emerald-400 font-bold tracking-widest mt-1">GROWTH: 0.00%</p>
             </div>
         </div>
 
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
             <div class="card border-l-4 border-emerald-500">
-                <p class="stat-label">Session Realized Profit</p>
+                <p class="stat-label text-emerald-500">Session Realized Profit</p>
                 <p id="realizedProfit" class="text-2xl font-black text-emerald-400 tracking-tighter">$0.00000000</p>
-                <p class="text-[9px] text-slate-500 mt-1 uppercase font-bold">Safe Buffer for Stop Loss</p>
             </div>
             <div class="card border-l-4 border-indigo-500">
-                <p class="stat-label">Net Session PnL (Unrealized + Realized)</p>
+                <p class="stat-label text-indigo-400">Net Session PnL</p>
                 <p id="netSession" class="text-2xl font-black text-white tracking-tighter">$0.00000000</p>
             </div>
         </div>
 
-        <div class="card mb-6">
-            <div class="grid grid-cols-2 gap-10">
-                <div>
-                    <p class="stat-label text-emerald-500">Long ROI</p>
-                    <p id="lRoi" class="text-4xl font-black">0.00%</p>
-                    <p id="lPnl" class="text-xs font-bold text-slate-400 tracking-tighter">$0.00000000</p>
-                </div>
-                <div class="text-right">
-                    <p class="stat-label text-rose-500">Short ROI</p>
-                    <p id="sRoi" class="text-4xl font-black">0.00%</p>
-                    <p id="sPnl" class="text-xs font-bold text-slate-400 tracking-tighter">$0.00000000</p>
-                </div>
-            </div>
-        </div>
+        <div id="accountGrid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-8"></div>
 
         <div class="card overflow-hidden mb-6">
+            <p class="stat-label mb-3 px-2">Exchange History (Match Mode)</p>
             <table class="w-full text-left text-[10px]">
-                <thead><tr class="text-slate-500 border-b border-slate-700 uppercase"><th class="pb-2">Time</th><th class="pb-2">Type</th><th class="pb-2">Side</th><th class="pb-2">ROI</th><th class="pb-2">PnL (8 Dec)</th></tr></thead>
+                <thead class="bg-slate-900/50 uppercase text-slate-500"><tr class="border-b border-slate-700"><th class="p-3">Time</th><th>Source</th><th>Type</th><th>ROI (4 Dec)</th><th>PnL (8 Dec)</th></tr></thead>
                 <tbody id="historyBody" class="font-bold"></tbody>
             </table>
         </div>
 
-        <button onclick="triggerClose()" class="w-full py-4 bg-rose-600 hover:bg-rose-500 text-white font-black rounded-xl transition-all active:scale-95 shadow-xl uppercase tracking-widest text-sm">
-            Emergency Liquidation (Close All)
+        <button onclick="triggerClose()" class="w-full py-5 bg-rose-600 hover:bg-rose-500 text-white font-black rounded-xl transition-all shadow-2xl uppercase tracking-widest text-xs">
+            Liquidate Entire Cluster
         </button>
     </div>
 
     <script>
-        async function triggerClose() {
-            if(confirm("Liquidate all positions and reset session?")) {
-                await fetch('/api/close', { method: 'POST' });
-            }
-        }
+        async function triggerClose() { if(confirm("Liquidate all accounts?")) fetch('/api/close', { method: 'POST' }); }
 
         setInterval(async () => {
             try {
-                const r = await fetch('/api/status'); 
-                const d = await r.json();
-                
-                document.getElementById('mStatus').innerText = 'Engine ' + d.market.status;
-                document.getElementById('mStatus').className = 'text-[10px] uppercase font-bold tracking-widest mt-1 italic ' + (d.market.status === 'Active' ? 'text-emerald-500' : 'text-rose-500');
-                
-                // Set to 8 Decimals
+                const r = await fetch('/api/status'); const d = await r.json();
                 document.getElementById('totalNetGain').innerText = '$' + d.market.totalNetGain.toFixed(8);
-                document.getElementById('growthPct').innerText = 'Growth: ' + d.market.growthPct.toFixed(2) + '%';
+                document.getElementById('growthPct').innerText = 'GROWTH: ' + d.market.growthPct.toFixed(2) + '%';
                 document.getElementById('realizedProfit').innerText = '$' + d.market.sessionRealizedProfit.toFixed(8);
                 document.getElementById('netSession').innerText = '$' + d.market.netSessionUsdt.toFixed(8);
-                
-                d.accounts.forEach((a, i) => {
-                    const p = i === 0 ? 'l' : 's';
-                    document.getElementById(p+'Roi').innerText = a.roi.toFixed(2)+'%';
-                    document.getElementById(p+'Roi').className = 'text-4xl font-black ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
-                    document.getElementById(p+'Pnl').innerText = '$' + a.unrealizedUsdt.toFixed(8);
-                });
 
-                let html = '';
-                d.tradeHistory.forEach(h => {
-                    html += '<tr class="border-b border-slate-800/50"><td class="py-2">' + h.time + '</td><td class="text-indigo-400 font-black italic">' + h.type + '</td><td>' + h.side + '</td><td class="font-black">' + h.roi + '</td><td>$' + h.pnl + '</td></tr>';
+                let accHtml = '';
+                d.accounts.forEach(a => {
+                    const sideColor = a.direction === 'buy' ? 'text-emerald-400' : 'text-rose-400';
+                    const sideLabel = a.direction === 'buy' ? 'BUY' : 'SELL';
+                    accHtml += \`
+                        <div class="card border-t-2 border-slate-700">
+                            <div class="flex justify-between items-center mb-2">
+                                <span class="stat-label">Account #\${a.id}</span>
+                                <span class="text-[9px] font-black px-2 py-0.5 rounded bg-slate-700 \${sideColor}">\${sideLabel}</span>
+                            </div>
+                            <!-- ROI matched to 4 decimals like exchange -->
+                            <p class="text-2xl font-black \${a.roi >= 0 ? 'text-emerald-400' : 'text-rose-400'}">\${a.roi.toFixed(4)}%</p>
+                            <div class="flex justify-between mt-1">
+                                <span class="text-[10px] text-slate-400 tracking-tighter">$\${a.unrealizedUsdt.toFixed(8)}</span>
+                                <span class="text-[9px] text-indigo-400 font-bold uppercase italic">\${a.lastAction}</span>
+                            </div>
+                        </div>\`;
                 });
-                document.getElementById('historyBody').innerHTML = html;
+                document.getElementById('accountGrid').innerHTML = accHtml;
+
+                let histHtml = '';
+                d.tradeHistory.forEach(h => {
+                    histHtml += '<tr class="border-b border-slate-800/50"><td class="p-3">' + h.time + '</td><td class="text-slate-400">' + h.side + '</td><td class="text-indigo-400 italic">' + h.type + '</td><td class="' + (parseFloat(h.roi) >= 0 ? 'text-emerald-400' : 'text-rose-400') + '">' + h.roi + '</td><td>$' + h.pnl + '</td></tr>';
+                });
+                document.getElementById('historyBody').innerHTML = histHtml;
             } catch(e) {}
-        }, 1000);
+        }, 1500);
     </script>
 </body></html>`);
 });
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`8-Decimal Ratio Engine Online`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Precision Cluster Engine Online.`));
