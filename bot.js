@@ -69,7 +69,8 @@ async function htxRequest(account, method, path, data = {}) {
 }
 
 async function syncAccount(acc, state) {
-    if (state.isLocked) return; 
+    if (state.isLocked) return; // SKIP SYNC IF WE JUST CLOSED OR OPENED
+    
     const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
     if (posRes?.status === 'ok' && posRes.data) {
         const pos = posRes.data.find(p => p.direction === state.direction);
@@ -139,23 +140,40 @@ async function processMartingale() {
 
         if (state.volume === 0) {
             state.isLocked = true;
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
             });
-            state.lastStepPrice = currentPrice;
-            state.lastAddedVolume = config.baseVolume;
+            if (res.status === 'ok') {
+                state.lastStepPrice = currentPrice;
+                state.lastAddedVolume = config.baseVolume;
+            }
             state.isLocked = false;
             continue;
         }
 
+        // --- IMPROVED TP LOGIC (PREVENT MULTI-LOG) ---
         if (state.roi >= config.takeProfitPct) {
-            state.isLocked = true;
+            const v = state.volume; // Save volume for log
+            const e = state.entryPrice; 
+            const r = state.roi;
+            const u = state.unrealizedUsdt;
+
+            state.isLocked = true; // HARD LOCK
+            state.lastAction = "CLOSING...";
+
             logTradeExchangeStyle(state, currentPrice);
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-                contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
-            });
+
+            // CRITICAL: Wipe volume locally BEFORE the API call finishes 
+            // so the next loop cycle doesn't see a position.
             state.volume = 0; 
-            setTimeout(() => { state.isLocked = false; }, 3000);
+            state.roi = 0;
+
+            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+                contract_code: config.symbol, volume: v, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_10' 
+            });
+
+            // Keep account locked for 5 seconds to let exchange sync
+            setTimeout(() => { state.isLocked = false; state.lastAction = "Idle"; }, 5000);
             continue;
         }
 
@@ -182,14 +200,10 @@ async function processMartingale() {
 async function backgroundLoop() {
     await Promise.all(config.accounts.map(acc => syncAccount(acc, accountStates[acc.accountId])));
     const s1 = accountStates[1]; const s2 = accountStates[2];
-    
     market.totalNetGain = (s1.currentEquity + s2.currentEquity) - market.initialTotalEquity;
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
-    
-    // Daily Growth Rate Calculation
     const elapsedDays = (Date.now() - market.startTime) / (1000 * 60 * 60 * 24);
     market.dgr = elapsedDays > 0 ? (market.growthPct / elapsedDays) : 0;
-
     if (market.status === 'Active') await processMartingale();
 }
 
@@ -208,7 +222,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>Ratio-Hedge Martingale</title>
+    <meta charset="UTF-8"><title>Martingale Pro Engine</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap" rel="stylesheet">
     <style>
@@ -291,7 +305,7 @@ app.get('/', (req, res) => {
                 document.getElementById('totalNetGain').innerText = '$' + d.market.totalNetGain.toFixed(8);
                 document.getElementById('growthPct').innerText = 'Total Profit: ' + d.market.growthPct.toFixed(2) + '%';
                 document.getElementById('dgrPct').innerText = 'DGR: ' + d.market.dgr.toFixed(2) + '% / DAY';
-                document.getElementById('marketStatus').innerText = d.market.status;
+                document.getElementById('uiSpread').innerText = d.market.spread.toFixed(3) + '%';
 
                 d.accounts.forEach(function(a, i) {
                     const p = i === 0 ? 'l' : 's';
