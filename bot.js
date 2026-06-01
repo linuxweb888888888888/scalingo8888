@@ -15,7 +15,7 @@ while (process.env[`HTX_API_KEY_${accountIndex}`]) {
     apiAccounts.push({
         apiKey: process.env[`HTX_API_KEY_${accountIndex}`],
         secretKey: process.env[`HTX_SECRET_KEY_${accountIndex}`],
-        accountId: accountIndex
+        id: accountIndex 
     });
     accountIndex++;
 }
@@ -28,16 +28,15 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
-    takeProfitPct: 2.0, // Set to 2%
-    pollInterval: 1500,
-    takerFeeRate: 0.0005
+    takeProfitPct: 2.0,
+    pollInterval: 2000
 };
 
 let market = {
-    status: 'Active', bid: 0, ask: 0, spread: 0,
+    status: 'Active', bid: 0, ask: 0, 
     totalNetGain: 0, growthPct: 0,
     initialTotalEquity: 0,
-    sessionRealizedProfit: 0, // Track profit made from TPs
+    sessionRealizedProfit: 0,
     netSessionUsdt: 0
 };
 
@@ -45,8 +44,9 @@ let tradeHistory = [];
 let accountStates = {};
 
 config.accounts.forEach((account, idx) => {
-    accountStates[account.accountId] = {
-        direction: idx === 0 ? 'buy' : 'sell',
+    accountStates[account.id] = {
+        id: account.id,
+        direction: idx % 2 === 0 ? 'buy' : 'sell',
         roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
         currentEquity: 0, initialEquity: null,
         isLocked: false, lastAction: 'Idle'
@@ -62,21 +62,21 @@ async function htxRequest(account, method, path, data = {}) {
     const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
-        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 2000 });
+        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 3000 });
         return res.data;
     } catch (e) { return { status: 'error' }; }
 }
 
-async function syncAccount(acc, state) {
+async function syncAccount(acc) {
+    const state = accountStates[acc.id];
     const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
     if (posRes?.status === 'ok' && posRes.data) {
         const pos = posRes.data.find(p => p.direction === state.direction);
         if (pos) {
             state.volume = Math.floor(parseFloat(pos.volume));
-            state.entryPrice = parseFloat(pos.cost_open || pos.last_price);
             state.roi = parseFloat(pos.profit_rate) * 100;
             state.unrealizedUsdt = parseFloat(pos.profit);
-        } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.entryPrice = 0; }
+        } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
     }
     const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
     if (accRes?.status === 'ok' && accRes.data?.[0]) {
@@ -86,49 +86,76 @@ async function syncAccount(acc, state) {
     }
 }
 
-function logTrade(side, roi, pnl, type) {
-    tradeHistory.unshift({
-        time: new Date().toLocaleTimeString(),
-        side: side.toUpperCase(),
-        roi: roi.toFixed(2) + '%',
-        pnl: pnl.toFixed(5),
-        total: market.totalNetGain.toFixed(5),
-        type: type
-    });
-    if (tradeHistory.length > 15) tradeHistory.pop();
-}
-
-async function executeAction(accIdx, type) {
-    const acc = config.accounts[accIdx];
-    const state = accountStates[acc.accountId];
-    if (state.isLocked || state.volume === 0) return;
+async function executeAction(accId, type) {
+    const state = accountStates[accId];
+    const acc = config.accounts.find(a => a.id === accId);
+    if (!state || !acc || state.isLocked || state.volume === 0) return;
 
     state.isLocked = true;
     state.lastAction = type;
     
-    // Close Position
     await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
         contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
         offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
     });
 
-    if (type === 'TAKE_PROFIT') {
-        market.sessionRealizedProfit += state.unrealizedUsdt;
-    } else if (type === 'STOP_LOSS') {
-        market.sessionRealizedProfit += state.unrealizedUsdt;
-    }
+    market.sessionRealizedProfit += state.unrealizedUsdt;
+    logToHistory(accId, state.direction, state.roi, state.unrealizedUsdt, type);
 
-    logTrade(state.direction, state.roi, state.unrealizedUsdt, type);
-
-    // Re-open fresh position
     setTimeout(async () => {
+        if (market.status !== 'Active') { state.isLocked = false; return; }
         await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
             contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, 
             offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
         });
         state.isLocked = false;
         state.lastAction = "Idle";
-    }, 2000);
+    }, 3000);
+}
+
+function logToHistory(accId, direction, roi, pnl, type) {
+    tradeHistory.unshift({
+        time: new Date().toLocaleTimeString(),
+        side: `ACC ${accId} ${direction.toUpperCase()}`,
+        roi: roi.toFixed(2) + '%',
+        pnl: pnl.toFixed(4),
+        type: type
+    });
+    if (tradeHistory.length > 20) tradeHistory.pop();
+}
+
+// ==================== MANUAL CLOSE ALL ====================
+async function closeAllPositions() {
+    console.log("!!! EMERGENCY CLOSE INITIATED !!!");
+    market.status = 'LIQUIDATING';
+
+    for (const acc of config.accounts) {
+        const state = accountStates[acc.id];
+        state.isLocked = true;
+        state.lastAction = "CLOSING ALL";
+        
+        if (state.volume > 0) {
+            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, 
+                volume: state.volume, 
+                direction: state.direction === 'buy' ? 'sell' : 'buy', 
+                offset: 'close', 
+                lever_rate: config.leverage, 
+                order_price_type: 'optimal_20'
+            });
+            logToHistory(acc.id, state.direction, state.roi, state.unrealizedUsdt, "MANUAL CLOSE");
+        }
+    }
+
+    // Hold in Liquidating state for 10 seconds, then reset to Active
+    setTimeout(() => {
+        config.accounts.forEach(acc => {
+            accountStates[acc.id].isLocked = false;
+            accountStates[acc.id].lastAction = "Idle";
+        });
+        market.status = 'Active';
+        console.log("System Resumed.");
+    }, 10000);
 }
 
 // ==================== WS ENGINE ====================
@@ -139,33 +166,18 @@ function startWS() {
         zlib.gunzip(data, (err, dec) => {
             if (err) return;
             const msg = JSON.parse(dec.toString());
-            if (msg.tick) {
+            if (msg.tick && market.status === 'Active') {
                 market.bid = msg.tick.bid[0];
                 market.ask = msg.tick.ask[0];
-                market.spread = ((market.ask - market.bid) / market.bid) * 100;
-
-                const s1 = accountStates[1]; 
-                const s2 = accountStates[2];
-                if (!s1 || !s2) return;
-                
-                market.netSessionUsdt = (s1.unrealizedUsdt + s2.unrealizedUsdt) + market.sessionRealizedProfit;
-
-                // Individual side logic
-                [s1, s2].forEach((state, idx) => {
+                let totalUnrealized = 0;
+                Object.values(accountStates).forEach((state) => {
+                    totalUnrealized += state.unrealizedUsdt;
                     if (state.volume > 0 && !state.isLocked) {
-                        // 1. Take Profit at 2%
-                        if (state.roi >= config.takeProfitPct) {
-                            executeAction(idx, 'TAKE_PROFIT');
-                        }
-                        // 2. Stop Loss only if current loss < total realized profit
-                        else if (state.roi < 0) {
-                            const currentLossAbs = Math.abs(state.unrealizedUsdt);
-                            if (currentLossAbs < market.sessionRealizedProfit && market.sessionRealizedProfit > 0) {
-                                executeAction(idx, 'STOP_LOSS');
-                            }
-                        }
+                        if (state.roi >= config.takeProfitPct) executeAction(state.id, 'TAKE_PROFIT');
+                        else if (state.roi < -5.0 && market.sessionRealizedProfit > (Math.abs(state.unrealizedUsdt) * 1.2)) executeAction(state.id, 'STOP_LOSS');
                     }
                 });
+                market.netSessionUsdt = totalUnrealized + market.sessionRealizedProfit;
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
         });
@@ -173,127 +185,117 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-// ==================== MAIN LOOP ====================
 async function backgroundLoop() {
-    await Promise.all(config.accounts.map(acc => syncAccount(acc, accountStates[acc.accountId])));
-    const s1 = accountStates[1]; const s2 = accountStates[2];
-    if (!s1 || !s2) return;
-
-    const totalCurrentEquity = s1.currentEquity + s2.currentEquity;
+    await Promise.all(config.accounts.map(acc => syncAccount(acc)));
+    const states = Object.values(accountStates);
+    const totalCurrentEquity = states.reduce((sum, s) => sum + s.currentEquity, 0);
     if (market.initialTotalEquity === 0 && totalCurrentEquity > 0) market.initialTotalEquity = totalCurrentEquity;
     market.totalNetGain = totalCurrentEquity - market.initialTotalEquity;
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
 
-    // Auto-initiate positions if empty
     if (market.status === 'Active') {
-        if (s1.volume === 0 && s2.volume === 0 && !s1.isLocked && !s2.isLocked) {
-            for (const acc of config.accounts) {
+        for (const state of states) {
+            if (state.volume === 0 && !state.isLocked) {
+                const acc = config.accounts.find(a => a.id === state.id);
                 await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol, volume: config.baseVolume, direction: accountStates[acc.accountId].direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
+                    contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
                 });
             }
         }
     }
 }
 
-async function manualClose() {
-    market.status = "LIQUIDATING";
-    for (const acc of config.accounts) {
-        const state = accountStates[acc.accountId];
-        state.isLocked = true;
-        if (state.volume > 0) {
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20'
-            });
-        }
-    }
-    market.sessionRealizedProfit = 0;
-    setTimeout(() => {
-        config.accounts.forEach(acc => { accountStates[acc.accountId].isLocked = false; });
-        market.status = "Active";
-    }, 5000);
-}
-
-// ==================== UI DASHBOARD ====================
+// ==================== ROUTES ====================
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), tradeHistory, config }));
-app.post('/api/close', async (req, res) => { await manualClose(); res.json({status: 'ok'}); });
+app.post('/api/close-all', async (req, res) => {
+    await closeAllPositions();
+    res.json({ status: 'ok', message: 'Closing all positions' });
+});
 
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>TP/SL Hedge Engine</title>
+    <meta charset="UTF-8"><title>Hedge Control</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body { background: #0f172a; color: white; font-family: sans-serif; }
-        .card { background: #1e293b; border-radius: 15px; padding: 20px; border: 1px solid #334155; }
-        .stat-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; font-weight: bold; }
-    </style>
+    <style>body { background: #0f172a; color: white; }</style>
 </head>
 <body class="p-10">
-    <div class="max-w-4xl mx-auto">
-        <div class="flex justify-between items-center mb-8">
-            <h1 class="text-2xl font-bold">Hedge <span class="text-indigo-400">TP/SL</span></h1>
-            <div class="text-right">
-                <p id="totalNetGain" class="text-2xl font-bold">$0.00</p>
-                <p id="growthPct" class="text-xs text-emerald-400">0.00%</p>
+    <div class="max-w-6xl mx-auto">
+        <div class="flex justify-between items-start mb-8">
+            <div>
+                <h1 class="text-3xl font-bold text-indigo-400">Hedge Engine</h1>
+                <p id="statusBadge" class="text-[10px] mt-1 font-bold bg-emerald-500/20 text-emerald-400 px-2 py-1 rounded inline-block">SYSTEM ACTIVE</p>
+            </div>
+            <div class="flex gap-4 items-center">
+                <button onclick="closeAll()" class="bg-rose-600 hover:bg-rose-700 text-white px-4 py-2 rounded-lg font-bold text-sm transition-all shadow-lg shadow-rose-900/20">
+                    EMERGENCY CLOSE ALL
+                </button>
+                <div class="text-right">
+                    <p id="totalNetGain" class="text-3xl font-bold">$0.00</p>
+                    <p id="growthPct" class="text-emerald-400 text-sm">0.00%</p>
+                </div>
             </div>
         </div>
 
-        <div class="grid grid-cols-2 gap-6 mb-6">
-            <div class="card">
-                <p class="stat-label">Realized Session Profit</p>
+        <div class="grid grid-cols-2 gap-6 mb-8 text-center">
+            <div class="bg-slate-800 p-6 rounded-xl border border-slate-700">
+                <p class="text-xs text-slate-400 uppercase mb-1">Session Realized</p>
                 <p id="realizedProfit" class="text-3xl font-bold text-emerald-400">$0.00</p>
             </div>
-            <div class="card">
-                <p class="stat-label">Net Session PnL</p>
+            <div class="bg-slate-800 p-6 rounded-xl border border-slate-700">
+                <p class="text-xs text-slate-400 uppercase mb-1">Live Session PnL</p>
                 <p id="netSession" class="text-3xl font-bold text-white">$0.00</p>
             </div>
         </div>
 
-        <div class="card mb-6">
-            <div class="grid grid-cols-2 gap-10">
-                <div>
-                    <p class="stat-label text-emerald-500">Long Side</p>
-                    <p id="lRoi" class="text-4xl font-bold">0.00%</p>
-                    <p id="lPnl" class="text-slate-400">$0.00</p>
-                </div>
-                <div class="text-right">
-                    <p class="stat-label text-rose-500">Short Side</p>
-                    <p id="sRoi" class="text-4xl font-bold">0.00%</p>
-                    <p id="sPnl" class="text-slate-400">$0.00</p>
-                </div>
-            </div>
-        </div>
+        <div id="accountGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8"></div>
 
-        <div class="card overflow-hidden">
+        <div class="bg-slate-800 rounded-xl p-6 border border-slate-700">
+            <h2 class="text-sm font-bold mb-4 text-slate-400 uppercase">Trade History</h2>
             <table class="w-full text-left text-xs">
-                <thead><tr class="text-slate-500 border-b border-slate-700"><th class="pb-2">Time</th><th class="pb-2">Type</th><th class="pb-2">Side</th><th class="pb-2">ROI</th><th class="pb-2">PnL</th></tr></thead>
+                <thead><tr class="text-slate-500 border-b border-slate-700"><th class="pb-2">Time</th><th class="pb-2">Type</th><th class="pb-2">Target</th><th class="pb-2">ROI</th><th class="pb-2">PnL</th></tr></thead>
                 <tbody id="historyBody"></tbody>
             </table>
         </div>
     </div>
 
     <script>
+        async function closeAll() {
+            if(confirm('Are you sure? This will close ALL positions on ALL accounts.')) {
+                await fetch('/api/close-all', { method: 'POST' });
+            }
+        }
+
         setInterval(async () => {
             const r = await fetch('/api/status'); const d = await r.json();
             document.getElementById('totalNetGain').innerText = '$' + d.market.totalNetGain.toFixed(4);
             document.getElementById('growthPct').innerText = d.market.growthPct.toFixed(2) + '%';
             document.getElementById('realizedProfit').innerText = '$' + d.market.sessionRealizedProfit.toFixed(4);
             document.getElementById('netSession').innerText = '$' + d.market.netSessionUsdt.toFixed(4);
+            document.getElementById('statusBadge').innerText = 'SYSTEM ' + d.market.status;
+            document.getElementById('statusBadge').className = 'text-[10px] mt-1 font-bold px-2 py-1 rounded inline-block ' + (d.market.status === 'Active' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400');
             
-            d.accounts.forEach((a, i) => {
-                const p = i === 0 ? 'l' : 's';
-                document.getElementById(p+'Roi').innerText = a.roi.toFixed(2)+'%';
-                document.getElementById(p+'Roi').className = 'text-4xl font-bold ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
-                document.getElementById(p+'Pnl').innerText = '$' + a.unrealizedUsdt.toFixed(4);
+            let accHtml = '';
+            d.accounts.forEach(a => {
+                accHtml += \`
+                <div class="bg-slate-900 p-4 rounded-lg border border-slate-800">
+                    <div class="flex justify-between items-center mb-2">
+                        <span class="text-[10px] bg-slate-700 px-2 py-0.5 rounded text-white">ACC \${a.id}</span>
+                        <span class="text-[10px] font-bold \${a.direction === 'buy' ? 'text-emerald-500' : 'text-rose-500'}">\${a.direction.toUpperCase()}</span>
+                    </div>
+                    <p class="text-2xl font-bold \${a.roi >= 0 ? 'text-emerald-400' : 'text-rose-400'}">\${a.roi.toFixed(2)}%</p>
+                    <p class="text-xs text-slate-500">PnL: $\${a.unrealizedUsdt.toFixed(4)}</p>
+                    <div class="mt-2 text-[10px] text-slate-600 uppercase font-bold">\${a.lastAction}</div>
+                </div>\`;
             });
+            document.getElementById('accountGrid').innerHTML = accHtml;
 
-            let html = '';
+            let historyHtml = '';
             d.tradeHistory.forEach(h => {
-                html += '<tr class="border-b border-slate-800/50"><td class="py-2">' + h.time + '</td><td class="font-bold text-indigo-400">' + h.type + '</td><td>' + h.side + '</td><td class="font-bold">' + h.roi + '</td><td>$' + h.pnl + '</td></tr>';
+                historyHtml += '<tr class="border-b border-slate-800/50"><td class="py-2">' + h.time + '</td><td class="font-bold text-indigo-400">' + h.type + '</td><td>' + h.side + '</td><td class="font-bold">' + h.roi + '</td><td>$' + h.pnl + '</td></tr>';
             });
-            document.getElementById('historyBody').innerHTML = html;
+            document.getElementById('historyBody').innerHTML = historyHtml;
         }, 1000);
     </script>
 </body></html>`);
@@ -301,4 +303,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`TP/SL Engine Online (TP: 2%)`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Running with ${config.accounts.length} accounts.`));
