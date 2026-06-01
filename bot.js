@@ -101,39 +101,32 @@ async function syncAccount(acc) {
 }
 
 async function openPositionUnique(accId) {
-    if (market.isQueueLocked) return;
+    if (market.isQueueLocked || market.status !== 'Active') return;
     
     const state = accountStates[accId];
     const acc = config.accounts.find(a => a.id === accId);
     const targetPrice = state.direction === 'buy' ? market.ask : market.bid;
 
-    // VALIDATION: Check if this price is already used by any other account
+    // UNIQUE PRICE CHECK
     const existingPrices = Object.values(accountStates)
         .filter(s => s.volume > 0)
         .map(s => s.entryPrice);
 
     if (existingPrices.includes(targetPrice)) {
-        state.lastAction = `WAITING FOR PRICE CHANGE (Current: ${targetPrice.toFixed(8)})`;
-        return; // Exit and wait for next background loop tick
+        state.lastAction = `WAIT FOR TICK (${targetPrice.toFixed(8)})`;
+        return; 
     }
 
-    // If price is unique, proceed
     market.isQueueLocked = true;
     state.isLocked = true;
-    state.lastAction = "OPENING UNIQUE...";
+    state.lastAction = "OPENING...";
 
     const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-        contract_code: config.symbol, 
-        volume: config.baseVolume, 
-        direction: state.direction, 
-        offset: 'open', 
-        lever_rate: config.leverage, 
-        order_price_type: 'optimal_5'
+        contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, 
+        offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
     });
 
-    if (res.status === 'ok') {
-        console.log(`[UNIQUE ENTRY] Acc ${accId} filled at ${targetPrice}`);
-    }
+    if (res.status === 'ok') console.log(`[UNIQUE] Acc ${accId} entry at ${targetPrice}`);
 
     state.isLocked = false;
     state.lastAction = "Idle";
@@ -200,7 +193,6 @@ function startWS() {
 
 async function backgroundLoop() {
     await Promise.all(config.accounts.map(acc => syncAccount(acc)));
-    
     const states = Object.values(accountStates);
     const totalCurrentEquity = states.reduce((sum, s) => sum + s.currentEquity, 0);
     if (market.initialTotalEquity === 0 && totalCurrentEquity > 0) market.initialTotalEquity = totalCurrentEquity;
@@ -208,27 +200,28 @@ async function backgroundLoop() {
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
 
     if (market.status === 'Active' && !market.isQueueLocked) {
-        // Only attempt to open the FIRST account in the list that is empty
         const nextToOpen = states.find(s => s.volume === 0 && !s.isLocked);
-        if (nextToOpen) {
-            openPositionUnique(nextToOpen.id);
-        }
+        if (nextToOpen) openPositionUnique(nextToOpen.id);
     }
 }
 
-// ==================== DASHBOARD ====================
+// ==================== DASHBOARD & ACTIONS ====================
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), tradeHistory, config }));
 app.post('/api/close-all', async (req, res) => {
     market.status = 'LIQUIDATING';
     for (const acc of config.accounts) {
         const state = accountStates[acc.id];
+        state.isLocked = true;
         if (state.volume > 0) {
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20'
             });
         }
     }
-    setTimeout(() => { market.status = 'Active'; }, 10000);
+    setTimeout(() => { 
+        Object.values(accountStates).forEach(s => s.isLocked = false);
+        market.status = 'Active'; 
+    }, 15000);
     res.json({status:'ok'});
 });
 
@@ -247,19 +240,23 @@ app.get('/', (req, res) => {
                 <h1 class="text-xl font-bold text-indigo-400">UNIQUE-PRICE ENGINE</h1>
                 <p id="statusBadge" class="text-[10px] mt-1 font-bold bg-emerald-500/10 text-emerald-500 px-2 py-0.5 rounded border border-emerald-500/20 uppercase tracking-widest">SYSTEM ACTIVE</p>
             </div>
-            <div class="text-right text-xs">
-                <p class="text-slate-500">MARKET PRICE</p>
-                <p id="marketPrice" class="font-bold text-white text-lg">0.00000000</p>
+            <div class="flex gap-4 items-center">
+                <button onclick="fetch('/api/close-all', {method:'POST'})" class="bg-rose-900/40 hover:bg-rose-900 text-rose-400 px-3 py-1 rounded text-[10px] border border-rose-500/30 font-bold uppercase">Liquidate All</button>
+                <div class="text-right">
+                    <p id="totalNetGain" class="text-2xl font-bold">0.00000000</p>
+                    <p id="growthPct" class="text-emerald-500 text-[10px] font-bold">0.0000%</p>
+                </div>
             </div>
         </div>
-        <div class="grid grid-cols-2 gap-4 mb-6">
-            <div class="bg-slate-900 p-4 border border-slate-800"><p class="text-[9px] text-slate-500 uppercase font-bold">Session Realized</p><p id="realizedProfit" class="text-xl font-bold text-emerald-400">0.00000000</p></div>
-            <div class="bg-slate-900 p-4 border border-slate-800 text-right"><p class="text-[9px] text-slate-500 uppercase font-bold text-right">Net Session PnL</p><p id="netSession" class="text-xl font-bold text-white">0.00000000</p></div>
+        <div class="grid grid-cols-2 gap-4 mb-6 text-center">
+            <div class="bg-slate-900 p-4 border border-slate-800"><p class="text-[9px] text-slate-500 uppercase font-bold">Session Realized Profit</p><p id="realizedProfit" class="text-xl font-bold text-emerald-400">0.00000000</p></div>
+            <div class="bg-slate-900 p-4 border border-slate-800"><p class="text-[9px] text-slate-500 uppercase font-bold">Live Session Net PnL</p><p id="netSession" class="text-xl font-bold text-white">0.00000000</p></div>
         </div>
         <div id="accountGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 mb-6"></div>
         <div class="bg-slate-900 rounded border border-slate-800 p-4">
+            <p class="text-[10px] font-bold mb-3 text-slate-500 uppercase">Recent Exchange Activity</p>
             <table class="w-full text-left text-[11px]">
-                <thead><tr class="text-slate-600"><th class="pb-2">Time</th><th class="pb-2">Type</th><th class="pb-2">Target</th><th class="pb-2">ROI</th><th class="pb-2 text-right">PnL (USDT)</th></tr></thead>
+                <thead><tr class="text-slate-600 border-b border-slate-800"><th class="pb-2">Time</th><th class="pb-2">Type</th><th class="pb-2">Target</th><th class="pb-2">ROI</th><th class="pb-2 text-right">PnL (USDT)</th></tr></thead>
                 <tbody id="historyBody"></tbody>
             </table>
         </div>
@@ -267,19 +264,20 @@ app.get('/', (req, res) => {
     <script>
         setInterval(async () => {
             const r = await fetch('/api/status'); const d = await r.json();
-            document.getElementById('marketPrice').innerText = d.market.bid.toFixed(8);
+            document.getElementById('totalNetGain').innerText = d.market.totalNetGain.toFixed(8);
+            document.getElementById('growthPct').innerText = d.market.growthPct.toFixed(4) + '%';
             document.getElementById('realizedProfit').innerText = d.market.sessionRealizedProfit.toFixed(8);
             document.getElementById('netSession').innerText = d.market.netSessionUsdt.toFixed(8);
             document.getElementById('statusBadge').innerText = 'SYSTEM ' + d.market.status;
             let accHtml = '';
             d.accounts.forEach(a => {
-                accHtml += '<div class="bg-slate-950 p-3 border border-slate-800"><div class="flex justify-between items-center mb-1"><span class="text-[9px] bg-slate-800 px-1.5 rounded text-slate-400 font-bold">ACC '+a.id+'</span><span class="text-[9px] font-bold '+(a.direction === "buy" ? "text-emerald-500" : "text-rose-500")+'">'+a.direction.toUpperCase()+'</span></div><p class="text-lg font-bold '+(a.roi >= 0 ? "text-emerald-400" : "text-rose-400")+'">'+a.roi.toFixed(4)+'%</p><p class="text-[10px] text-slate-500 font-bold tracking-tighter">ENTRY: '+a.entryPrice.toFixed(8)+'</p><p class="text-[11px] text-slate-200 font-bold">'+a.unrealizedUsdt.toFixed(8)+'</p><div class="mt-2 text-[8px] text-slate-600 font-bold uppercase truncate">'+a.lastAction+'</div></div>';
+                accHtml += '<div class="bg-slate-950 p-3 border border-slate-800"><div class="flex justify-between items-center mb-1"><span class="text-[9px] bg-slate-800 px-1.5 rounded text-slate-400 font-bold">ACC '+a.id+'</span><span class="text-[9px] font-bold '+(a.direction === "buy" ? "text-emerald-500" : "text-rose-500")+'">'+a.direction.toUpperCase()+'</span></div><p class="text-lg font-bold '+(a.roi >= 0 ? "text-emerald-400" : "text-rose-400")+'">'+a.roi.toFixed(4)+'%</p><p class="text-[10px] text-slate-500 font-bold tracking-tighter">PRICE: '+a.entryPrice.toFixed(8)+'</p><p class="text-[11px] text-slate-200 font-bold">'+a.unrealizedUsdt.toFixed(8)+'</p><div class="mt-2 text-[8px] text-slate-600 font-bold uppercase truncate">'+a.lastAction+'</div></div>';
             });
             document.getElementById('accountGrid').innerHTML = accHtml;
             let hHtml = '';
             d.tradeHistory.forEach(h => {
                 const isNeg = h.pnl.startsWith('-');
-                hHtml += '<tr class="border-b border-slate-800/50"><td class="py-1 text-slate-600">'+h.time+'</td><td class="font-bold text-indigo-400">'+h.type+'</td><td class="text-slate-400 font-bold">'+h.side+'</td><td class="font-bold text-slate-200">'+h.roi+'</td><td class="text-right font-bold '+(isNeg ? "text-rose-500" : "text-emerald-500")+'">'+h.pnl+'</td></tr>';
+                hHtml += '<tr class="border-b border-slate-900/50"><td class="py-1 text-slate-600">'+h.time+'</td><td class="font-bold text-indigo-400">'+h.type+'</td><td class="text-slate-400 font-bold">'+h.side+'</td><td class="font-bold text-slate-200">'+h.roi+'</td><td class="text-right font-bold '+(isNeg ? "text-rose-500" : "text-emerald-500")+'">'+h.pnl+'</td></tr>';
             });
             document.getElementById('historyBody').innerHTML = hHtml;
         }, 1000);
@@ -289,4 +287,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Unique Price Engine Online.`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Unique Price Engine Online (Liquidate All Button Restored).`));
