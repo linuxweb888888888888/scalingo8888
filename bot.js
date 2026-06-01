@@ -21,7 +21,7 @@ while (process.env[`HTX_API_KEY_${accountIndex}`]) {
 }
 
 const config = {
-    symbol: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase(),
+    symbol: (process.env.SYMBOL || 'LUNA-USDT').toUpperCase(), // UPDATED TO LUNA
     leverage: parseInt(process.env.LEVERAGE) || 10,
     port: process.env.PORT || 3000,
     restHost: 'api.hbdm.com',
@@ -29,7 +29,8 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
     takeProfitPct: 2.0,
-    pollInterval: 2000
+    pollInterval: 2000,
+    contractValue: 10 // 1 Contract = 10 LUNA (HTX Standard)
 };
 
 let market = {
@@ -78,9 +79,7 @@ async function syncAccount(acc) {
             state.volume = Math.floor(parseFloat(pos.volume));
             state.entryPrice = parseFloat(pos.cost_open);
             
-            // DIRECT FROM EXCHANGE:
-            // profit_rate is ROI (decimal, so * 100)
-            // profit is Unrealized PnL in USDT
+            // DATA DIRECT FROM EXCHANGE SERVERS
             state.roi = parseFloat(pos.profit_rate || 0) * 100;
             state.unrealizedUsdt = parseFloat(pos.profit || 0);
             
@@ -103,21 +102,21 @@ async function openPositionUnique(accId) {
     const acc = config.accounts.find(a => a.id === accId);
     const targetPrice = state.direction === 'buy' ? market.ask : market.bid;
 
-    // Check if price is unique
+    // UNIQUE PRICE CHECK: Prevents accounts from sharing the same entry price
     const existingPrices = Object.values(accountStates)
         .filter(s => s.volume > 0)
         .map(s => s.entryPrice);
 
     if (existingPrices.includes(targetPrice)) {
-        state.lastAction = "WAIT FOR PRICE CHANGE";
+        state.lastAction = "WAIT FOR TICK";
         return; 
     }
 
     market.isQueueLocked = true;
     state.isLocked = true;
-    state.lastAction = "OPENING...";
+    state.lastAction = "OPENING LUNA...";
 
-    const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
         contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, 
         offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
     });
@@ -199,7 +198,7 @@ async function backgroundLoop() {
     }
 }
 
-// ==================== DASHBOARD & ACTIONS ====================
+// ==================== UI & ACTIONS ====================
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), tradeHistory, config }));
 app.post('/api/close-all', async (req, res) => {
     market.status = 'LIQUIDATING';
@@ -223,7 +222,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>Hedge Engine DIRECT</title>
+    <meta charset="UTF-8"><title>LUNA Hedge Control</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>body { background: #020617; color: #f8fafc; font-family: monospace; }</style>
 </head>
@@ -231,7 +230,7 @@ app.get('/', (req, res) => {
     <div class="max-w-7xl mx-auto">
         <div class="flex justify-between items-end mb-6">
             <div>
-                <h1 class="text-xl font-bold text-indigo-400 uppercase tracking-widest">Hedge Direct Data</h1>
+                <h1 class="text-xl font-bold text-indigo-400 uppercase tracking-widest">LUNA-USDT HEDGE</h1>
                 <p id="statusBadge" class="text-[10px] mt-1 font-bold bg-emerald-500/10 text-emerald-500 px-2 py-0.5 rounded border border-emerald-500/20 uppercase tracking-widest">SYSTEM ACTIVE</p>
             </div>
             <div class="flex gap-4 items-center">
@@ -243,7 +242,7 @@ app.get('/', (req, res) => {
             </div>
         </div>
         <div class="grid grid-cols-2 gap-4 mb-6 text-center">
-            <div class="bg-slate-900 p-4 border border-slate-800"><p class="text-[9px] text-slate-500 uppercase font-bold">Realized Profit</p><p id="realizedProfit" class="text-xl font-bold text-emerald-400">0.00000000</p></div>
+            <div class="bg-slate-900 p-4 border border-slate-800"><p class="text-[9px] text-slate-500 uppercase font-bold">Session Realized Profit</p><p id="realizedProfit" class="text-xl font-bold text-emerald-400">0.00000000</p></div>
             <div class="bg-slate-900 p-4 border border-slate-800"><p class="text-[9px] text-slate-500 uppercase font-bold">Net Session PnL</p><p id="netSession" class="text-xl font-bold text-white">0.00000000</p></div>
         </div>
         <div id="accountGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 mb-6"></div>
@@ -264,7 +263,7 @@ app.get('/', (req, res) => {
             document.getElementById('statusBadge').innerText = 'SYSTEM ' + d.market.status;
             let accHtml = '';
             d.accounts.forEach(a => {
-                accHtml += '<div class="bg-slate-950 p-3 border border-slate-800"><div class="flex justify-between items-center mb-1"><span class="text-[9px] bg-slate-800 px-1.5 rounded text-slate-400 font-bold">ACC '+a.id+'</span><span class="text-[9px] font-bold '+(a.direction === "buy" ? "text-emerald-500" : "text-rose-500")+'">'+a.direction.toUpperCase()+'</span></div><p class="text-lg font-bold '+(a.roi >= 0 ? "text-emerald-400" : "text-rose-400")+'">'+a.roi.toFixed(4)+'%</p><p class="text-[10px] text-slate-500 font-bold tracking-tighter">PRICE: '+a.entryPrice.toFixed(8)+'</p><p class="text-[11px] text-slate-200 font-bold">'+a.unrealizedUsdt.toFixed(8)+'</p><div class="mt-2 text-[8px] text-slate-600 font-bold uppercase truncate">'+a.lastAction+'</div></div>';
+                accHtml += '<div class="bg-slate-950 p-3 border border-slate-800"><div class="flex justify-between items-center mb-1"><span class="text-[9px] bg-slate-800 px-1.5 rounded text-slate-400 font-bold">ACC '+a.id+'</span><span class="text-[9px] font-bold '+(a.direction === "buy" ? "text-emerald-500" : "text-rose-500")+'">'+a.direction.toUpperCase()+'</span></div><p class="text-lg font-bold '+(a.roi >= 0 ? "text-emerald-400" : "text-rose-400")+'">'+a.roi.toFixed(4)+'%</p><p class="text-[10px] text-slate-500 font-bold tracking-tighter">PRICE: '+a.entryPrice.toFixed(6)+'</p><p class="text-[11px] text-slate-200 font-bold">'+a.unrealizedUsdt.toFixed(8)+'</p><div class="mt-2 text-[8px] text-slate-600 font-bold uppercase truncate">'+a.lastAction+'</div></div>';
             });
             document.getElementById('accountGrid').innerHTML = accHtml;
             let hHtml = '';
@@ -280,4 +279,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Direct-Data Engine Online.`));
+app.listen(config.port, '0.0.0.0', () => console.log(`LUNA Engine Online.`));
