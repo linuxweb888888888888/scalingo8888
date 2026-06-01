@@ -52,7 +52,7 @@ config.accounts.forEach((account, idx) => {
         roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
         currentEquity: 0, availableMargin: 0, initialEquity: null,
         isLocked: false, 
-        pendingOrderId: null, // NEW: Track the specific order
+        pendingOrderId: null,
         lastAction: 'Idle',
         step: 0, lastStepPrice: 0, lastAddedVolume: 0, startTime: null
     };
@@ -86,19 +86,17 @@ async function fetchPriceRest() {
 }
 
 async function syncAccount(acc, state) {
-    // NEW: If we have an order ID, verify its status before doing anything else
     if (state.pendingOrderId) {
         const orderRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order_info', {
             contract_code: config.symbol,
             order_id: state.pendingOrderId
         });
-        // status 4 = filled, 6 = partial filled & cancelled, 7 = cancelled
         if (orderRes?.data?.[0]?.status >= 4) {
             state.pendingOrderId = null;
             state.isLocked = false; 
         } else {
             state.lastAction = "Waiting Confirmation";
-            return; // Stay locked and skip sync until order is finished
+            return;
         }
     }
 
@@ -177,7 +175,6 @@ async function processMartingale() {
         if (state.isLocked || market.bid === 0) continue;
         const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
 
-        // 1. Initial Entry with Spread Check
         if (state.volume === 0) {
             if (market.spread > config.maxStartSpread) {
                 state.lastAction = "Wait Spread < 0.1%";
@@ -187,12 +184,11 @@ async function processMartingale() {
             const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
-            if (res?.status === 'ok') state.pendingOrderId = res.data.order_id_str; // Capture ID
+            if (res?.status === 'ok') state.pendingOrderId = res.data.order_id_str;
             else state.isLocked = false;
             continue;
         }
 
-        // 2. Take Profit Trigger
         if (state.roi >= config.takeProfitPct) {
             const v = state.volume;
             state.isLocked = true; 
@@ -201,15 +197,14 @@ async function processMartingale() {
                 contract_code: config.symbol, volume: v, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
             });
             if (res?.status === 'ok') {
-                state.pendingOrderId = res.data.order_id_str; // Capture ID
-                state.volume = 0; state.roi = 0; // Optimistic clear
+                state.pendingOrderId = res.data.order_id_str;
+                state.volume = 0; state.roi = 0;
             } else {
                 state.isLocked = false;
             }
             continue;
         }
 
-        // 3. Step Logic
         let priceMove = state.direction === 'buy' ? 
             ((state.lastStepPrice - currentPrice) / state.lastStepPrice) * 100 : 
             ((currentPrice - state.lastStepPrice) / state.lastStepPrice) * 100;
@@ -221,7 +216,7 @@ async function processMartingale() {
                 contract_code: config.symbol, volume: nextVol, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
             if(res?.status === 'ok') {
-                state.pendingOrderId = res.data.order_id_str; // Capture ID
+                state.pendingOrderId = res.data.order_id_str;
                 state.step++;
                 state.lastStepPrice = currentPrice;
                 state.lastAddedVolume = nextVol;
@@ -234,15 +229,33 @@ async function processMartingale() {
 
 async function backgroundLoop() {
     if (Date.now() - market.lastPriceUpdate > 2000) await fetchPriceRest();
+    
     await Promise.all(config.accounts.map(acc => syncAccount(acc, accountStates[acc.accountId])));
-    const s1 = accountStates[1]; const s2 = accountStates[2];
-    market.totalNetGain = (s1.currentEquity + s2.currentEquity) - market.initialTotalEquity;
-    market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
-    const elapsedDays = (Date.now() - market.startTime) / (1000 * 60 * 60 * 24);
-    market.dgr = elapsedDays > 0 ? (market.growthPct / elapsedDays) : 0;
+    
+    // FIXED PROFIT LOGIC:
+    const s1 = accountStates[1]; 
+    const s2 = accountStates[2];
+    
+    if (s1 && s2) {
+        // Capture initial total equity once both accounts have reported their balance
+        if (market.initialTotalEquity === 0 && s1.initialEquity !== null && s2.initialEquity !== null) {
+            market.initialTotalEquity = s1.initialEquity + s2.initialEquity;
+        }
+
+        if (market.initialTotalEquity > 0) {
+            market.totalNetGain = (s1.currentEquity + s2.currentEquity) - market.initialTotalEquity;
+            market.growthPct = (market.totalNetGain / market.initialTotalEquity) * 100;
+            
+            const elapsedDays = (Date.now() - market.startTime) / (1000 * 60 * 60 * 24);
+            // Daily Growth Rate: (Total Growth / Days Elapsed)
+            market.dgr = elapsedDays > 0 ? (market.growthPct / elapsedDays) : 0;
+        }
+    }
+
     if (market.status === 'Active') await processMartingale();
 }
 
+// ==================== ENDPOINTS & UI ====================
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), tradeHistory }));
 app.post('/api/close', async (req, res) => { 
     market.status = "LIQUIDATING"; 
