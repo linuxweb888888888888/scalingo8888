@@ -32,10 +32,15 @@ const config = {
     stepDistancePct: 0.1,
     takeProfitPct: 1.0,
     takerFeeRate: 0.0005, 
-    pollInterval: 1000 // High frequency sync
+    pollInterval: 1000 
 };
 
-let market = { status: 'Active', bid: 0, ask: 0, totalNetGain: 0, growthPct: 0, initialTotalEquity: 0 };
+let market = { 
+    status: 'Active', bid: 0, ask: 0, 
+    totalNetGain: 0, growthPct: 0, dgr: 0,
+    initialTotalEquity: 0, startTime: Date.now() 
+};
+
 let tradeHistory = []; 
 let accountStates = {};
 
@@ -65,14 +70,12 @@ async function htxRequest(account, method, path, data = {}) {
 
 async function syncAccount(acc, state) {
     if (state.isLocked) return; 
-
     const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
     if (posRes?.status === 'ok' && posRes.data) {
         const pos = posRes.data.find(p => p.direction === state.direction);
         if (pos) {
             state.volume = Math.floor(parseFloat(pos.volume));
             state.entryPrice = parseFloat(pos.cost_open || pos.last_price);
-            // EXACT EXCHANGE ROI: Pulling directly from profit_rate
             state.roi = parseFloat(pos.profit_rate) * 100; 
             state.unrealizedUsdt = parseFloat(pos.profit);
             if (!state.startTime) state.startTime = new Date().toLocaleString();
@@ -91,7 +94,6 @@ async function syncAccount(acc, state) {
 
 function logTradeExchangeStyle(state, exitPrice) {
     const now = new Date();
-    // Fees are deducted from the Unrealized PnL to match the exchange's net settlement
     const faceValue = 0.001; 
     const entryNotional = state.volume * state.entryPrice * faceValue;
     const exitNotional = state.volume * exitPrice * faceValue;
@@ -106,7 +108,7 @@ function logTradeExchangeStyle(state, exitPrice) {
         volume: state.volume,
         entryPrice: state.entryPrice.toFixed(8),
         exitPrice: exitPrice.toFixed(8),
-        roi: state.roi.toFixed(4) + '%', // Exchange ROI
+        roi: state.roi.toFixed(4) + '%',
         netPnlUsdt: netPnl.toFixed(8),
         status: 'All Closed'
     });
@@ -146,16 +148,12 @@ async function processMartingale() {
             continue;
         }
 
-        // TP TRIGGER (Uses EXACT EXCHANGE ROI)
         if (state.roi >= config.takeProfitPct) {
-            state.isLocked = true; // PREVENT DUPLICATE CLOSING
+            state.isLocked = true;
             logTradeExchangeStyle(state, currentPrice);
-            
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
                 contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
             });
-
-            // Wipe local volume immediately to prevent multi-fire before sync
             state.volume = 0; 
             setTimeout(() => { state.isLocked = false; }, 3000);
             continue;
@@ -183,8 +181,15 @@ async function processMartingale() {
 
 async function backgroundLoop() {
     await Promise.all(config.accounts.map(acc => syncAccount(acc, accountStates[acc.accountId])));
-    market.totalNetGain = (accountStates[1].currentEquity + accountStates[2].currentEquity) - market.initialTotalEquity;
+    const s1 = accountStates[1]; const s2 = accountStates[2];
+    
+    market.totalNetGain = (s1.currentEquity + s2.currentEquity) - market.initialTotalEquity;
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
+    
+    // Daily Growth Rate Calculation
+    const elapsedDays = (Date.now() - market.startTime) / (1000 * 60 * 60 * 24);
+    market.dgr = elapsedDays > 0 ? (market.growthPct / elapsedDays) : 0;
+
     if (market.status === 'Active') await processMartingale();
 }
 
@@ -222,7 +227,10 @@ app.get('/', (req, res) => {
             </div>
             <div class="text-right">
                 <p id="totalNetGain" class="text-3xl font-black text-white">$0.00000000</p>
-                <p id="growthPct" class="stat-label text-emerald-400">Total Profit: 0.00%</p>
+                <div class="flex flex-col items-end">
+                    <p id="growthPct" class="stat-label text-emerald-400">Total Profit: 0.00%</p>
+                    <p id="dgrPct" class="text-[10px] font-black text-indigo-400 uppercase tracking-tighter">DGR: 0.00% / Day</p>
+                </div>
             </div>
         </div>
 
@@ -282,6 +290,7 @@ app.get('/', (req, res) => {
                 const d = await r.json();
                 document.getElementById('totalNetGain').innerText = '$' + d.market.totalNetGain.toFixed(8);
                 document.getElementById('growthPct').innerText = 'Total Profit: ' + d.market.growthPct.toFixed(2) + '%';
+                document.getElementById('dgrPct').innerText = 'DGR: ' + d.market.dgr.toFixed(2) + '% / DAY';
                 document.getElementById('marketStatus').innerText = d.market.status;
 
                 d.accounts.forEach(function(a, i) {
