@@ -31,8 +31,8 @@ const config = {
     takeProfitPct: 2.0,
     pollInterval: 2000,
     takerFeeRate: 0.0005,
-    contractValue: 1000, // FIXED: 1 Contract = 1000 SHIB
-    entryStaggerMs: 5000 // 5 seconds between account openings
+    contractValue: 1000, // 1 Contract = 1000 SHIB
+    staggerDelayMs: 7000 // Wait 7 seconds between each account opening
 };
 
 let market = {
@@ -40,7 +40,8 @@ let market = {
     totalNetGain: 0, growthPct: 0,
     initialTotalEquity: 0,
     sessionRealizedProfit: 0,
-    netSessionUsdt: 0
+    netSessionUsdt: 0,
+    isQueueLocked: false // Prevents multiple accounts opening at once
 };
 
 let tradeHistory = [];
@@ -65,7 +66,7 @@ async function htxRequest(account, method, path, data = {}) {
     const signature = crypto.createHmac('sha256', account.secret_key).update(payload).digest('base64');
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
-        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 4000 });
+        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 5000 });
         return res.data;
     } catch (e) { return { status: 'error' }; }
 }
@@ -84,12 +85,13 @@ async function syncAccount(acc) {
             if (currentPrice > 0) {
                 const sideMult = state.direction === 'buy' ? 1 : -1;
                 state.roi = ((currentPrice - state.entryPrice) / state.entryPrice) * config.leverage * sideMult * 100;
-                
                 const grossPnL = (currentPrice - state.entryPrice) * state.volume * config.contractValue * sideMult;
                 const feeEstimate = (state.entryPrice + currentPrice) * state.volume * config.contractValue * config.takerFeeRate;
                 state.unrealizedUsdt = grossPnL - feeEstimate;
             }
-        } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; }
+        } else { 
+            state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.entryPrice = 0;
+        }
     }
     
     const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
@@ -99,37 +101,55 @@ async function syncAccount(acc) {
     }
 }
 
-async function executeAction(accId, type) {
+async function openPositionSequential(accId) {
+    if (market.isQueueLocked) return;
     const state = accountStates[accId];
     const acc = config.accounts.find(a => a.id === accId);
-    if (!state || !acc || state.isLocked || state.volume === 0) return;
+    
+    market.isQueueLocked = true; // Block other accounts from opening
+    state.isLocked = true;
+    state.lastAction = "STAGGERING...";
+
+    // Wait for price movement
+    const randomExtra = Math.floor(Math.random() * 3000);
+    await new Promise(r => setTimeout(r, config.staggerDelayMs + randomExtra));
+
+    console.log(`[ORDER] Opening Account ${accId} | Direction: ${state.direction}`);
+    
+    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+        contract_code: config.symbol, 
+        volume: config.baseVolume, 
+        direction: state.direction, 
+        offset: 'open', 
+        lever_rate: config.leverage, 
+        order_price_type: 'optimal_5'
+    });
+
+    state.isLocked = false;
+    state.lastAction = "Idle";
+    market.isQueueLocked = false; // Release global queue
+}
+
+async function closePosition(accId, type) {
+    const state = accountStates[accId];
+    const acc = config.accounts.find(a => a.id === accId);
+    if (state.isLocked || state.volume === 0) return;
 
     state.isLocked = true;
     state.lastAction = type;
     
-    const closeRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+    const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
         contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
         offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
     });
 
-    if (closeRes.status === 'ok') {
+    if (res.status === 'ok') {
         market.sessionRealizedProfit += state.unrealizedUsdt;
         logToHistory(accId, state.direction, state.roi, state.unrealizedUsdt, type);
     }
-
-    // Re-entry with delay
-    const delay = config.entryStaggerMs + Math.floor(Math.random() * 2000);
-    state.lastAction = `RE-OPEN IN ${Math.round(delay/1000)}s`;
-
-    setTimeout(async () => {
-        if (market.status !== 'Active') { state.isLocked = false; return; }
-        await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-            contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, 
-            offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
-        });
-        state.isLocked = false;
-        state.lastAction = "Idle";
-    }, delay);
+    
+    // Position is now 0, backgroundLoop will pick it up for sequential re-entry
+    state.isLocked = false;
 }
 
 function logToHistory(accId, direction, roi, pnl, type) {
@@ -146,9 +166,7 @@ function logToHistory(accId, direction, roi, pnl, type) {
 // ==================== WS ENGINE ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
-    ws.on('open', () => {
-        ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' }));
-    });
+    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
     ws.on('message', (data) => {
         zlib.gunzip(data, (err, dec) => {
             if (err) return;
@@ -160,8 +178,8 @@ function startWS() {
                 Object.values(accountStates).forEach((state) => {
                     totalUnrealized += state.unrealizedUsdt;
                     if (state.volume > 0 && !state.isLocked) {
-                        if (state.roi >= config.takeProfitPct) executeAction(state.id, 'TAKE_PROFIT');
-                        else if (state.roi < -5.0 && market.sessionRealizedProfit > (Math.abs(state.unrealizedUsdt) * 1.15)) executeAction(state.id, 'STOP_LOSS');
+                        if (state.roi >= config.takeProfitPct) closePosition(state.id, 'TAKE_PROFIT');
+                        else if (state.roi < -5.0 && market.sessionRealizedProfit > (Math.abs(state.unrealizedUsdt) * 1.15)) closePosition(state.id, 'STOP_LOSS');
                     }
                 });
                 market.netSessionUsdt = totalUnrealized + market.sessionRealizedProfit;
@@ -172,7 +190,7 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-// ==================== STAGGERED INITIAL OPEN ====================
+// ==================== SEQUENTIAL MONITOR ====================
 async function backgroundLoop() {
     await Promise.all(config.accounts.map(acc => syncAccount(acc)));
     
@@ -182,20 +200,11 @@ async function backgroundLoop() {
     market.totalNetGain = totalCurrentEquity - market.initialTotalEquity;
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
 
-    if (market.status === 'Active') {
-        for (const state of states) {
-            if (state.volume === 0 && !state.isLocked) {
-                state.isLocked = true;
-                const acc = config.accounts.find(a => a.id === state.id);
-                
-                // Wait for the price to move slightly before opening this specific account
-                setTimeout(async () => {
-                    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                        contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
-                    });
-                    state.isLocked = false;
-                }, config.entryStaggerMs * state.id); 
-            }
+    if (market.status === 'Active' && !market.isQueueLocked) {
+        // Find the FIRST account that needs a position and open it
+        const nextToOpen = states.find(s => s.volume === 0 && !s.isLocked);
+        if (nextToOpen) {
+            openPositionSequential(nextToOpen.id);
         }
     }
 }
@@ -228,7 +237,7 @@ app.get('/', (req, res) => {
     <div class="max-w-7xl mx-auto">
         <div class="flex justify-between items-end mb-6">
             <div>
-                <h1 class="text-xl font-bold text-indigo-400">HEDGE ENGINE <span class="text-white opacity-40">STAGGERED 8D</span></h1>
+                <h1 class="text-xl font-bold text-indigo-400">SEQUENTIAL ENGINE <span class="text-white opacity-40">STAGGERED 8D</span></h1>
                 <p id="statusBadge" class="text-[10px] mt-1 font-bold bg-emerald-500/10 text-emerald-500 px-2 py-0.5 rounded border border-emerald-500/20 uppercase tracking-widest">SYSTEM ACTIVE</p>
             </div>
             <div class="text-right">
@@ -242,7 +251,7 @@ app.get('/', (req, res) => {
         </div>
         <div id="accountGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 mb-6"></div>
         <div class="bg-slate-900 rounded border border-slate-800 p-4">
-            <div class="flex justify-between mb-4 border-b border-slate-800 pb-2"><p class="text-[10px] font-bold text-slate-500 uppercase">Exchange Activity</p><button onclick="fetch('/api/close-all', {method:'POST'})" class="text-[9px] text-rose-500 font-bold uppercase">Liquidate All</button></div>
+            <div class="flex justify-between mb-4 border-b border-slate-800 pb-2"><p class="text-[10px] font-bold text-slate-500 uppercase">Recent Exchange Activity</p><button onclick="fetch('/api/close-all', {method:'POST'})" class="text-[9px] text-rose-500 font-bold uppercase">Liquidate All</button></div>
             <table class="w-full text-left text-[11px]">
                 <thead><tr class="text-slate-600"><th class="pb-2">Time</th><th class="pb-2">Type</th><th class="pb-2">Target</th><th class="pb-2">ROI</th><th class="pb-2 text-right">PnL (USDT)</th></tr></thead>
                 <tbody id="historyBody"></tbody>
@@ -259,7 +268,7 @@ app.get('/', (req, res) => {
             document.getElementById('statusBadge').innerText = 'SYSTEM ' + d.market.status;
             let accHtml = '';
             d.accounts.forEach(a => {
-                accHtml += '<div class="bg-slate-950 p-3 border border-slate-800"><div class="flex justify-between items-center mb-1"><span class="text-[9px] bg-slate-800 px-1.5 rounded text-slate-400 font-bold">ACC '+a.id+'</span><span class="text-[9px] font-bold '+(a.direction === "buy" ? "text-emerald-500" : "text-rose-500")+'">'+a.direction.toUpperCase()+'</span></div><p class="text-lg font-bold '+(a.roi >= 0 ? "text-emerald-400" : "text-rose-400")+'">'+a.roi.toFixed(4)+'%</p><p class="text-[11px] text-slate-200 font-bold">'+a.unrealizedUsdt.toFixed(8)+'</p><div class="mt-2 text-[9px] text-slate-600 font-bold uppercase truncate">'+a.lastAction+'</div></div>';
+                accHtml += '<div class="bg-slate-950 p-3 border border-slate-800"><div class="flex justify-between items-center mb-1"><span class="text-[9px] bg-slate-800 px-1.5 rounded text-slate-400 font-bold">ACC '+a.id+'</span><span class="text-[9px] font-bold '+(a.direction === "buy" ? "text-emerald-500" : "text-rose-500")+'">'+a.direction.toUpperCase()+'</span></div><p class="text-lg font-bold '+(a.roi >= 0 ? "text-emerald-400" : "text-rose-400")+'">'+a.roi.toFixed(4)+'%</p><p class="text-[10px] text-slate-500 font-bold">Price: '+a.entryPrice.toFixed(8)+'</p><p class="text-[11px] text-slate-200 font-bold">'+a.unrealizedUsdt.toFixed(8)+'</p><div class="mt-2 text-[9px] text-slate-600 font-bold uppercase truncate">'+a.lastAction+'</div></div>';
             });
             document.getElementById('accountGrid').innerHTML = accHtml;
             let hHtml = '';
@@ -275,4 +284,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Running: 1 Contract = 1000 SHIB`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Sequential Engine Running...`));
