@@ -14,7 +14,7 @@ let accountIndex = 1;
 while (process.env[`HTX_API_KEY_${accountIndex}`]) {
     apiAccounts.push({
         apiKey: process.env[`HTX_API_KEY_${accountIndex}`],
-        secretKey: process.env[`HTX_SECRET_KEY_${accountIndex}`],
+        secret_key: process.env[`HTX_SECRET_KEY_${accountIndex}`], // Corrected naming
         accountId: accountIndex
     });
     accountIndex++;
@@ -31,7 +31,7 @@ const config = {
     multiplier: 1.2,
     stepDistancePct: 0.1,
     takeProfitPct: 1.0,
-    maxStartSpread: 0.1, // NEW: Only open initial trade if spread < 0.1%
+    maxStartSpread: 0.1, 
     takerFeeRate: 0.0005, 
     pollInterval: 1000 
 };
@@ -51,7 +51,9 @@ config.accounts.forEach((account, idx) => {
         direction: idx === 0 ? 'buy' : 'sell',
         roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
         currentEquity: 0, availableMargin: 0, initialEquity: null,
-        isLocked: false, lastAction: 'Idle',
+        isLocked: false, 
+        pendingOrderId: null, // NEW: Track specific order ID
+        lastAction: 'Idle',
         step: 0, lastStepPrice: 0, lastAddedVolume: 0, startTime: null
     };
 });
@@ -62,7 +64,7 @@ async function htxRequest(account, method, path, data = {}) {
     const params = { AccessKeyId: account.apiKey, SignatureMethod: 'HmacSHA256', SignatureVersion: '2', Timestamp: timestamp };
     const query = Object.keys(params).sort().map(k => `${k}=${encodeURIComponent(params[k])}`).join('&');
     const payload = [method.toUpperCase(), config.restHost, path, query].join('\n');
-    const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
+    const signature = crypto.createHmac('sha256', account.secret_key || account.secretKey).update(payload).digest('base64');
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
         const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 2000 });
@@ -84,7 +86,26 @@ async function fetchPriceRest() {
 }
 
 async function syncAccount(acc, state) {
-    if (state.isLocked) return; 
+    // 1. If there is a pending order, check its status first
+    if (state.pendingOrderId) {
+        const orderRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order_info', {
+            contract_code: config.symbol,
+            order_id: state.pendingOrderId
+        });
+        
+        // Status 4 = Filled, 6 = Part-filled & Cancelled, 7 = Cancelled
+        const orderStatus = orderRes?.data?.[0]?.status;
+        if (orderStatus >= 4) {
+            state.pendingOrderId = null;
+            state.isLocked = false; // Finally unlock
+            state.lastAction = "Order Confirmed";
+        } else {
+            state.lastAction = "Waiting Confirmation...";
+            return; // Stay locked and stop sync here until order is finished
+        }
+    }
+
+    // 2. Regular Sync (Positions & Balance)
     const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
     if (posRes?.status === 'ok' && posRes.data) {
         const pos = posRes.data.find(p => p.direction === state.direction);
@@ -108,30 +129,73 @@ async function syncAccount(acc, state) {
     }
 }
 
-function logTradeExchangeStyle(state, exitPrice) {
-    const now = new Date();
-    const faceValue = 0.001; 
-    const entryNotional = state.volume * state.entryPrice * faceValue;
-    const exitNotional = state.volume * exitPrice * faceValue;
-    const totalFees = (entryNotional * config.takerFeeRate) + (exitNotional * config.takerFeeRate);
-    const netPnl = state.unrealizedUsdt - totalFees;
+// ==================== MARTINGALE LOGIC ====================
+async function processMartingale() {
+    for (const acc of config.accounts) {
+        const state = accountStates[acc.accountId];
+        if (state.isLocked || market.bid === 0) continue;
+        const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
 
-    tradeHistory.unshift({
-        symbol: config.symbol.replace('-', '') + 'Perpetual',
-        type: (state.direction === 'buy' ? 'BuyCross' : 'SellCross'),
-        openTime: state.startTime || now.toLocaleString(),
-        closeTime: now.toLocaleString(),
-        volume: state.volume,
-        entryPrice: state.entryPrice.toFixed(8),
-        exitPrice: exitPrice.toFixed(8),
-        roi: state.roi.toFixed(4) + '%',
-        netPnlUsdt: netPnl.toFixed(8),
-        status: 'All Closed'
-    });
-    if (tradeHistory.length > 20) tradeHistory.pop();
+        // 1. Initial Entry
+        if (state.volume === 0) {
+            if (market.spread > config.maxStartSpread) {
+                state.lastAction = "Wait Spread < 0.1%";
+                continue;
+            }
+            state.isLocked = true;
+            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+            });
+            if (res?.status === 'ok') {
+                state.pendingOrderId = res.data.order_id_str; // SAVE ORDER ID
+                state.lastAction = "Order Sent...";
+            } else {
+                state.isLocked = false;
+            }
+            continue;
+        }
+
+        // 2. Take Profit Trigger
+        if (state.roi >= config.takeProfitPct) {
+            const v = state.volume;
+            state.isLocked = true; 
+            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+                contract_code: config.symbol, volume: v, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
+            });
+            if (res?.status === 'ok') {
+                state.pendingOrderId = res.data.order_id_str;
+                state.lastAction = "Closing TP...";
+            } else {
+                state.isLocked = false;
+            }
+            continue;
+        }
+
+        // 3. Step Logic
+        let priceMove = state.direction === 'buy' ? 
+            ((state.lastStepPrice - currentPrice) / state.lastStepPrice) * 100 : 
+            ((currentPrice - state.lastStepPrice) / state.lastStepPrice) * 100;
+
+        if (priceMove >= config.stepDistancePct) {
+            state.isLocked = true;
+            const nextVol = Math.max(1, Math.ceil((state.lastAddedVolume || config.baseVolume) * config.multiplier));
+            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: nextVol, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
+            });
+            if(res?.status === 'ok') {
+                state.pendingOrderId = res.data.order_id_str;
+                state.step++;
+                state.lastStepPrice = currentPrice;
+                state.lastAddedVolume = nextVol;
+                state.lastAction = "Adding Step...";
+            } else {
+                state.isLocked = false;
+            }
+        }
+    }
 }
 
-// ==================== WS ENGINE ====================
+// ==================== ENGINE CORE ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
@@ -151,63 +215,6 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-// ==================== MARTINGALE LOGIC ====================
-async function processMartingale() {
-    for (const acc of config.accounts) {
-        const state = accountStates[acc.accountId];
-        if (state.isLocked || market.bid === 0) continue;
-        const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
-
-        // 1. Initial Entry with Spread Check
-        if (state.volume === 0) {
-            if (market.spread > config.maxStartSpread) {
-                state.lastAction = "Wait Spread < 0.1%";
-                continue;
-            }
-            state.isLocked = true;
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
-            });
-            state.lastAction = "Idle";
-            state.isLocked = false;
-            continue;
-        }
-
-        // 2. Take Profit Trigger
-        if (state.roi >= config.takeProfitPct) {
-            const v = state.volume;
-            state.isLocked = true; 
-            logTradeExchangeStyle(state, currentPrice);
-            state.volume = 0; 
-            state.roi = 0;
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-                contract_code: config.symbol, volume: v, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
-            });
-            setTimeout(() => { state.isLocked = false; }, 8000);
-            continue;
-        }
-
-        // 3. Step Logic
-        let priceMove = state.direction === 'buy' ? 
-            ((state.lastStepPrice - currentPrice) / state.lastStepPrice) * 100 : 
-            ((currentPrice - state.lastStepPrice) / state.lastStepPrice) * 100;
-
-        if (priceMove >= config.stepDistancePct) {
-            state.isLocked = true;
-            const nextVol = Math.max(1, Math.ceil((state.lastAddedVolume || config.baseVolume) * config.multiplier));
-            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: nextVol, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
-            });
-            if(res?.status === 'ok') {
-                state.step++;
-                state.lastStepPrice = currentPrice;
-                state.lastAddedVolume = nextVol;
-            }
-            state.isLocked = false;
-        }
-    }
-}
-
 async function backgroundLoop() {
     if (Date.now() - market.lastPriceUpdate > 2000) await fetchPriceRest();
     await Promise.all(config.accounts.map(acc => syncAccount(acc, accountStates[acc.accountId])));
@@ -220,16 +227,6 @@ async function backgroundLoop() {
 }
 
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), tradeHistory }));
-app.post('/api/close', async (req, res) => { 
-    market.status = "LIQUIDATING"; 
-    for (const acc of config.accounts) { 
-        const s = accountStates[acc.accountId];
-        if (s.volume > 0) await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: s.volume, direction: s.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' });
-    }
-    setTimeout(() => market.status = "Active", 5000);
-    res.json({status:'ok'});
-});
-
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -241,7 +238,6 @@ app.get('/', (req, res) => {
         body { background: #0f172a; color: white; font-family: 'Inter', sans-serif; }
         .card { background: #1e293b; border-radius: 20px; border: 1px solid #334155; }
         .stat-label { font-size: 10px; font-weight: 900; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.1em; }
-        .exchange-row { border-bottom: 1px solid #334155; padding: 16px; font-size: 11px; }
     </style>
 </head>
 <body class="p-4 md:p-10">
@@ -278,72 +274,36 @@ app.get('/', (req, res) => {
                 <div>
                     <p class="stat-label text-emerald-500">Long Account</p>
                     <p id="lRoi" class="text-4xl font-black">0.0000%</p>
-                    <p id="lPnl" class="text-sm font-bold text-slate-500 mb-2">$0.00000000</p>
                     <div class="bg-emerald-500/10 inline-block px-2 py-1 rounded">
                         <p id="lStep" class="text-[10px] font-black text-emerald-400 uppercase">STEP: 0</p>
                     </div>
-                    <p id="lMargin" class="text-[9px] text-slate-400 mt-2">AVL: $0.0000</p>
-                    <p id="lAction" class="text-[9px] text-indigo-400 italic mt-1"></p>
+                    <p id="lAction" class="text-[10px] text-indigo-400 italic mt-2"></p>
                 </div>
                 <div class="text-right">
                     <p class="stat-label text-rose-500">Short Account</p>
                     <p id="sRoi" class="text-4xl font-black">0.0000%</p>
-                    <p id="sPnl" class="text-sm font-bold text-slate-500 mb-2">$0.00000000</p>
                     <div class="bg-rose-500/10 inline-block px-2 py-1 rounded">
                         <p id="sStep" class="text-[10px] font-black text-rose-400 uppercase">STEP: 0</p>
                     </div>
-                    <p id="sMargin" class="text-[9px] text-slate-400 mt-2">AVL: $0.0000</p>
-                    <p id="sAction" class="text-[9px] text-indigo-400 italic mt-1"></p>
+                    <p id="sAction" class="text-[10px] text-indigo-400 italic mt-2"></p>
                 </div>
             </div>
         </div>
-
-        <div class="card overflow-hidden mb-8">
-             <div class="bg-slate-800/50 p-4 border-b border-slate-700">
-                <p class="stat-label">Exchange Style History</p>
-            </div>
-            <div id="historyBody" class="divide-y divide-slate-700"></div>
-        </div>
-
-        <button onclick="triggerClose()" class="w-full py-5 rounded-2xl bg-white text-black font-black uppercase tracking-widest hover:bg-rose-500 hover:text-white transition-all shadow-2xl">
-            Emergency Liquidation
-        </button>
     </div>
 
     <script>
-        async function triggerClose() { if(confirm("Close all?")) fetch('/api/close', {method:'POST'}); }
         setInterval(async () => {
             try {
                 const r = await fetch('/api/status'); 
                 const d = await r.json();
                 document.getElementById('totalNetGain').innerText = '$' + d.market.totalNetGain.toFixed(8);
-                document.getElementById('growthPct').innerText = 'Total Profit: ' + d.market.growthPct.toFixed(2) + '%';
-                document.getElementById('dgrPct').innerText = 'DGR: ' + d.market.dgr.toFixed(2) + '% / DAY';
                 document.getElementById('uiSpread').innerText = d.market.spread.toFixed(3) + '%';
-                document.getElementById('marketStatus').innerText = d.market.status;
-
                 d.accounts.forEach(function(a, i) {
                     const p = i === 0 ? 'l' : 's';
                     document.getElementById(p+'Roi').innerText = a.roi.toFixed(4)+'%';
-                    document.getElementById(p+'Roi').className = 'text-4xl font-black ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
-                    document.getElementById(p+'Pnl').innerText = '$' + a.unrealizedUsdt.toFixed(8);
                     document.getElementById(p+'Step').innerText = 'STEP: ' + a.step;
-                    document.getElementById(p+'Margin').innerText = 'AVL: $' + a.availableMargin.toFixed(4);
                     document.getElementById(p+'Action').innerText = a.lastAction;
                 });
-
-                let html = '';
-                d.tradeHistory.forEach(h => {
-                    html += '<div class="exchange-row">' +
-                        '<div class="flex justify-between mb-2"><div><span class="font-black">' + h.symbol + '</span><span class="ml-2 text-[9px] bg-slate-700 px-1 rounded">' + h.type + '</span></div>' +
-                        '<div class="text-right text-slate-500 text-[9px]">Open: ' + h.openTime + '<br>Close: ' + h.closeTime + '</div></div>' +
-                        '<div class="grid grid-cols-3 gap-4 text-[10px]">' +
-                        '<div><p class="text-slate-500 uppercase">Volume</p><p class="font-bold">' + h.volume + '</p></div>' +
-                        '<div><p class="text-slate-500 uppercase">Entry/Exit</p><p class="font-bold">' + h.entryPrice + ' / ' + h.exitPrice + '</p></div>' +
-                        '<div class="text-right"><p class="text-slate-500 uppercase">ROI / Net PnL</p><p class="font-black ' + (parseFloat(h.netPnlUsdt) >= 0 ? 'text-emerald-400' : 'text-rose-400') + '">' + h.roi + ' / ' + h.netPnlUsdt + ' USDT</p></div>' +
-                        '</div></div>';
-                });
-                document.getElementById('historyBody').innerHTML = html;
             } catch(e) { }
         }, 1000);
     </script>
