@@ -108,9 +108,10 @@ async function syncAccount(acc, state) {
         if (pos) {
             state.volume = Math.floor(parseFloat(pos.volume));
             state.entryPrice = parseFloat(pos.cost_open);
+            // CONFIRM WITH EXCHANGE: Use exchange-provided profit_rate directly
             state.roi = parseFloat(pos.profit_rate) * 100; 
             state.unrealizedUsdt = parseFloat(pos.profit);
-            state.faceValue = parseFloat(pos.contract_size); // Critical for PnL
+            state.faceValue = parseFloat(pos.contract_size);
             if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
             if (!state.startTime) state.startTime = new Date().toLocaleString();
         } else { 
@@ -126,26 +127,22 @@ async function syncAccount(acc, state) {
     }
 }
 
-// ==================== FIXED PNL LOGIC ====================
 function logTradeExchangeStyle(state, exitPrice) {
     const now = new Date();
-    
-    // Use numbers and fallbacks to prevent NaN
     const vol = Number(state.volume) || 0;
-    const entryPrice = Number(state.entryPrice) || 0;
-    const closePrice = Number(exitPrice) || 0;
-    const faceValue = Number(state.faceValue) || 1; // Default to 1 if faceValue is 0
+    const entryP = Number(state.entryPrice) || 0;
+    const exitP = Number(exitPrice) || 0;
+    const fv = Number(state.faceValue) || 0;
 
-    // Manual Gross PnL Calculation (Linear Swap Formula)
     let grossPnl = 0;
     if (state.direction === 'buy') {
-        grossPnl = (closePrice - entryPrice) * vol * faceValue;
+        grossPnl = (exitP - entryP) * vol * fv;
     } else {
-        grossPnl = (entryPrice - closePrice) * vol * faceValue;
+        grossPnl = (entryP - exitP) * vol * fv;
     }
 
-    const entryNotional = vol * entryPrice * faceValue;
-    const exitNotional = vol * closePrice * faceValue;
+    const entryNotional = vol * entryP * fv;
+    const exitNotional = vol * exitP * fv;
     const totalFees = (entryNotional * config.takerFeeRate) + (exitNotional * config.takerFeeRate);
     const netPnl = grossPnl - totalFees;
 
@@ -155,8 +152,8 @@ function logTradeExchangeStyle(state, exitPrice) {
         openTime: state.startTime || now.toLocaleString(),
         closeTime: now.toLocaleString(),
         volume: vol,
-        entryPrice: entryPrice.toFixed(8),
-        exitPrice: closePrice.toFixed(8),
+        entryPrice: entryP.toFixed(8),
+        exitPrice: exitP.toFixed(8),
         roi: state.roi.toFixed(4) + '%',
         netPnlUsdt: netPnl.toFixed(8),
         status: 'All Closed'
@@ -190,6 +187,7 @@ async function processMartingale() {
         if (state.isLocked || market.bid === 0) continue;
         const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
 
+        // ENTRY
         if (state.volume === 0) {
             if (market.spread > config.maxStartSpread) {
                 state.lastAction = "Wait Spread < 0.1%";
@@ -204,26 +202,28 @@ async function processMartingale() {
             continue;
         }
 
+        // TAKE PROFIT: This ROI was just updated in the syncAccount loop from Exchange Data
         if (state.roi >= config.takeProfitPct) {
             const v = state.volume;
-            const exitP = currentPrice;
             state.isLocked = true; 
+            logTradeExchangeStyle(state, currentPrice); 
             
-            // Log with the current captured state before resetting
-            logTradeExchangeStyle(state, exitP); 
-
+            // Execute closing order instantly with BBO (optimal_20)
             const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
                 contract_code: config.symbol, volume: v, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
             });
+            
             if (res?.status === 'ok') {
                 state.pendingOrderId = res.data.order_id_str;
                 state.volume = 0; state.roi = 0; 
+                state.lastAction = "Closing (TP Hit)";
             } else {
                 state.isLocked = false;
             }
             continue;
         }
 
+        // DCA STEPS
         let priceMove = state.direction === 'buy' ? 
             ((state.lastStepPrice - currentPrice) / state.lastStepPrice) * 100 : 
             ((currentPrice - state.lastStepPrice) / state.lastStepPrice) * 100;
@@ -248,7 +248,11 @@ async function processMartingale() {
 
 async function backgroundLoop() {
     if (Date.now() - market.lastPriceUpdate > 2000) await fetchPriceRest();
+    
+    // STEP 1: Sync with Exchange to get fresh ROI
     await Promise.all(config.accounts.map(acc => syncAccount(acc, accountStates[acc.accountId])));
+    
+    // Global Equity Stats
     const s1 = accountStates[1] || {currentEquity:0}; const s2 = accountStates[2] || {currentEquity:0};
     const currentTotalEquity = s1.currentEquity + s2.currentEquity;
     if (market.initialTotalEquity === 0 && currentTotalEquity > 0) market.initialTotalEquity = currentTotalEquity;
@@ -256,6 +260,8 @@ async function backgroundLoop() {
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
     const elapsedDays = (Date.now() - market.startTime) / (1000 * 60 * 60 * 24);
     market.dgr = elapsedDays > 0 ? (market.growthPct / elapsedDays) : 0;
+    
+    // STEP 2: Process logic using the confirmed ROI from Step 1
     if (market.status === 'Active') await processMartingale();
 }
 
