@@ -27,24 +27,17 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    baseVolume: parseInt(process.env.BASE_VOLUME) || 1, 
-    winLossRatio: 1.5,        
-    maxStartSpread: 0.1,      
-    autoClosePct: 110,        
-    pollInterval: 1000,       
-    resetCooldownMs: 3000,
-    resetDiffThreshold: 2.5,  // TRIGGER: Difference Sum must reach this value
-    takerFeeRate: 0.0005      
+    // MARTINGALE SETTINGS
+    baseVolume: 1,           // Start with 1 contract
+    multiplier: 1.2,         // Multiply volume by 1.2 each step
+    stepDistancePct: 0.1,    // Add safety order every 0.1% drop/rise
+    takeProfitPct: 1.0,      // Close at 1% profit
+    pollInterval: 2000
 };
 
 let market = { 
     status: 'Active', bid: 0, ask: 0, spread: 0,
-    currentRatio: 0, resetPenalty: 0, diffSum: 0,
-    balancePct: 0, totalNetGain: 0, growthPct: 0, 
-    initialTotalEquity: 0, resetUsed: false,
-    sessionResetLoss: 0,
-    netSessionUsdt: 0,         
-    estExitFees: 0
+    totalNetGain: 0, growthPct: 0, initialTotalEquity: 0
 };
 
 let tradeHistory = []; 
@@ -55,7 +48,8 @@ config.accounts.forEach((account, idx) => {
         direction: idx === 0 ? 'buy' : 'sell',
         roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
         currentEquity: 0, initialEquity: null,
-        isLocked: false, lastAction: 'Idle'
+        isLocked: false, lastAction: 'Idle',
+        step: 0 // Track Martingale level
     };
 });
 
@@ -68,7 +62,7 @@ async function htxRequest(account, method, path, data = {}) {
     const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
-        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 1500 });
+        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 2000 });
         return res.data;
     } catch (e) { return { status: 'error' }; }
 }
@@ -82,7 +76,9 @@ async function syncAccount(acc, state) {
             state.entryPrice = parseFloat(pos.cost_open || pos.last_price);
             state.roi = parseFloat(pos.profit_rate) * 100;
             state.unrealizedUsdt = parseFloat(pos.profit);
-        } else { state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.entryPrice = 0; }
+        } else { 
+            state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.entryPrice = 0; state.step = 0;
+        }
     }
     const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
     if (accRes?.status === 'ok' && accRes.data?.[0]) {
@@ -97,38 +93,11 @@ function logTrade(side, roi, pnl, type) {
         time: new Date().toLocaleTimeString(), 
         side: side.toUpperCase(), 
         roi: roi.toFixed(2) + '%', 
-        pnl: pnl.toFixed(5), 
-        total: market.totalNetGain.toFixed(5), 
+        pnl: pnl.toFixed(4), 
+        total: market.totalNetGain.toFixed(4), 
         type: type 
     });
     if (tradeHistory.length > 15) tradeHistory.pop();
-}
-
-async function flashReset(accIdxToReset) {
-    if (market.status !== 'Active' || market.resetUsed) return;
-    const acc = config.accounts[accIdxToReset];
-    const state = accountStates[acc.accountId];
-    if (state.isLocked || state.volume === 0) return;
-
-    state.isLocked = true;
-    market.resetUsed = true; 
-    
-    const feeCost = (state.volume * market.bid * config.takerFeeRate * 2);
-    market.sessionResetLoss += (Math.abs(state.unrealizedUsdt) + feeCost);
-    
-    state.lastAction = "⚡ RESET";
-    logTrade(state.direction, state.roi, state.unrealizedUsdt, 'RESET');
-
-    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-        contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
-        offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
-    });
-    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-        contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, 
-        offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
-    });
-
-    setTimeout(() => { state.isLocked = false; state.lastAction = "Idle"; }, config.resetCooldownMs);
 }
 
 // ==================== WS ENGINE ====================
@@ -143,36 +112,6 @@ function startWS() {
                 market.bid = msg.tick.bid[0];
                 market.ask = msg.tick.ask[0];
                 market.spread = ((market.ask - market.bid) / market.bid) * 100;
-                market.resetPenalty = -(market.spread * config.leverage);
-
-                const s1 = accountStates[1]; 
-                const s2 = accountStates[2];
-                if (!s1 || !s2) return;
-                
-                const lRoi = s1.entryPrice > 0 ? ((market.bid - s1.entryPrice) / s1.entryPrice) * config.leverage * 100 : s1.roi;
-                const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : s2.roi;
-                
-                const winRoi = Math.max(lRoi, sRoi);
-                
-                // CORE LOGIC: Difference Sum = Winner ROI + (Spread * Leverage)
-                market.diffSum = winRoi + market.resetPenalty;
-
-                const fee1 = s1.volume > 0 ? (s1.volume * market.bid * config.takerFeeRate) : 0;
-                const fee2 = s2.volume > 0 ? (s2.volume * market.ask * config.takerFeeRate) : 0;
-                market.estExitFees = fee1 + fee2;
-
-                const winPnl = Math.max(s1.unrealizedUsdt, s2.unrealizedUsdt);
-                const totalDebt = Math.abs(Math.min(s1.unrealizedUsdt, s2.unrealizedUsdt)) + market.sessionResetLoss + market.estExitFees;
-                
-                market.currentRatio = totalDebt > 0 ? (winPnl / totalDebt) : 0;
-                market.netSessionUsdt = (s1.unrealizedUsdt + s2.unrealizedUsdt) - market.sessionResetLoss - market.estExitFees;
-
-                // RESET TRIGGER: Strictly triggered only when Difference Sum reaches target (e.g. 2.5%)
-                if (market.status === 'Active' && !market.resetUsed) {
-                    if (market.diffSum >= config.resetDiffThreshold) {
-                        lRoi < sRoi ? flashReset(0) : flashReset(1);
-                    }
-                }
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
         });
@@ -180,9 +119,63 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
+// ==================== MARTINGALE LOGIC ====================
+async function processMartingale() {
+    for (const acc of config.accounts) {
+        const state = accountStates[acc.accountId];
+        if (state.isLocked || market.bid === 0) continue;
+
+        // 1. OPEN INITIAL POSITION
+        if (state.volume === 0) {
+            state.isLocked = true;
+            console.log(`Opening Step 0 for ${state.direction}`);
+            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
+            });
+            state.step = 0;
+            state.isLocked = false;
+            continue;
+        }
+
+        // 2. CHECK TAKE PROFIT
+        if (state.roi >= config.takeProfitPct) {
+            state.isLocked = true;
+            logTrade(state.direction, state.roi, state.unrealizedUsdt, 'TAKE PROFIT');
+            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+                contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
+            });
+            state.isLocked = false;
+            continue;
+        }
+
+        // 3. CHECK SAFETY ORDER (MARTINGALE STEP)
+        let priceDiff = 0;
+        if (state.direction === 'buy') {
+            priceDiff = ((state.entryPrice - market.bid) / state.entryPrice) * 100;
+        } else {
+            priceDiff = ((market.ask - state.entryPrice) / state.entryPrice) * 100;
+        }
+
+        // Trigger if price moved against us by X% multiplied by number of steps
+        const triggerThreshold = config.stepDistancePct; 
+        if (priceDiff >= triggerThreshold) {
+            state.isLocked = true;
+            state.step++;
+            const nextVolume = Math.max(1, Math.floor(state.volume * config.multiplier));
+            
+            console.log(`Adding Safety Order Step ${state.step} for ${state.direction}. Volume: ${nextVolume}`);
+            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol, volume: nextVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
+            });
+            state.isLocked = false;
+        }
+    }
+}
+
 // ==================== MAIN LOOP ====================
 async function backgroundLoop() {
     await Promise.all(config.accounts.map(acc => syncAccount(acc, accountStates[acc.accountId])));
+    
     const s1 = accountStates[1]; const s2 = accountStates[2];
     if (!s1 || !s2) return;
 
@@ -190,46 +183,23 @@ async function backgroundLoop() {
     if (market.initialTotalEquity === 0 && totalCurrentEquity > 0) market.initialTotalEquity = totalCurrentEquity;
     market.totalNetGain = totalCurrentEquity - market.initialTotalEquity;
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
-    
-    market.balancePct = market.currentRatio > 0 ? (market.currentRatio / config.winLossRatio) * 100 : 0;
 
     if (market.status === 'Active') {
-        if (market.balancePct >= config.autoClosePct && market.netSessionUsdt > 0) {
-            await manualClose('TARGET EXIT');
-            return;
-        }
-
-        if (s1.volume === 0 && s2.volume === 0 && !s1.isLocked && !s2.isLocked) {
-            if (market.spread > 0 && market.spread <= config.maxStartSpread) {
-                for (const acc of config.accounts) {
-                    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                        contract_code: config.symbol, volume: config.baseVolume, direction: accountStates[acc.accountId].direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
-                    });
-                }
-            }
-        }
+        await processMartingale();
     }
 }
 
-async function manualClose(type = 'MANUAL') {
-    if (market.status === "LIQUIDATING") return; 
+async function manualClose() {
     market.status = "LIQUIDATING";
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
-        state.isLocked = true;
         if (state.volume > 0) {
-            logTrade(state.direction, state.roi, state.unrealizedUsdt, type);
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
                 contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
             });
         }
     }
-    market.resetUsed = false;
-    market.sessionResetLoss = 0;
-    setTimeout(() => { 
-        config.accounts.forEach(acc => { accountStates[acc.accountId].isLocked = false; });
-        market.status = "Active"; 
-    }, 5000);
+    setTimeout(() => { market.status = "Active"; }, 5000);
 }
 
 // ==================== UI DASHBOARD ====================
@@ -240,7 +210,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>Ratio Hedge Engine</title>
+    <meta charset="UTF-8"><title>Martingale Hedge Engine</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap" rel="stylesheet">
     <style>
@@ -253,28 +223,20 @@ app.get('/', (req, res) => {
     <div class="max-w-4xl mx-auto">
         <div class="flex justify-between items-center mb-10">
             <div>
-                <h1 class="text-3xl font-black tracking-tighter uppercase italic">Ratio-Hedge <span class="text-indigo-500">Pro</span></h1>
+                <h1 class="text-3xl font-black tracking-tighter uppercase italic">Martingale-Hedge <span class="text-indigo-500">Pro</span></h1>
                 <p id="botStatus" class="text-[10px] font-bold text-emerald-500 uppercase tracking-widest mt-1">Engine Online</p>
             </div>
             <div class="text-right">
-                <p id="totalNetGain" class="text-3xl font-black text-white">$0.00000</p>
+                <p id="totalNetGain" class="text-3xl font-black text-white">$0.0000</p>
                 <p id="growthPct" class="stat-label text-emerald-400">Total Profit: 0.00%</p>
             </div>
         </div>
 
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
             <div class="card p-6 border-l-4 border-indigo-500">
-                <p class="stat-label mb-1">Debt Coverage Ratio</p>
-                <p id="uiRatio" class="text-3xl font-black text-white">0.00x</p>
-                <p class="text-[9px] text-slate-500 mt-1">Target: ${config.winLossRatio}x</p>
-            </div>
-            <div class="card p-6 border-l-4 border-rose-500">
-                <p class="stat-label mb-1">ROI If Reset Now</p>
-                <p id="uiPenalty" class="text-3xl font-black text-rose-400">-0.00%</p>
-                <div class="mt-2 pt-2 border-t border-slate-700">
-                   <p class="stat-label text-[9px]">Difference Sum (Trigger: ${config.resetDiffThreshold}%)</p>
-                   <p id="uiDiffSum" class="text-lg font-black text-emerald-400">+0.00%</p>
-                </div>
+                <p class="stat-label mb-1">Target Take Profit</p>
+                <p class="text-3xl font-black text-white">${config.takeProfitPct}%</p>
+                <p class="text-[9px] text-slate-500 mt-1">Per Side Independence</p>
             </div>
             <div class="card p-6 border-l-4 border-slate-500">
                 <p class="stat-label mb-1">Market Spread</p>
@@ -284,23 +246,22 @@ app.get('/', (req, res) => {
         </div>
 
         <div class="card p-8 mb-8">
-            <div class="flex justify-between items-end mb-4">
-                <p class="stat-label">Recovery Progress (Exit @ ${config.autoClosePct}%) <span id="netLabel" class="ml-2 text-indigo-400 font-bold lowercase">Net: $0.00</span></p>
-                <p id="balPct" class="text-2xl font-black text-white">0.0%</p>
-            </div>
-            <div class="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
-                <div id="balBar" class="bg-indigo-500 h-full w-0 transition-all duration-500"></div>
-            </div>
-            <div class="grid grid-cols-2 gap-10 mt-8">
+            <div class="grid grid-cols-2 gap-10">
                 <div>
                     <p class="stat-label text-emerald-500">Long Position</p>
                     <p id="lRoi" class="text-4xl font-black">0.00%</p>
-                    <p id="lPnl" class="text-sm font-bold text-slate-500">$0.00000</p>
+                    <p id="lPnl" class="text-sm font-bold text-slate-500">$0.0000</p>
+                    <div class="mt-2 bg-emerald-500/10 inline-block px-2 py-1 rounded">
+                        <p id="lStep" class="text-[10px] font-black text-emerald-400 uppercase">STEP: 0</p>
+                    </div>
                 </div>
                 <div class="text-right">
                     <p class="stat-label text-rose-500">Short Position</p>
                     <p id="sRoi" class="text-4xl font-black">0.00%</p>
-                    <p id="sPnl" class="text-sm font-bold text-slate-500">$0.00000</p>
+                    <p id="sPnl" class="text-sm font-bold text-slate-500">$0.0000</p>
+                    <div class="mt-2 bg-rose-500/10 inline-block px-2 py-1 rounded">
+                        <p id="sStep" class="text-[10px] font-black text-rose-400 uppercase">STEP: 0</p>
+                    </div>
                 </div>
             </div>
         </div>
@@ -314,7 +275,6 @@ app.get('/', (req, res) => {
                         <th class="p-4 stat-label">Side</th>
                         <th class="p-4 stat-label">ROI</th>
                         <th class="p-4 stat-label">PnL</th>
-                        <th class="p-4 stat-label">Session Total</th>
                     </tr>
                 </thead>
                 <tbody id="historyBody" class="divide-y divide-slate-700"></tbody>
@@ -333,25 +293,17 @@ app.get('/', (req, res) => {
                 const r = await fetch('/api/status'); 
                 const d = await r.json();
                 
-                document.getElementById('uiRatio').innerText = d.market.currentRatio.toFixed(2) + 'x';
-                document.getElementById('uiPenalty').innerText = d.market.resetPenalty.toFixed(2) + '%';
-                document.getElementById('marketStatus').innerText = (d.market.resetUsed ? 'RESET USED' : d.market.status);
-                
-                document.getElementById('uiDiffSum').innerText = (d.market.diffSum >= 0 ? '+' : '') + d.market.diffSum.toFixed(2) + '%';
-                document.getElementById('uiDiffSum').className = 'text-lg font-black ' + (d.market.diffSum >= d.config.resetDiffThreshold ? 'text-emerald-400' : 'text-indigo-400');
-                
                 document.getElementById('uiSpread').innerText = d.market.spread.toFixed(3) + '%';
-                document.getElementById('totalNetGain').innerText = (d.market.totalNetGain >= 0 ? '$' : '-$') + Math.abs(d.market.totalNetGain).toFixed(5);
+                document.getElementById('totalNetGain').innerText = (d.market.totalNetGain >= 0 ? '$' : '-$') + Math.abs(d.market.totalNetGain).toFixed(4);
                 document.getElementById('growthPct').innerText = 'Total Profit: ' + d.market.growthPct.toFixed(2) + '%';
-                document.getElementById('balPct').innerText = d.market.balancePct.toFixed(1) + '%';
-                document.getElementById('balBar').style.width = Math.min(100, d.market.balancePct) + '%';
-                document.getElementById('netLabel').innerText = 'Net: $' + d.market.netSessionUsdt.toFixed(5);
+                document.getElementById('marketStatus').innerText = d.market.status;
 
                 d.accounts.forEach(function(a, i) {
                     const p = i === 0 ? 'l' : 's';
                     document.getElementById(p+'Roi').innerText = a.roi.toFixed(2)+'%';
                     document.getElementById(p+'Roi').className = 'text-4xl font-black ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
-                    document.getElementById(p+'Pnl').innerText = (a.unrealizedUsdt >= 0 ? '$' : '-$') + Math.abs(a.unrealizedUsdt).toFixed(5);
+                    document.getElementById(p+'Pnl').innerText = (a.unrealizedUsdt >= 0 ? '$' : '-$') + Math.abs(a.unrealizedUsdt).toFixed(4);
+                    document.getElementById(p+'Step').innerText = 'STEP: ' + a.step;
                 });
 
                 let tableHtml = '';
@@ -362,7 +314,6 @@ app.get('/', (req, res) => {
                         '<td class="p-4 font-bold">' + h.side + '</td>' +
                         '<td class="p-4 ' + (parseFloat(h.roi) >= 0 ? 'text-emerald-400' : 'text-rose-400') + ' font-black">' + h.roi + '</td>' +
                         '<td class="p-4 font-bold">$' + h.pnl + '</td>' +
-                        '<td class="p-4 font-black text-white">$' + h.total + '</td>' +
                         '</tr>';
                 });
                 document.getElementById('historyBody').innerHTML = tableHtml;
@@ -375,4 +326,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Strict Difference Sum Mode)`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Martingale Engine Online - Step: 0.1% | Multiplier: 1.2x`));
