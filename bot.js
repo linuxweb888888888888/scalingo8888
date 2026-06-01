@@ -28,8 +28,8 @@ const config = {
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
     baseVolume: 1, 
-    multiplier: 1.5,
-    stepDistancePct: 0.5,
+    multiplier: 1.2,
+    stepDistancePct: 0.1,
     takeProfitPct: 1.0,      // Triggers based on Exchange ROI
     maxStartSpread: 0.1, 
     takerFeeRate: 0.0005, 
