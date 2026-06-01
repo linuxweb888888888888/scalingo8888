@@ -33,10 +33,8 @@ const config = {
     autoClosePct: 110,        
     pollInterval: 1000,       
     resetCooldownMs: 3000,
-    resetDiffThreshold: 2.5,  
-    takerFeeRate: 0.0005,
-    chaseRetryMs: 2500,       // Time to wait for limit fill before re-pricing
-    resetOffsetPct: 0.001     // 0.1% Offset for Resets
+    resetDiffThreshold: 2.5,  // TRIGGER: Difference Sum must reach this value
+    takerFeeRate: 0.0005      
 };
 
 let market = { 
@@ -57,8 +55,7 @@ config.accounts.forEach((account, idx) => {
         direction: idx === 0 ? 'buy' : 'sell',
         roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
         currentEquity: 0, initialEquity: null,
-        isLocked: false, // LOCK: Prevents spam during chase
-        lastAction: 'Idle'
+        isLocked: false, lastAction: 'Idle'
     };
 });
 
@@ -71,66 +68,9 @@ async function htxRequest(account, method, path, data = {}) {
     const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
-        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 2000 });
+        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 1500 });
         return res.data;
     } catch (e) { return { status: 'error' }; }
-}
-
-/**
- * EXECUTE LIMIT CHASE
- * Places limit order, waits, checks, and re-prices if needed.
- */
-async function executeLimitChase(accIdx, direction, volume, offset, useResetOffset = false) {
-    const account = config.accounts[accIdx];
-    const state = accountStates[account.accountId];
-    
-    let filled = false;
-    let attempts = 0;
-    let remainingVolume = volume;
-
-    while (!filled && attempts < 10) {
-        // Calculate limit price (Best Bid/Ask)
-        let targetPrice = (direction === 'buy') ? market.bid : market.ask;
-
-        // Apply 0.1% Offset if this is a Reset Open
-        if (useResetOffset && targetPrice > 0) {
-            targetPrice = (direction === 'buy') ? targetPrice * (1 - config.resetOffsetPct) : targetPrice * (1 + config.resetOffsetPct);
-        }
-
-        if (!targetPrice) { await new Promise(r => setTimeout(r, 1000)); continue; }
-
-        const order = await htxRequest(account, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-            contract_code: config.symbol, volume: Math.floor(remainingVolume), direction, offset, 
-            lever_rate: config.leverage, order_price_type: 'limit', price: targetPrice.toFixed(10)
-        });
-
-        if (order?.status === 'ok') {
-            const orderId = order.data.order_id;
-            state.lastAction = `Limit ${offset} @ ${targetPrice.toFixed(8)}`;
-            
-            // Wait for fill
-            await new Promise(r => setTimeout(r, config.chaseRetryMs));
-
-            // Check fill status
-            const info = await htxRequest(account, 'POST', '/linear-swap-api/v1/swap_cross_order_info', { 
-                contract_code: config.symbol, order_id: orderId 
-            });
-
-            if (info?.status === 'ok' && info.data && info.data[0].status === 6) {
-                filled = true;
-                state.lastAction = "Filled";
-            } else {
-                // Cancel and re-price
-                await htxRequest(account, 'POST', '/linear-swap-api/v1/swap_cross_cancel', { 
-                    contract_code: config.symbol, order_id: orderId 
-                });
-                const tradeVol = (info?.data && info.data[0]) ? parseFloat(info.data[0].trade_volume) : 0;
-                remainingVolume -= tradeVol;
-                if (remainingVolume <= 0) filled = true;
-            }
-        }
-        attempts++;
-    }
 }
 
 async function syncAccount(acc, state) {
@@ -176,14 +116,17 @@ async function flashReset(accIdxToReset) {
     const feeCost = (state.volume * market.bid * config.takerFeeRate * 2);
     market.sessionResetLoss += (Math.abs(state.unrealizedUsdt) + feeCost);
     
-    state.lastAction = "⚡ RESET CHASE";
+    state.lastAction = "⚡ RESET";
     logTrade(state.direction, state.roi, state.unrealizedUsdt, 'RESET');
 
-    // 1. Close current position
-    await executeChaseLimit(accIdxToReset, state.direction === 'buy' ? 'sell' : 'buy', state.volume, 'close', false);
-    
-    // 2. Open new position with 0.1% Offset
-    await executeChaseLimit(accIdxToReset, state.direction, config.baseVolume, 'open', true);
+    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+        contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', 
+        offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_5' 
+    });
+    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+        contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, 
+        offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5' 
+    });
 
     setTimeout(() => { state.isLocked = false; state.lastAction = "Idle"; }, config.resetCooldownMs);
 }
@@ -210,14 +153,21 @@ function startWS() {
                 const sRoi = s2.entryPrice > 0 ? ((s2.entryPrice - market.ask) / s2.entryPrice) * config.leverage * 100 : s2.roi;
                 
                 const winRoi = Math.max(lRoi, sRoi);
+                
+                // CORE LOGIC: Difference Sum = Winner ROI + (Spread * Leverage)
                 market.diffSum = winRoi + market.resetPenalty;
 
+                const fee1 = s1.volume > 0 ? (s1.volume * market.bid * config.takerFeeRate) : 0;
+                const fee2 = s2.volume > 0 ? (s2.volume * market.ask * config.takerFeeRate) : 0;
+                market.estExitFees = fee1 + fee2;
+
                 const winPnl = Math.max(s1.unrealizedUsdt, s2.unrealizedUsdt);
-                const totalDebt = Math.abs(Math.min(s1.unrealizedUsdt, s2.unrealizedUsdt)) + market.sessionResetLoss + ( (s1.volume + s2.volume) * market.bid * config.takerFeeRate );
+                const totalDebt = Math.abs(Math.min(s1.unrealizedUsdt, s2.unrealizedUsdt)) + market.sessionResetLoss + market.estExitFees;
                 
                 market.currentRatio = totalDebt > 0 ? (winPnl / totalDebt) : 0;
-                market.netSessionUsdt = (s1.unrealizedUsdt + s2.unrealizedUsdt) - market.sessionResetLoss - ( (s1.volume + s2.volume) * market.bid * config.takerFeeRate );
+                market.netSessionUsdt = (s1.unrealizedUsdt + s2.unrealizedUsdt) - market.sessionResetLoss - market.estExitFees;
 
+                // RESET TRIGGER: Strictly triggered only when Difference Sum reaches target (e.g. 2.5%)
                 if (market.status === 'Active' && !market.resetUsed) {
                     if (market.diffSum >= config.resetDiffThreshold) {
                         lRoi < sRoi ? flashReset(0) : flashReset(1);
@@ -240,6 +190,7 @@ async function backgroundLoop() {
     if (market.initialTotalEquity === 0 && totalCurrentEquity > 0) market.initialTotalEquity = totalCurrentEquity;
     market.totalNetGain = totalCurrentEquity - market.initialTotalEquity;
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
+    
     market.balancePct = market.currentRatio > 0 ? (market.currentRatio / config.winLossRatio) * 100 : 0;
 
     if (market.status === 'Active') {
@@ -250,13 +201,11 @@ async function backgroundLoop() {
 
         if (s1.volume === 0 && s2.volume === 0 && !s1.isLocked && !s2.isLocked) {
             if (market.spread > 0 && market.spread <= config.maxStartSpread) {
-                // LOCK immediately to prevent loop spam
-                s1.isLocked = true; s2.isLocked = true;
-                await Promise.all([
-                    executeChaseLimit(0, 'buy', config.baseVolume, 'open', false),
-                    executeChaseLimit(1, 'sell', config.baseVolume, 'open', false)
-                ]);
-                s1.isLocked = false; s2.isLocked = false;
+                for (const acc of config.accounts) {
+                    await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                        contract_code: config.symbol, volume: config.baseVolume, direction: accountStates[acc.accountId].direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
+                    });
+                }
             }
         }
     }
@@ -265,12 +214,14 @@ async function backgroundLoop() {
 async function manualClose(type = 'MANUAL') {
     if (market.status === "LIQUIDATING") return; 
     market.status = "LIQUIDATING";
-    for (let i = 0; i < config.accounts.length; i++) {
-        const state = accountStates[config.accounts[i].accountId];
+    for (const acc of config.accounts) {
+        const state = accountStates[acc.accountId];
         state.isLocked = true;
         if (state.volume > 0) {
             logTrade(state.direction, state.roi, state.unrealizedUsdt, type);
-            await executeChaseLimit(i, state.direction === 'buy' ? 'sell' : 'buy', state.volume, 'close', false);
+            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+                contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' 
+            });
         }
     }
     market.resetUsed = false;
@@ -424,4 +375,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online with Limit Chase & 0.1% Offset`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Strict Difference Sum Mode)`));
