@@ -35,8 +35,8 @@ const config = {
     resetCooldownMs: 3000,
     resetDiffThreshold: 2.5,  
     takerFeeRate: 0.0005,
-    chaseRetryMs: 2500,
-    resetOffsetPct: 0.001 // 0.1% Offset for Resets
+    chaseRetryMs: 2500,        // Time to wait for limit fill before re-pricing
+    resetOffsetPct: 0.001      // The 0.1% price advantage for resets
 };
 
 let market = { 
@@ -70,11 +70,16 @@ async function htxRequest(account, method, path, data = {}) {
     const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
-        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 2000 });
+        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 1500 });
         return res.data;
     } catch (e) { return { status: 'error' }; }
 }
 
+/**
+ * SMART LIMIT CHASE: 
+ * Places a limit order. If it's a reset, it applies a 0.1% price advantage.
+ * If not filled in 2.5s, it cancels and moves the order to the top of the book.
+ */
 async function chaseLimitOrder(account, direction, volume, offset, applyOffset = false) {
     let filled = false;
     let attempts = 0;
@@ -83,7 +88,7 @@ async function chaseLimitOrder(account, direction, volume, offset, applyOffset =
     while (!filled && attempts < 10) {
         let price = (direction === 'buy') ? market.bid : market.ask;
         
-        // Strategy: Open 0.1% away from market on Resets
+        // Apply the 0.1% price move for Resets to make winner more profitable
         if (applyOffset) {
             price = (direction === 'buy') ? price * (1 - config.resetOffsetPct) : price * (1 + config.resetOffsetPct);
         }
@@ -106,6 +111,7 @@ async function chaseLimitOrder(account, direction, volume, offset, applyOffset =
             if (info?.status === 'ok' && info.data[0].status === 6) {
                 filled = true;
             } else {
+                // Not filled, cancel and re-price
                 await htxRequest(account, 'POST', '/linear-swap-api/v1/swap_cross_cancel', { 
                     contract_code: config.symbol, order_id: orderId 
                 });
@@ -161,10 +167,12 @@ async function flashReset(accIdxToReset) {
     const feeCost = (state.volume * market.bid * config.takerFeeRate * 2);
     market.sessionResetLoss += (Math.abs(state.unrealizedUsdt) + feeCost);
     
-    state.lastAction = "⚡ RESET (CHASE)";
+    state.lastAction = "⚡ RESET CHASE";
     logTrade(state.direction, state.roi, state.unrealizedUsdt, 'RESET');
 
+    // Close loser at market price (Limit Chase)
     await chaseLimitOrder(acc, state.direction === 'buy' ? 'sell' : 'buy', state.volume, 'close', false);
+    // Re-open with the 0.1% price offset logic
     await chaseLimitOrder(acc, state.direction, config.baseVolume, 'open', true);
 
     setTimeout(() => { state.isLocked = false; state.lastAction = "Idle"; }, config.resetCooldownMs);
@@ -380,7 +388,7 @@ app.get('/', (req, res) => {
                 document.getElementById('netLabel').innerText = 'Net: $' + d.market.netSessionUsdt.toFixed(5);
 
                 d.accounts.forEach(function(a, i) {
-                    const p = i === 1 ? 'l' : 's';
+                    const p = i === 0 ? 'l' : 's';
                     document.getElementById(p+'Roi').innerText = a.roi.toFixed(2)+'%';
                     document.getElementById(p+'Roi').className = 'text-4xl font-black ' + (a.roi >= 0 ? 'text-emerald-500' : 'text-rose-500');
                     document.getElementById(p+'Pnl').innerText = (a.unrealizedUsdt >= 0 ? '$' : '-$') + Math.abs(a.unrealizedUsdt).toFixed(5);
@@ -407,4 +415,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online (Ratio Hedge Pro)`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Engine Online with Smart Chase and 0.1% Offset`));
