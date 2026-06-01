@@ -21,7 +21,7 @@ while (process.env[`HTX_API_KEY_${accountIndex}`]) {
 }
 
 const config = {
-    symbol: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase(), // Ensure SHIB-USDT format
+    symbol: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase(),
     leverage: parseInt(process.env.LEVERAGE) || 10,
     port: process.env.PORT || 3000,
     restHost: 'api.hbdm.com',
@@ -38,8 +38,7 @@ const config = {
 let market = { 
     status: 'Active', bid: 0, ask: 0, spread: 0,
     totalNetGain: 0, growthPct: 0, dgr: 0,
-    initialTotalEquity: 0, startTime: Date.now(),
-    lastPriceUpdate: 0
+    initialTotalEquity: 0, startTime: Date.now() 
 };
 
 let tradeHistory = []; 
@@ -50,7 +49,8 @@ config.accounts.forEach((account, idx) => {
         direction: idx === 0 ? 'buy' : 'sell',
         roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
         currentEquity: 0, availableMargin: 0, initialEquity: null,
-        isLocked: false, lastAction: 'Idle',
+        isLocked: false, 
+        lastAction: 'Idle',
         step: 0, lastStepPrice: 0, lastAddedVolume: 0, startTime: null
     };
 });
@@ -64,22 +64,22 @@ async function htxRequest(account, method, path, data = {}) {
     const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
     const url = `https://${config.restHost}${path}?${query}&Signature=${encodeURIComponent(signature)}`;
     try {
-        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 2500 });
+        const res = await axios({ method, url, data: method === 'POST' ? data : null, headers: { 'Content-Type': 'application/json' }, timeout: 2000 });
         return res.data;
     } catch (e) { return { status: 'error' }; }
 }
 
 async function syncAccount(acc, state) {
+    // IGNORE SYNC IF LOCKED: Prevents exchange lag from showing "ghost" positions
     if (state.isLocked) return; 
 
-    // Sync Position & ROI
     const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', { contract_code: config.symbol });
     if (posRes?.status === 'ok' && posRes.data) {
         const pos = posRes.data.find(p => p.direction === state.direction);
         if (pos) {
             state.volume = Math.floor(parseFloat(pos.volume));
             state.entryPrice = parseFloat(pos.cost_open || pos.last_price);
-            state.roi = parseFloat(pos.profit_rate) * 100; // Face value ROI from exchange
+            state.roi = parseFloat(pos.profit_rate) * 100; // Directly from exchange
             state.unrealizedUsdt = parseFloat(pos.profit);
             if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
             if (!state.startTime) state.startTime = new Date().toLocaleString();
@@ -88,8 +88,6 @@ async function syncAccount(acc, state) {
             state.step = 0; state.lastStepPrice = 0; state.startTime = null;
         }
     }
-
-    // Sync Balance & AVL
     const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
     if (accRes?.status === 'ok' && accRes.data?.[0]) {
         state.currentEquity = parseFloat(accRes.data[0].margin_balance);
@@ -98,27 +96,9 @@ async function syncAccount(acc, state) {
     }
 }
 
-// REST Fallback for Price (Fixes 0.000% spread)
-async function fetchPriceRest() {
-    try {
-        const res = await axios.get(`https://${config.restHost}/linear-swap-ex/market/detail/merged?contract_code=${config.symbol}`);
-        if (res.data?.tick) {
-            market.bid = res.data.tick.bid[0];
-            market.ask = res.data.tick.ask[0];
-            market.spread = ((market.ask - market.bid) / market.bid) * 100;
-            market.lastPriceUpdate = Date.now();
-        }
-    } catch (e) {}
-}
-
 function logTradeExchangeStyle(state, exitPrice) {
     const now = new Date();
-    const faceValue = 0.001; 
-    const entryNotional = state.volume * state.entryPrice * faceValue;
-    const exitNotional = state.volume * exitPrice * faceValue;
-    const totalFees = (entryNotional * config.takerFeeRate) + (exitNotional * config.takerFeeRate);
-    const netPnl = state.unrealizedUsdt - totalFees;
-
+    // Use the exchange's ROI and PnL values at the moment of closure
     tradeHistory.unshift({
         symbol: config.symbol.replace('-', '') + 'Perpetual',
         type: (state.direction === 'buy' ? 'BuyCross' : 'SellCross'),
@@ -126,9 +106,9 @@ function logTradeExchangeStyle(state, exitPrice) {
         closeTime: now.toLocaleString(),
         volume: state.volume,
         entryPrice: state.entryPrice.toFixed(8),
-        exitPrice: exitPrice.toFixed(8),
+        exitPrice: parseFloat(exitPrice).toFixed(8),
         roi: state.roi.toFixed(4) + '%',
-        netPnlUsdt: netPnl.toFixed(8),
+        netPnlUsdt: state.unrealizedUsdt.toFixed(8),
         status: 'All Closed'
     });
     if (tradeHistory.length > 20) tradeHistory.pop();
@@ -136,13 +116,9 @@ function logTradeExchangeStyle(state, exitPrice) {
 
 // ==================== WS ENGINE ====================
 function startWS() {
+    const wsSymbol = config.symbol.replace('-', '').toLowerCase();
     const ws = new WebSocket(config.wsHost);
-    const subTopic = `market.${config.symbol}.bbo`; // Standard Linear Swap Format
-
-    ws.on('open', () => {
-        ws.send(JSON.stringify({ sub: subTopic, id: 'bbo_sub' }));
-    });
-
+    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${wsSymbol}.bbo`, id: 'bbo' })));
     ws.on('message', (data) => {
         zlib.gunzip(data, (err, dec) => {
             if (err) return;
@@ -151,7 +127,6 @@ function startWS() {
                 market.bid = msg.tick.bid[0]; 
                 market.ask = msg.tick.ask[0]; 
                 market.spread = ((market.ask - market.bid) / market.bid) * 100;
-                market.lastPriceUpdate = Date.now();
             }
             if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
         });
@@ -166,33 +141,51 @@ async function processMartingale() {
         if (state.isLocked || market.bid === 0) continue;
         const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
 
+        // 1. Initial Entry
         if (state.volume === 0) {
             state.isLocked = true;
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, offset: 'open', lever_rate: config.leverage, order_price_type: 'opponent'
             });
+            // Unlock only after API confirms success
+            if (res.status === 'ok') {
+                state.lastAction = "Entry Open";
+            }
             state.isLocked = false;
             continue;
         }
 
-        // Take Profit (Locked against duplicates)
-        if (state.roi >= config.takeProfitPct && state.volume > 0) {
-            const v = state.volume;
-            state.isLocked = true; 
-            logTradeExchangeStyle(state, currentPrice);
-            
-            // Immediate Wipe
-            state.volume = 0; 
-            state.roi = 0;
+        // 2. TAKE PROFIT (WITH CONFIRMATION IGNORE)
+        if (state.roi >= config.takeProfitPct) {
+            state.isLocked = true; // LOCK IMMEDIATELY
+            state.lastAction = "⚡ CLOSING...";
 
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
-                contract_code: config.symbol, volume: v, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'lightning' 
+            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { 
+                contract_code: config.symbol, 
+                volume: state.volume, 
+                direction: state.direction === 'buy' ? 'sell' : 'buy', 
+                offset: 'close', 
+                lever_rate: config.leverage, 
+                order_price_type: 'optimal_20' 
             });
-            setTimeout(() => { state.isLocked = false; }, 8000);
+
+            if (res.status === 'ok') {
+                logTradeExchangeStyle(state, currentPrice);
+                // WIPE LOCAL MEMORY: Sync loop will ignore exchange data for 10s
+                state.volume = 0;
+                state.roi = 0;
+                state.entryPrice = 0;
+                setTimeout(() => { 
+                    state.isLocked = false; 
+                    state.lastAction = "Idle"; 
+                }, 10000); 
+            } else {
+                state.isLocked = false; // Order failed, unlock to retry
+            }
             continue;
         }
 
-        // Step Logic
+        // 3. Step Logic (Confirmation Required)
         let priceMove = state.direction === 'buy' ? 
             ((state.lastStepPrice - currentPrice) / state.lastStepPrice) * 100 : 
             ((currentPrice - state.lastStepPrice) / state.lastStepPrice) * 100;
@@ -214,18 +207,12 @@ async function processMartingale() {
 }
 
 async function backgroundLoop() {
-    // If WS is silent, force REST price fetch
-    if (Date.now() - market.lastPriceUpdate > 2000) await fetchPriceRest();
-
     await Promise.all(config.accounts.map(acc => syncAccount(acc, accountStates[acc.accountId])));
-    
     const s1 = accountStates[1]; const s2 = accountStates[2];
     market.totalNetGain = (s1.currentEquity + s2.currentEquity) - market.initialTotalEquity;
     market.growthPct = market.initialTotalEquity > 0 ? (market.totalNetGain / market.initialTotalEquity) * 100 : 0;
-    
     const elapsedDays = (Date.now() - market.startTime) / (1000 * 60 * 60 * 24);
     market.dgr = elapsedDays > 0 ? (market.growthPct / elapsedDays) : 0;
-
     if (market.status === 'Active') await processMartingale();
 }
 
@@ -234,7 +221,7 @@ app.post('/api/close', async (req, res) => {
     market.status = "LIQUIDATING"; 
     for (const acc of config.accounts) { 
         const s = accountStates[acc.accountId];
-        if (s.volume > 0) await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: s.volume, direction: s.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'lightning' });
+        if (s.volume > 0) await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', { contract_code: config.symbol, volume: s.volume, direction: s.direction === 'buy' ? 'sell' : 'buy', offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20' });
     }
     setTimeout(() => market.status = "Active", 5000);
     res.json({status:'ok'});
@@ -293,6 +280,7 @@ app.get('/', (req, res) => {
                         <p id="lStep" class="text-[10px] font-black text-emerald-400 uppercase">STEP: 0</p>
                     </div>
                     <p id="lMargin" class="text-[9px] text-slate-400 mt-2">AVL: $0.0000</p>
+                    <p id="lAction" class="text-[9px] text-indigo-400 italic mt-1"></p>
                 </div>
                 <div class="text-right">
                     <p class="stat-label text-rose-500">Short Account</p>
@@ -302,6 +290,7 @@ app.get('/', (req, res) => {
                         <p id="sStep" class="text-[10px] font-black text-rose-400 uppercase">STEP: 0</p>
                     </div>
                     <p id="sMargin" class="text-[9px] text-slate-400 mt-2">AVL: $0.0000</p>
+                    <p id="sAction" class="text-[9px] text-indigo-400 italic mt-1"></p>
                 </div>
             </div>
         </div>
@@ -328,7 +317,6 @@ app.get('/', (req, res) => {
                 document.getElementById('growthPct').innerText = 'Total Profit: ' + d.market.growthPct.toFixed(2) + '%';
                 document.getElementById('dgrPct').innerText = 'DGR: ' + d.market.dgr.toFixed(2) + '% / DAY';
                 document.getElementById('uiSpread').innerText = d.market.spread.toFixed(3) + '%';
-                document.getElementById('marketStatus').innerText = d.market.status;
 
                 d.accounts.forEach(function(a, i) {
                     const p = i === 0 ? 'l' : 's';
@@ -337,6 +325,7 @@ app.get('/', (req, res) => {
                     document.getElementById(p+'Pnl').innerText = '$' + a.unrealizedUsdt.toFixed(8);
                     document.getElementById(p+'Step').innerText = 'STEP: ' + a.step;
                     document.getElementById(p+'Margin').innerText = 'AVL: $' + a.availableMargin.toFixed(4);
+                    document.getElementById(p+'Action').innerText = a.lastAction;
                 });
 
                 let html = '';
