@@ -29,9 +29,7 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
     takeProfitPct: 2.0,
-    pollInterval: 2000,
-    takerFeeRate: 0.0005,
-    contractValue: 1000 // 1 Contract = 1000 SHIB
+    pollInterval: 2000
 };
 
 let market = {
@@ -80,14 +78,12 @@ async function syncAccount(acc) {
             state.volume = Math.floor(parseFloat(pos.volume));
             state.entryPrice = parseFloat(pos.cost_open);
             
-            const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
-            if (currentPrice > 0) {
-                const sideMult = state.direction === 'buy' ? 1 : -1;
-                state.roi = ((currentPrice - state.entryPrice) / state.entryPrice) * config.leverage * sideMult * 100;
-                const grossPnL = (currentPrice - state.entryPrice) * state.volume * config.contractValue * sideMult;
-                const feeEstimate = (state.entryPrice + currentPrice) * state.volume * config.contractValue * config.takerFeeRate;
-                state.unrealizedUsdt = grossPnL - feeEstimate;
-            }
+            // DIRECT FROM EXCHANGE:
+            // profit_rate is ROI (decimal, so * 100)
+            // profit is Unrealized PnL in USDT
+            state.roi = parseFloat(pos.profit_rate || 0) * 100;
+            state.unrealizedUsdt = parseFloat(pos.profit || 0);
+            
         } else { 
             state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.entryPrice = 0;
         }
@@ -107,13 +103,13 @@ async function openPositionUnique(accId) {
     const acc = config.accounts.find(a => a.id === accId);
     const targetPrice = state.direction === 'buy' ? market.ask : market.bid;
 
-    // UNIQUE PRICE CHECK
+    // Check if price is unique
     const existingPrices = Object.values(accountStates)
         .filter(s => s.volume > 0)
         .map(s => s.entryPrice);
 
     if (existingPrices.includes(targetPrice)) {
-        state.lastAction = `WAIT FOR TICK (${targetPrice.toFixed(8)})`;
+        state.lastAction = "WAIT FOR PRICE CHANGE";
         return; 
     }
 
@@ -125,8 +121,6 @@ async function openPositionUnique(accId) {
         contract_code: config.symbol, volume: config.baseVolume, direction: state.direction, 
         offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_5'
     });
-
-    if (res.status === 'ok') console.log(`[UNIQUE] Acc ${accId} entry at ${targetPrice}`);
 
     state.isLocked = false;
     state.lastAction = "Idle";
@@ -229,7 +223,7 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>Hedge Engine UNIQUE</title>
+    <meta charset="UTF-8"><title>Hedge Engine DIRECT</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>body { background: #020617; color: #f8fafc; font-family: monospace; }</style>
 </head>
@@ -237,7 +231,7 @@ app.get('/', (req, res) => {
     <div class="max-w-7xl mx-auto">
         <div class="flex justify-between items-end mb-6">
             <div>
-                <h1 class="text-xl font-bold text-indigo-400">UNIQUE-PRICE ENGINE</h1>
+                <h1 class="text-xl font-bold text-indigo-400 uppercase tracking-widest">Hedge Direct Data</h1>
                 <p id="statusBadge" class="text-[10px] mt-1 font-bold bg-emerald-500/10 text-emerald-500 px-2 py-0.5 rounded border border-emerald-500/20 uppercase tracking-widest">SYSTEM ACTIVE</p>
             </div>
             <div class="flex gap-4 items-center">
@@ -249,12 +243,11 @@ app.get('/', (req, res) => {
             </div>
         </div>
         <div class="grid grid-cols-2 gap-4 mb-6 text-center">
-            <div class="bg-slate-900 p-4 border border-slate-800"><p class="text-[9px] text-slate-500 uppercase font-bold">Session Realized Profit</p><p id="realizedProfit" class="text-xl font-bold text-emerald-400">0.00000000</p></div>
-            <div class="bg-slate-900 p-4 border border-slate-800"><p class="text-[9px] text-slate-500 uppercase font-bold">Live Session Net PnL</p><p id="netSession" class="text-xl font-bold text-white">0.00000000</p></div>
+            <div class="bg-slate-900 p-4 border border-slate-800"><p class="text-[9px] text-slate-500 uppercase font-bold">Realized Profit</p><p id="realizedProfit" class="text-xl font-bold text-emerald-400">0.00000000</p></div>
+            <div class="bg-slate-900 p-4 border border-slate-800"><p class="text-[9px] text-slate-500 uppercase font-bold">Net Session PnL</p><p id="netSession" class="text-xl font-bold text-white">0.00000000</p></div>
         </div>
         <div id="accountGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 mb-6"></div>
         <div class="bg-slate-900 rounded border border-slate-800 p-4">
-            <p class="text-[10px] font-bold mb-3 text-slate-500 uppercase">Recent Exchange Activity</p>
             <table class="w-full text-left text-[11px]">
                 <thead><tr class="text-slate-600 border-b border-slate-800"><th class="pb-2">Time</th><th class="pb-2">Type</th><th class="pb-2">Target</th><th class="pb-2">ROI</th><th class="pb-2 text-right">PnL (USDT)</th></tr></thead>
                 <tbody id="historyBody"></tbody>
@@ -277,7 +270,7 @@ app.get('/', (req, res) => {
             let hHtml = '';
             d.tradeHistory.forEach(h => {
                 const isNeg = h.pnl.startsWith('-');
-                hHtml += '<tr class="border-b border-slate-900/50"><td class="py-1 text-slate-600">'+h.time+'</td><td class="font-bold text-indigo-400">'+h.type+'</td><td class="text-slate-400 font-bold">'+h.side+'</td><td class="font-bold text-slate-200">'+h.roi+'</td><td class="text-right font-bold '+(isNeg ? "text-rose-500" : "text-emerald-500")+'">'+h.pnl+'</td></tr>';
+                hHtml += '<tr class="border-b border-slate-800/50"><td class="py-1 text-slate-600">'+h.time+'</td><td class="font-bold text-indigo-400">'+h.type+'</td><td class="text-slate-400 font-bold">'+h.side+'</td><td class="font-bold text-slate-200">'+h.roi+'</td><td class="text-right font-bold '+(isNeg ? "text-rose-500" : "text-emerald-500")+'">'+h.pnl+'</td></tr>';
             });
             document.getElementById('historyBody').innerHTML = hHtml;
         }, 1000);
@@ -287,4 +280,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`Unique Price Engine Online (Liquidate All Button Restored).`));
+app.listen(config.port, '0.0.0.0', () => console.log(`Direct-Data Engine Online.`));
