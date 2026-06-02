@@ -53,11 +53,20 @@ const publicBinance = new ccxt.pro.binance({ options: { defaultType: 'swap' } })
 function hashPassword(password, salt) { return crypto.scryptSync(password, salt, 64).toString('hex'); }
 function generateToken() { return crypto.randomBytes(32).toString('hex'); }
 
+const workers = new Map(); // Moved up so middleware can see it
+
 async function authMiddleware(req, res, next) {
     const token = req.headers['authorization'];
     const user = await UserModel.findOne({ token });
     if (!user) return res.status(401).json({ error: 'Unauthorized' });
     req.user = user;
+    
+    // FIX: Auto-restore worker if server restarted
+    if (!workers.has(user._id.toString())) {
+        const w = new UserTradeInstance(user);
+        w.startSync();
+        workers.set(user._id.toString(), w);
+    }
     next();
 }
 
@@ -69,7 +78,7 @@ class UserTradeInstance {
         this.activePositions = user.activePositions || [];
         this.isTrading = false;
         this.balances = { long: 0, short: 0 };
-        this.status = { long: 'Checking...', short: 'Checking...' }; // Added status
+        this.status = { long: 'Checking...', short: 'Checking...' };
         this.livePositions = { long: { roi: 0, contracts: 0 }, short: { roi: 0, contracts: 0 } };
         this.applyUserKeys(user);
     }
@@ -146,30 +155,24 @@ class UserTradeInstance {
                         this.htxLong.fetchBalance({type:'swap'}).catch(e => { this.status.long = "Auth Error"; return null; }),
                         this.htxShort.fetchBalance({type:'swap'}).catch(e => { this.status.short = "Auth Error"; return null; })
                     ]);
-                    
                     if(b1) { this.balances.long = b1.total.USDT || 0; this.status.long = "Connected"; }
                     if(b2) { this.balances.short = b2.total.USDT || 0; this.status.short = "Connected"; }
-                    
                     const [p1, p2] = await Promise.all([
                         this.htxLong.fetchPositions([this.config.htxSymbol]).catch(() => []),
                         this.htxShort.fetchPositions([this.config.htxSymbol]).catch(() => [])
                     ]);
-
                     const lp = p1.find(x => x.contracts > 0);
                     const sp = p2.find(x => x.contracts > 0);
                     this.livePositions.long = lp ? { roi: lp.percentage, contracts: lp.contracts } : { roi: 0, contracts: 0 };
                     this.livePositions.short = sp ? { roi: sp.percentage, contracts: sp.contracts } : { roi: 0, contracts: 0 };
-                    if (!lp && !sp) this.activePositions = [];
-                } catch(e){ console.log("Sync loop error"); }
-            } else {
-                this.status = { long: "Live Mode Off", short: "Live Mode Off" };
-            }
+                    if (!lp && !sp && this.activePositions.length > 0) this.activePositions = [];
+                } catch(e){}
+            } else { this.status = { long: "Live Mode Off", short: "Live Mode Off" }; }
         }, 2000);
     }
 }
 
 // ==================== MASTER LOOP ====================
-const workers = new Map();
 async function masterLoop() {
     (async function stream() {
         while(true) {
@@ -234,7 +237,6 @@ app.get('/', (req, res) => { res.send(`
         .card { background: white; border: 1px solid #eee; border-radius: 12px; padding: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.02); }
         .input { border: 1px solid #ddd; padding: 8px; border-radius: 6px; width: 100%; font-size: 13px; }
         .label { font-size: 11px; font-weight: 700; color: #888; text-transform: uppercase; margin-bottom: 4px; display: block; }
-        .status-dot { height: 8px; width: 8px; border-radius: 50%; display: inline-block; margin-right: 4px; }
     </style>
 </head>
 <body class="p-8">
@@ -244,7 +246,6 @@ app.get('/', (req, res) => { res.send(`
         <input id="pass" type="password" placeholder="Password" class="input mb-4">
         <button onclick="login()" class="w-full bg-black text-white p-3 rounded-lg font-bold">Enter Terminal</button>
     </div>
-
     <div id="dash" class="hidden max-w-6xl mx-auto">
         <div class="flex justify-between items-center mb-8">
             <h1 class="text-2xl font-bold">Hedge Terminal</h1>
@@ -254,127 +255,69 @@ app.get('/', (req, res) => { res.send(`
                 <button onclick="logout()" class="text-gray-400 text-sm">Logout</button>
             </div>
         </div>
-
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
             <div class="card">
-                <div class="flex justify-between items-start mb-2">
-                    <p class="label">Long Account (Primary)</p>
-                    <span id="l-stat" class="text-[10px] font-bold uppercase py-1 px-2 rounded bg-gray-100">Checking...</span>
-                </div>
+                <div class="flex justify-between items-start mb-2"><p class="label">Long Account</p><span id="l-stat" class="text-[10px] font-bold uppercase py-1 px-2 rounded bg-gray-100">Checking...</span></div>
                 <div class="flex justify-between items-end">
-                    <div>
-                        <p id="l-bal" class="text-2xl font-bold">$0.00</p>
-                        <p id="l-roi" class="text-lg font-semibold text-green-500">0.00%</p>
-                    </div>
-                    <div class="text-right">
-                        <p class="label">Volume Contracts</p>
-                        <p id="l-vol" class="font-mono font-bold">0</p>
-                    </div>
+                    <div><p id="l-bal" class="text-2xl font-bold">$0.00</p><p id="l-roi" class="text-lg font-semibold text-green-500">0.00%</p></div>
+                    <div class="text-right"><p class="label">Volume</p><p id="l-vol" class="font-mono font-bold">0</p></div>
                 </div>
             </div>
             <div class="card">
-                <div class="flex justify-between items-start mb-2">
-                    <p class="label">Short Account (Secondary)</p>
-                    <span id="s-stat" class="text-[10px] font-bold uppercase py-1 px-2 rounded bg-gray-100">Checking...</span>
-                </div>
+                <div class="flex justify-between items-start mb-2"><p class="label">Short Account</p><span id="s-stat" class="text-[10px] font-bold uppercase py-1 px-2 rounded bg-gray-100">Checking...</span></div>
                 <div class="flex justify-between items-end">
-                    <div>
-                        <p id="s-bal" class="text-2xl font-bold">$0.00</p>
-                        <p id="s-roi" class="text-lg font-semibold text-red-500">0.00%</p>
-                    </div>
-                    <div class="text-right">
-                        <p class="label">Volume Contracts</p>
-                        <p id="s-vol" class="font-mono font-bold">0</p>
-                    </div>
+                    <div><p id="s-bal" class="text-2xl font-bold">$0.00</p><p id="s-roi" class="text-lg font-semibold text-red-500">0.00%</p></div>
+                    <div class="text-right"><p class="label">Volume</p><p id="s-vol" class="font-mono font-bold">0</p></div>
                 </div>
             </div>
         </div>
-
         <div class="grid grid-cols-3 gap-6">
             <div class="card col-span-2">
                 <h3 class="font-bold mb-4 border-b pb-2">DCA Strategy Settings</h3>
                 <div class="grid grid-cols-2 gap-4">
-                    <div>
-                        <label class="label">Take Profit %</label>
-                        <input id="cfg-tp" class="input">
-                    </div>
-                    <div>
-                        <label class="label">Stop Loss %</label>
-                        <input id="cfg-sl" class="input">
-                    </div>
-                    <div>
-                        <label class="label">DCA Trigger (ROI %)</label>
-                        <input id="cfg-dca-t" class="input" placeholder="e.g. -10">
-                    </div>
-                    <div>
-                        <label class="label">DCA Multiplier</label>
-                        <input id="cfg-dca-m" class="input" placeholder="e.g. 2.0">
-                    </div>
+                    <div><label class="label">Take Profit %</label><input id="cfg-tp" class="input"></div>
+                    <div><label class="label">Stop Loss %</label><input id="cfg-sl" class="input"></div>
+                    <div><label class="label">DCA Trigger (ROI %)</label><input id="cfg-dca-t" class="input"></div>
+                    <div><label class="label">DCA Multiplier</label><input id="cfg-dca-m" class="input"></div>
                 </div>
                 <button onclick="saveConfig()" class="mt-4 w-full bg-gray-100 p-2 rounded font-bold text-sm hover:bg-gray-200">Update DCA Parameters</button>
             </div>
-            
-            <div class="card">
-                <h3 class="font-bold mb-4 border-b pb-2">Recent Logs</h3>
-                <div id="logs" class="text-xs space-y-2 font-mono"></div>
-            </div>
+            <div class="card"><h3 class="font-bold mb-4 border-b pb-2">Recent Logs</h3><div id="logs" class="text-xs space-y-2 font-mono"></div></div>
         </div>
     </div>
-
     <script>
         let token = localStorage.getItem('token');
         async function login() {
             const res = await fetch('/api/auth/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email:document.getElementById('email').value, password:document.getElementById('pass').value}) });
-            const d = await res.json();
-            if(d.token) { localStorage.setItem('token', d.token); location.reload(); }
+            const d = await res.json(); if(d.token) { localStorage.setItem('token', d.token); location.reload(); }
         }
         function logout() { localStorage.removeItem('token'); location.reload(); }
-
         async function openHedge() { await fetch('/api/open-hedge', { headers:{'Authorization':token} }); }
         async function closeAll() { await fetch('/api/close-all', { headers:{'Authorization':token} }); }
-        
         async function saveConfig() {
-            const body = { 
-                takeProfitPct: parseFloat(document.getElementById('cfg-tp').value),
-                stopLossPct: parseFloat(document.getElementById('cfg-sl').value),
-                dcaRoiThresholdPct: parseFloat(document.getElementById('cfg-dca-t').value),
-                dcaMultiplier: parseFloat(document.getElementById('cfg-dca-m').value)
-            };
+            const body = { takeProfitPct: parseFloat(document.getElementById('cfg-tp').value), stopLossPct: parseFloat(document.getElementById('cfg-sl').value), dcaRoiThresholdPct: parseFloat(document.getElementById('cfg-dca-t').value), dcaMultiplier: parseFloat(document.getElementById('cfg-dca-m').value) };
             await fetch('/api/user/config', { method:'POST', headers:{'Content-Type':'application/json','Authorization':token}, body:JSON.stringify(body) });
             alert('Config Saved');
         }
-
         if(token) {
-            document.getElementById('auth').classList.add('hidden');
-            document.getElementById('dash').classList.remove('hidden');
+            document.getElementById('auth').classList.add('hidden'); document.getElementById('dash').classList.remove('hidden');
             setInterval(async () => {
-                const res = await fetch('/api/data', { headers:{'Authorization':token} });
-                const d = await res.json();
-                
+                const res = await fetch('/api/data', { headers:{'Authorization':token} }); const d = await res.json();
                 document.getElementById('l-bal').innerText = '$' + d.balances.long.toFixed(2);
                 document.getElementById('s-bal').innerText = '$' + d.balances.short.toFixed(2);
                 document.getElementById('l-roi').innerText = d.live.long.roi.toFixed(2) + '%';
                 document.getElementById('s-roi').innerText = d.live.short.roi.toFixed(2) + '%';
                 document.getElementById('l-vol').innerText = d.live.long.contracts;
                 document.getElementById('s-vol').innerText = d.live.short.contracts;
-
-                // Update Status UI
-                const ls = document.getElementById('l-stat');
-                const ss = document.getElementById('s-stat');
-                ls.innerText = d.status.long;
-                ss.innerText = d.status.short;
-                ls.className = d.status.long === "Connected" ? "text-[10px] font-bold uppercase py-1 px-2 rounded bg-green-100 text-green-700" : "text-[10px] font-bold uppercase py-1 px-2 rounded bg-red-100 text-red-700";
-                ss.className = d.status.short === "Connected" ? "text-[10px] font-bold uppercase py-1 px-2 rounded bg-green-100 text-green-700" : "text-[10px] font-bold uppercase py-1 px-2 rounded bg-red-100 text-red-700";
-
+                document.getElementById('l-stat').innerText = d.status.long;
+                document.getElementById('s-stat').innerText = d.status.short;
                 if(!document.getElementById('cfg-tp').value) {
                     document.getElementById('cfg-tp').value = d.config.takeProfitPct;
                     document.getElementById('cfg-sl').value = d.config.stopLossPct;
                     document.getElementById('cfg-dca-t').value = d.config.dcaRoiThresholdPct;
                     document.getElementById('cfg-dca-m').value = d.config.dcaMultiplier;
                 }
-
-                const logDiv = document.getElementById('logs');
-                logDiv.innerHTML = d.trades.map(t => \`<div class="border-b pb-1">\${t.side.toUpperCase()} | \${t.exitReason} | \${t.contracts} contracts</div>\`).join('');
+                document.getElementById('logs').innerHTML = d.trades.map(t => \`<div class="border-b pb-1">\${t.side.toUpperCase()} | \${t.exitReason} | \${t.contracts} contracts</div>\`).join('');
             }, 2000);
         }
     </script>
