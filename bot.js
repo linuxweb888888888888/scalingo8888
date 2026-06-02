@@ -351,7 +351,7 @@ class UserTradeInstance {
             userDoc.apiSecret = this.apiSecret;
         } else {
             if (!userDoc.secondAccount) {
-                userDoc.secondAccount = { apiKey: "", apiSecret: "", liveTradingEnabled: false, config: {}, activePosition: null, lastCloseTime: 0 };
+                userDoc.secondAccount = {};
             }
             userDoc.secondAccount.activePosition = this.activePositions.length > 0 ? this.activePositions[0] : null;
             userDoc.secondAccount.lastCloseTime = this.lastCloseTime;
@@ -359,13 +359,23 @@ class UserTradeInstance {
             userDoc.secondAccount.liveTradingEnabled = this.liveTradingEnabled;
             userDoc.secondAccount.apiKey = this.apiKey;
             userDoc.secondAccount.apiSecret = this.apiSecret;
-            userDoc.markModified('secondAccount'); // CRITICAL FIX: Ensure Mongoose detects nested object change
         }
         await userDoc.save();
         
-        const cacheEntry = tokenCache.get(userDoc.token);
+        const cacheEntry = tokenCache.get(this.userId);
         if (cacheEntry) {
-            cacheEntry.user = userDoc;
+            if (this.accountType === "main") {
+                cacheEntry.user.activePosition = this.activePositions.length > 0 ? this.activePositions[0] : null;
+                cacheEntry.user.liveTradingEnabled = this.liveTradingEnabled;
+                cacheEntry.user.apiKey = this.apiKey;
+            } else {
+                if (!cacheEntry.user.secondAccount) {
+                    cacheEntry.user.secondAccount = {};
+                }
+                cacheEntry.user.secondAccount.activePosition = this.activePositions.length > 0 ? this.activePositions[0] : null;
+                cacheEntry.user.secondAccount.liveTradingEnabled = this.liveTradingEnabled;
+                cacheEntry.user.secondAccount.apiKey = this.apiKey;
+            }
             cacheEntry.lastAccessed = Date.now();
         }
     }
@@ -454,12 +464,14 @@ class UserTradeInstance {
     }
 
     async evaluateManualEntry() {
+        // Only check if this specific account is trading
         if (this.isTrading) return;
 
         try {
             let signal = this.config.manualDirection === 'long' ? 'long' : (this.config.manualDirection === 'short' ? 'short' : null);
             
             if (this.activePositions.length > 0) {
+                // Position exists - check if we need to flip (only if direction changed)
                 const pos = this.activePositions[0];
                 if (signal && pos.side !== signal) {
                     console.log(`[${this.accountType}] Flipping from ${pos.side} to ${signal}`);
@@ -467,6 +479,7 @@ class UserTradeInstance {
                     setTimeout(() => this.syncState(signal), 500);
                 }
             } else {
+                // No position - open new position immediately if signal exists
                 if (signal) {
                     console.log(`[${this.accountType}] Opening new ${signal.toUpperCase()} position`);
                     await this.syncState(signal);
@@ -582,6 +595,7 @@ class UserTradeInstance {
     }
 
     async syncState(targetSide) {
+        // Only check if this specific account is trading
         if (this.isTrading) return;
         
         this.isTrading = true;
@@ -607,6 +621,7 @@ class UserTradeInstance {
                             executionPrice = this.config.htxSymbol.includes('SHIB') && !this.config.htxSymbol.includes('1000') ? oOrder.average * 1000 : oOrder.average;
                         }
                     } catch(e){}
+                    console.log(`[${this.accountType}] LIVE order executed at $${executionPrice}`);
                 } catch(err) {
                     console.error(`[${this.accountType}] LIVE order failed:`, err.message);
                     this.isTrading = false;
@@ -635,7 +650,9 @@ class UserTradeInstance {
             
             this.metrics.updateMaxMargin(marginUsed); 
             const user = await UserModel.findById(this.userId);
-            if (user) await this.saveState(user);
+            if (user) {
+                await this.saveState(user);
+            }
             console.log(`[${this.accountType}] SUCCESS: Opened ${targetSide.toUpperCase()} position at $${executionPrice}`);
             
         } catch (err) { 
@@ -688,6 +705,7 @@ class UserTradeInstance {
     startExchangeROISync() {
         setInterval(async () => {
             try {
+                // For LIVE trading with valid API keys - fetch real data from exchange
                 if (this.liveTradingEnabled && this.apiKey && this.apiKey !== "demo" && this.apiSecret && this.apiSecret !== "demo") {
                     try {
                         const bal = await this.htx.fetchBalance({ type: 'swap' });
@@ -696,10 +714,13 @@ class UserTradeInstance {
                             if (this.initialWalletBalance === 0 && this.walletBalance > 0) {
                                 this.initialWalletBalance = this.walletBalance;
                                 this.metrics.initialWalletBalance = this.initialWalletBalance;
+                                console.log(`[${this.accountType}] Initial wallet: $${this.initialWalletBalance}`);
                             }
                             this.metrics.currentWalletBalance = this.walletBalance;
                         }
-                    } catch(e) {}
+                    } catch(e) {
+                        console.log(`[${this.accountType}] Balance fetch error:`, e.message);
+                    }
                     
                     try {
                         const positions = await this.htx.fetchPositions([this.config.htxSymbol]);
@@ -707,30 +728,62 @@ class UserTradeInstance {
                         
                         if (openPos) {
                             let entryP = openPos.entryPrice;
-                            if (this.config.htxSymbol.includes('SHIB') && !this.config.htxSymbol.includes('1000')) entryP = entryP * 1000;
+                            if (this.config.htxSymbol.includes('SHIB') && !this.config.htxSymbol.includes('1000')) {
+                                entryP = entryP * 1000;
+                            }
+                            
                             const currentROI = openPos.percentage || 0;
                             const currentPnL = openPos.unrealizedPnl || 0;
                             
+                            // Update or create active position
                             if (this.activePositions.length === 0) {
                                 const sizeUsd = openPos.contracts * this.config.contractSize * entryP;
                                 const marginUsed = sizeUsd / FORCED_LEVERAGE;
-                                this.activePositions = [{ id: Date.now(), side: openPos.side, entryPrice: entryP, contracts: openPos.contracts, size: sizeUsd, marginUsed: marginUsed, exchangeROI: currentROI, exchangePnl: currentPnL, entryTime: Date.now(), isPaper: false, lastDcaTime: 0, dcaStep: 0, stepHistory: [] }];
+                                this.activePositions = [{
+                                    id: Date.now(),
+                                    side: openPos.side,
+                                    entryPrice: entryP,
+                                    contracts: openPos.contracts,
+                                    size: sizeUsd,
+                                    marginUsed: marginUsed,
+                                    exchangeROI: currentROI,
+                                    exchangePnl: currentPnL,
+                                    entryTime: Date.now(),
+                                    isPaper: false,
+                                    lastDcaTime: 0,
+                                    dcaStep: 0,
+                                    stepHistory: []
+                                }];
+                                console.log(`[${this.accountType}] Detected existing position: ${openPos.side} ${openPos.contracts} contracts @ ${currentROI.toFixed(2)}%`);
                             } else {
                                 this.activePositions[0].exchangeROI = currentROI;
                                 this.activePositions[0].exchangePnl = currentPnL;
                                 this.activePositions[0].contracts = openPos.contracts;
                             }
                             
+                            // Save state to database
                             const user = await UserModel.findById(this.userId);
-                            if (user) await this.saveState(user);
-                        } else if (this.activePositions.length > 0) {
-                            this.activePositions = [];
-                            const user = await UserModel.findById(this.userId);
-                            if (user) await this.saveState(user);
+                            if (user) {
+                                await this.saveState(user);
+                            }
+                            return;
+                        } else {
+                            // No position on exchange - clear local position if exists
+                            if (this.activePositions.length > 0) {
+                                console.log(`[${this.accountType}] No position on exchange, clearing local position`);
+                                this.activePositions = [];
+                                const user = await UserModel.findById(this.userId);
+                                if (user) {
+                                    await this.saveState(user);
+                                }
+                            }
                         }
-                    } catch(e) {}
+                    } catch(e) {
+                        console.log(`[${this.accountType}] Position fetch error:`, e.message);
+                    }
                 } 
                 
+                // For PAPER trading or when API keys are not set
                 if (this.activePositions.length > 0 && !this.isTrading) {
                     const pos = this.activePositions[0];
                     let currentPrice = pos.side === 'long' ? globalMarketData.binance.bid : globalMarketData.binance.ask;
@@ -739,29 +792,45 @@ class UserTradeInstance {
                     if (currentPrice && pos.entryPrice > 0) {
                         const sideMult = pos.side === 'long' ? 1 : -1;
                         const pnlPercent = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100 * sideMult;
-                        pos.exchangeROI = pnlPercent * FORCED_LEVERAGE;
-                        pos.exchangePnl = (pos.exchangeROI / 100) * pos.marginUsed;
+                        const exchangeROI = pnlPercent * FORCED_LEVERAGE;
+                        const exchangePnl = (exchangeROI / 100) * pos.marginUsed;
+                        
+                        pos.exchangeROI = exchangeROI;
+                        pos.exchangePnl = exchangePnl;
                     }
                 }
                 
+                // Update wallet balance for paper trading
                 if (!this.liveTradingEnabled || !this.apiKey || this.apiKey === "demo") {
-                    this.initialWalletBalance = this.initialWalletBalance || 1000;
-                    this.walletBalance = this.initialWalletBalance + (this.metrics?.totalNetPnl || 0);
+                    if (this.initialWalletBalance === 0) {
+                        this.initialWalletBalance = 1000;
+                        this.walletBalance = 1000 + (this.metrics?.totalNetPnl || 0);
+                        this.metrics.initialWalletBalance = this.initialWalletBalance;
+                        console.log(`[${this.accountType}] Paper trading - initial wallet: $${this.initialWalletBalance}`);
+                    } else {
+                        this.walletBalance = this.initialWalletBalance + (this.metrics?.totalNetPnl || 0);
+                    }
                     this.metrics.currentWalletBalance = this.walletBalance;
-                    this.metrics.initialWalletBalance = this.initialWalletBalance;
                 }
                 
-            } catch (err) {}
+            } catch (err) {
+                console.error(`[${this.accountType}] Sync error:`, err.message);
+            }
         }, 2000);
     }
 
     getExportData() { 
         return { 
-            config: this.config, liveTradingEnabled: this.liveTradingEnabled, 
+            config: this.config, 
+            liveTradingEnabled: this.liveTradingEnabled, 
             uptime: Math.floor((Date.now() - this.startTime) / 1000),
-            metrics: this.metrics, activePositions: this.activePositions, 
-            binance: globalMarketData.binance, walletBalance: this.walletBalance,
-            initialWalletBalance: this.initialWalletBalance, growthPct: this.metrics.getGrowthPct(), accountType: this.accountType
+            metrics: this.metrics, 
+            activePositions: this.activePositions, 
+            binance: globalMarketData.binance,
+            walletBalance: this.walletBalance,
+            initialWalletBalance: this.initialWalletBalance,
+            growthPct: this.metrics.getGrowthPct(),
+            accountType: this.accountType
         }; 
     }
 }
@@ -784,17 +853,34 @@ async function startMasterStreams() {
     (async function streamBinance() {
         let lastHistorySave = 0, lastSavedMid = null;
         
+        try {
+            const seedData = await publicBinance.fetchOHLCV(BASE_CONFIG.binanceSymbol, '1m', undefined, 100);
+            if (seedData && seedData.length > 0) {
+                seedData.forEach(c => {
+                    const seedMid = c[4];
+                    if (globalMarketData.tickBuffer.length === 0 || globalMarketData.tickBuffer[globalMarketData.tickBuffer.length - 1] !== seedMid) {
+                        globalMarketData.tickBuffer.push(seedMid);
+                    }
+                });
+            }
+        } catch (e) { console.log("Seeding failed, starting empty."); }
+
         while (true) {
             try {
                 let mid = 0;
                 try {
-                    const ticker = await publicBinance.watchTicker(BASE_CONFIG.binanceSymbol);
+                    const ticker = await Promise.race([
+                        publicBinance.watchTicker(BASE_CONFIG.binanceSymbol),
+                        new Promise((_, r) => setTimeout(() => r(new Error('WS_TIMEOUT')), 3000))
+                    ]);
                     let bid = ticker.bid !== undefined ? ticker.bid : ticker.last;
                     let ask = ticker.ask !== undefined ? ticker.ask : ticker.last;
                     mid = (bid + ask) / 2;
                 } catch(wsErr) {
                     const ticker = await publicBinance.fetchTicker(BASE_CONFIG.binanceSymbol); 
-                    mid = (ticker.bid + ticker.ask) / 2;
+                    let bid = ticker.bid !== undefined ? ticker.bid : ticker.last;
+                    let ask = ticker.ask !== undefined ? ticker.ask : ticker.last;
+                    mid = (bid + ask) / 2;
                     await new Promise(r => setTimeout(r, 1000)); 
                 }
 
@@ -802,6 +888,12 @@ async function startMasterStreams() {
 
                 globalMarketData.binance = { bid: mid, ask: mid, mid: mid, timestamp: Date.now() };
                 
+                const lastTick = globalMarketData.tickBuffer.length > 0 ? globalMarketData.tickBuffer[globalMarketData.tickBuffer.length - 1] : null;
+                if (mid !== lastTick) {
+                    globalMarketData.tickBuffer.push(mid);
+                    if (globalMarketData.tickBuffer.length > 500) globalMarketData.tickBuffer.shift();
+                }
+
                 if (Date.now() - lastHistorySave > 2000) { 
                     if (mid !== lastSavedMid) {
                         const doc = { priceMid: mid, timestamp: Date.now() };
@@ -811,13 +903,21 @@ async function startMasterStreams() {
                     }
                 }
 
-                for (const workers of activeWorkers.values()) {
-                    if (workers.main) { workers.main.checkExits().catch(()=>{}); workers.main.evaluateManualEntry().catch(()=>{}); }
-                    if (workers.second) { workers.second.checkExits().catch(()=>{}); workers.second.evaluateManualEntry().catch(()=>{}); }
+                for (const [userId, workers] of activeWorkers.entries()) {
+                    if (workers.main) {
+                        workers.main.checkExits().catch(()=>{});
+                        workers.main.evaluateManualEntry().catch(()=>{});
+                    }
+                    if (workers.second) {
+                        workers.second.checkExits().catch(()=>{});
+                        workers.second.evaluateManualEntry().catch(()=>{});
+                    }
                 }
 
                 await new Promise(r => setTimeout(r, 100)); 
-            } catch (e) { await new Promise(r => setTimeout(r, 2000)); }
+            } catch (e) { 
+                await new Promise(r => setTimeout(r, 2000)); 
+            }
         }
     })();
 }
@@ -829,8 +929,13 @@ async function loadAllUsers() {
             try {
                 const mainWorker = new UserTradeInstance(u, "main");
                 await mainWorker.initialize();
-                const secondWorker = new UserTradeInstance(u, "second"); // CRITICAL FIX: Unconditional startup
-                await secondWorker.initialize();
+                
+                let secondWorker = null;
+                if (u.secondAccount && (u.secondAccount.apiKey || u.secondAccount.liveTradingEnabled)) {
+                    secondWorker = new UserTradeInstance(u, "second");
+                    await secondWorker.initialize();
+                }
+                
                 activeWorkers.set(u._id.toString(), { main: mainWorker, second: secondWorker });
                 if (u.token) tokenCache.set(u.token, { user: u, lastAccessed: Date.now() });
             } catch(we) { console.error(`Worker error for ${u.email}:`, we.message); }
@@ -838,18 +943,23 @@ async function loadAllUsers() {
     } catch(e) {}
 }
 
+// ==================== ANALYTICS ENGINE ====================
 const activeSessions = new Map();
 setInterval(() => {
     const now = Date.now();
-    for (const [sid, data] of activeSessions.entries()) { if (now - data.lastSeen > 15000) activeSessions.delete(sid); }
+    for (const [sid, data] of activeSessions.entries()) {
+        if (now - data.lastSeen > 15000) activeSessions.delete(sid);
+    }
 }, 5000);
 
+// ==================== EXPRESS SERVER & API ====================
 const app = express(); app.use(express.json());
 
 app.post('/api/analytics/track', async (req, res) => {
     const { sessionId, page, isView } = req.body;
     if (!sessionId) return res.status(400).json({ error: 'Missing session' });
     activeSessions.set(sessionId, { page: page || 'unknown', lastSeen: Date.now() });
+
     if (isView) {
         try {
             let doc = await AnalyticsModel.findOne({ key: "global" });
@@ -874,9 +984,12 @@ app.get('/api/analytics/stats', async (req, res) => {
 app.post('/api/backtest', async (req, res) => {
     const bConfig = { ...BASE_CONFIG,
         takeProfitPct: parseFloat(req.body.tpPct) || 10.0, stopLossPct: parseFloat(req.body.slPct) || -50.0,
-        dcaTriggerPct: parseFloat(req.body.dcaTriggerPct) || 1.0, dcaMultiplier: parseFloat(req.body.dcaMultiplier) || 2.0,
-        startContracts: parseInt(req.body.startContracts) || 1, dgrDailyGrowthRate: parseFloat(req.body.dgrDailyGrowthRate) || 0.0,
-        manualDirection: req.body.manualDirection || 'long', maxContracts: parseInt(req.body.maxContracts) || 100
+        dcaTriggerPct: parseFloat(req.body.dcaTriggerPct) || 1.0,
+        dcaMultiplier: parseFloat(req.body.dcaMultiplier) || 2.0,
+        startContracts: parseInt(req.body.startContracts) || 1,
+        dgrDailyGrowthRate: parseFloat(req.body.dgrDailyGrowthRate) || 0.0,
+        manualDirection: req.body.manualDirection || 'long',
+        maxContracts: parseInt(req.body.maxContracts) || 100
     };
     try {
         const results = await runBacktestSimulation(bConfig, parseInt(req.body.ticks) || 5000, BASE_CONFIG.binanceSymbol);
@@ -888,12 +1001,16 @@ app.post('/api/auth/register', async (req, res) => {
     try {
         const { name, email, password } = req.body;
         if(await UserModel.findOne({ email })) return res.status(400).json({ error: 'Email already exists' });
+        
         const salt = crypto.randomBytes(16).toString('hex');
         const user = await UserModel.create({ name, email, passwordHash: hashPassword(password, salt), salt, token: generateToken() });
-        const mainWorker = new UserTradeInstance(user, "main"); await mainWorker.initialize();
-        const secondWorker = new UserTradeInstance(user, "second"); await secondWorker.initialize();
-        activeWorkers.set(user._id.toString(), { main: mainWorker, second: secondWorker });
+        
+        const mainWorker = new UserTradeInstance(user, "main");
+        await mainWorker.initialize();
+        
+        activeWorkers.set(user._id.toString(), { main: mainWorker, second: null });
         tokenCache.set(user.token, { user, lastAccessed: Date.now() });
+
         res.json({ token: user.token, user: { name: user.name, email: user.email } });
     } catch(e) { res.status(500).json({ error: 'Registration failed' }); }
 });
@@ -902,138 +1019,426 @@ app.post('/api/auth/login', async (req, res) => {
     try {
         const user = await UserModel.findOne({ email: req.body.email });
         if(!user || hashPassword(req.body.password, user.salt) !== user.passwordHash) return res.status(400).json({ error: 'Invalid credentials' });
+
         user.token = generateToken(); await user.save();
         tokenCache.set(user.token, { user, lastAccessed: Date.now() });
+
         res.json({ token: user.token, user: { name: user.name, email: user.email } });
     } catch(e) { res.status(500).json({ error: 'Login failed' }); }
 });
 
 app.get('/api/user/me', authMiddleware, (req, res) => {
     res.json({ 
-        name: req.user.name, email: req.user.email, apiKey: req.user.apiKey, 
-        liveTradingEnabled: req.user.liveTradingEnabled, secondAccount: req.user.secondAccount || { apiKey: "", liveTradingEnabled: false }
+        name: req.user.name, 
+        email: req.user.email, 
+        apiKey: req.user.apiKey, 
+        liveTradingEnabled: req.user.liveTradingEnabled,
+        secondAccount: req.user.secondAccount || { apiKey: "", liveTradingEnabled: false }
     });
 });
 
 app.post('/api/user/keys', authMiddleware, async (req, res) => {
     try {
         const { apiKey, apiSecret, liveTradingEnabled, isSecondAccount } = req.body;
+        
         let workers = activeWorkers.get(req.user._id.toString());
+        
         if (isSecondAccount) {
             if (!req.user.secondAccount) req.user.secondAccount = {};
-            req.user.secondAccount.apiKey = apiKey; req.user.secondAccount.apiSecret = apiSecret;
+            req.user.secondAccount.apiKey = apiKey;
+            req.user.secondAccount.apiSecret = apiSecret;
             req.user.secondAccount.liveTradingEnabled = Boolean(liveTradingEnabled);
-            req.user.markModified('secondAccount'); // CRITICAL FIX: Mark modified for DB save
-            if (workers?.second) { 
-                workers.second.apiKey = apiKey; workers.second.apiSecret = apiSecret; 
+            
+            if (workers && workers.second) {
+                workers.second.apiKey = apiKey;
+                workers.second.apiSecret = apiSecret;
                 workers.second.liveTradingEnabled = Boolean(liveTradingEnabled);
-                workers.second.applyUserKeys(); await workers.second.connectExchange();
+                workers.second.applyUserKeys();
+                const connectionResult = await workers.second.connectExchange();
+                if (Boolean(liveTradingEnabled) && !connectionResult.success) {
+                    workers.second.liveTradingEnabled = false;
+                    req.user.secondAccount.liveTradingEnabled = false;
+                }
+            } else if (workers) {
+                const secondWorker = new UserTradeInstance(req.user, "second");
+                await secondWorker.initialize();
+                workers.second = secondWorker;
             }
         } else {
-            req.user.apiKey = apiKey; req.user.apiSecret = apiSecret; req.user.liveTradingEnabled = Boolean(liveTradingEnabled);
-            if (workers?.main) { 
-                workers.main.apiKey = apiKey; workers.main.apiSecret = apiSecret; 
+            req.user.apiKey = apiKey;
+            req.user.apiSecret = apiSecret;
+            req.user.liveTradingEnabled = Boolean(liveTradingEnabled);
+            
+            if (workers && workers.main) {
+                workers.main.apiKey = apiKey;
+                workers.main.apiSecret = apiSecret;
                 workers.main.liveTradingEnabled = Boolean(liveTradingEnabled);
-                workers.main.applyUserKeys(); await workers.main.connectExchange();
+                workers.main.applyUserKeys();
+                const connectionResult = await workers.main.connectExchange();
+                if (Boolean(liveTradingEnabled) && !connectionResult.success) {
+                    workers.main.liveTradingEnabled = false;
+                    req.user.liveTradingEnabled = false;
+                }
             }
         }
+        
         await req.user.save();
         res.json({ status: 'ok' });
-    } catch(e) { res.status(500).json({ error: 'Failed' }); }
+    } catch(e) { res.status(500).json({ error: 'Failed to update settings' }); }
 });
 
 app.post('/api/user/config', authMiddleware, async (req, res) => {
     const workers = activeWorkers.get(req.user._id.toString());
+    if(!workers) return res.status(400).json({ error: 'Worker not active' });
+    
     const { tpPct, slPct, dcaTriggerPct, dcaMultiplier, startContracts, dgrDailyGrowthRate, manualDirection, maxContracts, isSecondAccount } = req.body;
-    const targetWorker = isSecondAccount ? workers?.second : workers?.main;
-    if (!targetWorker) return res.status(400).json({ error: 'Not initialized' });
-    const pSet = (v, f, k) => { if (v !== undefined && v !== "") { const p = f(v); if (!isNaN(p)) targetWorker.config[k] = p; } };
-    pSet(tpPct, parseFloat, 'takeProfitPct'); pSet(slPct, parseFloat, 'stopLossPct'); pSet(dcaTriggerPct, parseFloat, 'dcaTriggerPct');
-    pSet(dcaMultiplier, parseFloat, 'dcaMultiplier'); pSet(startContracts, parseInt, 'startContracts');
-    pSet(dgrDailyGrowthRate, parseFloat, 'dgrDailyGrowthRate'); pSet(maxContracts, parseInt, 'maxContracts');
-    if (manualDirection === 'long' || manualDirection === 'short') targetWorker.config.manualDirection = manualDirection;
-    if (isSecondAccount) { req.user.secondAccount.config = targetWorker.config; req.user.markModified('secondAccount'); }
-    else { req.user.config = targetWorker.config; }
+    const pSet = (v, f, k, targetWorker) => { if (v !== undefined && v !== "") { const p = f(v); if (!isNaN(p)) targetWorker.config[k] = p; } };
+    
+    const targetWorker = isSecondAccount ? workers.second : workers.main;
+    if (!targetWorker) return res.status(400).json({ error: 'Account not initialized' });
+    
+    pSet(tpPct, parseFloat, 'takeProfitPct', targetWorker);
+    pSet(slPct, parseFloat, 'stopLossPct', targetWorker);
+    pSet(dcaTriggerPct, parseFloat, 'dcaTriggerPct', targetWorker);
+    pSet(dcaMultiplier, parseFloat, 'dcaMultiplier', targetWorker);
+    pSet(startContracts, parseInt, 'startContracts', targetWorker);
+    pSet(dgrDailyGrowthRate, parseFloat, 'dgrDailyGrowthRate', targetWorker);
+    pSet(maxContracts, parseInt, 'maxContracts', targetWorker);
+    
+    if (manualDirection !== undefined && (manualDirection === 'long' || manualDirection === 'short')) {
+        targetWorker.config.manualDirection = manualDirection;
+    }
+    
+    if (isSecondAccount) {
+        if (!req.user.secondAccount) req.user.secondAccount = {};
+        req.user.secondAccount.config = targetWorker.config;
+        req.user.markModified('secondAccount');
+    } else {
+        req.user.config = targetWorker.config;
+    }
+    
     await req.user.save();
-    res.json({status: 'ok'});
+    res.json({status: 'ok', config: targetWorker.config});
 });
 
 app.post('/api/user/reset-metrics', authMiddleware, async (req, res) => {
-    const { isSecondAccount } = req.body;
-    const workers = activeWorkers.get(req.user._id.toString());
-    const target = isSecondAccount ? workers?.second : workers?.main;
-    if (target) { await TradeModel.deleteMany({ userId: req.user._id, accountId: target.accountType }); target.metrics = new PerformanceMetrics(target.userId, target.accountType); }
-    res.json({status: 'ok'});
+    try {
+        const { isSecondAccount } = req.body;
+        const workers = activeWorkers.get(req.user._id.toString());
+        if(workers) {
+            const targetWorker = isSecondAccount ? workers.second : workers.main;
+            if (targetWorker) {
+                await TradeModel.deleteMany({ userId: req.user._id.toString(), accountId: targetWorker.accountType });
+                targetWorker.metrics = new PerformanceMetrics(targetWorker.userId, targetWorker.accountType);
+            }
+        }
+        res.json({status: 'ok'});
+    } catch(err) { res.status(500).json({error: 'Failed to reset metrics'}); }
 });
 
 app.post('/api/user/close-all', authMiddleware, async (req, res) => {
     const { isSecondAccount } = req.body;
     const workers = activeWorkers.get(req.user._id.toString());
-    const target = isSecondAccount ? workers?.second : workers?.main;
-    if(target) await target.forceClosePosition("MANUAL_FORCE_CLOSE").catch(()=>{});
+    if(workers) {
+        const targetWorker = isSecondAccount ? workers.second : workers.main;
+        if(targetWorker) await targetWorker.forceClosePosition("MANUAL_FORCE_CLOSE").catch(()=>{});
+    }
     res.json({status: 'ok'});
 });
 
 app.get('/api/data', authMiddleware, (req, res) => {
     const workers = activeWorkers.get(req.user._id.toString());
-    res.json({ main: workers?.main?.getExportData(), second: workers?.second?.getExportData() });
+    const mainData = workers?.main ? workers.main.getExportData() : null;
+    const secondData = workers?.second ? workers.second.getExportData() : null;
+    res.json({ main: mainData, second: secondData });
 });
 
 app.get('/api/chart-history', (req, res) => res.json(memoryChartHistory.slice(-800))); 
 
+// ==================== FRONTEND UI ====================
 app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>TradeBotPille</title>
-    <script src="https://cdn.tailwindcss.com"></script><script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>body { background: #fafafa; } .card { background: white; border-radius: 16px; border: 1px solid #e4e4e7; padding: 20px; } .btn-primary { background: #09090b; color: white; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer; } .account-tab { padding: 8px 20px; cursor: pointer; border-bottom: 2px solid transparent; } .account-tab.active { border-bottom-color: #09090b; font-weight: 700; } .view-section { display: none; } .active-view { display: block; } input, select { border: 1px solid #e4e4e7; border-radius: 8px; padding: 8px 12px; font-size: 14px; }</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TradeBotPille | Multi-Account DCA</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; background: #fafafa; }
+        .card { background: white; border-radius: 16px; border: 1px solid #e4e4e7; padding: 20px; }
+        .btn-primary { background: #09090b; color: white; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer; }
+        .btn-secondary { background: white; border: 1px solid #e4e4e7; padding: 10px 20px; border-radius: 8px; font-weight: 500; cursor: pointer; }
+        .status-pill { padding: 4px 12px; border-radius: 99px; font-size: 10px; font-weight: 800; text-transform: uppercase; }
+        .account-tab { padding: 8px 20px; cursor: pointer; border-bottom: 2px solid transparent; }
+        .account-tab.active { border-bottom-color: #09090b; font-weight: 700; }
+        .view-section { display: none; }
+        .active-view { display: block; }
+        input, select { border: 1px solid #e4e4e7; border-radius: 8px; padding: 8px 12px; font-size: 14px; }
+    </style>
 </head>
 <body>
 <div class="max-w-7xl mx-auto px-4 py-6">
     <div class="flex justify-between items-center mb-8">
-        <div class="flex items-center gap-3"><div class="w-10 h-10 bg-black rounded-lg flex items-center justify-center"><span class="text-white text-xl">⚡</span></div><div><h1 class="font-bold text-xl">TRADEBOT<span class="text-indigo-600">PILLE</span></h1></div></div>
-        <div class="flex gap-3"><button onclick="nav('home')" class="px-4 py-2 text-sm font-semibold">Home</button><button onclick="nav('backtest')" class="px-4 py-2 text-sm font-semibold">Backtest</button><button onclick="nav('dashboard')" class="px-4 py-2 text-sm font-semibold">Terminal</button><button onclick="nav('settings')" class="px-4 py-2 text-sm font-semibold">Settings</button><button onclick="logout()" id="logout-btn" class="px-4 py-2 text-sm font-semibold text-red-600 hidden">Logout</button><button onclick="nav('login')" id="login-btn" class="btn-primary text-sm">Login</button></div>
+        <div class="flex items-center gap-3">
+            <div class="w-10 h-10 bg-black rounded-lg flex items-center justify-center"><span class="text-white text-xl">⚡</span></div>
+            <div><h1 class="font-bold text-xl">TRADEBOT<span class="text-indigo-600">PILLE</span></h1><p class="text-xs text-gray-400">Multi-Account DCA Engine</p></div>
+        </div>
+        <div id="nav-buttons" class="flex gap-3">
+            <button onclick="nav('home')" class="px-4 py-2 text-sm font-semibold">Home</button>
+            <button onclick="nav('backtest')" class="px-4 py-2 text-sm font-semibold">Backtest</button>
+            <button onclick="nav('dashboard')" class="px-4 py-2 text-sm font-semibold">Terminal</button>
+            <button onclick="nav('settings')" class="px-4 py-2 text-sm font-semibold">Settings</button>
+            <button onclick="logout()" id="logout-btn" class="px-4 py-2 text-sm font-semibold text-red-600 hidden">Logout</button>
+            <button onclick="nav('login')" id="login-btn" class="btn-primary text-sm">Login</button>
+        </div>
     </div>
-    <div id="view-home" class="view-section active-view text-center py-20"><h1 class="text-6xl font-black mb-4">DUAL ACCOUNT DCA</h1><button onclick="nav('dashboard')" class="btn-primary">Open Terminal</button></div>
+
+    <div id="view-home" class="view-section active-view text-center py-20">
+        <h1 class="text-6xl font-black mb-4">DUAL ACCOUNT<br><span class="text-gray-400">DCA TRADING</span></h1>
+        <p class="text-gray-500 mb-8">Run two independent DCA bots with different strategies</p>
+        <button onclick="nav('dashboard')" class="btn-primary">Open Terminal</button>
+    </div>
+
     <div id="view-dashboard" class="view-section">
-        <div class="flex justify-between items-center mb-6"><h2 class="text-2xl font-black">TERMINAL</h2><div class="flex gap-2 bg-gray-100 rounded-lg p-1"><button onclick="switchAccount('main')" id="tab-main" class="account-tab active">ACCOUNT 1</button><button onclick="switchAccount('second')" id="tab-second" class="account-tab text-gray-400">ACCOUNT 2</button></div></div>
+        <div class="flex justify-between items-center mb-6">
+            <h2 class="text-2xl font-black">LIVE TERMINAL</h2>
+            <div class="flex gap-2 bg-gray-100 rounded-lg p-1">
+                <button onclick="switchAccount('main')" id="tab-main" class="account-tab active">ACCOUNT 1</button>
+                <button onclick="switchAccount('second')" id="tab-second" class="account-tab text-gray-400">ACCOUNT 2</button>
+            </div>
+        </div>
+
         <div id="main-view">
-            <div class="grid grid-cols-4 gap-4 mb-6"><div class="card"><p class="text-xs text-gray-400">PnL</p><p id="main-pnl" class="text-2xl font-bold">$0.00</p></div><div class="card"><p class="text-xs text-gray-400">Wallet</p><p id="main-wallet" class="text-2xl font-bold">$0.00</p></div><div class="card"><p class="text-xs text-gray-400">Live ROI</p><p id="main-roi" class="text-2xl font-bold">IDLE</p></div><div class="card bg-black text-white"><p class="text-xs text-gray-400">Mode</p><p id="main-dir" class="text-2xl font-bold">LONG</p></div></div>
-            <div class="card mb-6 h-80"><canvas id="priceChart"></canvas></div><div class="card"><table class="w-full text-sm"><thead><tr><th>Time</th><th>Side</th><th>Exit Reason</th><th class="text-right">PnL</th></tr></thead><tbody id="main-trades"></tbody></table></div>
+            <div class="grid grid-cols-4 gap-4 mb-6">
+                <div class="card"><p class="text-xs text-gray-400 uppercase">Total PnL</p><p id="main-pnl" class="text-2xl font-mono font-bold">$0.00</p><p id="main-growth" class="text-xs">Growth: 0%</p></div>
+                <div class="card"><p class="text-xs text-gray-400 uppercase">Wallet</p><p id="main-wallet" class="text-2xl font-mono font-bold">$0.00</p><p id="main-initial" class="text-xs">Initial: $0</p></div>
+                <div class="card"><p class="text-xs text-gray-400 uppercase">Live ROI</p><p id="main-roi" class="text-2xl font-mono font-bold">IDLE</p></div>
+                <div class="card bg-black text-white"><p class="text-xs text-gray-400 uppercase">Direction</p><p id="main-dir" class="text-2xl font-bold">LONG</p><p id="main-dgr" class="text-xs">DGR: 0%</p></div>
+            </div>
+            <div class="card mb-6 h-80"><canvas id="priceChart"></canvas></div>
+            <div class="card"><h3 class="font-bold mb-4">Trade History</h3><div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr><th>Time</th><th>Side</th><th>Contracts</th><th>Exit Reason</th><th class="text-right">PnL</th></tr></thead><tbody id="main-trades"></tbody></table></div></div>
         </div>
+
         <div id="second-view" style="display:none">
-            <div class="grid grid-cols-4 gap-4 mb-6"><div class="card"><p class="text-xs text-gray-400">PnL</p><p id="second-pnl" class="text-2xl font-bold">$0.00</p></div><div class="card"><p class="text-xs text-gray-400">Wallet</p><p id="second-wallet" class="text-2xl font-bold">$0.00</p></div><div class="card"><p class="text-xs text-gray-400">Live ROI</p><p id="second-roi" class="text-2xl font-bold">IDLE</p></div><div class="card bg-indigo-600 text-white"><p class="text-xs text-indigo-100">Mode</p><p id="second-dir" class="text-2xl font-bold">LONG</p></div></div>
-            <div class="card"><table class="w-full text-sm"><thead><tr><th>Time</th><th>Side</th><th>Exit Reason</th><th class="text-right">PnL</th></tr></thead><tbody id="second-trades"></tbody></table></div>
+            <div class="grid grid-cols-4 gap-4 mb-6">
+                <div class="card"><p class="text-xs text-gray-400 uppercase">Total PnL</p><p id="second-pnl" class="text-2xl font-mono font-bold">$0.00</p><p id="second-growth" class="text-xs">Growth: 0%</p></div>
+                <div class="card"><p class="text-xs text-gray-400 uppercase">Wallet</p><p id="second-wallet" class="text-2xl font-mono font-bold">$0.00</p><p id="second-initial" class="text-xs">Initial: $0</p></div>
+                <div class="card"><p class="text-xs text-gray-400 uppercase">Live ROI</p><p id="second-roi" class="text-2xl font-mono font-bold">IDLE</p></div>
+                <div class="card bg-emerald-600 text-white"><p class="text-xs text-emerald-100 uppercase">Direction</p><p id="second-dir" class="text-2xl font-bold">LONG</p><p id="second-dgr" class="text-xs">DGR: 0%</p></div>
+            </div>
+            <div class="card"><h3 class="font-bold mb-4">Trade History</h3><div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr><th>Time</th><th>Side</th><th>Contracts</th><th>Exit Reason</th><th class="text-right">PnL</th></tr></thead><tbody id="second-trades"></tbody></table></div></div>
         </div>
     </div>
+
     <div id="view-settings" class="view-section max-w-2xl mx-auto">
-        <div class="card mb-6"><h3 class="font-bold mb-4">ACCOUNT 1</h3><label class="flex items-center gap-3"><input type="checkbox" id="main-live"> Live</label><input type="password" id="main-key" placeholder="API Key" class="w-full mt-2"><input type="password" id="main-secret" placeholder="API Secret" class="w-full mt-2"><button onclick="saveKeys('main')" class="btn-primary w-full mt-3">Save</button></div>
-        <div class="card mb-6"><h3 class="font-bold mb-4">ACCOUNT 2</h3><label class="flex items-center gap-3"><input type="checkbox" id="second-live"> Live</label><input type="password" id="second-key" placeholder="API Key" class="w-full mt-2"><input type="password" id="second-secret" placeholder="API Secret" class="w-full mt-2"><button onclick="saveKeys('second')" class="btn-primary w-full mt-3">Save</button></div>
-        <div class="card"><h3 class="font-bold mb-4">DCA CONFIG</h3><div class="grid grid-cols-2 gap-4"><div><label>TP%</label><input type="number" id="tp" value="10" class="w-full"></div><div><label>SL%</label><input type="number" id="sl" value="-50" class="w-full"></div><div><label>DCA Trigger</label><input type="number" id="dcaTrigger" value="1" class="w-full"></div><div><label>Multiplier</label><input type="number" id="dcaMult" value="2" class="w-full"></div><div><label>Direction</label><select id="dir" class="w-full"><option value="long">LONG</option><option value="short">SHORT</option></select></div></div><button onclick="saveConfig()" class="btn-primary w-full mt-4">Apply to Current</button></div>
+        <div class="card mb-6"><h3 class="font-bold mb-4">ACCOUNT 1 (MAIN)</h3><div class="space-y-4"><label class="flex items-center gap-3"><input type="checkbox" id="main-live" class="w-5 h-5"> Live Trading</label><input type="password" id="main-key" placeholder="API Key" class="w-full"><input type="password" id="main-secret" placeholder="API Secret" class="w-full"><button onclick="saveKeys('main')" class="btn-primary w-full">Save Keys</button></div></div>
+        <div class="card"><h3 class="font-bold mb-4">ACCOUNT 2 (SECONDARY)</h3><div class="space-y-4"><label class="flex items-center gap-3"><input type="checkbox" id="second-live" class="w-5 h-5"> Live Trading</label><input type="password" id="second-key" placeholder="API Key" class="w-full"><input type="password" id="second-secret" placeholder="API Secret" class="w-full"><button onclick="saveKeys('second')" class="btn-primary w-full bg-emerald-600">Save Keys</button></div></div>
+        <div class="card mt-6"><h3 class="font-bold mb-4">DCA PARAMETERS</h3><div class="grid grid-cols-2 gap-4"><div><label class="text-xs">TP %</label><input type="number" id="tp" class="w-full" value="10"></div><div><label class="text-xs">SL %</label><input type="number" id="sl" class="w-full" value="-50"></div><div><label class="text-xs">DCA Trigger %</label><input type="number" id="dcaTrigger" class="w-full" value="1" step="0.1"></div><div><label class="text-xs">DCA Multiplier</label><input type="number" id="dcaMult" class="w-full" value="2" step="0.1"></div><div><label class="text-xs">Start Contracts</label><input type="number" id="startContracts" class="w-full" value="1"></div><div><label class="text-xs">DGR %</label><input type="number" id="dgr" class="w-full" value="0" step="0.1"></div><div><label class="text-xs">Direction</label><select id="dir" class="w-full"><option value="long">LONG</option><option value="short">SHORT</option></select></div><div><label class="text-xs">Max Contracts</label><input type="number" id="maxC" class="w-full" value="100"></div></div><button onclick="saveConfig()" class="btn-primary w-full mt-4">Apply to Current Account</button></div>
+        <p id="msg" class="text-center text-xs text-gray-500 mt-4"></p>
     </div>
-    <div id="view-login" class="view-section max-w-md mx-auto"><div class="card"><h2 class="text-2xl font-bold mb-4">Login</h2><input type="email" id="login-email" placeholder="Email" class="w-full mb-3"><input type="password" id="login-pass" placeholder="Password" class="w-full mb-3"><button onclick="doLogin()" class="btn-primary w-full">Login</button></div></div>
-    <div id="view-register" class="view-section max-w-md mx-auto"><div class="card"><h2 class="text-2xl font-bold mb-4">Register</h2><input type="text" id="reg-name" placeholder="Name" class="w-full mb-3"><input type="email" id="reg-email" placeholder="Email" class="w-full mb-3"><input type="password" id="reg-pass" placeholder="Password" class="w-full mb-3"><button onclick="doRegister()" class="btn-primary w-full">Register</button></div></div>
+
+    <div id="view-login" class="view-section max-w-md mx-auto"><div class="card"><h2 class="text-2xl font-bold mb-4">Login</h2><input type="email" id="login-email" placeholder="Email" class="w-full mb-3"><input type="password" id="login-pass" placeholder="Password" class="w-full mb-3"><button onclick="doLogin()" class="btn-primary w-full">Login</button><p id="login-error" class="text-red-500 text-xs mt-2"></p><p class="text-center mt-4 text-sm">New? <a href="#" onclick="nav('register')" class="text-indigo-600">Register</a></p></div></div>
+
+    <div id="view-register" class="view-section max-w-md mx-auto"><div class="card"><h2 class="text-2xl font-bold mb-4">Register</h2><input type="text" id="reg-name" placeholder="Name" class="w-full mb-3"><input type="email" id="reg-email" placeholder="Email" class="w-full mb-3"><input type="password" id="reg-pass" placeholder="Password" class="w-full mb-3"><button onclick="doRegister()" class="btn-primary w-full">Register</button><p id="reg-error" class="text-red-500 text-xs mt-2"></p></div></div>
+
+    <div id="view-backtest" class="view-section max-w-4xl mx-auto"><div class="card"><h2 class="text-2xl font-bold mb-4">Backtest</h2><div class="grid grid-cols-3 gap-4 mb-4"><div><label class="text-xs">Ticks</label><input type="number" id="bt-ticks" value="5000"></div><div><label class="text-xs">TP %</label><input type="number" id="bt-tp" value="10"></div><div><label class="text-xs">SL %</label><input type="number" id="bt-sl" value="-50"></div><div><label class="text-xs">DCA Trigger</label><input type="number" id="bt-dcaTrigger" value="1" step="0.1"></div><div><label class="text-xs">DCA Multiplier</label><input type="number" id="bt-dcaMult" value="2" step="0.1"></div><div><label class="text-xs">Direction</label><select id="bt-dir"><option value="long">LONG</option><option value="short">SHORT</option></select></div></div><button onclick="runBacktest()" class="btn-primary">Run Simulation</button><div id="bt-results" class="mt-6"></div></div></div>
 </div>
+
 <script>
-let authToken = localStorage.getItem('token'); let currentAccount = 'main'; let priceChart = null; let updateInterval = null;
-async function doAPI(endpoint, method, body) { const headers = {'Content-Type':'application/json'}; if(authToken) headers['Authorization'] = authToken; const res = await fetch(endpoint, {method, headers, body: body ? JSON.stringify(body) : undefined}); if(res.status === 401) { logout(); return {error: 'Unauthorized'}; } return await res.json(); }
-function nav(view) { document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active-view')); document.getElementById('view-' + view).classList.add('active-view'); if(view === 'dashboard') startUpdates(); else if(updateInterval) clearInterval(updateInterval); }
-function logout() { localStorage.removeItem('token'); authToken = null; window.location.reload(); }
-function switchAccount(account) { currentAccount = account; document.getElementById('main-view').style.display = account === 'main' ? 'block' : 'none'; document.getElementById('second-view').style.display = account === 'second' ? 'block' : 'none'; document.getElementById('tab-main').classList.toggle('active', account === 'main'); document.getElementById('tab-second').classList.toggle('active', account === 'second'); }
-async function saveKeys(account) { await doAPI('/api/user/keys', 'POST', { apiKey: document.getElementById(account + '-key').value, apiSecret: document.getElementById(account + '-secret').value, liveTradingEnabled: document.getElementById(account + '-live').checked, isSecondAccount: account === 'second' }); alert('Saved'); }
-async function saveConfig() { await doAPI('/api/user/config', 'POST', { tpPct: document.getElementById('tp').value, slPct: document.getElementById('sl').value, dcaTriggerPct: document.getElementById('dcaTrigger').value, dcaMultiplier: document.getElementById('dcaMult').value, manualDirection: document.getElementById('dir').value, isSecondAccount: currentAccount === 'second' }); alert('Config Applied'); }
+let authToken = localStorage.getItem('token');
+let currentAccount = 'main';
+let priceChart = null;
+let updateInterval = null;
+
+async function doAPI(endpoint, method, body) {
+    const headers = {'Content-Type':'application/json'};
+    if(authToken) headers['Authorization'] = authToken;
+    const res = await fetch(endpoint, {method, headers, body: body ? JSON.stringify(body) : undefined});
+    if(res.status === 401) { logout(); return {error: 'Unauthorized'}; }
+    return await res.json();
+}
+
+function nav(view) {
+    document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active-view'));
+    document.getElementById('view-' + view).classList.add('active-view');
+    if(view === 'dashboard') { startUpdates(); }
+    else { if(updateInterval) clearInterval(updateInterval); }
+}
+
+function logout() { localStorage.removeItem('token'); authToken = null; document.getElementById('login-btn').classList.remove('hidden'); document.getElementById('logout-btn').classList.add('hidden'); nav('home'); }
+
+function switchAccount(account) {
+    currentAccount = account;
+    document.getElementById('main-view').style.display = account === 'main' ? 'block' : 'none';
+    document.getElementById('second-view').style.display = account === 'second' ? 'block' : 'none';
+    document.getElementById('tab-main').classList.toggle('active', account === 'main');
+    document.getElementById('tab-second').classList.toggle('active', account === 'second');
+}
+
+async function saveKeys(account) {
+    const isSecond = account === 'second';
+    const res = await doAPI('/api/user/keys', 'POST', {
+        apiKey: document.getElementById(account + '-key').value,
+        apiSecret: document.getElementById(account + '-secret').value,
+        liveTradingEnabled: document.getElementById(account + '-live').checked,
+        isSecondAccount: isSecond
+    });
+    document.getElementById('msg').innerText = res.error ? res.error : 'Keys saved!';
+}
+
+async function saveConfig() {
+    const isSecond = currentAccount === 'second';
+    const res = await doAPI('/api/user/config', 'POST', {
+        tpPct: parseFloat(document.getElementById('tp').value),
+        slPct: parseFloat(document.getElementById('sl').value),
+        dcaTriggerPct: parseFloat(document.getElementById('dcaTrigger').value),
+        dcaMultiplier: parseFloat(document.getElementById('dcaMult').value),
+        startContracts: parseInt(document.getElementById('startContracts').value),
+        dgrDailyGrowthRate: parseFloat(document.getElementById('dgr').value),
+        manualDirection: document.getElementById('dir').value,
+        maxContracts: parseInt(document.getElementById('maxC').value),
+        isSecondAccount: isSecond
+    });
+    if(!res.error) alert('Config saved for ' + currentAccount.toUpperCase());
+}
+
+async function runBacktest() {
+    const res = await doAPI('/api/backtest', 'POST', {
+        ticks: document.getElementById('bt-ticks').value,
+        tpPct: document.getElementById('bt-tp').value,
+        slPct: document.getElementById('bt-sl').value,
+        dcaTriggerPct: document.getElementById('bt-dcaTrigger').value,
+        dcaMultiplier: document.getElementById('bt-dcaMult').value,
+        startContracts: 1,
+        dgrDailyGrowthRate: 0,
+        manualDirection: document.getElementById('bt-dir').value,
+        maxContracts: 100
+    });
+    if(!res.error) {
+        document.getElementById('bt-results').innerHTML = '<div class="grid grid-cols-4 gap-4 mt-4"><div class="card"><p class="text-xs">Win Rate</p><p class="text-xl font-bold">'+res.winRate+'%</p></div><div class="card"><p class="text-xs">Net PnL</p><p class="text-xl font-bold">$'+res.netPnl.toFixed(4)+'</p></div><div class="card"><p class="text-xs">Trades</p><p class="text-xl font-bold">'+res.totalTradesCount+'</p></div><div class="card"><p class="text-xs">Max Deposit</p><p class="text-xl font-bold">$'+res.depositNeeded.toFixed(4)+'</p></div></div>';
+    }
+}
+
+async function doLogin() {
+    const res = await doAPI('/api/auth/login', 'POST', {email: document.getElementById('login-email').value, password: document.getElementById('login-pass').value});
+    if(res.error) document.getElementById('login-error').innerText = res.error;
+    else { authToken = res.token; localStorage.setItem('token', authToken); document.getElementById('login-btn').classList.add('hidden'); document.getElementById('logout-btn').classList.remove('hidden'); nav('dashboard'); }
+}
+
+async function doRegister() {
+    const res = await doAPI('/api/auth/register', 'POST', {name: document.getElementById('reg-name').value, email: document.getElementById('reg-email').value, password: document.getElementById('reg-pass').value});
+    if(res.error) document.getElementById('reg-error').innerText = res.error;
+    else { authToken = res.token; localStorage.setItem('token', authToken); document.getElementById('login-btn').classList.add('hidden'); document.getElementById('logout-btn').classList.remove('hidden'); nav('dashboard'); }
+}
+
 async function fetchData() {
     const data = await doAPI('/api/data', 'GET');
-    if(data.main) { document.getElementById('main-pnl').innerText = '$' + (data.main.metrics?.totalNetPnl || 0).toFixed(4); document.getElementById('main-wallet').innerText = '$' + (data.main.walletBalance || 0).toFixed(2); document.getElementById('main-roi').innerText = (data.main.activePositions?.[0]?.exchangeROI || 0).toFixed(2) + '%'; document.getElementById('main-dir').innerText = data.main.config.manualDirection.toUpperCase(); const mTrades = (data.main.metrics?.trades || []).slice().reverse().slice(0, 10); document.getElementById('main-trades').innerHTML = mTrades.map(t => '<tr><td>'+new Date(t.timestamp).toLocaleTimeString()+'</td><td class="font-bold">'+t.side+'</td><td>'+t.exitReason+'</td><td class="text-right">$'+t.netPnl.toFixed(4)+'</td></tr>').join(''); }
-    if(data.second) { document.getElementById('second-pnl').innerText = '$' + (data.second.metrics?.totalNetPnl || 0).toFixed(4); document.getElementById('second-wallet').innerText = '$' + (data.second.walletBalance || 0).toFixed(2); document.getElementById('second-roi').innerText = (data.second.activePositions?.[0]?.exchangeROI || 0).toFixed(2) + '%'; document.getElementById('second-dir').innerText = data.second.config.manualDirection.toUpperCase(); const sTrades = (data.second.metrics?.trades || []).slice().reverse().slice(0, 10); document.getElementById('second-trades').innerHTML = sTrades.map(t => '<tr><td>'+new Date(t.timestamp).toLocaleTimeString()+'</td><td class="font-bold">'+t.side+'</td><td>'+t.exitReason+'</td><td class="text-right">$'+t.netPnl.toFixed(4)+'</td></tr>').join(''); }
-    if(data.main?.binance?.mid && priceChart) { priceChart.data.labels.push(''); priceChart.data.datasets[0].data.push(data.main.binance.mid); if(priceChart.data.labels.length > 50) { priceChart.data.labels.shift(); priceChart.data.datasets[0].data.shift(); } priceChart.update('none'); }
+    if(data.error) return;
+    
+    if(data.main) {
+        document.getElementById('main-pnl').innerText = '$' + (data.main.metrics?.totalNetPnl || 0).toFixed(4);
+        document.getElementById('main-pnl').className = 'text-2xl font-mono font-bold ' + ((data.main.metrics?.totalNetPnl || 0) >= 0 ? 'text-green-600' : 'text-red-600');
+        document.getElementById('main-growth').innerText = 'Growth: ' + (data.main.growthPct || 0).toFixed(2) + '%';
+        document.getElementById('main-wallet').innerText = '$' + Number(data.main.walletBalance || 0).toFixed(4);
+        document.getElementById('main-initial').innerText = 'Initial: $' + (data.main.initialWalletBalance || 0).toFixed(4);
+        document.getElementById('main-dir').innerText = (data.main.config?.manualDirection || 'LONG').toUpperCase();
+        document.getElementById('main-dgr').innerText = 'DGR: ' + (data.main.config?.dgrDailyGrowthRate || 0) + '%';
+        
+        if(data.main.activePositions?.length > 0) {
+            const roi = data.main.activePositions[0].exchangeROI || 0;
+            document.getElementById('main-roi').innerText = roi.toFixed(2) + '%';
+            document.getElementById('main-roi').className = 'text-2xl font-mono font-bold ' + (roi >= 0 ? 'text-green-600' : 'text-red-600');
+        } else {
+            document.getElementById('main-roi').innerText = 'IDLE';
+            document.getElementById('main-roi').className = 'text-2xl font-mono font-bold text-gray-400';
+        }
+        
+        if(data.main.metrics?.trades) {
+            const trades = data.main.metrics.trades.slice().reverse().slice(0, 20);
+            document.getElementById('main-trades').innerHTML = trades.map(t => '<tr class="border-b"><td class="py-2 text-xs">'+new Date(t.timestamp).toLocaleTimeString()+'</td><td class="py-2 font-bold '+(t.side==='long'?'text-green-600':'text-red-600')+'">'+t.side.toUpperCase()+'</td><td class="py-2">'+t.contracts+'</td><td class="py-2 text-xs">'+t.exitReason+'</td><td class="py-2 text-right '+(t.netPnl>=0?'text-green-600':'text-red-600')+'">$'+t.netPnl.toFixed(4)+'</td></tr>').join('');
+        }
+    }
+    
+    if(data.second) {
+        document.getElementById('second-pnl').innerText = '$' + (data.second.metrics?.totalNetPnl || 0).toFixed(4);
+        document.getElementById('second-pnl').className = 'text-2xl font-mono font-bold ' + ((data.second.metrics?.totalNetPnl || 0) >= 0 ? 'text-green-600' : 'text-red-600');
+        document.getElementById('second-growth').innerText = 'Growth: ' + (data.second.growthPct || 0).toFixed(2) + '%';
+        document.getElementById('second-wallet').innerText = '$' + Number(data.second.walletBalance || 0).toFixed(4);
+        document.getElementById('second-initial').innerText = 'Initial: $' + (data.second.initialWalletBalance || 0).toFixed(4);
+        document.getElementById('second-dir').innerText = (data.second.config?.manualDirection || 'LONG').toUpperCase();
+        document.getElementById('second-dgr').innerText = 'DGR: ' + (data.second.config?.dgrDailyGrowthRate || 0) + '%';
+        
+        if(data.second.activePositions?.length > 0) {
+            const roi = data.second.activePositions[0].exchangeROI || 0;
+            document.getElementById('second-roi').innerText = roi.toFixed(2) + '%';
+            document.getElementById('second-roi').className = 'text-2xl font-mono font-bold ' + (roi >= 0 ? 'text-green-600' : 'text-red-600');
+        } else {
+            document.getElementById('second-roi').innerText = 'IDLE';
+            document.getElementById('second-roi').className = 'text-2xl font-mono font-bold text-gray-400';
+        }
+        
+        if(data.second.metrics?.trades) {
+            const trades = data.second.metrics.trades.slice().reverse().slice(0, 20);
+            document.getElementById('second-trades').innerHTML = trades.map(t => '<tr class="border-b"><td class="py-2 text-xs">'+new Date(t.timestamp).toLocaleTimeString()+'</td><td class="py-2 font-bold '+(t.side==='long'?'text-green-600':'text-red-600')+'">'+t.side.toUpperCase()+'</td><td class="py-2">'+t.contracts+'</td><td class="py-2 text-xs">'+t.exitReason+'</td><td class="py-2 text-right '+(t.netPnl>=0?'text-green-600':'text-red-600')+'">$'+t.netPnl.toFixed(4)+'</td></tr>').join('');
+        }
+    }
+    
+    if(data.main?.binance?.mid && priceChart) {
+        priceChart.data.labels.push('');
+        priceChart.data.datasets[0].data.push(data.main.binance.mid);
+        if(priceChart.data.labels.length > 200) {
+            priceChart.data.labels.shift();
+            priceChart.data.datasets[0].data.shift();
+        }
+        priceChart.update('none');
+    }
 }
-async function doLogin() { const res = await doAPI('/api/auth/login', 'POST', {email: document.getElementById('login-email').value, password: document.getElementById('login-pass').value}); if(res.token) { authToken = res.token; localStorage.setItem('token', authToken); window.location.reload(); } }
-async function doRegister() { const res = await doAPI('/api/auth/register', 'POST', {name: document.getElementById('reg-name').value, email: document.getElementById('reg-email').value, password: document.getElementById('reg-pass').value}); if(res.token) { authToken = res.token; localStorage.setItem('token', authToken); window.location.reload(); } }
-function startUpdates() { if(updateInterval) clearInterval(updateInterval); updateInterval = setInterval(fetchData, 2000); }
-if(authToken) { document.getElementById('login-btn').classList.add('hidden'); document.getElementById('logout-btn').classList.remove('hidden'); const ctx = document.getElementById('priceChart').getContext('2d'); priceChart = new Chart(ctx, { type: 'line', data: { labels: [], datasets: [{ label: 'SHIB', data: [], borderColor: 'black', borderWidth: 2, pointRadius: 0 }] }, options: { animation: false, scales: { x: { display: false } } } }); nav('dashboard'); }
+
+async function loadUser() {
+    const me = await doAPI('/api/user/me', 'GET');
+    if(!me.error && me) {
+        document.getElementById('main-live').checked = me.liveTradingEnabled;
+        document.getElementById('main-key').value = me.apiKey || '';
+        if(me.secondAccount) {
+            document.getElementById('second-live').checked = me.secondAccount.liveTradingEnabled;
+            document.getElementById('second-key').value = me.secondAccount.apiKey || '';
+        }
+    }
+}
+
+function startUpdates() {
+    if(updateInterval) clearInterval(updateInterval);
+    fetchData();
+    updateInterval = setInterval(fetchData, 2000);
+}
+
+function initChart() {
+    const ctx = document.getElementById('priceChart').getContext('2d');
+    priceChart = new Chart(ctx, {
+        type: 'line',
+        data: { labels: [], datasets: [{ label: 'SHIB Price', data: [], borderColor: '#09090b', borderWidth: 2, pointRadius: 0 }] },
+        options: { responsive: true, maintainAspectRatio: true, animation: false, scales: { x: { display: false }, y: { display: true } } }
+    });
+}
+
+if(authToken) {
+    document.getElementById('login-btn').classList.add('hidden');
+    document.getElementById('logout-btn').classList.remove('hidden');
+    initChart();
+    loadUser();
+    nav('dashboard');
+} else {
+    nav('home');
+}
 </script>
 </body>
-</html>`); });
+</html>`);
+});
 
-app.listen(CUSTOM_PORT, async () => { console.log(`✅ Server running on port ${CUSTOM_PORT}`); await loadAllUsers(); startMasterStreams(); });
+// ==================== APP INITIALIZATION ====================
+app.listen(CUSTOM_PORT, async () => {
+    console.log(`✅ Server running on port ${CUSTOM_PORT}`);
+    await loadAllUsers();
+    startMasterStreams();
+});
