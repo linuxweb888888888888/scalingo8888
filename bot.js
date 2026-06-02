@@ -1,131 +1,142 @@
 const express = require('express');
-const ccxt = require('ccxt');
-require('dotenv').config();
-
+const WebSocket = require('ws');
+const zlib = require('zlib');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// --- SETTINGS ---
-const SYMBOL = 'SHIB/USDT:USDT'; // HTX Perpetual Swap
-const GROWTH_INTERVAL_MS = 60 * 60 * 1000; // Time-based: Every 1 hour
-const BASE_CONTRACTS = 1;         // Start with 1 contract
-const DCA_MULTIPLIER = 1.2;       // Multiplier for DCA
-const DCA_ROI_TRIGGER = -10;      // Trigger if ROI < -10%
-const CONTRACT_SIZE = 1000000;    // 1 SHIB contract on HTX is typically 1M SHIB
-
-// --- PAPER TRADING STATE ---
-let paperAccount = {
-    totalContracts: 0,
-    totalCostBasis: 0, // In USDT
-    closedTrades: [],
-    lastPrice: 0,
-    nextBuyAmount: BASE_CONTRACTS
+// --- BOT SETTINGS ---
+const CONFIG = {
+    SYMBOL: 'shibusdt',
+    BASE_CONTRACT_SIZE: 1000, // 1 contract = 1000 SHIB
+    DCA_MULTIPLIER: 1.2,
+    DCA_TRIGGER_ROI: -10,     // Trigger DCA if ROI < -10%
+    GROWTH_RATE_THRESHOLD: 0.05, // 0.05% growth
+    GROWTH_WINDOW_MS: 60000,   // Check growth over 1 minute
 };
 
-const exchange = new ccxt.htx();
+// --- BOT STATE (Paper Trading) ---
+let state = {
+    priceHistory: [],
+    position: null, // { avgPrice: 0, totalQty: 0, contracts: 0 }
+    closedTrades: [],
+    currentTicker: { bid: 0, ask: 0, last: 0 },
+    lastUpdate: Date.now()
+};
 
-// --- LOGIC ---
-async function calculateGrowth() {
-    try {
-        const ticker = await exchange.fetchTicker(SYMBOL);
-        const currentPrice = ticker.last;
-        paperAccount.lastPrice = currentPrice;
+// --- UTILS ---
+const calculateROI = (currentPrice, avgEntry) => ((currentPrice - avgEntry) / avgEntry) * 100;
 
-        const currentPositionValue = paperAccount.totalContracts * CONTRACT_SIZE * currentPrice;
-        
-        // ROI Calculation
-        let roi = 0;
-        if (paperAccount.totalCostBasis > 0) {
-            roi = ((currentPositionValue - paperAccount.totalCostBasis) / paperAccount.totalCostBasis) * 100;
+// --- WEBSOCKET LOGIC (HTX) ---
+const initWS = () => {
+    const ws = new WebSocket('wss://api.huobi.pro/ws');
+
+    ws.on('open', () => {
+        // Subscribe to BBO (Best Bid Offer) for Paper Trading Bid/Ask
+        ws.send(JSON.stringify({ sub: `market.${CONFIG.SYMBOL}.bbo`, id: 'id1' }));
+    });
+
+    ws.on('message', (data) => {
+        // HTX sends GZIP compressed data
+        const payload = zlib.gunzipSync(data).toString();
+        const msg = JSON.parse(payload);
+
+        // Handle Heartbeat
+        if (msg.ping) {
+            ws.send(JSON.stringify({ pong: msg.ping }));
+            return;
         }
 
-        console.log(`[${new Date().toISOString()}] Price: ${currentPrice} | ROI: ${roi.toFixed(2)}% | Pos: ${paperAccount.totalContracts} conts`);
-
-        // DCA Trigger Logic
-        if (paperAccount.totalContracts === 0 || roi < DCA_ROI_TRIGGER) {
-            const amountToBuy = paperAccount.totalContracts === 0 ? BASE_CONTRACTS : paperAccount.nextBuyAmount;
-            
-            // Execute Paper Buy
-            const cost = amountToBuy * CONTRACT_SIZE * currentPrice;
-            paperAccount.totalContracts += amountToBuy;
-            paperAccount.totalCostBasis += cost;
-            
-            console.log(`>>> DCA BUY: ${amountToBuy} contracts at ${currentPrice}`);
-
-            // Set next multiplier if we are in a dip
-            if (roi < DCA_ROI_TRIGGER) {
-                paperAccount.nextBuyAmount *= DCA_MULTIPLIER;
-            } else {
-                paperAccount.nextBuyAmount = BASE_CONTRACTS;
-            }
+        if (msg.tick) {
+            const { bid, ask } = msg.tick;
+            state.currentTicker = { bid, ask, last: (bid + ask) / 2 };
+            updateStrategy();
         }
+    });
 
-        // Logic to "Close" Paper Trade (Take Profit example at 5%)
-        if (roi >= 5) {
-            const profit = currentPositionValue - paperAccount.totalCostBasis;
-            paperAccount.closedTrades.push({
-                type: 'Long',
-                contracts: paperAccount.totalContracts,
-                entryPrice: (paperAccount.totalCostBasis / (paperAccount.totalContracts * CONTRACT_SIZE)).toFixed(10),
-                exitPrice: currentPrice,
-                pnl: profit.toFixed(4),
-                roi: roi.toFixed(2),
-                timestamp: new Date().toLocaleString()
-            });
-            // Reset position
-            paperAccount.totalContracts = 0;
-            paperAccount.totalCostBasis = 0;
-            paperAccount.nextBuyAmount = BASE_CONTRACTS;
-            console.log(`### CLOSED TRADE: Profit ${profit.toFixed(4)} USDT`);
+    ws.on('close', () => setTimeout(initWS, 5000));
+};
+
+// --- TRADING STRATEGY ---
+function updateStrategy() {
+    const now = Date.now();
+    const currentPrice = state.currentTicker.ask; // Entry on Ask for Longs
+
+    // 1. Manage Price History for Growth Rate
+    state.priceHistory.push({ time: now, price: currentPrice });
+    state.priceHistory = state.priceHistory.filter(p => now - p.time <= CONFIG.GROWTH_WINDOW_MS);
+
+    // 2. Logic: If no position, check Growth Rate to Open Long
+    if (!state.position && state.priceHistory.length > 2) {
+        const oldest = state.priceHistory[0];
+        const growth = ((currentPrice - oldest.price) / oldest.price) * 100;
+
+        if (growth >= CONFIG.GROWTH_RATE_THRESHOLD) {
+            openPosition(currentPrice, CONFIG.BASE_CONTRACT_SIZE);
         }
+    }
 
-    } catch (e) {
-        console.error("Exchange Error:", e.message);
+    // 3. Logic: If in position, check for DCA trigger
+    if (state.position) {
+        const roi = calculateROI(state.currentTicker.bid, state.position.avgPrice);
+        if (roi <= CONFIG.DCA_TRIGGER_ROI) {
+            const dcaQty = state.position.totalQty * CONFIG.DCA_MULTIPLIER;
+            openPosition(currentPrice, dcaQty, true);
+        }
     }
 }
 
-// Start the Growth Loop
-setInterval(calculateGrowth, GROWTH_INTERVAL_MS);
-calculateGrowth(); // Run immediately on start
+function openPosition(price, qty, isDCA = false) {
+    if (!state.position) {
+        state.position = { avgPrice: price, totalQty: qty, contracts: qty / 1000, startTime: Date.now() };
+    } else {
+        // Update Weighted Average for DCA
+        const newTotalQty = state.position.totalQty + qty;
+        state.position.avgPrice = ((state.position.avgPrice * state.position.totalQty) + (price * qty)) / newTotalQty;
+        state.position.totalQty = newTotalQty;
+        state.position.contracts = newTotalQty / 1000;
+    }
+    console.log(`${isDCA ? 'DCA' : 'OPEN'} LONG at ${price} | Total Qty: ${state.position.totalQty}`);
+}
 
-// --- WEBSERVER ROUTES ---
+// --- EXPRESS SERVER (Dashboard) ---
 app.get('/', (req, res) => {
-    const currentVal = paperAccount.totalContracts * CONTRACT_SIZE * paperAccount.lastPrice;
-    const pnl = currentVal - paperAccount.totalCostBasis;
-    const roi = paperAccount.totalCostBasis > 0 ? (pnl / paperAccount.totalCostBasis * 100) : 0;
+    let roi = 0, pnl = 0;
+    if (state.position) {
+        roi = calculateROI(state.currentTicker.bid, state.position.avgPrice);
+        pnl = (state.currentTicker.bid - state.position.avgPrice) * state.position.totalQty;
+    }
 
-    let html = `
-    <html>
-    <head><title>SHIB Growth Bot</title><style>body{font-family:sans-serif; padding:20px;} .card{border:1px solid #ccc; padding:15px; margin-bottom:10px; border-radius:5px;}</style></head>
-    <body>
-        <h1>SHIB Growth Bot Dashboard</h1>
-        <div class="card">
-            <h3>Current Open Position</h3>
-            <p>Contracts: ${paperAccount.totalContracts}</p>
-            <p>Cost Basis: ${paperAccount.totalCostBasis.toFixed(4)} USDT</p>
-            <p>Current PnL: <b>${pnl.toFixed(4)} USDT</b></p>
-            <p>Current ROI: <b>${roi.toFixed(2)}%</b></p>
-            <p>Next DCA Multiplier: ${paperAccount.nextBuyAmount.toFixed(2)}x</p>
-        </div>
-        <h3>Closed Paper Trades</h3>
-        <table border="1" cellpadding="10" style="border-collapse:collapse; width:100%;">
-            <tr><th>Time</th><th>Contracts</th><th>Entry</th><th>Exit</th><th>PnL (USDT)</th><th>ROI</th></tr>
-            ${paperAccount.closedTrades.map(t => `
-                <tr>
-                    <td>${t.timestamp}</td>
-                    <td>${t.contracts}</td>
-                    <td>${t.entryPrice}</td>
-                    <td>${t.exitPrice}</td>
-                    <td>${t.pnl}</td>
-                    <td>${t.roi}%</td>
-                </tr>
-            `).join('')}
-        </table>
-    </body>
-    </html>`;
+    const html = `
+        <html>
+            <body style="font-family: sans-serif; background: #121212; color: white; padding: 20px;">
+                <h1>SHIB HTX Bot (Paper Trading)</h1>
+                <div style="border: 1px solid #333; padding: 15px; margin-bottom: 20px;">
+                    <h3>Market: SHIB/USDT</h3>
+                    <p>Bid: ${state.currentTicker.bid} | Ask: ${state.currentTicker.ask}</p>
+                </div>
+
+                <div style="background: ${roi >= 0 ? '#1b5e20' : '#b71c1c'}; padding: 15px; border-radius: 8px;">
+                    <h2>Active Position: LONG</h2>
+                    <p>Status: ${state.position ? 'OPEN' : 'WAITING FOR GROWTH SIGNAL'}</p>
+                    ${state.position ? `
+                        <p>Avg Entry: ${state.position.avgPrice.toFixed(8)}</p>
+                        <p>Contracts: ${state.position.contracts} (${state.position.totalQty} SHIB)</p>
+                        <p><b>ROI: ${roi.toFixed(2)}%</b></p>
+                        <p><b>Unrealized PnL: ${pnl.toFixed(4)} USDT</b></p>
+                    ` : ''}
+                </div>
+
+                <h3>Closed Trades</h3>
+                <pre>${JSON.stringify(state.closedTrades, null, 2)}</pre>
+                
+                <script>setTimeout(() => location.reload(), 2000);</script>
+            </body>
+        </html>
+    `;
     res.send(html);
 });
 
 app.listen(port, () => {
-    console.log(`Dashboard running at port ${port}`);
+    console.log(`Webserver running on port ${port}`);
+    initWS();
 });
