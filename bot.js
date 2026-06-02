@@ -8,7 +8,7 @@ const crypto = require('crypto');
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
 // ==================== MONGODB SETUP ====================
-// 🚨 SECURITY WARNING: Do not hardcode your DB password. Use .env instead!
+// 🚨 SECURITY WARNING: Use environment variable for production!
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
 
 mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000, socketTimeoutMS: 45000 })
@@ -27,7 +27,7 @@ const UserModel = mongoose.model('User_V3', new mongoose.Schema({
     config: { type: Object, default: {} },
     activePosition: { type: Object, default: null }, 
     lastCloseTime: { type: Number, default: 0 },
-    createdAt: { type: Date, default: Date.now }  // Track when account was created
+    createdAt: { type: Date, default: Date.now }
 }));
 
 const TradeModel = mongoose.model('TradeLog_V3', new mongoose.Schema({
@@ -63,10 +63,80 @@ const AnalyticsModel = mongoose.model('SiteAnalytics_V3', new mongoose.Schema({
     knownIds: { type: [String], default: [] }
 }));
 
+// ==================== USER STATS SCHEMA (for tracking user performance) ====================
+const UserStatsModel = mongoose.model('UserStats_V1', new mongoose.Schema({
+    userId: { type: String, required: true, unique: true, index: true },
+    email: { type: String, required: true },
+    name: { type: String, required: true },
+    
+    // Wallet tracking
+    initialWalletBalance: { type: Number, default: 0 },
+    currentWalletBalance: { type: Number, default: 0 },
+    peakWalletBalance: { type: Number, default: 0 },
+    lowestWalletBalance: { type: Number, default: 0 },
+    
+    // Performance metrics
+    totalRealizedPnL: { type: Number, default: 0 },
+    totalUnrealizedPnL: { type: Number, default: 0 },
+    totalGrowth: { type: Number, default: 0 },
+    peakGrowth: { type: Number, default: 0 },
+    
+    // Trading stats
+    totalClosedTrades: { type: Number, default: 0 },
+    winningTrades: { type: Number, default: 0 },
+    losingTrades: { type: Number, default: 0 },
+    totalVolume: { type: Number, default: 0 },
+    totalFeesPaid: { type: Number, default: 0 },
+    
+    // Current position
+    currentDirection: { type: String, default: 'none' },
+    currentROI: { type: Number, default: 0 },
+    currentMarginUsed: { type: Number, default: 0 },
+    currentContracts: { type: Number, default: 0 },
+    currentEntryPrice: { type: Number, default: 0 },
+    
+    // DGR & Config
+    dgrDailyGrowthRate: { type: Number, default: 0 },
+    manualDirection: { type: String, default: 'long' },
+    isLiveTrading: { type: Boolean, default: false },
+    
+    // Timestamps
+    lastUpdate: { type: Date, default: Date.now },
+    lastTradeTime: { type: Date, default: null },
+    createdAt: { type: Date, default: Date.now }
+}));
+
+// ==================== WALLET SNAPSHOT SCHEMA ====================
+const WalletSnapshotModel = mongoose.model('WalletSnapshot_V1', new mongoose.Schema({
+    userId: { type: String, required: true, index: true },
+    balance: { type: Number, required: true },
+    realizedPnL: { type: Number, default: 0 },
+    unrealizedPnL: { type: Number, default: 0 },
+    timestamp: { type: Date, default: Date.now, index: true }
+}));
+
+// ==================== DAILY PERFORMANCE SCHEMA ====================
+const DailyPerformanceModel = mongoose.model('DailyPerformance_V1', new mongoose.Schema({
+    userId: { type: String, required: true, index: true },
+    date: { type: String, required: true },
+    startingBalance: { type: Number, required: true },
+    endingBalance: { type: Number, required: true },
+    dailyPnL: { type: Number, required: true },
+    dailyGrowth: { type: Number, required: true },
+    tradesCount: { type: Number, default: 0 },
+    winsCount: { type: Number, default: 0 },
+    lossesCount: { type: Number, default: 0 }
+}));
+
+// Add indexes for performance
+UserStatsModel.schema.index({ totalRealizedPnL: -1 });
+UserStatsModel.schema.index({ totalGrowth: -1 });
+DailyPerformanceModel.schema.index({ userId: 1, date: -1 });
+
 // ==================== BASE CONFIGURATION ====================
 const CUSTOM_PORT = process.env.PORT || 3000;
 
-// SHIB CONFIGURATION (FORCED 20x LEVERAGE)
+// SHIB CONFIGURATION (FORCED 75x LEVERAGE)
 const FORCED_LEVERAGE = 75;
 
 const BASE_CONFIG = {
@@ -126,6 +196,91 @@ async function authMiddleware(req, res, next) {
     next();
 }
 
+// ==================== HELPER: UPDATE USER STATS ====================
+async function updateUserStats(userId, userEmail, userName, currentData) {
+    try {
+        let stats = await UserStatsModel.findOne({ userId });
+        
+        if (!stats) {
+            stats = new UserStatsModel({
+                userId,
+                email: userEmail,
+                name: userName,
+                initialWalletBalance: currentData.walletBalance || 0,
+                currentWalletBalance: currentData.walletBalance || 0,
+                peakWalletBalance: currentData.walletBalance || 0,
+                lowestWalletBalance: currentData.walletBalance || 0
+            });
+        }
+        
+        const previousBalance = stats.currentWalletBalance;
+        const newBalance = currentData.walletBalance || 0;
+        
+        stats.currentWalletBalance = newBalance;
+        if (newBalance > stats.peakWalletBalance) stats.peakWalletBalance = newBalance;
+        if (stats.lowestWalletBalance === 0 || newBalance < stats.lowestWalletBalance) stats.lowestWalletBalance = newBalance;
+        
+        if (stats.initialWalletBalance > 0) {
+            stats.totalGrowth = ((newBalance - stats.initialWalletBalance) / stats.initialWalletBalance) * 100;
+            if (stats.totalGrowth > stats.peakGrowth) stats.peakGrowth = stats.totalGrowth;
+        }
+        
+        if (currentData.activePositions && currentData.activePositions.length > 0) {
+            const pos = currentData.activePositions[0];
+            stats.currentDirection = pos.side;
+            stats.currentROI = pos.exchangeROI || 0;
+            stats.currentMarginUsed = pos.marginUsed || 0;
+            stats.currentContracts = pos.contracts || 0;
+            stats.currentEntryPrice = pos.entryPrice || 0;
+            stats.totalUnrealizedPnL = pos.exchangePnl || 0;
+        } else {
+            stats.currentDirection = 'none';
+            stats.currentROI = 0;
+            stats.currentMarginUsed = 0;
+            stats.currentContracts = 0;
+            stats.currentEntryPrice = 0;
+            stats.totalUnrealizedPnL = 0;
+        }
+        
+        if (currentData.metrics) {
+            stats.totalClosedTrades = currentData.metrics.totalTradesCount || 0;
+            stats.winningTrades = currentData.metrics.wins || 0;
+            stats.losingTrades = currentData.metrics.losses || 0;
+            stats.totalRealizedPnL = currentData.metrics.totalNetPnl || 0;
+            stats.totalFeesPaid = currentData.metrics.totalFees || 0;
+            
+            if (currentData.metrics.trades && currentData.metrics.trades.length > 0) {
+                const lastTrade = currentData.metrics.trades[currentData.metrics.trades.length - 1];
+                stats.lastTradeTime = lastTrade.timestamp || new Date();
+            }
+        }
+        
+        if (currentData.config) {
+            stats.dgrDailyGrowthRate = currentData.config.dgrDailyGrowthRate || 0;
+            stats.manualDirection = currentData.config.manualDirection || 'long';
+            stats.isLiveTrading = currentData.liveTradingEnabled || false;
+        }
+        
+        stats.lastUpdate = new Date();
+        await stats.save();
+        
+        const shouldSaveSnapshot = Math.abs(newBalance - previousBalance) > 10 || Math.random() < 0.1;
+        if (shouldSaveSnapshot) {
+            await WalletSnapshotModel.create({
+                userId,
+                balance: newBalance,
+                realizedPnL: stats.totalRealizedPnL,
+                unrealizedPnL: stats.totalUnrealizedPnL,
+                timestamp: new Date()
+            });
+        }
+        
+        return stats;
+    } catch (err) {
+        console.error(`Failed to update stats for ${userId}:`, err.message);
+    }
+}
+
 // ==================== HELPER: CORE MATH ====================
 function calculateTradeMath(side, entryPrice, currentPrice, sizeUsd, leverage, takerFee) {
     const sideMult = side === 'long' ? 1 : -1;
@@ -182,7 +337,6 @@ class PerformanceMetrics {
     updateMaxMargin(margin) { if (margin > this.maxMarginUsed) this.maxMarginUsed = margin; }
     getDaysActive() { return (Date.now() - this.startDate) / (1000 * 60 * 60 * 24); }
     
-    // Reset metrics for clean start
     async reset() {
         await TradeModel.deleteMany({ userId: this.userId });
         this.trades = [];
@@ -236,7 +390,6 @@ async function runBacktestSimulation(config, tickCount, symbol) {
         const tick = ticks[i];
         const price = tick.priceMid, tickTime = tick.timestamp;
 
-        // Prevent event loop blocking
         if (i % 1000 === 0 && i > 0) {
             await new Promise(resolve => setImmediate(resolve));
         }
@@ -335,11 +488,11 @@ async function runBacktestSimulation(config, tickCount, symbol) {
 class UserTradeInstance {
     constructor(user, forceClean = false) {
         this.userId = user._id.toString(); 
+        this.userEmail = user.email;
+        this.userName = user.name;
         
-        // Start with fresh config if forced or no existing config
         if (forceClean || !user.config || Object.keys(user.config).length === 0) {
             this.config = { ...BASE_CONFIG };
-            // Save fresh config to user (don't await to avoid blocking)
             user.config = this.config;
             user.save().catch(err => console.error(`Failed to save clean config for ${this.userId}:`, err.message));
         } else {
@@ -357,7 +510,6 @@ class UserTradeInstance {
         this.startTime = Date.now(); 
         this.metrics = new PerformanceMetrics(this.userId);
         
-        // Force clean positions on new accounts or when requested
         if (forceClean || !user.activePosition) {
             this.activePositions = [];
             user.activePosition = null;
@@ -370,10 +522,11 @@ class UserTradeInstance {
         this.lastCloseTime = user.lastCloseTime || 0;
         
         this.isTrading = false; 
-        this.isClosing = false;  // New flag to prevent close race conditions
+        this.isClosing = false;
         
         this.lastEvalPrice = 0;
         this.walletBalance = 0;
+        this.statsInterval = null;
 
         this.applyUserKeys(user);
     }
@@ -400,6 +553,19 @@ class UserTradeInstance {
         if (this.activePositions.length > 0) this.metrics.updateMaxMargin(this.activePositions[0].marginUsed);
         await this.connectExchange();
         this.startExchangeROISync();
+        
+        this.statsInterval = setInterval(async () => {
+            await this.updatePerformanceStats();
+        }, 30000);
+    }
+    
+    async cleanup() {
+        if (this.statsInterval) clearInterval(this.statsInterval);
+    }
+    
+    async updatePerformanceStats() {
+        const exportData = this.getExportData();
+        await updateUserStats(this.userId, this.userEmail, this.userName, exportData);
     }
 
     async saveState() {
@@ -411,7 +577,6 @@ class UserTradeInstance {
                 config: this.config 
             } }
         );
-        // Update cache if exists
         for (const [token, data] of tokenCache.entries()) {
             if (data.user._id.toString() === this.userId) {
                 data.user.activePosition = this.activePositions.length > 0 ? this.activePositions[0] : null;
@@ -753,6 +918,7 @@ class UserTradeInstance {
                 wins: this.metrics.wins,
                 losses: this.metrics.losses,
                 winRate: this.metrics.winRate,
+                totalFees: this.metrics.totalFees,
                 trades: this.metrics.trades.slice(-50)
             }, 
             activePositions: this.activePositions, 
@@ -762,27 +928,22 @@ class UserTradeInstance {
         }; 
     }
     
-    // New method to completely reset user account
     async resetAccount() {
         console.log(`[User ${this.userId}] Resetting account to clean state...`);
         
-        // Force close any open positions
         if (this.activePositions.length > 0) {
             await this.forceClosePosition("ACCOUNT_RESET");
         }
         
-        // Reset metrics
         await this.metrics.reset();
         
-        // Reset config to defaults
         this.config = { ...BASE_CONFIG };
         
-        // Clear active positions
         this.activePositions = [];
         this.lastCloseTime = 0;
         this.startTime = Date.now();
+        this.walletBalance = 0;
         
-        // Save clean state to database
         await UserModel.updateOne(
             { _id: this.userId },
             { 
@@ -794,6 +955,9 @@ class UserTradeInstance {
                 } 
             }
         );
+        
+        await UserStatsModel.findOneAndDelete({ userId: this.userId });
+        await WalletSnapshotModel.deleteMany({ userId: this.userId });
         
         await this.saveState();
         console.log(`[User ${this.userId}] Account reset complete`);
@@ -898,7 +1062,7 @@ async function loadAllUsers() {
         console.log(`Loading ${users.length} existing users...`);
         for(const u of users) {
             try {
-                const worker = new UserTradeInstance(u, false); // Don't force clean for existing users
+                const worker = new UserTradeInstance(u, false);
                 await worker.initialize();
                 activeWorkers.set(u._id.toString(), worker);
                 if (u.token) tokenCache.set(u.token, { user: u, lastAccessed: Date.now() });
@@ -922,15 +1086,66 @@ setInterval(() => {
     }
 }, 5000);
 
+// ==================== DAILY PERFORMANCE UPDATE JOB ====================
+async function recordDailyPerformance() {
+    const today = new Date().toISOString().split('T')[0];
+    const allStats = await UserStatsModel.find({});
+    
+    for (const stats of allStats) {
+        const existing = await DailyPerformanceModel.findOne({ 
+            userId: stats.userId, 
+            date: today 
+        });
+        
+        if (!existing && stats.lastUpdate) {
+            const yesterday = new Date();
+            yesterday.setDate(yesterday.getDate() - 1);
+            const yesterdayStr = yesterday.toISOString().split('T')[0];
+            const yesterdayStats = await DailyPerformanceModel.findOne({
+                userId: stats.userId,
+                date: yesterdayStr
+            });
+            
+            const startingBalance = yesterdayStats ? yesterdayStats.endingBalance : stats.initialWalletBalance;
+            const endingBalance = stats.currentWalletBalance;
+            const dailyPnL = endingBalance - startingBalance;
+            const dailyGrowth = startingBalance > 0 ? (dailyPnL / startingBalance) * 100 : 0;
+            
+            const todayTrades = await TradeModel.countDocuments({
+                userId: stats.userId,
+                timestamp: { $gte: new Date(today) }
+            });
+            
+            await DailyPerformanceModel.create({
+                userId: stats.userId,
+                date: today,
+                startingBalance,
+                endingBalance,
+                dailyPnL,
+                dailyGrowth,
+                tradesCount: todayTrades,
+                winsCount: 0,
+                lossesCount: 0
+            });
+        }
+    }
+}
+
+setInterval(() => {
+    const now = new Date();
+    if (now.getHours() === 0 && now.getMinutes() === 0) {
+        recordDailyPerformance();
+    }
+}, 60000);
+
 // ==================== EXPRESS SERVER & API ====================
 const app = express(); 
 app.use(express.json());
 
-// Add rate limiting for security
 const rateLimit = require('express-rate-limit');
 const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100, // Limit each IP to 100 requests per windowMs
+    windowMs: 15 * 60 * 1000,
+    max: 100,
     message: { error: 'Too many requests, please try again later.' }
 });
 app.use('/api/', limiter);
@@ -978,12 +1193,10 @@ app.post('/api/backtest', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// UPDATED: Clean registration endpoint with forceClean = true
 app.post('/api/auth/register', async (req, res) => {
     try {
         const { name, email, password } = req.body;
         
-        // Validate input
         if (!name || !email || !password) {
             return res.status(400).json({ error: 'Name, email, and password are required' });
         }
@@ -998,7 +1211,6 @@ app.post('/api/auth/register', async (req, res) => {
         
         const salt = crypto.randomBytes(16).toString('hex');
         
-        // Create user with COMPLETELY CLEAN state
         const user = await UserModel.create({ 
             name, 
             email, 
@@ -1008,13 +1220,12 @@ app.post('/api/auth/register', async (req, res) => {
             apiKey: "",
             apiSecret: "",
             liveTradingEnabled: false,
-            config: {},  // Empty config - will use BASE_CONFIG defaults
+            config: {},
             activePosition: null,
             lastCloseTime: 0,
             createdAt: new Date()
         });
         
-        // Create worker with forceClean = true to ensure fresh start
         const worker = new UserTradeInstance(user, true);
         await worker.initialize();
         activeWorkers.set(user._id.toString(), worker);
@@ -1054,7 +1265,6 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-// NEW ENDPOINT: Reset user account to clean state
 app.post('/api/user/reset-account', authMiddleware, async (req, res) => {
     try {
         const worker = activeWorkers.get(req.user._id.toString());
@@ -1070,7 +1280,6 @@ app.post('/api/user/reset-account', authMiddleware, async (req, res) => {
     }
 });
 
-// NEW ENDPOINT: Get account creation info
 app.get('/api/user/account-info', authMiddleware, async (req, res) => {
     try {
         const user = await UserModel.findById(req.user._id);
@@ -1188,6 +1397,200 @@ app.post('/api/close-all', authMiddleware, async (req, res) => {
         res.json({status: 'ok', message: 'Position closed' });
     } else {
         res.status(400).json({ error: 'Worker not found' });
+    }
+});
+
+// ==================== ADMIN PANEL ENDPOINTS ====================
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "admin_secret_token_change_me";
+
+function adminAuthMiddleware(req, res, next) {
+    const token = req.headers['x-admin-token'];
+    if (!token || token !== ADMIN_TOKEN) {
+        return res.status(403).json({ error: 'Admin access denied' });
+    }
+    next();
+}
+
+app.get('/api/admin/users', adminAuthMiddleware, async (req, res) => {
+    try {
+        const users = await UserModel.find({}).select('-passwordHash -salt -apiSecret');
+        const userStats = await UserStatsModel.find({});
+        
+        const combinedData = users.map(user => {
+            const stats = userStats.find(s => s.userId === user._id.toString()) || {};
+            return {
+                _id: user._id,
+                name: user.name,
+                email: user.email,
+                createdAt: user.createdAt,
+                liveTradingEnabled: user.liveTradingEnabled,
+                hasApiKeys: !!(user.apiKey && user.apiKey !== ""),
+                stats: {
+                    initialWalletBalance: stats.initialWalletBalance || 0,
+                    currentWalletBalance: stats.currentWalletBalance || 0,
+                    totalRealizedPnL: stats.totalRealizedPnL || 0,
+                    totalUnrealizedPnL: stats.totalUnrealizedPnL || 0,
+                    totalGrowth: stats.totalGrowth || 0,
+                    peakGrowth: stats.peakGrowth || 0,
+                    peakWalletBalance: stats.peakWalletBalance || 0,
+                    lowestWalletBalance: stats.lowestWalletBalance || 0,
+                    totalClosedTrades: stats.totalClosedTrades || 0,
+                    winningTrades: stats.winningTrades || 0,
+                    losingTrades: stats.losingTrades || 0,
+                    winRate: stats.totalClosedTrades > 0 ? ((stats.winningTrades / stats.totalClosedTrades) * 100).toFixed(2) : 0,
+                    totalFeesPaid: stats.totalFeesPaid || 0,
+                    currentDirection: stats.currentDirection || 'none',
+                    currentROI: stats.currentROI || 0,
+                    currentMarginUsed: stats.currentMarginUsed || 0,
+                    dgrDailyGrowthRate: stats.dgrDailyGrowthRate || 0,
+                    manualDirection: stats.manualDirection || 'long',
+                    lastTradeTime: stats.lastTradeTime,
+                    lastUpdate: stats.lastUpdate
+                }
+            };
+        });
+        
+        combinedData.sort((a, b) => (b.stats.totalGrowth || 0) - (a.stats.totalGrowth || 0));
+        
+        res.json({
+            totalUsers: combinedData.length,
+            activeTradingUsers: combinedData.filter(u => u.liveTradingEnabled).length,
+            users: combinedData
+        });
+    } catch (err) {
+        console.error('Admin users error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/admin/user/:userId', adminAuthMiddleware, async (req, res) => {
+    try {
+        const user = await UserModel.findById(req.params.userId).select('-passwordHash -salt -apiSecret');
+        if (!user) return res.status(404).json({ error: 'User not found' });
+        
+        const stats = await UserStatsModel.findOne({ userId: req.params.userId });
+        const walletSnapshots = await WalletSnapshotModel.find({ userId: req.params.userId })
+            .sort({ timestamp: -1 })
+            .limit(100);
+        const dailyPerformance = await DailyPerformanceModel.find({ userId: req.params.userId })
+            .sort({ date: -1 })
+            .limit(30);
+        const recentTrades = await TradeModel.find({ userId: req.params.userId })
+            .sort({ timestamp: -1 })
+            .limit(50);
+        
+        res.json({
+            user: {
+                _id: user._id,
+                name: user.name,
+                email: user.email,
+                createdAt: user.createdAt,
+                liveTradingEnabled: user.liveTradingEnabled
+            },
+            stats: stats || {},
+            walletHistory: walletSnapshots,
+            dailyPerformance: dailyPerformance,
+            recentTrades: recentTrades
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/admin/leaderboard', adminAuthMiddleware, async (req, res) => {
+    try {
+        const { metric = 'totalGrowth', limit = 10 } = req.query;
+        const allowedMetrics = ['totalGrowth', 'totalRealizedPnL', 'winningTrades', 'totalClosedTrades', 'peakGrowth'];
+        
+        if (!allowedMetrics.includes(metric)) {
+            return res.status(400).json({ error: 'Invalid metric' });
+        }
+        
+        const stats = await UserStatsModel.find({})
+            .sort({ [metric]: -1 })
+            .limit(parseInt(limit));
+        
+        const leaderboard = await Promise.all(stats.map(async (stat) => {
+            const user = await UserModel.findById(stat.userId).select('name email');
+            return {
+                userId: stat.userId,
+                name: user?.name || 'Unknown',
+                email: user?.email || 'Unknown',
+                metric: metric,
+                value: stat[metric],
+                totalGrowth: stat.totalGrowth,
+                totalPnL: stat.totalRealizedPnL,
+                tradesCount: stat.totalClosedTrades,
+                winRate: stat.totalClosedTrades > 0 ? ((stat.winningTrades / stat.totalClosedTrades) * 100).toFixed(2) : 0
+            };
+        }));
+        
+        res.json({ metric, leaderboard });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/admin/dashboard-stats', adminAuthMiddleware, async (req, res) => {
+    try {
+        const totalUsers = await UserModel.countDocuments();
+        const liveTraders = await UserModel.countDocuments({ liveTradingEnabled: true });
+        const usersWithKeys = await UserModel.countDocuments({ apiKey: { $ne: "" } });
+        
+        const allStats = await UserStatsModel.find({});
+        
+        const totalVolume = allStats.reduce((sum, s) => sum + (s.totalVolume || 0), 0);
+        const totalFees = allStats.reduce((sum, s) => sum + (s.totalFeesPaid || 0), 0);
+        const totalPnL = allStats.reduce((sum, s) => sum + (s.totalRealizedPnL || 0), 0);
+        const positivePnLUsers = allStats.filter(s => (s.totalRealizedPnL || 0) > 0).length;
+        
+        const totalWallets = allStats.reduce((sum, s) => sum + (s.currentWalletBalance || 0), 0);
+        const totalInitialWallets = allStats.reduce((sum, s) => sum + (s.initialWalletBalance || 0), 0);
+        const totalGrowthPercent = totalInitialWallets > 0 ? ((totalWallets - totalInitialWallets) / totalInitialWallets) * 100 : 0;
+        
+        const activePositions = allStats.filter(s => s.currentDirection !== 'none').length;
+        
+        const topPerformers = [...allStats]
+            .sort((a, b) => (b.totalGrowth || 0) - (a.totalGrowth || 0))
+            .slice(0, 5)
+            .map(s => ({
+                userId: s.userId,
+                name: s.name,
+                growth: s.totalGrowth,
+                pnl: s.totalRealizedPnL
+            }));
+        
+        res.json({
+            overview: {
+                totalUsers,
+                liveTraders,
+                usersWithKeys,
+                activePositions,
+                totalVolume: totalVolume.toFixed(2),
+                totalFees: totalFees.toFixed(2),
+                totalPnL: totalPnL.toFixed(2),
+                positivePnLUsers,
+                negativePnLUsers: totalUsers - positivePnLUsers,
+                totalWalletBalance: totalWallets.toFixed(2),
+                totalInitialBalance: totalInitialWallets.toFixed(2),
+                totalGrowthPercent: totalGrowthPercent.toFixed(2)
+            },
+            topPerformers
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/admin/reset-user-stats/:userId', adminAuthMiddleware, async (req, res) => {
+    try {
+        await UserStatsModel.findOneAndDelete({ userId: req.params.userId });
+        await WalletSnapshotModel.deleteMany({ userId: req.params.userId });
+        await DailyPerformanceModel.deleteMany({ userId: req.params.userId });
+        
+        res.json({ success: true, message: 'User stats reset successfully' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -1377,7 +1780,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 
             <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
                 <div class="lg:col-span-8 space-y-8">
-                    <!-- Stat Grid -->
                     <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
                         <div class="ui-card p-6 relative group overflow-hidden">
                             <div class="absolute inset-y-0 left-0 w-1 bg-zinc-950"></div>
@@ -1402,7 +1804,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                         </div>
                     </div>
 
-                    <!-- Chart -->
                     <div class="ui-card p-6 h-[450px] relative">
                         <div class="absolute top-6 left-8 z-10">
                             <div class="flex items-center gap-2 bg-white/80 backdrop-blur px-3 py-1.5 rounded-full border border-zinc-200 text-[9px] font-black uppercase">
@@ -1412,7 +1813,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                         <canvas id="priceChart"></canvas>
                     </div>
 
-                    <!-- History -->
                     <div class="ui-card overflow-hidden">
                         <div class="p-5 border-b flex items-center justify-between">
                             <h3 class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Exchange Execution Logs</h3>
@@ -1428,7 +1828,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                     </div>
                 </div>
 
-                <!-- Config Sidebar -->
                 <aside class="lg:col-span-4 space-y-8">
                     <div class="ui-card p-8 border-t-4 border-t-indigo-600">
                         <h3 class="text-sm font-black uppercase tracking-widest mb-8 flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">tune</span> DCA Parameters</h3>
@@ -1476,7 +1875,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- STEPS -->
         <section id="view-step-history" class="view-section max-w-4xl mx-auto px-4 py-20">
             <h2 class="text-4xl font-black mb-8 flex items-center gap-4 italic"><span class="material-symbols-outlined text-4xl">layers</span> DCA STEP TRACE</h2>
             <div class="ui-card overflow-hidden">
@@ -1489,7 +1887,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- SETTINGS -->
         <section id="view-settings" class="view-section max-w-xl mx-auto px-4 py-20">
             <div class="ui-card p-10 border-t-4 border-t-zinc-950">
                 <h2 class="text-3xl font-black mb-8 italic">API INTEGRATION</h2>
@@ -1506,7 +1903,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             </div>
         </section>
 
-        <!-- AUTH -->
         <section id="view-login" class="view-section max-w-md mx-auto px-4 py-32">
             <div class="ui-card p-10">
                 <h2 class="text-3xl font-black mb-8 italic">Welcome Back.</h2>
@@ -1626,7 +2022,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 if(res.error) alert("Reset failed: " + res.error);
                 else {
                     alert("✅ Account reset successfully! Starting fresh.");
-                    // Refresh dashboard data
                     if(dashLoop) clearInterval(dashLoop);
                     setTimeout(() => {
                         initDashboard();
