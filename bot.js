@@ -24,7 +24,7 @@ const UserModel = mongoose.model('User_V4', new mongoose.Schema({
     apiSecret2: { type: String, default: "" },
     liveTradingEnabled: { type: Boolean, default: false },
     config: { type: Object, default: {} },
-    activePositions: { type: Array, default: [] }, // Stores [{side, entry, qty...}]
+    activePositions: { type: Array, default: [] }, 
     lastCloseTime: { type: Number, default: 0 }      
 }));
 
@@ -38,11 +38,11 @@ const BASE_CONFIG = {
     htxSymbol: 'SHIB/USDT:USDT',         
     binanceSymbol: '1000SHIB/USDT:USDT', 
     leverage: 75, 
-    baseContracts: 100, // Starting amount
+    baseContracts: 100, 
     takeProfitPct: 5.0, 
     stopLossPct: -50.0, 
-    dcaRoiThresholdPct: -10.0, // DCA when -10% ROI
-    dcaMultiplier: 1.5,        // Increase size by 1.5x
+    dcaRoiThresholdPct: -10.0, 
+    dcaMultiplier: 1.5,        
     maxContracts: 50000
 };
 
@@ -69,6 +69,7 @@ class UserTradeInstance {
         this.activePositions = user.activePositions || [];
         this.isTrading = false;
         this.balances = { long: 0, short: 0 };
+        this.status = { long: 'Checking...', short: 'Checking...' }; // Added status
         this.livePositions = { long: { roi: 0, contracts: 0 }, short: { roi: 0, contracts: 0 } };
         this.applyUserKeys(user);
     }
@@ -76,15 +77,14 @@ class UserTradeInstance {
     applyUserKeys(user) {
         this.liveTradingEnabled = user.liveTradingEnabled;
         const opt = { agent: keepAliveAgent, options: { defaultType: 'swap', positionMode: 'hedged' } };
-        this.htxLong = new ccxt.pro.htx({ apiKey: user.apiKey, secret: user.apiSecret, ...opt });
-        this.htxShort = new ccxt.pro.htx({ apiKey: user.apiKey2, secret: user.apiSecret2, ...opt });
+        this.htxLong = new ccxt.htx({ apiKey: user.apiKey, secret: user.apiSecret, ...opt });
+        this.htxShort = new ccxt.htx({ apiKey: user.apiKey2, secret: user.apiSecret2, ...opt });
     }
 
     async saveState() {
         await UserModel.updateOne({ _id: this.userId }, { $set: { activePositions: this.activePositions, config: this.config } });
     }
 
-    // Opens both Long and Short at once
     async openHedge() {
         if (this.isTrading) return;
         this.isTrading = true;
@@ -101,31 +101,21 @@ class UserTradeInstance {
         if (this.liveTradingEnabled) {
             await ex.createMarketOrder(this.config.htxSymbol, type, qty, { offset: 'open' });
         }
-        // Logic to track internal state
         const existing = this.activePositions.find(p => p.side === side);
-        if (existing) {
-            existing.contracts += qty;
-        } else {
-            this.activePositions.push({ side, entryPrice: globalMarketData.binance.mid, contracts: qty });
-        }
+        if (existing) { existing.contracts += qty; } 
+        else { this.activePositions.push({ side, entryPrice: globalMarketData.binance.mid, contracts: qty }); }
     }
 
     async checkDCAAndExits() {
         if (this.isTrading || this.activePositions.length === 0) return;
-        
         for (const pos of this.activePositions) {
             const sideData = pos.side === 'long' ? this.livePositions.long : this.livePositions.short;
             const roi = sideData.roi;
-
-            // 1. Take Profit / Stop Loss
             if (roi >= this.config.takeProfitPct || roi <= this.config.stopLossPct) {
                 await this.closeSide(pos.side, roi >= this.config.takeProfitPct ? "TP" : "SL");
-            } 
-            // 2. DCA Logic
-            else if (roi <= this.config.dcaRoiThresholdPct) {
+            } else if (roi <= this.config.dcaRoiThresholdPct) {
                 const dcaQty = pos.contracts * (this.config.dcaMultiplier - 1);
                 if (pos.contracts + dcaQty <= this.config.maxContracts) {
-                    console.log(`DCA Triggered for ${pos.side}`);
                     await this.executeOrder(pos.side, pos.side === 'long' ? 'buy' : 'sell', dcaQty);
                 }
             }
@@ -141,7 +131,7 @@ class UserTradeInstance {
             if (this.liveTradingEnabled) {
                 await ex.createMarketOrder(this.config.htxSymbol, side === 'long' ? 'sell' : 'buy', pos.contracts, { reduceOnly: true, offset: 'close' });
             }
-            await TradeModel.create({ userId: this.userId, side, contracts: pos.contracts, exitReason: reason, netPnl: 0 }); // Pnl calculation simplified
+            await TradeModel.create({ userId: this.userId, side, contracts: pos.contracts, exitReason: reason, netPnl: 0 });
             this.activePositions = this.activePositions.filter(p => p.side !== side);
             await this.saveState();
         } catch(e) { console.error("Close Error", e); }
@@ -152,23 +142,27 @@ class UserTradeInstance {
         setInterval(async () => {
             if (this.liveTradingEnabled) {
                 try {
-                    const [b1, b2] = await Promise.all([this.htxLong.fetchBalance({type:'swap'}), this.htxShort.fetchBalance({type:'swap'})]);
-                    this.balances = { long: b1.total.USDT || 0, short: b2.total.USDT || 0 };
+                    const [b1, b2] = await Promise.all([
+                        this.htxLong.fetchBalance({type:'swap'}).catch(e => { this.status.long = "Auth Error"; return null; }),
+                        this.htxShort.fetchBalance({type:'swap'}).catch(e => { this.status.short = "Auth Error"; return null; })
+                    ]);
+                    
+                    if(b1) { this.balances.long = b1.total.USDT || 0; this.status.long = "Connected"; }
+                    if(b2) { this.balances.short = b2.total.USDT || 0; this.status.short = "Connected"; }
                     
                     const [p1, p2] = await Promise.all([
-                        this.htxLong.fetchPositions([this.config.htxSymbol]),
-                        this.htxShort.fetchPositions([this.config.htxSymbol])
+                        this.htxLong.fetchPositions([this.config.htxSymbol]).catch(() => []),
+                        this.htxShort.fetchPositions([this.config.htxSymbol]).catch(() => [])
                     ]);
 
                     const lp = p1.find(x => x.contracts > 0);
                     const sp = p2.find(x => x.contracts > 0);
-
                     this.livePositions.long = lp ? { roi: lp.percentage, contracts: lp.contracts } : { roi: 0, contracts: 0 };
                     this.livePositions.short = sp ? { roi: sp.percentage, contracts: sp.contracts } : { roi: 0, contracts: 0 };
-                    
-                    // Sync activePositions array with exchange reality
                     if (!lp && !sp) this.activePositions = [];
-                } catch(e){}
+                } catch(e){ console.log("Sync loop error"); }
+            } else {
+                this.status = { long: "Live Mode Off", short: "Live Mode Off" };
             }
         }, 2000);
     }
@@ -206,7 +200,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/data', authMiddleware, async (req, res) => {
     const w = workers.get(req.user._id.toString());
     const trades = await TradeModel.find({ userId: req.user._id.toString() }).sort({ timestamp: -1 }).limit(10);
-    res.json({ config: w.config, live: w.livePositions, balances: w.balances, trades, liveTradingEnabled: w.liveTradingEnabled });
+    res.json({ config: w.config, live: w.livePositions, balances: w.balances, trades, status: w.status, liveTradingEnabled: w.liveTradingEnabled });
 });
 
 app.post('/api/user/config', authMiddleware, async (req, res) => {
@@ -240,6 +234,7 @@ app.get('/', (req, res) => { res.send(`
         .card { background: white; border: 1px solid #eee; border-radius: 12px; padding: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.02); }
         .input { border: 1px solid #ddd; padding: 8px; border-radius: 6px; width: 100%; font-size: 13px; }
         .label { font-size: 11px; font-weight: 700; color: #888; text-transform: uppercase; margin-bottom: 4px; display: block; }
+        .status-dot { height: 8px; width: 8px; border-radius: 50%; display: inline-block; margin-right: 4px; }
     </style>
 </head>
 <body class="p-8">
@@ -262,7 +257,10 @@ app.get('/', (req, res) => { res.send(`
 
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
             <div class="card">
-                <p class="label">Long Account (Primary)</p>
+                <div class="flex justify-between items-start mb-2">
+                    <p class="label">Long Account (Primary)</p>
+                    <span id="l-stat" class="text-[10px] font-bold uppercase py-1 px-2 rounded bg-gray-100">Checking...</span>
+                </div>
                 <div class="flex justify-between items-end">
                     <div>
                         <p id="l-bal" class="text-2xl font-bold">$0.00</p>
@@ -275,7 +273,10 @@ app.get('/', (req, res) => { res.send(`
                 </div>
             </div>
             <div class="card">
-                <p class="label">Short Account (Secondary)</p>
+                <div class="flex justify-between items-start mb-2">
+                    <p class="label">Short Account (Secondary)</p>
+                    <span id="s-stat" class="text-[10px] font-bold uppercase py-1 px-2 rounded bg-gray-100">Checking...</span>
+                </div>
                 <div class="flex justify-between items-end">
                     <div>
                         <p id="s-bal" class="text-2xl font-bold">$0.00</p>
@@ -356,6 +357,14 @@ app.get('/', (req, res) => { res.send(`
                 document.getElementById('s-roi').innerText = d.live.short.roi.toFixed(2) + '%';
                 document.getElementById('l-vol').innerText = d.live.long.contracts;
                 document.getElementById('s-vol').innerText = d.live.short.contracts;
+
+                // Update Status UI
+                const ls = document.getElementById('l-stat');
+                const ss = document.getElementById('s-stat');
+                ls.innerText = d.status.long;
+                ss.innerText = d.status.short;
+                ls.className = d.status.long === "Connected" ? "text-[10px] font-bold uppercase py-1 px-2 rounded bg-green-100 text-green-700" : "text-[10px] font-bold uppercase py-1 px-2 rounded bg-red-100 text-red-700";
+                ss.className = d.status.short === "Connected" ? "text-[10px] font-bold uppercase py-1 px-2 rounded bg-green-100 text-green-700" : "text-[10px] font-bold uppercase py-1 px-2 rounded bg-red-100 text-red-700";
 
                 if(!document.getElementById('cfg-tp').value) {
                     document.getElementById('cfg-tp').value = d.config.takeProfitPct;
