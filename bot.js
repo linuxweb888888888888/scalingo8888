@@ -14,7 +14,7 @@ mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000, socketTimeoutMS: 4
     .then(() => console.log('✅ MongoDB Connected Successfully'))
     .catch(err => console.error('🚨 MongoDB Connection Error:', err));
 
-const UserModel = mongoose.model('User_V3', new mongoose.Schema({
+const UserModel = mongoose.model('User_V4_Hedge', new mongoose.Schema({
     name: { type: String, required: true },
     email: { type: String, unique: true, required: true },
     passwordHash: { type: String, required: true },
@@ -22,27 +22,22 @@ const UserModel = mongoose.model('User_V3', new mongoose.Schema({
     token: { type: String },
     apiKey: { type: String, default: "" },
     apiSecret: { type: String, default: "" },
-    apiKey2: { type: String, default: "" }, // HEDGED: Account 2 Key
-    apiSecret2: { type: String, default: "" }, // HEDGED: Account 2 Secret
+    apiKey2: { type: String, default: "" }, // ACCOUNT 2 (Shorts)
+    apiSecret2: { type: String, default: "" }, // ACCOUNT 2 (Shorts)
     liveTradingEnabled: { type: Boolean, default: false },
     config: { type: Object, default: {} },
     activePosition: { type: Object, default: null }, 
     lastCloseTime: { type: Number, default: 0 }      
 }));
 
-const TradeModel = mongoose.model('TradeLog_V3', new mongoose.Schema({
+const TradeModel = mongoose.model('TradeLog_V4_Hedge', new mongoose.Schema({
     userId: { type: String, required: true }, side: String, entryPrice: Number, exitPrice: Number,
     contracts: Number, marginUsed: Number, grossPnl: Number, grossRoiPct: Number, roiPct: Number, 
     netPnl: Number, feeCost: Number, timestamp: { type: Date, default: Date.now }, exitReason: String
 }));
 
-const ChartDataModel = mongoose.model('ChartData_V8', new mongoose.Schema({
+const ChartDataModel = mongoose.model('ChartData_V9', new mongoose.Schema({
     priceMid: Number, mlPlot: Number, timestamp: { type: Date, default: Date.now, expires: 86400 } 
-}));
-
-const AnalyticsModel = mongoose.model('SiteAnalytics_V3', new mongoose.Schema({
-    key: { type: String, default: "global" }, views: { type: Number, default: 0 },
-    uniques: { type: Number, default: 0 }, knownIds: { type: [String], default: [] }
 }));
 
 // ==================== BASE CONFIGURATION ====================
@@ -57,33 +52,22 @@ const BASE_CONFIG = {
     mlAverageTicks: 5, mlUseAverage: false, flipOnlyInProfit: true, flipThresholdPct: 0.5, 
     dcaRoiThresholdPct: 1.0, dcaMultiplier: 2.0, 
     profitRoiThresholdPct: 2.0, profitMultiplier: 2.0, 
-    maxContracts: 100, 
-    chartTicks: 800
+    maxContracts: 100, chartTicks: 800
 };
 
 const globalMarketData = { 
     binance: { bid: 0, ask: 0, mid: 0, timestamp: 0 },
-    htx: { bid: 0, ask: 0, mid: 0, timestamp: 0 },
     tickBuffer: [],
     mlSignal: { confidence: 0, type: 'flat', rawValue: 0.5 } 
 };
 const memoryChartHistory = []; 
 const publicBinance = new ccxt.pro.binance({ options: { defaultType: 'swap', defaultSubType: 'linear' } });
-const publicHtx = new ccxt.pro.htx({ options: { defaultType: 'swap', defaultSubType: 'linear' } });
-
 const mlSignalCache = new Map();
 
 // ==================== SECURITY & AUTH ====================
 function hashPassword(password, salt) { return crypto.scryptSync(password, salt, 64).toString('hex'); }
 function generateToken() { return crypto.randomBytes(32).toString('hex'); }
 const tokenCache = new Map();
-
-setInterval(() => {
-    const now = Date.now();
-    for (const [token, data] of tokenCache.entries()) {
-        if (now - data.lastAccessed > 3600000) tokenCache.delete(token);
-    }
-}, 600000);
 
 async function authMiddleware(req, res, next) {
     const token = req.headers['authorization'];
@@ -94,7 +78,7 @@ async function authMiddleware(req, res, next) {
         if (!user) return res.status(401).json({ error: 'Unauthorized' });
         userEntry = { user, lastAccessed: Date.now() };
         tokenCache.set(token, userEntry);
-    } else userEntry.lastAccessed = Date.now();
+    }
     req.user = userEntry.user;
     next();
 }
@@ -110,6 +94,7 @@ function calculateTradeMath(side, entryPrice, currentPrice, sizeUsd, leverage, t
     return { grossPnlPercent, currentGrossRoi: grossPnlPercent * leverage, grossPnlUsd, grossRoiPct, netPnlUsd, netRoiPct: (netPnlUsd / margin) * 100, feeCost, margin };
 }
 
+// ==================== ML ENGINE ====================
 function calculateMLSignal(prices, lookback) {
     if (prices.length < lookback + 15 || lookback < 10) return { confidence: 0, type: 'flat', rawValue: 0.5 };
     let X = [], y = [];
@@ -119,693 +104,326 @@ function calculateMLSignal(prices, lookback) {
         ((prices[idx] - prices[idx-5]) / prices[idx-5]) * 1000,
         ((prices[idx] - prices[idx-10]) / prices[idx-10]) * 1000
     ];
-    const trainEnd = prices.length - 2; 
-    const trainStart = trainEnd - lookback;
-    let upCount = 0, downCount = 0;
-    for (let i = trainStart; i <= trainEnd; i++) {
+    for (let i = prices.length - lookback - 1; i < prices.length - 1; i++) {
         X.push(getFeatures(i));
-        let diff = prices[i+1] - prices[i];
-        let label = 0.5;
-        if (diff > 0) { label = 1; upCount++; } else if (diff < 0) { label = 0; downCount++; }
-        y.push(label);
+        y.push((prices[i+1] - prices[i]) > 0 ? 1 : 0);
     }
-    let n = X.length, totalDirectional = upCount + downCount;
-    let upWeight = totalDirectional > 0 && upCount > 0 ? (totalDirectional / (2 * upCount)) : 1;
-    let downWeight = totalDirectional > 0 && downCount > 0 ? (totalDirectional / (2 * downCount)) : 1;
-    let means = [0, 0, 0, 0], stds = [0, 0, 0, 0];
-    for(let i=0; i<n; i++) for(let j=0; j<4; j++) means[j] += X[i][j];
-    for(let j=0; j<4; j++) means[j] /= n;
-    for(let i=0; i<n; i++) for(let j=0; j<4; j++) stds[j] += Math.pow(X[i][j] - means[j], 2);
-    for(let j=0; j<4; j++) { stds[j] = Math.sqrt(stds[j] / n); if (stds[j] === 0) stds[j] = 1; }
-    for(let i=0; i<n; i++) for(let j=0; j<4; j++) X[i][j] = (X[i][j] - means[j]) / stds[j];
-    let w = [0, 0, 0, 0], b = 0, lr = 0.05, epochs = 20; 
-    for (let e = 0; e < epochs; e++) {
-        for (let i = 0; i < n; i++) {
-            let z = w[0]*X[i][0] + w[1]*X[i][1] + w[2]*X[i][2] + w[3]*X[i][3] + b;
-            let pred = 1 / (1 + Math.exp(-Math.max(Math.min(z, 20), -20))); 
-            let weight = y[i] === 1 ? upWeight : (y[i] === 0 ? downWeight : 1);
-            let err = (pred - y[i]) * weight;
+    let w = [0,0,0,0], b = 0, lr = 0.05;
+    for (let e=0; e<20; e++) {
+        for (let i=0; i<X.length; i++) {
+            let pred = 1 / (1 + Math.exp(-(w[0]*X[i][0] + w[1]*X[i][1] + w[2]*X[i][2] + w[3]*X[i][3] + b)));
+            let err = pred - y[i];
             for(let j=0; j<4; j++) w[j] -= lr * err * X[i][j];
             b -= lr * err;
         }
     }
-    let currX = getFeatures(prices.length - 1);
-    for(let j=0; j<4; j++) currX[j] = (currX[j] - means[j]) / stds[j];
-    let zCur = w[0]*currX[0] + w[1]*currX[1] + w[2]*currX[2] + w[3]*currX[3] + b;
-    let finalPred = 1 / (1 + Math.exp(-Math.max(Math.min(zCur, 20), -20)));
+    let curX = getFeatures(prices.length - 1);
+    let finalPred = 1 / (1 + Math.exp(-(w[0]*curX[0] + w[1]*curX[1] + w[2]*curX[2] + w[3]*curX[3] + b)));
     finalPred = 1 - finalPred;
-    let confidence = Math.abs(finalPred - 0.5) * 200; 
-    return { confidence: Math.min(confidence, 100), type: finalPred >= 0.5 ? 'bull' : 'bear', rawValue: finalPred };
+    return { confidence: Math.min(Math.abs(finalPred - 0.5) * 200, 100), type: finalPred >= 0.5 ? 'bull' : 'bear', rawValue: finalPred };
 }
 
+// ==================== PERFORMANCE TRACKER ====================
 class PerformanceMetrics {
     constructor(userId) {
         this.userId = userId; this.trades = []; 
-        this.totalGrossPnl = 0; this.totalNetPnl = 0; this.totalFees = 0; this.totalRoiPct = 0;
-        this.wins = 0; this.losses = 0; this.winRate = 0; this.totalTradesCount = 0; this.maxMarginUsed = 0; 
+        this.totalNetPnl = 0; this.wins = 0; this.losses = 0; this.winRate = 0; this.totalTradesCount = 0;
     }
     async init() { 
-        const dbTrades = await TradeModel.find({ userId: this.userId }).sort({ timestamp: -1 }).limit(2000).lean(); 
+        const dbTrades = await TradeModel.find({ userId: this.userId }).sort({ timestamp: -1 }).limit(100).lean(); 
         dbTrades.reverse().forEach(t => this.processTrade(t, false)); 
     }
-    recordTrade(trade) { this.processTrade(trade, true); }
-    processTrade(trade, saveToDb = true) {
-        this.totalTradesCount++; if (!trade.timestamp) trade.timestamp = Date.now();
-        this.trades.push(trade); if (this.trades.length > 2000) this.trades.shift(); 
-        if (trade.marginUsed > this.maxMarginUsed) this.maxMarginUsed = trade.marginUsed;
-        this.totalNetPnl += trade.netPnl || 0; this.totalFees += trade.feeCost || 0; this.totalRoiPct += trade.roiPct || 0; 
+    processTrade(trade, save = true) {
+        this.totalTradesCount++;
+        this.trades.push(trade); if (this.trades.length > 100) this.trades.shift();
+        this.totalNetPnl += trade.netPnl || 0;
         if (trade.netPnl > 0) this.wins++; else this.losses++;
-        this.winRate = this.trades.length ? ((this.wins / this.trades.length) * 100).toFixed(2) : 0;
-        if (saveToDb) TradeModel.create({ ...trade, userId: this.userId }).catch(()=>{});
+        this.winRate = ((this.wins / this.trades.length) * 100).toFixed(2);
+        if (save) TradeModel.create({ ...trade, userId: this.userId }).catch(()=>{});
     }
-    updateMaxMargin(margin) { if (margin > this.maxMarginUsed) this.maxMarginUsed = margin; }
 }
 
-async function runBacktestSimulation(config, tickCount, symbol) {
-    try { await publicBinance.loadMarkets(); } catch (e) { return { error: `Market resolution error: ${e.message}` }; }
-    let allCandles = [], since = Date.now() - (tickCount * 60 * 1000); 
-    try {
-        while (allCandles.length < tickCount) {
-            const limit = Math.min(1000, tickCount - allCandles.length);
-            const ohlcv = await publicBinance.fetchOHLCV(symbol, '1m', since, limit);
-            if (!ohlcv || ohlcv.length === 0) break;
-            allCandles.push(...ohlcv);
-            since = ohlcv[ohlcv.length - 1][0] + 60000;
-            if (allCandles.length < tickCount) await new Promise(r => setTimeout(r, 100));
-        }
-    } catch (e) { if (allCandles.length === 0) allCandles = await publicBinance.fetchOHLCV(symbol, '1m', undefined, Math.min(tickCount, 1000)).catch(()=>[]) || []; }
-    const ticks = allCandles.map(c => ({ timestamp: c[0], priceMid: c[4] }));
-    if (!ticks || ticks.length === 0) return { error: `No historical tick data fetched for ${symbol}.` };
-    let activePos = null, closedTrades = [], netPnl = 0, wins = 0, losses = 0, totalTradeDurationMs = 0, maxMarginUsed = 0;
-    const { mlLookback=50, mlThreshold=60.0, mlAverageTicks=5, mlUseAverage=false, flipOnlyInProfit=true, flipThresholdPct=0.5 } = config;
-    const dcaRoiThresholdPct = config.dcaRoiThresholdPct || 1.0;
-    const profitRoiThresholdPct = config.profitRoiThresholdPct !== undefined ? config.profitRoiThresholdPct : 2.0;
-    const maxContracts = config.maxContracts !== undefined ? Number(config.maxContracts) : 100;
-    let priceBuffer = [], mlRawBuffer = [];
-    const totalSpanMs = ticks[ticks.length - 1].timestamp - ticks[0].timestamp;
-    for (const tick of ticks) {
-        const price = tick.priceMid, tickTime = tick.timestamp;
-        if (priceBuffer.length === 0 || price !== priceBuffer[priceBuffer.length - 1]) { priceBuffer.push(price); if (priceBuffer.length > 500) priceBuffer.shift(); }
-        if (ticks.indexOf(tick) % 500 === 0) { await new Promise(resolve => setImmediate(resolve)); }
-        const mlSig = calculateMLSignal(priceBuffer, mlLookback);
-        mlRawBuffer.push(mlSig.rawValue); if (mlRawBuffer.length > mlAverageTicks) mlRawBuffer.shift();
-        let avgRaw = mlRawBuffer.reduce((a,b)=>a+b,0) / mlRawBuffer.length;
-        let avgConf = Math.min(Math.abs(avgRaw - 0.5) * 200, 100);
-        let avgType = avgRaw >= 0.5 ? 'bull' : 'bear';
-        let activeType = mlUseAverage ? avgType : mlSig.type;
-        let activeConf = mlUseAverage ? avgConf : mlSig.confidence;
-        let signal = (activeType === 'bull' && activeConf >= mlThreshold) ? 'long' : (activeType === 'bear' && activeConf >= mlThreshold) ? 'short' : null;
-        if (!activePos && signal) {
-            let bC = parseInt(config.baseContracts) || 1;
-            const sizeUsd = bC * config.contractSize * price; 
-            const margin = sizeUsd / FORCED_LEVERAGE;
-            activePos = { side: signal, entryPrice: price, contracts: bC, size: sizeUsd, marginUsed: margin, entryTime: tickTime, lastDcaTime: 0, dcaStep: 0 };
-            if (margin > maxMarginUsed) maxMarginUsed = margin;
-            continue;
-        }
-        if (activePos) {
-            const math = calculateTradeMath(activePos.side, activePos.entryPrice, price, activePos.size, FORCED_LEVERAGE, config.fees.taker);
-            let forceExitReason = null;
-            if (signal && activePos.side !== signal) {
-                if (flipOnlyInProfit) { if (math.currentGrossRoi >= flipThresholdPct) forceExitReason = "ML_FLIP"; } else forceExitReason = "ML_FLIP";
-            }
-            if (!forceExitReason && math.currentGrossRoi >= config.takeProfitPct) forceExitReason = "TAKE_PROFIT";
-            else if (!forceExitReason && math.currentGrossRoi <= config.stopLossPct) forceExitReason = "STOP_LOSS";
-            if (forceExitReason) {
-                netPnl += math.netPnlUsd; math.netPnlUsd > 0 ? wins++ : losses++;
-                totalTradeDurationMs += (tickTime - activePos.entryTime);
-                closedTrades.push({ side: activePos.side, entryPrice: activePos.entryPrice, exitPrice: price, contracts: activePos.contracts, grossPnl: math.grossPnlUsd, grossRoiPct: math.grossRoiPct, netPnl: math.netPnlUsd, roiPct: math.netRoiPct, exitReason: forceExitReason, time: tick.timestamp });
-                if (forceExitReason === "ML_FLIP") {
-                    let bC = parseInt(config.baseContracts) || 1;
-                    const sizeUsd = bC * config.contractSize * price; 
-                    activePos = { side: signal, entryPrice: price, contracts: bC, size: sizeUsd, marginUsed: sizeUsd / FORCED_LEVERAGE, entryTime: tickTime, lastDcaTime: 0, dcaStep: 0 };
-                    if (activePos.marginUsed > maxMarginUsed) maxMarginUsed = activePos.marginUsed;
-                } else activePos = null;
-            } else {
-                const requiredRoiForDca = -(Math.abs(dcaRoiThresholdPct || 1.0));
-                if (math.currentGrossRoi <= requiredRoiForDca && tickTime - (activePos.lastDcaTime || 0) >= 3000) {
-                    let bC = Number(config.baseContracts) || 1;
-                    let mult = Number(config.dcaMultiplier) || 2.0;
-                    let step = Number(activePos.dcaStep) || 0;
-                    let contractsToAdd = parseInt(Math.max(1, Math.floor(bC * Math.pow(mult, step))), 10);
-                    const addedSizeUsd = contractsToAdd * Number(config.contractSize) * price;
-                    activePos.entryPrice = ((Number(activePos.entryPrice) * Number(activePos.size)) + (price * addedSizeUsd)) / (Number(activePos.size) + addedSizeUsd);
-                    activePos.size = Number(activePos.size) + addedSizeUsd; 
-                    activePos.contracts = Number(activePos.contracts) + contractsToAdd;
-                    activePos.marginUsed = Number(activePos.marginUsed) + (addedSizeUsd / FORCED_LEVERAGE);
-                    activePos.lastDcaTime = tickTime; activePos.dcaStep = step + 1;
-                    if (activePos.marginUsed > maxMarginUsed) maxMarginUsed = activePos.marginUsed;
-                } else if (math.currentGrossRoi >= profitRoiThresholdPct && tickTime - (activePos.lastDcaTime || 0) >= 3000) {
-                    let bC = Number(config.baseContracts) || 1;
-                    let mult = Number(config.profitMultiplier) || 2.0;
-                    let step = Number(activePos.dcaStep) || 0;
-                    let contractsToAdd = parseInt(Math.max(1, Math.floor(bC * Math.pow(mult, step))), 10);
-                    if (Number(activePos.contracts) + contractsToAdd <= maxContracts) {
-                        const addedSizeUsd = contractsToAdd * Number(config.contractSize) * price;
-                        activePos.entryPrice = ((Number(activePos.entryPrice) * Number(activePos.size)) + (price * addedSizeUsd)) / (Number(activePos.size) + addedSizeUsd);
-                        activePos.size = Number(activePos.size) + addedSizeUsd; 
-                        activePos.contracts = Number(activePos.contracts) + contractsToAdd;
-                        activePos.marginUsed = Number(activePos.marginUsed) + (addedSizeUsd / FORCED_LEVERAGE);
-                        activePos.lastDcaTime = tickTime; activePos.dcaStep = step + 1;
-                        if (activePos.marginUsed > maxMarginUsed) maxMarginUsed = activePos.marginUsed;
-                    }
-                }
-            }
-        }
-    }
-    if (activePos) {
-        const lastTick = ticks[ticks.length - 1]; 
-        const math = calculateTradeMath(activePos.side, activePos.entryPrice, lastTick.priceMid, activePos.size, FORCED_LEVERAGE, config.fees.taker);
-        netPnl += math.netPnlUsd; math.netPnlUsd > 0 ? wins++ : losses++;
-        totalTradeDurationMs += (lastTick.timestamp - activePos.entryTime);
-        closedTrades.push({ side: activePos.side, entryPrice: activePos.entryPrice, exitPrice: lastTick.priceMid, contracts: activePos.contracts, grossPnl: math.grossPnlUsd, grossRoiPct: math.grossRoiPct, netPnl: math.netPnlUsd, roiPct: math.netRoiPct, exitReason: "END_OF_TEST", time: lastTick.timestamp });
-    }
-    const totalTradesCount = closedTrades.length;
-    const formatTime = (ms) => {
-        if (ms < 1000) return "< 1s";
-        let s = Math.floor(ms / 1000), m = Math.floor(s / 60), h = Math.floor(m / 60), d = Math.floor(h / 24);
-        if (d > 0) return `${d}d ${h%24}h`; if (h > 0) return `${h}h ${m%60}m`; if (m > 0) return `${m}m ${s%60}s`; return `${s}s`;
-    };
-    return { ticksAnalyzed: ticks.length, totalTradesCount, wins, losses, winRate: totalTradesCount > 0 ? ((wins / totalTradesCount) * 100).toFixed(2) : 0, netPnl, depositNeeded: maxMarginUsed, avgDuration: formatTime(totalTradesCount > 0 ? totalTradeDurationMs / totalTradesCount : 0), totalSpan: formatTime(totalSpanMs), trades: closedTrades.slice(-200) };
-}
-
-// ==================== USER BOT INSTANCE (HEDGED) ====================
+// ==================== HEDGED USER INSTANCE ====================
 class UserTradeInstance {
     constructor(user) {
-        this.userId = user._id.toString(); 
-        this.config = { ...BASE_CONFIG, ...(user.config || {}) }; 
-        if (!this.config.htxSymbol || this.config.htxSymbol.includes('1000')) { this.config.htxSymbol = 'SHIB/USDT:USDT'; this.config.binanceSymbol = '1000SHIB/USDT:USDT'; }
-        if (!this.config.contractSize) this.config.contractSize = 1000;
-        this.config.leverage = FORCED_LEVERAGE; this.config.marginMode = 'cross'; 
-        this.startTime = Date.now(); this.metrics = new PerformanceMetrics(this.userId);
-        this.activePositions = user.activePosition ? [user.activePosition] : []; 
+        this.userId = user._id.toString();
+        this.config = { ...BASE_CONFIG, ...(user.config || {}) };
+        this.activePositions = user.activePosition ? [user.activePosition] : [];
         this.lastCloseTime = user.lastCloseTime || 0;
-        this.isTrading = false; this.currentMl = { confidence: 0, type: 'flat', rawValue: 0.5 };
-        this.mlRawBuffer = []; this.lastEvalPrice = 0; this.walletBalance = 0;
+        this.metrics = new PerformanceMetrics(this.userId);
+        this.isTrading = false; this.currentMl = { confidence: 0, type: 'flat' };
+        this.mlRawBuffer = []; this.walletBalance = 0;
         this.applyUserKeys(user);
     }
     applyUserKeys(user) {
-        this.liveTradingEnabled = user.liveTradingEnabled; 
-        const key1 = user.apiKey || "demo", sec1 = user.apiSecret || "demo";
-        const key2 = user.apiKey2 || "demo", sec2 = user.apiSecret2 || "demo";
-        const opt = { agent: keepAliveAgent, enableRateLimit: false, options: { defaultType: 'swap', defaultSubType: 'linear', defaultMarginMode: 'cross', positionMode: 'hedged' } };
-        this.htxLong = new ccxt.pro.htx({ apiKey: key1, secret: sec1, ...opt }); // Account for Longs
-        this.htxShort = new ccxt.pro.htx({ apiKey: key2, secret: sec2, ...opt }); // Account for Shorts
+        this.liveTradingEnabled = user.liveTradingEnabled;
+        const opt = { agent: keepAliveAgent, options: { defaultType: 'swap', defaultSubType: 'linear', positionMode: 'hedged' } };
+        this.htxLong = new ccxt.pro.htx({ apiKey: user.apiKey, secret: user.apiSecret, ...opt });
+        this.htxShort = new ccxt.pro.htx({ apiKey: user.apiKey2, secret: user.apiSecret2, ...opt });
     }
     async initialize() {
-        await this.metrics.init(); if (this.activePositions.length > 0) this.metrics.updateMaxMargin(this.activePositions[0].marginUsed);
-        await this.connectExchange(); this.startExchangeROISync();
+        await this.metrics.init();
+        if (this.liveTradingEnabled) {
+            try { 
+                await this.htxLong.loadMarkets(); await this.htxShort.loadMarkets();
+                await this.htxLong.setLeverage(FORCED_LEVERAGE, this.config.htxSymbol).catch(()=>{});
+                await this.htxShort.setLeverage(FORCED_LEVERAGE, this.config.htxSymbol).catch(()=>{});
+            } catch(e){}
+        }
+        this.startSync();
     }
     async saveState() {
-        await UserModel.updateOne({ _id: this.userId }, { $set: { activePosition: this.activePositions.length > 0 ? this.activePositions[0] : null, lastCloseTime: this.lastCloseTime, config: this.config } });
-        const cacheEntry = tokenCache.get(this.userId); if(cacheEntry) cacheEntry.user.activePosition = this.activePositions.length > 0 ? this.activePositions[0] : null; 
-    }
-    async connectExchange() {
-        try {
-            if(this.liveTradingEnabled) {
-                await this.htxLong.loadMarkets(); await this.htxShort.loadMarkets();
-                try { await this.htxLong.setMarginMode('cross', this.config.htxSymbol); await this.htxShort.setMarginMode('cross', this.config.htxSymbol); } catch(e){}
-                try { await this.htxLong.setLeverage(FORCED_LEVERAGE, this.config.htxSymbol); await this.htxShort.setLeverage(FORCED_LEVERAGE, this.config.htxSymbol); } catch(e){}
-                const posLong = (await this.htxLong.fetchPositions([this.config.htxSymbol])).find(p => p.contracts > 0);
-                const posShort = (await this.htxShort.fetchPositions([this.config.htxSymbol])).find(p => p.contracts > 0);
-                const openPos = posLong || posShort;
-                if (openPos) {
-                    let entryP = openPos.entryPrice; if (this.config.htxSymbol.includes('SHIB') && !this.config.htxSymbol.includes('1000')) entryP = entryP * 1000;
-                    const sizeUsd = openPos.contracts * this.config.contractSize * entryP;
-                    this.activePositions = [{ id: Date.now(), side: openPos.side, entryPrice: entryP, contracts: openPos.contracts, size: sizeUsd, marginUsed: sizeUsd / FORCED_LEVERAGE, exchangeROI: openPos.percentage || 0, exchangePnl: openPos.unrealizedPnl || 0, entryTime: Date.now(), isPaper: false, lastDcaTime: 0, dcaStep: 0, stepHistory: [] }];
-                    this.metrics.updateMaxMargin(this.activePositions[0].marginUsed); await this.saveState();
-                } else { this.activePositions = []; await this.saveState(); }
-            } return { success: true };
-        } catch (error) { this.liveTradingEnabled = false; return { success: false, message: error.message }; }
+        await UserModel.updateOne({ _id: this.userId }, { $set: { activePosition: this.activePositions[0] || null, lastCloseTime: this.lastCloseTime, config: this.config } });
     }
     async evaluateAIEntry() {
-        let mlSig = mlSignalCache.get(this.config.mlLookback);
-        if (!mlSig) { mlSig = calculateMLSignal(globalMarketData.tickBuffer, this.config.mlLookback || 50); mlSignalCache.set(this.config.mlLookback, mlSig); }
-        if (this.lastEvalPrice !== globalMarketData.binance.mid) { this.mlRawBuffer.push(mlSig.rawValue); if (this.mlRawBuffer.length > (this.config.mlAverageTicks || 5)) this.mlRawBuffer.shift(); this.lastEvalPrice = globalMarketData.binance.mid; }
-        let avgRaw = this.mlRawBuffer.length > 0 ? (this.mlRawBuffer.reduce((a,b)=>a+b,0) / this.mlRawBuffer.length) : mlSig.rawValue;
-        let avgConf = Math.min(Math.abs(avgRaw - 0.5) * 200, 100);
-        this.currentMl = { confidence: mlSig.confidence, type: mlSig.type, rawValue: mlSig.rawValue, avgRaw: avgRaw, avgConfidence: avgConf, avgType: avgRaw >= 0.5 ? 'bull' : 'bear' };
-        if (this.isTrading || (Date.now() - this.lastCloseTime < 3000)) return;
-        try {
-            let activeType = this.config.mlUseAverage ? this.currentMl.avgType : mlSig.type;
-            let activeConf = this.config.mlUseAverage ? this.currentMl.avgConfidence : mlSig.confidence;
-            let signal = (activeType === 'bull' && activeConf >= (this.config.mlThreshold || 60.0)) ? 'long' : (activeType === 'bear' && activeConf >= (this.config.mlThreshold || 60.0)) ? 'short' : null;
-            if (this.activePositions.length > 0) {
-                const pos = this.activePositions[0];
-                if (signal && pos.side !== signal) {
-                    let currentPrice = pos.side === 'long' ? globalMarketData.binance.bid : globalMarketData.binance.ask; if (!currentPrice) currentPrice = globalMarketData.binance.mid;
-                    const pnlPercent = pos.side === 'long' ? ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100 : ((pos.entryPrice - currentPrice) / pos.entryPrice) * 100;
-                    let instantRoi = pnlPercent * FORCED_LEVERAGE;
-                    if (this.config.flipOnlyInProfit !== false) { if (instantRoi >= (this.config.flipThresholdPct || 0.0)) { await this.forceClosePosition("ML_FLIP"); setTimeout(() => this.syncState(signal), 50); } } else { await this.forceClosePosition("ML_FLIP"); setTimeout(() => this.syncState(signal), 50); }
+        const mlSig = calculateMLSignal(globalMarketData.tickBuffer, this.config.mlLookback);
+        this.mlRawBuffer.push(mlSig.rawValue); if (this.mlRawBuffer.length > this.config.mlAverageTicks) this.mlRawBuffer.shift();
+        const avgRaw = this.mlRawBuffer.reduce((a,b)=>a+b,0)/this.mlRawBuffer.length;
+        this.currentMl = { confidence: mlSig.confidence, type: mlSig.type, avgConf: Math.abs(avgRaw-0.5)*200, avgType: avgRaw >= 0.5 ? 'bull' : 'bear' };
+
+        if (this.isTrading || Date.now() - this.lastCloseTime < 3000) return;
+        
+        const activeType = this.config.mlUseAverage ? this.currentMl.avgType : this.currentMl.type;
+        const activeConf = this.config.mlUseAverage ? this.currentMl.avgConf : this.currentMl.confidence;
+        const signal = activeConf >= this.config.mlThreshold ? (activeType === 'bull' ? 'long' : 'short') : null;
+
+        if (this.activePositions.length > 0) {
+            const pos = this.activePositions[0];
+            if (signal && pos.side !== signal) {
+                if (!this.config.flipOnlyInProfit || pos.exchangeROI >= (this.config.flipThresholdPct || 0)) {
+                    await this.closePosition("ML_FLIP");
+                    setTimeout(() => this.openPosition(signal), 500);
                 }
-            } else { if (signal) await this.syncState(signal); }
-        } catch (e) {}
+            }
+        } else if (signal) await this.openPosition(signal);
     }
     async checkExits() {
         if (this.isTrading || this.activePositions.length === 0) return;
-        try {
-            const pos = this.activePositions[0];
-            let effectiveRoi = 0;
-            if (this.liveTradingEnabled && !pos.isPaper) effectiveRoi = pos.exchangeROI || 0;
-            else {
-                let currentPrice = pos.side === 'long' ? globalMarketData.binance.bid : globalMarketData.binance.ask; if (!currentPrice) currentPrice = globalMarketData.binance.mid;
-                const pnlPercent = pos.side === 'long' ? ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100 : ((pos.entryPrice - currentPrice) / pos.entryPrice) * 100;
-                effectiveRoi = pnlPercent * FORCED_LEVERAGE;
-            }
-            if (effectiveRoi >= this.config.takeProfitPct) await this.forceClosePosition("TAKE_PROFIT");
-            else if (effectiveRoi <= this.config.stopLossPct) await this.forceClosePosition("STOP_LOSS");
-            else {
-                const reqDca = -(Math.abs(this.config.dcaRoiThresholdPct || 1.0));
-                const reqProfit = this.config.profitRoiThresholdPct !== undefined ? this.config.profitRoiThresholdPct : 2.0;
-                if (effectiveRoi <= reqDca && Date.now() - (pos.lastDcaTime || 0) > 10000) await this.addDcaPosition(false);
-                else if (effectiveRoi >= reqProfit && Date.now() - (pos.lastDcaTime || 0) > 10000) await this.addDcaPosition(true);
-            }
-        } catch (e) {}
+        const pos = this.activePositions[0];
+        const roi = pos.exchangeROI || 0;
+        if (roi >= this.config.takeProfitPct) await this.closePosition("TAKE_PROFIT");
+        else if (roi <= this.config.stopLossPct) await this.closePosition("STOP_LOSS");
+        else if (roi <= -(this.config.dcaRoiThresholdPct) && Date.now() - (pos.lastDcaTime || 0) > 10000) await this.scalePosition(false);
+        else if (roi >= this.config.profitRoiThresholdPct && Date.now() - (pos.lastDcaTime || 0) > 10000) await this.scalePosition(true);
     }
-    async addDcaPosition(isProfitScale = false) {
-        if (this.isTrading || this.activePositions.length === 0) return;
+    async openPosition(side) {
+        this.isTrading = true;
+        try {
+            const ex = side === 'long' ? this.htxLong : this.htxShort;
+            let price = side === 'long' ? globalMarketData.binance.mid : globalMarketData.binance.mid;
+            let qty = Math.max(1, Math.floor(this.walletBalance * 1));
+            if (this.liveTradingEnabled) {
+                const res = await ex.createMarketOrder(this.config.htxSymbol, side==='long'?'buy':'sell', qty, { offset: 'open' });
+                price = res.average || price;
+            }
+            const size = qty * this.config.contractSize * price;
+            this.activePositions = [{ side, entryPrice: price, contracts: qty, size, marginUsed: size/FORCED_LEVERAGE, entryTime: Date.now(), exchangeROI: 0, dcaStep: 0, isPaper: !this.liveTradingEnabled }];
+            await this.saveState();
+        } catch(e) { console.error("Open Error", e.message); } finally { this.isTrading = false; }
+    }
+    async scalePosition(isProfit) {
         this.isTrading = true;
         try {
             const pos = this.activePositions[0];
-            const exchange = pos.side === 'long' ? this.htxLong : this.htxShort; // HEDGED: Pick correct exchange
-            const orderSide = pos.side === 'long' ? 'buy' : 'sell';
-            let mult = Number(isProfitScale ? (Number(this.walletBalance) * 1) : this.config.dcaMultiplier); if (isNaN(mult) || mult < 1.0) mult = 2.0;
-            let baseC = Number(this.walletBalance) * 1000; if (isNaN(baseC) || baseC < 1) baseC = 1;
-            let step = Number(pos.dcaStep); if (isNaN(step)) step = 0;
-            let contractsToAdd = parseInt(Math.max(1, Math.floor(baseC * Math.pow(mult, step))), 10);
-            if (isProfitScale) { const maxC = (Number(this.walletBalance) * 2); if (Number(pos.contracts) + contractsToAdd > maxC) { pos.lastDcaTime = Date.now(); await this.saveState(); this.isTrading = false; return; } }
-            pos.lastDcaTime = Date.now(); await this.saveState();
-            let realPrice = pos.side === 'long' ? globalMarketData.binance.ask : globalMarketData.binance.bid; if (!realPrice) realPrice = globalMarketData.binance.mid;
-            if (!pos.isPaper && this.liveTradingEnabled) {
-                try {
-                    const res = await exchange.createMarketOrder(this.config.htxSymbol, orderSide, contractsToAdd, undefined, { offset: 'open', marginMode: 'cross', lever_rate: FORCED_LEVERAGE });
-                    await new Promise(r => setTimeout(r, 150)); const order = await exchange.fetchOrder(res.id, this.config.htxSymbol); 
-                    if (order && order.average) realPrice = this.config.htxSymbol.includes('SHIB') && !this.config.htxSymbol.includes('1000') ? order.average * 1000 : order.average;
-                } catch(e) { return; }
-            }
-            if(!pos.stepHistory) pos.stepHistory = [];
-            pos.stepHistory.push({ step: step + 1, type: isProfitScale ? 'SCALE' : 'DCA', price: realPrice, roi: pos.exchangeROI || 0, time: Date.now() });
-            const addSize = contractsToAdd * (Number(this.config.contractSize) || 1000) * realPrice;
-            pos.entryPrice = ((Number(pos.entryPrice) * Number(pos.size)) + (Number(realPrice) * addSize)) / (Number(pos.size) + addSize);
-            pos.size = Number(pos.size) + addSize; pos.contracts = Number(pos.contracts) + contractsToAdd; 
-            pos.marginUsed = Number(pos.marginUsed) + (addSize / FORCED_LEVERAGE); pos.dcaStep = step + 1;
-            this.metrics.updateMaxMargin(pos.marginUsed); await this.saveState();
-        } catch (err) {} finally { this.isTrading = false; }
+            const ex = pos.side === 'long' ? this.htxLong : this.htxShort;
+            const mult = isProfit ? this.config.profitMultiplier : this.config.dcaMultiplier;
+            const qty = Math.floor(pos.contracts * (mult - 1));
+            if (qty < 1) return;
+            if (isProfit && pos.contracts + qty > this.config.maxContracts) return;
+            if (this.liveTradingEnabled) await ex.createMarketOrder(this.config.htxSymbol, pos.side==='long'?'buy':'sell', qty, { offset: 'open' });
+            pos.contracts += qty; pos.lastDcaTime = Date.now(); pos.dcaStep++;
+            await this.saveState();
+        } catch(e) {} finally { this.isTrading = false; }
     }
-    async syncState(targetSide) {
-        if (this.isTrading || this.activePositions.length > 0) return;
+    async closePosition(reason) {
         this.isTrading = true;
         try {
-            const isPaper = !this.liveTradingEnabled; 
-            const exchange = targetSide === 'long' ? this.htxLong : this.htxShort; // HEDGED: Pick correct exchange
-            const orderSide = targetSide === 'long' ? 'buy' : 'sell'; 
-            let baseC = Number(this.walletBalance) * 1000; if (isNaN(baseC) || baseC < 1) baseC = 1;
-            const contracts = parseInt(Math.max(1, Math.floor(baseC)), 10);
-            let execPrice = targetSide === 'long' ? globalMarketData.binance.ask : globalMarketData.binance.bid; if (!execPrice) execPrice = globalMarketData.binance.mid;
-            if (!isPaper) {
-                const res = await exchange.createMarketOrder(this.config.htxSymbol, orderSide, contracts, undefined, { offset: 'open', marginMode: 'cross', lever_rate: FORCED_LEVERAGE });
-                await new Promise(r => setTimeout(r, 150)); 
-                try { const oOrder = await exchange.fetchOrder(res.id, this.config.htxSymbol); if (oOrder && oOrder.average) execPrice = this.config.htxSymbol.includes('SHIB') && !this.config.htxSymbol.includes('1000') ? oOrder.average * 1000 : oOrder.average; } catch(e){}
-            }
-            const sizeUsd = contracts * (Number(this.config.contractSize) || 1000) * execPrice;
-            const marginUsed = sizeUsd / FORCED_LEVERAGE;
-            this.activePositions = [{ id: Date.now(), side: targetSide, entryPrice: Number(execPrice), contracts: Number(contracts), size: Number(sizeUsd), marginUsed: Number(marginUsed), entryTime: Date.now(), exchangeROI: 0, exchangePnl: 0, isPaper, lastDcaTime: 0, dcaStep: 0, stepHistory: [{ step: 0, type: 'OPEN', price: execPrice, roi: 0, time: Date.now() }] }];
-            this.metrics.updateMaxMargin(marginUsed); await this.saveState();
-        } catch (err) { this.activePositions = []; } finally { this.isTrading = false; }
+            const pos = this.activePositions[0];
+            const ex = pos.side === 'long' ? this.htxLong : this.htxShort;
+            if (this.liveTradingEnabled) await ex.createMarketOrder(this.config.htxSymbol, pos.side==='long'?'sell':'buy', pos.contracts, { reduceOnly: true, offset: 'close' });
+            const math = calculateTradeMath(pos.side, pos.entryPrice, globalMarketData.binance.mid, pos.size, FORCED_LEVERAGE, this.config.fees.taker);
+            this.metrics.processTrade({ ...math, side: pos.side, contracts: pos.contracts, exitReason: reason });
+            this.activePositions = []; this.lastCloseTime = Date.now();
+            await this.saveState();
+        } catch(e) {} finally { this.isTrading = false; }
     }
-    async forceClosePosition(reason = "MANUAL") {
-        if (this.isTrading || this.activePositions.length === 0) return;
-        this.isTrading = true;
-        try {
-            const snapPos = { ...this.activePositions[0] };
-            const exchange = snapPos.side === 'long' ? this.htxLong : this.htxShort; // HEDGED: Pick correct exchange
-            const closeSide = snapPos.side === 'long' ? 'sell' : 'buy';
-            let realExitPrice = closeSide === 'sell' ? globalMarketData.binance.bid : globalMarketData.binance.ask; if (!realExitPrice) realExitPrice = globalMarketData.binance.mid;
-            if (!snapPos.isPaper && this.liveTradingEnabled) {
-                const res = await exchange.createMarketOrder(this.config.htxSymbol, closeSide, snapPos.contracts, undefined, { reduceOnly: true, offset: 'close', marginMode: 'cross', lever_rate: FORCED_LEVERAGE });
-                this.activePositions = []; await new Promise(r => setTimeout(r, 150));
-                try { const cOrder = await exchange.fetchOrder(res.id, this.config.htxSymbol); if (cOrder && cOrder.average) realExitPrice = this.config.htxSymbol.includes('SHIB') && !this.config.htxSymbol.includes('1000') ? cOrder.average * 1000 : cOrder.average; } catch(e){}
-            } else { this.activePositions = []; }
-            const math = calculateTradeMath(snapPos.side, snapPos.entryPrice, realExitPrice, snapPos.size, FORCED_LEVERAGE, this.config.fees.taker);
-            this.metrics.recordTrade({ side: snapPos.side, contracts: snapPos.contracts, entryPrice: snapPos.entryPrice, exitPrice: realExitPrice, marginUsed: math.margin, grossPnl: math.grossPnlUsd, grossRoiPct: math.grossRoiPct, netPnl: math.netPnlUsd, roiPct: math.netRoiPct, feeCost: math.feeCost, exitReason: reason });
-            this.lastCloseTime = Date.now(); await this.saveState();
-        } catch (err) {} finally { this.isTrading = false; }
-    }
-    startExchangeROISync() {
+    startSync() {
         setInterval(async () => {
-            if (this.activePositions.length === 0 || this.isTrading) {
-                if (this.liveTradingEnabled) {
-                    try { 
-                        const b1 = await this.htxLong.fetchBalance({ type: 'swap' }); 
-                        const b2 = await this.htxShort.fetchBalance({ type: 'swap' });
-                        this.walletBalance = ((b1.total?.USDT || 0) + (b2.total?.USDT || 0)); // Total sum of both accounts
-                    } catch(e){}
-                } return;
-            }
-            const pos = this.activePositions[0];
-            if (this.liveTradingEnabled && !pos.isPaper) {
+            if (this.liveTradingEnabled) {
                 try {
-                    const exchange = pos.side === 'long' ? this.htxLong : this.htxShort;
-                    const b1 = await this.htxLong.fetchBalance({ type: 'swap' }); const b2 = await this.htxShort.fetchBalance({ type: 'swap' });
-                    this.walletBalance = ((b1.total?.USDT || 0) + (b2.total?.USDT || 0));
-                    const op = (await exchange.fetchPositions([this.config.htxSymbol])).find(p => p.contracts > 0);
-                    if (op) {
-                        let ep = op.entryPrice; if (this.config.htxSymbol.includes('SHIB') && !this.config.htxSymbol.includes('1000')) ep = ep * 1000;
-                        pos.entryPrice = ep; pos.exchangeROI = op.percentage || 0; pos.exchangePnl = op.unrealizedPnl || 0; return;
-                    } else { this.activePositions = []; await this.saveState(); return; }
-                } catch(e) {}
+                    const b1 = await this.htxLong.fetchBalance({ type: 'swap' });
+                    const b2 = await this.htxShort.fetchBalance({ type: 'swap' });
+                    this.walletBalance = (b1.total?.USDT || 0) + (b2.total?.USDT || 0);
+                    if (this.activePositions.length > 0) {
+                        const side = this.activePositions[0].side;
+                        const ex = side === 'long' ? this.htxLong : this.htxShort;
+                        const p = (await ex.fetchPositions([this.config.htxSymbol])).find(x => x.contracts > 0);
+                        if (p) { this.activePositions[0].exchangeROI = p.percentage; this.activePositions[0].entryPrice = p.entryPrice; }
+                        else this.activePositions = [];
+                    }
+                } catch(e){}
             }
-            let cp = pos.side === 'long' ? globalMarketData.binance.bid : globalMarketData.binance.ask; if (!cp) cp = globalMarketData.binance.mid;
-            if (cp && pos.entryPrice > 0) { const sm = pos.side === 'long' ? 1 : -1; const pp = ((cp - pos.entryPrice) / pos.entryPrice) * 100 * sm; pos.exchangeROI = pp * FORCED_LEVERAGE; pos.exchangePnl = (pos.exchangeROI / 100) * pos.marginUsed; }
-        }, 1000);
+        }, 2000);
     }
-    getExportData() { return { config: this.config, liveTradingEnabled: this.liveTradingEnabled, uptime: Math.floor((Date.now() - this.startTime) / 1000), metrics: this.metrics, activePositions: this.activePositions, mlSignal: this.currentMl, binance: globalMarketData.binance, walletBalance: this.walletBalance }; }
+    getExport() { return { config: this.config, metrics: this.metrics, activePositions: this.activePositions, mlSignal: this.currentMl, walletBalance: this.walletBalance, liveTradingEnabled: this.liveTradingEnabled }; }
 }
 
-// ==================== WORKER MANAGER ====================
-const activeWorkers = new Map();
-async function startMasterStreams() {
-    let marketsLoaded = false; while (!marketsLoaded) { try { await publicBinance.loadMarkets(); await publicHtx.loadMarkets(); marketsLoaded = true; } catch (e) { await new Promise(r => setTimeout(r, 5000)); } }
-    try {
-        const history = await ChartDataModel.find().sort({ timestamp: -1 }).limit(800).lean();
-        if (history) history.reverse().forEach(doc => memoryChartHistory.push({ priceMid: doc.priceMid, mlPlot: doc.mlPlot || 0.5, timestamp: doc.timestamp }));
-    } catch(e) {}
-    (async function streamBinance() {
-        let lastHistorySave = 0, lastSavedMid = null, lastSavedMlPlot = null;
-        try {
-            const seedData = await publicBinance.fetchOHLCV(BASE_CONFIG.binanceSymbol, '1m', undefined, 100);
-            if (seedData && seedData.length > 0) { seedData.forEach(c => { if (globalMarketData.tickBuffer.length === 0 || globalMarketData.tickBuffer[globalMarketData.tickBuffer.length - 1] !== c[4]) globalMarketData.tickBuffer.push(c[4]); }); }
-        } catch (e) {}
-        while (true) {
+// ==================== MASTER CONTROLLER ====================
+const workers = new Map();
+async function masterLoop() {
+    await publicBinance.loadMarkets();
+    (async function stream() {
+        while(true) {
             try {
-                let mid = 0;
-                try {
-                    const ticker = await Promise.race([publicBinance.watchTicker(BASE_CONFIG.binanceSymbol), new Promise((_, r) => setTimeout(() => r(new Error('WS_TIMEOUT')), 3000))]);
-                    mid = ((ticker.bid !== undefined ? ticker.bid : ticker.last) + (ticker.ask !== undefined ? ticker.ask : ticker.last)) / 2;
-                } catch(wsErr) {
-                    const ticker = await publicBinance.fetchTicker(BASE_CONFIG.binanceSymbol); 
-                    mid = ((ticker.bid !== undefined ? ticker.bid : ticker.last) + (ticker.ask !== undefined ? ticker.ask : ticker.last)) / 2;
-                    await new Promise(r => setTimeout(r, 1000)); 
-                }
-                if (!mid || isNaN(mid)) { await new Promise(r => setTimeout(r, 1000)); continue; }
-                globalMarketData.binance = { bid: mid, ask: mid, mid: mid, timestamp: Date.now() };
-                if (mid !== (globalMarketData.tickBuffer.length > 0 ? globalMarketData.tickBuffer[globalMarketData.tickBuffer.length - 1] : null)) { globalMarketData.tickBuffer.push(mid); if (globalMarketData.tickBuffer.length > 500) globalMarketData.tickBuffer.shift(); }
-                mlSignalCache.clear(); const globalMl = calculateMLSignal(globalMarketData.tickBuffer, BASE_CONFIG.mlLookback);
-                globalMarketData.mlSignal = globalMl; mlSignalCache.set(BASE_CONFIG.mlLookback, globalMl); 
-                if (Date.now() - lastHistorySave > 2000) { if (mid !== lastSavedMid || globalMl.rawValue !== lastSavedMlPlot) { const doc = { priceMid: mid, mlPlot: globalMl.rawValue, timestamp: Date.now() }; memoryChartHistory.push(doc); if (memoryChartHistory.length > 800) memoryChartHistory.shift(); ChartDataModel.create(doc).catch(()=>{}); lastHistorySave = Date.now(); lastSavedMid = mid; lastSavedMlPlot = globalMl.rawValue; } }
-                for (const worker of activeWorkers.values()) { worker.checkExits().catch(()=>{}); worker.evaluateAIEntry().catch(()=>{}); }
-                await new Promise(r => setTimeout(r, 100)); 
-            } catch (e) { await new Promise(r => setTimeout(r, 2000)); }
+                const t = await publicBinance.fetchTicker(BASE_CONFIG.binanceSymbol);
+                globalMarketData.binance = { mid: (t.bid + t.ask) / 2, timestamp: Date.now() };
+                globalMarketData.tickBuffer.push(globalMarketData.binance.mid);
+                if (globalMarketData.tickBuffer.length > 500) globalMarketData.tickBuffer.shift();
+                for (const w of workers.values()) { w.evaluateAIEntry(); w.checkExits(); }
+            } catch(e){}
+            await new Promise(r => setTimeout(r, 1000));
         }
     })();
 }
 
-async function loadAllUsers() {
-    try {
-        const users = await UserModel.find({});
-        for(const u of users) { try { const worker = new UserTradeInstance(u); await worker.initialize(); activeWorkers.set(u._id.toString(), worker); if (u.token) tokenCache.set(u.token, { user: u, lastAccessed: Date.now() }); } catch(we) {} }
-    } catch(e) {}
-}
-
-// ==================== EXPRESS SERVER & API ====================
+// ==================== API ROUTES ====================
 const app = express(); app.use(express.json());
-const activeSessions = new Map();
-setInterval(() => { for (const [sid, data] of activeSessions.entries()) if (Date.now() - data.lastSeen > 15000) activeSessions.delete(sid); }, 5000);
-
-app.post('/api/analytics/track', async (req, res) => {
-    const { sessionId, page, isView } = req.body; if (!sessionId) return res.status(400).json({ error: 'Missing session' });
-    activeSessions.set(sessionId, { page: page || 'unknown', lastSeen: Date.now() });
-    if (isView) { try { let doc = await AnalyticsModel.findOne({ key: "global" }); if (!doc) doc = await AnalyticsModel.create({ key: "global" }); doc.views += 1; if (!doc.knownIds.includes(sessionId)) { doc.knownIds.push(sessionId); doc.uniques += 1; } await doc.save(); } catch(e) {} }
-    res.json({ status: 'ok' });
+app.post('/api/auth/register', async (req, res) => {
+    const { name, email, password } = req.body;
+    const salt = crypto.randomBytes(16).toString('hex');
+    const user = await UserModel.create({ name, email, passwordHash: hashPassword(password, salt), salt, token: generateToken() });
+    const w = new UserTradeInstance(user); await w.initialize(); workers.set(user._id.toString(), w);
+    tokenCache.set(user.token, { user }); res.json({ token: user.token });
 });
-
-app.get('/api/analytics/stats', async (req, res) => { try { let doc = await AnalyticsModel.findOne({ key: "global" }); const breakdown = {}; for (const data of activeSessions.values()) breakdown[data.page] = (breakdown[data.page] || 0) + 1; res.json({ online: activeSessions.size, views: doc ? doc.views : 0, uniques: doc ? doc.uniques : 0, pages: breakdown }); } catch(e) { res.status(500).json({ error: 'Failed' }); } });
-
-app.post('/api/backtest', async (req, res) => {
-    const bConfig = { ...BASE_CONFIG, takeProfitPct: parseFloat(req.body.tpPct) || 10.0, stopLossPct: parseFloat(req.body.slPct) || -50.0, baseContracts: parseInt(req.body.baseContracts) || 1, mlLookback: parseInt(req.body.mlLookback) || 50, mlThreshold: parseFloat(req.body.mlThreshold) || 60.0, mlAverageTicks: parseInt(req.body.mlAverageTicks) || 5, mlUseAverage: (req.body.mlUseAverage === 'true'), flipOnlyInProfit: (req.body.flipOnlyInProfit === 'true'), flipThresholdPct: parseFloat(req.body.flipThresholdPct) || 0.5, dcaRoiThresholdPct: parseFloat(req.body.dcaRoiThresholdPct) || 1.0, dcaMultiplier: parseFloat(req.body.dcaMultiplier) || 2.0, profitRoiThresholdPct: parseFloat(req.body.profitRoiThresholdPct) || 2.0, profitMultiplier: parseFloat(req.body.profitMultiplier) || 2.0, maxContracts: parseInt(req.body.maxContracts) || 100 };
-    try { const resu = await runBacktestSimulation(bConfig, parseInt(req.body.ticks) || 5000, BASE_CONFIG.binanceSymbol); res.json(resu); } catch (e) { res.status(500).json({ error: e.message }); }
+app.post('/api/auth/login', async (req, res) => {
+    const user = await UserModel.findOne({ email: req.body.email });
+    if (user && hashPassword(req.body.password, user.salt) === user.passwordHash) {
+        user.token = generateToken(); await user.save();
+        const w = new UserTradeInstance(user); await w.initialize(); workers.set(user._id.toString(), w);
+        tokenCache.set(user.token, { user }); res.json({ token: user.token });
+    } else res.status(401).send();
 });
-
-app.post('/api/auth/register', async (req, res) => { try { const { name, email, password } = req.body; if(await UserModel.findOne({ email })) return res.status(400).json({ error: 'Exists' }); const salt = crypto.randomBytes(16).toString('hex'); const user = await UserModel.create({ name, email, passwordHash: hashPassword(password, salt), salt, token: generateToken() }); const worker = new UserTradeInstance(user); await worker.initialize(); activeWorkers.set(user._id.toString(), worker); tokenCache.set(user.token, { user, lastAccessed: Date.now() }); res.json({ token: user.token, user: { name: user.name, email: user.email } }); } catch(e) { res.status(500).json({ error: 'Failed' }); } });
-
-app.post('/api/auth/login', async (req, res) => { try { const user = await UserModel.findOne({ email: req.body.email }); if(!user || hashPassword(req.body.password, user.salt) !== user.passwordHash) return res.status(400).json({ error: 'Invalid' }); user.token = generateToken(); await user.save(); tokenCache.set(user.token, { user, lastAccessed: Date.now() }); res.json({ token: user.token, user: { name: user.name, email: user.email } }); } catch(e) { res.status(500).json({ error: 'Failed' }); } });
-
-app.get('/api/user/me', authMiddleware, (req, res) => res.json({ name: req.user.name, email: req.user.email, apiKey: req.user.apiKey, apiKey2: req.user.apiKey2, liveTradingEnabled: req.user.liveTradingEnabled }));
-
+app.get('/api/data', authMiddleware, (req, res) => res.json(workers.get(req.user._id.toString())?.getExport() || {}));
 app.post('/api/user/keys', authMiddleware, async (req, res) => {
-    try {
-        const { apiKey, apiSecret, apiKey2, apiSecret2, liveTradingEnabled } = req.body;
-        let worker = activeWorkers.get(req.user._id.toString());
-        if(worker) {
-            if (Boolean(liveTradingEnabled) && worker.activePositions.length > 0 && worker.activePositions[0].isPaper) worker.activePositions = [];
-            worker.applyUserKeys({ apiKey, apiSecret, apiKey2, apiSecret2, liveTradingEnabled });
-            const conn = await worker.connectExchange();
-            if (liveTradingEnabled && !conn.success) { worker.liveTradingEnabled = false; return res.json({ error: 'Exchange Error: ' + conn.message }); }
-            req.user.liveTradingEnabled = worker.liveTradingEnabled;
-        } else req.user.liveTradingEnabled = Boolean(liveTradingEnabled);
-        req.user.apiKey = apiKey; req.user.apiSecret = apiSecret; req.user.apiKey2 = apiKey2; req.user.apiSecret2 = apiSecret2;
-        await req.user.save(); res.json({ status: 'ok' });
-    } catch(e) { res.status(500).json({ error: 'Failed' }); }
+    const w = workers.get(req.user._id.toString());
+    Object.assign(req.user, req.body); await req.user.save();
+    w.applyUserKeys(req.user); res.json({ status: 'ok' });
 });
-
 app.post('/api/user/config', authMiddleware, async (req, res) => {
-    const worker = activeWorkers.get(req.user._id.toString()); if(!worker) return res.status(400).json({ error: 'Worker not active' });
-    const { tpPct, slPct, baseContracts, contractSize, mlLookbackSens, mlThresholdSens, mlAverageTicksSens, mlUseAverageSens, flipOnlyInProfitSens, flipThresholdSens, dcaRoiThresholdSens, dcaMultiplierSens, profitRoiThresholdSens, profitMultiplierSens, maxContractsSens } = req.body;
-    const pSet = (v, f, k) => { if (v !== undefined && v !== "") { const p = f(v); if (!isNaN(p)) worker.config[k] = p; } };
-    pSet(tpPct, parseFloat, 'takeProfitPct'); pSet(slPct, parseFloat, 'stopLossPct'); pSet(baseContracts, parseInt, 'baseContracts'); pSet(contractSize, parseFloat, 'contractSize'); pSet(mlLookbackSens, parseInt, 'mlLookback'); pSet(mlThresholdSens, parseFloat, 'mlThreshold'); pSet(mlAverageTicksSens, parseInt, 'mlAverageTicks'); pSet(dcaRoiThresholdSens, parseFloat, 'dcaRoiThresholdPct'); pSet(dcaMultiplierSens, parseFloat, 'dcaMultiplier'); pSet(profitRoiThresholdSens, parseFloat, 'profitRoiThresholdPct'); pSet(profitMultiplierSens, parseFloat, 'profitMultiplier'); pSet(flipThresholdSens, parseFloat, 'flipThresholdPct'); pSet(maxContractsSens, parseInt, 'maxContracts'); 
-    if (mlUseAverageSens !== undefined) worker.config.mlUseAverage = (mlUseAverageSens === 'true');
-    if (flipOnlyInProfitSens !== undefined) worker.config.flipOnlyInProfit = (flipOnlyInProfitSens === 'true');
-    req.user.config = worker.config; req.user.markModified('config'); await req.user.save(); res.json({status: 'ok', config: worker.config});
+    const w = workers.get(req.user._id.toString());
+    Object.assign(w.config, req.body); req.user.config = w.config; 
+    req.user.markModified('config'); await req.user.save(); res.json({ status: 'ok' });
 });
 
-app.post('/api/user/reset-metrics', authMiddleware, async (req, res) => { try { const worker = activeWorkers.get(req.user._id.toString()); if(worker) { await TradeModel.deleteMany({ userId: req.user._id.toString() }); worker.metrics = new PerformanceMetrics(worker.userId); } res.json({status: 'ok'}); } catch(err) { res.status(500).json({error: 'Failed'}); } });
-
-app.get('/api/data', authMiddleware, (req, res) => { const worker = activeWorkers.get(req.user._id.toString()); res.json(worker ? worker.getExportData() : { error: "Worker not found" }); });
-app.get('/api/chart-history', (req, res) => res.json(memoryChartHistory.slice(-800))); 
-app.get('/api/close-all', authMiddleware, async (req, res) => { const worker = activeWorkers.get(req.user._id.toString()); if(worker) await worker.forceClosePosition("MANUAL_FORCE_CLOSE").catch(()=>{}); res.json({status: 'ok'}); });
-
-// ==================== FRONTEND UI ====================
-app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
-<html lang="en" class="scroll-smooth">
+// ==================== UI HTML ====================
+app.get('/', (req, res) => { res.send(`
+<!DOCTYPE html>
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>TradeBotPille | SHIB AI Engine</title>
-    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700;900&family=Roboto+Mono:wght@400;700&display=swap" rel="stylesheet">
-    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet" />
+    <title>TradeBot Hedge V4</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono&display=swap" rel="stylesheet">
     <style>
-        body { font-family: 'Roboto', sans-serif; background-color: #fafafa; color: #111827; }
-        .font-mono { font-family: 'Roboto Mono', monospace; }
-        .material-symbols-outlined { font-variation-settings: 'FILL' 0, 'wght' 300, 'GRAD' 0, 'opsz' 24; vertical-align: middle; }
-        .ui-card { background-color: #ffffff; border-radius: 16px; box-shadow: 0 4px 24px -4px rgba(0,0,0,0.04); }
-        .ui-card-hover { transition: transform 0.2s, box-shadow: 0.2s; }
-        .ui-card-hover:hover { transform: translateY(-3px); box-shadow: 0 10px 30px -5px rgba(0,0,0,0.08); }
-        .input-minimal { width: 100%; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 14px; font-size: 14px; outline: none; transition: all 0.2s; background: #fafafa; }
-        .input-minimal:focus { border-color: #000000; background: #ffffff; box-shadow: 0 0 0 2px rgba(0,0,0,0.05); }
-        .btn-primary { background: #000000; color: #ffffff; border-radius: 8px; padding: 10px 20px; font-size: 14px; font-weight: 500; cursor: pointer; transition: background 0.2s; text-align: center; }
-        .btn-primary:hover { background: #374151; }
-        .btn-secondary { background: #ffffff; color: #374151; border: 1px solid #d1d5db; border-radius: 8px; padding: 10px 20px; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.2s; text-align: center; }
-        .btn-secondary:hover { background: #f9fafb; border-color: #9ca3af; }
-        .view-section { display: none; animation: fade 0.3s ease; }
-        @keyframes fade { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
-        .active-view { display: block; }
+        body { background: #0a0a0a; color: #eee; font-family: 'Roboto Mono', monospace; }
+        .card { background: #141414; border: 1px solid #222; border-radius: 12px; padding: 20px; }
+        input, select { background: #1a1a1a; border: 1px solid #333; color: #fff; padding: 8px; border-radius: 4px; width: 100%; }
+        .btn { background: #fff; color: #000; font-weight: bold; padding: 10px; border-radius: 6px; cursor: pointer; text-align: center; }
+        .btn-red { background: #ef4444; color: #fff; }
     </style>
 </head>
-<body class="antialiased min-h-screen flex flex-col selection:bg-gray-200">
-    <header class="bg-white/80 backdrop-blur-md shadow-[0_2px_10px_-4px_rgba(0,0,0,0.05)] sticky top-0 z-50">
-        <div class="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
-            <div class="flex items-center gap-2 cursor-pointer" onclick="nav('home')">
-                <div class="w-9 h-9 rounded-full bg-gray-700 flex items-center justify-center shrink-0 shadow-md border border-gray-600 relative overflow-hidden">
-                    <div class="absolute inset-0 m-[5px] grid grid-cols-2 grid-rows-2 gap-[2px]">
-                        <div class="bg-white rounded-tl-[3px]"></div><div class="bg-white rounded-tr-[3px]"></div><div class="bg-black rounded-bl-[3px]"></div><div class="bg-[#E1AD01] rounded-br-[3px]"></div>
-                    </div>
-                    <span class="material-symbols-outlined text-[20px] font-bold text-white z-10 relative drop-shadow-[0_1px_2px_rgba(0,0,0,0.8)]">api</span>
-                </div>
-                <span class="font-bold tracking-tight text-lg ml-1">TradeBotPille</span><div class="hidden sm:block ml-2 text-xs text-gray-400">taking it to the next level</div>
-            </div>
-            <nav id="nav-public" class="flex items-center gap-4 text-sm font-medium text-gray-500">
-                <button onclick="nav('backtest')" class="hover:text-black transition flex items-center gap-1"><span class="material-symbols-outlined text-[16px]">science</span> Backtest</button>
-                <button onclick="nav('analytics')" class="hover:text-black transition flex items-center gap-1"><span class="material-symbols-outlined text-[16px]">monitoring</span> Stats</button>
-                <div class="w-px h-4 bg-gray-200 mx-1"></div>
-                <button onclick="nav('login')" class="hover:text-black transition">Login</button>
-                <button onclick="nav('register')" class="btn-primary py-1.5 px-4 rounded-md">Get Started</button>
-            </nav>
-            <nav id="nav-private" class="hidden items-center gap-6 text-sm font-medium">
-                <span id="nav-user-name" class="text-gray-500 hidden sm:block"></span>
-                <button onclick="nav('backtest')" class="text-gray-500 hover:text-black transition flex items-center gap-1"><span class="material-symbols-outlined text-[18px]">science</span></button>
-                <button onclick="nav('analytics')" class="text-gray-500 hover:text-black transition flex items-center gap-1"><span class="material-symbols-outlined text-[18px]">monitoring</span></button>
-                <button onclick="nav('dashboard')" class="hover:text-black transition">Dashboard</button>
-                <button onclick="nav('step-history')" class="hover:text-black transition">History</button>
-                <button onclick="logout()" class="text-red-500 hover:text-red-700 transition">Logout</button>
-            </nav>
+<body class="p-4 max-w-7xl mx-auto">
+    <div id="auth-view" class="max-w-md mx-auto mt-20">
+        <div class="card space-y-4">
+            <h2 class="text-xl font-bold">Terminal Access</h2>
+            <input id="email" placeholder="Email">
+            <input id="pass" type="password" placeholder="Password">
+            <div class="btn" onclick="login()">Enter Terminal</div>
         </div>
-    </header>
+    </div>
 
-    <main class="flex-grow flex flex-col justify-center">
-        <!-- HOME VIEW -->
-        <section id="view-home" class="view-section active-view w-full">
-            <div class="max-w-5xl mx-auto px-4 pt-24 pb-16 text-center">
-                <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-gray-100 text-xs font-bold uppercase tracking-widest text-gray-600 mb-6 border border-gray-200">
-                    <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span> SHIB ML Hedge Strategy
-                </div>
-                <h1 class="text-5xl sm:text-6xl md:text-7xl font-extrabold tracking-tight mb-6 leading-tight">Dual Account Hedge.<br><span class="text-gray-400">Pure Probability.</span></h1>
-                <p class="text-lg md:text-xl text-gray-500 mb-10 max-w-2xl mx-auto leading-relaxed">Account A trades Longs. Account B trades Shorts. Zero margin netting. 75x Execution.</p>
-                <button onclick="nav('register')" class="btn-primary text-base px-10 py-4 shadow-lg shadow-black/20 flex items-center gap-2 mx-auto">Launch Web Terminal <span class="material-symbols-outlined text-[20px]">arrow_forward</span></button>
-            </div>
-        </section>
+    <div id="dash-view" class="hidden space-y-6">
+        <div class="grid grid-cols-4 gap-4">
+            <div class="card"><div class="text-xs text-gray-500">NET PNL</div><div id="net-pnl" class="text-xl font-bold">$0.00</div></div>
+            <div class="card"><div class="text-xs text-gray-500">LIVE ROI</div><div id="live-roi" class="text-xl font-bold">0.00%</div></div>
+            <div class="card"><div class="text-xs text-gray-500">TOTAL BALANCE</div><div id="balance" class="text-xl font-bold">$0.00</div></div>
+            <div class="card"><div class="text-xs text-gray-500">AI SIGNAL</div><div id="ai-sig" class="text-xl font-bold">WAITING</div></div>
+        </div>
 
-        <!-- DASHBOARD -->
-        <section id="view-dashboard" class="view-section max-w-[1400px] w-full mx-auto px-4 sm:px-6 py-8">
-            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-8 gap-4">
-                <div><h2 class="text-2xl font-bold flex items-center gap-3">Trading Terminal <span id="statusBadge" class="text-[10px] bg-gray-100 text-gray-600 px-3 py-1 rounded-full uppercase font-bold border border-gray-200">Loading</span></h2></div>
-                <div class="flex gap-3 w-full sm:w-auto"><button onclick="nav('settings')" class="btn-secondary flex-1 sm:flex-none flex justify-center items-center gap-1 shadow-sm"><span class="material-symbols-outlined text-[18px]">key</span> Setup API</button><button onclick="closeAll()" class="btn-secondary text-red-600 hover:bg-red-50 flex-1 sm:flex-none flex justify-center items-center gap-1 shadow-sm"><span class="material-symbols-outlined text-[18px]">close</span> Close All</button></div>
-            </div>
-            <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
-                <div class="lg:col-span-8 space-y-8">
-                    <div class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-4 sm:gap-6">
-                        <div class="ui-card p-5 border border-gray-100"><p class="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-2">Net PnL</p><p id="netPnl" class="text-lg font-mono font-bold">$0.00</p></div>
-                        <div class="ui-card p-5 border border-gray-100"><p class="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-2">Win Rate</p><p id="winRateDisplay" class="text-lg font-mono font-bold text-blue-600">0%</p></div>
-                        <div class="ui-card p-5 border border-gray-100"><p class="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-2">Total Balance</p><p id="marginUsed" class="text-lg font-mono font-bold text-gray-800">$0.00</p></div>
-                        <div class="ui-card p-5 border border-gray-100"><p class="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-2">Contracts</p><p id="activeQty" class="text-lg font-mono font-bold text-gray-800">0</p></div>
-                        <div class="ui-card p-5 border border-gray-100"><p class="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-2">Live ROI</p><p id="activeRoi" class="text-lg font-mono font-bold text-gray-800">N/A</p></div>
-                        <div class="ui-card p-3 border border-gray-100 flex flex-col items-center justify-center"><p class="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-1">ML Prob</p><canvas id="mlGauge"></canvas><p id="mlValue" class="text-lg font-mono font-bold mt-1">0%</p></div>
-                    </div>
-                    <div class="ui-card p-6 h-[350px] w-full border border-gray-100 relative"><canvas id="mlChart"></canvas></div>
-                </div>
-                <div class="lg:col-span-4 h-fit space-y-6">
-                    <div class="ui-card p-6 border border-gray-100"><h3 class="text-base font-bold mb-5 flex items-center gap-2 pb-3 border-b border-gray-50">Strategy Config</h3>
-                        <div class="space-y-4">
-                            <div class="flex justify-between items-center"><label class="text-sm font-medium text-gray-500">TP (%)</label><input type="number" id="tpPctSens" class="input-minimal w-24 py-1.5 text-right font-mono"></div>
-                            <div class="flex justify-between items-center"><label class="text-sm font-medium text-gray-500">SL (%)</label><input type="number" id="slPctSens" class="input-minimal w-24 py-1.5 text-right font-mono"></div>
-                            <div class="flex justify-between items-center"><label class="text-sm font-medium text-gray-500">Threshold (%)</label><input type="number" id="mlThresholdSens" class="input-minimal w-24 py-1.5 text-right font-mono text-blue-600"></div>
-                            <button onclick="saveConfig()" class="btn-primary w-full mt-6 py-3 text-sm">Update Strategy</button>
-                        </div>
-                    </div>
+        <div class="grid grid-cols-3 gap-6">
+            <div class="col-span-2 space-y-6">
+                <div class="card">
+                    <h3 class="font-bold mb-4">Closed Trade History</h3>
+                    <table class="w-full text-xs text-left">
+                        <thead class="text-gray-500 uppercase"><tr><th>Time</th><th>Side</th><th>Reason</th><th>Net PnL</th></tr></thead>
+                        <tbody id="trade-history"></tbody>
+                    </table>
                 </div>
             </div>
-        </section>
-
-        <!-- API SETTINGS VIEW -->
-        <section id="view-settings" class="view-section max-w-lg mx-auto px-4 py-10">
-            <button onclick="nav('dashboard')" class="text-sm font-medium text-gray-400 hover:text-black mb-8 flex items-center gap-1 transition"><span class="material-symbols-outlined text-[18px]">arrow_back</span> Back to Terminal</button>
-            <div class="ui-card p-8 border border-gray-100">
-                <h2 class="text-2xl font-bold mb-6 flex items-center gap-2"><span class="material-symbols-outlined">api</span> Hedge API Integration</h2>
-                <div class="space-y-6">
-                    <div class="flex items-center gap-3 p-4 bg-gray-50 border border-gray-200 rounded-xl cursor-pointer" onclick="handleLiveToggle()"><input type="checkbox" id="liveTrade" class="w-5 h-5 accent-black pointer-events-none"><label class="text-sm font-bold text-gray-800">Enable Live Execution</label></div>
-                    <div class="p-4 border border-gray-100 rounded-xl">
-                        <p class="text-xs font-bold text-green-600 mb-2">ACCOUNT 1 (LONG ONLY)</p>
-                        <div><label class="block text-xs font-semibold text-gray-400 mb-1">API Key</label><input type="password" id="apiKey" class="input-minimal font-mono"></div>
-                        <div class="mt-2"><label class="block text-xs font-semibold text-gray-400 mb-1">Secret Key</label><input type="password" id="apiSecret" class="input-minimal font-mono"></div>
+            <div class="space-y-6">
+                <div class="card space-y-4">
+                    <h3 class="font-bold">Hedge API Setup</h3>
+                    <div class="flex items-center gap-2 mb-2"><input type="checkbox" id="live-on" class="w-4 h-4"> Enable Live</div>
+                    <div class="text-[10px] text-green-500 font-bold">ACCOUNT 1 (LONG)</div>
+                    <input id="key1" type="password" placeholder="API Key">
+                    <input id="sec1" type="password" placeholder="API Secret">
+                    <div class="text-[10px] text-red-500 font-bold">ACCOUNT 2 (SHORT)</div>
+                    <input id="key2" type="password" placeholder="API Key">
+                    <input id="sec2" type="password" placeholder="API Secret">
+                    <div class="btn" onclick="saveKeys()">Update Keys</div>
+                </div>
+                <div class="card space-y-4">
+                    <h3 class="font-bold">DCA & AI Strategy</h3>
+                    <div class="grid grid-cols-2 gap-2 text-[10px]">
+                        <div>TP %<input id="s-tp"></div>
+                        <div>SL %<input id="s-sl"></div>
+                        <div>DCA Threshold<input id="s-dca-t"></div>
+                        <div>DCA Multiplier<input id="s-dca-m"></div>
+                        <div>Lookback<input id="s-look"></div>
+                        <div>Threshold %<input id="s-ml-t"></div>
                     </div>
-                    <div class="p-4 border border-gray-100 rounded-xl">
-                        <p class="text-xs font-bold text-red-600 mb-2">ACCOUNT 2 (SHORT ONLY)</p>
-                        <div><label class="block text-xs font-semibold text-gray-400 mb-1">API Key</label><input type="password" id="apiKey2" class="input-minimal font-mono"></div>
-                        <div class="mt-2"><label class="block text-xs font-semibold text-gray-400 mb-1">Secret Key</label><input type="password" id="apiSecret2" class="input-minimal font-mono"></div>
-                    </div>
-                    <button onclick="saveApiKeys()" class="btn-primary w-full py-3 mt-2 flex justify-center items-center gap-2"><span class="material-symbols-outlined text-[18px]">power_settings_new</span> Save & Restart Engine</button>
-                    <div id="key-msg" class="text-sm text-center font-medium mt-3"></div>
+                    <div class="btn" onclick="saveConfig()">Save Strategy</div>
                 </div>
             </div>
-        </section>
-
-        <!-- ANALYTICS, BACKTEST, LOGIN, REGISTER, STEP HISTORY (Inherited Logic) -->
-        <section id="view-login" class="view-section max-w-md w-full mx-auto px-4 py-20"><div class="ui-card p-8 border border-gray-100"><h2 class="text-2xl font-bold mb-6">Login</h2><div class="space-y-5"><div><input type="email" id="login-email" placeholder="Email" class="input-minimal"></div><div><input type="password" id="login-pass" placeholder="Password" class="input-minimal"></div><button onclick="doLogin()" class="btn-primary w-full">Log In</button></div></div></section>
-        <section id="view-register" class="view-section max-w-md w-full mx-auto px-4 py-20"><div class="ui-card p-8 border border-gray-100"><h2 class="text-2xl font-bold mb-6">Register</h2><div class="space-y-5"><div><input type="text" id="reg-name" placeholder="Name" class="input-minimal"></div><div><input type="email" id="reg-email" placeholder="Email" class="input-minimal"></div><div><input type="password" id="reg-pass" placeholder="Password" class="input-minimal"></div><button onclick="doRegister()" class="btn-primary w-full">Sign Up</button></div></div></section>
-    </main>
+        </div>
+    </div>
 
     <script>
-        let authToken = localStorage.getItem('bot_token');
-        let sessionTrackId = localStorage.getItem('rdca_visitor_id') || Math.random().toString(36).substring(2, 15);
-        localStorage.setItem('rdca_visitor_id', sessionTrackId);
-        let currentPageView = 'home';
-        let dashLoop = null, settingsLoaded = false, lastTradesCount = -1;
-
-        async function doAPI(endpoint, method, body) {
-            const headers = { 'Content-Type': 'application/json' };
-            if (authToken) headers['Authorization'] = authToken;
-            const res = await fetch(endpoint, { method, headers, body: body ? JSON.stringify(body) : undefined });
-            const data = await res.json();
-            if (res.status === 401) { logout(); return { error: "Session expired" }; }
-            return data;
+        let token = localStorage.getItem('token');
+        async function api(path, method='GET', body=null) {
+            const res = await fetch(path, { method, headers: {'Content-Type':'application/json', 'Authorization':token}, body: body?JSON.stringify(body):null });
+            return res.json();
         }
-
-        function nav(viewId) {
-            document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active-view'));
-            document.getElementById('view-' + viewId).classList.add('active-view');
-            window.scrollTo(0,0); currentPageView = viewId;
-            if(viewId === 'dashboard' && authToken) initDashboard();
+        async function login() {
+            const res = await api('/api/auth/login', 'POST', {email:document.getElementById('email').value, password:document.getElementById('pass').value});
+            if(res.token) { token=res.token; localStorage.setItem('token', token); location.reload(); }
         }
-
-        function toggleAuthUI() {
-            if (authToken) { document.getElementById('nav-public').classList.add('hidden'); document.getElementById('nav-private').classList.remove('hidden'); document.getElementById('nav-private').classList.add('flex'); } 
-            else { document.getElementById('nav-public').classList.remove('hidden'); document.getElementById('nav-private').classList.add('hidden'); document.getElementById('nav-private').classList.remove('flex'); }
+        async function saveKeys() {
+            await api('/api/user/keys', 'POST', {apiKey:document.getElementById('key1').value, apiSecret:document.getElementById('sec1').value, apiKey2:document.getElementById('key2').value, apiSecret2:document.getElementById('sec2').value, liveTradingEnabled:document.getElementById('live-on').checked});
+            alert('Keys Updated');
         }
-
-        function logout() { localStorage.removeItem('bot_token'); authToken = null; toggleAuthUI(); nav('home'); }
-
-        async function initDashboard() {
-            const me = await doAPI('/api/user/me', 'GET');
-            if(!me.error) {
-                document.getElementById('nav-user-name').innerText = me.name;
-                document.getElementById('liveTrade').checked = me.liveTradingEnabled;
-                document.getElementById('apiKey').value = me.apiKey; document.getElementById('apiKey2').value = me.apiKey2 || "";
-            }
-            if(dashLoop) clearInterval(dashLoop);
-            dashLoop = setInterval(fetchMetrics, 1000);
-        }
-
-        async function fetchMetrics() {
-            if(document.getElementById('view-dashboard').classList.contains('active-view') === false) return;
-            const data = await doAPI('/api/data', 'GET'); if(data.error) return;
-            if(!settingsLoaded) {
-                document.getElementById("tpPctSens").value = data.config.takeProfitPct; document.getElementById("slPctSens").value = data.config.stopLossPct; 
-                document.getElementById("mlThresholdSens").value = data.config.mlThreshold || 60.0;
-                settingsLoaded = true;
-            }
-            document.getElementById("netPnl").innerText = "$" + (data.metrics.totalNetPnl || 0).toFixed(2);
-            document.getElementById("winRateDisplay").innerText = (data.metrics.winRate || 0) + "%";
-            document.getElementById("marginUsed").innerText = "$" + Number(data.walletBalance || 0).toFixed(2);
-            const badge = document.getElementById("statusBadge");
-            if(data.activePositions.length > 0) {
-                const p = data.activePositions[0];
-                badge.innerText = (p.side === 'long' ? "⚡ ACCOUNT 1 (LONG)" : "⚡ ACCOUNT 2 (SHORT)");
-                document.getElementById("activeRoi").innerText = (p.exchangeROI || 0).toFixed(2) + "%";
-                document.getElementById("activeQty").innerText = p.contracts.toLocaleString();
-            } else { badge.innerText = "WAITING FOR SIGNAL"; document.getElementById("activeRoi").innerText = "N/A"; document.getElementById("activeQty").innerText = "0"; }
-            if (data.mlSignal) document.getElementById('mlValue').innerText = data.mlSignal.confidence.toFixed(1) + "% (" + data.mlSignal.type.toUpperCase() + ")";
-        }
-
-        async function saveApiKeys() {
-            const res = await doAPI('/api/user/keys', 'POST', { 
-                apiKey: document.getElementById('apiKey').value, apiSecret: document.getElementById('apiSecret').value,
-                apiKey2: document.getElementById('apiKey2').value, apiSecret2: document.getElementById('apiSecret2').value,
-                liveTradingEnabled: document.getElementById('liveTrade').checked 
-            });
-            if(res.error) alert(res.error); else nav('dashboard');
-        }
-
         async function saveConfig() {
-            const p = { tpPct: document.getElementById("tpPctSens").value, slPct: document.getElementById("slPctSens").value, mlThresholdSens: document.getElementById("mlThresholdSens").value };
-            await doAPI('/api/user/config', 'POST', p); alert("Saved");
+            await api('/api/user/config', 'POST', {takeProfitPct:parseFloat(document.getElementById('s-tp').value), stopLossPct:parseFloat(document.getElementById('s-sl').value), dcaRoiThresholdPct:parseFloat(document.getElementById('s-dca-t').value), dcaMultiplier:parseFloat(document.getElementById('s-dca-m').value), mlLookback:parseInt(document.getElementById('s-look').value), mlThreshold:parseFloat(document.getElementById('s-ml-t').value)});
+            alert('Config Saved');
         }
-
-        async function doLogin() {
-            const r = await doAPI('/api/auth/login', 'POST', { email: document.getElementById('login-email').value, password: document.getElementById('login-pass').value });
-            if (!r.error) { authToken = r.token; localStorage.setItem('bot_token', authToken); toggleAuthUI(); nav('dashboard'); }
+        if(token) {
+            document.getElementById('auth-view').style.display='none';
+            document.getElementById('dash-view').style.display='block';
+            setInterval(async () => {
+                const d = await api('/api/data');
+                document.getElementById('net-pnl').innerText = '$' + d.metrics.totalNetPnl.toFixed(2);
+                document.getElementById('balance').innerText = '$' + d.walletBalance.toFixed(2);
+                document.getElementById('ai-sig').innerText = d.mlSignal.confidence.toFixed(1) + '% ' + d.mlSignal.type.toUpperCase();
+                document.getElementById('live-roi').innerText = (d.activePositions[0]?.exchangeROI || 0).toFixed(2) + '%';
+                
+                const h = document.getElementById('trade-history'); h.innerHTML = '';
+                d.metrics.trades.reverse().forEach(t => {
+                    h.innerHTML += '<tr><td>'+new Date(t.timestamp).toLocaleTimeString()+'</td><td class="'+(t.side==='long'?'text-green-500':'text-red-500')+'">'+t.side.toUpperCase()+'</td><td>'+t.exitReason+'</td><td>$'+t.netPnl.toFixed(2)+'</td></tr>';
+                });
+            }, 1000);
         }
-
-        async function doRegister() {
-            const r = await doAPI('/api/auth/register', 'POST', { name: document.getElementById('reg-name').value, email: document.getElementById('reg-email').value, password: document.getElementById('reg-pass').value });
-            if (!r.error) { authToken = r.token; localStorage.setItem('bot_token', authToken); toggleAuthUI(); nav('dashboard'); }
-        }
-
-        function handleLiveToggle() { document.getElementById('liveTrade').checked = !document.getElementById('liveTrade').checked; }
-        if(authToken) { toggleAuthUI(); nav('dashboard'); } else { toggleAuthUI(); nav('home'); }
     </script>
 </body>
-</html>`);
-});
+</html>
+`)});
 
-app.listen(CUSTOM_PORT, async () => { console.log(`✅ Hedge Server running on port ${CUSTOM_PORT}`); await loadAllUsers(); startMasterStreams(); });
+app.listen(CUSTOM_PORT, async () => { await masterLoop(); console.log('Hedge Server Online'); });
