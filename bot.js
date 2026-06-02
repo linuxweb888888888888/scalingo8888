@@ -1,144 +1,150 @@
+require('dotenv').config();
 const express = require('express');
 const WebSocket = require('ws');
-const pako = require('pako'); // HTX uses GZIP compression
-require('dotenv').config();
-
+const pako = require('pako'); // HTX uses gzip compression
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Bot Settings & State
-let botState = {
-    symbol: 'shibusdt', // HTX spot or '1000shibusdt' for futures
-    isRunning: true,
-    startTime: new Date(),
-    priceHistory: [],
-    currentPrice: { bid: 0, ask: 0 },
-    openPosition: null, // { entryPrice, contracts, totalCost, direction: 'LONG' }
-    closedTrades: [],
-    totalRealizedPnl: 0,
-    metrics: {
-        roi: 0,
-        unrealizedPnl: 0,
-        growthRate: 0
-    }
-};
+// --- BOT SETTINGS ---
+const SYMBOL = 'shibusdt'; // HTX WS symbol format
+const CONTRACT_SIZE = 1000; // 1 contract = 1000 SHIB
+const GROWTH_CHECK_INTERVAL = 60000; // 1 minute (Time-based setting)
+const DCA_ROI_TRIGGER = -10; // Trigger DCA if ROI is below -10%
+const MULTIPLIER = 1.2;
 
-// 1. WebSocket for Real-time Data
-const connectHTX = () => {
+// --- STATE MANAGEMENT ---
+let botStartTime = new Date();
+let currentPrice = { bid: 0, ask: 0, last: 0 };
+let priceHistory = [];
+let realizedPnl = 0;
+let openPosition = null; // { side: 'long', size: 0, entryPrice: 0, contracts: 0 }
+let tradeHistory = [];
+
+// --- UTILITIES ---
+const calculateROI = (entry, current) => ((current - entry) / entry) * 100;
+const calculatePNL = (entry, current, size) => (current - entry) * size;
+
+// --- WEBSOCKET CONNECTION (HTX) ---
+function connectWS() {
     const ws = new WebSocket('wss://api.huobi.pro/ws');
 
     ws.on('open', () => {
-        // Subscribe to Market Detail (gives bid/ask/last price)
-        ws.send(JSON.stringify({ sub: `market.${botState.symbol}.detail`, id: 'shib_bot' }));
+        // Subscribe to SHIB/USDT Market Detail (ticker)
+        ws.send(JSON.stringify({ sub: `market.${SYMBOL}.detail`, id: 'shib_bot' }));
     });
 
     ws.on('message', (data) => {
-        const payload = JSON.parse(pako.ungzip(data, { to: 'string' }));
+        const payload = JSON.parse(pako.inflate(data, { to: 'string' }));
         
-        // Handle Ping/Pong to keep connection alive
+        // Handle Ping/Pong
         if (payload.ping) {
             ws.send(JSON.stringify({ pong: payload.ping }));
             return;
         }
 
         if (payload.tick) {
-            botState.currentPrice.bid = payload.tick.bid[0];
-            botState.currentPrice.ask = payload.tick.ask[0];
-            updateLogic();
+            // HTX Detail provides close (last), bid, and ask
+            currentPrice.last = payload.tick.close;
+            // Simulated bid/ask spread for paper trading (0.01% offset)
+            currentPrice.bid = payload.tick.close * 0.9999; 
+            currentPrice.ask = payload.tick.close * 1.0001;
         }
     });
 
-    ws.on('close', () => setTimeout(connectHTX, 5000));
-};
+    ws.on('close', () => setTimeout(connectWS, 5000));
+}
 
-// 2. Trading Strategy & DCA Logic
-const updateLogic = () => {
-    const price = botState.currentPrice.bid;
-    if (!price) return;
-
-    // Maintain Price History for Growth Rate (Time-based)
-    const now = Date.now();
-    botState.priceHistory.push({ price, time: now });
-    const windowMs = process.env.GROWTH_RATE_WINDOW_MINS * 60000;
-    botState.priceHistory = botState.priceHistory.filter(p => now - p.time <= windowMs);
-
-    // Calculate Growth Rate
-    if (botState.priceHistory.length > 1) {
-        const oldPrice = botState.priceHistory[0].price;
-        botState.metrics.growthRate = ((price - oldPrice) / oldPrice) * 100;
-    }
-
-    // Initialize first contract (1000 SHIB unit)
-    if (!botState.openPosition) {
-        openPosition(1); // Start with 1 contract
-        return;
-    }
-
-    // Calculate ROI & Unrealized PNL
-    const pos = botState.openPosition;
-    botState.metrics.unrealizedPnl = (price - pos.entryPrice) * (pos.contracts * 1000);
-    botState.metrics.roi = (botState.metrics.unrealizedPnl / pos.totalCost) * 100;
-
-    // DCA Logic: Trigger if ROI below -10% (drawdown)
-    const dcaThreshold = parseFloat(process.env.DCA_THRESHOLD_PERCENT);
-    if (botState.metrics.roi <= dcaThreshold) {
-        const multiplier = parseFloat(process.env.DCA_MULTIPLIER);
-        const newContracts = pos.contracts * multiplier;
-        console.log(`DCA Triggered! Buying ${newContracts.toFixed(2)} units...`);
-        openPosition(newContracts, true);
-    }
-};
-
-const openPosition = (contracts, isDca = false) => {
-    const price = botState.currentPrice.ask; // Buy at Ask
-    const cost = price * (contracts * 1000);
-
-    if (!isDca) {
-        botState.openPosition = {
-            entryPrice: price,
-            contracts: contracts,
-            totalCost: cost,
-            direction: 'LONG'
+// --- TRADING LOGIC ---
+function startPosition() {
+    if (!openPosition) {
+        const entry = currentPrice.ask; // Buy at ask
+        openPosition = {
+            side: 'long',
+            contracts: 1,
+            size: 1 * CONTRACT_SIZE,
+            entryPrice: entry,
+            timestamp: new Date()
         };
-    } else {
-        // Average Down Logic
-        const totalContracts = botState.openPosition.contracts + contracts;
-        const totalCost = botState.openPosition.totalCost + cost;
-        botState.openPosition.entryPrice = totalCost / (totalContracts * 1000);
-        botState.openPosition.contracts = totalContracts;
-        botState.openPosition.totalCost = totalCost;
+        console.log(`[BOT] Started first contract at ${entry}`);
     }
-};
+}
 
-// 3. Webserver UI
+function checkStrategy() {
+    if (!openPosition || currentPrice.last === 0) return;
+
+    // 1. Calculate Growth Rate (Price vs 1 minute ago)
+    priceHistory.push(currentPrice.last);
+    if (priceHistory.length > 60) priceHistory.shift();
+    
+    const pastPrice = priceHistory[0];
+    const growthRate = ((currentPrice.last - pastPrice) / pastPrice) * 100;
+
+    // 2. Calculate ROI
+    const roi = calculateROI(openPosition.entryPrice, currentPrice.bid);
+
+    // 3. DCA Logic (Multiplier 1.2)
+    if (roi <= DCA_ROI_TRIGGER) {
+        const newContracts = openPosition.contracts * MULTIPLIER;
+        const totalContracts = openPosition.contracts + newContracts;
+        const newSize = totalContracts * CONTRACT_SIZE;
+        
+        // Average the entry price
+        const totalCost = (openPosition.entryPrice * openPosition.size) + (currentPrice.ask * (newContracts * CONTRACT_SIZE));
+        openPosition.entryPrice = totalCost / newSize;
+        openPosition.contracts = totalContracts;
+        openPosition.size = newSize;
+        
+        console.log(`[DCA] Triggered! New Size: ${openPosition.contracts.toFixed(2)} contracts. Avg Price: ${openPosition.entryPrice.toFixed(8)}`);
+    }
+}
+
+// --- WEB SERVER ROUTES ---
 app.get('/', (req, res) => {
-    res.send(`
-        <html>
-            <body style="font-family:sans-serif; background:#121212; color:white; padding:20px;">
-                <h1>SHIB HTX Growth Bot (Paper)</h1>
-                <div style="display:grid; grid-template-columns: 1fr 1fr; gap:20px;">
-                    <div style="border:1px solid #333; padding:15px;">
-                        <h3>Active Position</h3>
-                        <p>Direction: <b style="color:#00ff00">${botState.openPosition?.direction || 'NONE'}</b></p>
-                        <p>Contracts: ${botState.openPosition?.contracts.toFixed(2) || 0} (1k/unit)</p>
-                        <p>Avg Entry: $${botState.openPosition?.entryPrice.toFixed(8) || 0}</p>
-                        <p>Current Bid: $${botState.currentPrice.bid.toFixed(8)}</p>
-                    </div>
-                    <div style="border:1px solid #333; padding:15px;">
-                        <h3>Metrics</h3>
-                        <p>ROI: <span style="color:${botState.metrics.roi >= 0 ? '#00ff00' : '#ff4444'}">${botState.metrics.roi.toFixed(2)}%</span></p>
-                        <p>Unrealized PNL: $${botState.metrics.unrealizedPnl.toFixed(4)}</p>
-                        <p>Realized PNL: $${botState.totalRealizedPnl.toFixed(4)}</p>
-                        <p>Growth Rate (${process.env.GROWTH_RATE_WINDOW_MINS}m): ${botState.metrics.growthRate.toFixed(4)}%</p>
-                    </div>
-                </div>
-                <h3>Bot Uptime: ${Math.floor((Date.now() - botState.startTime)/60000)} mins</h3>
-            </body>
-        </html>
-    `);
+    let unrealizedPnl = 0;
+    let roi = 0;
+
+    if (openPosition) {
+        unrealizedPnl = calculatePNL(openPosition.entryPrice, currentPrice.bid, openPosition.size);
+        roi = calculateROI(openPosition.entryPrice, currentPrice.bid);
+    }
+
+    const metrics = {
+        bot_uptime: `${Math.floor((new Date() - botStartTime) / 1000 / 60)} mins`,
+        symbol: SYMBOL.toUpperCase(),
+        market: {
+            last: currentPrice.last,
+            bid: currentPrice.bid,
+            ask: currentPrice.ask
+        },
+        position: openPosition ? {
+            direction: openPosition.side.toUpperCase(),
+            contracts: openPosition.contracts.toFixed(2),
+            total_shib: openPosition.size,
+            avg_entry: openPosition.entryPrice.toFixed(8),
+            unrealized_pnl: unrealizedPnl.toFixed(4) + " USDT",
+            roi: roi.toFixed(2) + "%"
+        } : "No open position",
+        closed_trades: tradeHistory,
+        summary: {
+            realized_pnl: realizedPnl.toFixed(4) + " USDT",
+            total_profit_from_start: (realizedPnl + unrealizedPnl).toFixed(4) + " USDT"
+        }
+    };
+
+    res.json(metrics);
 });
 
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    connectHTX();
-});
+// --- START BOT ---
+connectWS();
+// Initialize position once price is received
+const initInterval = setInterval(() => {
+    if (currentPrice.last > 0) {
+        startPosition();
+        clearInterval(initInterval);
+    }
+}, 2000);
+
+// Set Growth Rate / DCA check interval
+setInterval(checkStrategy, GROWTH_CHECK_INTERVAL);
+
+app.listen(PORT, () => console.log(`Webserver running on port ${PORT}`));
