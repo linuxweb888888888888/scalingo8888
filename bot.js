@@ -1728,121 +1728,401 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         :root { --zinc-50: #fafafa; --zinc-100: #f4f4f5; --zinc-200: #e4e4e7; --zinc-800: #27272a; --zinc-950: #09090b; }
         body { font-family: 'Inter', sans-serif; background-color: var(--zinc-50); color: var(--zinc-950); }
         .font-mono { font-family: 'JetBrains Mono', monospace; }
         .ui-card { background: #ffffff; border-radius: 12px; border: 1px solid var(--zinc-200); box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05); }
         .input-minimal { width: 100%; border: 1px solid var(--zinc-200); border-radius: 8px; padding: 10px 14px; font-size: 14px; outline: none; background: #fff; }
         .input-minimal:focus { border-color: var(--zinc-950); }
-        .btn-primary { background: var(--zinc-950); color: #fff; border-radius: 8px; padding: 10px 20px; font-size: 14px; font-weight: 600; transition: all 0.2s; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 8px; }
-        .btn-primary:hover { opacity: 0.9; }
+        .btn-primary { background: var(--zinc-950); color: #fff; border-radius: 8px; padding: 10px 20px; font-size: 14px; font-weight: 600; transition: all 0.2s; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 8px; border: none; }
+        .btn-primary:hover { opacity: 0.9; transform: translateY(-1px); }
         .btn-secondary { background: #fff; color: var(--zinc-800); border: 1px solid var(--zinc-200); border-radius: 8px; padding: 10px 20px; font-size: 14px; font-weight: 500; cursor: pointer; }
         .btn-secondary:hover { background: var(--zinc-50); }
         .status-pill { padding: 4px 10px; border-radius: 9999px; font-size: 10px; font-weight: 800; text-transform: uppercase; }
-        .view-section { display: none; animation: slideUp 0.4s ease-out; }
-        @keyframes slideUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .view-section { display: none; }
         .active-view { display: block; }
-        button { cursor: pointer; }
-        [onclick] { cursor: pointer; }
+        button, [onclick], .cursor-pointer { cursor: pointer; }
+        nav button { background: none; border: none; }
     </style>
 </head>
 <body class="antialiased min-h-screen flex flex-col">
-    <header class="bg-white/70 backdrop-blur-xl border-b border-zinc-200 sticky top-0 z-50">
-        <div class="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
-            <div class="flex items-center gap-3 cursor-pointer group" onclick="window.nav('home')">
-                <div class="w-8 h-8 rounded bg-zinc-950 flex items-center justify-center shadow-lg group-hover:scale-110 transition">
-                    <span class="material-symbols-outlined text-white text-[18px]">bolt</span>
-                </div>
-                <div class="flex flex-col leading-tight">
-                    <span class="font-extrabold tracking-tighter text-base">TRADEBOT<span class="text-indigo-600">PILLE</span></span>
-                    <span class="text-[9px] uppercase font-bold text-zinc-400 tracking-widest">DCA Engine</span>
-                </div>
+
+<header class="bg-white/70 backdrop-blur-xl border-b border-zinc-200 sticky top-0 z-50">
+    <div class="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
+        <div class="flex items-center gap-3 cursor-pointer group" id="homeLogo">
+            <div class="w-8 h-8 rounded bg-zinc-950 flex items-center justify-center shadow-lg group-hover:scale-110 transition">
+                <span class="material-symbols-outlined text-white text-[18px]">bolt</span>
             </div>
-            <nav id="nav-public" class="flex items-center gap-2 text-sm">
-                <button onclick="window.nav('backtest')" class="px-4 py-2 font-semibold text-zinc-500 hover:text-zinc-950 transition">Backtest</button>
-                <button onclick="window.nav('analytics')" class="px-4 py-2 font-semibold text-zinc-500 hover:text-zinc-950 transition">Stats</button>
-                <div class="w-px h-4 bg-zinc-200 mx-2"></div>
-                <button onclick="window.nav('login')" class="px-4 py-2 font-semibold text-zinc-500 hover:text-zinc-950 transition">Login</button>
-                <button onclick="window.nav('register')" class="btn-primary">Get Started</button>
-            </nav>
-            <nav id="nav-private" class="hidden items-center gap-4 text-sm">
-                <div class="hidden md:flex flex-col items-end mr-2">
-                    <span id="nav-user-name" class="font-bold text-zinc-950"></span>
-                    <span class="text-[9px] text-zinc-400 font-bold uppercase tracking-tighter">Authorized Operator</span>
-                </div>
-                <button onclick="window.nav('dashboard')" class="px-3 py-2 rounded-md hover:bg-zinc-100 transition font-bold text-zinc-600">Terminal</button>
-                <button onclick="window.nav('step-history')" class="px-3 py-2 rounded-md hover:bg-zinc-100 transition font-bold text-zinc-600">Steps</button>
-                <button onclick="window.logout()" class="px-3 py-2 text-red-500 font-bold hover:bg-red-50 rounded-md transition">Logout</button>
-            </nav>
+            <div class="flex flex-col leading-tight">
+                <span class="font-extrabold tracking-tighter text-base">TRADEBOT<span class="text-indigo-600">PILLE</span></span>
+                <span class="text-[9px] uppercase font-bold text-zinc-400 tracking-widest">DCA Engine</span>
+            </div>
         </div>
-    </header>
-    <main class="flex-grow flex flex-col">
-        <section id="view-home" class="view-section active-view">
-            <div class="max-w-4xl mx-auto px-4 pt-32 pb-24 text-center">
-                <div class="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-zinc-100 text-[10px] font-black uppercase tracking-widest text-zinc-500 mb-8 border border-zinc-200">
-                    <span class="w-2 h-2 rounded-full bg-indigo-500 animate-ping"></span> Live SHIB DCA Execution
-                </div>
-                <h1 class="text-6xl md:text-8xl font-black tracking-tight mb-8 leading-[0.9]">DCA TRADING<br><span class="text-zinc-400 italic">WITH PRECISION.</span></h1>
-                <p class="text-lg md:text-xl text-zinc-500 mb-12 max-w-2xl mx-auto font-medium leading-relaxed">A specialized DCA trading algorithm using 75x cross-leverage on HTX with configurable DCA triggers and daily growth rate.</p>
-                <div class="flex flex-col sm:flex-row justify-center gap-4">
-                    <button onclick="window.nav('register')" class="btn-primary text-base px-8 py-4 shadow-xl shadow-indigo-200">Open Terminal <span class="material-symbols-outlined">trending_up</span></button>
-                    <button onclick="window.nav('backtest')" class="btn-secondary text-base px-8 py-4">Explore Backtest</button>
-                </div>
+        <nav id="nav-public" class="flex items-center gap-2 text-sm">
+            <button id="navBacktest" class="px-4 py-2 font-semibold text-zinc-500 hover:text-zinc-950 transition">Backtest</button>
+            <button id="navAnalytics" class="px-4 py-2 font-semibold text-zinc-500 hover:text-zinc-950 transition">Stats</button>
+            <div class="w-px h-4 bg-zinc-200 mx-2"></div>
+            <button id="navLogin" class="px-4 py-2 font-semibold text-zinc-500 hover:text-zinc-950 transition">Login</button>
+            <button id="navRegister" class="btn-primary">Get Started</button>
+        </nav>
+        <nav id="nav-private" class="hidden items-center gap-4 text-sm">
+            <div class="hidden md:flex flex-col items-end mr-2">
+                <span id="nav-user-name" class="font-bold text-zinc-950"></span>
+                <span class="text-[9px] text-zinc-400 font-bold uppercase tracking-tighter">Authorized Operator</span>
             </div>
-        </section>
-        <section id="view-analytics" class="view-section max-w-5xl mx-auto px-4 py-20">
-            <h2 class="text-4xl font-black mb-12 flex items-center gap-4 italic"><span class="material-symbols-outlined text-4xl">insights</span> PLATFORM ANALYTICS</h2>
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-12">
-                <div class="ui-card p-8 border-b-4 border-b-zinc-950"><p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2">Live Connections</p><p id="stat-online" class="text-5xl font-mono font-black">0</p></div>
-                <div class="ui-card p-8"><p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2">Platform Views</p><p id="stat-views" class="text-5xl font-mono font-black">0</p></div>
-                <div class="ui-card p-8"><p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2">Unique Ops</p><p id="stat-uniques" class="text-5xl font-mono font-black">0</p></div>
+            <button id="navDashboard" class="px-3 py-2 rounded-md hover:bg-zinc-100 transition font-bold text-zinc-600">Terminal</button>
+            <button id="navSteps" class="px-3 py-2 rounded-md hover:bg-zinc-100 transition font-bold text-zinc-600">Steps</button>
+            <button id="logoutBtn" class="px-3 py-2 text-red-500 font-bold hover:bg-red-50 rounded-md transition">Logout</button>
+        </nav>
+    </div>
+</header>
+
+<main class="flex-grow flex flex-col">
+    <!-- HOME -->
+    <section id="view-home" class="view-section active-view">
+        <div class="max-w-4xl mx-auto px-4 pt-32 pb-24 text-center">
+            <div class="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-zinc-100 text-[10px] font-black uppercase tracking-widest text-zinc-500 mb-8 border border-zinc-200">
+                <span class="w-2 h-2 rounded-full bg-indigo-500 animate-ping"></span> Live SHIB DCA Execution
             </div>
-            <div class="ui-card p-8"><h3 class="text-xs font-black mb-6 uppercase tracking-widest text-zinc-400">Live Viewport Distribution</h3><div id="stat-pages" class="divide-y divide-zinc-100"></div></div>
-        </section>
-        <section id="view-backtest" class="view-section max-w-7xl mx-auto px-4 py-16">
-            <div class="grid lg:grid-cols-12 gap-8">
-                <aside class="lg:col-span-3 space-y-6"><div class="ui-card p-6 sticky top-24"><h3 class="font-black text-sm uppercase tracking-widest mb-6 border-b pb-4">Backtest Config</h3><div class="space-y-4"><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Data Span (Min)</label><input type="number" id="btTicks" class="input-minimal font-mono font-bold" value="5000"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">DCA Trigger (%)</label><input type="number" id="btDcaTrigger" class="input-minimal font-mono font-bold" value="1.0" step="0.1"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">DCA Multiplier</label><input type="number" id="btDcaMultiplier" class="input-minimal font-mono font-bold" value="2.0" step="0.1"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Start Contracts</label><input type="number" id="btStartContracts" class="input-minimal font-mono font-bold" value="1"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">DGR Daily Growth (%)</label><input type="number" id="btDgr" class="input-minimal font-mono font-bold" value="0.0" step="0.1"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Direction</label><select id="btDirection" class="input-minimal font-mono font-bold"><option value="long">Long Only</option><option value="short">Short Only</option></select></div><div class="grid grid-cols-2 gap-2"><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">TP %</label><input type="number" id="btTp" class="input-minimal font-mono text-green-600 font-bold" value="10.0"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">SL %</label><input type="number" id="btSl" class="input-minimal font-mono text-red-600 font-bold" value="-50.0"></div></div><button onclick="window.runBacktest()" class="btn-primary w-full py-4 mt-4">Execute Simulation</button></div></div></aside>
-                <div class="lg:col-span-9 space-y-6"><div class="grid grid-cols-2 md:grid-cols-4 gap-4"><div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase mb-1">Win Rate</p><p id="btResWinrate" class="text-3xl font-mono font-black text-indigo-600">-</p></div><div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase mb-1">Net Yield</p><p id="btResPnl" class="text-3xl font-mono font-black">-</p></div><div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase mb-1">Volume (Trades)</p><p id="btResTrades" class="text-3xl font-mono font-black">-</p></div><div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase mb-1">Max Deposit</p><p id="btResDeposit" class="text-3xl font-mono font-black">-</p></div></div><div class="ui-card overflow-hidden"><div class="p-4 bg-zinc-50 border-b"><span class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Simulation Tape</span></div><div class="overflow-x-auto max-h-[600px]"><table class="w-full text-left"><thead class="text-[10px] font-black uppercase text-zinc-400 border-b bg-white sticky top-0"><tr><th class="p-4">Side</th><th class="p-4">Qty</th><th class="p-4">Exit Trigger</th><th class="p-4 text-right">Net PnL</th></tr></thead><tbody id="btTableBody" class="font-mono text-xs divide-y"></tbody></table></div></div></div>
+            <h1 class="text-6xl md:text-8xl font-black tracking-tight mb-8 leading-[0.9]">DCA TRADING<br><span class="text-zinc-400 italic">WITH PRECISION.</span></h1>
+            <p class="text-lg md:text-xl text-zinc-500 mb-12 max-w-2xl mx-auto font-medium leading-relaxed">A specialized DCA trading algorithm using 75x cross-leverage on HTX with configurable DCA triggers and daily growth rate.</p>
+            <div class="flex flex-col sm:flex-row justify-center gap-4">
+                <button id="homeGetStarted" class="btn-primary text-base px-8 py-4 shadow-xl shadow-indigo-200">Open Terminal <span class="material-symbols-outlined">trending_up</span></button>
+                <button id="homeBacktest" class="btn-secondary text-base px-8 py-4">Explore Backtest</button>
             </div>
-        </section>
-        <section id="view-dashboard" class="view-section max-w-[1440px] mx-auto px-4 sm:px-6 py-10">
-            <div class="flex flex-col md:flex-row justify-between items-end mb-10 gap-6"><div><h2 class="text-4xl font-black tracking-tighter mb-2 italic">LIVE TERMINAL</h2><div class="flex items-center gap-3"><span id="statusBadge" class="status-pill">Waking...</span><span class="text-[10px] font-black text-zinc-400 uppercase flex items-center gap-1"><span class="material-symbols-outlined text-[14px]">timer</span> Uptime: <span id="uptime" class="text-zinc-950">0s</span></span></div></div><div class="flex gap-3"><button onclick="window.nav('settings')" class="btn-secondary flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">settings</span> Config</button><button onclick="window.resetAccount()" class="btn-secondary bg-red-50 text-red-600 border-red-200 hover:bg-red-100 flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">factory_reset</span> Reset Account</button><button onclick="window.closeAll()" class="btn-secondary text-red-600 border-red-200 hover:bg-red-50 flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">cancel</span> Emergency Exit</button></div></div>
-            <div class="grid grid-cols-1 lg:grid-cols-12 gap-8"><div class="lg:col-span-8 space-y-8"><div class="grid grid-cols-2 md:grid-cols-4 gap-4"><div class="ui-card p-6 relative"><div class="absolute inset-y-0 left-0 w-1 bg-zinc-950"></div><p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Global PnL</p><p id="netPnl" class="text-3xl font-mono font-black">$0.00</p><button onclick="window.resetMetrics()" class="absolute top-4 right-4 text-zinc-300 hover:text-zinc-950"><span class="material-symbols-outlined text-[16px]">restart_alt</span></button></div><div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase mb-1">Wallet Core</p><p id="marginUsed" class="text-3xl font-mono font-black">$0.00</p></div><div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase mb-1">Live Delta</p><p id="activeRoi" class="text-3xl font-mono font-black text-zinc-400 italic">IDLE</p></div><div class="ui-card p-6 bg-zinc-950 border-zinc-950"><p class="text-[10px] font-black text-zinc-800 uppercase mb-1">Current Direction</p><div class="flex justify-between"><span id="directionValue" class="text-3xl font-mono font-black text-white">LONG</span><span id="dgrValue" class="text-[10px] font-black text-zinc-500 uppercase italic">DGR: 0%</span></div></div></div><div class="ui-card p-6 h-[450px] relative"><canvas id="priceChart"></canvas></div><div class="ui-card overflow-hidden"><div class="p-5 border-b"><h3 class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Exchange Execution Logs</h3></div><div class="overflow-x-auto"><table class="w-full text-left"><thead class="text-[10px] font-black uppercase bg-zinc-50 border-b"><tr><th class="p-4">Time</th><th class="p-4">Side</th><th class="p-4">Qty</th><th class="p-4">Trigger</th><th class="p-4 text-right">Net Return</th></tr></thead><tbody id="tradeHistoryBody" class="font-mono text-xs divide-y"></tbody></table></div></div></div><aside class="lg:col-span-4 space-y-8"><div class="ui-card p-8 border-t-4 border-t-indigo-600"><h3 class="text-sm font-black uppercase tracking-widest mb-8 flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">tune</span> DCA Parameters</h3><div class="space-y-6"><div class="flex justify-between"><label class="text-xs font-bold text-zinc-500">TP Target (%)</label><input type="number" id="tpPctSens" class="input-minimal w-24 text-right font-mono font-bold text-green-600"></div><div class="flex justify-between"><label class="text-xs font-bold text-zinc-500">SL Threshold (%)</label><input type="number" id="slPctSens" class="input-minimal w-24 text-right font-mono font-bold text-red-600"></div><hr><div class="flex justify-between"><label class="text-xs font-bold text-zinc-500">DCA Trigger (%)</label><input type="number" id="dcaTriggerSens" class="input-minimal w-24 text-right font-mono font-bold" step="0.1"></div><div class="flex justify-between"><label class="text-xs font-bold text-zinc-500">DCA Multiplier</label><input type="number" id="dcaMultiplierSens" class="input-minimal w-24 text-right font-mono font-bold" step="0.1"></div><div class="flex justify-between"><label class="text-xs font-bold text-zinc-500">Start Contracts</label><input type="number" id="startContractsSens" class="input-minimal w-24 text-right font-mono font-bold"></div><div class="flex justify-between"><label class="text-xs font-bold text-zinc-500">DGR Growth (%)</label><input type="number" id="dgrSens" class="input-minimal w-24 text-right font-mono font-bold" step="0.1"></div><div class="flex justify-between"><label class="text-xs font-bold text-zinc-500">Direction</label><select id="directionSens" class="input-minimal w-24 text-right font-mono font-bold"><option value="long">LONG</option><option value="short">SHORT</option></select></div><div class="flex justify-between"><label class="text-xs font-bold text-zinc-500">Max Contracts</label><input type="number" id="maxContractsSens" class="input-minimal w-24 text-right font-mono font-bold"></div><button onclick="window.saveConfig()" class="btn-primary w-full py-4 mt-4 italic">Apply Config Settings</button></div></div></aside></div>
-        </section>
-        <section id="view-step-history" class="view-section max-w-4xl mx-auto px-4 py-20"><h2 class="text-4xl font-black mb-8 flex items-center gap-4 italic"><span class="material-symbols-outlined text-4xl">layers</span> DCA STEP TRACE</h2><div class="ui-card overflow-hidden"><table class="w-full text-left"><thead class="text-[10px] font-black uppercase bg-zinc-950 text-white"><tr><th class="p-5">Step</th><th class="p-5">Action</th><th class="p-5">Price</th><th class="p-5">ROI %</th><th class="p-5 text-right">Time</th></tr></thead><tbody id="stepHistoryBody" class="font-mono text-xs divide-y"></tbody></table></div></section>
-        <section id="view-settings" class="view-section max-w-xl mx-auto px-4 py-20"><div class="ui-card p-10 border-t-4 border-t-zinc-950"><h2 class="text-3xl font-black mb-8 italic">API INTEGRATION</h2><div class="space-y-8"><div class="flex items-center gap-4 p-5 bg-zinc-50 rounded-xl border-2 border-dashed border-zinc-200 cursor-pointer" onclick="window.handleLiveToggle()"><input type="checkbox" id="liveTrade" class="w-5 h-5 accent-zinc-950 cursor-pointer"><label class="text-xs font-black uppercase tracking-widest cursor-pointer">Live Exchange Execution</label></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-2 block">HTX Key</label><input type="password" id="apiKey" class="input-minimal font-mono"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-2 block">HTX Secret</label><input type="password" id="apiSecret" class="input-minimal font-mono"></div><button onclick="window.saveApiKeys()" class="btn-primary w-full py-4 text-base italic">Establish Connection</button><p id="key-msg" class="text-center text-[10px] font-black uppercase tracking-widest"></p></div></div></section>
-        <section id="view-login" class="view-section max-w-md mx-auto px-4 py-32"><div class="ui-card p-10"><h2 class="text-3xl font-black mb-8 italic">Welcome Back.</h2><div class="space-y-6"><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Operator Email</label><input type="email" id="login-email" class="input-minimal"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Password</label><input type="password" id="login-pass" class="input-minimal"></div><button onclick="window.doLogin()" class="btn-primary w-full py-4">Authenticate Operator</button><p id="login-err" class="text-red-500 text-[10px] font-black text-center uppercase"></p></div></div></section>
-        <section id="view-register" class="view-section max-w-md mx-auto px-4 py-32"><div class="ui-card p-10"><h2 class="text-3xl font-black mb-8 italic">New Operator.</h2><div class="space-y-6"><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Name</label><input type="text" id="reg-name" class="input-minimal"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Email</label><input type="email" id="reg-email" class="input-minimal"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Password</label><input type="password" id="reg-pass" class="input-minimal"></div><button onclick="window.doRegister()" class="btn-primary w-full py-4">Initialize Command</button><p id="reg-err" class="text-red-500 text-[10px] font-black text-center uppercase"></p></div></div></section>
-    </main>
-    <footer class="bg-white border-t border-zinc-200 py-12"><div class="max-w-7xl mx-auto px-4 text-center"><p class="text-[10px] font-black uppercase tracking-widest text-zinc-400 mb-2">&copy; <script>document.write(new Date().getFullYear())</script> TRADEBOTPILLE DCA ENGINE</p><p class="text-[9px] text-zinc-300 font-bold uppercase tracking-tighter">Geometric trading carries absolute risk. Non-custodial execution strictly for education.</p></div></footer>
-    <script>
-        let authToken = localStorage.getItem('bot_token');
-        let chartPoints = 800;
-        let sessionTrackId = localStorage.getItem('rdca_visitor_id');
-        if (!sessionTrackId) { sessionTrackId = Math.random().toString(36).substring(2, 15); localStorage.setItem('rdca_visitor_id', sessionTrackId); }
-        let currentPageView = 'home';
-        async function pingAnalytics(isViewRecord) { try { await fetch('/api/analytics/track', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: sessionTrackId, page: currentPageView, isView: isViewRecord }) }); } catch(e) {} }
-        setInterval(() => pingAnalytics(false), 10000);
-        window.nav = function(viewId) { document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active-view')); document.getElementById('view-' + viewId).classList.add('active-view'); window.scrollTo(0,0); currentPageView = viewId; pingAnalytics(true); if(viewId === 'dashboard' && authToken) initDashboard(); if(viewId === 'analytics') fetchAnalyticsData(); };
-        function toggleAuthUI() { if (authToken) { document.getElementById('nav-public').classList.add('hidden'); document.getElementById('nav-private').classList.remove('hidden'); document.getElementById('nav-private').classList.add('flex'); } else { document.getElementById('nav-public').classList.remove('hidden'); document.getElementById('nav-private').classList.add('hidden'); document.getElementById('nav-private').classList.remove('flex'); } }
-        window.logout = function() { localStorage.removeItem('bot_token'); authToken = null; toggleAuthUI(); window.nav('home'); };
-        async function doAPI(endpoint, method, body) { const headers = { 'Content-Type': 'application/json' }; if (authToken) headers['Authorization'] = authToken; const res = await fetch(endpoint, { method, headers, body: body ? JSON.stringify(body) : undefined }); const data = await res.json(); if (res.status === 401) { window.logout(); return { error: "Session expired" }; } return data; }
-        window.runBacktest = async function() { document.getElementById('btResTrades').innerText = "..."; const payload = { ticks: document.getElementById('btTicks').value, tpPct: document.getElementById('btTp').value, slPct: document.getElementById('btSl').value, dcaTriggerPct: document.getElementById('btDcaTrigger').value, dcaMultiplier: document.getElementById('btDcaMultiplier').value, startContracts: document.getElementById('btStartContracts').value, dgrDailyGrowthRate: document.getElementById('btDgr').value, manualDirection: document.getElementById('btDirection').value, maxContracts: 100 }; const res = await doAPI('/api/backtest', 'POST', payload); if(res.error) return; document.getElementById('btResWinrate').innerText = res.winRate + "%"; document.getElementById('btResPnl').innerText = "$" + res.netPnl.toFixed(4); document.getElementById('btResTrades').innerText = res.totalTradesCount; document.getElementById('btResDeposit').innerText = "$" + (res.depositNeeded || 0).toFixed(4); const tbody = document.getElementById('btTableBody'); tbody.innerHTML = ""; [...res.trades].reverse().forEach(t => { tbody.innerHTML += '<tr class="border-b"><td class="p-4 font-black ' + (t.side==='long'?'text-green-600':'text-red-600') + '">' + t.side.toUpperCase() + '</td><td class="p-4">' + t.contracts + '</td><td class="p-4 text-[9px] uppercase font-bold text-zinc-400">' + t.exitReason + '</td><td class="p-4 text-right font-black ' + (t.netPnl>=0?'text-green-600':'text-red-600') + '">$' + t.netPnl.toFixed(4) + 'NonNull(','); }); };
-        window.doLogin = async function() { const res = await doAPI('/api/auth/login', 'POST', { email: document.getElementById('login-email').value, password: document.getElementById('login-pass').value }); if (res.error) document.getElementById('login-err').innerText = res.error; else { authToken = res.token; localStorage.setItem('bot_token', authToken); toggleAuthUI(); window.nav('dashboard'); } };
-        window.doRegister = async function() { const res = await doAPI('/api/auth/register', 'POST', { name: document.getElementById('reg-name').value, email: document.getElementById('reg-email').value, password: document.getElementById('reg-pass').value }); if (res.error) document.getElementById('reg-err').innerText = res.error; else { authToken = res.token; localStorage.setItem('bot_token', authToken); toggleAuthUI(); window.nav('dashboard'); } };
-        window.resetAccount = async function() { if(confirm("⚠️ WARNING: This will reset your account to a clean state!")) { const res = await doAPI('/api/user/reset-account', 'POST'); if(res.error) alert("Reset failed: " + res.error); else { alert("✅ Account reset successfully!"); if(dashLoop) clearInterval(dashLoop); setTimeout(() => initDashboard(), 1000); } } };
-        window.handleLiveToggle = function() { const cb = document.getElementById('liveTrade'); cb.checked = !cb.checked; };
-        window.saveApiKeys = async function() { const res = await doAPI('/api/user/keys', 'POST', { apiKey: document.getElementById('apiKey').value, apiSecret: document.getElementById('apiSecret').value, liveTradingEnabled: document.getElementById('liveTrade').checked }); document.getElementById('key-msg').innerText = res.error ? res.error : "KEYS SECURED"; if(!res.error) setTimeout(() => window.nav('dashboard'), 1500); };
-        window.saveConfig = async function() { const payload = { tpPct: document.getElementById("tpPctSens").value, slPct: document.getElementById("slPctSens").value, dcaTriggerPct: document.getElementById("dcaTriggerSens").value, dcaMultiplier: document.getElementById("dcaMultiplierSens").value, startContracts: document.getElementById("startContractsSens").value, dgrDailyGrowthRate: document.getElementById("dgrSens").value, manualDirection: document.getElementById("directionSens").value, maxContracts: document.getElementById("maxContractsSens").value }; await doAPI('/api/user/config', 'POST', payload); alert("CONFIG SYNCED"); };
-        window.closeAll = async function() { if(confirm("ABORT ALL TRADES?")) await doAPI('/api/close-all', 'POST'); };
-        window.resetMetrics = async function() { if(confirm("PURGE TRADE HISTORY?")) { await doAPI('/api/user/reset-metrics', 'POST'); lastTradesCount = -1; fetchMetrics(); } };
-        async function fetchAnalyticsData() { if(currentPageView !== 'analytics') return; const data = await (await fetch('/api/analytics/stats')).json(); document.getElementById('stat-online').innerText = data.online; document.getElementById('stat-views').innerText = data.views; document.getElementById('stat-uniques').innerText = data.uniques; document.getElementById('stat-pages').innerHTML = Object.entries(data.pages).map(([n, c]) => '<div class="flex justify-between p-4"><span class="font-black text-[10px] uppercase tracking-widest text-zinc-500">'+n+'</span><span class="font-mono font-bold">'+c+' OPS</span></div>').join(''); }
-        const ctx = document.getElementById("priceChart").getContext("2d"); const priceChart = new Chart(ctx, { type: "line", data: { labels: [], datasets: [{ label: "Price", data: [], borderColor: "#09090b", borderWidth: 2, pointRadius: 0, tension: 0.1 }] }, options: { responsive: true, maintainAspectRatio: false, animation: false, scales: { x: { display: false }, y: { display: true, position: 'left', grid: { display: false }, ticks: { font: { family: "JetBrains Mono", size: 9 } } } }, plugins: { legend: { display: false } } } });
-        let dashLoop = null, settingsLoaded = false, lastTradesCount = -1;
-        async function initDashboard() { const me = await doAPI('/api/user/me', 'GET'); if(!me.error) { document.getElementById('nav-user-name').innerText = me.name; document.getElementById('liveTrade').checked = me.liveTradingEnabled; document.getElementById('apiKey').value = me.apiKey; } const history = await doAPI('/api/chart-history', 'GET'); if(!history.error && history.length) { priceChart.data.labels = history.map(()=>""); priceChart.data.datasets[0].data = history.map(p=>p.priceMid); priceChart.update(); } if(dashLoop) clearInterval(dashLoop); dashLoop = setInterval(fetchMetrics, 300); }
-        async function fetchMetrics() { if(currentPageView !== 'dashboard' && currentPageView !== 'step-history') return; const data = await doAPI('/api/data', 'GET'); if(data.error) return; if (currentPageView === 'step-history') { const tbody = document.getElementById("stepHistoryBody"); tbody.innerHTML = (data.activePositions[0]?.stepHistory || []).map(s => '<tr class="border-b"><td class="p-5 font-black">'+s.step+'</td><td class="p-5 font-black '+(s.type==='DCA'?'text-red-500':'text-indigo-500')+'">'+s.type+'</td><td class="p-5">$'+s.price.toFixed(8)+'</td><td class="p-5 font-black '+(s.roi>=0?'text-green-600':'text-red-600')+'">'+s.roi.toFixed(2)+'%</td><td class="p-5 text-right text-zinc-400">'+new Date(s.time).toLocaleTimeString()+'</td>').join('') || '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">No Trace Data</td></table>'; } if(!settingsLoaded && data.config) { document.getElementById("tpPctSens").value = data.config.takeProfitPct; document.getElementById("slPctSens").value = data.config.stopLossPct; document.getElementById("dcaTriggerSens").value = data.config.dcaTriggerPct || 1.0; document.getElementById("dcaMultiplierSens").value = data.config.dcaMultiplier || 2.0; document.getElementById("startContractsSens").value = data.config.startContracts || 1; document.getElementById("dgrSens").value = data.config.dgrDailyGrowthRate || 0.0; document.getElementById("directionSens").value = data.config.manualDirection || 'long'; document.getElementById("maxContractsSens").value = data.config.maxContracts || 100; settingsLoaded = true; } document.getElementById("uptime").innerText = data.uptime + "s"; document.getElementById("netPnl").innerText = "$" + (data.metrics?.totalNetPnl || 0).toFixed(4); document.getElementById("netPnl").className = "text-3xl font-mono font-black tracking-tight " + ((data.metrics?.totalNetPnl || 0) >= 0 ? "text-green-600" : "text-red-600"); document.getElementById("marginUsed").innerText = "$" + Number(data.walletBalance || 0).toFixed(4); const badge = document.getElementById("statusBadge"); if(data.activePositions && data.activePositions.length > 0) { const p = data.activePositions[0]; badge.innerText = p.isPaper ? "PAPER ACTIVE" : "LIVE ACTIVE"; badge.className = "status-pill bg-zinc-950 text-white"; document.getElementById("activeRoi").innerText = (p.exchangeROI || 0).toFixed(2) + "%"; document.getElementById("activeRoi").className = "text-3xl font-mono font-black tracking-tight " + ((p.exchangeROI || 0) >= 0 ? "text-green-600" : "text-red-600"); } else { badge.innerText = data.liveTradingEnabled ? "LIVE SCANNING" : "PAPER STANDBY"; badge.className = "status-pill bg-zinc-100 text-zinc-400"; document.getElementById("activeRoi").innerText = "IDLE"; document.getElementById("activeRoi").className = "text-3xl font-mono font-black tracking-tight text-zinc-200"; } if(data.config) { document.getElementById('directionValue').innerText = (data.config.manualDirection || 'LONG').toUpperCase(); document.getElementById('dgrValue').innerText = 'DGR: ' + (data.config.dgrDailyGrowthRate || 0) + '%'; } if(data.metrics && data.metrics.totalTradesCount !== lastTradesCount && data.metrics.trades) { lastTradesCount = data.metrics.totalTradesCount; const tbody = document.getElementById("tradeHistoryBody"); tbody.innerHTML = [...data.metrics.trades].reverse().slice(0, 10).map(t => '<tr class="border-b"><td class="p-4 text-zinc-400">'+new Date(t.timestamp).toLocaleTimeString()+'</td><td class="p-4 font-black '+(t.side==='long'?'text-green-600':'text-red-600')+'">'+t.side.toUpperCase()+'</td><td class="p-4 font-bold">'+t.contracts.toLocaleString()+'</td><td class="p-4 text-[9px] font-black uppercase text-zinc-300">'+t.exitReason+'<tr><td class="p-4 text-right font-black '+(t.netPnl>=0?'text-green-600':'text-red-600')+'">$' + t.netPnl.toFixed(4) + 'NonNull(',') } if(data.binance && data.binance.mid) { priceChart.data.labels.push(""); priceChart.data.datasets[0].data.push(data.binance.mid); if(priceChart.data.labels.length > chartPoints) { priceChart.data.labels.shift(); priceChart.data.datasets[0].data.shift(); } priceChart.update(); } }
-        pingAnalytics(true); setInterval(fetchAnalyticsData, 4000); if(authToken) { toggleAuthUI(); window.nav('dashboard'); } else { toggleAuthUI(); window.nav('home'); }
-    </script>
+        </div>
+    </section>
+
+    <!-- ANALYTICS -->
+    <section id="view-analytics" class="view-section max-w-5xl mx-auto px-4 py-20">
+        <h2 class="text-4xl font-black mb-12 flex items-center gap-4 italic"><span class="material-symbols-outlined text-4xl">insights</span> PLATFORM ANALYTICS</h2>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-12">
+            <div class="ui-card p-8 border-b-4 border-b-zinc-950"><p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2">Live Connections</p><p id="stat-online" class="text-5xl font-mono font-black">0</p></div>
+            <div class="ui-card p-8"><p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2">Platform Views</p><p id="stat-views" class="text-5xl font-mono font-black">0</p></div>
+            <div class="ui-card p-8"><p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-2">Unique Ops</p><p id="stat-uniques" class="text-5xl font-mono font-black">0</p></div>
+        </div>
+        <div class="ui-card p-8"><h3 class="text-xs font-black mb-6 uppercase tracking-widest text-zinc-400">Live Viewport Distribution</h3><div id="stat-pages" class="divide-y divide-zinc-100"></div></div>
+    </section>
+
+    <!-- BACKTEST -->
+    <section id="view-backtest" class="view-section max-w-7xl mx-auto px-4 py-16">
+        <div class="grid lg:grid-cols-12 gap-8">
+            <aside class="lg:col-span-3 space-y-6"><div class="ui-card p-6 sticky top-24"><h3 class="font-black text-sm uppercase tracking-widest mb-6 border-b pb-4">Backtest Config</h3><div class="space-y-4"><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Data Span (Min)</label><input type="number" id="btTicks" class="input-minimal font-mono font-bold" value="5000"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">DCA Trigger (%)</label><input type="number" id="btDcaTrigger" class="input-minimal font-mono font-bold" value="1.0" step="0.1"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">DCA Multiplier</label><input type="number" id="btDcaMultiplier" class="input-minimal font-mono font-bold" value="2.0" step="0.1"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Start Contracts</label><input type="number" id="btStartContracts" class="input-minimal font-mono font-bold" value="1"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">DGR Daily Growth (%)</label><input type="number" id="btDgr" class="input-minimal font-mono font-bold" value="0.0" step="0.1"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Direction</label><select id="btDirection" class="input-minimal font-mono font-bold"><option value="long">Long Only</option><option value="short">Short Only</option></select></div><div class="grid grid-cols-2 gap-2"><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">TP %</label><input type="number" id="btTp" class="input-minimal font-mono text-green-600 font-bold" value="10.0"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">SL %</label><input type="number" id="btSl" class="input-minimal font-mono text-red-600 font-bold" value="-50.0"></div></div><button id="runBacktestBtn" class="btn-primary w-full py-4 mt-4">Execute Simulation</button></div></div></aside>
+            <div class="lg:col-span-9 space-y-6"><div class="grid grid-cols-2 md:grid-cols-4 gap-4"><div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase mb-1">Win Rate</p><p id="btResWinrate" class="text-3xl font-mono font-black text-indigo-600">-</p></div><div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase mb-1">Net Yield</p><p id="btResPnl" class="text-3xl font-mono font-black">-</p></div><div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase mb-1">Volume (Trades)</p><p id="btResTrades" class="text-3xl font-mono font-black">-</p></div><div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase mb-1">Max Deposit</p><p id="btResDeposit" class="text-3xl font-mono font-black">-</p></div></div><div class="ui-card overflow-hidden"><div class="p-4 bg-zinc-50 border-b"><span class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Simulation Tape</span></div><div class="overflow-x-auto max-h-[600px]"><table class="w-full text-left"><thead class="text-[10px] font-black uppercase text-zinc-400 border-b bg-white sticky top-0"><tr><th class="p-4">Side</th><th class="p-4">Qty</th><th class="p-4">Exit Trigger</th><th class="p-4 text-right">Net PnL</th></tr></thead><tbody id="btTableBody" class="font-mono text-xs divide-y"></tbody><table></div></div></div>
+        </div>
+    </section>
+
+    <!-- DASHBOARD -->
+    <section id="view-dashboard" class="view-section max-w-[1440px] mx-auto px-4 sm:px-6 py-10">
+        <div class="flex flex-col md:flex-row justify-between items-end mb-10 gap-6"><div><h2 class="text-4xl font-black tracking-tighter mb-2 italic">LIVE TERMINAL</h2><div class="flex items-center gap-3"><span id="statusBadge" class="status-pill">Waking...</span><span class="text-[10px] font-black text-zinc-400 uppercase flex items-center gap-1"><span class="material-symbols-outlined text-[14px]">timer</span> Uptime: <span id="uptime" class="text-zinc-950">0s</span></span></div></div><div class="flex gap-3"><button id="settingsBtn" class="btn-secondary flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">settings</span> Config</button><button id="resetAccountBtn" class="btn-secondary bg-red-50 text-red-600 border-red-200 hover:bg-red-100 flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">factory_reset</span> Reset Account</button><button id="emergencyExitBtn" class="btn-secondary text-red-600 border-red-200 hover:bg-red-50 flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">cancel</span> Emergency Exit</button></div></div>
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-8"><div class="lg:col-span-8 space-y-8"><div class="grid grid-cols-2 md:grid-cols-4 gap-4"><div class="ui-card p-6 relative"><div class="absolute inset-y-0 left-0 w-1 bg-zinc-950"></div><p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Global PnL</p><p id="netPnl" class="text-3xl font-mono font-black">$0.00</p><button id="resetMetricsBtn" class="absolute top-4 right-4 text-zinc-300 hover:text-zinc-950"><span class="material-symbols-outlined text-[16px]">restart_alt</span></button></div><div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase mb-1">Wallet Core</p><p id="marginUsed" class="text-3xl font-mono font-black">$0.00</p></div><div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase mb-1">Live Delta</p><p id="activeRoi" class="text-3xl font-mono font-black text-zinc-400 italic">IDLE</p></div><div class="ui-card p-6 bg-zinc-950 border-zinc-950"><p class="text-[10px] font-black text-zinc-800 uppercase mb-1">Current Direction</p><div class="flex justify-between"><span id="directionValue" class="text-3xl font-mono font-black text-white">LONG</span><span id="dgrValue" class="text-[10px] font-black text-zinc-500 uppercase italic">DGR: 0%</span></div></div></div><div class="ui-card p-6 h-[450px] relative"><canvas id="priceChart"></canvas></div><div class="ui-card overflow-hidden"><div class="p-5 border-b"><h3 class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Exchange Execution Logs</h3></div><div class="overflow-x-auto"><table class="w-full text-left"><thead class="text-[10px] font-black uppercase bg-zinc-50 border-b"><tr><th class="p-4">Time</th><th class="p-4">Side</th><th class="p-4">Qty</th><th class="p-4">Trigger</th><th class="p-4 text-right">Net Return</th></tr></thead><tbody id="tradeHistoryBody" class="font-mono text-xs divide-y"></tbody></table></div></div></div><aside class="lg:col-span-4 space-y-8"><div class="ui-card p-8 border-t-4 border-t-indigo-600"><h3 class="text-sm font-black uppercase tracking-widest mb-8 flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">tune</span> DCA Parameters</h3><div class="space-y-6"><div class="flex justify-between"><label class="text-xs font-bold text-zinc-500">TP Target (%)</label><input type="number" id="tpPctSens" class="input-minimal w-24 text-right font-mono font-bold text-green-600"></div><div class="flex justify-between"><label class="text-xs font-bold text-zinc-500">SL Threshold (%)</label><input type="number" id="slPctSens" class="input-minimal w-24 text-right font-mono font-bold text-red-600"></div><hr><div class="flex justify-between"><label class="text-xs font-bold text-zinc-500">DCA Trigger (%)</label><input type="number" id="dcaTriggerSens" class="input-minimal w-24 text-right font-mono font-bold" step="0.1"></div><div class="flex justify-between"><label class="text-xs font-bold text-zinc-500">DCA Multiplier</label><input type="number" id="dcaMultiplierSens" class="input-minimal w-24 text-right font-mono font-bold" step="0.1"></div><div class="flex justify-between"><label class="text-xs font-bold text-zinc-500">Start Contracts</label><input type="number" id="startContractsSens" class="input-minimal w-24 text-right font-mono font-bold"></div><div class="flex justify-between"><label class="text-xs font-bold text-zinc-500">DGR Growth (%)</label><input type="number" id="dgrSens" class="input-minimal w-24 text-right font-mono font-bold" step="0.1"></div><div class="flex justify-between"><label class="text-xs font-bold text-zinc-500">Direction</label><select id="directionSens" class="input-minimal w-24 text-right font-mono font-bold"><option value="long">LONG</option><option value="short">SHORT</option></select></div><div class="flex justify-between"><label class="text-xs font-bold text-zinc-500">Max Contracts</label><input type="number" id="maxContractsSens" class="input-minimal w-24 text-right font-mono font-bold"></div><button id="saveConfigBtn" class="btn-primary w-full py-4 mt-4 italic">Apply Config Settings</button></div></div></aside></div>
+    </section>
+
+    <!-- STEP HISTORY -->
+    <section id="view-step-history" class="view-section max-w-4xl mx-auto px-4 py-20"><h2 class="text-4xl font-black mb-8 flex items-center gap-4 italic"><span class="material-symbols-outlined text-4xl">layers</span> DCA STEP TRACE</h2><div class="ui-card overflow-hidden"><table class="w-full text-left"><thead class="text-[10px] font-black uppercase bg-zinc-950 text-white"><tr><th class="p-5">Step</th><th class="p-5">Action</th><th class="p-5">Price</th><th class="p-5">ROI %</th><th class="p-5 text-right">Time</th></tr></thead><tbody id="stepHistoryBody" class="font-mono text-xs divide-y"></tbody></table></div></section>
+
+    <!-- SETTINGS -->
+    <section id="view-settings" class="view-section max-w-xl mx-auto px-4 py-20"><div class="ui-card p-10 border-t-4 border-t-zinc-950"><h2 class="text-3xl font-black mb-8 italic">API INTEGRATION</h2><div class="space-y-8"><div class="flex items-center gap-4 p-5 bg-zinc-50 rounded-xl border-2 border-dashed border-zinc-200 cursor-pointer" id="liveToggleDiv"><input type="checkbox" id="liveTrade" class="w-5 h-5 accent-zinc-950 cursor-pointer"><label class="text-xs font-black uppercase tracking-widest cursor-pointer">Live Exchange Execution</label></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-2 block">HTX Key</label><input type="password" id="apiKey" class="input-minimal font-mono"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-2 block">HTX Secret</label><input type="password" id="apiSecret" class="input-minimal font-mono"></div><button id="saveApiKeysBtn" class="btn-primary w-full py-4 text-base italic">Establish Connection</button><p id="key-msg" class="text-center text-[10px] font-black uppercase tracking-widest"></p></div></div></section>
+
+    <!-- LOGIN -->
+    <section id="view-login" class="view-section max-w-md mx-auto px-4 py-32"><div class="ui-card p-10"><h2 class="text-3xl font-black mb-8 italic">Welcome Back.</h2><div class="space-y-6"><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Operator Email</label><input type="email" id="login-email" class="input-minimal"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Password</label><input type="password" id="login-pass" class="input-minimal"></div><button id="doLoginBtn" class="btn-primary w-full py-4">Authenticate Operator</button><p id="login-err" class="text-red-500 text-[10px] font-black text-center uppercase"></p></div></div></section>
+
+    <!-- REGISTER -->
+    <section id="view-register" class="view-section max-w-md mx-auto px-4 py-32"><div class="ui-card p-10"><h2 class="text-3xl font-black mb-8 italic">New Operator.</h2><div class="space-y-6"><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Name</label><input type="text" id="reg-name" class="input-minimal"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Email</label><input type="email" id="reg-email" class="input-minimal"></div><div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Password</label><input type="password" id="reg-pass" class="input-minimal"></div><button id="doRegisterBtn" class="btn-primary w-full py-4">Initialize Command</button><p id="reg-err" class="text-red-500 text-[10px] font-black text-center uppercase"></p></div></div></section>
+</main>
+
+<footer class="bg-white border-t border-zinc-200 py-12"><div class="max-w-7xl mx-auto px-4 text-center"><p class="text-[10px] font-black uppercase tracking-widest text-zinc-400 mb-2">&copy; <script>document.write(new Date().getFullYear())</script> TRADEBOTPILLE DCA ENGINE</p><p class="text-[9px] text-zinc-300 font-bold uppercase tracking-tighter">Geometric trading carries absolute risk. Non-custodial execution strictly for education.</p></div></footer>
+
+<script>
+(function() {
+    // Global variables
+    let authToken = localStorage.getItem('bot_token');
+    let chartPoints = 800;
+    let sessionTrackId = localStorage.getItem('rdca_visitor_id');
+    if (!sessionTrackId) { sessionTrackId = Math.random().toString(36).substring(2, 15); localStorage.setItem('rdca_visitor_id', sessionTrackId); }
+    let currentPageView = 'home';
+    let dashLoop = null;
+    let settingsLoaded = false;
+    let lastTradesCount = -1;
+    
+    // Chart initialization
+    const ctx = document.getElementById("priceChart").getContext("2d");
+    const priceChart = new Chart(ctx, { type: "line", data: { labels: [], datasets: [{ label: "Price", data: [], borderColor: "#09090b", borderWidth: 2, pointRadius: 0, tension: 0.1 }] }, options: { responsive: true, maintainAspectRatio: false, animation: false, scales: { x: { display: false }, y: { display: true, position: 'left', grid: { display: false }, ticks: { font: { family: "JetBrains Mono", size: 9 } } } }, plugins: { legend: { display: false } } } });
+    
+    // Navigation function
+    function navigateTo(viewId) {
+        document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active-view'));
+        const targetView = document.getElementById('view-' + viewId);
+        if (targetView) targetView.classList.add('active-view');
+        window.scrollTo(0, 0);
+        currentPageView = viewId;
+        pingAnalytics(true);
+        if (viewId === 'dashboard' && authToken) initDashboard();
+        if (viewId === 'analytics') fetchAnalyticsData();
+    }
+    
+    // Analytics
+    async function pingAnalytics(isViewRecord) { 
+        try { await fetch('/api/analytics/track', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: sessionTrackId, page: currentPageView, isView: isViewRecord }) }); } catch(e) {} 
+    }
+    
+    // API caller
+    async function doAPI(endpoint, method, body) { 
+        const headers = { 'Content-Type': 'application/json' }; 
+        if (authToken) headers['Authorization'] = authToken; 
+        const res = await fetch(endpoint, { method, headers, body: body ? JSON.stringify(body) : undefined }); 
+        const data = await res.json(); 
+        if (res.status === 401) { logout(); return { error: "Session expired" }; } 
+        return data; 
+    }
+    
+    // Auth UI toggle
+    function toggleAuthUI() { 
+        if (authToken) { 
+            document.getElementById('nav-public').classList.add('hidden'); 
+            document.getElementById('nav-private').classList.remove('hidden'); 
+            document.getElementById('nav-private').classList.add('flex'); 
+        } else { 
+            document.getElementById('nav-public').classList.remove('hidden'); 
+            document.getElementById('nav-private').classList.add('hidden'); 
+            document.getElementById('nav-private').classList.remove('flex'); 
+        } 
+    }
+    
+    // Logout
+    function logout() { 
+        localStorage.removeItem('bot_token'); 
+        authToken = null; 
+        toggleAuthUI(); 
+        navigateTo('home'); 
+    }
+    
+    // Dashboard functions
+    async function initDashboard() { 
+        const me = await doAPI('/api/user/me', 'GET'); 
+        if(!me.error) { 
+            document.getElementById('nav-user-name').innerText = me.name; 
+            const liveCheckbox = document.getElementById('liveTrade');
+            if(liveCheckbox) liveCheckbox.checked = me.liveTradingEnabled; 
+            const apiKeyInput = document.getElementById('apiKey');
+            if(apiKeyInput) apiKeyInput.value = me.apiKey; 
+        } 
+        const history = await doAPI('/api/chart-history', 'GET'); 
+        if(!history.error && history.length) { 
+            priceChart.data.labels = history.map(()=>""); 
+            priceChart.data.datasets[0].data = history.map(p=>p.priceMid); 
+            priceChart.update(); 
+        } 
+        if(dashLoop) clearInterval(dashLoop); 
+        dashLoop = setInterval(fetchMetrics, 300); 
+    }
+    
+    async function fetchMetrics() { 
+        if(currentPageView !== 'dashboard' && currentPageView !== 'step-history') return; 
+        const data = await doAPI('/api/data', 'GET'); 
+        if(data.error) return; 
+        
+        if (currentPageView === 'step-history') { 
+            const tbody = document.getElementById("stepHistoryBody"); 
+            tbody.innerHTML = (data.activePositions[0]?.stepHistory || []).map(s => '<tr class="border-b"><td class="p-5 font-black">'+s.step+'</td><td class="p-5 font-black '+(s.type==='DCA'?'text-red-500':'text-indigo-500')+'">'+s.type+'</td><td class="p-5">$'+s.price.toFixed(8)+'</td><td class="p-5 font-black '+(s.roi>=0?'text-green-600':'text-red-600')+'">'+s.roi.toFixed(2)+'%</td><td class="p-5 text-right text-zinc-400">'+new Date(s.time).toLocaleTimeString()+'</td></tr>').join('') || '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">No Trace Data</td></tr>'; 
+        } 
+        
+        if(!settingsLoaded && data.config) { 
+            document.getElementById("tpPctSens").value = data.config.takeProfitPct; 
+            document.getElementById("slPctSens").value = data.config.stopLossPct; 
+            document.getElementById("dcaTriggerSens").value = data.config.dcaTriggerPct || 1.0; 
+            document.getElementById("dcaMultiplierSens").value = data.config.dcaMultiplier || 2.0; 
+            document.getElementById("startContractsSens").value = data.config.startContracts || 1; 
+            document.getElementById("dgrSens").value = data.config.dgrDailyGrowthRate || 0.0; 
+            document.getElementById("directionSens").value = data.config.manualDirection || 'long'; 
+            document.getElementById("maxContractsSens").value = data.config.maxContracts || 100; 
+            settingsLoaded = true; 
+        } 
+        
+        document.getElementById("uptime").innerText = data.uptime + "s"; 
+        document.getElementById("netPnl").innerText = "$" + (data.metrics?.totalNetPnl || 0).toFixed(4); 
+        document.getElementById("netPnl").className = "text-3xl font-mono font-black tracking-tight " + ((data.metrics?.totalNetPnl || 0) >= 0 ? "text-green-600" : "text-red-600"); 
+        document.getElementById("marginUsed").innerText = "$" + Number(data.walletBalance || 0).toFixed(4); 
+        
+        const badge = document.getElementById("statusBadge"); 
+        if(data.activePositions && data.activePositions.length > 0) { 
+            const p = data.activePositions[0]; 
+            badge.innerText = p.isPaper ? "PAPER ACTIVE" : "LIVE ACTIVE"; 
+            badge.className = "status-pill bg-zinc-950 text-white"; 
+            document.getElementById("activeRoi").innerText = (p.exchangeROI || 0).toFixed(2) + "%"; 
+            document.getElementById("activeRoi").className = "text-3xl font-mono font-black tracking-tight " + ((p.exchangeROI || 0) >= 0 ? "text-green-600" : "text-red-600"); 
+        } else { 
+            badge.innerText = data.liveTradingEnabled ? "LIVE SCANNING" : "PAPER STANDBY"; 
+            badge.className = "status-pill bg-zinc-100 text-zinc-400"; 
+            document.getElementById("activeRoi").innerText = "IDLE"; 
+            document.getElementById("activeRoi").className = "text-3xl font-mono font-black tracking-tight text-zinc-200"; 
+        } 
+        
+        if(data.config) { 
+            document.getElementById('directionValue').innerText = (data.config.manualDirection || 'LONG').toUpperCase(); 
+            document.getElementById('dgrValue').innerText = 'DGR: ' + (data.config.dgrDailyGrowthRate || 0) + '%'; 
+        } 
+        
+        if(data.metrics && data.metrics.totalTradesCount !== lastTradesCount && data.metrics.trades) { 
+            lastTradesCount = data.metrics.totalTradesCount; 
+            const tbody = document.getElementById("tradeHistoryBody"); 
+            tbody.innerHTML = [...data.metrics.trades].reverse().slice(0, 10).map(t => '<tr class="border-b"><td class="p-4 text-zinc-400">'+new Date(t.timestamp).toLocaleTimeString()+'</td><td class="p-4 font-black '+(t.side==='long'?'text-green-600':'text-red-600')+'">'+t.side.toUpperCase()+'</td><td class="p-4 font-bold">'+t.contracts.toLocaleString()+'</td><td class="p-4 text-[9px] font-black uppercase text-zinc-300">'+t.exitReason+'</td><td class="p-4 text-right font-black '+(t.netPnl>=0?'text-green-600':'text-red-600')+'">$' + t.netPnl.toFixed(4) + 'NonNull(',') 
+        } 
+        
+        if(data.binance && data.binance.mid) { 
+            priceChart.data.labels.push(""); 
+            priceChart.data.datasets[0].data.push(data.binance.mid); 
+            if(priceChart.data.labels.length > chartPoints) { 
+                priceChart.data.labels.shift(); 
+                priceChart.data.datasets[0].data.shift(); 
+            } 
+            priceChart.update(); 
+        } 
+    }
+    
+    // Action functions
+    async function runBacktest() { 
+        document.getElementById('btResTrades').innerText = "..."; 
+        const payload = { 
+            ticks: document.getElementById('btTicks').value, 
+            tpPct: document.getElementById('btTp').value, 
+            slPct: document.getElementById('btSl').value, 
+            dcaTriggerPct: document.getElementById('btDcaTrigger').value, 
+            dcaMultiplier: document.getElementById('btDcaMultiplier').value, 
+            startContracts: document.getElementById('btStartContracts').value, 
+            dgrDailyGrowthRate: document.getElementById('btDgr').value, 
+            manualDirection: document.getElementById('btDirection').value, 
+            maxContracts: 100 
+        }; 
+        const res = await doAPI('/api/backtest', 'POST', payload); 
+        if(res.error) return; 
+        document.getElementById('btResWinrate').innerText = res.winRate + "%"; 
+        document.getElementById('btResPnl').innerText = "$" + res.netPnl.toFixed(4); 
+        document.getElementById('btResTrades').innerText = res.totalTradesCount; 
+        document.getElementById('btResDeposit').innerText = "$" + (res.depositNeeded || 0).toFixed(4); 
+        const tbody = document.getElementById('btTableBody'); 
+        tbody.innerHTML = ""; 
+        [...res.trades].reverse().forEach(t => { 
+            tbody.innerHTML += '<tr class="border-b"><td class="p-4 font-black ' + (t.side==='long'?'text-green-600':'text-red-600') + '">' + t.side.toUpperCase() + '</td><td class="p-4">' + t.contracts + '</td><td class="p-4 text-[9px] uppercase font-bold text-zinc-400">' + t.exitReason + '</td><td class="p-4 text-right font-black ' + (t.netPnl>=0?'text-green-600':'text-red-600') + '">$' + t.netPnl.toFixed(4) + 'NonNull(',') 
+        }); 
+    }
+    
+    async function doLogin() { 
+        const res = await doAPI('/api/auth/login', 'POST', { email: document.getElementById('login-email').value, password: document.getElementById('login-pass').value }); 
+        if (res.error) document.getElementById('login-err').innerText = res.error; 
+        else { authToken = res.token; localStorage.setItem('bot_token', authToken); toggleAuthUI(); navigateTo('dashboard'); } 
+    }
+    
+    async function doRegister() { 
+        const res = await doAPI('/api/auth/register', 'POST', { name: document.getElementById('reg-name').value, email: document.getElementById('reg-email').value, password: document.getElementById('reg-pass').value }); 
+        if (res.error) document.getElementById('reg-err').innerText = res.error; 
+        else { authToken = res.token; localStorage.setItem('bot_token', authToken); toggleAuthUI(); navigateTo('dashboard'); } 
+    }
+    
+    async function resetAccount() { 
+        if(confirm("⚠️ WARNING: This will reset your account to a clean state!")) { 
+            const res = await doAPI('/api/user/reset-account', 'POST'); 
+            if(res.error) alert("Reset failed: " + res.error); 
+            else { alert("✅ Account reset successfully!"); if(dashLoop) clearInterval(dashLoop); setTimeout(() => initDashboard(), 1000); } 
+        } 
+    }
+    
+    function handleLiveToggle() { 
+        const cb = document.getElementById('liveTrade'); 
+        cb.checked = !cb.checked; 
+    }
+    
+    async function saveApiKeys() { 
+        const res = await doAPI('/api/user/keys', 'POST', { apiKey: document.getElementById('apiKey').value, apiSecret: document.getElementById('apiSecret').value, liveTradingEnabled: document.getElementById('liveTrade').checked }); 
+        document.getElementById('key-msg').innerText = res.error ? res.error : "KEYS SECURED"; 
+        if(!res.error) setTimeout(() => navigateTo('dashboard'), 1500); 
+    }
+    
+    async function saveConfig() { 
+        const payload = { 
+            tpPct: document.getElementById("tpPctSens").value, 
+            slPct: document.getElementById("slPctSens").value, 
+            dcaTriggerPct: document.getElementById("dcaTriggerSens").value, 
+            dcaMultiplier: document.getElementById("dcaMultiplierSens").value, 
+            startContracts: document.getElementById("startContractsSens").value, 
+            dgrDailyGrowthRate: document.getElementById("dgrSens").value, 
+            manualDirection: document.getElementById("directionSens").value, 
+            maxContracts: document.getElementById("maxContractsSens").value 
+        }; 
+        await doAPI('/api/user/config', 'POST', payload); 
+        alert("CONFIG SYNCED"); 
+    }
+    
+    async function closeAll() { 
+        if(confirm("ABORT ALL TRADES?")) await doAPI('/api/close-all', 'POST'); 
+    }
+    
+    async function resetMetrics() { 
+        if(confirm("PURGE TRADE HISTORY?")) { 
+            await doAPI('/api/user/reset-metrics', 'POST'); 
+            lastTradesCount = -1; 
+            fetchMetrics(); 
+        } 
+    }
+    
+    async function fetchAnalyticsData() { 
+        if(currentPageView !== 'analytics') return; 
+        const data = await (await fetch('/api/analytics/stats')).json(); 
+        document.getElementById('stat-online').innerText = data.online; 
+        document.getElementById('stat-views').innerText = data.views; 
+        document.getElementById('stat-uniques').innerText = data.uniques; 
+        document.getElementById('stat-pages').innerHTML = Object.entries(data.pages).map(([n, c]) => '<div class="flex justify-between p-4"><span class="font-black text-[10px] uppercase tracking-widest text-zinc-500">'+n+'</span><span class="font-mono font-bold">'+c+' OPS</span></div>').join(''); 
+    }
+    
+    // Set up event listeners
+    function setupEventListeners() {
+        // Navigation buttons
+        document.getElementById('homeLogo')?.addEventListener('click', () => navigateTo('home'));
+        document.getElementById('navBacktest')?.addEventListener('click', () => navigateTo('backtest'));
+        document.getElementById('navAnalytics')?.addEventListener('click', () => navigateTo('analytics'));
+        document.getElementById('navLogin')?.addEventListener('click', () => navigateTo('login'));
+        document.getElementById('navRegister')?.addEventListener('click', () => navigateTo('register'));
+        document.getElementById('navDashboard')?.addEventListener('click', () => navigateTo('dashboard'));
+        document.getElementById('navSteps')?.addEventListener('click', () => navigateTo('step-history'));
+        document.getElementById('logoutBtn')?.addEventListener('click', logout);
+        
+        // Home buttons
+        document.getElementById('homeGetStarted')?.addEventListener('click', () => navigateTo('register'));
+        document.getElementById('homeBacktest')?.addEventListener('click', () => navigateTo('backtest'));
+        
+        // Dashboard buttons
+        document.getElementById('settingsBtn')?.addEventListener('click', () => navigateTo('settings'));
+        document.getElementById('resetAccountBtn')?.addEventListener('click', resetAccount);
+        document.getElementById('emergencyExitBtn')?.addEventListener('click', closeAll);
+        document.getElementById('resetMetricsBtn')?.addEventListener('click', resetMetrics);
+        document.getElementById('saveConfigBtn')?.addEventListener('click', saveConfig);
+        
+        // Backtest button
+        document.getElementById('runBacktestBtn')?.addEventListener('click', runBacktest);
+        
+        // Auth buttons
+        document.getElementById('doLoginBtn')?.addEventListener('click', doLogin);
+        document.getElementById('doRegisterBtn')?.addEventListener('click', doRegister);
+        
+        // Settings buttons
+        document.getElementById('liveToggleDiv')?.addEventListener('click', handleLiveToggle);
+        document.getElementById('saveApiKeysBtn')?.addEventListener('click', saveApiKeys);
+    }
+    
+    // Initialize
+    setInterval(pingAnalytics, 10000);
+    setInterval(fetchAnalyticsData, 4000);
+    setupEventListeners();
+    toggleAuthUI();
+    
+    if(authToken) { 
+        navigateTo('dashboard'); 
+    } else { 
+        navigateTo('home'); 
+    }
+})();
+</script>
 </body>
 </html>`);
 });
