@@ -57,10 +57,10 @@ const BASE_CONFIG = {
     fees: { taker: 0.0004 }, 
     takeProfitPct: 10.0, 
     stopLossPct: -50.0, 
-    dcaRoiThresholdPct: 1.5,    // DCA TRIGGER PERCENTAGE
+    dcaRoiThresholdPct: 1.0,    // DCA TRIGGER PERCENTAGE
     dcaMultiplier: 2.0,         // DCA MULTIPLIER
     profitRoiThresholdPct: 2.0, 
-    profitMultiplier: 1.5, 
+    profitMultiplier: 2.0, 
     maxContracts: 5000, 
     chartTicks: 800
 };
@@ -105,7 +105,7 @@ function calculateTradeMath(side, entryPrice, currentPrice, sizeUsd, leverage, t
     return { grossPnlPercent, currentGrossRoi: grossPnlPercent * leverage, grossPnlUsd, grossRoiPct, netPnlUsd, netRoiPct: (netPnlUsd / margin) * 100, feeCost, margin };
 }
 
-// ==================== METRICS ENGINE (ADDED DGR) ====================
+// ==================== METRICS ENGINE ====================
 class PerformanceMetrics {
     constructor(userId) {
         this.userId = userId; this.trades = []; 
@@ -123,11 +123,8 @@ class PerformanceMetrics {
         this.totalNetPnl += trade.netPnl || 0;
         const wins = this.trades.filter(t => t.netPnl > 0).length;
         this.winRate = this.trades.length ? ((wins / this.trades.length) * 100).toFixed(2) : 0;
-        
-        // Calculate DGR (Daily Growth Rate)
         const daysActive = (Date.now() - this.startTime) / (1000 * 60 * 60 * 24);
         this.dailyGrowthRate = daysActive > 0 ? (this.totalNetPnl / Math.max(1, daysActive)).toFixed(4) : 0;
-
         if (saveToDb) TradeModel.create({ ...trade, userId: this.userId }).catch(()=>{});
     }
 }
@@ -194,8 +191,24 @@ class UserTradeInstance {
         else if (effectiveRoi <= this.config.stopLossPct) await this.forceClosePosition("STOP_LOSS");
         else {
             const trigger = -(Math.abs(this.config.dcaRoiThresholdPct));
-            if (effectiveRoi <= trigger && Date.now() - (pos.lastDcaTime || 0) > 5000) await this.addDcaPosition();
+            if (effectiveRoi <= trigger && Date.now() - (pos.lastDcaTime || 0) > 8000) await this.addDcaPosition();
         }
+    }
+
+    async manualOpen(side) {
+        if (this.isTrading || this.activePositions.length > 0) return;
+        this.isTrading = true;
+        try {
+            const startC = Number(this.config.baseContracts) || 10;
+            let execPrice = side === 'long' ? globalMarketData.binance.ask : globalMarketData.binance.bid;
+            if (this.liveTradingEnabled) {
+                const orderSide = side === 'long' ? 'buy' : 'sell';
+                await this.htx.createMarketOrder(this.config.htxSymbol, orderSide, startC, undefined, { offset: 'open' });
+            }
+            const sizeUsd = startC * this.config.contractSize * execPrice;
+            this.activePositions = [{ id: Date.now(), side: side, entryPrice: execPrice, contracts: startC, size: sizeUsd, marginUsed: sizeUsd / FORCED_LEVERAGE, entryTime: Date.now(), isPaper: !this.liveTradingEnabled, lastDcaTime: 0, dcaStep: 0, stepHistory: [{step: 0, type: 'OPEN', price: execPrice, time: Date.now()}] }];
+            await this.saveState();
+        } catch (e) { console.error("Manual Open Error:", e.message); } finally { this.isTrading = false; }
     }
 
     async addDcaPosition() {
@@ -204,44 +217,23 @@ class UserTradeInstance {
         try {
             const pos = this.activePositions[0];
             const multiplier = Number(this.config.dcaMultiplier) || 2.0;
-            const startContracts = Number(this.config.baseContracts) || 10;
+            const startC = Number(this.config.baseContracts) || 10;
             let step = Number(pos.dcaStep) || 0;
+            let contractsToAdd = Math.floor(startC * Math.pow(multiplier, step));
 
-            let contractsToAdd = Math.floor(startContracts * Math.pow(multiplier, step));
-            if (pos.contracts + contractsToAdd > (this.config.maxContracts || 10000)) return;
+            if (pos.contracts + contractsToAdd > this.config.maxContracts) { this.isTrading = false; return; }
 
             let execPrice = pos.side === 'long' ? globalMarketData.binance.ask : globalMarketData.binance.bid;
             if (!pos.isPaper && this.liveTradingEnabled) {
                 const orderSide = pos.side === 'long' ? 'buy' : 'sell';
                 await this.htx.createMarketOrder(this.config.htxSymbol, orderSide, contractsToAdd, undefined, { offset: 'open' });
             }
-
             const addedSize = contractsToAdd * this.config.contractSize * execPrice;
             pos.entryPrice = ((pos.entryPrice * pos.size) + (execPrice * addedSize)) / (pos.size + addedSize);
-            pos.size += addedSize;
-            pos.contracts += contractsToAdd;
-            pos.dcaStep = step + 1;
-            pos.lastDcaTime = Date.now();
+            pos.size += addedSize; pos.contracts += contractsToAdd; pos.dcaStep = step + 1; pos.lastDcaTime = Date.now();
+            pos.stepHistory.push({step: pos.dcaStep, type: 'DCA', price: execPrice, time: Date.now()});
             await this.saveState();
         } catch (e) { console.error("DCA Error:", e.message); } finally { this.isTrading = false; }
-    }
-
-    async manualOpen(side) {
-        if (this.isTrading || this.activePositions.length > 0) return;
-        this.isTrading = true;
-        try {
-            const startContracts = Number(this.config.baseContracts) || 10;
-            let execPrice = side === 'long' ? globalMarketData.binance.ask : globalMarketData.binance.bid;
-            
-            if (this.liveTradingEnabled) {
-                const orderSide = side === 'long' ? 'buy' : 'sell';
-                await this.htx.createMarketOrder(this.config.htxSymbol, orderSide, startContracts, undefined, { offset: 'open' });
-            }
-
-            const sizeUsd = startContracts * this.config.contractSize * execPrice;
-            this.activePositions = [{ id: Date.now(), side: side, entryPrice: execPrice, contracts: startContracts, size: sizeUsd, marginUsed: sizeUsd / FORCED_LEVERAGE, entryTime: Date.now(), isPaper: !this.liveTradingEnabled, lastDcaTime: 0, dcaStep: 0, stepHistory: [] }];
-            await this.saveState();
-        } catch (e) { console.error("Open Error:", e.message); } finally { this.isTrading = false; }
     }
 
     async forceClosePosition(reason = "MANUAL") {
@@ -256,8 +248,7 @@ class UserTradeInstance {
             }
             const math = calculateTradeMath(pos.side, pos.entryPrice, exitPrice, pos.size, FORCED_LEVERAGE, this.config.fees.taker);
             this.metrics.recordTrade({ side: pos.side, contracts: pos.contracts, entryPrice: pos.entryPrice, exitPrice, netPnl: math.netPnlUsd, exitReason: reason, timestamp: Date.now() });
-            this.activePositions = [];
-            await this.saveState();
+            this.activePositions = []; await this.saveState();
         } catch (e) { console.error("Close Error:", e.message); } finally { this.isTrading = false; }
     }
     
@@ -288,28 +279,28 @@ async function startMasterStreams() {
                 const ticker = await publicBinance.watchTicker(BASE_CONFIG.binanceSymbol);
                 const mid = (ticker.bid + ticker.ask) / 2;
                 globalMarketData.binance = { bid: ticker.bid, ask: ticker.ask, mid, timestamp: Date.now() };
-                
                 if (memoryChartHistory.length === 0 || Date.now() - memoryChartHistory[memoryChartHistory.length-1].timestamp > 2000) {
                     memoryChartHistory.push({ priceMid: mid, timestamp: Date.now() });
                     if (memoryChartHistory.length > 800) memoryChartHistory.shift();
                 }
-
                 for (const worker of activeWorkers.values()) { worker.checkExits().catch(()=>{}); }
             } catch (e) { await new Promise(r => setTimeout(r, 2000)); }
         }
     })();
 }
 
-// ==================== API ====================
+// ==================== EXPRESS SERVER & API ====================
 const app = express(); app.use(express.json());
 
 app.post('/api/auth/register', async (req, res) => {
-    const { name, email, password } = req.body;
-    const salt = crypto.randomBytes(16).toString('hex');
-    const user = await UserModel.create({ name, email, passwordHash: hashPassword(password, salt), salt, token: generateToken() });
-    const worker = new UserTradeInstance(user); await worker.initialize();
-    activeWorkers.set(user._id.toString(), worker);
-    res.json({ token: user.token });
+    try {
+        const { name, email, password } = req.body;
+        const salt = crypto.randomBytes(16).toString('hex');
+        const user = await UserModel.create({ name, email, passwordHash: hashPassword(password, salt), salt, token: generateToken() });
+        const worker = new UserTradeInstance(user); await worker.initialize();
+        activeWorkers.set(user._id.toString(), worker);
+        res.json({ token: user.token });
+    } catch(e) { res.status(500).json({ error: 'Failed' }); }
 });
 
 app.post('/api/auth/login', async (req, res) => {
@@ -342,7 +333,7 @@ app.post('/api/user/config', authMiddleware, async (req, res) => {
 
 app.get('/api/open/:side', authMiddleware, async (req, res) => {
     const worker = activeWorkers.get(req.user._id.toString());
-    await worker.manualOpen(req.params.side);
+    if(worker) await worker.manualOpen(req.params.side);
     res.json({ status: 'ok' });
 });
 
@@ -353,160 +344,216 @@ app.get('/api/data', authMiddleware, (req, res) => {
 
 app.get('/api/close-all', authMiddleware, async (req, res) => { 
     const worker = activeWorkers.get(req.user._id.toString());
-    await worker.forceClosePosition("MANUAL_EXIT"); 
+    if(worker) await worker.forceClosePosition("MANUAL_ABORT"); 
     res.json({status: 'ok'}); 
 });
 
-app.get('/', (req, res) => { res.send(`
-<!DOCTYPE html>
-<html>
+app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
+<html lang="en">
 <head>
-    <title>SHIB Controller | No-AI Engine</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TradeBotPille | SHIB Controller</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined" rel="stylesheet" />
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
-    <style>body { font-family: 'Inter', sans-serif; background: #fafafa; } .font-mono { font-family: 'JetBrains Mono', monospace; }</style>
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #fafafa; color: #09090b; }
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+        .ui-card { background: #ffffff; border-radius: 12px; border: 1px solid #e4e4e7; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+        .input-minimal { width: 100%; border: 1px solid #e4e4e7; border-radius: 8px; padding: 10px; font-size: 14px; outline: none; }
+        .btn-primary { background: #09090b; color: #fff; border-radius: 8px; padding: 12px; font-weight: 600; width: 100%; }
+        .btn-long { background: #22c55e; color: #fff; border-radius: 8px; padding: 16px; font-weight: 800; font-size: 18px; flex: 1; }
+        .btn-short { background: #ef4444; color: #fff; border-radius: 8px; padding: 16px; font-weight: 800; font-size: 18px; flex: 1; }
+        .status-pill { padding: 4px 10px; border-radius: 9999px; font-size: 10px; font-weight: 800; text-transform: uppercase; }
+        .view-section { display: none; } .active-view { display: block; }
+    </style>
 </head>
-<body class="p-4 md:p-10">
-    <div id="auth-view" class="max-w-md mx-auto space-y-4">
-        <h1 class="text-3xl font-black italic">TERMINAL LOGIN</h1>
-        <input id="email" type="email" placeholder="Email" class="w-full p-3 border rounded">
-        <input id="pass" type="password" placeholder="Password" class="w-full p-3 border rounded">
-        <button onclick="login()" class="w-full bg-black text-white p-3 rounded font-bold">ENTER SYSTEM</button>
-    </div>
+<body class="antialiased min-h-screen">
 
-    <div id="main-view" class="hidden max-w-6xl mx-auto space-y-6">
-        <div class="flex justify-between items-center">
-            <h1 class="text-2xl font-black">SHIB <span class="text-indigo-600">DCA</span> SYSTEM</h1>
-            <button onclick="logout()" class="text-red-500 font-bold">Logout</button>
+    <header class="bg-white border-b border-zinc-200 h-16 flex items-center justify-between px-6 sticky top-0 z-50">
+        <div class="flex items-center gap-3">
+            <div class="w-8 h-8 rounded bg-zinc-950 flex items-center justify-center shadow-lg"><span class="material-symbols-outlined text-white text-[18px]">bolt</span></div>
+            <span class="font-extrabold tracking-tighter text-base uppercase">TRADEBOT<span class="text-indigo-600">PILLE</span></span>
         </div>
+        <nav id="nav-private" class="hidden items-center gap-4 text-sm font-bold">
+            <button onclick="nav('dashboard')" class="text-zinc-600 hover:text-zinc-950">Terminal</button>
+            <button onclick="logout()" class="text-red-500">Logout</button>
+        </nav>
+    </header>
 
-        <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
-            <div class="bg-white p-6 border rounded shadow-sm">
-                <p class="text-xs font-bold text-gray-400 uppercase">Daily Growth Rate (DGR)</p>
-                <p id="dgr" class="text-2xl font-mono font-black">$0.00</p>
+    <main class="max-w-7xl mx-auto p-6">
+        
+        <!-- AUTH -->
+        <section id="view-login" class="view-section active-view max-w-md mx-auto pt-20">
+            <div class="ui-card p-10 space-y-6">
+                <h2 class="text-3xl font-black italic tracking-tighter">AUTHENTICATE.</h2>
+                <input type="email" id="login-email" placeholder="Email" class="input-minimal">
+                <input type="password" id="login-pass" placeholder="Password" class="input-minimal">
+                <button onclick="doLogin()" class="btn-primary">ENTER SYSTEM</button>
+                <p class="text-[10px] text-center font-bold text-zinc-400">NO ACCOUNT? <button onclick="nav('register')" class="text-zinc-950">REGISTER</button></p>
             </div>
-            <div class="bg-white p-6 border rounded shadow-sm">
-                <p class="text-xs font-bold text-gray-400 uppercase">Net PnL</p>
-                <p id="pnl" class="text-2xl font-mono font-black">$0.00</p>
-            </div>
-            <div class="bg-white p-6 border rounded shadow-sm">
-                <p class="text-xs font-bold text-gray-400 uppercase">Start Contracts</p>
-                <p id="cur-contracts" class="text-2xl font-mono font-black">0</p>
-            </div>
-            <div class="bg-black p-6 rounded shadow-lg text-white">
-                <p class="text-xs font-bold text-gray-500 uppercase">Live ROI</p>
-                <p id="roi" class="text-2xl font-mono font-black">0.00%</p>
-            </div>
-        </div>
+        </section>
 
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <div class="lg:col-span-2 space-y-6">
-                <div class="bg-white p-4 border rounded h-64"><canvas id="chart"></canvas></div>
-                <div class="flex gap-4">
-                    <button onclick="openTrade('long')" class="flex-1 bg-green-500 text-white p-6 rounded-xl font-black text-xl hover:bg-green-600 transition">OPEN LONG</button>
-                    <button onclick="openTrade('short')" class="flex-1 bg-red-500 text-white p-6 rounded-xl font-black text-xl hover:bg-red-600 transition">OPEN SHORT</button>
+        <section id="view-register" class="view-section max-w-md mx-auto pt-20">
+            <div class="ui-card p-10 space-y-6">
+                <h2 class="text-3xl font-black italic tracking-tighter">NEW OPERATOR.</h2>
+                <input type="text" id="reg-name" placeholder="Full Name" class="input-minimal">
+                <input type="email" id="reg-email" placeholder="Email" class="input-minimal">
+                <input type="password" id="reg-pass" placeholder="Password" class="input-minimal">
+                <button onclick="doRegister()" class="btn-primary">INITIALIZE</button>
+            </div>
+        </section>
+
+        <!-- DASHBOARD -->
+        <section id="view-dashboard" class="view-section space-y-8">
+            <div class="flex justify-between items-end">
+                <div>
+                    <h2 class="text-4xl font-black italic tracking-tighter">LIVE TERMINAL</h2>
+                    <span id="statusBadge" class="status-pill bg-zinc-100 text-zinc-400">Scanning...</span>
                 </div>
-                <button onclick="closePos()" class="w-full border-2 border-black p-4 rounded-xl font-black hover:bg-gray-100">EMERGENCY EXIT</button>
-            </div>
-
-            <div class="bg-white p-6 border rounded space-y-4">
-                <h2 class="font-black border-b pb-2 uppercase text-sm">Strategy Settings</h2>
-                <div><label class="text-xs font-bold">Start Contracts</label><input id="cfg-base" type="number" class="w-full p-2 border rounded font-mono"></div>
-                <div><label class="text-xs font-bold">DCA Multiplier</label><input id="cfg-mult" type="number" step="0.1" class="w-full p-2 border rounded font-mono"></div>
-                <div><label class="text-xs font-bold">DCA Trigger % (Loss)</label><input id="cfg-trigger" type="number" step="0.1" class="w-full p-2 border rounded font-mono"></div>
-                <div class="grid grid-cols-2 gap-2">
-                    <div><label class="text-xs font-bold">TP %</label><input id="cfg-tp" type="number" class="w-full p-2 border rounded font-mono"></div>
-                    <div><label class="text-xs font-bold">SL %</label><input id="cfg-sl" type="number" class="w-full p-2 border rounded font-mono"></div>
-                </div>
-                <button onclick="saveCfg()" class="w-full bg-indigo-600 text-white p-3 rounded font-bold">SAVE CONFIG</button>
-                
-                <div class="pt-4 space-y-2">
-                   <h2 class="font-black border-b pb-2 uppercase text-sm">API Settings</h2>
-                   <input id="api-key" type="password" placeholder="HTX Key" class="w-full p-2 border rounded text-xs">
-                   <input id="api-sec" type="password" placeholder="HTX Secret" class="w-full p-2 border rounded text-xs">
-                   <div class="flex items-center gap-2"><input type="checkbox" id="api-live"><label class="text-xs font-bold">Enable Live Trading</label></div>
-                   <button onclick="saveKeys()" class="w-full bg-gray-200 p-2 rounded text-xs font-bold">Update Keys</button>
+                <div class="flex gap-3">
+                    <button onclick="nav('settings')" class="px-4 py-2 bg-white border rounded-md font-bold text-xs flex items-center gap-2"><span class="material-symbols-outlined text-[16px]">settings</span> SETTINGS</button>
+                    <button onclick="closeAll()" class="px-4 py-2 bg-red-50 text-red-600 border border-red-200 rounded-md font-bold text-xs">ABORT POSITION</button>
                 </div>
             </div>
-        </div>
-    </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+                <div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">DGR (DAILY GROWTH)</p><p id="dgrStat" class="text-3xl font-mono font-black text-indigo-600">$0.0000</p></div>
+                <div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">TOTAL NET PNL</p><p id="netPnl" class="text-3xl font-mono font-black">$0.0000</p></div>
+                <div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">WALLET BALANCE</p><p id="walletBal" class="text-3xl font-mono font-black">$0.0000</p></div>
+                <div class="ui-card p-6 bg-zinc-950 border-zinc-950"><p class="text-[10px] font-black text-zinc-500 uppercase tracking-widest mb-1">LIVE POSITION ROI</p><p id="activeRoi" class="text-3xl font-mono font-black text-white">IDLE</p></div>
+            </div>
+
+            <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
+                <div class="lg:col-span-8 space-y-8">
+                    <div class="ui-card p-6 h-[400px]"><canvas id="mainChart"></canvas></div>
+                    <div class="flex gap-4">
+                        <button onclick="openTrade('long')" class="btn-long shadow-lg shadow-green-100">OPEN LONG</button>
+                        <button onclick="openTrade('short')" class="btn-short shadow-lg shadow-red-100">OPEN SHORT</button>
+                    </div>
+                </div>
+                <aside class="lg:col-span-4 space-y-6">
+                    <div class="ui-card p-8 border-t-4 border-t-indigo-600">
+                        <h3 class="text-xs font-black uppercase tracking-widest mb-6 border-b pb-4">Strategy Config</h3>
+                        <div class="space-y-4">
+                            <div><label class="text-[10px] font-black text-zinc-400 uppercase">Start Contracts</label><input type="number" id="cfg-base" class="input-minimal font-mono"></div>
+                            <div><label class="text-[10px] font-black text-zinc-400 uppercase">DCA Multiplier</label><input type="number" step="0.1" id="cfg-mult" class="input-minimal font-mono"></div>
+                            <div><label class="text-[10px] font-black text-zinc-400 uppercase">DCA Trigger % (Loss)</label><input type="number" step="0.1" id="cfg-trigger" class="input-minimal font-mono"></div>
+                            <div class="grid grid-cols-2 gap-2">
+                                <div><label class="text-[10px] font-black text-zinc-400 uppercase">TP %</label><input type="number" id="cfg-tp" class="input-minimal font-mono"></div>
+                                <div><label class="text-[10px] font-black text-zinc-400 uppercase">SL %</label><input type="number" id="cfg-sl" class="input-minimal font-mono"></div>
+                            </div>
+                            <button onclick="saveConfig()" class="btn-primary mt-2">SAVE STRATEGY</button>
+                        </div>
+                    </div>
+                </aside>
+            </div>
+        </section>
+
+        <!-- SETTINGS -->
+        <section id="view-settings" class="view-section max-w-xl mx-auto pt-20">
+            <div class="ui-card p-10 space-y-8 border-t-4 border-t-zinc-950">
+                <h2 class="text-3xl font-black italic tracking-tighter">API INTEGRATION</h2>
+                <div class="flex items-center gap-3 p-4 bg-zinc-50 rounded border border-dashed border-zinc-200">
+                    <input type="checkbox" id="liveTrade" class="w-5 h-5 accent-zinc-950"><label class="text-xs font-black uppercase tracking-widest">Enable Live Exchange Execution</label>
+                </div>
+                <div><label class="text-[10px] font-black text-zinc-400 uppercase">HTX API Key</label><input type="password" id="apiKey" class="input-minimal font-mono"></div>
+                <div><label class="text-[10px] font-black text-zinc-400 uppercase">HTX Secret</label><input type="password" id="apiSecret" class="input-minimal font-mono"></div>
+                <button onclick="saveKeys()" class="btn-primary">ESTABLISH CONNECTION</button>
+                <button onclick="nav('dashboard')" class="w-full text-[10px] font-bold text-zinc-400 uppercase">Back to Terminal</button>
+            </div>
+        </section>
+
+    </main>
 
     <script>
-        let token = localStorage.getItem('bt_token');
-        const chart = new Chart(document.getElementById('chart'), { type: 'line', data: { labels: [], datasets: [{ label: 'SHIB', data: [], borderColor: '#000', pointRadius: 0, borderWidth: 2 }] }, options: { maintainAspectRatio: false, animation: false, scales: { x: { display: false } } } });
+        let authToken = localStorage.getItem('bt_token');
+        const ctx = document.getElementById('mainChart').getContext('2d');
+        const chart = new Chart(ctx, { type: 'line', data: { labels: [], datasets: [{ label: 'SHIB', data: [], borderColor: '#09090b', borderWidth: 2, pointRadius: 0, tension: 0.1 }] }, options: { maintainAspectRatio: false, animation: false, scales: { x: { display: false } } } });
 
-        async function login() {
-            const res = await fetch('/api/auth/login', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ email: document.getElementById('email').value, password: document.getElementById('pass').value }) });
-            const data = await res.json();
-            if(data.token) { token = data.token; localStorage.setItem('bt_token', token); location.reload(); }
-        }
-
+        function nav(id) { document.querySelectorAll('.view-section').forEach(s => s.classList.remove('active-view')); document.getElementById('view-'+id).classList.add('active-view'); if(id==='dashboard') initDash(); }
         function logout() { localStorage.removeItem('bt_token'); location.reload(); }
 
-        async function saveCfg() {
-            await fetch('/api/user/config', { method: 'POST', headers: {'Content-Type': 'application/json', 'Authorization': token}, body: JSON.stringify({ baseContracts: document.getElementById('cfg-base').value, dcaMultiplier: document.getElementById('cfg-mult').value, dcaTrigger: document.getElementById('cfg-trigger').value, tpPct: document.getElementById('cfg-tp').value, slPct: document.getElementById('cfg-sl').value }) });
-            alert("Saved");
+        async function doLogin() {
+            const res = await fetch('/api/auth/login', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ email: document.getElementById('login-email').value, password: document.getElementById('login-pass').value }) });
+            const data = await res.json(); if(data.token) { authToken = data.token; localStorage.setItem('bt_token', data.token); location.reload(); }
+        }
+
+        async function doRegister() {
+            const res = await fetch('/api/auth/register', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ name: document.getElementById('reg-name').value, email: document.getElementById('reg-email').value, password: document.getElementById('reg-pass').value }) });
+            const data = await res.json(); if(data.token) { authToken = data.token; localStorage.setItem('bt_token', data.token); location.reload(); }
+        }
+
+        async function initDash() {
+            const res = await fetch('/api/data', { headers: {'Authorization': authToken} });
+            const data = await res.json();
+            document.getElementById('cfg-base').value = data.config.baseContracts;
+            document.getElementById('cfg-mult').value = data.config.dcaMultiplier;
+            document.getElementById('cfg-trigger').value = data.config.dcaRoiThresholdPct;
+            document.getElementById('cfg-tp').value = data.config.takeProfitPct;
+            document.getElementById('cfg-sl').value = data.config.stopLossPct;
+            document.getElementById('apiKey').value = data.config.apiKey || "";
+            document.getElementById('apiSecret').value = data.config.apiSecret || "";
+            document.getElementById('liveTrade').checked = data.liveTradingEnabled;
+        }
+
+        async function saveConfig() {
+            await fetch('/api/user/config', { method: 'POST', headers: {'Content-Type': 'application/json', 'Authorization': authToken}, body: JSON.stringify({ baseContracts: document.getElementById('cfg-base').value, dcaMultiplier: document.getElementById('cfg-mult').value, dcaTrigger: document.getElementById('cfg-trigger').value, tpPct: document.getElementById('cfg-tp').value, slPct: document.getElementById('cfg-sl').value }) });
+            alert("STRATEGY SAVED");
         }
 
         async function saveKeys() {
-            await fetch('/api/user/keys', { method: 'POST', headers: {'Content-Type': 'application/json', 'Authorization': token}, body: JSON.stringify({ apiKey: document.getElementById('api-key').value, apiSecret: document.getElementById('api-sec').value, liveTradingEnabled: document.getElementById('api-live').checked }) });
-            alert("Keys Updated");
+            await fetch('/api/user/keys', { method: 'POST', headers: {'Content-Type': 'application/json', 'Authorization': authToken}, body: JSON.stringify({ apiKey: document.getElementById('apiKey').value, apiSecret: document.getElementById('apiSecret').value, liveTradingEnabled: document.getElementById('liveTrade').checked }) });
+            alert("KEYS UPDATED");
         }
 
-        async function openTrade(side) { await fetch('/api/open/'+side, { headers: {'Authorization': token} }); }
-        async function closePos() { await fetch('/api/close-all', { headers: {'Authorization': token} }); }
+        async function openTrade(side) { await fetch('/api/open/'+side, { headers: {'Authorization': authToken} }); }
+        async function closeAll() { if(confirm("ABORT POSITION?")) await fetch('/api/close-all', { headers: {'Authorization': authToken} }); }
 
-        async function refresh() {
-            if(!token) return;
-            document.getElementById('auth-view').classList.add('hidden');
-            document.getElementById('main-view').classList.remove('hidden');
-            const res = await fetch('/api/data', { headers: {'Authorization': token} });
-            const data = await res.json();
+        async function updateData() {
+            if(!authToken) return;
+            const res = await fetch('/api/data', { headers: {'Authorization': authToken} });
+            const data = await res.json(); if(!data.metrics) return;
             
-            document.getElementById('pnl').innerText = '$' + data.metrics.totalNetPnl.toFixed(4);
-            document.getElementById('dgr').innerText = '$' + data.metrics.dailyGrowthRate;
+            document.getElementById('netPnl').innerText = '$' + data.metrics.totalNetPnl.toFixed(4);
+            document.getElementById('dgrStat').innerText = '$' + data.metrics.dailyGrowthRate;
+            document.getElementById('walletBal').innerText = '$' + Number(data.walletBalance).toFixed(2);
             
             if(data.activePositions.length > 0) {
                 const p = data.activePositions[0];
-                document.getElementById('cur-contracts').innerText = p.contracts;
-                document.getElementById('roi').innerText = (p.exchangeROI || 0).toFixed(2) + '%';
-                document.getElementById('roi').className = p.exchangeROI >= 0 ? 'text-2xl font-mono font-black text-green-400' : 'text-2xl font-mono font-black text-red-400';
+                document.getElementById('activeRoi').innerText = (p.exchangeROI || 0).toFixed(2) + '%';
+                document.getElementById('activeRoi').className = 'text-3xl font-mono font-black ' + (p.exchangeROI >= 0 ? 'text-green-400' : 'text-red-400');
+                document.getElementById('statusBadge').innerText = 'COMMAND ACTIVE | STEP ' + p.dcaStep;
+                document.getElementById('statusBadge').className = 'status-pill bg-zinc-950 text-white';
             } else {
-                document.getElementById('cur-contracts').innerText = '0';
-                document.getElementById('roi').innerText = 'IDLE';
-                document.getElementById('roi').className = 'text-2xl font-mono font-black text-gray-500';
+                document.getElementById('activeRoi').innerText = 'IDLE';
+                document.getElementById('activeRoi').className = 'text-3xl font-mono font-black text-white';
+                document.getElementById('statusBadge').innerText = 'SCANNING MARKET';
+                document.getElementById('statusBadge').className = 'status-pill bg-zinc-100 text-zinc-400';
             }
 
             if(data.binance) {
-                chart.data.labels.push('');
-                chart.data.datasets[0].data.push(data.binance.mid);
-                if(chart.data.labels.length > 50) { chart.data.labels.shift(); chart.data.datasets[0].data.shift(); }
+                chart.data.labels.push(''); chart.data.datasets[0].data.push(data.binance.mid);
+                if(chart.data.labels.length > 100) { chart.data.labels.shift(); chart.data.datasets[0].data.shift(); }
                 chart.update();
             }
         }
 
-        if(token) {
-            setInterval(refresh, 1000);
-            fetch('/api/data', { headers: {'Authorization': token} }).then(r => r.json()).then(data => {
-                document.getElementById('cfg-base').value = data.config.baseContracts;
-                document.getElementById('cfg-mult').value = data.config.dcaMultiplier;
-                document.getElementById('cfg-trigger').value = data.config.dcaRoiThresholdPct;
-                document.getElementById('cfg-tp').value = data.config.takeProfitPct;
-                document.getElementById('cfg-sl').value = data.config.stopLossPct;
-            });
-        }
+        if(authToken) { document.getElementById('nav-private').classList.remove('hidden'); nav('dashboard'); setInterval(updateData, 1000); }
     </script>
 </body>
-</html>
-`)});
+</html>`)});
 
+// ==================== APP INITIALIZATION ====================
 app.listen(CUSTOM_PORT, async () => {
     console.log(`✅ Server running on port ${CUSTOM_PORT}`);
     const users = await UserModel.find({});
     for(const u of users) {
         const worker = new UserTradeInstance(u); await worker.initialize();
         activeWorkers.set(u._id.toString(), worker);
+        if(u.token) tokenCache.set(u.token, { user: u, lastAccessed: Date.now() });
     }
     startMasterStreams();
 });
