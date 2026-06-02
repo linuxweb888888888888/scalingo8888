@@ -1,142 +1,144 @@
 const express = require('express');
 const WebSocket = require('ws');
-const zlib = require('zlib');
+const pako = require('pako'); // HTX uses GZIP compression
+require('dotenv').config();
+
 const app = express();
-const port = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 
-// --- BOT SETTINGS ---
-const CONFIG = {
-    SYMBOL: 'shibusdt',
-    BASE_CONTRACT_SIZE: 1000, // 1 contract = 1000 SHIB
-    DCA_MULTIPLIER: 1.2,
-    DCA_TRIGGER_ROI: -10,     // Trigger DCA if ROI < -10%
-    GROWTH_RATE_THRESHOLD: 0.05, // 0.05% growth
-    GROWTH_WINDOW_MS: 60000,   // Check growth over 1 minute
-};
-
-// --- BOT STATE (Paper Trading) ---
-let state = {
+// Bot Settings & State
+let botState = {
+    symbol: 'shibusdt', // HTX spot or '1000shibusdt' for futures
+    isRunning: true,
+    startTime: new Date(),
     priceHistory: [],
-    position: null, // { avgPrice: 0, totalQty: 0, contracts: 0 }
+    currentPrice: { bid: 0, ask: 0 },
+    openPosition: null, // { entryPrice, contracts, totalCost, direction: 'LONG' }
     closedTrades: [],
-    currentTicker: { bid: 0, ask: 0, last: 0 },
-    lastUpdate: Date.now()
+    totalRealizedPnl: 0,
+    metrics: {
+        roi: 0,
+        unrealizedPnl: 0,
+        growthRate: 0
+    }
 };
 
-// --- UTILS ---
-const calculateROI = (currentPrice, avgEntry) => ((currentPrice - avgEntry) / avgEntry) * 100;
-
-// --- WEBSOCKET LOGIC (HTX) ---
-const initWS = () => {
+// 1. WebSocket for Real-time Data
+const connectHTX = () => {
     const ws = new WebSocket('wss://api.huobi.pro/ws');
 
     ws.on('open', () => {
-        // Subscribe to BBO (Best Bid Offer) for Paper Trading Bid/Ask
-        ws.send(JSON.stringify({ sub: `market.${CONFIG.SYMBOL}.bbo`, id: 'id1' }));
+        // Subscribe to Market Detail (gives bid/ask/last price)
+        ws.send(JSON.stringify({ sub: `market.${botState.symbol}.detail`, id: 'shib_bot' }));
     });
 
     ws.on('message', (data) => {
-        // HTX sends GZIP compressed data
-        const payload = zlib.gunzipSync(data).toString();
-        const msg = JSON.parse(payload);
-
-        // Handle Heartbeat
-        if (msg.ping) {
-            ws.send(JSON.stringify({ pong: msg.ping }));
+        const payload = JSON.parse(pako.ungzip(data, { to: 'string' }));
+        
+        // Handle Ping/Pong to keep connection alive
+        if (payload.ping) {
+            ws.send(JSON.stringify({ pong: payload.ping }));
             return;
         }
 
-        if (msg.tick) {
-            const { bid, ask } = msg.tick;
-            state.currentTicker = { bid, ask, last: (bid + ask) / 2 };
-            updateStrategy();
+        if (payload.tick) {
+            botState.currentPrice.bid = payload.tick.bid[0];
+            botState.currentPrice.ask = payload.tick.ask[0];
+            updateLogic();
         }
     });
 
-    ws.on('close', () => setTimeout(initWS, 5000));
+    ws.on('close', () => setTimeout(connectHTX, 5000));
 };
 
-// --- TRADING STRATEGY ---
-function updateStrategy() {
+// 2. Trading Strategy & DCA Logic
+const updateLogic = () => {
+    const price = botState.currentPrice.bid;
+    if (!price) return;
+
+    // Maintain Price History for Growth Rate (Time-based)
     const now = Date.now();
-    const currentPrice = state.currentTicker.ask; // Entry on Ask for Longs
+    botState.priceHistory.push({ price, time: now });
+    const windowMs = process.env.GROWTH_RATE_WINDOW_MINS * 60000;
+    botState.priceHistory = botState.priceHistory.filter(p => now - p.time <= windowMs);
 
-    // 1. Manage Price History for Growth Rate
-    state.priceHistory.push({ time: now, price: currentPrice });
-    state.priceHistory = state.priceHistory.filter(p => now - p.time <= CONFIG.GROWTH_WINDOW_MS);
-
-    // 2. Logic: If no position, check Growth Rate to Open Long
-    if (!state.position && state.priceHistory.length > 2) {
-        const oldest = state.priceHistory[0];
-        const growth = ((currentPrice - oldest.price) / oldest.price) * 100;
-
-        if (growth >= CONFIG.GROWTH_RATE_THRESHOLD) {
-            openPosition(currentPrice, CONFIG.BASE_CONTRACT_SIZE);
-        }
+    // Calculate Growth Rate
+    if (botState.priceHistory.length > 1) {
+        const oldPrice = botState.priceHistory[0].price;
+        botState.metrics.growthRate = ((price - oldPrice) / oldPrice) * 100;
     }
 
-    // 3. Logic: If in position, check for DCA trigger
-    if (state.position) {
-        const roi = calculateROI(state.currentTicker.bid, state.position.avgPrice);
-        if (roi <= CONFIG.DCA_TRIGGER_ROI) {
-            const dcaQty = state.position.totalQty * CONFIG.DCA_MULTIPLIER;
-            openPosition(currentPrice, dcaQty, true);
-        }
+    // Initialize first contract (1000 SHIB unit)
+    if (!botState.openPosition) {
+        openPosition(1); // Start with 1 contract
+        return;
     }
-}
 
-function openPosition(price, qty, isDCA = false) {
-    if (!state.position) {
-        state.position = { avgPrice: price, totalQty: qty, contracts: qty / 1000, startTime: Date.now() };
+    // Calculate ROI & Unrealized PNL
+    const pos = botState.openPosition;
+    botState.metrics.unrealizedPnl = (price - pos.entryPrice) * (pos.contracts * 1000);
+    botState.metrics.roi = (botState.metrics.unrealizedPnl / pos.totalCost) * 100;
+
+    // DCA Logic: Trigger if ROI below -10% (drawdown)
+    const dcaThreshold = parseFloat(process.env.DCA_THRESHOLD_PERCENT);
+    if (botState.metrics.roi <= dcaThreshold) {
+        const multiplier = parseFloat(process.env.DCA_MULTIPLIER);
+        const newContracts = pos.contracts * multiplier;
+        console.log(`DCA Triggered! Buying ${newContracts.toFixed(2)} units...`);
+        openPosition(newContracts, true);
+    }
+};
+
+const openPosition = (contracts, isDca = false) => {
+    const price = botState.currentPrice.ask; // Buy at Ask
+    const cost = price * (contracts * 1000);
+
+    if (!isDca) {
+        botState.openPosition = {
+            entryPrice: price,
+            contracts: contracts,
+            totalCost: cost,
+            direction: 'LONG'
+        };
     } else {
-        // Update Weighted Average for DCA
-        const newTotalQty = state.position.totalQty + qty;
-        state.position.avgPrice = ((state.position.avgPrice * state.position.totalQty) + (price * qty)) / newTotalQty;
-        state.position.totalQty = newTotalQty;
-        state.position.contracts = newTotalQty / 1000;
+        // Average Down Logic
+        const totalContracts = botState.openPosition.contracts + contracts;
+        const totalCost = botState.openPosition.totalCost + cost;
+        botState.openPosition.entryPrice = totalCost / (totalContracts * 1000);
+        botState.openPosition.contracts = totalContracts;
+        botState.openPosition.totalCost = totalCost;
     }
-    console.log(`${isDCA ? 'DCA' : 'OPEN'} LONG at ${price} | Total Qty: ${state.position.totalQty}`);
-}
+};
 
-// --- EXPRESS SERVER (Dashboard) ---
+// 3. Webserver UI
 app.get('/', (req, res) => {
-    let roi = 0, pnl = 0;
-    if (state.position) {
-        roi = calculateROI(state.currentTicker.bid, state.position.avgPrice);
-        pnl = (state.currentTicker.bid - state.position.avgPrice) * state.position.totalQty;
-    }
-
-    const html = `
+    res.send(`
         <html>
-            <body style="font-family: sans-serif; background: #121212; color: white; padding: 20px;">
-                <h1>SHIB HTX Bot (Paper Trading)</h1>
-                <div style="border: 1px solid #333; padding: 15px; margin-bottom: 20px;">
-                    <h3>Market: SHIB/USDT</h3>
-                    <p>Bid: ${state.currentTicker.bid} | Ask: ${state.currentTicker.ask}</p>
+            <body style="font-family:sans-serif; background:#121212; color:white; padding:20px;">
+                <h1>SHIB HTX Growth Bot (Paper)</h1>
+                <div style="display:grid; grid-template-columns: 1fr 1fr; gap:20px;">
+                    <div style="border:1px solid #333; padding:15px;">
+                        <h3>Active Position</h3>
+                        <p>Direction: <b style="color:#00ff00">${botState.openPosition?.direction || 'NONE'}</b></p>
+                        <p>Contracts: ${botState.openPosition?.contracts.toFixed(2) || 0} (1k/unit)</p>
+                        <p>Avg Entry: $${botState.openPosition?.entryPrice.toFixed(8) || 0}</p>
+                        <p>Current Bid: $${botState.currentPrice.bid.toFixed(8)}</p>
+                    </div>
+                    <div style="border:1px solid #333; padding:15px;">
+                        <h3>Metrics</h3>
+                        <p>ROI: <span style="color:${botState.metrics.roi >= 0 ? '#00ff00' : '#ff4444'}">${botState.metrics.roi.toFixed(2)}%</span></p>
+                        <p>Unrealized PNL: $${botState.metrics.unrealizedPnl.toFixed(4)}</p>
+                        <p>Realized PNL: $${botState.totalRealizedPnl.toFixed(4)}</p>
+                        <p>Growth Rate (${process.env.GROWTH_RATE_WINDOW_MINS}m): ${botState.metrics.growthRate.toFixed(4)}%</p>
+                    </div>
                 </div>
-
-                <div style="background: ${roi >= 0 ? '#1b5e20' : '#b71c1c'}; padding: 15px; border-radius: 8px;">
-                    <h2>Active Position: LONG</h2>
-                    <p>Status: ${state.position ? 'OPEN' : 'WAITING FOR GROWTH SIGNAL'}</p>
-                    ${state.position ? `
-                        <p>Avg Entry: ${state.position.avgPrice.toFixed(8)}</p>
-                        <p>Contracts: ${state.position.contracts} (${state.position.totalQty} SHIB)</p>
-                        <p><b>ROI: ${roi.toFixed(2)}%</b></p>
-                        <p><b>Unrealized PnL: ${pnl.toFixed(4)} USDT</b></p>
-                    ` : ''}
-                </div>
-
-                <h3>Closed Trades</h3>
-                <pre>${JSON.stringify(state.closedTrades, null, 2)}</pre>
-                
-                <script>setTimeout(() => location.reload(), 2000);</script>
+                <h3>Bot Uptime: ${Math.floor((Date.now() - botState.startTime)/60000)} mins</h3>
             </body>
         </html>
-    `;
-    res.send(html);
+    `);
 });
 
-app.listen(port, () => {
-    console.log(`Webserver running on port ${port}`);
-    initWS();
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    connectHTX();
 });
