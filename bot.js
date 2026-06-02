@@ -10,76 +10,55 @@ const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepA
 // ==================== MONGODB SETUP ====================
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
 
-mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000, socketTimeoutMS: 45000 })
-    .then(() => console.log('✅ MongoDB Connected Successfully'))
-    .catch(err => console.error('🚨 MongoDB Connection Error:', err));
+mongoose.connect(MONGO_URI).then(() => console.log('✅ MongoDB Connected')).catch(err => console.error('🚨 DB Error:', err));
 
-const UserModel = mongoose.model('User_V3_Hedge', new mongoose.Schema({
+const UserModel = mongoose.model('User_V4', new mongoose.Schema({
     name: { type: String, required: true },
     email: { type: String, unique: true, required: true },
     passwordHash: { type: String, required: true },
     salt: { type: String, required: true },
     token: { type: String },
-    apiKey: { type: String, default: "" },      // Account 1 (Longs)
+    apiKey: { type: String, default: "" },      
     apiSecret: { type: String, default: "" },
-    apiKey2: { type: String, default: "" },     // Account 2 (Shorts)
+    apiKey2: { type: String, default: "" },     
     apiSecret2: { type: String, default: "" },
     liveTradingEnabled: { type: Boolean, default: false },
     config: { type: Object, default: {} },
-    activePositionLong: { type: Object, default: null }, 
-    activePositionShort: { type: Object, default: null },
+    activePositions: { type: Array, default: [] }, // Stores [{side, entry, qty...}]
     lastCloseTime: { type: Number, default: 0 }      
 }));
 
-const TradeModel = mongoose.model('TradeLog_V3', new mongoose.Schema({
+const TradeModel = mongoose.model('TradeLog_V4', new mongoose.Schema({
     userId: { type: String, required: true }, side: String, entryPrice: Number, exitPrice: Number,
-    contracts: Number, marginUsed: Number, netPnl: Number, roiPct: Number, timestamp: { type: Date, default: Date.now }, exitReason: String
+    contracts: Number, netPnl: Number, timestamp: { type: Date, default: Date.now }, exitReason: String
 }));
 
 // ==================== BASE CONFIGURATION ====================
-const CUSTOM_PORT = process.env.PORT || 3000;
-const FORCED_LEVERAGE = 75;
-
 const BASE_CONFIG = {
     htxSymbol: 'SHIB/USDT:USDT',         
     binanceSymbol: '1000SHIB/USDT:USDT', 
-    leverage: FORCED_LEVERAGE, 
-    baseContracts: 1, 
-    contractSize: 1000, 
-    takeProfitPct: 10.0, 
+    leverage: 75, 
+    baseContracts: 100, // Starting amount
+    takeProfitPct: 5.0, 
     stopLossPct: -50.0, 
-    dcaRoiThresholdPct: 1.0, 
-    dcaMultiplier: 2.0, 
-    maxContracts: 500
+    dcaRoiThresholdPct: -10.0, // DCA when -10% ROI
+    dcaMultiplier: 1.5,        // Increase size by 1.5x
+    maxContracts: 50000
 };
 
 const globalMarketData = { binance: { mid: 0 } };
-const publicBinance = new ccxt.pro.binance({ options: { defaultType: 'swap', defaultSubType: 'linear' } });
+const publicBinance = new ccxt.pro.binance({ options: { defaultType: 'swap' } });
 
-// ==================== SECURITY ====================
+// ==================== SECURITY & AUTH ====================
 function hashPassword(password, salt) { return crypto.scryptSync(password, salt, 64).toString('hex'); }
 function generateToken() { return crypto.randomBytes(32).toString('hex'); }
-const tokenCache = new Map();
 
 async function authMiddleware(req, res, next) {
     const token = req.headers['authorization'];
-    if (!token) return res.status(401).json({ error: 'Unauthorized' });
-    let userEntry = tokenCache.get(token);
-    if (!userEntry) {
-        const user = await UserModel.findOne({ token });
-        if (!user) return res.status(401).json({ error: 'Unauthorized' });
-        userEntry = { user }; tokenCache.set(token, userEntry);
-    }
-    req.user = userEntry.user;
+    const user = await UserModel.findOne({ token });
+    if (!user) return res.status(401).json({ error: 'Unauthorized' });
+    req.user = user;
     next();
-}
-
-function calculateTradeMath(side, entryPrice, currentPrice, sizeUsd, leverage) {
-    const sideMult = side === 'long' ? 1 : -1;
-    const grossPnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100 * sideMult;
-    const margin = sizeUsd / leverage;
-    const netPnlUsd = (grossPnlPercent / 100) * sizeUsd;
-    return { netPnlUsd, roiPct: grossPnlPercent * leverage, margin };
 }
 
 // ==================== HEDGED USER INSTANCE ====================
@@ -87,137 +66,115 @@ class UserTradeInstance {
     constructor(user) {
         this.userId = user._id.toString();
         this.config = { ...BASE_CONFIG, ...(user.config || {}) };
-        this.activeLong = user.activePositionLong || null;
-        this.activeShort = user.activePositionShort || null;
+        this.activePositions = user.activePositions || [];
         this.isTrading = false;
-        this.balances = { longAcc: 0, shortAcc: 0 };
+        this.balances = { long: 0, short: 0 };
+        this.livePositions = { long: { roi: 0, contracts: 0 }, short: { roi: 0, contracts: 0 } };
         this.applyUserKeys(user);
     }
 
     applyUserKeys(user) {
         this.liveTradingEnabled = user.liveTradingEnabled;
-        const opt = { agent: keepAliveAgent, options: { defaultType: 'swap', defaultSubType: 'linear' } };
+        const opt = { agent: keepAliveAgent, options: { defaultType: 'swap', positionMode: 'hedged' } };
         this.htxLong = new ccxt.pro.htx({ apiKey: user.apiKey, secret: user.apiSecret, ...opt });
         this.htxShort = new ccxt.pro.htx({ apiKey: user.apiKey2, secret: user.apiSecret2, ...opt });
     }
 
-    async initialize() {
-        if (this.liveTradingEnabled) {
-            try { await this.htxLong.loadMarkets(); await this.htxShort.loadMarkets(); } catch(e){}
-        }
-        this.startSync();
-    }
-
     async saveState() {
-        await UserModel.updateOne({ _id: this.userId }, { $set: { activePositionLong: this.activeLong, activePositionShort: this.activeShort, config: this.config } });
+        await UserModel.updateOne({ _id: this.userId }, { $set: { activePositions: this.activePositions, config: this.config } });
     }
 
-    async startHedge() {
+    // Opens both Long and Short at once
+    async openHedge() {
         if (this.isTrading) return;
-        if (!this.activeLong) await this.openPosition('long');
-        if (!this.activeShort) await this.openPosition('short');
-    }
-
-    async openPosition(side) {
         this.isTrading = true;
         try {
-            const ex = side === 'long' ? this.htxLong : this.htxShort;
-            const qty = this.config.baseContracts;
-            if (this.liveTradingEnabled) {
-                await ex.createMarketOrder(this.config.htxSymbol, side === 'long' ? 'buy' : 'sell', qty);
-            }
-            const price = globalMarketData.binance.mid;
-            const size = qty * this.config.contractSize * price;
-            const pos = { side, entryPrice: price, contracts: qty, size, marginUsed: size/FORCED_LEVERAGE, entryTime: Date.now(), exchangeROI: 0, lastDcaTime: 0 };
-            if (side === 'long') this.activeLong = pos; else this.activeShort = pos;
+            await this.executeOrder('long', 'buy', this.config.baseContracts);
+            await this.executeOrder('short', 'sell', this.config.baseContracts);
             await this.saveState();
-        } catch(e) { console.log("Open Error:", e.message); } finally { this.isTrading = false; }
+        } catch(e) { console.error("Entry Error", e); }
+        this.isTrading = false;
     }
 
-    async checkExitsAndDca() {
-        if (this.isTrading) return;
-        const legs = [this.activeLong, this.activeShort];
-        for (let pos of legs) {
-            if (!pos) continue;
-            const roi = pos.exchangeROI || 0;
-            
-            // TAKE PROFIT / STOP LOSS
-            if (roi >= this.config.takeProfitPct) await this.closePosition(pos.side, "TAKE_PROFIT");
-            else if (roi <= this.config.stopLossPct) await this.closePosition(pos.side, "STOP_LOSS");
-            
-            // DCA
-            else if (roi <= -(Math.abs(this.config.dcaRoiThresholdPct)) && (Date.now() - (pos.lastDcaTime || 0) > 30000)) {
-                await this.dcaPosition(pos.side);
+    async executeOrder(side, type, qty) {
+        const ex = side === 'long' ? this.htxLong : this.htxShort;
+        if (this.liveTradingEnabled) {
+            await ex.createMarketOrder(this.config.htxSymbol, type, qty, { offset: 'open' });
+        }
+        // Logic to track internal state
+        const existing = this.activePositions.find(p => p.side === side);
+        if (existing) {
+            existing.contracts += qty;
+        } else {
+            this.activePositions.push({ side, entryPrice: globalMarketData.binance.mid, contracts: qty });
+        }
+    }
+
+    async checkDCAAndExits() {
+        if (this.isTrading || this.activePositions.length === 0) return;
+        
+        for (const pos of this.activePositions) {
+            const sideData = pos.side === 'long' ? this.livePositions.long : this.livePositions.short;
+            const roi = sideData.roi;
+
+            // 1. Take Profit / Stop Loss
+            if (roi >= this.config.takeProfitPct || roi <= this.config.stopLossPct) {
+                await this.closeSide(pos.side, roi >= this.config.takeProfitPct ? "TP" : "SL");
+            } 
+            // 2. DCA Logic
+            else if (roi <= this.config.dcaRoiThresholdPct) {
+                const dcaQty = pos.contracts * (this.config.dcaMultiplier - 1);
+                if (pos.contracts + dcaQty <= this.config.maxContracts) {
+                    console.log(`DCA Triggered for ${pos.side}`);
+                    await this.executeOrder(pos.side, pos.side === 'long' ? 'buy' : 'sell', dcaQty);
+                }
             }
         }
     }
 
-    async dcaPosition(side) {
+    async closeSide(side, reason) {
         this.isTrading = true;
         try {
-            const pos = side === 'long' ? this.activeLong : this.activeShort;
-            const ex = side === 'long' ? this.htxLong : this.htxShort;
-            const qtyToAdd = Math.max(1, Math.floor(pos.contracts * (this.config.dcaMultiplier - 1)));
-            
-            if (pos.contracts + qtyToAdd > this.config.maxContracts) return;
-
-            if (this.liveTradingEnabled) {
-                await ex.createMarketOrder(this.config.htxSymbol, side === 'long' ? 'buy' : 'sell', qtyToAdd);
-            }
-
-            const currentPrice = globalMarketData.binance.mid;
-            const oldTotalCost = pos.entryPrice * pos.contracts;
-            const newTotalCost = oldTotalCost + (currentPrice * qtyToAdd);
-            
-            pos.contracts += qtyToAdd;
-            pos.entryPrice = newTotalCost / pos.contracts;
-            pos.size = pos.contracts * this.config.contractSize * pos.entryPrice;
-            pos.lastDcaTime = Date.now();
-            await this.saveState();
-        } catch(e){} finally { this.isTrading = false; }
-    }
-
-    async closePosition(side, reason) {
-        this.isTrading = true;
-        try {
-            const pos = side === 'long' ? this.activeLong : this.activeShort;
+            const pos = this.activePositions.find(p => p.side === side);
+            if (!pos) return;
             const ex = side === 'long' ? this.htxLong : this.htxShort;
             if (this.liveTradingEnabled) {
-                await ex.createMarketOrder(this.config.htxSymbol, side === 'long' ? 'sell' : 'buy', pos.contracts, { reduceOnly: true });
+                await ex.createMarketOrder(this.config.htxSymbol, side === 'long' ? 'sell' : 'buy', pos.contracts, { reduceOnly: true, offset: 'close' });
             }
-            const math = calculateTradeMath(pos.side, pos.entryPrice, globalMarketData.binance.mid, pos.size, 75);
-            await TradeModel.create({ userId: this.userId, side: pos.side, contracts: pos.contracts, entryPrice: pos.entryPrice, exitPrice: globalMarketData.binance.mid, netPnl: math.netPnlUsd, roiPct: math.roiPct, exitReason: reason });
-            
-            if (side === 'long') this.activeLong = null; else this.activeShort = null;
+            await TradeModel.create({ userId: this.userId, side, contracts: pos.contracts, exitReason: reason, netPnl: 0 }); // Pnl calculation simplified
+            this.activePositions = this.activePositions.filter(p => p.side !== side);
             await this.saveState();
-            // Automatically reopen leg to maintain hedge
-            setTimeout(() => this.openPosition(side), 5000);
-        } catch(e) {} finally { this.isTrading = false; }
+        } catch(e) { console.error("Close Error", e); }
+        this.isTrading = false;
     }
 
     startSync() {
         setInterval(async () => {
             if (this.liveTradingEnabled) {
                 try {
-                    const b1 = await this.htxLong.fetchBalance({ type: 'swap' });
-                    const b2 = await this.htxShort.fetchBalance({ type: 'swap' });
-                    this.balances = { longAcc: b1.total?.USDT || 0, shortAcc: b2.total?.USDT || 0 };
+                    const [b1, b2] = await Promise.all([this.htxLong.fetchBalance({type:'swap'}), this.htxShort.fetchBalance({type:'swap'})]);
+                    this.balances = { long: b1.total.USDT || 0, short: b2.total.USDT || 0 };
                     
-                    if (this.activeLong) {
-                        const p = (await this.htxLong.fetchPositions([this.config.htxSymbol])).find(x => x.side === 'long' && x.contracts > 0);
-                        if (p) this.activeLong.exchangeROI = p.percentage;
-                    }
-                    if (this.activeShort) {
-                        const p = (await this.htxShort.fetchPositions([this.config.htxSymbol])).find(x => x.side === 'short' && x.contracts > 0);
-                        if (p) this.activeShort.exchangeROI = p.percentage;
-                    }
+                    const [p1, p2] = await Promise.all([
+                        this.htxLong.fetchPositions([this.config.htxSymbol]),
+                        this.htxShort.fetchPositions([this.config.htxSymbol])
+                    ]);
+
+                    const lp = p1.find(x => x.contracts > 0);
+                    const sp = p2.find(x => x.contracts > 0);
+
+                    this.livePositions.long = lp ? { roi: lp.percentage, contracts: lp.contracts } : { roi: 0, contracts: 0 };
+                    this.livePositions.short = sp ? { roi: sp.percentage, contracts: sp.contracts } : { roi: 0, contracts: 0 };
+                    
+                    // Sync activePositions array with exchange reality
+                    if (!lp && !sp) this.activePositions = [];
                 } catch(e){}
             }
         }, 2000);
     }
 }
 
-// ==================== CONTROLLER ====================
+// ==================== MASTER LOOP ====================
 const workers = new Map();
 async function masterLoop() {
     (async function stream() {
@@ -225,214 +182,195 @@ async function masterLoop() {
             try {
                 const t = await publicBinance.fetchTicker(BASE_CONFIG.binanceSymbol);
                 globalMarketData.binance.mid = (t.bid + t.ask) / 2;
-                for (const w of workers.values()) { w.checkExitsAndDca(); }
+                for (const w of workers.values()) { w.checkDCAAndExits(); }
             } catch(e){}
-            await new Promise(r => setTimeout(r, 1000));
+            await new Promise(r => setTimeout(r, 2000));
         }
     })();
 }
 
-// ==================== API ====================
+// ==================== API ENDPOINTS ====================
 const app = express(); app.use(express.json());
-app.post('/api/auth/register', async (req, res) => {
-    const salt = crypto.randomBytes(16).toString('hex');
-    const user = await UserModel.create({ ...req.body, passwordHash: hashPassword(req.body.password, salt), salt, token: generateToken() });
-    res.json({ token: user.token });
-});
+
 app.post('/api/auth/login', async (req, res) => {
     const user = await UserModel.findOne({ email: req.body.email });
     if (user && hashPassword(req.body.password, user.salt) === user.passwordHash) {
         user.token = generateToken(); await user.save();
-        if(!workers.has(user._id.toString())) { const w = new UserTradeInstance(user); await w.initialize(); workers.set(user._id.toString(), w); }
+        if(!workers.has(user._id.toString())) { 
+            const w = new UserTradeInstance(user); w.startSync(); workers.set(user._id.toString(), w); 
+        }
         res.json({ token: user.token });
     } else res.status(401).json({ error: 'Invalid Credentials' });
 });
+
 app.get('/api/data', authMiddleware, async (req, res) => {
     const w = workers.get(req.user._id.toString());
-    const trades = await TradeModel.find({ userId: req.user._id.toString() }).sort({ timestamp: -1 }).limit(10).lean();
-    res.json({ config: w.config, metrics: { trades }, activeLong: w.activeLong, activeShort: w.activeShort, balances: w.balances, liveTradingEnabled: w.liveTradingEnabled });
-});
-app.post('/api/user/keys', authMiddleware, async (req, res) => {
-    Object.assign(req.user, req.body); await req.user.save();
-    workers.get(req.user._id.toString()).applyUserKeys(req.user); res.json({status:'ok'});
-});
-app.post('/api/user/config', authMiddleware, async (req, res) => {
-    const w = workers.get(req.user._id.toString()); Object.assign(w.config, req.body);
-    req.user.config = w.config; req.user.markModified('config'); await req.user.save(); res.json({status:'ok'});
-});
-app.get('/api/start-hedge', authMiddleware, async (req, res) => { await workers.get(req.user._id.toString()).startHedge(); res.json({status:'ok'}); });
-app.get('/api/close-all', authMiddleware, async (req, res) => { 
-    const w = workers.get(req.user._id.toString());
-    if (w.activeLong) await w.closePosition('long', "MANUAL");
-    if (w.activeShort) await w.closePosition('short', "MANUAL");
-    res.json({status:'ok'}); 
+    const trades = await TradeModel.find({ userId: req.user._id.toString() }).sort({ timestamp: -1 }).limit(10);
+    res.json({ config: w.config, live: w.livePositions, balances: w.balances, trades, liveTradingEnabled: w.liveTradingEnabled });
 });
 
-// ==================== DASHBOARD UI ====================
+app.post('/api/user/config', authMiddleware, async (req, res) => {
+    const w = workers.get(req.user._id.toString()); 
+    Object.assign(w.config, req.body);
+    req.user.config = w.config; req.user.markModified('config'); 
+    await req.user.save(); res.json({status:'ok'});
+});
+
+app.get('/api/open-hedge', authMiddleware, async (req, res) => {
+    await workers.get(req.user._id.toString()).openHedge();
+    res.json({status:'ok'});
+});
+
+app.get('/api/close-all', authMiddleware, async (req, res) => {
+    const w = workers.get(req.user._id.toString());
+    await w.closeSide('long', 'MANUAL'); await w.closeSide('short', 'MANUAL');
+    res.json({status:'ok'});
+});
+
+// ==================== UI DASHBOARD ====================
 app.get('/', (req, res) => { res.send(`
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <title>TradeBotPille | Constant Hedge</title>
+    <title>Hedge DCA Terminal</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&family=Roboto+Mono&display=swap" rel="stylesheet">
-    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
-        body { font-family: 'Roboto', sans-serif; background-color: #fafafa; color: #111827; }
-        .ui-card { background-color: #ffffff; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.03); border: 1px solid #f0f0f0; padding: 24px; }
-        .input-minimal { width: 100%; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px; font-size: 14px; outline: none; background: #fafafa; }
-        .btn-black { background: #000; color: #fff; border-radius: 8px; padding: 12px; font-weight: 500; text-align: center; width: 100%; cursor: pointer; }
-        .view-section { display: none; } .active-view { display: block; }
+        body { font-family: 'Inter', sans-serif; background: #fafafa; color: #111; }
+        .card { background: white; border: 1px solid #eee; border-radius: 12px; padding: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.02); }
+        .input { border: 1px solid #ddd; padding: 8px; border-radius: 6px; width: 100%; font-size: 13px; }
+        .label { font-size: 11px; font-weight: 700; color: #888; text-transform: uppercase; margin-bottom: 4px; display: block; }
     </style>
 </head>
-<body class="antialiased min-h-screen flex flex-col">
-    <header class="bg-white border-b h-16 flex items-center px-8 justify-between sticky top-0 z-50">
-        <div class="flex items-center gap-2">
-            <span class="material-symbols-outlined text-black text-3xl">api</span>
-            <span class="font-bold text-xl tracking-tight">TradeBotPille</span>
+<body class="p-8">
+    <div id="auth" class="max-w-sm mx-auto mt-20 card">
+        <h2 class="text-xl font-bold mb-4">Hedge Login</h2>
+        <input id="email" placeholder="Email" class="input mb-2">
+        <input id="pass" type="password" placeholder="Password" class="input mb-4">
+        <button onclick="login()" class="w-full bg-black text-white p-3 rounded-lg font-bold">Enter Terminal</button>
+    </div>
+
+    <div id="dash" class="hidden max-w-6xl mx-auto">
+        <div class="flex justify-between items-center mb-8">
+            <h1 class="text-2xl font-bold">Hedge Terminal</h1>
+            <div class="flex gap-4">
+                <button onclick="openHedge()" class="bg-blue-600 text-white px-6 py-2 rounded-lg font-bold text-sm">Open New Hedge</button>
+                <button onclick="closeAll()" class="bg-red-500 text-white px-6 py-2 rounded-lg font-bold text-sm">Close All</button>
+                <button onclick="logout()" class="text-gray-400 text-sm">Logout</button>
+            </div>
         </div>
-        <div id="nav-private" class="hidden flex items-center gap-6 text-sm font-medium">
-            <button onclick="nav('dashboard')" class="text-gray-500 hover:text-black">Dashboard</button>
-            <button onclick="logout()" class="text-red-500">Logout</button>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+            <div class="card">
+                <p class="label">Long Account (Primary)</p>
+                <div class="flex justify-between items-end">
+                    <div>
+                        <p id="l-bal" class="text-2xl font-bold">$0.00</p>
+                        <p id="l-roi" class="text-lg font-semibold text-green-500">0.00%</p>
+                    </div>
+                    <div class="text-right">
+                        <p class="label">Volume Contracts</p>
+                        <p id="l-vol" class="font-mono font-bold">0</p>
+                    </div>
+                </div>
+            </div>
+            <div class="card">
+                <p class="label">Short Account (Secondary)</p>
+                <div class="flex justify-between items-end">
+                    <div>
+                        <p id="s-bal" class="text-2xl font-bold">$0.00</p>
+                        <p id="s-roi" class="text-lg font-semibold text-red-500">0.00%</p>
+                    </div>
+                    <div class="text-right">
+                        <p class="label">Volume Contracts</p>
+                        <p id="s-vol" class="font-mono font-bold">0</p>
+                    </div>
+                </div>
+            </div>
         </div>
-    </header>
 
-    <main class="flex-grow p-8">
-        <section id="view-home" class="view-section active-view max-w-md mx-auto py-20">
-            <div class="ui-card">
-                <h2 class="text-2xl font-bold mb-6 text-center">Login to Terminal</h2>
-                <div class="space-y-4">
-                    <input type="email" id="email" placeholder="Email" class="input-minimal">
-                    <input type="password" id="pass" placeholder="Password" class="input-minimal">
-                    <button onclick="login()" class="btn-black">Access Terminal</button>
-                </div>
-            </div>
-        </section>
-
-        <section id="view-dashboard" class="view-section max-w-7xl mx-auto">
-            <div class="flex justify-between items-center mb-8">
-                <h2 class="text-2xl font-bold">Hedge Terminal</h2>
-                <div class="flex gap-3">
-                    <button onclick="startHedge()" class="px-4 py-2 bg-green-600 text-white rounded-md text-sm font-bold">Start Hedge</button>
-                    <button onclick="nav('settings')" class="px-4 py-2 bg-white border rounded-md text-sm font-bold">API Setup</button>
-                    <button onclick="closeAll()" class="px-4 py-2 bg-red-50 text-red-600 rounded-md text-sm font-bold">Emergency Stop</button>
-                </div>
-            </div>
-
-            <div class="grid lg:grid-cols-2 gap-8 mb-8">
-                <!-- ACCOUNT 1 -->
-                <div class="ui-card border-t-4 border-green-500">
-                    <h3 class="font-bold text-green-600 mb-4">ACCOUNT 1 (LONG LEG)</h3>
-                    <div class="grid grid-cols-3 gap-4">
-                        <div><p class="text-[10px] text-gray-400">BALANCE</p><p id="bal1" class="font-mono font-bold">$0.00</p></div>
-                        <div><p class="text-[10px] text-gray-400">VOLUME</p><p id="vol1" class="font-mono font-bold">0</p></div>
-                        <div><p class="text-[10px] text-gray-400">ROI</p><p id="roi1" class="font-mono font-bold">0.00%</p></div>
+        <div class="grid grid-cols-3 gap-6">
+            <div class="card col-span-2">
+                <h3 class="font-bold mb-4 border-b pb-2">DCA Strategy Settings</h3>
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="label">Take Profit %</label>
+                        <input id="cfg-tp" class="input">
+                    </div>
+                    <div>
+                        <label class="label">Stop Loss %</label>
+                        <input id="cfg-sl" class="input">
+                    </div>
+                    <div>
+                        <label class="label">DCA Trigger (ROI %)</label>
+                        <input id="cfg-dca-t" class="input" placeholder="e.g. -10">
+                    </div>
+                    <div>
+                        <label class="label">DCA Multiplier</label>
+                        <input id="cfg-dca-m" class="input" placeholder="e.g. 2.0">
                     </div>
                 </div>
-                <!-- ACCOUNT 2 -->
-                <div class="ui-card border-t-4 border-red-500">
-                    <h3 class="font-bold text-red-600 mb-4">ACCOUNT 2 (SHORT LEG)</h3>
-                    <div class="grid grid-cols-3 gap-4">
-                        <div><p class="text-[10px] text-gray-400">BALANCE</p><p id="bal2" class="font-mono font-bold">$0.00</p></div>
-                        <div><p class="text-[10px] text-gray-400">VOLUME</p><p id="vol2" class="font-mono font-bold">0</p></div>
-                        <div><p class="text-[10px] text-gray-400">ROI</p><p id="roi2" class="font-mono font-bold">0.00%</p></div>
-                    </div>
-                </div>
+                <button onclick="saveConfig()" class="mt-4 w-full bg-gray-100 p-2 rounded font-bold text-sm hover:bg-gray-200">Update DCA Parameters</button>
             </div>
-
-            <div class="grid lg:grid-cols-12 gap-8">
-                <div class="lg:col-span-8 ui-card">
-                    <h3 class="font-bold mb-4 border-b pb-4">Recent Closed Trades</h3>
-                    <table class="w-full text-sm text-left"><thead class="text-gray-400"><tr><th>Side</th><th>Reason</th><th>Qty</th><th class="text-right">PnL</th></tr></thead><tbody id="history" class="font-mono"></tbody></table>
-                </div>
-                <div class="lg:col-span-4 ui-card">
-                    <h3 class="font-bold mb-4 border-b pb-4">DCA Settings</h3>
-                    <div class="space-y-4 text-xs font-bold text-gray-500">
-                        <div>Take Profit %<input id="s-tp" class="input-minimal mt-1 text-green-600"></div>
-                        <div>DCA ROI Drop %<input id="s-dca-t" class="input-minimal mt-1"></div>
-                        <div>DCA Multiplier<input id="s-dca-m" class="input-minimal mt-1"></div>
-                        <div>Base Contracts<input id="s-base" class="input-minimal mt-1"></div>
-                        <button onclick="saveConfig()" class="btn-black mt-4">Save Config</button>
-                    </div>
-                </div>
+            
+            <div class="card">
+                <h3 class="font-bold mb-4 border-b pb-2">Recent Logs</h3>
+                <div id="logs" class="text-xs space-y-2 font-mono"></div>
             </div>
-        </section>
-
-        <section id="view-settings" class="view-section max-w-lg mx-auto py-10">
-            <div class="ui-card">
-                <h3 class="text-xl font-bold mb-6">Dual Hedge API</h3>
-                <div class="space-y-6">
-                    <div class="flex items-center gap-2 mb-4"><input type="checkbox" id="liveTrade" class="w-4 h-4"> <label class="font-bold">Enable Live Trading</label></div>
-                    <div class="p-4 bg-gray-50 rounded-lg border">
-                        <p class="text-[10px] font-bold text-green-600 mb-2 uppercase">Account 1 (Primary)</p>
-                        <input type="password" id="key1" placeholder="API Key" class="input-minimal mb-2">
-                        <input type="password" id="sec1" placeholder="Secret Key" class="input-minimal">
-                    </div>
-                    <div class="p-4 bg-gray-50 rounded-lg border">
-                        <p class="text-[10px] font-bold text-red-600 mb-2 uppercase">Account 2 (Secondary)</p>
-                        <input type="password" id="key2" placeholder="API Key" class="input-minimal mb-2">
-                        <input type="password" id="sec2" placeholder="Secret Key" class="input-minimal">
-                    </div>
-                    <button onclick="saveKeys()" class="btn-black">Update Hedge Keys</button>
-                    <button onclick="nav('dashboard')" class="w-full text-sm mt-4 text-gray-400">Cancel</button>
-                </div>
-            </div>
-        </section>
-    </main>
+        </div>
+    </div>
 
     <script>
         let token = localStorage.getItem('token');
-        async function api(path, method='GET', body=null) {
-            const res = await fetch(path, { method, headers: {'Content-Type': 'application/json', 'Authorization': token}, body: body?JSON.stringify(body):null });
-            return res.json();
-        }
-        function nav(id) { document.querySelectorAll('.view-section').forEach(s=>s.classList.remove('active-view')); document.getElementById('view-'+id).classList.add('active-view'); }
-        async function login() { 
-            const email = document.getElementById('email').value;
-            const password = document.getElementById('pass').value;
-            const res = await fetch('/api/auth/login', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ email, password }) });
-            const data = await res.json();
-            if(data.token) { localStorage.setItem('token',data.token); location.reload(); } else { alert(data.error); }
+        async function login() {
+            const res = await fetch('/api/auth/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email:document.getElementById('email').value, password:document.getElementById('pass').value}) });
+            const d = await res.json();
+            if(d.token) { localStorage.setItem('token', d.token); location.reload(); }
         }
         function logout() { localStorage.removeItem('token'); location.reload(); }
-        async function startHedge() { await api('/api/start-hedge'); }
-        async function saveKeys() {
-            await api('/api/user/keys', 'POST', { apiKey: document.getElementById('key1').value, apiSecret: document.getElementById('sec1').value, apiKey2: document.getElementById('key2').value, apiSecret2: document.getElementById('sec2').value, liveTradingEnabled: document.getElementById('liveTrade').checked });
-            alert('Saved'); nav('dashboard');
-        }
-        async function saveConfig() {
-            await api('/api/user/config', 'POST', { takeProfitPct: parseFloat(document.getElementById('s-tp').value), dcaRoiThresholdPct: parseFloat(document.getElementById('s-dca-t').value), dcaMultiplier: parseFloat(document.getElementById('s-dca-m').value), baseContracts: parseInt(document.getElementById('s-base').value) });
-            alert('Saved');
-        }
-        async function closeAll() { if(confirm('Emergency Stop?')) await api('/api/close-all'); }
-        
-        if(token) {
-            document.getElementById('nav-private').classList.remove('hidden'); nav('dashboard');
-            setInterval(async () => {
-                const d = await api('/api/data');
-                document.getElementById('bal1').innerText = '$'+(d.balances?.longAcc || 0).toFixed(2);
-                document.getElementById('bal2').innerText = '$'+(d.balances?.shortAcc || 0).toFixed(2);
-                document.getElementById('roi1').innerText = (d.activeLong?.exchangeROI || 0).toFixed(2)+'%';
-                document.getElementById('roi2').innerText = (d.activeShort?.exchangeROI || 0).toFixed(2)+'%';
-                document.getElementById('vol1').innerText = d.activeLong?.contracts || 0;
-                document.getElementById('vol2').innerText = d.activeShort?.contracts || 0;
-                
-                const h = document.getElementById('history'); h.innerHTML = '';
-                d.metrics.trades.forEach(t => {
-                    h.innerHTML += '<tr class="border-b"><td class="py-3 '+(t.side==='long'?'text-green-600':'text-red-600')+' font-bold">'+t.side.toUpperCase()+'</td><td class="text-xs text-gray-400 uppercase">'+t.exitReason+'</td><td>'+t.contracts+'</td><td class="text-right font-bold '+(t.netPnl>=0?'text-green-600':'text-red-600')+'">$'+t.netPnl.toFixed(2)+'</td></tr>';
-                });
 
-                if(!document.getElementById('s-tp').value) {
-                    document.getElementById('s-tp').value = d.config.takeProfitPct; document.getElementById('s-dca-t').value = d.config.dcaRoiThresholdPct;
-                    document.getElementById('s-dca-m').value = d.config.dcaMultiplier; document.getElementById('s-base').value = d.config.baseContracts;
-                    document.getElementById('liveTrade').checked = d.liveTradingEnabled;
+        async function openHedge() { await fetch('/api/open-hedge', { headers:{'Authorization':token} }); }
+        async function closeAll() { await fetch('/api/close-all', { headers:{'Authorization':token} }); }
+        
+        async function saveConfig() {
+            const body = { 
+                takeProfitPct: parseFloat(document.getElementById('cfg-tp').value),
+                stopLossPct: parseFloat(document.getElementById('cfg-sl').value),
+                dcaRoiThresholdPct: parseFloat(document.getElementById('cfg-dca-t').value),
+                dcaMultiplier: parseFloat(document.getElementById('cfg-dca-m').value)
+            };
+            await fetch('/api/user/config', { method:'POST', headers:{'Content-Type':'application/json','Authorization':token}, body:JSON.stringify(body) });
+            alert('Config Saved');
+        }
+
+        if(token) {
+            document.getElementById('auth').classList.add('hidden');
+            document.getElementById('dash').classList.remove('hidden');
+            setInterval(async () => {
+                const res = await fetch('/api/data', { headers:{'Authorization':token} });
+                const d = await res.json();
+                
+                document.getElementById('l-bal').innerText = '$' + d.balances.long.toFixed(2);
+                document.getElementById('s-bal').innerText = '$' + d.balances.short.toFixed(2);
+                document.getElementById('l-roi').innerText = d.live.long.roi.toFixed(2) + '%';
+                document.getElementById('s-roi').innerText = d.live.short.roi.toFixed(2) + '%';
+                document.getElementById('l-vol').innerText = d.live.long.contracts;
+                document.getElementById('s-vol').innerText = d.live.short.contracts;
+
+                if(!document.getElementById('cfg-tp').value) {
+                    document.getElementById('cfg-tp').value = d.config.takeProfitPct;
+                    document.getElementById('cfg-sl').value = d.config.stopLossPct;
+                    document.getElementById('cfg-dca-t').value = d.config.dcaRoiThresholdPct;
+                    document.getElementById('cfg-dca-m').value = d.config.dcaMultiplier;
                 }
-            }, 1000);
+
+                const logDiv = document.getElementById('logs');
+                logDiv.innerHTML = d.trades.map(t => \`<div class="border-b pb-1">\${t.side.toUpperCase()} | \${t.exitReason} | \${t.contracts} contracts</div>\`).join('');
+            }, 2000);
         }
     </script>
 </body>
 </html>
 `)});
 
-app.listen(CUSTOM_PORT, async () => { await masterLoop(); console.log('Hedge Server Online'); });
+app.listen(process.env.PORT || 3000, async () => { await masterLoop(); console.log('Hedge DCA Server Online'); });
