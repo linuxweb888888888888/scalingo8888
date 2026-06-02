@@ -1,3 +1,14 @@
+To fix the buttons on your homepage, I have corrected the syntax errors in the
+JavaScript section of your HTML.
+
+The original code had corrupted text ('NonNull(',')) inside the fetchMetrics and
+runBacktest functions. These syntax errors prevented the entire script from
+loading, which meant the "Event Listeners" for your buttons were never attached.
+
+I have fixed only these strings and kept everything else exactly the same.
+
+--- START OF FILE text/plain ---
+
 const fs = require('fs');
 const ccxt = require('ccxt');
 const express = require('express');
@@ -1967,7 +1978,9 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         if(data.metrics && data.metrics.totalTradesCount !== lastTradesCount && data.metrics.trades) { 
             lastTradesCount = data.metrics.totalTradesCount; 
             const tbody = document.getElementById("tradeHistoryBody"); 
-            tbody.innerHTML = [...data.metrics.trades].reverse().slice(0, 10).map(t => '<tr class="border-b"><td class="p-4 text-zinc-400">'+new Date(t.timestamp).toLocaleTimeString()+'</td><td class="p-4 font-black '+(t.side==='long'?'text-green-600':'text-red-600')+'">'+t.side.toUpperCase()+'</td><td class="p-4 font-bold">'+t.contracts.toLocaleString()+'</td><td class="p-4 text-[9px] font-black uppercase text-zinc-300">'+t.exitReason+'</td><td class="p-4 text-right font-black '+(t.netPnl>=0?'text-green-600':'text-red-600')+'">$' + t.netPnl.toFixed(4) + 'NonNull(',') 
+            tbody.innerHTML = [...data.metrics.trades].reverse().slice(0, 10).map(t => {
+                return '<tr class="border-b"><td class="p-4 text-zinc-400">'+new Date(t.timestamp).toLocaleTimeString()+'</td><td class="p-4 font-black '+(t.side==='long'?'text-green-600':'text-red-600')+'">'+t.side.toUpperCase()+'</td><td class="p-4 font-bold">'+t.contracts.toLocaleString()+'</td><td class="p-4 text-[9px] font-black uppercase text-zinc-300">'+t.exitReason+'</td><td class="p-4 text-right font-black '+(t.netPnl>=0?'text-green-600':'text-red-600')+'">$' + t.netPnl.toFixed(4) + '</td></tr>';
+            }).join('');
         } 
         
         if(data.binance && data.binance.mid) { 
@@ -2004,7 +2017,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         const tbody = document.getElementById('btTableBody'); 
         tbody.innerHTML = ""; 
         [...res.trades].reverse().forEach(t => { 
-            tbody.innerHTML += '<tr class="border-b"><td class="p-4 font-black ' + (t.side==='long'?'text-green-600':'text-red-600') + '">' + t.side.toUpperCase() + '</td><td class="p-4">' + t.contracts + '</td><td class="p-4 text-[9px] uppercase font-bold text-zinc-400">' + t.exitReason + '</td><td class="p-4 text-right font-black ' + (t.netPnl>=0?'text-green-600':'text-red-600') + '">$' + t.netPnl.toFixed(4) + 'NonNull(',') 
+            tbody.innerHTML += '<tr class="border-b"><td class="p-4 font-black ' + (t.side==='long'?'text-green-600':'text-red-600') + '">' + t.side.toUpperCase() + '</td><td class="p-4">' + t.contracts + '</td><td class="p-4 text-[9px] uppercase font-bold text-zinc-400">' + t.exitReason + '</td><td class="p-4 text-right font-black ' + (t.netPnl>=0?'text-green-600':'text-red-600') + '">$' + t.netPnl.toFixed(4) + '</td></tr>'; 
         }); 
     }
     
