@@ -26,7 +26,7 @@ const TradeModel = mongoose.model('TradeLog_V4', new mongoose.Schema({
 
 const BASE_CONFIG = {
     htxSymbol: 'SHIB/USDT:USDT', binanceSymbol: '1000SHIB/USDT:USDT', 
-    leverage: 75, baseContracts: 100, takeProfitPct: 5.0, stopLossPct: -50.0, dcaRoiThresholdPct: -10.0, dcaMultiplier: 1.5, maxContracts: 50000
+    leverage: 75, baseContracts: 1, takeProfitPct: 5.0, stopLossPct: -50.0, dcaRoiThresholdPct: -10.0, dcaMultiplier: 1.5, maxContracts: 50000
 };
 
 const globalMarketData = { binance: { mid: 0 } };
@@ -41,7 +41,6 @@ async function authMiddleware(req, res, next) {
     const user = await UserModel.findOne({ token });
     if (!user) return res.status(401).json({ error: 'Unauthorized' });
     req.user = user;
-    // CRASH FIX: Ensure worker exists before proceeding
     if (!workers.has(user._id.toString())) {
         const w = new UserTradeInstance(user); w.startSync(); workers.set(user._id.toString(), w);
     }
@@ -63,7 +62,7 @@ class UserTradeInstance {
 
     applyUserKeys(user) {
         this.liveTradingEnabled = user.liveTradingEnabled;
-        const opt = { agent: keepAliveAgent, options: { defaultType: 'swap' } }; // Simplified options
+        const opt = { agent: keepAliveAgent, options: { defaultType: 'swap' } };
         this.htxLong = new ccxt.htx({ apiKey: user.apiKey, secret: user.apiSecret, ...opt });
         this.htxShort = new ccxt.htx({ apiKey: user.apiKey2, secret: user.apiSecret2, ...opt });
     }
@@ -72,12 +71,21 @@ class UserTradeInstance {
 
     async openHedge() {
         if (this.isTrading) return; this.isTrading = true;
-        this.addLog("Opening Normal Positions...");
+        this.addLog("Opening Optimal Hedge...");
         try {
+            if (this.liveTradingEnabled) {
+                // Step 1: Force Leverage (HTX requires this to sync before order)
+                await Promise.all([
+                    this.htxLong.setLeverage(this.config.leverage, this.config.htxSymbol).catch(() => {}),
+                    this.htxShort.setLeverage(this.config.leverage, this.config.htxSymbol).catch(() => {})
+                ]);
+            }
+            // Step 2: Open both sides with Hedge-specific parameters
             await this.executeOrder('long', 'buy', this.config.baseContracts);
             await this.executeOrder('short', 'sell', this.config.baseContracts);
+            
             await UserModel.updateOne({ _id: this.userId }, { $set: { activePositions: this.activePositions } });
-        } catch(e) { this.addLog("Error: " + e.message); }
+        } catch(e) { this.addLog("Hedge Failed: " + e.message); }
         this.isTrading = false;
     }
 
@@ -85,20 +93,23 @@ class UserTradeInstance {
         if (!this.liveTradingEnabled) return;
         const ex = side === 'long' ? this.htxLong : this.htxShort;
         try {
-            // HTX Hedge Mode requires 'pos_side' and 'offset'
+            // FIX for 1499: Explicitly define hedge parameters
             const params = {
-                'pos_side': side, // 'long' or 'short'
-                'offset': 'open'
+                'pos_side': side, // must be 'long' or 'short'
+                'offset': 'open'  // must be 'open'
             };
-            await ex.createMarketOrder(this.config.htxSymbol, type, qty, params);
-            this.addLog(`Order Sent: ${side} ${type}`);
             
-            if (!this.activePositions.find(p => p.side === side)) {
-                this.activePositions.push({ side, contracts: qty });
-            } else {
-                this.activePositions.find(p => p.side === side).contracts += qty;
-            }
-        } catch(e) { this.addLog(`${side} Failed: ${e.message}`); throw e; }
+            // Market orders on HTX Hedge mode
+            await ex.createOrder(this.config.htxSymbol, 'market', type, qty, undefined, params);
+            this.addLog(`Success: ${side.toUpperCase()} ${type}`);
+            
+            const existing = this.activePositions.find(p => p.side === side);
+            if (existing) { existing.contracts += qty; } else { this.activePositions.push({ side, contracts: qty }); }
+        } catch(e) { 
+            this.addLog(`${side} Error: ${e.message}`); 
+            if (e.message.includes('insufficient')) this.addLog("TIP: Check Min Notional ($5+)");
+            throw e; 
+        }
     }
 
     async checkDCAAndExits() {
@@ -122,7 +133,8 @@ class UserTradeInstance {
             const pos = this.activePositions.find(p => p.side === side);
             if (pos && this.liveTradingEnabled) {
                 const params = { 'pos_side': side, 'offset': 'close' };
-                await ex.createMarketOrder(this.config.htxSymbol, side === 'long' ? 'sell' : 'buy', pos.contracts, params);
+                const type = side === 'long' ? 'sell' : 'buy';
+                await ex.createOrder(this.config.htxSymbol, 'market', type, pos.contracts, undefined, params);
                 this.addLog(`Closed ${side} (${reason})`);
             }
             this.activePositions = this.activePositions.filter(p => p.side !== side);
@@ -194,7 +206,7 @@ app.get('/', (req, res) => { res.send(`
 <body class="p-8">
     <div id="auth" class="max-w-sm mx-auto mt-20 card border p-6"><h2 class="text-xl font-bold mb-4">Hedge Login</h2><input id="email" placeholder="Email" class="input mb-2"><input id="pass" type="password" placeholder="Password" class="input mb-4"><button onclick="login()" class="w-full bg-black text-white p-3 rounded-lg font-bold">Enter Terminal</button></div>
     <div id="dash" class="hidden max-w-6xl mx-auto">
-        <div class="flex justify-between items-center mb-8"><h1 class="text-2xl font-bold">Hedge Terminal</h1><div class="flex gap-4"><button onclick="openHedge()" class="bg-blue-600 text-white px-6 py-2 rounded-lg font-bold text-sm">Open Positions</button><button onclick="closeAll()" class="bg-red-500 text-white px-6 py-2 rounded-lg font-bold text-sm">Close All</button></div></div>
+        <div class="flex justify-between items-center mb-8"><h1 class="text-2xl font-bold">Hedge Terminal</h1><div class="flex gap-4"><button onclick="openHedge()" class="bg-blue-600 text-white px-6 py-2 rounded-lg font-bold text-sm">Open Optimal Hedge</button><button onclick="closeAll()" class="bg-red-500 text-white px-6 py-2 rounded-lg font-bold text-sm">Close All</button></div></div>
         <div class="grid grid-cols-2 gap-6 mb-6">
             <div class="card border"><div class="flex justify-between"><p class="label">Long Account</p><span id="l-stat" class="text-[10px] font-bold px-2 rounded bg-gray-100"></span></div><p id="l-bal" class="text-2xl font-bold">$0.00</p><p id="l-roi" class="text-lg font-semibold text-green-500">0.00%</p><p class="label mt-2">Volume: <span id="l-vol">0</span></p></div>
             <div class="card border"><div class="flex justify-between"><p class="label">Short Account</p><span id="s-stat" class="text-[10px] font-bold px-2 rounded bg-gray-100"></span></div><p id="s-bal" class="text-2xl font-bold">$0.00</p><p id="s-roi" class="text-lg font-semibold text-red-500">0.00%</p><p class="label mt-2">Volume: <span id="s-vol">0</span></p></div>
@@ -214,7 +226,7 @@ app.get('/', (req, res) => { res.send(`
                 </div>
                 <button onclick="saveConfig()" class="mt-4 w-full bg-gray-100 p-2 rounded font-bold text-sm">Save Strategy</button>
             </div>
-            <div class="card border"><h3 class="font-bold mb-4 border-b pb-2 text-sm">Exchange Logs</h3><div id="logs" class="text-[10px] space-y-1 font-mono text-gray-600"></div></div>
+            <div class="card border"><h3 class="font-bold mb-4 border-b pb-2 text-sm">Activity Logs</h3><div id="logs" class="text-[10px] space-y-1 font-mono text-gray-500"></div></div>
         </div>
     </div>
     <script>
