@@ -26,11 +26,11 @@ const UserModel = mongoose.model('User_V3', new mongoose.Schema({
     config: { type: Object, default: {} },
     activePosition: { type: Object, default: null }, 
     lastCloseTime: { type: Number, default: 0 },
-    // DGR Cycle Tracking Fields
     activeCycle: { type: Object, default: null },
     isWaitingForNextCycle: { type: Boolean, default: false },
     nextCycleStartTime: { type: Number, default: 0 },
-    cycleHistory: { type: Array, default: [] }
+    cycleHistory: { type: Array, default: [] },
+    paperBalance: { type: Number, default: 1000 }
 }));
 
 const TradeModel = mongoose.model('TradeLog_V3', new mongoose.Schema({
@@ -201,7 +201,7 @@ class PerformanceMetrics {
     updateMaxMargin(margin) { if (margin > this.maxMarginUsed) this.maxMarginUsed = margin; }
 }
 
-// ==================== DGR CYCLE TRACKING ====================
+// ==================== DGR CYCLE TRACKING WITH AUTO-ADJUST ====================
 class GrowthCycleManager {
     constructor(userId) {
         this.userId = userId;
@@ -223,7 +223,34 @@ class GrowthCycleManager {
         }
     }
     
-    async startNewCycle(targetGrowthPct, targetTimeUnit, targetValue, startBalance) {
+    calculateRequiredPositionForTarget(targetGrowthPct, targetTimeRemainingMs, currentBalance, currentPrice, leverage, contractSize, maxContracts) {
+        const targetProfit = (currentBalance * targetGrowthPct) / 100;
+        const contractValue = contractSize * currentPrice;
+        
+        // Each 1% price move gives leverage% ROI
+        const requiredMovePct = targetGrowthPct / leverage;
+        const requiredProfitPerContract = contractValue * (requiredMovePct / 100);
+        let requiredContracts = Math.ceil(targetProfit / requiredProfitPerContract);
+        
+        // Time adjustment factor
+        const targetHours = targetTimeRemainingMs / (1000 * 60 * 60);
+        const timeMultiplier = Math.max(0.5, Math.min(3, 24 / Math.max(1, targetHours)));
+        requiredContracts = Math.ceil(requiredContracts * timeMultiplier);
+        
+        // Apply max contracts limit
+        requiredContracts = Math.min(requiredContracts, maxContracts || 100);
+        requiredContracts = Math.max(1, requiredContracts);
+        
+        return {
+            requiredContracts: requiredContracts,
+            requiredMovePct: requiredMovePct,
+            targetProfit: targetProfit,
+            recommendedTpPct: requiredMovePct * 100,
+            timeMultiplier: timeMultiplier
+        };
+    }
+    
+    async startNewCycle(targetGrowthPct, targetTimeUnit, targetValue, startBalance, currentPrice, leverage, contractSize, maxContracts, currentConfig) {
         const now = Date.now();
         let durationMs = 0;
         
@@ -241,9 +268,14 @@ class GrowthCycleManager {
             default: durationMs = 86400000;
         }
         
+        // Calculate required position size
+        const required = this.calculateRequiredPositionForTarget(
+            targetGrowthPct, durationMs, startBalance, currentPrice, 
+            leverage, contractSize, maxContracts
+        );
+        
         const targetAmountUsd = (startBalance * targetGrowthPct) / 100;
-        const shibPrice = globalMarketData.binance.mid || 0.00001;
-        const targetAmountShib = targetAmountUsd / shibPrice;
+        const targetAmountShib = targetAmountUsd / currentPrice;
         
         this.activeCycle = {
             id: Date.now(),
@@ -255,6 +287,9 @@ class GrowthCycleManager {
             targetAmountShib: targetAmountShib,
             targetTimeUnit: targetTimeUnit,
             targetValue: targetValue,
+            requiredContracts: required.requiredContracts,
+            requiredMovePct: required.requiredMovePct,
+            recommendedTpPct: required.recommendedTpPct,
             achievedGrowthPct: 0,
             achievedAmountUsd: 0,
             achievedAmountShib: 0,
@@ -264,17 +299,17 @@ class GrowthCycleManager {
         
         this.isWaitingForNextCycle = false;
         await this.saveState();
-        return this.activeCycle;
+        
+        return { cycle: this.activeCycle, requiredConfig: required };
     }
     
-    async checkCycleCompletion(currentBalance) {
+    async checkCycleCompletion(currentBalance, currentPrice) {
         if (!this.activeCycle || this.activeCycle.status !== 'active') return false;
         
         const now = Date.now();
         const currentGrowthPct = ((currentBalance - this.activeCycle.startBalance) / this.activeCycle.startBalance) * 100;
         const currentGrowthUsd = currentBalance - this.activeCycle.startBalance;
-        const shibPrice = globalMarketData.binance.mid || 0.00001;
-        const currentGrowthShib = currentGrowthUsd / shibPrice;
+        const currentGrowthShib = currentGrowthUsd / currentPrice;
         
         if (currentGrowthPct >= this.activeCycle.targetGrowthPct) {
             this.activeCycle.achievedGrowthPct = currentGrowthPct;
@@ -290,7 +325,7 @@ class GrowthCycleManager {
             this.nextCycleStartTime = now + (this.activeCycle.endTime - this.activeCycle.startTime);
             
             await this.saveState();
-            return true;
+            return { completed: true, achieved: true, cycle: this.activeCycle };
         }
         
         if (now > this.activeCycle.endTime && currentGrowthPct < this.activeCycle.targetGrowthPct) {
@@ -307,10 +342,27 @@ class GrowthCycleManager {
             this.nextCycleStartTime = now + (this.activeCycle.endTime - this.activeCycle.startTime);
             
             await this.saveState();
-            return false;
+            return { completed: true, achieved: false, cycle: this.activeCycle };
         }
         
-        return false;
+        // Check if we need to adjust strategy mid-cycle
+        const timeElapsed = now - this.activeCycle.startTime;
+        const totalDuration = this.activeCycle.endTime - this.activeCycle.startTime;
+        const timeProgress = (timeElapsed / totalDuration) * 100;
+        const growthProgress = (currentGrowthPct / this.activeCycle.targetGrowthPct) * 100;
+        
+        let needsAdjustment = false;
+        let adjustmentReason = null;
+        
+        if (growthProgress < timeProgress - 30 && timeProgress > 10) {
+            needsAdjustment = true;
+            adjustmentReason = "behind_schedule";
+        } else if (growthProgress > timeProgress + 30 && growthProgress > 80) {
+            needsAdjustment = true;
+            adjustmentReason = "ahead_schedule";
+        }
+        
+        return { completed: false, needsAdjustment, adjustmentReason, timeProgress, growthProgress };
     }
     
     async shouldAllowTrading() {
@@ -326,20 +378,27 @@ class GrowthCycleManager {
         return true;
     }
     
-    async getCycleStatus(currentBalance) {
+    async getCycleStatus(currentBalance, currentPrice) {
         if (this.activeCycle && this.activeCycle.status === 'active') {
             const now = Date.now();
             const timeRemaining = Math.max(0, this.activeCycle.endTime - now);
             const currentGrowthPct = ((currentBalance - this.activeCycle.startBalance) / this.activeCycle.startBalance) * 100;
             const currentGrowthUsd = currentBalance - this.activeCycle.startBalance;
-            const shibPrice = globalMarketData.binance.mid || 0.00001;
-            const currentGrowthShib = currentGrowthUsd / shibPrice;
+            const currentGrowthShib = currentGrowthUsd / currentPrice;
+            
+            const timeElapsed = now - this.activeCycle.startTime;
+            const totalDuration = this.activeCycle.endTime - this.activeCycle.startTime;
+            const timeProgress = (timeElapsed / totalDuration) * 100;
+            const growthProgress = (currentGrowthPct / this.activeCycle.targetGrowthPct) * 100;
             
             return {
                 hasActiveCycle: true,
                 targetGrowthPct: this.activeCycle.targetGrowthPct,
                 targetAmountUsd: this.activeCycle.targetAmountUsd,
                 targetAmountShib: this.activeCycle.targetAmountShib,
+                requiredContracts: this.activeCycle.requiredContracts,
+                requiredMovePct: this.activeCycle.requiredMovePct,
+                recommendedTpPct: this.activeCycle.recommendedTpPct,
                 currentGrowthPct: currentGrowthPct,
                 currentGrowthUsd: currentGrowthUsd,
                 currentGrowthShib: currentGrowthShib,
@@ -348,6 +407,8 @@ class GrowthCycleManager {
                 remainingShibToTarget: Math.max(0, this.activeCycle.targetAmountShib - currentGrowthShib),
                 timeRemainingMs: timeRemaining,
                 timeRemainingFormatted: this.formatTime(timeRemaining),
+                timeProgress: timeProgress,
+                growthProgress: growthProgress,
                 startBalance: this.activeCycle.startBalance,
                 endTime: this.activeCycle.endTime,
                 status: 'active'
@@ -584,7 +645,7 @@ class UserTradeInstance {
         this.currentMl = { confidence: 0, type: 'flat', rawValue: 0.5 };
         this.mlRawBuffer = [];
         this.lastEvalPrice = 0;
-        this.walletBalance = 0;
+        this.walletBalance = user.paperBalance || 1000;
 
         this.cycleManager = new GrowthCycleManager(this.userId);
         
@@ -614,12 +675,24 @@ class UserTradeInstance {
         if (this.activePositions.length > 0) this.metrics.updateMaxMargin(this.activePositions[0].marginUsed);
         await this.connectExchange();
         this.startExchangeROISync();
+        
+        // Initialize paper trading balance if zero
+        if (!this.liveTradingEnabled && this.walletBalance === 0) {
+            this.walletBalance = 1000;
+            await UserModel.updateOne({ _id: this.userId }, { $set: { paperBalance: 1000 } });
+            console.log(`[${this.userId}] Paper trading initialized with $1000 balance`);
+        }
     }
 
     async saveState() {
         await UserModel.updateOne(
             { _id: this.userId },
-            { $set: { activePosition: this.activePositions.length > 0 ? this.activePositions[0] : null, lastCloseTime: this.lastCloseTime, config: this.config } }
+            { $set: { 
+                activePosition: this.activePositions.length > 0 ? this.activePositions[0] : null, 
+                lastCloseTime: this.lastCloseTime, 
+                config: this.config,
+                paperBalance: this.walletBalance
+            } }
         );
         const cacheEntry = tokenCache.get(this.userId);
         if(cacheEntry) cacheEntry.user.activePosition = this.activePositions.length > 0 ? this.activePositions[0] : null; 
@@ -730,10 +803,16 @@ class UserTradeInstance {
             
             if (effectiveRoi >= this.config.takeProfitPct) {
                 await this.forceClosePosition("TAKE_PROFIT");
-                await this.cycleManager.checkCycleCompletion(this.walletBalance);
+                const checkResult = await this.cycleManager.checkCycleCompletion(this.walletBalance, globalMarketData.binance.mid || 0.00001);
+                if (checkResult.completed) {
+                    console.log(`[${this.userId}] Cycle ${checkResult.achieved ? 'ACHIEVED' : 'FAILED'}!`);
+                }
             } else if (effectiveRoi <= this.config.stopLossPct) {
                 await this.forceClosePosition("STOP_LOSS");
-                await this.cycleManager.checkCycleCompletion(this.walletBalance);
+                const checkResult = await this.cycleManager.checkCycleCompletion(this.walletBalance, globalMarketData.binance.mid || 0.00001);
+                if (checkResult.completed) {
+                    console.log(`[${this.userId}] Cycle ${checkResult.achieved ? 'ACHIEVED' : 'FAILED'}!`);
+                }
             } else {
                 const requiredRoiForDca = -(Math.abs(this.config.dcaRoiThresholdPct || 1.0));
                 const profitScaleThreshold = this.config.profitRoiThresholdPct !== undefined ? this.config.profitRoiThresholdPct : 2.0;
@@ -743,6 +822,22 @@ class UserTradeInstance {
                 } 
                 else if (effectiveRoi >= profitScaleThreshold && Date.now() - (pos.lastDcaTime || 0) > 10000) {
                     await this.addDcaPosition(true);
+                }
+                
+                // Check if we need to adjust strategy mid-cycle
+                const cycleCheck = await this.cycleManager.checkCycleCompletion(this.walletBalance, globalMarketData.binance.mid || 0.00001);
+                if (cycleCheck.needsAdjustment && cycleCheck.adjustmentReason === "behind_schedule") {
+                    // Behind schedule - increase position size
+                    const newMultiplier = Math.min(3, this.config.dcaMultiplier * 1.2);
+                    this.config.dcaMultiplier = newMultiplier;
+                    console.log(`[${this.userId}] Behind schedule! Increasing DCA multiplier to ${newMultiplier}`);
+                    await this.saveState();
+                } else if (cycleCheck.needsAdjustment && cycleCheck.adjustmentReason === "ahead_schedule") {
+                    // Ahead of schedule - reduce risk
+                    const newTp = Math.max(1, this.config.takeProfitPct * 0.8);
+                    this.config.takeProfitPct = newTp;
+                    console.log(`[${this.userId}] Ahead of schedule! Reducing TP to ${newTp}%`);
+                    await this.saveState();
                 }
             }
         } catch (e) {
@@ -834,7 +929,14 @@ class UserTradeInstance {
             
             let baseC = Number(this.walletBalance) * 1000;
             if (isNaN(baseC) || baseC < 1) baseC = 1;
-            const contracts = parseInt(Math.max(1, Math.floor(baseC)), 10);
+            
+            // Check if we have an active cycle with required contracts
+            let contracts = parseInt(Math.max(1, Math.floor(baseC)), 10);
+            const cycleStatus = await this.cycleManager.getCycleStatus(this.walletBalance, globalMarketData.binance.mid || 0.00001);
+            if (cycleStatus.hasActiveCycle && cycleStatus.requiredContracts) {
+                contracts = cycleStatus.requiredContracts;
+                console.log(`[${this.userId}] Using cycle-adjusted contracts: ${contracts} (required for ${cycleStatus.targetGrowthPct}% target)`);
+            }
             
             let executionPrice = targetSide === 'long' ? globalMarketData.binance.ask : globalMarketData.binance.bid;
             if (!executionPrice) executionPrice = globalMarketData.binance.mid;
@@ -857,7 +959,7 @@ class UserTradeInstance {
             
             this.metrics.updateMaxMargin(marginUsed); 
             await this.saveState();
-            console.log(`[User ${this.userId}] ${isPaper?'Paper':'LIVE'} OPEN: ${targetSide.toUpperCase()} at $${executionPrice}`);
+            console.log(`[User ${this.userId}] ${isPaper?'Paper':'LIVE'} OPEN: ${targetSide.toUpperCase()} at $${executionPrice} (${contracts} contracts)`);
         } catch (err) { 
             console.error(`🚨 [Open Error - User ${this.userId}]:`, err.message); this.activePositions = []; 
         } finally { this.isTrading = false; }
@@ -891,6 +993,12 @@ class UserTradeInstance {
                 marginUsed: math.margin, grossPnl: math.grossPnlUsd, grossRoiPct: math.grossRoiPct, netPnl: math.netPnlUsd, roiPct: math.netRoiPct, feeCost: math.feeCost, exitReason: reason 
             });
             
+            // Update wallet balance after closing
+            if (!this.liveTradingEnabled || snapPos.isPaper) {
+                this.walletBalance += math.netPnlUsd;
+                await this.saveState();
+            }
+            
             this.lastCloseTime = Date.now(); await this.saveState();
             console.log(`[User ${this.userId}] ${snapPos.isPaper?'Paper':'LIVE'} CLOSED: ${reason}`);
         } catch (err) {
@@ -900,11 +1008,17 @@ class UserTradeInstance {
     
     startExchangeROISync() {
         setInterval(async () => {
+            // Initialize paper balance if needed
+            if (!this.liveTradingEnabled && this.walletBalance === 0) {
+                this.walletBalance = 1000;
+                await this.saveState();
+            }
+            
             if (this.activePositions.length === 0 || this.isTrading) {
                 if (this.liveTradingEnabled) {
                     try {
                         const bal = await this.htx.fetchBalance({ type: 'swap' });
-                        this.walletBalance = (bal.total && bal.total.USDT) ? bal.total.USDT : 0;
+                        this.walletBalance = (bal.total && bal.total.USDT) ? bal.total.USDT : 1000;
                     } catch(e){}
                 }
                 return;
@@ -914,7 +1028,7 @@ class UserTradeInstance {
             if (this.liveTradingEnabled && !pos.isPaper) {
                 try {
                     const bal = await this.htx.fetchBalance({ type: 'swap' });
-                    this.walletBalance = (bal.total && bal.total.USDT) ? bal.total.USDT : 0;
+                    this.walletBalance = (bal.total && bal.total.USDT) ? bal.total.USDT : 1000;
                     const positions = await this.htx.fetchPositions([this.config.htxSymbol]);
                     const openPos = positions.find(p => p.contracts > 0);
                     
@@ -943,6 +1057,12 @@ class UserTradeInstance {
                 
                 pos.exchangeROI = pnlPercent * FORCED_LEVERAGE;
                 pos.exchangePnl = (pos.exchangeROI / 100) * pos.marginUsed; 
+                
+                // Update paper wallet balance in real-time
+                if (!this.liveTradingEnabled || pos.isPaper) {
+                    const unrealizedPnl = pos.exchangePnl;
+                    // Don't update wallet balance until closed, just for display
+                }
             }
         }, 1000);
     }
@@ -956,11 +1076,28 @@ class UserTradeInstance {
     }
     
     async getCycleStatus() {
-        return await this.cycleManager.getCycleStatus(this.walletBalance);
+        return await this.cycleManager.getCycleStatus(this.walletBalance, globalMarketData.binance.mid || 0.00001);
     }
     
     async startCycle(targetGrowthPct, targetTimeUnit, targetValue) {
-        return await this.cycleManager.startNewCycle(targetGrowthPct, targetTimeUnit, targetValue, this.walletBalance);
+        const result = await this.cycleManager.startNewCycle(
+            targetGrowthPct, targetTimeUnit, targetValue, this.walletBalance,
+            globalMarketData.binance.mid || 0.00001,
+            FORCED_LEVERAGE,
+            this.config.contractSize,
+            this.config.maxContracts,
+            this.config
+        );
+        
+        // Auto-adjust strategy based on required position
+        if (result.requiredConfig) {
+            this.config.takeProfitPct = result.requiredConfig.recommendedTpPct;
+            this.config.baseContracts = result.requiredConfig.requiredContracts;
+            await this.saveState();
+            console.log(`[${this.userId}] Auto-adjusted: TP=${this.config.takeProfitPct}%, BaseContracts=${this.config.baseContracts}`);
+        }
+        
+        return result.cycle;
     }
 }
 
@@ -1127,7 +1264,7 @@ app.post('/api/auth/register', async (req, res) => {
         if(await UserModel.findOne({ email })) return res.status(400).json({ error: 'Email already exists' });
         
         const salt = crypto.randomBytes(16).toString('hex');
-        const user = await UserModel.create({ name, email, passwordHash: hashPassword(password, salt), salt, token: generateToken() });
+        const user = await UserModel.create({ name, email, passwordHash: hashPassword(password, salt), salt, token: generateToken(), paperBalance: 1000 });
         
         const worker = new UserTradeInstance(user);
         await worker.initialize();
@@ -1245,13 +1382,13 @@ app.get('/api/close-all', authMiddleware, async (req, res) => {
     res.json({status: 'ok'}); 
 });
 
-// ==================== FRONTEND UI ====================
+// ==================== FRONTEND UI (SAME AS BEFORE WITH DGR CARDS) ====================
 app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 <html lang="en" class="scroll-smooth">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>TradeBotPille | SHIB AI Engine</title>
+    <title>TradeBotPille | SHIB AI Engine with DGR Auto-Adjust</title>
     
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700;900&family=Roboto+Mono:wght@400;700&display=swap" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet" />
@@ -1279,13 +1416,12 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         @keyframes fade { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
         .active-view { display: block; }
         
-        #netPnl, #activeRoi, #marginUsed, #activeQty { transition: color 0.3s ease; }
-        
-        /* DGR Cycle Card Styles */
         .cycle-card-active { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
         .cycle-card-achieved { background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); }
         .cycle-card-waiting { background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); }
         .cycle-card-inactive { background: linear-gradient(135deg, #4b5563 0%, #374151 100%); }
+        
+        #netPnl, #activeRoi, #marginUsed, #activeQty { transition: color 0.3s ease; }
     </style>
 </head>
 <body class="antialiased min-h-screen flex flex-col selection:bg-gray-200">
@@ -1330,10 +1466,10 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         <section id="view-home" class="view-section active-view w-full">
             <div class="max-w-5xl mx-auto px-4 pt-24 pb-16 text-center">
                 <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-gray-100 text-xs font-bold uppercase tracking-widest text-gray-600 mb-6 border border-gray-200">
-                    <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span> SHIB ML Probability Strategy
+                    <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span> SHIB ML Probability Strategy with DGR Auto-Adjust
                 </div>
                 <h1 class="text-5xl sm:text-6xl md:text-7xl font-extrabold tracking-tight mb-6 leading-tight">Algorithmic Math.<br><span class="text-gray-400">Zero Emotion.</span></h1>
-                <p class="text-lg md:text-xl text-gray-500 mb-10 max-w-2xl mx-auto leading-relaxed">TradeBot utilizes a dynamically trained logistic regression model, analyzing the rolling tick buffer to predict directional probabilities and executing automatically via HTX 24/7.</p>
+                <p class="text-lg md:text-xl text-gray-500 mb-10 max-w-2xl mx-auto leading-relaxed">TradeBot utilizes a dynamically trained logistic regression model, analyzing the rolling tick buffer to predict directional probabilities and executing automatically via HTX 24/7 with DGR auto-adjustment.</p>
                 <button onclick="nav('register')" class="btn-primary text-base px-10 py-4 shadow-lg shadow-black/20 flex items-center gap-2 mx-auto">
                     Launch Web Terminal <span class="material-symbols-outlined text-[20px]">arrow_forward</span>
                 </button>
@@ -1525,7 +1661,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                                     </tr>
                                 </thead>
                                 <tbody id="btTableBody" class="font-mono text-xs">
-                                    <tr><td colspan="5" class="py-6 text-center text-gray-400 font-sans">No executions triggered.</td></tr>
+                                    <tr><td colspan="5" class="py-6 text-center text-gray-400 font-sans">No executions triggered.eringer</td></td></tr>
                                 </tbody>
                             </table>
                         </div>
@@ -1580,13 +1716,13 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 </div>
             </div>
 
-            <!-- DGR CYCLE STATUS CARD (ADDED) -->
+            <!-- DGR CYCLE STATUS CARD -->
             <div id="cycleStatusCard" class="mb-6 rounded-xl p-6 text-white transition-all duration-300 cycle-card-inactive">
                 <div class="flex justify-between items-start">
                     <div>
                         <h3 class="text-lg font-bold mb-1 flex items-center gap-2">
                             <span class="material-symbols-outlined">trending_up</span> 
-                            DGR Cycle Status
+                            DGR Cycle Status (Auto-Adjust)
                         </h3>
                         <p id="cycleStatusText" class="text-sm opacity-90">No active cycle</p>
                     </div>
@@ -1601,7 +1737,11 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                     <div><span class="opacity-75">Target SHIB:</span> <br><span id="cycleTargetShib" class="font-bold">-</span></div>
                     <div><span class="opacity-75">Time Remaining:</span> <br><span id="cycleTimeRemaining" class="font-bold">-</span></div>
                 </div>
-                <div class="mt-3 pt-2 border-t border-white/20">
+                <div class="mt-2 grid grid-cols-2 gap-3 text-xs border-t border-white/20 pt-2">
+                    <div><span class="opacity-75">Required Contracts:</span> <br><span id="cycleRequiredContracts" class="font-bold">-</span></div>
+                    <div><span class="opacity-75">Adjusted TP:</span> <br><span id="cycleAdjustedTp" class="font-bold">-</span></div>
+                </div>
+                <div class="mt-3 pt-2">
                     <div class="flex justify-between text-xs">
                         <span>Current Growth: <span id="cycleCurrentGrowth" class="font-bold">0%</span></span>
                         <span>Current USDT: <span id="cycleCurrentUsdt" class="font-bold">$0</span></span>
@@ -1610,14 +1750,18 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                     <div class="mt-2 w-full bg-white/20 rounded-full h-2 overflow-hidden">
                         <div id="cycleProgressBar" class="bg-white h-2 rounded-full transition-all duration-500" style="width: 0%"></div>
                     </div>
+                    <div class="flex justify-between text-xs mt-1">
+                        <span>Time Progress: <span id="cycleTimeProgress" class="font-bold">0%</span></span>
+                        <span>Growth Progress: <span id="cycleGrowthProgress" class="font-bold">0%</span></span>
+                    </div>
                 </div>
             </div>
 
-            <!-- DGR CONTROLS CARD (ADDED) -->
+            <!-- DGR CONTROLS CARD -->
             <div class="ui-card p-5 border border-gray-100 mb-6">
                 <h3 class="text-base font-bold mb-3 flex items-center gap-2">
                     <span class="material-symbols-outlined text-[20px] text-gray-500">target</span> 
-                    Set Growth Target Cycle
+                    Set Growth Target Cycle (Auto-Adjusts Strategy)
                 </h3>
                 <div class="grid grid-cols-1 sm:grid-cols-4 gap-3">
                     <div>
@@ -1640,16 +1784,16 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                     </div>
                     <div>
                         <label class="text-xs font-semibold text-gray-500 block mb-1">Growth Rate (%)</label>
-                        <input type="number" id="cycleGrowthRate" class="input-minimal w-full py-2" value="5" step="0.1">
+                        <input type="number" id="cycleGrowthRate" class="input-minimal w-full py-2" value="10" step="0.1">
                     </div>
                     <div class="flex items-end">
                         <button onclick="startNewCycle()" class="btn-primary w-full py-2 text-sm">
-                            Start Cycle
+                            Start Cycle & Auto-Adjust
                         </button>
                     </div>
                 </div>
                 <div class="mt-3 text-xs text-gray-500">
-                    💡 When target is reached, trading stops until next cycle period begins.
+                    💡 When you start a cycle, the bot automatically calculates required contracts and adjusts TP to achieve your target!
                 </div>
             </div>
 
@@ -1839,7 +1983,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                             </tr>
                         </thead>
                         <tbody id="stepHistoryBody" class="font-mono text-xs">
-                            <tr><td colspan="5" class="py-10 text-center text-gray-400 font-sans">No active position data found.</td></tr>
+                            <tr><td colspan="5" class="py-10 text-center text-gray-400 font-sans">No active position data found.eringer</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -1947,16 +2091,17 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             document.getElementById('btResSpan').innerText = res.totalSpan || "-";
 
             const tbody = document.getElementById('btTableBody'); tbody.innerHTML = "";
-            if(!res.trades || res.trades.length === 0) { tbody.innerHTML = '<tr><td colspan="5" class="py-6 text-center text-gray-400 font-sans">No executions triggered.</td></table>'; return; }
+            if(!res.trades || res.trades.length === 0) { tbody.innerHTML = '<tr><td colspan="5" class="py-6 text-center text-gray-400 font-sans">No executions triggered.</td></tr>'; return; }
 
             [...res.trades].reverse().forEach(t => {
                 const grossPnlStr = t.grossPnl !== undefined ? '$' + t.grossPnl.toFixed(4) : '-';
                 tbody.innerHTML += '<tr class="border-b border-gray-50 hover:bg-gray-50">' +
-                    '<td class="py-2 px-2 font-bold ' + (t.side==='long'?'text-green-600':'text-red-600') + '">' + t.side.toUpperCase() + '</tr>' +
+                    '<td class="py-2 px-2 font-bold ' + (t.side==='long'?'text-green-600':'text-red-600') + '">' + t.side.toUpperCase() + '</td>' +
                     '<td class="py-2 px-2">' + t.contracts + '</td>' +
                     '<td class="py-2 px-2 text-[10px] text-gray-400 uppercase tracking-wide">' + t.exitReason + '</td>' +
                     '<td class="py-2 px-2 text-right font-bold ' + (t.grossPnl>=0?'text-green-600':'text-red-600') + '">' + grossPnlStr + '</td>' +
-                    '<td class="py-2 px-2 text-right font-bold ' + (t.netPnl>=0?'text-green-600':'text-red-600') + '">$' + t.netPnl.toFixed(4) + '</td><tr>';
+                    '<td class="py-2 px-2 text-right font-bold ' + (t.netPnl>=0?'text-green-600':'text-red-600') + '">$' + t.netPnl.toFixed(4) + '</td>' +
+                    '</table>';
             });
         }
 
@@ -2030,7 +2175,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             if (data.hasActiveCycle) {
                 const card = document.getElementById('cycleStatusCard');
                 card.className = 'mb-6 rounded-xl p-6 text-white transition-all duration-300 cycle-card-active';
-                document.getElementById('cycleStatusText').innerHTML = '🎯 <strong>Active Cycle</strong> - Trading until target achieved';
+                document.getElementById('cycleStatusText').innerHTML = '🎯 <strong>Active Cycle</strong> - Trading until target achieved (Auto-Adjusted)';
                 document.getElementById('cycleTargetGrowth').innerHTML = data.targetGrowthPct.toFixed(2) + '%';
                 document.getElementById('cycleTargetUsdt').innerHTML = '$' + data.targetAmountUsd.toFixed(2);
                 document.getElementById('cycleTargetShib').innerHTML = Math.floor(data.targetAmountShib).toLocaleString();
@@ -2038,6 +2183,10 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 document.getElementById('cycleCurrentGrowth').innerHTML = data.currentGrowthPct.toFixed(2) + '%';
                 document.getElementById('cycleCurrentUsdt').innerHTML = '$' + data.currentGrowthUsd.toFixed(2);
                 document.getElementById('cycleCurrentShib').innerHTML = Math.floor(data.currentGrowthShib).toLocaleString();
+                document.getElementById('cycleRequiredContracts').innerHTML = data.requiredContracts || '-';
+                document.getElementById('cycleAdjustedTp').innerHTML = (data.recommendedTpPct || 0).toFixed(2) + '%';
+                document.getElementById('cycleTimeProgress').innerHTML = (data.timeProgress || 0).toFixed(1) + '%';
+                document.getElementById('cycleGrowthProgress').innerHTML = (data.growthProgress || 0).toFixed(1) + '%';
                 const progress = (data.currentGrowthPct / data.targetGrowthPct) * 100;
                 document.getElementById('cycleProgressBar').style.width = Math.min(progress, 100) + '%';
                 document.getElementById('cycleProgress').innerHTML = '<div class="text-2xl font-bold">' + Math.min(progress, 100).toFixed(1) + '%</div><div class="text-xs opacity-75">Progress</div>';
@@ -2055,12 +2204,16 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             } else {
                 const card = document.getElementById('cycleStatusCard');
                 card.className = 'mb-6 rounded-xl p-6 text-white transition-all duration-300 cycle-card-inactive';
-                document.getElementById('cycleStatusText').innerHTML = '💡 <strong>No Active Cycle</strong> - Set a DGR target above to start';
+                document.getElementById('cycleStatusText').innerHTML = '💡 <strong>No Active Cycle</strong> - Set a DGR target above to start (auto-adjusts strategy)';
                 document.getElementById('cycleTargetGrowth').innerHTML = '-';
                 document.getElementById('cycleTargetUsdt').innerHTML = '-';
                 document.getElementById('cycleTargetShib').innerHTML = '-';
                 document.getElementById('cycleTimeRemaining').innerHTML = '-';
                 document.getElementById('cycleCurrentGrowth').innerHTML = '0%';
+                document.getElementById('cycleRequiredContracts').innerHTML = '-';
+                document.getElementById('cycleAdjustedTp').innerHTML = '-';
+                document.getElementById('cycleTimeProgress').innerHTML = '0%';
+                document.getElementById('cycleGrowthProgress').innerHTML = '0%';
                 document.getElementById('cycleProgressBar').style.width = '0%';
                 document.getElementById('cycleProgress').innerHTML = '<div class="text-2xl font-bold">0%</div><div class="text-xs opacity-75">Progress</div>';
             }
@@ -2078,7 +2231,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             });
             
             if (res.id) {
-                alert('✅ Cycle started! Target: ' + growthRate + '% in ' + targetValue + ' ' + timeUnit + '(s)');
+                alert('✅ Cycle started! Target: ' + growthRate + '% in ' + targetValue + ' ' + timeUnit + '(s)\nStrategy auto-adjusted: TP and Contracts optimized for this target!');
                 fetchCycleStatus();
             } else {
                 alert('❌ Failed to start cycle');
@@ -2198,6 +2351,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             }
 
             document.getElementById("uptime").innerText = data.uptime + "s";
+            document.getElementById("netPnl").innerText = "$" + data.metrics.totalNetPnl.toFixed(4);
             document.getElementById("netPnl").className = "text-lg sm:text-xl font-mono font-bold tracking-tight " + (data.metrics.totalNetPnl >= 0 ? "text-green-600" : "text-red-600");
             document.getElementById("winRateDisplay").innerText = (data.metrics.winRate || 0) + "%";
             document.getElementById("marginUsed").innerText = "$" + Number(data.walletBalance || 0).toFixed(4);
