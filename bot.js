@@ -48,7 +48,7 @@ const AnalyticsModel = mongoose.model('SiteAnalytics_V3', new mongoose.Schema({
 const CUSTOM_PORT = process.env.PORT || 3000;
 
 // SHIB CONFIGURATION (FORCED 20x LEVERAGE)
-const FORCED_LEVERAGE = 75;
+const FORCED_LEVERAGE = 1;
 
 const BASE_CONFIG = {
     htxSymbol: 'SHIB/USDT:USDT',         
