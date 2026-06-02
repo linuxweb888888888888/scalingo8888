@@ -26,22 +26,41 @@ const UserModel = mongoose.model('User_V3', new mongoose.Schema({
     liveTradingEnabled: { type: Boolean, default: false },
     config: { type: Object, default: {} },
     activePosition: { type: Object, default: null }, 
-    lastCloseTime: { type: Number, default: 0 }      
+    lastCloseTime: { type: Number, default: 0 },
+    createdAt: { type: Date, default: Date.now }  // Track when account was created
 }));
 
 const TradeModel = mongoose.model('TradeLog_V3', new mongoose.Schema({
-    userId: { type: String, required: true }, side: String, entryPrice: Number, exitPrice: Number,
-    contracts: Number, marginUsed: Number, grossPnl: Number, grossRoiPct: Number, roiPct: Number, 
-    netPnl: Number, feeCost: Number, timestamp: { type: Date, default: Date.now }, exitReason: String
+    userId: { type: String, required: true, index: true }, 
+    side: String, 
+    entryPrice: Number, 
+    exitPrice: Number,
+    contracts: Number, 
+    marginUsed: Number, 
+    grossPnl: Number, 
+    grossRoiPct: Number, 
+    roiPct: Number, 
+    netPnl: Number, 
+    feeCost: Number, 
+    timestamp: { type: Date, default: Date.now, index: true }, 
+    exitReason: String
 }));
 
+// Add indexes for better query performance
+TradeModel.schema.index({ userId: 1, timestamp: -1 });
+UserModel.schema.index({ token: 1 });
+UserModel.schema.index({ email: 1 });
+
 const ChartDataModel = mongoose.model('ChartData_V8', new mongoose.Schema({
-    priceMid: Number, timestamp: { type: Date, default: Date.now, expires: 86400 } 
+    priceMid: Number, 
+    timestamp: { type: Date, default: Date.now, expires: 86400 } 
 }));
 
 const AnalyticsModel = mongoose.model('SiteAnalytics_V3', new mongoose.Schema({
-    key: { type: String, default: "global" }, views: { type: Number, default: 0 },
-    uniques: { type: Number, default: 0 }, knownIds: { type: [String], default: [] }
+    key: { type: String, default: "global" }, 
+    views: { type: Number, default: 0 },
+    uniques: { type: Number, default: 0 }, 
+    knownIds: { type: [String], default: [] }
 }));
 
 // ==================== BASE CONFIGURATION ====================
@@ -53,9 +72,15 @@ const FORCED_LEVERAGE = 75;
 const BASE_CONFIG = {
     htxSymbol: 'SHIB/USDT:USDT',         
     binanceSymbol: '1000SHIB/USDT:USDT', 
-    leverage: FORCED_LEVERAGE, baseContracts: 1, contractSize: 1000, marginMode: 'cross', fees: { taker: 0.0004 }, 
-    takeProfitPct: 10.0, stopLossPct: -50.0, 
-    dcaTriggerPct: 1.0, dcaMultiplier: 2.0, 
+    leverage: FORCED_LEVERAGE, 
+    baseContracts: 1, 
+    contractSize: 1000, 
+    marginMode: 'cross', 
+    fees: { taker: 0.0004 }, 
+    takeProfitPct: 10.0, 
+    stopLossPct: -50.0, 
+    dcaTriggerPct: 1.0, 
+    dcaMultiplier: 2.0, 
     startContracts: 1,
     dgrDailyGrowthRate: 0.0,
     manualDirection: 'long',
@@ -123,9 +148,17 @@ function calculateDGRAdjustment(dgrDailyGrowthRate, daysActive) {
 // ==================== METRICS ENGINE ====================
 class PerformanceMetrics {
     constructor(userId) {
-        this.userId = userId; this.trades = []; 
-        this.totalGrossPnl = 0; this.totalNetPnl = 0; this.totalFees = 0; this.totalRoiPct = 0;
-        this.wins = 0; this.losses = 0; this.winRate = 0; this.totalTradesCount = 0; this.maxMarginUsed = 0; 
+        this.userId = userId; 
+        this.trades = []; 
+        this.totalGrossPnl = 0; 
+        this.totalNetPnl = 0; 
+        this.totalFees = 0; 
+        this.totalRoiPct = 0;
+        this.wins = 0; 
+        this.losses = 0; 
+        this.winRate = 0; 
+        this.totalTradesCount = 0; 
+        this.maxMarginUsed = 0; 
         this.startDate = Date.now();
     }
     async init() { 
@@ -134,16 +167,36 @@ class PerformanceMetrics {
     }
     recordTrade(trade) { this.processTrade(trade, true); }
     processTrade(trade, saveToDb = true) {
-        this.totalTradesCount++; if (!trade.timestamp) trade.timestamp = Date.now();
-        this.trades.push(trade); if (this.trades.length > 2000) this.trades.shift(); 
+        this.totalTradesCount++; 
+        if (!trade.timestamp) trade.timestamp = Date.now();
+        this.trades.push(trade); 
+        if (this.trades.length > 2000) this.trades.shift(); 
         if (trade.marginUsed > this.maxMarginUsed) this.maxMarginUsed = trade.marginUsed;
-        this.totalNetPnl += trade.netPnl || 0; this.totalFees += trade.feeCost || 0; this.totalRoiPct += trade.roiPct || 0; 
+        this.totalNetPnl += trade.netPnl || 0; 
+        this.totalFees += trade.feeCost || 0; 
+        this.totalRoiPct += trade.roiPct || 0; 
         if (trade.netPnl > 0) this.wins++; else this.losses++;
         this.winRate = this.trades.length ? ((this.wins / this.trades.length) * 100).toFixed(2) : 0;
-        if (saveToDb) TradeModel.create({ ...trade, userId: this.userId }).catch(()=>{});
+        if (saveToDb) TradeModel.create({ ...trade, userId: this.userId }).catch((err) => console.error('Trade save error:', err.message));
     }
     updateMaxMargin(margin) { if (margin > this.maxMarginUsed) this.maxMarginUsed = margin; }
     getDaysActive() { return (Date.now() - this.startDate) / (1000 * 60 * 60 * 24); }
+    
+    // Reset metrics for clean start
+    async reset() {
+        await TradeModel.deleteMany({ userId: this.userId });
+        this.trades = [];
+        this.totalGrossPnl = 0;
+        this.totalNetPnl = 0;
+        this.totalFees = 0;
+        this.totalRoiPct = 0;
+        this.wins = 0;
+        this.losses = 0;
+        this.winRate = 0;
+        this.totalTradesCount = 0;
+        this.maxMarginUsed = 0;
+        this.startDate = Date.now();
+    }
 }
 
 // ==================== BACKTEST SIMULATION ENGINE ====================
@@ -179,17 +232,20 @@ async function runBacktestSimulation(config, tickCount, symbol) {
     let priceBuffer = [];
     const totalSpanMs = ticks[ticks.length - 1].timestamp - ticks[0].timestamp;
 
-    for (const tick of ticks) {
+    for (let i = 0; i < ticks.length; i++) {
+        const tick = ticks[i];
         const price = tick.priceMid, tickTime = tick.timestamp;
 
-        if (priceBuffer.length === 0 || price !== priceBuffer[priceBuffer.length - 1]) {
-            priceBuffer.push(price); if (priceBuffer.length > 500) priceBuffer.shift();
-        }
-        
-        if (ticks.indexOf(tick) % 500 === 0) {
+        // Prevent event loop blocking
+        if (i % 1000 === 0 && i > 0) {
             await new Promise(resolve => setImmediate(resolve));
         }
 
+        if (priceBuffer.length === 0 || price !== priceBuffer[priceBuffer.length - 1]) {
+            priceBuffer.push(price); 
+            if (priceBuffer.length > 500) priceBuffer.shift();
+        }
+        
         let signal = manualDirection === 'long' ? 'long' : (manualDirection === 'short' ? 'short' : null);
 
         if (!activePos && signal) {
@@ -209,7 +265,8 @@ async function runBacktestSimulation(config, tickCount, symbol) {
             else if (math.currentGrossRoi <= config.stopLossPct) forceExitReason = "STOP_LOSS";
 
             if (forceExitReason) {
-                netPnl += math.netPnlUsd; math.netPnlUsd > 0 ? wins++ : losses++;
+                netPnl += math.netPnlUsd; 
+                math.netPnlUsd > 0 ? wins++ : losses++;
                 totalTradeDurationMs += (tickTime - activePos.entryTime);
 
                 closedTrades.push({ side: activePos.side, entryPrice: activePos.entryPrice, exitPrice: price, contracts: activePos.contracts, grossPnl: math.grossPnlUsd, grossRoiPct: math.grossRoiPct, netPnl: math.netPnlUsd, roiPct: math.netRoiPct, exitReason: forceExitReason, time: tick.timestamp });
@@ -232,7 +289,8 @@ async function runBacktestSimulation(config, tickCount, symbol) {
                         activePos.size = Number(activePos.size) + addedSizeUsd; 
                         activePos.contracts = Number(activePos.contracts) + contractsToAdd;
                         activePos.marginUsed = Number(activePos.marginUsed) + (addedSizeUsd / FORCED_LEVERAGE);
-                        activePos.lastDcaTime = tickTime; activePos.dcaStep = step + 1;
+                        activePos.lastDcaTime = tickTime; 
+                        activePos.dcaStep = step + 1;
                         if (activePos.marginUsed > maxMarginUsed) maxMarginUsed = activePos.marginUsed;
                     }
                 }
@@ -243,7 +301,8 @@ async function runBacktestSimulation(config, tickCount, symbol) {
     if (activePos) {
         const lastTick = ticks[ticks.length - 1]; 
         const math = calculateTradeMath(activePos.side, activePos.entryPrice, lastTick.priceMid, activePos.size, FORCED_LEVERAGE, config.fees.taker);
-        netPnl += math.netPnlUsd; math.netPnlUsd > 0 ? wins++ : losses++;
+        netPnl += math.netPnlUsd; 
+        math.netPnlUsd > 0 ? wins++ : losses++;
         totalTradeDurationMs += (lastTick.timestamp - activePos.entryTime);
         closedTrades.push({ side: activePos.side, entryPrice: activePos.entryPrice, exitPrice: lastTick.priceMid, contracts: activePos.contracts, grossPnl: math.grossPnlUsd, grossRoiPct: math.grossRoiPct, netPnl: math.netPnlUsd, roiPct: math.netRoiPct, exitReason: "END_OF_TEST", time: lastTick.timestamp });
     }
@@ -252,23 +311,40 @@ async function runBacktestSimulation(config, tickCount, symbol) {
     const formatTime = (ms) => {
         if (ms < 1000) return "< 1s";
         let s = Math.floor(ms / 1000), m = Math.floor(s / 60), h = Math.floor(m / 60), d = Math.floor(h / 24);
-        if (d > 0) return `${d}d ${h%24}h`; if (h > 0) return `${h}h ${m%60}m`; if (m > 0) return `${m}m ${s%60}s`; return `${s}s`;
+        if (d > 0) return `${d}d ${h%24}h`; 
+        if (h > 0) return `${h}h ${m%60}m`; 
+        if (m > 0) return `${m}m ${s%60}s`; 
+        return `${s}s`;
     };
 
     return { 
-        ticksAnalyzed: ticks.length, totalTradesCount, wins, losses, 
+        ticksAnalyzed: ticks.length, 
+        totalTradesCount, 
+        wins, 
+        losses, 
         winRate: totalTradesCount > 0 ? ((wins / totalTradesCount) * 100).toFixed(2) : 0, 
-        netPnl, depositNeeded: maxMarginUsed, 
+        netPnl, 
+        depositNeeded: maxMarginUsed, 
         avgDuration: formatTime(totalTradesCount > 0 ? totalTradeDurationMs / totalTradesCount : 0), 
-        totalSpan: formatTime(totalSpanMs), trades: closedTrades.slice(-200) 
+        totalSpan: formatTime(totalSpanMs), 
+        trades: closedTrades.slice(-200) 
     };
 }
 
 // ==================== USER BOT INSTANCE ====================
 class UserTradeInstance {
-    constructor(user) {
+    constructor(user, forceClean = false) {
         this.userId = user._id.toString(); 
-        this.config = { ...BASE_CONFIG, ...(user.config || {}) }; 
+        
+        // Start with fresh config if forced or no existing config
+        if (forceClean || !user.config || Object.keys(user.config).length === 0) {
+            this.config = { ...BASE_CONFIG };
+            // Save fresh config to user (don't await to avoid blocking)
+            user.config = this.config;
+            user.save().catch(err => console.error(`Failed to save clean config for ${this.userId}:`, err.message));
+        } else {
+            this.config = { ...BASE_CONFIG, ...(user.config || {}) };
+        }
         
         if (!this.config.htxSymbol || this.config.htxSymbol.includes('1000')) {
             this.config.htxSymbol = 'SHIB/USDT:USDT';
@@ -278,11 +354,23 @@ class UserTradeInstance {
         this.config.leverage = FORCED_LEVERAGE;
         this.config.marginMode = 'cross'; 
 
-        this.startTime = Date.now(); this.metrics = new PerformanceMetrics(this.userId);
-        this.activePositions = user.activePosition ? [user.activePosition] : []; 
+        this.startTime = Date.now(); 
+        this.metrics = new PerformanceMetrics(this.userId);
+        
+        // Force clean positions on new accounts or when requested
+        if (forceClean || !user.activePosition) {
+            this.activePositions = [];
+            user.activePosition = null;
+            user.lastCloseTime = 0;
+            user.save().catch(err => console.error(`Failed to save clean position for ${this.userId}:`, err.message));
+        } else {
+            this.activePositions = user.activePosition ? [user.activePosition] : [];
+        }
+        
         this.lastCloseTime = user.lastCloseTime || 0;
         
         this.isTrading = false; 
+        this.isClosing = false;  // New flag to prevent close race conditions
         
         this.lastEvalPrice = 0;
         this.walletBalance = 0;
@@ -317,10 +405,20 @@ class UserTradeInstance {
     async saveState() {
         await UserModel.updateOne(
             { _id: this.userId },
-            { $set: { activePosition: this.activePositions.length > 0 ? this.activePositions[0] : null, lastCloseTime: this.lastCloseTime, config: this.config } }
+            { $set: { 
+                activePosition: this.activePositions.length > 0 ? this.activePositions[0] : null, 
+                lastCloseTime: this.lastCloseTime, 
+                config: this.config 
+            } }
         );
-        const cacheEntry = tokenCache.get(this.userId);
-        if(cacheEntry) cacheEntry.user.activePosition = this.activePositions.length > 0 ? this.activePositions[0] : null; 
+        // Update cache if exists
+        for (const [token, data] of tokenCache.entries()) {
+            if (data.user._id.toString() === this.userId) {
+                data.user.activePosition = this.activePositions.length > 0 ? this.activePositions[0] : null;
+                data.user.config = this.config;
+                break;
+            }
+        }
     }
 
     async connectExchange() {
@@ -340,20 +438,23 @@ class UserTradeInstance {
 
                     const sizeUsd = openPos.contracts * this.config.contractSize * entryP;
                     this.activePositions = [{ id: Date.now(), side: openPos.side, entryPrice: entryP, contracts: openPos.contracts, size: sizeUsd, marginUsed: sizeUsd / FORCED_LEVERAGE, exchangeROI: openPos.percentage || 0, exchangePnl: openPos.unrealizedPnl || 0, entryTime: Date.now(), isPaper: false, lastDcaTime: 0, dcaStep: 0, stepHistory: [] }];
-                    this.metrics.updateMaxMargin(this.activePositions[0].marginUsed); await this.saveState();
+                    this.metrics.updateMaxMargin(this.activePositions[0].marginUsed); 
+                    await this.saveState();
                 } else {
-                    this.activePositions = []; await this.saveState();
+                    this.activePositions = []; 
+                    await this.saveState();
                 }
             }
             return { success: true };
         } catch (error) { 
             console.log(`[Worker ${this.userId}] Exchange Init Error:`, error.message); 
-            this.liveTradingEnabled = false; return { success: false, message: error.message }; 
+            this.liveTradingEnabled = false; 
+            return { success: false, message: error.message }; 
         }
     }
 
     async evaluateManualEntry() {
-        if (this.isTrading || (Date.now() - this.lastCloseTime < 3000)) return;
+        if (this.isTrading || this.isClosing || (Date.now() - this.lastCloseTime < 3000)) return;
 
         try {
             let signal = this.config.manualDirection === 'long' ? 'long' : (this.config.manualDirection === 'short' ? 'short' : null);
@@ -368,19 +469,20 @@ class UserTradeInstance {
                     let instantRoi = pnlPercent * FORCED_LEVERAGE;
 
                     if (instantRoi >= 0) {
-                        await this.forceClosePosition("MANUAL_FLIP"); setTimeout(() => this.syncState(signal), 50);
+                        await this.forceClosePosition("MANUAL_FLIP"); 
+                        setTimeout(() => this.syncState(signal), 50);
                     }
                 }
             } else {
                 if (signal) await this.syncState(signal);
             }
         } catch (e) {
-            console.error(`🚨 [Eval Error]:`, e.message);
+            console.error(`🚨 [Eval Error - ${this.userId}]:`, e.message);
         }
     }
 
     async checkExits() {
-        if (this.isTrading || this.activePositions.length === 0) return;
+        if (this.isTrading || this.isClosing || this.activePositions.length === 0) return;
         
         try {
             const pos = this.activePositions[0];
@@ -407,12 +509,12 @@ class UserTradeInstance {
                 }
             }
         } catch (e) {
-             console.error(`🚨 [Exit Check Error]:`, e.message);
+             console.error(`🚨 [Exit Check Error - ${this.userId}]:`, e.message);
         }
     }
 
     async addDcaPosition() {
-        if (this.isTrading || this.activePositions.length === 0) return;
+        if (this.isTrading || this.isClosing || this.activePositions.length === 0) return;
         this.isTrading = true;
         try {
             const pos = this.activePositions[0];
@@ -483,11 +585,13 @@ class UserTradeInstance {
             console.log(`[User ${this.userId}] ${pos.isPaper ? 'Paper' : 'LIVE'} DCA Executed (Step ${pos.dcaStep}). Added ${contractsToAdd} to ${pos.side.toUpperCase()}`);
         } catch (err) {
             console.error(`🚨 [DCA Error - User ${this.userId}]:`, err.message);
-        } finally { this.isTrading = false; }
+        } finally { 
+            this.isTrading = false; 
+        }
     }
 
     async syncState(targetSide) {
-        if (this.isTrading || this.activePositions.length > 0) return;
+        if (this.isTrading || this.isClosing || this.activePositions.length > 0) return;
         this.isTrading = true;
         try {
             const isPaper = !this.liveTradingEnabled; 
@@ -514,19 +618,36 @@ class UserTradeInstance {
             const sizeUsd = contracts * (Number(this.config.contractSize) || 1000) * executionPrice;
             const marginUsed = sizeUsd / FORCED_LEVERAGE;
             
-            this.activePositions = [{ id: Date.now(), side: targetSide, entryPrice: Number(executionPrice), contracts: Number(contracts), size: Number(sizeUsd), marginUsed: Number(marginUsed), entryTime: Date.now(), exchangeROI: 0, exchangePnl: 0, isPaper, lastDcaTime: 0, dcaStep: 0, stepHistory: [{ step: 0, type: 'OPEN', price: executionPrice, roi: 0, time: Date.now() }] }];
+            this.activePositions = [{ 
+                id: Date.now(), 
+                side: targetSide, 
+                entryPrice: Number(executionPrice), 
+                contracts: Number(contracts), 
+                size: Number(sizeUsd), 
+                marginUsed: Number(marginUsed), 
+                entryTime: Date.now(), 
+                exchangeROI: 0, 
+                exchangePnl: 0, 
+                isPaper, 
+                lastDcaTime: 0, 
+                dcaStep: 0, 
+                stepHistory: [{ step: 0, type: 'OPEN', price: executionPrice, roi: 0, time: Date.now() }] 
+            }];
             
             this.metrics.updateMaxMargin(marginUsed); 
             await this.saveState();
             console.log(`[User ${this.userId}] ${isPaper?'Paper':'LIVE'} OPEN: ${targetSide.toUpperCase()} at $${executionPrice}`);
         } catch (err) { 
-            console.error(`🚨 [Open Error - User ${this.userId}]:`, err.message); this.activePositions = []; 
-        } finally { this.isTrading = false; }
+            console.error(`🚨 [Open Error - User ${this.userId}]:`, err.message); 
+            this.activePositions = []; 
+        } finally { 
+            this.isTrading = false; 
+        }
     }
 
     async forceClosePosition(reason = "MANUAL") {
-        if (this.isTrading || this.activePositions.length === 0) return;
-        this.isTrading = true;
+        if (this.isTrading || this.isClosing || this.activePositions.length === 0) return;
+        this.isClosing = true;
         try {
             const snapPos = { ...this.activePositions[0] };
             const closeSide = snapPos.side === 'long' ? 'sell' : 'buy';
@@ -535,7 +656,8 @@ class UserTradeInstance {
 
             if (!snapPos.isPaper && this.liveTradingEnabled) {
                 const closeRes = await this.htx.createMarketOrder(this.config.htxSymbol, closeSide, snapPos.contracts, undefined, { reduceOnly: true, offset: 'close', marginMode: 'cross', lever_rate: FORCED_LEVERAGE });
-                this.activePositions = []; await new Promise(r => setTimeout(r, 150));
+                this.activePositions = []; 
+                await new Promise(r => setTimeout(r, 150));
                 try { 
                     const cOrder = await this.htx.fetchOrder(closeRes.id, this.config.htxSymbol); 
                     if (cOrder && cOrder.average) {
@@ -548,20 +670,32 @@ class UserTradeInstance {
 
             const math = calculateTradeMath(snapPos.side, snapPos.entryPrice, realExitPrice, snapPos.size, FORCED_LEVERAGE, this.config.fees.taker);
             this.metrics.recordTrade({ 
-                side: snapPos.side, contracts: snapPos.contracts, entryPrice: snapPos.entryPrice, exitPrice: realExitPrice, 
-                marginUsed: math.margin, grossPnl: math.grossPnlUsd, grossRoiPct: math.grossRoiPct, netPnl: math.netPnlUsd, roiPct: math.netRoiPct, feeCost: math.feeCost, exitReason: reason 
+                side: snapPos.side, 
+                contracts: snapPos.contracts, 
+                entryPrice: snapPos.entryPrice, 
+                exitPrice: realExitPrice, 
+                marginUsed: math.margin, 
+                grossPnl: math.grossPnlUsd, 
+                grossRoiPct: math.grossRoiPct, 
+                netPnl: math.netPnlUsd, 
+                roiPct: math.netRoiPct, 
+                feeCost: math.feeCost, 
+                exitReason: reason 
             });
             
-            this.lastCloseTime = Date.now(); await this.saveState();
+            this.lastCloseTime = Date.now(); 
+            await this.saveState();
             console.log(`[User ${this.userId}] ${snapPos.isPaper?'Paper':'LIVE'} CLOSED: ${reason}`);
         } catch (err) {
             console.error(`🚨 [Close Error - User ${this.userId}]:`, err.message);
-        } finally { this.isTrading = false; }
+        } finally { 
+            this.isClosing = false; 
+        }
     }
     
     startExchangeROISync() {
         setInterval(async () => {
-            if (this.activePositions.length === 0 || this.isTrading) {
+            if (this.activePositions.length === 0 || this.isTrading || this.isClosing) {
                 if (this.liveTradingEnabled) {
                     try {
                         const bal = await this.htx.fetchBalance({ type: 'swap' });
@@ -610,10 +744,60 @@ class UserTradeInstance {
 
     getExportData() { 
         return { 
-            config: this.config, liveTradingEnabled: this.liveTradingEnabled, uptime: Math.floor((Date.now() - this.startTime) / 1000),
-            metrics: this.metrics, activePositions: this.activePositions, binance: globalMarketData.binance,
-            walletBalance: this.walletBalance, dgrDaysActive: this.metrics.getDaysActive()
+            config: this.config, 
+            liveTradingEnabled: this.liveTradingEnabled, 
+            uptime: Math.floor((Date.now() - this.startTime) / 1000),
+            metrics: {
+                totalNetPnl: this.metrics.totalNetPnl,
+                totalTradesCount: this.metrics.totalTradesCount,
+                wins: this.metrics.wins,
+                losses: this.metrics.losses,
+                winRate: this.metrics.winRate,
+                trades: this.metrics.trades.slice(-50)
+            }, 
+            activePositions: this.activePositions, 
+            binance: globalMarketData.binance,
+            walletBalance: this.walletBalance, 
+            dgrDaysActive: this.metrics.getDaysActive()
         }; 
+    }
+    
+    // New method to completely reset user account
+    async resetAccount() {
+        console.log(`[User ${this.userId}] Resetting account to clean state...`);
+        
+        // Force close any open positions
+        if (this.activePositions.length > 0) {
+            await this.forceClosePosition("ACCOUNT_RESET");
+        }
+        
+        // Reset metrics
+        await this.metrics.reset();
+        
+        // Reset config to defaults
+        this.config = { ...BASE_CONFIG };
+        
+        // Clear active positions
+        this.activePositions = [];
+        this.lastCloseTime = 0;
+        this.startTime = Date.now();
+        
+        // Save clean state to database
+        await UserModel.updateOne(
+            { _id: this.userId },
+            { 
+                $set: { 
+                    config: this.config,
+                    activePosition: null,
+                    lastCloseTime: 0,
+                    liveTradingEnabled: false
+                } 
+            }
+        );
+        
+        await this.saveState();
+        console.log(`[User ${this.userId}] Account reset complete`);
+        return { success: true, message: "Account reset to clean state" };
     }
 }
 
@@ -623,8 +807,15 @@ const activeWorkers = new Map();
 async function startMasterStreams() {
     let marketsLoaded = false; 
     while (!marketsLoaded) { 
-        try { await publicBinance.loadMarkets(); await publicHtx.loadMarkets(); marketsLoaded = true; } 
-        catch (e) { await new Promise(r => setTimeout(r, 5000)); } 
+        try { 
+            await publicBinance.loadMarkets(); 
+            await publicHtx.loadMarkets(); 
+            marketsLoaded = true; 
+        } 
+        catch (e) { 
+            console.log("Waiting for markets to load...");
+            await new Promise(r => setTimeout(r, 5000)); 
+        } 
     }
 
     try {
@@ -653,7 +844,7 @@ async function startMasterStreams() {
                 try {
                     const ticker = await Promise.race([
                         publicBinance.watchTicker(BASE_CONFIG.binanceSymbol),
-                        new Promise((_, r) => setTimeout(() => r(new Error('WS_TIMEOUT')), 3000))
+                        new Promise((_, reject) => setTimeout(() => reject(new Error('WS_TIMEOUT')), 3000))
                     ]);
                     let bid = ticker.bid !== undefined ? ticker.bid : ticker.last;
                     let ask = ticker.ask !== undefined ? ticker.ask : ticker.last;
@@ -679,19 +870,22 @@ async function startMasterStreams() {
                 if (Date.now() - lastHistorySave > 2000) { 
                     if (mid !== lastSavedMid) {
                         const doc = { priceMid: mid, timestamp: Date.now() };
-                        memoryChartHistory.push(doc); if (memoryChartHistory.length > 800) memoryChartHistory.shift(); 
+                        memoryChartHistory.push(doc); 
+                        if (memoryChartHistory.length > 800) memoryChartHistory.shift(); 
                         ChartDataModel.create(doc).catch(()=>{}); 
-                        lastHistorySave = Date.now(); lastSavedMid = mid;
+                        lastHistorySave = Date.now(); 
+                        lastSavedMid = mid;
                     }
                 }
 
                 for (const worker of activeWorkers.values()) {
-                    worker.checkExits().catch(()=>{}); 
-                    worker.evaluateManualEntry().catch(()=>{}); 
+                    worker.checkExits().catch((err) => console.error(`Worker exit check error:`, err.message)); 
+                    worker.evaluateManualEntry().catch((err) => console.error(`Worker eval error:`, err.message)); 
                 }
 
                 await new Promise(r => setTimeout(r, 100)); 
             } catch (e) { 
+                console.error("Stream error:", e.message);
                 await new Promise(r => setTimeout(r, 2000)); 
             }
         }
@@ -701,15 +895,22 @@ async function startMasterStreams() {
 async function loadAllUsers() {
     try {
         const users = await UserModel.find({});
+        console.log(`Loading ${users.length} existing users...`);
         for(const u of users) {
             try {
-                const worker = new UserTradeInstance(u);
+                const worker = new UserTradeInstance(u, false); // Don't force clean for existing users
                 await worker.initialize();
                 activeWorkers.set(u._id.toString(), worker);
                 if (u.token) tokenCache.set(u.token, { user: u, lastAccessed: Date.now() });
-            } catch(we) { console.error(`Worker error for ${u.email}:`, we.message); }
+                console.log(`✅ Loaded user: ${u.email}`);
+            } catch(we) { 
+                console.error(`Worker error for ${u.email}:`, we.message); 
+            }
         }
-    } catch(e) {}
+        console.log(`Total active workers: ${activeWorkers.size}`);
+    } catch(e) {
+        console.error("Failed to load users:", e);
+    }
 }
 
 // ==================== ANALYTICS ENGINE ====================
@@ -722,7 +923,17 @@ setInterval(() => {
 }, 5000);
 
 // ==================== EXPRESS SERVER & API ====================
-const app = express(); app.use(express.json());
+const app = express(); 
+app.use(express.json());
+
+// Add rate limiting for security
+const rateLimit = require('express-rate-limit');
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100, // Limit each IP to 100 requests per windowMs
+    message: { error: 'Too many requests, please try again later.' }
+});
+app.use('/api/', limiter);
 
 app.post('/api/analytics/track', async (req, res) => {
     const { sessionId, page, isView } = req.body;
@@ -752,7 +963,8 @@ app.get('/api/analytics/stats', async (req, res) => {
 
 app.post('/api/backtest', async (req, res) => {
     const bConfig = { ...BASE_CONFIG,
-        takeProfitPct: parseFloat(req.body.tpPct) || 10.0, stopLossPct: parseFloat(req.body.slPct) || -50.0,
+        takeProfitPct: parseFloat(req.body.tpPct) || 10.0, 
+        stopLossPct: parseFloat(req.body.slPct) || -50.0,
         dcaTriggerPct: parseFloat(req.body.dcaTriggerPct) || 1.0,
         dcaMultiplier: parseFloat(req.body.dcaMultiplier) || 2.0,
         startContracts: parseInt(req.body.startContracts) || 1,
@@ -766,37 +978,122 @@ app.post('/api/backtest', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// UPDATED: Clean registration endpoint with forceClean = true
 app.post('/api/auth/register', async (req, res) => {
     try {
         const { name, email, password } = req.body;
-        if(await UserModel.findOne({ email })) return res.status(400).json({ error: 'Email already exists' });
+        
+        // Validate input
+        if (!name || !email || !password) {
+            return res.status(400).json({ error: 'Name, email, and password are required' });
+        }
+        if (password.length < 6) {
+            return res.status(400).json({ error: 'Password must be at least 6 characters' });
+        }
+        
+        const existingUser = await UserModel.findOne({ email });
+        if (existingUser) {
+            return res.status(400).json({ error: 'Email already exists' });
+        }
         
         const salt = crypto.randomBytes(16).toString('hex');
-        const user = await UserModel.create({ name, email, passwordHash: hashPassword(password, salt), salt, token: generateToken() });
         
-        const worker = new UserTradeInstance(user);
+        // Create user with COMPLETELY CLEAN state
+        const user = await UserModel.create({ 
+            name, 
+            email, 
+            passwordHash: hashPassword(password, salt), 
+            salt, 
+            token: generateToken(),
+            apiKey: "",
+            apiSecret: "",
+            liveTradingEnabled: false,
+            config: {},  // Empty config - will use BASE_CONFIG defaults
+            activePosition: null,
+            lastCloseTime: 0,
+            createdAt: new Date()
+        });
+        
+        // Create worker with forceClean = true to ensure fresh start
+        const worker = new UserTradeInstance(user, true);
         await worker.initialize();
         activeWorkers.set(user._id.toString(), worker);
         tokenCache.set(user.token, { user, lastAccessed: Date.now() });
 
-        res.json({ token: user.token, user: { name: user.name, email: user.email } });
-    } catch(e) { res.status(500).json({ error: 'Registration failed' }); }
+        console.log(`✅ New user registered: ${email} (${user._id})`);
+        
+        res.json({ 
+            token: user.token, 
+            user: { 
+                name: user.name, 
+                email: user.email,
+                createdAt: user.createdAt
+            } 
+        });
+    } catch(e) { 
+        console.error('Registration error:', e);
+        res.status(500).json({ error: 'Registration failed: ' + e.message }); 
+    }
 });
 
 app.post('/api/auth/login', async (req, res) => {
     try {
         const user = await UserModel.findOne({ email: req.body.email });
-        if(!user || hashPassword(req.body.password, user.salt) !== user.passwordHash) return res.status(400).json({ error: 'Invalid credentials' });
+        if(!user || hashPassword(req.body.password, user.salt) !== user.passwordHash) {
+            return res.status(400).json({ error: 'Invalid credentials' });
+        }
 
-        user.token = generateToken(); await user.save();
+        user.token = generateToken(); 
+        await user.save();
         tokenCache.set(user.token, { user, lastAccessed: Date.now() });
 
         res.json({ token: user.token, user: { name: user.name, email: user.email } });
-    } catch(e) { res.status(500).json({ error: 'Login failed' }); }
+    } catch(e) { 
+        console.error('Login error:', e);
+        res.status(500).json({ error: 'Login failed' }); 
+    }
+});
+
+// NEW ENDPOINT: Reset user account to clean state
+app.post('/api/user/reset-account', authMiddleware, async (req, res) => {
+    try {
+        const worker = activeWorkers.get(req.user._id.toString());
+        if (!worker) {
+            return res.status(400).json({ error: 'Worker not found' });
+        }
+        
+        const result = await worker.resetAccount();
+        res.json(result);
+    } catch(err) {
+        console.error('Reset account error:', err);
+        res.status(500).json({ error: 'Failed to reset account: ' + err.message });
+    }
+});
+
+// NEW ENDPOINT: Get account creation info
+app.get('/api/user/account-info', authMiddleware, async (req, res) => {
+    try {
+        const user = await UserModel.findById(req.user._id);
+        res.json({
+            createdAt: user.createdAt,
+            daysActive: Math.floor((Date.now() - new Date(user.createdAt)) / (1000 * 60 * 60 * 24)),
+            totalTrades: await TradeModel.countDocuments({ userId: user._id.toString() }),
+            hasActivePosition: !!(user.activePosition),
+            isLiveEnabled: user.liveTradingEnabled
+        });
+    } catch(err) {
+        res.status(500).json({ error: 'Failed to get account info' });
+    }
 });
 
 app.get('/api/user/me', authMiddleware, (req, res) => {
-    res.json({ name: req.user.name, email: req.user.email, apiKey: req.user.apiKey, liveTradingEnabled: req.user.liveTradingEnabled });
+    res.json({ 
+        name: req.user.name, 
+        email: req.user.email, 
+        apiKey: req.user.apiKey ? '***' : '', 
+        liveTradingEnabled: req.user.liveTradingEnabled,
+        createdAt: req.user.createdAt
+    });
 });
 
 app.post('/api/user/keys', authMiddleware, async (req, res) => {
@@ -824,10 +1121,14 @@ app.post('/api/user/keys', authMiddleware, async (req, res) => {
             req.user.liveTradingEnabled = Boolean(liveTradingEnabled);
         }
 
-        req.user.apiKey = apiKey; req.user.apiSecret = apiSecret; 
+        req.user.apiKey = apiKey; 
+        req.user.apiSecret = apiSecret; 
         await req.user.save();
         res.json({ status: 'ok' });
-    } catch(e) { res.status(500).json({ error: 'Failed to update settings' }); }
+    } catch(e) { 
+        console.error('Keys update error:', e);
+        res.status(500).json({ error: 'Failed to update settings' }); 
+    }
 });
 
 app.post('/api/user/config', authMiddleware, async (req, res) => {
@@ -837,37 +1138,57 @@ app.post('/api/user/config', authMiddleware, async (req, res) => {
     const { tpPct, slPct, dcaTriggerPct, dcaMultiplier, startContracts, dgrDailyGrowthRate, manualDirection, maxContracts } = req.body;
     const pSet = (v, f, k) => { if (v !== undefined && v !== "") { const p = f(v); if (!isNaN(p)) worker.config[k] = p; } };
 
-    pSet(tpPct, parseFloat, 'takeProfitPct'); pSet(slPct, parseFloat, 'stopLossPct');
-    pSet(dcaTriggerPct, parseFloat, 'dcaTriggerPct'); pSet(dcaMultiplier, parseFloat, 'dcaMultiplier');
-    pSet(startContracts, parseInt, 'startContracts'); pSet(dgrDailyGrowthRate, parseFloat, 'dgrDailyGrowthRate');
+    pSet(tpPct, parseFloat, 'takeProfitPct'); 
+    pSet(slPct, parseFloat, 'stopLossPct');
+    pSet(dcaTriggerPct, parseFloat, 'dcaTriggerPct'); 
+    pSet(dcaMultiplier, parseFloat, 'dcaMultiplier');
+    pSet(startContracts, parseInt, 'startContracts'); 
+    pSet(dgrDailyGrowthRate, parseFloat, 'dgrDailyGrowthRate');
     pSet(maxContracts, parseInt, 'maxContracts');
     
     if (manualDirection !== undefined && (manualDirection === 'long' || manualDirection === 'short')) {
         worker.config.manualDirection = manualDirection;
     }
 
-    req.user.config = worker.config; req.user.markModified('config'); await req.user.save();
+    req.user.config = worker.config; 
+    req.user.markModified('config'); 
+    await req.user.save();
     res.json({status: 'ok', config: worker.config});
 });
 
 app.post('/api/user/reset-metrics', authMiddleware, async (req, res) => {
     try {
         const worker = activeWorkers.get(req.user._id.toString());
-        if(worker) { await TradeModel.deleteMany({ userId: req.user._id.toString() }); worker.metrics = new PerformanceMetrics(worker.userId); }
-        res.json({status: 'ok'});
-    } catch(err) { res.status(500).json({error: 'Failed to reset metrics'}); }
+        if(worker) { 
+            await worker.metrics.reset();
+            res.json({status: 'ok', message: 'Metrics reset successfully' });
+        } else {
+            res.status(400).json({ error: 'Worker not found' });
+        }
+    } catch(err) { 
+        console.error('Reset metrics error:', err);
+        res.status(500).json({error: 'Failed to reset metrics'}); 
+    }
 });
 
 app.get('/api/data', authMiddleware, (req, res) => {
     const worker = activeWorkers.get(req.user._id.toString());
-    res.json(worker ? worker.getExportData() : { error: "Worker not found" });
+    if (!worker) {
+        return res.status(400).json({ error: "Worker not found" });
+    }
+    res.json(worker.getExportData());
 });
 
 app.get('/api/chart-history', (req, res) => res.json(memoryChartHistory.slice(-800))); 
-app.get('/api/close-all', authMiddleware, async (req, res) => { 
+
+app.post('/api/close-all', authMiddleware, async (req, res) => { 
     const worker = activeWorkers.get(req.user._id.toString());
-    if(worker) await worker.forceClosePosition("MANUAL_FORCE_CLOSE").catch(()=>{}); 
-    res.json({status: 'ok'}); 
+    if(worker) {
+        await worker.forceClosePosition("MANUAL_FORCE_CLOSE").catch((err) => console.error(err)); 
+        res.json({status: 'ok', message: 'Position closed' });
+    } else {
+        res.status(400).json({ error: 'Worker not found' });
+    }
 });
 
 // ==================== FRONTEND UI ====================
@@ -909,6 +1230,8 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         ::-webkit-scrollbar-track { background: var(--zinc-50); }
         ::-webkit-scrollbar-thumb { background: var(--zinc-200); border-radius: 10px; }
         ::-webkit-scrollbar-thumb:hover { background: var(--zinc-800); }
+        
+        .reset-btn { background: linear-gradient(135deg, #dc2626 0%, #991b1b 100%); }
     </style>
 </head>
 <body class="antialiased min-h-screen flex flex-col">
@@ -1047,6 +1370,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 </div>
                 <div class="flex gap-3">
                     <button onclick="nav('settings')" class="btn-secondary flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">settings</span> Config</button>
+                    <button onclick="resetAccount()" class="btn-secondary bg-red-50 text-red-600 border-red-200 hover:bg-red-100 flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">factory_reset</span> Reset Account</button>
                     <button onclick="closeAll()" class="btn-secondary text-red-600 border-red-200 hover:bg-red-50 flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">cancel</span> Emergency Exit</button>
                 </div>
             </div>
@@ -1280,7 +1604,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             document.getElementById('btResDeposit').innerText = "$" + (res.depositNeeded || 0).toFixed(4);
             const tbody = document.getElementById('btTableBody'); tbody.innerHTML = "";
             [...res.trades].reverse().forEach(t => {
-                tbody.innerHTML += '<tr class="border-b"><td class="p-4 font-black ' + (t.side==='long'?'text-green-600':'text-red-600') + '">' + t.side.toUpperCase() + '</td><td class="p-4">' + t.contracts + '</td><td class="p-4 text-[9px] uppercase font-bold text-zinc-400">' + t.exitReason + '</td><td class="p-4 text-right font-black ' + (t.netPnl>=0?'text-green-600':'text-red-600') + '">$' + t.netPnl.toFixed(4) + '</td></tr>';
+                tbody.innerHTML += '<tr class="border-b"><td class="p-4 font-black ' + (t.side==='long'?'text-green-600':'text-red-600') + '">' + t.side.toUpperCase() + '</td><td class="p-4">' + t.contracts + '</td><td class="p-4 text-[9px] uppercase font-bold text-zinc-400">' + t.exitReason + '</td><td class="p-4 text-right font-black ' + (t.netPnl>=0?'text-green-600':'text-red-600') + '">$' + t.netPnl.toFixed(4) + 'NonNull(',');
             });
         }
 
@@ -1294,6 +1618,21 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             const res = await doAPI('/api/auth/register', 'POST', { name: document.getElementById('reg-name').value, email: document.getElementById('reg-email').value, password: document.getElementById('reg-pass').value });
             if (res.error) document.getElementById('reg-err').innerText = res.error;
             else { authToken = res.token; localStorage.setItem('bot_token', authToken); toggleAuthUI(); nav('dashboard'); }
+        }
+        
+        async function resetAccount() {
+            if(confirm("⚠️ WARNING: This will reset your account to a clean state!\n- Close any open positions\n- Clear all trade history\n- Reset all settings to defaults\n\nThis action cannot be undone. Continue?")) {
+                const res = await doAPI('/api/user/reset-account', 'POST');
+                if(res.error) alert("Reset failed: " + res.error);
+                else {
+                    alert("✅ Account reset successfully! Starting fresh.");
+                    // Refresh dashboard data
+                    if(dashLoop) clearInterval(dashLoop);
+                    setTimeout(() => {
+                        initDashboard();
+                    }, 1000);
+                }
+            }
         }
 
         function handleLiveToggle() { const cb = document.getElementById('liveTrade'); cb.checked = !cb.checked; }
@@ -1318,8 +1657,8 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             await doAPI('/api/user/config', 'POST', payload); alert("CONFIG SYNCED");
         }
 
-        async function closeAll() { if(confirm("ABORT ALL TRADES?")) await doAPI('/api/close-all', 'GET'); }
-        async function resetMetrics() { if(confirm("PURGE DATA?")) { await doAPI('/api/user/reset-metrics', 'POST'); lastTradesCount = -1; fetchMetrics(); } }
+        async function closeAll() { if(confirm("ABORT ALL TRADES?")) await doAPI('/api/close-all', 'POST'); }
+        async function resetMetrics() { if(confirm("PURGE TRADE HISTORY?")) { await doAPI('/api/user/reset-metrics', 'POST'); lastTradesCount = -1; fetchMetrics(); } }
 
         async function fetchAnalyticsData() {
             if(currentPageView !== 'analytics') return;
@@ -1353,7 +1692,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             const me = await doAPI('/api/user/me', 'GET');
             if(!me.error) { document.getElementById('nav-user-name').innerText = me.name; document.getElementById('liveTrade').checked = me.liveTradingEnabled; document.getElementById('apiKey').value = me.apiKey; }
             const history = await doAPI('/api/chart-history', 'GET');
-            if(!history.error) { 
+            if(!history.error && history.length) { 
                 priceChart.data.labels = history.map(()=>""); priceChart.data.datasets[0].data = history.map(p=>p.priceMid);
                 priceChart.update(); 
             }
@@ -1367,7 +1706,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 
             if (currentPageView === 'step-history') {
                 const tbody = document.getElementById("stepHistoryBody");
-                tbody.innerHTML = (data.activePositions[0]?.stepHistory || []).map(s => '<tr class="border-b"><td class="p-5 font-black">'+s.step+'</td><td class="p-5 font-black '+(s.type==='DCA'?'text-red-500':'text-indigo-500')+'">'+s.type+'</td><td class="p-5">$'+s.price.toFixed(8)+'</td><td class="p-5 font-black '+(s.roi>=0?'text-green-600':'text-red-600')+'">'+s.roi.toFixed(2)+'%</td><td class="p-5 text-right text-zinc-400">'+new Date(s.time).toLocaleTimeString()+'</td></tr>').join('') || '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">No Trace Data</td></tr>';
+                tbody.innerHTML = (data.activePositions[0]?.stepHistory || []).map(s => '<tr class="border-b"><td class="p-5 font-black">'+s.step+'</td><td class="p-5 font-black '+(s.type==='DCA'?'text-red-500':'text-indigo-500')+'">'+s.type+'</td><td class="p-5">$'+s.price.toFixed(8)+'</td><td class="p-5 font-black '+(s.roi>=0?'text-green-600':'text-red-600')+'">'+s.roi.toFixed(2)+'%</td><td class="p-5 text-right text-zinc-400">'+new Date(s.time).toLocaleTimeString()+'</td>').join('') || '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">No Trace Data</td></tr>';
             }
 
             if(!settingsLoaded && data.config) {
@@ -1409,10 +1748,10 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             if(data.metrics && data.metrics.totalTradesCount !== lastTradesCount && data.metrics.trades) {
                 lastTradesCount = data.metrics.totalTradesCount;
                 const tbody = document.getElementById("tradeHistoryBody");
-                tbody.innerHTML = [...data.metrics.trades].reverse().slice(0, 10).map(t => '<tr class="border-b"><td class="p-4 text-zinc-400">'+new Date(t.timestamp).toLocaleTimeString()+'</td><td class="p-4 font-black '+(t.side==='long'?'text-green-600':'text-red-600')+'">'+t.side.toUpperCase()+'</td><td class="p-4 font-bold">'+t.contracts.toLocaleString()+'</td><td class="p-4 text-[9px] font-black uppercase text-zinc-300">'+t.exitReason+'</td><td class="p-4 text-right font-black '+(t.netPnl>=0?'text-green-600':'text-red-600')+'">$' + t.netPnl.toFixed(4) + '</td></tr>').join('') || '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">Scanning Tape...</td></tr>';
+                tbody.innerHTML = [...data.metrics.trades].reverse().slice(0, 10).map(t => '<tr class="border-b"><td class="p-4 text-zinc-400">'+new Date(t.timestamp).toLocaleTimeString()+'</td><td class="p-4 font-black '+(t.side==='long'?'text-green-600':'text-red-600')+'">'+t.side.toUpperCase()+'</td><td class="p-4 font-bold">'+t.contracts.toLocaleString()+'</td><td class="p-4 text-[9px] font-black uppercase text-zinc-300">'+t.exitReason+'</td><td class="p-4 text-right font-black '+(t.netPnl>=0?'text-green-600':'text-red-600')+'">$' + t.netPnl.toFixed(4) + 'NonNull(',');
             }
 
-            if(data.binance) { 
+            if(data.binance && data.binance.mid) { 
                 priceChart.data.labels.push(""); 
                 priceChart.data.datasets[0].data.push(data.binance.mid);
                 if(priceChart.data.labels.length > chartPoints) { 
