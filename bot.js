@@ -8,6 +8,7 @@ const crypto = require('crypto');
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
 // ==================== MONGODB SETUP ====================
+// 🚨 SECURITY WARNING: Do not hardcode your DB password. Use .env instead!
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
 
 mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000, socketTimeoutMS: 45000 })
@@ -35,7 +36,7 @@ const TradeModel = mongoose.model('TradeLog_V3', new mongoose.Schema({
 }));
 
 const ChartDataModel = mongoose.model('ChartData_V8', new mongoose.Schema({
-    priceMid: Number, timestamp: { type: Date, default: Date.now, expires: 86400 } 
+    priceMid: Number, mlPlot: Number, timestamp: { type: Date, default: Date.now, expires: 86400 } 
 }));
 
 const AnalyticsModel = mongoose.model('SiteAnalytics_V3', new mongoose.Schema({
@@ -45,23 +46,25 @@ const AnalyticsModel = mongoose.model('SiteAnalytics_V3', new mongoose.Schema({
 
 // ==================== BASE CONFIGURATION ====================
 const CUSTOM_PORT = process.env.PORT || 3000;
+
+// SHIB CONFIGURATION (FORCED 75x LEVERAGE)
 const FORCED_LEVERAGE = 75;
 
 const BASE_CONFIG = {
     htxSymbol: 'SHIB/USDT:USDT',         
     binanceSymbol: '1000SHIB/USDT:USDT', 
     leverage: FORCED_LEVERAGE, 
-    baseContracts: 10,           // START CONTRACTS
+    baseContracts: 10,                 // START CONTRACTS
     contractSize: 1000, 
     marginMode: 'cross', 
     fees: { taker: 0.0004 }, 
     takeProfitPct: 10.0, 
     stopLossPct: -50.0, 
-    dcaRoiThresholdPct: 1.0,    // DCA TRIGGER PERCENTAGE
-    dcaMultiplier: 2.0,         // DCA MULTIPLIER
+    dcaRoiThresholdPct: 1.0,           // DCA TRIGGER PERCENTAGE
+    dcaMultiplier: 2.0,                // DCA MULTIPLIER
     profitRoiThresholdPct: 2.0, 
     profitMultiplier: 2.0, 
-    maxContracts: 5000, 
+    maxContracts: 10000, 
     chartTicks: 800
 };
 
@@ -77,11 +80,13 @@ const publicHtx = new ccxt.pro.htx({ options: { defaultType: 'swap', defaultSubT
 // ==================== SECURITY & AUTH ====================
 function hashPassword(password, salt) { return crypto.scryptSync(password, salt, 64).toString('hex'); }
 function generateToken() { return crypto.randomBytes(32).toString('hex'); }
+
 const tokenCache = new Map();
 
 async function authMiddleware(req, res, next) {
     const token = req.headers['authorization'];
     if (!token) return res.status(401).json({ error: 'Unauthorized' });
+    
     let userEntry = tokenCache.get(token);
     if (!userEntry) {
         const user = await UserModel.findOne({ token });
@@ -89,11 +94,12 @@ async function authMiddleware(req, res, next) {
         userEntry = { user, lastAccessed: Date.now() };
         tokenCache.set(token, userEntry);
     } else userEntry.lastAccessed = Date.now();
+    
     req.user = userEntry.user;
     next();
 }
 
-// ==================== MATH ENGINE ====================
+// ==================== HELPER: CORE MATH ====================
 function calculateTradeMath(side, entryPrice, currentPrice, sizeUsd, leverage, takerFee) {
     const sideMult = side === 'long' ? 1 : -1;
     const grossPnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100 * sideMult;
@@ -102,10 +108,11 @@ function calculateTradeMath(side, entryPrice, currentPrice, sizeUsd, leverage, t
     const grossRoiPct = (grossPnlUsd / margin) * 100;
     const feeCost = sizeUsd * (takerFee * 2);
     const netPnlUsd = grossPnlUsd - feeCost;
+
     return { grossPnlPercent, currentGrossRoi: grossPnlPercent * leverage, grossPnlUsd, grossRoiPct, netPnlUsd, netRoiPct: (netPnlUsd / margin) * 100, feeCost, margin };
 }
 
-// ==================== METRICS ENGINE ====================
+// ==================== METRICS ENGINE (ADDED DGR) ====================
 class PerformanceMetrics {
     constructor(userId) {
         this.userId = userId; this.trades = []; 
@@ -123,8 +130,11 @@ class PerformanceMetrics {
         this.totalNetPnl += trade.netPnl || 0;
         const wins = this.trades.filter(t => t.netPnl > 0).length;
         this.winRate = this.trades.length ? ((wins / this.trades.length) * 100).toFixed(2) : 0;
-        const daysActive = (Date.now() - this.startTime) / (1000 * 60 * 60 * 24);
-        this.dailyGrowthRate = daysActive > 0 ? (this.totalNetPnl / Math.max(1, daysActive)).toFixed(4) : 0;
+        
+        // DGR Calculation
+        const days = (Date.now() - this.startTime) / (1000 * 60 * 60 * 24);
+        this.dailyGrowthRate = days > 0 ? (this.totalNetPnl / Math.max(0.1, days)).toFixed(4) : 0;
+
         if (saveToDb) TradeModel.create({ ...trade, userId: this.userId }).catch(()=>{});
     }
 }
@@ -157,7 +167,10 @@ class UserTradeInstance {
     }
 
     async saveState() {
-        await UserModel.updateOne({ _id: this.userId }, { $set: { activePosition: this.activePositions.length > 0 ? this.activePositions[0] : null, config: this.config } });
+        await UserModel.updateOne(
+            { _id: this.userId },
+            { $set: { activePosition: this.activePositions.length > 0 ? this.activePositions[0] : null, config: this.config } }
+        );
     }
 
     async connectExchange() {
@@ -191,7 +204,7 @@ class UserTradeInstance {
         else if (effectiveRoi <= this.config.stopLossPct) await this.forceClosePosition("STOP_LOSS");
         else {
             const trigger = -(Math.abs(this.config.dcaRoiThresholdPct));
-            if (effectiveRoi <= trigger && Date.now() - (pos.lastDcaTime || 0) > 8000) await this.addDcaPosition();
+            if (effectiveRoi <= trigger && Date.now() - (pos.lastDcaTime || 0) > 10000) await this.addDcaPosition();
         }
     }
 
@@ -201,14 +214,16 @@ class UserTradeInstance {
         try {
             const startC = Number(this.config.baseContracts) || 10;
             let execPrice = side === 'long' ? globalMarketData.binance.ask : globalMarketData.binance.bid;
+            if (!execPrice) execPrice = globalMarketData.binance.mid;
+
             if (this.liveTradingEnabled) {
-                const orderSide = side === 'long' ? 'buy' : 'sell';
-                await this.htx.createMarketOrder(this.config.htxSymbol, orderSide, startC, undefined, { offset: 'open' });
+                await this.htx.createMarketOrder(this.config.htxSymbol, side === 'long' ? 'buy' : 'sell', startC, undefined, { offset: 'open' });
             }
+
             const sizeUsd = startC * this.config.contractSize * execPrice;
             this.activePositions = [{ id: Date.now(), side: side, entryPrice: execPrice, contracts: startC, size: sizeUsd, marginUsed: sizeUsd / FORCED_LEVERAGE, entryTime: Date.now(), isPaper: !this.liveTradingEnabled, lastDcaTime: 0, dcaStep: 0, stepHistory: [{step: 0, type: 'OPEN', price: execPrice, time: Date.now()}] }];
             await this.saveState();
-        } catch (e) { console.error("Manual Open Error:", e.message); } finally { this.isTrading = false; }
+        } catch (e) { console.error("Open Error:", e.message); } finally { this.isTrading = false; }
     }
 
     async addDcaPosition() {
@@ -224,10 +239,10 @@ class UserTradeInstance {
             if (pos.contracts + contractsToAdd > this.config.maxContracts) { this.isTrading = false; return; }
 
             let execPrice = pos.side === 'long' ? globalMarketData.binance.ask : globalMarketData.binance.bid;
-            if (!pos.isPaper && this.liveTradingEnabled) {
-                const orderSide = pos.side === 'long' ? 'buy' : 'sell';
-                await this.htx.createMarketOrder(this.config.htxSymbol, orderSide, contractsToAdd, undefined, { offset: 'open' });
+            if (this.liveTradingEnabled) {
+                await this.htx.createMarketOrder(this.config.htxSymbol, pos.side === 'long' ? 'buy' : 'sell', contractsToAdd, undefined, { offset: 'open' });
             }
+
             const addedSize = contractsToAdd * this.config.contractSize * execPrice;
             pos.entryPrice = ((pos.entryPrice * pos.size) + (execPrice * addedSize)) / (pos.size + addedSize);
             pos.size += addedSize; pos.contracts += contractsToAdd; pos.dcaStep = step + 1; pos.lastDcaTime = Date.now();
@@ -242,9 +257,8 @@ class UserTradeInstance {
         try {
             const pos = this.activePositions[0];
             let exitPrice = pos.side === 'long' ? globalMarketData.binance.bid : globalMarketData.binance.ask;
-            if (!pos.isPaper && this.liveTradingEnabled) {
-                const orderSide = pos.side === 'long' ? 'sell' : 'buy';
-                await this.htx.createMarketOrder(this.config.htxSymbol, orderSide, pos.contracts, undefined, { reduceOnly: true, offset: 'close' });
+            if (this.liveTradingEnabled) {
+                await this.htx.createMarketOrder(this.config.htxSymbol, pos.side === 'long' ? 'sell' : 'buy', pos.contracts, undefined, { reduceOnly: true, offset: 'close' });
             }
             const math = calculateTradeMath(pos.side, pos.entryPrice, exitPrice, pos.size, FORCED_LEVERAGE, this.config.fees.taker);
             this.metrics.recordTrade({ side: pos.side, contracts: pos.contracts, entryPrice: pos.entryPrice, exitPrice, netPnl: math.netPnlUsd, exitReason: reason, timestamp: Date.now() });
@@ -289,18 +303,16 @@ async function startMasterStreams() {
     })();
 }
 
-// ==================== EXPRESS SERVER & API ====================
+// ==================== API ====================
 const app = express(); app.use(express.json());
 
 app.post('/api/auth/register', async (req, res) => {
-    try {
-        const { name, email, password } = req.body;
-        const salt = crypto.randomBytes(16).toString('hex');
-        const user = await UserModel.create({ name, email, passwordHash: hashPassword(password, salt), salt, token: generateToken() });
-        const worker = new UserTradeInstance(user); await worker.initialize();
-        activeWorkers.set(user._id.toString(), worker);
-        res.json({ token: user.token });
-    } catch(e) { res.status(500).json({ error: 'Failed' }); }
+    const { name, email, password } = req.body;
+    const salt = crypto.randomBytes(16).toString('hex');
+    const user = await UserModel.create({ name, email, passwordHash: hashPassword(password, salt), salt, token: generateToken() });
+    const worker = new UserTradeInstance(user); await worker.initialize();
+    activeWorkers.set(user._id.toString(), worker);
+    res.json({ token: user.token });
 });
 
 app.post('/api/auth/login', async (req, res) => {
@@ -348,6 +360,7 @@ app.get('/api/close-all', authMiddleware, async (req, res) => {
     res.json({status: 'ok'}); 
 });
 
+// ==================== FRONTEND UI (MIRROR DESIGN) ====================
 app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -364,8 +377,9 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         .ui-card { background: #ffffff; border-radius: 12px; border: 1px solid #e4e4e7; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
         .input-minimal { width: 100%; border: 1px solid #e4e4e7; border-radius: 8px; padding: 10px; font-size: 14px; outline: none; }
         .btn-primary { background: #09090b; color: #fff; border-radius: 8px; padding: 12px; font-weight: 600; width: 100%; }
-        .btn-long { background: #22c55e; color: #fff; border-radius: 8px; padding: 16px; font-weight: 800; font-size: 18px; flex: 1; }
-        .btn-short { background: #ef4444; color: #fff; border-radius: 8px; padding: 16px; font-weight: 800; font-size: 18px; flex: 1; }
+        .btn-long { background: #22c55e; color: #fff; border-radius: 8px; padding: 16px; font-weight: 800; font-size: 18px; flex: 1; transition: 0.2s; }
+        .btn-short { background: #ef4444; color: #fff; border-radius: 8px; padding: 16px; font-weight: 800; font-size: 18px; flex: 1; transition: 0.2s; }
+        .btn-long:hover, .btn-short:hover { opacity: 0.8; transform: translateY(-2px); }
         .status-pill { padding: 4px 10px; border-radius: 9999px; font-size: 10px; font-weight: 800; text-transform: uppercase; }
         .view-section { display: none; } .active-view { display: block; }
     </style>
@@ -385,7 +399,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 
     <main class="max-w-7xl mx-auto p-6">
         
-        <!-- AUTH -->
         <section id="view-login" class="view-section active-view max-w-md mx-auto pt-20">
             <div class="ui-card p-10 space-y-6">
                 <h2 class="text-3xl font-black italic tracking-tighter">AUTHENTICATE.</h2>
@@ -410,8 +423,8 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         <section id="view-dashboard" class="view-section space-y-8">
             <div class="flex justify-between items-end">
                 <div>
-                    <h2 class="text-4xl font-black italic tracking-tighter">LIVE TERMINAL</h2>
-                    <span id="statusBadge" class="status-pill bg-zinc-100 text-zinc-400">Scanning...</span>
+                    <h1 class="text-6xl md:text-8xl font-black tracking-tight leading-[0.9]">TRADE WITH<br><span class="text-zinc-400 italic">PRECISION.</span></h1>
+                    <span id="statusBadge" class="status-pill bg-zinc-100 text-zinc-400 mt-4 inline-block">Scanning...</span>
                 </div>
                 <div class="flex gap-3">
                     <button onclick="nav('settings')" class="px-4 py-2 bg-white border rounded-md font-bold text-xs flex items-center gap-2"><span class="material-symbols-outlined text-[16px]">settings</span> SETTINGS</button>
@@ -423,20 +436,20 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 <div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">DGR (DAILY GROWTH)</p><p id="dgrStat" class="text-3xl font-mono font-black text-indigo-600">$0.0000</p></div>
                 <div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">TOTAL NET PNL</p><p id="netPnl" class="text-3xl font-mono font-black">$0.0000</p></div>
                 <div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">WALLET BALANCE</p><p id="walletBal" class="text-3xl font-mono font-black">$0.0000</p></div>
-                <div class="ui-card p-6 bg-zinc-950 border-zinc-950"><p class="text-[10px] font-black text-zinc-500 uppercase tracking-widest mb-1">LIVE POSITION ROI</p><p id="activeRoi" class="text-3xl font-mono font-black text-white">IDLE</p></div>
+                <div class="ui-card p-6 bg-zinc-950 border-zinc-950 shadow-xl shadow-zinc-200"><p class="text-[10px] font-black text-zinc-500 uppercase tracking-widest mb-1">LIVE POSITION ROI</p><p id="activeRoi" class="text-3xl font-mono font-black text-white">IDLE</p></div>
             </div>
 
             <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
                 <div class="lg:col-span-8 space-y-8">
-                    <div class="ui-card p-6 h-[400px]"><canvas id="mainChart"></canvas></div>
+                    <div class="ui-card p-6 h-[450px]"><canvas id="mainChart"></canvas></div>
                     <div class="flex gap-4">
-                        <button onclick="openTrade('long')" class="btn-long shadow-lg shadow-green-100">OPEN LONG</button>
-                        <button onclick="openTrade('short')" class="btn-short shadow-lg shadow-red-100">OPEN SHORT</button>
+                        <button onclick="openTrade('long')" class="btn-long shadow-xl shadow-green-100">OPEN LONG <span class="material-symbols-outlined align-middle">trending_up</span></button>
+                        <button onclick="openTrade('short')" class="btn-short shadow-xl shadow-red-100">OPEN SHORT <span class="material-symbols-outlined align-middle">trending_down</span></button>
                     </div>
                 </div>
                 <aside class="lg:col-span-4 space-y-6">
-                    <div class="ui-card p-8 border-t-4 border-t-indigo-600">
-                        <h3 class="text-xs font-black uppercase tracking-widest mb-6 border-b pb-4">Strategy Config</h3>
+                    <div class="ui-card p-8 border-t-4 border-t-zinc-950">
+                        <h3 class="text-xs font-black uppercase tracking-widest mb-6 border-b pb-4">Strategy Parameters</h3>
                         <div class="space-y-4">
                             <div><label class="text-[10px] font-black text-zinc-400 uppercase">Start Contracts</label><input type="number" id="cfg-base" class="input-minimal font-mono"></div>
                             <div><label class="text-[10px] font-black text-zinc-400 uppercase">DCA Multiplier</label><input type="number" step="0.1" id="cfg-mult" class="input-minimal font-mono"></div>
@@ -445,7 +458,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                                 <div><label class="text-[10px] font-black text-zinc-400 uppercase">TP %</label><input type="number" id="cfg-tp" class="input-minimal font-mono"></div>
                                 <div><label class="text-[10px] font-black text-zinc-400 uppercase">SL %</label><input type="number" id="cfg-sl" class="input-minimal font-mono"></div>
                             </div>
-                            <button onclick="saveConfig()" class="btn-primary mt-2">SAVE STRATEGY</button>
+                            <button onclick="saveConfig()" class="btn-primary mt-2 italic">APPLY STRATEGY</button>
                         </div>
                     </div>
                 </aside>
@@ -462,7 +475,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 <div><label class="text-[10px] font-black text-zinc-400 uppercase">HTX API Key</label><input type="password" id="apiKey" class="input-minimal font-mono"></div>
                 <div><label class="text-[10px] font-black text-zinc-400 uppercase">HTX Secret</label><input type="password" id="apiSecret" class="input-minimal font-mono"></div>
                 <button onclick="saveKeys()" class="btn-primary">ESTABLISH CONNECTION</button>
-                <button onclick="nav('dashboard')" class="w-full text-[10px] font-bold text-zinc-400 uppercase">Back to Terminal</button>
             </div>
         </section>
 
@@ -470,8 +482,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 
     <script>
         let authToken = localStorage.getItem('bt_token');
-        const ctx = document.getElementById('mainChart').getContext('2d');
-        const chart = new Chart(ctx, { type: 'line', data: { labels: [], datasets: [{ label: 'SHIB', data: [], borderColor: '#09090b', borderWidth: 2, pointRadius: 0, tension: 0.1 }] }, options: { maintainAspectRatio: false, animation: false, scales: { x: { display: false } } } });
+        const chart = new Chart(document.getElementById('mainChart').getContext('2d'), { type: 'line', data: { labels: [], datasets: [{ label: 'SHIB', data: [], borderColor: '#09090b', borderWidth: 2, pointRadius: 0, tension: 0.1 }] }, options: { maintainAspectRatio: false, animation: false, scales: { x: { display: false } } } });
 
         function nav(id) { document.querySelectorAll('.view-section').forEach(s => s.classList.remove('active-view')); document.getElementById('view-'+id).classList.add('active-view'); if(id==='dashboard') initDash(); }
         function logout() { localStorage.removeItem('bt_token'); location.reload(); }
@@ -501,26 +512,24 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 
         async function saveConfig() {
             await fetch('/api/user/config', { method: 'POST', headers: {'Content-Type': 'application/json', 'Authorization': authToken}, body: JSON.stringify({ baseContracts: document.getElementById('cfg-base').value, dcaMultiplier: document.getElementById('cfg-mult').value, dcaTrigger: document.getElementById('cfg-trigger').value, tpPct: document.getElementById('cfg-tp').value, slPct: document.getElementById('cfg-sl').value }) });
-            alert("STRATEGY SAVED");
+            alert("STRATEGY SYNCED");
         }
 
         async function saveKeys() {
             await fetch('/api/user/keys', { method: 'POST', headers: {'Content-Type': 'application/json', 'Authorization': authToken}, body: JSON.stringify({ apiKey: document.getElementById('apiKey').value, apiSecret: document.getElementById('apiSecret').value, liveTradingEnabled: document.getElementById('liveTrade').checked }) });
-            alert("KEYS UPDATED");
+            alert("KEYS SECURED");
         }
 
         async function openTrade(side) { await fetch('/api/open/'+side, { headers: {'Authorization': authToken} }); }
-        async function closeAll() { if(confirm("ABORT POSITION?")) await fetch('/api/close-all', { headers: {'Authorization': authToken} }); }
+        async function closeAll() { if(confirm("ABORT ALL TRADES?")) await fetch('/api/close-all', { headers: {'Authorization': authToken} }); }
 
         async function updateData() {
             if(!authToken) return;
             const res = await fetch('/api/data', { headers: {'Authorization': authToken} });
             const data = await res.json(); if(!data.metrics) return;
-            
             document.getElementById('netPnl').innerText = '$' + data.metrics.totalNetPnl.toFixed(4);
             document.getElementById('dgrStat').innerText = '$' + data.metrics.dailyGrowthRate;
-            document.getElementById('walletBal').innerText = '$' + Number(data.walletBalance).toFixed(2);
-            
+            document.getElementById('walletBal').innerText = '$' + Number(data.walletBalance).toFixed(4);
             if(data.activePositions.length > 0) {
                 const p = data.activePositions[0];
                 document.getElementById('activeRoi').innerText = (p.exchangeROI || 0).toFixed(2) + '%';
@@ -533,7 +542,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 document.getElementById('statusBadge').innerText = 'SCANNING MARKET';
                 document.getElementById('statusBadge').className = 'status-pill bg-zinc-100 text-zinc-400';
             }
-
             if(data.binance) {
                 chart.data.labels.push(''); chart.data.datasets[0].data.push(data.binance.mid);
                 if(chart.data.labels.length > 100) { chart.data.labels.shift(); chart.data.datasets[0].data.shift(); }
@@ -546,7 +554,6 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 </body>
 </html>`)});
 
-// ==================== APP INITIALIZATION ====================
 app.listen(CUSTOM_PORT, async () => {
     console.log(`✅ Server running on port ${CUSTOM_PORT}`);
     const users = await UserModel.find({});
