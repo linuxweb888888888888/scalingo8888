@@ -1507,7 +1507,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 
                             <div class="flex justify-between items-center" title="Contract multiplier per scale step in profit (e.g., 2.0 doubles size).">
                                 <label class="text-sm font-medium text-gray-500">Profit Step Multiplier</label>
-                                <input type="number" id="profitMultiplierSens" step="0.1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-200" disabled>
+                                <input type="number" id="profitMultiplierSens" step="0.1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-200" disabled>
                             </div>
 
                             <div class="flex justify-between items-center" title="Maximum contracts allowed for Profit Scaling. Loss DCA is unlimited.">
@@ -1526,6 +1526,76 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                             <button onclick="saveConfig()" class="btn-primary w-full mt-6 py-3 text-sm tracking-wide shadow-sm flex items-center justify-center gap-2"><span class="material-symbols-outlined text-[18px]">save</span> Update Strategy</button>
                         </div>
                     </div>
+
+                    <!-- ==================== DGR SETTINGS CARD (NEW) ==================== -->
+                    <div class="ui-card p-6 border border-gray-100">
+                        <h3 class="text-base font-bold mb-5 flex items-center gap-2 pb-3 border-b border-gray-50">
+                            <span class="material-symbols-outlined text-[20px] text-gray-500">trending_up</span> 
+                            Daily Growth Rate (DGR) Targeting
+                        </h3>
+                        
+                        <div class="space-y-4">
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="text-xs font-semibold text-gray-500 mb-1 block">Time Unit</label>
+                                    <select id="dgrTimeUnit" class="input-minimal w-full font-mono text-gray-700" onchange="updateDgrEstimate()">
+                                        <option value="minute">Minute</option>
+                                        <option value="minute10">10 Minutes</option>
+                                        <option value="minute30">30 Minutes</option>
+                                        <option value="hour">Hour</option>
+                                        <option value="hour2">2 Hours</option>
+                                        <option value="hour10">10 Hours</option>
+                                        <option value="day">Day</option>
+                                        <option value="week">Week</option>
+                                        <option value="month">Month</option>
+                                        <option value="year">Year</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="text-xs font-semibold text-gray-500 mb-1 block">Growth Rate (%)</label>
+                                    <input type="number" id="dgrRate" step="0.1" class="input-minimal w-full font-mono text-green-600" value="1.0" oninput="updateDgrEstimate()">
+                                </div>
+                            </div>
+                            
+                            <div>
+                                <label class="text-xs font-semibold text-gray-500 mb-1 block">Target Time Value</label>
+                                <input type="number" id="dgrTargetValue" step="1" class="input-minimal w-full font-mono text-blue-600" value="1" oninput="updateDgrEstimate()">
+                            </div>
+                            
+                            <div class="bg-gray-50 rounded-lg p-4 space-y-2">
+                                <div class="flex justify-between items-center text-sm">
+                                    <span class="text-gray-600">Estimated Growth:</span>
+                                    <span id="dgrEstimate" class="font-mono font-bold text-green-600">0.00%</span>
+                                </div>
+                                <div class="flex justify-between items-center text-sm">
+                                    <span class="text-gray-600">Target Return:</span>
+                                    <span id="dgrTargetReturn" class="font-mono font-bold text-blue-600">$0.00</span>
+                                </div>
+                                <div class="flex justify-between items-center text-sm">
+                                    <span class="text-gray-600">Capital Needed:</span>
+                                    <span id="dgrCapitalNeeded" class="font-mono font-bold text-purple-600">$0.00</span>
+                                </div>
+                                <div class="flex justify-between items-center text-sm border-t border-gray-200 pt-2 mt-2">
+                                    <span class="text-gray-600">Est. Daily Return:</span>
+                                    <span id="dgrDailyReturn" class="font-mono font-bold text-green-600">0.00%</span>
+                                </div>
+                                <div class="flex justify-between items-center text-sm">
+                                    <span class="text-gray-600">Est. Monthly Return:</span>
+                                    <span id="dgrMonthlyReturn" class="font-mono font-bold text-green-600">0.00%</span>
+                                </div>
+                                <div class="flex justify-between items-center text-sm">
+                                    <span class="text-gray-600">Est. Yearly Return:</span>
+                                    <span id="dgrYearlyReturn" class="font-mono font-bold text-green-600">0.00%</span>
+                                </div>
+                            </div>
+                            
+                            <button onclick="applyDgrSettings()" class="btn-primary w-full py-2 text-sm tracking-wide shadow-sm flex items-center justify-center gap-2">
+                                <span class="material-symbols-outlined text-[18px]">calculate</span> 
+                                Apply Growth Settings
+                            </button>
+                        </div>
+                    </div>
+                    <!-- ==================== END DGR SETTINGS CARD ==================== -->
                 </div>
             </div>
         </section>
@@ -1638,13 +1708,13 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 ticks: document.getElementById('btTicks').value, tpPct: document.getElementById('btTp').value,
                 slPct: document.getElementById('btSl').value, baseContracts: document.getElementById('btBase').value,
                 mlLookback: document.getElementById('btMlLookback').value, mlThreshold: document.getElementById('btMlThreshold').value,
-                mlAverageTicks: document.getElementById('btMlAvgTicks').value, mlUseAverage: document.getElementById('btMlUseAverageSens').value,
-                flipOnlyInProfit: document.getElementById('flipOnlyInProfitSens').value, flipThresholdPct: document.getElementById('flipThresholdSens').value,
-                dcaRoiThresholdPct: document.getElementById('dcaRoiThresholdSens').value, 
-                dcaMultiplier: document.getElementById('dcaMultiplierSens').value,
-                profitRoiThresholdPct: document.getElementById('profitRoiThresholdSens').value,
-                profitMultiplier: document.getElementById('profitMultiplierSens').value,
-                maxContracts: document.getElementById('maxContractsSens').value
+                mlAverageTicks: document.getElementById('btMlAvgTicks').value, mlUseAverage: document.getElementById('btMlUseAvg').value,
+                flipOnlyInProfit: document.getElementById('btFlipOnlyInProfit').value, flipThresholdPct: document.getElementById('btFlipThreshold').value,
+                dcaRoiThresholdPct: document.getElementById('btDcaRoiThreshold').value, 
+                dcaMultiplier: document.getElementById('btDcaMultiplier').value,
+                profitRoiThresholdPct: document.getElementById('btProfitRoiThreshold').value,
+                profitMultiplier: document.getElementById('btProfitMultiplier').value,
+                maxContracts: document.getElementById('btMaxContracts').value
             };
 
             const res = await doAPI('/api/backtest', 'POST', payload);
@@ -1805,13 +1875,83 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             dashLoop = setInterval(fetchMetrics, 300); fetchMetrics();
         }
 
+        // ==================== DGR FUNCTIONS (NEW) ====================
+        function updateDgrEstimate() {
+            const timeUnit = document.getElementById('dgrTimeUnit').value;
+            const rate = parseFloat(document.getElementById('dgrRate').value) || 0;
+            const targetValue = parseInt(document.getElementById('dgrTargetValue').value) || 1;
+            
+            let multiplier = 1;
+            switch(timeUnit) {
+                case 'minute': multiplier = 1440 * targetValue; break;
+                case 'minute10': multiplier = 144 * targetValue; break;
+                case 'minute30': multiplier = 48 * targetValue; break;
+                case 'hour': multiplier = 24 * targetValue; break;
+                case 'hour2': multiplier = 12 * targetValue; break;
+                case 'hour10': multiplier = 2.4 * targetValue; break;
+                case 'day': multiplier = targetValue; break;
+                case 'week': multiplier = targetValue / 7; break;
+                case 'month': multiplier = targetValue / 30; break;
+                case 'year': multiplier = targetValue / 365; break;
+                default: multiplier = targetValue;
+            }
+            
+            const dailyGrowthPct = (Math.pow(1 + (rate / 100), multiplier) - 1) * 100;
+            const monthlyGrowthPct = (Math.pow(1 + dailyGrowthPct / 100, 30) - 1) * 100;
+            const yearlyGrowthPct = (Math.pow(1 + dailyGrowthPct / 100, 365) - 1) * 100;
+            
+            document.getElementById('dgrEstimate').innerText = dailyGrowthPct.toFixed(2) + '%';
+            document.getElementById('dgrDailyReturn').innerText = dailyGrowthPct.toFixed(2) + '%';
+            document.getElementById('dgrMonthlyReturn').innerText = monthlyGrowthPct.toFixed(2) + '%';
+            document.getElementById('dgrYearlyReturn').innerText = yearlyGrowthPct.toFixed(2) + '%';
+            
+            const currentBalanceElem = document.getElementById('marginUsed');
+            const currentBalance = currentBalanceElem ? parseFloat(currentBalanceElem.innerText.replace('$', '')) || 100 : 100;
+            const targetReturnAmount = (currentBalance * dailyGrowthPct) / 100;
+            
+            document.getElementById('dgrTargetReturn').innerHTML = '$' + targetReturnAmount.toFixed(4);
+            
+            const desiredDailyReturn = 100;
+            const capitalNeeded = (desiredDailyReturn * 100) / dailyGrowthPct;
+            document.getElementById('dgrCapitalNeeded').innerHTML = '$' + (isFinite(capitalNeeded) ? capitalNeeded.toFixed(2) : '∞');
+        }
+
+        function applyDgrSettings() {
+            const timeUnit = document.getElementById('dgrTimeUnit').value;
+            const rate = parseFloat(document.getElementById('dgrRate').value) || 0;
+            const targetValue = parseInt(document.getElementById('dgrTargetValue').value) || 1;
+            
+            let multiplier = 1;
+            switch(timeUnit) {
+                case 'minute': multiplier = 1440 * targetValue; break;
+                case 'minute10': multiplier = 144 * targetValue; break;
+                case 'minute30': multiplier = 48 * targetValue; break;
+                case 'hour': multiplier = 24 * targetValue; break;
+                case 'hour2': multiplier = 12 * targetValue; break;
+                case 'hour10': multiplier = 2.4 * targetValue; break;
+                case 'day': multiplier = targetValue; break;
+                case 'week': multiplier = targetValue / 7; break;
+                case 'month': multiplier = targetValue / 30; break;
+                case 'year': multiplier = targetValue / 365; break;
+                default: multiplier = targetValue;
+            }
+            
+            const dailyGrowthPct = (Math.pow(1 + (rate / 100), multiplier) - 1) * 100;
+            const requiredTpPct = (Math.pow(1 + dailyGrowthPct / 100, 1 / 24) - 1) * 100;
+            
+            if(confirm(`Set Take Profit to ${requiredTpPct.toFixed(2)}% to achieve ${dailyGrowthPct.toFixed(2)}% daily growth?`)) {
+                document.getElementById('tpPctSens').value = requiredTpPct.toFixed(2);
+                saveConfig();
+            }
+        }
+        // ==================== END DGR FUNCTIONS ====================
+
         async function fetchMetrics() {
             if(document.getElementById('view-dashboard').classList.contains('active-view') === false && 
                document.getElementById('view-step-history').classList.contains('active-view') === false) return;
 
             const data = await doAPI('/api/data', 'GET'); if(data.error) return;
 
-            // INJECTED: REFRESH STEP HISTORY TABLE IF VIEW IS ACTIVE
             if (document.getElementById('view-step-history').classList.contains('active-view')) {
                 const tbody = document.getElementById("stepHistoryBody");
                 if (data.activePositions.length > 0 && data.activePositions[0].stepHistory) {
@@ -1852,6 +1992,9 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             document.getElementById("profitMultiplierSens").value = Number(data.walletBalance || 0) * 1;
             document.getElementById("maxContractsSens").value = Number(data.walletBalance || 0) * 2;
             document.getElementById("baseContracts").value = Number(data.walletBalance || 0) * 1000;
+
+            // Update DGR estimate when wallet balance changes
+            if(document.getElementById('dgrTimeUnit')) updateDgrEstimate();
 
             const badge = document.getElementById("statusBadge");
             if(data.activePositions.length > 0) {
