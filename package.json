@@ -1,26 +1,27 @@
 {
-  "name": "tradebot-pille",
-  "version": "3.0.0",
-  "description": "SHIB AI Mathematical Trading Engine with HTX Integration",
+  "name": "tradebotpille-dual-acc",
+  "version": "4.0.0",
+  "description": "Dual-Account Hedged SHIB Trading Engine with ML logic",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js"
+    "start": "node index.js"
   },
   "keywords": [
     "trading",
     "bot",
+    "shib",
+    "htx",
+    "binance",
     "ccxt",
-    "machine-learning",
-    "crypto",
-    "shib"
+    "machine-learning"
   ],
-  "author": "",
+  "author": "TradeBotPille",
   "license": "ISC",
   "dependencies": {
     "ccxt": "^4.2.0",
-    "express": "^4.18.2",
-    "mongoose": "^8.0.0"
+    "dotenv": "^16.4.5",
+    "express": "^4.18.3",
+    "mongoose": "^8.2.1"
   },
   "engines": {
     "node": ">=18.0.0"
