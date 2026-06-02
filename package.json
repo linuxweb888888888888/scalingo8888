@@ -1,29 +1,31 @@
 {
-  "name": "tradebotpille-dual-acc",
-  "version": "4.0.0",
-  "description": "Dual-Account Hedged SHIB Trading Engine with ML logic",
+  "name": "tradebotpille-dca-engine",
+  "version": "3.0.0",
+  "description": "SHIB DCA Trading Bot with 75x Leverage on HTX",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
-  },
-  "keywords": [
-    "trading",
-    "bot",
-    "shib",
-    "htx",
-    "binance",
-    "ccxt",
-    "machine-learning"
-  ],
-  "author": "TradeBotPille",
-  "license": "ISC",
-  "dependencies": {
-    "ccxt": "^4.2.0",
-    "dotenv": "^16.4.5",
-    "express": "^4.18.3",
-    "mongoose": "^8.2.1"
+    "start": "node index.js",
+    "security-check": "npm audit"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  },
+  "keywords": [
+    "trading-bot",
+    "cryptocurrency",
+    "dca",
+    "htx",
+    "binance",
+    "shib",
+    "futures-trading"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "ccxt": "^4.2.55",
+    "express": "^4.18.2",
+    "mongoose": "^7.5.0",
+    "express-rate-limit": "^6.10.0"
   }
 }
