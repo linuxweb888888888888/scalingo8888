@@ -1502,6 +1502,10 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         let chartPoints = 800;
         let currentAccount = 'main';
         let currentStepAccount = 'main';
+        let lastMainTradesCount = -1;
+        let lastSecondTradesCount = -1;
+        let lastMainPositions = null;
+        let lastSecondPositions = null;
 
         let sessionTrackId = localStorage.getItem('rdca_visitor_id');
         if (!sessionTrackId) {
@@ -1519,11 +1523,21 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active-view'));
             document.getElementById('view-' + viewId).classList.add('active-view');
             window.scrollTo(0,0);
-            currentPageView = viewId; pingAnalytics(true); 
+            currentPageView = viewId; 
+            pingAnalytics(true); 
 
-            if(viewId === 'dashboard' && authToken) initDashboard();
+            if(viewId === 'dashboard' && authToken) {
+                initDashboard();
+                fetchMetrics();
+                if (window.dashInterval) clearInterval(window.dashInterval);
+                window.dashInterval = setInterval(fetchMetrics, 1000);
+            }
             if(viewId === 'analytics') fetchAnalyticsData();
             if(viewId === 'step-history' && authToken) fetchStepHistory();
+            if(viewId !== 'dashboard' && window.dashInterval) {
+                clearInterval(window.dashInterval);
+                window.dashInterval = null;
+            }
         }
 
         function switchAccount(account) {
@@ -1534,6 +1548,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             document.getElementById('tab-second').classList.toggle('active', account === 'second');
             document.getElementById('tab-main').classList.toggle('text-zinc-400', account !== 'main');
             document.getElementById('tab-second').classList.toggle('text-zinc-400', account !== 'second');
+            fetchMetrics(); // Refresh when switching
         }
         
         function switchStepAccount(account) {
@@ -1546,26 +1561,42 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         }
 
         function toggleAuthUI() {
-            if (authToken) { document.getElementById('nav-public').classList.add('hidden'); document.getElementById('nav-private').classList.remove('hidden'); document.getElementById('nav-private').classList.add('flex'); } 
-            else { document.getElementById('nav-public').classList.remove('hidden'); document.getElementById('nav-private').classList.add('hidden'); document.getElementById('nav-private').classList.remove('flex'); }
+            if (authToken) { 
+                document.getElementById('nav-public').classList.add('hidden'); 
+                document.getElementById('nav-private').classList.remove('hidden'); 
+                document.getElementById('nav-private').classList.add('flex'); 
+            } else { 
+                document.getElementById('nav-public').classList.remove('hidden'); 
+                document.getElementById('nav-private').classList.add('hidden'); 
+                document.getElementById('nav-private').classList.remove('flex'); 
+            }
         }
 
-        function logout() { localStorage.removeItem('bot_token'); authToken = null; toggleAuthUI(); nav('home'); }
+        function logout() { 
+            localStorage.removeItem('bot_token'); 
+            authToken = null; 
+            toggleAuthUI(); 
+            nav('home'); 
+            if (window.dashInterval) clearInterval(window.dashInterval);
+        }
 
         async function doAPI(endpoint, method, body) {
             const headers = { 'Content-Type': 'application/json' };
             if (authToken) headers['Authorization'] = authToken;
             const res = await fetch(endpoint, { method, headers, body: body ? JSON.stringify(body) : undefined });
             const data = await res.json();
-            if (res.status === 401) { logout(); return { error: "Session expired" }; }
-            if (res.status === 403) { return { error: data.error, isForbidden: true }; }
+            if (res.status === 401) { 
+                logout(); 
+                return { error: "Session expired" }; 
+            }
             return data;
         }
 
         async function runBacktest() {
             document.getElementById('btResTrades').innerText = "...";
             const payload = {
-                ticks: document.getElementById('btTicks').value, tpPct: document.getElementById('btTp').value,
+                ticks: document.getElementById('btTicks').value, 
+                tpPct: document.getElementById('btTp').value,
                 slPct: document.getElementById('btSl').value,
                 dcaTriggerPct: document.getElementById('btDcaTrigger').value,
                 dcaMultiplier: document.getElementById('btDcaMultiplier').value,
@@ -1577,25 +1608,49 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             const res = await doAPI('/api/backtest', 'POST', payload);
             if(res.error) return;
             document.getElementById('btResWinrate').innerText = res.winRate + "%";
-            document.getElementById('btResPnl').innerText = "$" + res.netPnl.toFixed(4);
-            document.getElementById('btResTrades').innerText = res.totalTradesCount;
+            document.getElementById('btResPnl').innerText = "$" + (res.netPnl || 0).toFixed(4);
+            document.getElementById('btResTrades').innerText = res.totalTradesCount || 0;
             document.getElementById('btResDeposit').innerText = "$" + (res.depositNeeded || 0).toFixed(4);
-            const tbody = document.getElementById('btTableBody'); tbody.innerHTML = "";
-            [...res.trades].reverse().forEach(t => {
-                tbody.innerHTML += '<tr class="border-b"><td class="p-4 font-black ' + (t.side==='long'?'text-green-600':'text-red-600') + '">' + t.side.toUpperCase() + '<tr><td class="p-4">' + t.contracts + '</td><td class="p-4 text-[9px] uppercase font-bold text-zinc-400">' + t.exitReason + '</td><td class="p-4 text-right font-black ' + (t.netPnl>=0?'text-green-600':'text-red-600') + '">$' + t.netPnl.toFixed(4) + '</td></tr>';
-            });
+            const tbody = document.getElementById('btTableBody'); 
+            tbody.innerHTML = "";
+            if (res.trades && res.trades.length) {
+                [...res.trades].reverse().forEach(t => {
+                    tbody.innerHTML += '<tr class="border-b"><td class="p-4 font-black ' + (t.side==='long'?'text-green-600':'text-red-600') + '">' + t.side.toUpperCase() + '</td><td class="p-4">' + t.contracts + '</td><td class="p-4 text-[9px] uppercase font-bold text-zinc-400">' + t.exitReason + '</td><td class="p-4 text-right font-black ' + (t.netPnl>=0?'text-green-600':'text-red-600') + '">$' + (t.netPnl || 0).toFixed(4) + '</td></tr>';
+                });
+            } else {
+                tbody.innerHTML = '<tr><td colspan="4" class="p-20 text-center font-black uppercase text-zinc-300">No Trades in Simulation</td></tr>';
+            }
         }
 
         async function doLogin() {
-            const res = await doAPI('/api/auth/login', 'POST', { email: document.getElementById('login-email').value, password: document.getElementById('login-pass').value });
-            if (res.error) document.getElementById('login-err').innerText = res.error;
-            else { authToken = res.token; localStorage.setItem('bot_token', authToken); toggleAuthUI(); nav('dashboard'); }
+            const res = await doAPI('/api/auth/login', 'POST', { 
+                email: document.getElementById('login-email').value, 
+                password: document.getElementById('login-pass').value 
+            });
+            if (res.error) {
+                document.getElementById('login-err').innerText = res.error;
+            } else { 
+                authToken = res.token; 
+                localStorage.setItem('bot_token', authToken); 
+                toggleAuthUI(); 
+                nav('dashboard'); 
+            }
         }
 
         async function doRegister() {
-            const res = await doAPI('/api/auth/register', 'POST', { name: document.getElementById('reg-name').value, email: document.getElementById('reg-email').value, password: document.getElementById('reg-pass').value });
-            if (res.error) document.getElementById('reg-err').innerText = res.error;
-            else { authToken = res.token; localStorage.setItem('bot_token', authToken); toggleAuthUI(); nav('dashboard'); }
+            const res = await doAPI('/api/auth/register', 'POST', { 
+                name: document.getElementById('reg-name').value, 
+                email: document.getElementById('reg-email').value, 
+                password: document.getElementById('reg-pass').value 
+            });
+            if (res.error) {
+                document.getElementById('reg-err').innerText = res.error;
+            } else { 
+                authToken = res.token; 
+                localStorage.setItem('bot_token', authToken); 
+                toggleAuthUI(); 
+                nav('dashboard'); 
+            }
         }
 
         function toggleLive(account) { 
@@ -1605,113 +1660,140 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 
         async function saveApiKeys(account) {
             const isSecondAccount = account === 'second';
-            const res = await doAPI('/api/user/keys', 'POST', { 
+            const payload = { 
                 apiKey: document.getElementById(account + '-apiKey').value, 
                 apiSecret: document.getElementById(account + '-apiSecret').value, 
                 liveTradingEnabled: document.getElementById(account + '-liveTrade').checked,
                 isSecondAccount: isSecondAccount
-            });
+            };
+            const res = await doAPI('/api/user/keys', 'POST', payload);
             document.getElementById('key-msg').innerText = res.error ? res.error : "KEYS SECURED FOR " + account.toUpperCase();
-            if(!res.error) setTimeout(() => nav('dashboard'), 1500);
+            if(!res.error) {
+                setTimeout(() => nav('dashboard'), 1500);
+                fetchMetrics();
+            }
         }
 
         async function saveConfig(account) {
             const isSecondAccount = account === 'second';
             const payload = { 
-                tpPct: document.getElementById(account + "-tpPctSens").value, 
-                slPct: document.getElementById(account + "-slPctSens").value,
-                dcaTriggerPct: document.getElementById(account + "-dcaTriggerSens").value,
-                dcaMultiplier: document.getElementById(account + "-dcaMultiplierSens").value,
-                startContracts: document.getElementById(account + "-startContractsSens").value,
-                dgrDailyGrowthRate: document.getElementById(account + "-dgrSens").value,
+                tpPct: parseFloat(document.getElementById(account + "-tpPctSens").value) || 10.0,
+                slPct: parseFloat(document.getElementById(account + "-slPctSens").value) || -50.0,
+                dcaTriggerPct: parseFloat(document.getElementById(account + "-dcaTriggerSens").value) || 1.0,
+                dcaMultiplier: parseFloat(document.getElementById(account + "-dcaMultiplierSens").value) || 2.0,
+                startContracts: parseInt(document.getElementById(account + "-startContractsSens").value) || 1,
+                dgrDailyGrowthRate: parseFloat(document.getElementById(account + "-dgrSens").value) || 0.0,
                 manualDirection: document.getElementById(account + "-directionSens").value,
-                maxContracts: document.getElementById(account + "-maxContractsSens").value,
+                maxContracts: parseInt(document.getElementById(account + "-maxContractsSens").value) || 100,
                 isSecondAccount: isSecondAccount
             };
-            await doAPI('/api/user/config', 'POST', payload); 
-            alert("CONFIG SYNCED FOR " + account.toUpperCase());
+            const res = await doAPI('/api/user/config', 'POST', payload); 
+            if (!res.error) {
+                alert("CONFIG SYNCED FOR " + account.toUpperCase());
+                fetchMetrics();
+            } else {
+                alert("Error: " + res.error);
+            }
         }
 
         async function closeAccount(account) { 
             if(confirm("ABORT ALL TRADES FOR " + account.toUpperCase() + "?")) {
                 await doAPI('/api/user/close-all', 'POST', { isSecondAccount: account === 'second' });
+                setTimeout(() => fetchMetrics(), 500);
             }
         }
         
         async function resetMetrics(account) { 
-            if(confirm("PURGE DATA FOR " + account.toUpperCase() + "?")) { 
+            if(confirm("PURGE TRADE HISTORY FOR " + account.toUpperCase() + "?")) { 
                 await doAPI('/api/user/reset-metrics', 'POST', { isSecondAccount: account === 'second' }); 
+                if (account === 'main') lastMainTradesCount = -1;
+                else lastSecondTradesCount = -1;
                 fetchMetrics(); 
             } 
         }
 
         async function fetchAnalyticsData() {
             if(currentPageView !== 'analytics') return;
-            const data = await (await fetch('/api/analytics/stats')).json();
-            document.getElementById('stat-online').innerText = data.online; 
-            document.getElementById('stat-views').innerText = data.views; 
-            document.getElementById('stat-uniques').innerText = data.uniques;
-            document.getElementById('stat-pages').innerHTML = Object.entries(data.pages).map(([n, c]) => '<div class="flex justify-between p-4"><span class="font-black text-[10px] uppercase tracking-widest text-zinc-500">'+n+'</span><span class="font-mono font-bold">'+c+' OPS</span></div>').join('');
+            try {
+                const data = await (await fetch('/api/analytics/stats')).json();
+                document.getElementById('stat-online').innerText = data.online || 0; 
+                document.getElementById('stat-views').innerText = data.views || 0; 
+                document.getElementById('stat-uniques').innerText = data.uniques || 0;
+                document.getElementById('stat-pages').innerHTML = Object.entries(data.pages || {}).map(([n, c]) => '<div class="flex justify-between p-4"><span class="font-black text-[10px] uppercase tracking-widest text-zinc-500">'+n+'</span><span class="font-mono font-bold">'+c+' OPS</span></div>').join('');
+            } catch(e) {}
         }
 
-        const ctx = document.getElementById("priceChart").getContext("2d");
-        const priceChart = new Chart(ctx, {
-            type: "line", 
-            data: { 
-                labels: [], 
-                datasets: [
-                    { label: "Price", data: [], borderColor: "#09090b", borderWidth: 2, pointRadius: 0, tension: 0.1, yAxisID: 'y' }
-                ] 
-            },
-            options: { 
-                responsive: true, maintainAspectRatio: false, animation: false, 
-                scales: { 
-                    x: { display: false },
-                    y: { display: true, position: 'left', grid: { display: false }, ticks: { font: { family: "JetBrains Mono", size: 9 } } }
-                }, 
-                plugins: { legend: { display: false } } 
-            }
-        });
-
-        let dashLoop = null, settingsLoaded = { main: false, second: false };
+        // Initialize chart
+        let priceChart = null;
+        function initPriceChart() {
+            const ctx = document.getElementById("priceChart").getContext("2d");
+            priceChart = new Chart(ctx, {
+                type: "line", 
+                data: { 
+                    labels: [], 
+                    datasets: [
+                        { label: "Price", data: [], borderColor: "#09090b", borderWidth: 2, pointRadius: 0, tension: 0.1, yAxisID: 'y' }
+                    ] 
+                },
+                options: { 
+                    responsive: true, 
+                    maintainAspectRatio: false, 
+                    animation: false, 
+                    scales: { 
+                        x: { display: false },
+                        y: { display: true, position: 'left', grid: { display: false }, ticks: { font: { family: "JetBrains Mono", size: 9 } } }
+                    }, 
+                    plugins: { legend: { display: false } } 
+                }
+            });
+        }
+        
+        let settingsLoaded = { main: false, second: false };
         
         async function initDashboard() {
+            if (!priceChart) initPriceChart();
+            
             const me = await doAPI('/api/user/me', 'GET');
-            if(!me.error) { 
-                document.getElementById('nav-user-name').innerText = me.name;
-                document.getElementById('main-liveTrade').checked = me.liveTradingEnabled;
-                document.getElementById('main-apiKey').value = me.apiKey || '';
-                if(me.secondAccount) {
-                    document.getElementById('second-liveTrade').checked = me.secondAccount.liveTradingEnabled;
+            if(!me.error && me) { 
+                document.getElementById('nav-user-name').innerText = me.name || 'User';
+                if (document.getElementById('main-liveTrade')) {
+                    document.getElementById('main-liveTrade').checked = me.liveTradingEnabled || false;
+                    document.getElementById('main-apiKey').value = me.apiKey || '';
+                }
+                if (me.secondAccount && document.getElementById('second-liveTrade')) {
+                    document.getElementById('second-liveTrade').checked = me.secondAccount.liveTradingEnabled || false;
                     document.getElementById('second-apiKey').value = me.secondAccount.apiKey || '';
                 }
             }
+            
             const history = await doAPI('/api/chart-history', 'GET');
-            if(!history.error) { 
+            if(!history.error && history && history.length) { 
                 priceChart.data.labels = history.map(()=>""); 
                 priceChart.data.datasets[0].data = history.map(p=>p.priceMid);
                 priceChart.update(); 
             }
-            if(dashLoop) clearInterval(dashLoop);
-            dashLoop = setInterval(fetchMetrics, 300);
         }
         
         async function fetchStepHistory() {
             const data = await doAPI('/api/data', 'GET');
             if(data.error) return;
             const accountData = currentStepAccount === 'main' ? data.main : data.second;
-            if(accountData && accountData.activePositions && accountData.activePositions.length > 0) {
-                const tbody = document.getElementById("stepHistoryBody");
-                tbody.innerHTML = (accountData.activePositions[0]?.stepHistory || []).map(s => '<tr class="border-b"><td class="p-5 font-black">'+s.step+'</td><td class="p-5 font-black '+(s.type==='DCA'?'text-red-500':'text-indigo-500')+'">'+s.type+'</td><td class="p-5">$'+s.price.toFixed(8)+'</td><td class="p-5 font-black '+(s.roi>=0?'text-green-600':'text-red-600')+'">'+s.roi.toFixed(2)+'%</td><td class="p-5 text-right text-zinc-400">'+new Date(s.time).toLocaleTimeString()+'</td></tr>').join('') || '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">No Trace Data</td></tr>';
-            } else {
-                document.getElementById("stepHistoryBody").innerHTML = '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">No Active Position</td></tr>';
+            const tbody = document.getElementById("stepHistoryBody");
+            if (accountData && accountData.activePositions && accountData.activePositions.length > 0 && accountData.activePositions[0].stepHistory) {
+                const steps = accountData.activePositions[0].stepHistory;
+                if (steps.length) {
+                    tbody.innerHTML = steps.map(s => '<tr class="border-b"><td class="p-5 font-black">'+s.step+'</td><td class="p-5 font-black '+(s.type==='DCA'?'text-red-500':'text-indigo-500')+'">'+s.type+'</td><td class="p-5">$'+Number(s.price).toFixed(8)+'</td><td class="p-5 font-black '+(s.roi>=0?'text-green-600':'text-red-600')+'">'+Number(s.roi).toFixed(2)+'%</td><td class="p-5 text-right text-zinc-400">'+new Date(s.time).toLocaleTimeString()+'</td></tr>').join('');
+                    return;
+                }
             }
+            tbody.innerHTML = '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">No DCA Steps Yet</td></tr>';
         }
 
         async function fetchMetrics() {
             if(currentPageView !== 'dashboard' && currentPageView !== 'step-history') return;
+            
             const data = await doAPI('/api/data', 'GET'); 
-            if(data.error) return;
+            if(data.error || !data) return;
             
             if(currentPageView === 'step-history') {
                 await fetchStepHistory();
@@ -1720,111 +1802,191 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             const mainData = data.main;
             const secondData = data.second;
             
-            if(mainData) {
-                if(!settingsLoaded.main && mainData.config) {
-                    document.getElementById("main-tpPctSens").value = mainData.config.takeProfitPct; 
-                    document.getElementById("main-slPctSens").value = mainData.config.stopLossPct; 
-                    document.getElementById("main-dcaTriggerSens").value = mainData.config.dcaTriggerPct || 1.0;
-                    document.getElementById("main-dcaMultiplierSens").value = mainData.config.dcaMultiplier || 2.0;
-                    document.getElementById("main-startContractsSens").value = mainData.config.startContracts || 1;
-                    document.getElementById("main-dgrSens").value = mainData.config.dgrDailyGrowthRate || 0.0;
-                    document.getElementById("main-directionSens").value = mainData.config.manualDirection || 'long';
-                    document.getElementById("main-maxContractsSens").value = mainData.config.maxContracts || 100;
-                    settingsLoaded.main = true;
-                }
-                
-                document.getElementById("main-uptime").innerText = mainData.uptime + "s";
-                document.getElementById("main-netPnl").innerText = "$" + (mainData.metrics?.totalNetPnl || 0).toFixed(4);
-                document.getElementById("main-netPnl").className = "text-3xl font-mono font-black tracking-tight " + ((mainData.metrics?.totalNetPnl || 0) >= 0 ? "text-green-600" : "text-red-600");
-                document.getElementById("main-growthPct").innerText = "Growth: " + (mainData.growthPct || 0).toFixed(2) + "%";
-                document.getElementById("main-walletBalance").innerText = "$" + Number(mainData.walletBalance || 0).toFixed(4);
-                document.getElementById("main-initialBalance").innerText = "Initial: $" + (mainData.initialWalletBalance || 0).toFixed(4);
-                
-                const mainBadge = document.getElementById("main-statusBadge");
-                if(mainData.activePositions && mainData.activePositions.length > 0) {
-                    const p = mainData.activePositions[0];
-                    mainBadge.innerText = p.isPaper ? "PAPER ACTIVE" : "LIVE ACTIVE"; 
-                    mainBadge.className = "status-pill bg-zinc-950 text-white";
-                    document.getElementById("main-activeRoi").innerText = (p.exchangeROI || 0).toFixed(2) + "%"; 
-                    document.getElementById("main-activeRoi").className = "text-3xl font-mono font-black tracking-tight " + ((p.exchangeROI || 0) >= 0 ? "text-green-600" : "text-red-600");
-                } else {
-                    mainBadge.innerText = mainData.liveTradingEnabled ? "LIVE SCANNING" : "PAPER STANDBY"; 
-                    mainBadge.className = "status-pill bg-zinc-100 text-zinc-400";
-                    document.getElementById("main-activeRoi").innerText = "IDLE"; 
-                    document.getElementById("main-activeRoi").className = "text-3xl font-mono font-black tracking-tight text-zinc-200";
-                }
-                
-                if(mainData.config) {
-                    document.getElementById('main-directionValue').innerText = (mainData.config.manualDirection || 'LONG').toUpperCase();
-                    document.getElementById('main-dgrValue').innerText = 'DGR: ' + (mainData.config.dgrDailyGrowthRate || 0) + '%';
-                }
-                
-                if(mainData.metrics && mainData.metrics.trades) {
-                    const mainTbody = document.getElementById("main-tradeHistoryBody");
-                    mainTbody.innerHTML = [...mainData.metrics.trades].reverse().slice(0, 10).map(t => '<tr class="border-b"><td class="p-4 text-zinc-400">'+new Date(t.timestamp).toLocaleTimeString()+'</td><td class="p-4 font-black '+(t.side==='long'?'text-green-600':'text-red-600')+'">'+t.side.toUpperCase()+'</td><td class="p-4 font-bold">'+t.contracts.toLocaleString()+'</td><td class="p-4 text-[9px] font-black uppercase text-zinc-300">'+t.exitReason+'</td><td class="p-4 text-right font-black '+(t.netPnl>=0?'text-green-600':'text-red-600')+'">$' + t.netPnl.toFixed(4) + '</td></tr>').join('') || '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">No Trades Yet</td></tr>';
-                }
-            }
-            
-            if(secondData) {
-                if(!settingsLoaded.second && secondData.config) {
-                    document.getElementById("second-tpPctSens").value = secondData.config.takeProfitPct; 
-                    document.getElementById("second-slPctSens").value = secondData.config.stopLossPct; 
-                    document.getElementById("second-dcaTriggerSens").value = secondData.config.dcaTriggerPct || 1.0;
-                    document.getElementById("second-dcaMultiplierSens").value = secondData.config.dcaMultiplier || 2.0;
-                    document.getElementById("second-startContractsSens").value = secondData.config.startContracts || 1;
-                    document.getElementById("second-dgrSens").value = secondData.config.dgrDailyGrowthRate || 0.0;
-                    document.getElementById("second-directionSens").value = secondData.config.manualDirection || 'long';
-                    document.getElementById("second-maxContractsSens").value = secondData.config.maxContracts || 100;
-                    settingsLoaded.second = true;
-                }
-                
-                document.getElementById("second-uptime").innerText = secondData.uptime + "s";
-                document.getElementById("second-netPnl").innerText = "$" + (secondData.metrics?.totalNetPnl || 0).toFixed(4);
-                document.getElementById("second-netPnl").className = "text-3xl font-mono font-black tracking-tight " + ((secondData.metrics?.totalNetPnl || 0) >= 0 ? "text-green-600" : "text-red-600");
-                document.getElementById("second-growthPct").innerText = "Growth: " + (secondData.growthPct || 0).toFixed(2) + "%";
-                document.getElementById("second-walletBalance").innerText = "$" + Number(secondData.walletBalance || 0).toFixed(4);
-                document.getElementById("second-initialBalance").innerText = "Initial: $" + (secondData.initialWalletBalance || 0).toFixed(4);
-                
-                const secondBadge = document.getElementById("second-statusBadge");
-                if(secondData.activePositions && secondData.activePositions.length > 0) {
-                    const p = secondData.activePositions[0];
-                    secondBadge.innerText = p.isPaper ? "PAPER ACTIVE" : "LIVE ACTIVE"; 
-                    secondBadge.className = "status-pill bg-emerald-600 text-white";
-                    document.getElementById("second-activeRoi").innerText = (p.exchangeROI || 0).toFixed(2) + "%"; 
-                    document.getElementById("second-activeRoi").className = "text-3xl font-mono font-black tracking-tight " + ((p.exchangeROI || 0) >= 0 ? "text-green-600" : "text-red-600");
-                } else {
-                    secondBadge.innerText = secondData.liveTradingEnabled ? "LIVE SCANNING" : "PAPER STANDBY"; 
-                    secondBadge.className = "status-pill bg-zinc-100 text-zinc-400";
-                    document.getElementById("second-activeRoi").innerText = "IDLE"; 
-                    document.getElementById("second-activeRoi").className = "text-3xl font-mono font-black tracking-tight text-zinc-200";
-                }
-                
-                if(secondData.config) {
-                    document.getElementById('second-directionValue').innerText = (secondData.config.manualDirection || 'LONG').toUpperCase();
-                    document.getElementById('second-dgrValue').innerText = 'DGR: ' + (secondData.config.dgrDailyGrowthRate || 0) + '%';
-                }
-                
-                if(secondData.metrics && secondData.metrics.trades) {
-                    const secondTbody = document.getElementById("second-tradeHistoryBody");
-                    secondTbody.innerHTML = [...secondData.metrics.trades].reverse().slice(0, 10).map(t => '<tr class="border-b"><td class="p-4 text-zinc-400">'+new Date(t.timestamp).toLocaleTimeString()+'</td><td class="p-4 font-black '+(t.side==='long'?'text-green-600':'text-red-600')+'">'+t.side.toUpperCase()+'</td><td class="p-4 font-bold">'+t.contracts.toLocaleString()+'</td><td class="p-4 text-[9px] font-black uppercase text-zinc-300">'+t.exitReason+'</td><td class="p-4 text-right font-black '+(t.netPnl>=0?'text-green-600':'text-red-600')+'">$' + t.netPnl.toFixed(4) + '</td></tr>').join('') || '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">No Trades Yet</td></tr>';
-                }
-            }
-            
-            if(globalMarketData && globalMarketData.binance) { 
+            // Update chart with latest price
+            if (mainData && mainData.binance && mainData.binance.mid && priceChart) {
                 priceChart.data.labels.push(""); 
-                priceChart.data.datasets[0].data.push(globalMarketData.binance.mid);
+                priceChart.data.datasets[0].data.push(mainData.binance.mid);
                 if(priceChart.data.labels.length > chartPoints) { 
                     priceChart.data.labels.shift(); 
                     priceChart.data.datasets[0].data.shift(); 
                 }
-                priceChart.update(); 
+                priceChart.update('none'); 
+            } else if (secondData && secondData.binance && secondData.binance.mid && priceChart) {
+                priceChart.data.labels.push(""); 
+                priceChart.data.datasets[0].data.push(secondData.binance.mid);
+                if(priceChart.data.labels.length > chartPoints) { 
+                    priceChart.data.labels.shift(); 
+                    priceChart.data.datasets[0].data.shift(); 
+                }
+                priceChart.update('none');
+            }
+            
+            // ========== MAIN ACCOUNT DISPLAY ==========
+            if(mainData) {
+                // Update Config inputs if not loaded
+                if(!settingsLoaded.main && mainData.config) {
+                    const cfg = mainData.config;
+                    document.getElementById("main-tpPctSens").value = cfg.takeProfitPct || 10.0;
+                    document.getElementById("main-slPctSens").value = cfg.stopLossPct || -50.0;
+                    document.getElementById("main-dcaTriggerSens").value = cfg.dcaTriggerPct || 1.0;
+                    document.getElementById("main-dcaMultiplierSens").value = cfg.dcaMultiplier || 2.0;
+                    document.getElementById("main-startContractsSens").value = cfg.startContracts || 1;
+                    document.getElementById("main-dgrSens").value = cfg.dgrDailyGrowthRate || 0.0;
+                    document.getElementById("main-directionSens").value = cfg.manualDirection || 'long';
+                    document.getElementById("main-maxContractsSens").value = cfg.maxContracts || 100;
+                    settingsLoaded.main = true;
+                }
+                
+                // Update uptime
+                document.getElementById("main-uptime").innerText = (mainData.uptime || 0) + "s";
+                
+                // Update PnL and Growth
+                const netPnl = mainData.metrics?.totalNetPnl || 0;
+                const netPnlEl = document.getElementById("main-netPnl");
+                netPnlEl.innerText = "$" + netPnl.toFixed(4);
+                netPnlEl.className = "text-3xl font-mono font-black tracking-tight " + (netPnl >= 0 ? "text-green-600" : "text-red-600");
+                
+                const growthPct = mainData.growthPct || 0;
+                document.getElementById("main-growthPct").innerHTML = "Growth: " + growthPct.toFixed(2) + "%";
+                
+                // Update wallet balances
+                document.getElementById("main-walletBalance").innerText = "$" + Number(mainData.walletBalance || 0).toFixed(4);
+                document.getElementById("main-initialBalance").innerText = "Initial: $" + (mainData.initialWalletBalance || 0).toFixed(4);
+                
+                // Update status badge and ROI
+                const mainBadge = document.getElementById("main-statusBadge");
+                const activeRoiEl = document.getElementById("main-activeRoi");
+                
+                if(mainData.activePositions && mainData.activePositions.length > 0) {
+                    const pos = mainData.activePositions[0];
+                    mainBadge.innerText = pos.isPaper ? "PAPER ACTIVE" : "LIVE ACTIVE";
+                    mainBadge.className = "status-pill bg-zinc-950 text-white";
+                    const roi = pos.exchangeROI || 0;
+                    activeRoiEl.innerText = roi.toFixed(2) + "%";
+                    activeRoiEl.className = "text-3xl font-mono font-black tracking-tight " + (roi >= 0 ? "text-green-600" : "text-red-600");
+                } else {
+                    mainBadge.innerText = mainData.liveTradingEnabled ? "LIVE SCANNING" : "PAPER STANDBY";
+                    mainBadge.className = "status-pill bg-zinc-100 text-zinc-400";
+                    activeRoiEl.innerText = "IDLE";
+                    activeRoiEl.className = "text-3xl font-mono font-black tracking-tight text-zinc-200";
+                }
+                
+                // Update direction and DGR display
+                if(mainData.config) {
+                    document.getElementById('main-directionValue').innerText = (mainData.config.manualDirection || 'LONG').toUpperCase();
+                    document.getElementById('main-dgrValue').innerHTML = 'DGR: ' + (mainData.config.dgrDailyGrowthRate || 0) + '%';
+                }
+                
+                // Update trade history table
+                if(mainData.metrics && mainData.metrics.trades && mainData.metrics.totalTradesCount !== lastMainTradesCount) {
+                    lastMainTradesCount = mainData.metrics.totalTradesCount;
+                    const trades = mainData.metrics.trades || [];
+                    const mainTbody = document.getElementById("main-tradeHistoryBody");
+                    if (trades.length) {
+                        mainTbody.innerHTML = [...trades].reverse().slice(0, 20).map(t => {
+                            const tradeTime = t.timestamp ? new Date(t.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
+                            return '<tr class="border-b"><td class="p-4 text-zinc-400 text-[9px]">' + tradeTime + 
+                                '</td><td class="p-4 font-black ' + (t.side==='long'?'text-green-600':'text-red-600') + '">' + (t.side || '?').toUpperCase() + 
+                                '</td><td class="p-4 font-bold">' + (t.contracts || 0).toLocaleString() + 
+                                '</td><td class="p-4 text-[9px] font-black uppercase text-zinc-400">' + (t.exitReason || 'UNKNOWN') + 
+                                '</td><td class="p-4 text-right font-black ' + ((t.netPnl || 0) >= 0 ? 'text-green-600' : 'text-red-600') + '">$' + (t.netPnl || 0).toFixed(4) + 
+                                '</td></tr>';
+                        }).join('');
+                    } else {
+                        mainTbody.innerHTML = '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">No Trades Yet</td></tr>';
+                    }
+                }
+            }
+            
+            // ========== SECOND ACCOUNT DISPLAY ==========
+            if(secondData) {
+                // Update Config inputs if not loaded
+                if(!settingsLoaded.second && secondData.config) {
+                    const cfg = secondData.config;
+                    document.getElementById("second-tpPctSens").value = cfg.takeProfitPct || 10.0;
+                    document.getElementById("second-slPctSens").value = cfg.stopLossPct || -50.0;
+                    document.getElementById("second-dcaTriggerSens").value = cfg.dcaTriggerPct || 1.0;
+                    document.getElementById("second-dcaMultiplierSens").value = cfg.dcaMultiplier || 2.0;
+                    document.getElementById("second-startContractsSens").value = cfg.startContracts || 1;
+                    document.getElementById("second-dgrSens").value = cfg.dgrDailyGrowthRate || 0.0;
+                    document.getElementById("second-directionSens").value = cfg.manualDirection || 'long';
+                    document.getElementById("second-maxContractsSens").value = cfg.maxContracts || 100;
+                    settingsLoaded.second = true;
+                }
+                
+                // Update uptime
+                document.getElementById("second-uptime").innerText = (secondData.uptime || 0) + "s";
+                
+                // Update PnL and Growth
+                const netPnl = secondData.metrics?.totalNetPnl || 0;
+                const netPnlEl = document.getElementById("second-netPnl");
+                netPnlEl.innerText = "$" + netPnl.toFixed(4);
+                netPnlEl.className = "text-3xl font-mono font-black tracking-tight " + (netPnl >= 0 ? "text-green-600" : "text-red-600");
+                
+                const growthPct = secondData.growthPct || 0;
+                document.getElementById("second-growthPct").innerHTML = "Growth: " + growthPct.toFixed(2) + "%";
+                
+                // Update wallet balances
+                document.getElementById("second-walletBalance").innerText = "$" + Number(secondData.walletBalance || 0).toFixed(4);
+                document.getElementById("second-initialBalance").innerText = "Initial: $" + (secondData.initialWalletBalance || 0).toFixed(4);
+                
+                // Update status badge and ROI
+                const secondBadge = document.getElementById("second-statusBadge");
+                const activeRoiEl = document.getElementById("second-activeRoi");
+                
+                if(secondData.activePositions && secondData.activePositions.length > 0) {
+                    const pos = secondData.activePositions[0];
+                    secondBadge.innerText = pos.isPaper ? "PAPER ACTIVE" : "LIVE ACTIVE";
+                    secondBadge.className = "status-pill bg-emerald-600 text-white";
+                    const roi = pos.exchangeROI || 0;
+                    activeRoiEl.innerText = roi.toFixed(2) + "%";
+                    activeRoiEl.className = "text-3xl font-mono font-black tracking-tight " + (roi >= 0 ? "text-green-600" : "text-red-600");
+                } else {
+                    secondBadge.innerText = secondData.liveTradingEnabled ? "LIVE SCANNING" : "PAPER STANDBY";
+                    secondBadge.className = "status-pill bg-zinc-100 text-zinc-400";
+                    activeRoiEl.innerText = "IDLE";
+                    activeRoiEl.className = "text-3xl font-mono font-black tracking-tight text-zinc-200";
+                }
+                
+                // Update direction and DGR display
+                if(secondData.config) {
+                    document.getElementById('second-directionValue').innerText = (secondData.config.manualDirection || 'LONG').toUpperCase();
+                    document.getElementById('second-dgrValue').innerHTML = 'DGR: ' + (secondData.config.dgrDailyGrowthRate || 0) + '%';
+                }
+                
+                // Update trade history table
+                if(secondData.metrics && secondData.metrics.trades && secondData.metrics.totalTradesCount !== lastSecondTradesCount) {
+                    lastSecondTradesCount = secondData.metrics.totalTradesCount;
+                    const trades = secondData.metrics.trades || [];
+                    const secondTbody = document.getElementById("second-tradeHistoryBody");
+                    if (trades.length) {
+                        secondTbody.innerHTML = [...trades].reverse().slice(0, 20).map(t => {
+                            const tradeTime = t.timestamp ? new Date(t.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
+                            return '<tr class="border-b"><td class="p-4 text-zinc-400 text-[9px]">' + tradeTime + 
+                                '</td><td class="p-4 font-black ' + (t.side==='long'?'text-green-600':'text-red-600') + '">' + (t.side || '?').toUpperCase() + 
+                                '</td><td class="p-4 font-bold">' + (t.contracts || 0).toLocaleString() + 
+                                '</td><td class="p-4 text-[9px] font-black uppercase text-zinc-400">' + (t.exitReason || 'UNKNOWN') + 
+                                '</td><td class="p-4 text-right font-black ' + ((t.netPnl || 0) >= 0 ? 'text-green-600' : 'text-red-600') + '">$' + (t.netPnl || 0).toFixed(4) + 
+                                '</td></tr>';
+                        }).join('');
+                    } else {
+                        secondTbody.innerHTML = '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">No Trades Yet</td></tr>';
+                    }
+                }
             }
         }
 
+        // Initialize everything
         pingAnalytics(true); 
         setInterval(fetchAnalyticsData, 4000); 
-        if(authToken) { toggleAuthUI(); nav('dashboard'); } 
-        else { toggleAuthUI(); nav('home'); }
+        
+        if(authToken) { 
+            toggleAuthUI(); 
+            nav('dashboard'); 
+        } else { 
+            toggleAuthUI(); 
+            nav('home'); 
+        }
     </script>
 </body>
 </html>`);
