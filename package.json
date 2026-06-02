@@ -1,31 +1,26 @@
 {
-  "name": "tradebotpille-dca-engine",
-  "version": "3.0.0",
-  "description": "SHIB DCA Trading Bot with 75x Leverage on HTX",
+  "name": "tradepille-stateless-terminal",
+  "version": "4.0.0",
+  "description": "Stateless SHIB AI Machine Learning Trading Terminal",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "security-check": "npm audit"
-  },
-  "engines": {
-    "node": ">=18.0.0",
-    "npm": ">=9.0.0"
+    "start": "node index.js"
   },
   "keywords": [
-    "trading-bot",
-    "cryptocurrency",
-    "dca",
-    "htx",
-    "binance",
+    "crypto",
+    "trading",
+    "ml",
     "shib",
-    "futures-trading"
+    "stateless"
   ],
-  "author": "",
+  "author": "TradeBotPille",
   "license": "MIT",
   "dependencies": {
-    "ccxt": "^4.2.55",
-    "express": "^4.18.2",
-    "mongoose": "^7.5.0",
-    "express-rate-limit": "^6.10.0"
+    "ccxt": "^4.2.0",
+    "dotenv": "^16.4.0",
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
