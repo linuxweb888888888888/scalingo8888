@@ -1,21 +1,3 @@
-To fix the issue where your targets and contract sizes show as zero because of a
-$0.00 wallet balance (especially during initialization or in Paper Trading
-mode), I have modified the calculation logic.
-
-Changes made:
-
-1.  DGR Cycle Logic: Added a fallback so if your balance is 0, the engine treats
-    it as a minimum of 10 USDT to ensure "Target Growth" and "Target Amount"
-    calculate correctly instead of returning 0.
-2.  Position Sizing: Updated syncState and addDcaPosition to ensure baseC
-    (contracts) defaults to at least 1, even if the balance is not yet fetched.
-3.  Frontend Logic: Updated the dashboard sync so fields don't stay at zero if
-    the exchange hasn't reported a balance yet.
-
-Here is the corrected, ready-to-run code:
-
---- START OF FILE Paste June 02, 2026 - 5:53PM ---
-
 const fs = require('fs');
 const ccxt = require('ccxt');
 const express = require('express');
