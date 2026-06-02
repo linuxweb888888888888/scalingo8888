@@ -1,32 +1,28 @@
 {
-  "name": "htx-dual-direction-bot",
-  "version": "1.0.0",
-  "description": "HTX Futures Trading Bot - One direction per account (LONG/SHORT separate accounts)",
-  "main": "bot.js",
+  "name": "tradebot-pille",
+  "version": "3.0.0",
+  "description": "SHIB AI Mathematical Trading Engine with HTX Integration",
+  "main": "index.js",
   "scripts": {
-    "start": "node bot.js",
-    "dev": "nodemon bot.js"
-  },
-  "engines": {
-    "node": ">=16.0.0",
-    "npm": ">=8.0.0"
+    "start": "node index.js",
+    "dev": "node --watch index.js"
   },
   "keywords": [
-    "htx",
+    "trading",
+    "bot",
+    "ccxt",
+    "machine-learning",
     "crypto",
-    "trading-bot",
-    "futures",
-    "long-short"
+    "shib"
   ],
   "author": "",
-  "license": "MIT",
+  "license": "ISC",
   "dependencies": {
+    "ccxt": "^4.2.0",
     "express": "^4.18.2",
-    "axios": "^1.6.0",
-    "ws": "^8.14.2",
-    "dotenv": "^16.3.1"
+    "mongoose": "^8.0.0"
   },
-  "devDependencies": {
-    "nodemon": "^3.0.1"
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
