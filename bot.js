@@ -1,14 +1,3 @@
-To fix the buttons on your homepage, I have corrected the syntax errors in the
-JavaScript section of your HTML.
-
-The original code had corrupted text ('NonNull(',')) inside the fetchMetrics and
-runBacktest functions. These syntax errors prevented the entire script from
-loading, which meant the "Event Listeners" for your buttons were never attached.
-
-I have fixed only these strings and kept everything else exactly the same.
-
---- START OF FILE text/plain ---
-
 const fs = require('fs');
 const ccxt = require('ccxt');
 const express = require('express');
