@@ -26,11 +26,12 @@ const UserModel = mongoose.model('User_V3', new mongoose.Schema({
     liveTradingEnabled: { type: Boolean, default: false },
     config: { type: Object, default: {} },
     activePosition: { type: Object, default: null }, 
-    lastCloseTime: { type: Number, default: 0 }      
+    lastCloseTime: { type: Number, default: 0 },
+    secondAccount: { type: Object, default: { apiKey: "", apiSecret: "", liveTradingEnabled: false, config: {}, activePosition: null, lastCloseTime: 0 } }
 }));
 
 const TradeModel = mongoose.model('TradeLog_V3', new mongoose.Schema({
-    userId: { type: String, required: true }, side: String, entryPrice: Number, exitPrice: Number,
+    userId: { type: String, required: true }, accountId: { type: String, default: "main" }, side: String, entryPrice: Number, exitPrice: Number,
     contracts: Number, marginUsed: Number, grossPnl: Number, grossRoiPct: Number, roiPct: Number, 
     netPnl: Number, feeCost: Number, timestamp: { type: Date, default: Date.now }, exitReason: String
 }));
@@ -47,7 +48,7 @@ const AnalyticsModel = mongoose.model('SiteAnalytics_V3', new mongoose.Schema({
 // ==================== BASE CONFIGURATION ====================
 const CUSTOM_PORT = process.env.PORT || 3000;
 
-// SHIB CONFIGURATION (FORCED 20x LEVERAGE)
+// SHIB CONFIGURATION (FORCED 75x LEVERAGE)
 const FORCED_LEVERAGE = 75;
 
 const BASE_CONFIG = {
@@ -122,14 +123,25 @@ function calculateDGRAdjustment(dgrDailyGrowthRate, daysActive) {
 
 // ==================== METRICS ENGINE ====================
 class PerformanceMetrics {
-    constructor(userId) {
-        this.userId = userId; this.trades = []; 
-        this.totalGrossPnl = 0; this.totalNetPnl = 0; this.totalFees = 0; this.totalRoiPct = 0;
-        this.wins = 0; this.losses = 0; this.winRate = 0; this.totalTradesCount = 0; this.maxMarginUsed = 0; 
+    constructor(userId, accountId = "main") {
+        this.userId = userId;
+        this.accountId = accountId;
+        this.trades = []; 
+        this.totalGrossPnl = 0; 
+        this.totalNetPnl = 0; 
+        this.totalFees = 0; 
+        this.totalRoiPct = 0;
+        this.wins = 0; 
+        this.losses = 0; 
+        this.winRate = 0; 
+        this.totalTradesCount = 0; 
+        this.maxMarginUsed = 0; 
         this.startDate = Date.now();
+        this.initialWalletBalance = 0;
+        this.currentWalletBalance = 0;
     }
     async init() { 
-        const dbTrades = await TradeModel.find({ userId: this.userId }).sort({ timestamp: -1 }).limit(2000).lean(); 
+        const dbTrades = await TradeModel.find({ userId: this.userId, accountId: this.accountId }).sort({ timestamp: -1 }).limit(2000).lean(); 
         dbTrades.reverse().forEach(t => this.processTrade(t, false)); 
     }
     recordTrade(trade) { this.processTrade(trade, true); }
@@ -137,13 +149,19 @@ class PerformanceMetrics {
         this.totalTradesCount++; if (!trade.timestamp) trade.timestamp = Date.now();
         this.trades.push(trade); if (this.trades.length > 2000) this.trades.shift(); 
         if (trade.marginUsed > this.maxMarginUsed) this.maxMarginUsed = trade.marginUsed;
-        this.totalNetPnl += trade.netPnl || 0; this.totalFees += trade.feeCost || 0; this.totalRoiPct += trade.roiPct || 0; 
+        this.totalNetPnl += trade.netPnl || 0; 
+        this.totalFees += trade.feeCost || 0; 
+        this.totalRoiPct += trade.roiPct || 0; 
         if (trade.netPnl > 0) this.wins++; else this.losses++;
         this.winRate = this.trades.length ? ((this.wins / this.trades.length) * 100).toFixed(2) : 0;
-        if (saveToDb) TradeModel.create({ ...trade, userId: this.userId }).catch(()=>{});
+        if (saveToDb) TradeModel.create({ ...trade, userId: this.userId, accountId: this.accountId }).catch(()=>{});
     }
     updateMaxMargin(margin) { if (margin > this.maxMarginUsed) this.maxMarginUsed = margin; }
     getDaysActive() { return (Date.now() - this.startDate) / (1000 * 60 * 60 * 24); }
+    getGrowthPct() {
+        if (this.initialWalletBalance <= 0) return 0;
+        return ((this.currentWalletBalance - this.initialWalletBalance) / this.initialWalletBalance) * 100;
+    }
 }
 
 // ==================== BACKTEST SIMULATION ENGINE ====================
@@ -266,9 +284,25 @@ async function runBacktestSimulation(config, tickCount, symbol) {
 
 // ==================== USER BOT INSTANCE ====================
 class UserTradeInstance {
-    constructor(user) {
+    constructor(user, accountType = "main") {
         this.userId = user._id.toString(); 
-        this.config = { ...BASE_CONFIG, ...(user.config || {}) }; 
+        this.accountType = accountType;
+        
+        if (accountType === "main") {
+            this.config = { ...BASE_CONFIG, ...(user.config || {}) }; 
+            this.liveTradingEnabled = user.liveTradingEnabled;
+            this.apiKey = user.apiKey;
+            this.apiSecret = user.apiSecret;
+            this.activePositions = user.activePosition ? [user.activePosition] : [];
+            this.lastCloseTime = user.lastCloseTime || 0;
+        } else {
+            this.config = { ...BASE_CONFIG, ...(user.secondAccount?.config || {}) };
+            this.liveTradingEnabled = user.secondAccount?.liveTradingEnabled || false;
+            this.apiKey = user.secondAccount?.apiKey || "";
+            this.apiSecret = user.secondAccount?.apiSecret || "";
+            this.activePositions = user.secondAccount?.activePosition ? [user.secondAccount.activePosition] : [];
+            this.lastCloseTime = user.secondAccount?.lastCloseTime || 0;
+        }
         
         if (!this.config.htxSymbol || this.config.htxSymbol.includes('1000')) {
             this.config.htxSymbol = 'SHIB/USDT:USDT';
@@ -278,21 +312,18 @@ class UserTradeInstance {
         this.config.leverage = FORCED_LEVERAGE;
         this.config.marginMode = 'cross'; 
 
-        this.startTime = Date.now(); this.metrics = new PerformanceMetrics(this.userId);
-        this.activePositions = user.activePosition ? [user.activePosition] : []; 
-        this.lastCloseTime = user.lastCloseTime || 0;
-        
+        this.startTime = Date.now(); 
+        this.metrics = new PerformanceMetrics(this.userId, accountType);
         this.isTrading = false; 
-        
         this.lastEvalPrice = 0;
         this.walletBalance = 0;
+        this.initialWalletBalance = 0;
 
-        this.applyUserKeys(user);
+        this.applyUserKeys();
     }
 
-    applyUserKeys(user) {
-        this.liveTradingEnabled = user.liveTradingEnabled; 
-        const key = user.apiKey || "demo", secret = user.apiSecret || "demo";
+    applyUserKeys() {
+        const key = this.apiKey || "demo", secret = this.apiSecret || "demo";
         this.htx = new ccxt.pro.htx({ 
             apiKey: key, 
             secret: secret, 
@@ -314,18 +345,36 @@ class UserTradeInstance {
         this.startExchangeROISync();
     }
 
-    async saveState() {
-        await UserModel.updateOne(
-            { _id: this.userId },
-            { $set: { activePosition: this.activePositions.length > 0 ? this.activePositions[0] : null, lastCloseTime: this.lastCloseTime, config: this.config } }
-        );
+    async saveState(userDoc) {
+        if (this.accountType === "main") {
+            userDoc.activePosition = this.activePositions.length > 0 ? this.activePositions[0] : null;
+            userDoc.lastCloseTime = this.lastCloseTime;
+            userDoc.config = this.config;
+        } else {
+            if (!userDoc.secondAccount) userDoc.secondAccount = {};
+            userDoc.secondAccount.activePosition = this.activePositions.length > 0 ? this.activePositions[0] : null;
+            userDoc.secondAccount.lastCloseTime = this.lastCloseTime;
+            userDoc.secondAccount.config = this.config;
+            userDoc.secondAccount.liveTradingEnabled = this.liveTradingEnabled;
+            userDoc.secondAccount.apiKey = this.apiKey;
+            userDoc.secondAccount.apiSecret = this.apiSecret;
+        }
+        await userDoc.save();
+        
         const cacheEntry = tokenCache.get(this.userId);
-        if(cacheEntry) cacheEntry.user.activePosition = this.activePositions.length > 0 ? this.activePositions[0] : null; 
+        if(cacheEntry) {
+            if (this.accountType === "main") {
+                cacheEntry.user.activePosition = this.activePositions.length > 0 ? this.activePositions[0] : null;
+            } else {
+                if (!cacheEntry.user.secondAccount) cacheEntry.user.secondAccount = {};
+                cacheEntry.user.secondAccount.activePosition = this.activePositions.length > 0 ? this.activePositions[0] : null;
+            }
+        }
     }
 
     async connectExchange() {
         try {
-            if(this.liveTradingEnabled) {
+            if(this.liveTradingEnabled && this.apiKey && this.apiSecret) {
                 await this.htx.loadMarkets(); 
                 
                 try { await this.htx.setMarginMode('cross', this.config.htxSymbol); } catch(e){}
@@ -340,15 +389,22 @@ class UserTradeInstance {
 
                     const sizeUsd = openPos.contracts * this.config.contractSize * entryP;
                     this.activePositions = [{ id: Date.now(), side: openPos.side, entryPrice: entryP, contracts: openPos.contracts, size: sizeUsd, marginUsed: sizeUsd / FORCED_LEVERAGE, exchangeROI: openPos.percentage || 0, exchangePnl: openPos.unrealizedPnl || 0, entryTime: Date.now(), isPaper: false, lastDcaTime: 0, dcaStep: 0, stepHistory: [] }];
-                    this.metrics.updateMaxMargin(this.activePositions[0].marginUsed); await this.saveState();
+                    this.metrics.updateMaxMargin(this.activePositions[0].marginUsed);
+                    const user = await UserModel.findById(this.userId);
+                    await this.saveState(user);
                 } else {
-                    this.activePositions = []; await this.saveState();
+                    this.activePositions = [];
+                    const user = await UserModel.findById(this.userId);
+                    await this.saveState(user);
                 }
             }
             return { success: true };
         } catch (error) { 
-            console.log(`[Worker ${this.userId}] Exchange Init Error:`, error.message); 
-            this.liveTradingEnabled = false; return { success: false, message: error.message }; 
+            console.log(`[Worker ${this.userId}/${this.accountType}] Exchange Init Error:`, error.message); 
+            this.liveTradingEnabled = false; 
+            const user = await UserModel.findById(this.userId);
+            await this.saveState(user);
+            return { success: false, message: error.message }; 
         }
     }
 
@@ -368,14 +424,15 @@ class UserTradeInstance {
                     let instantRoi = pnlPercent * FORCED_LEVERAGE;
 
                     if (instantRoi >= 0) {
-                        await this.forceClosePosition("MANUAL_FLIP"); setTimeout(() => this.syncState(signal), 50);
+                        await this.forceClosePosition("MANUAL_FLIP"); 
+                        setTimeout(() => this.syncState(signal), 50);
                     }
                 }
             } else {
                 if (signal) await this.syncState(signal);
             }
         } catch (e) {
-            console.error(`🚨 [Eval Error]:`, e.message);
+            console.error(`🚨 [Eval Error ${this.accountType}]:`, e.message);
         }
     }
 
@@ -407,7 +464,7 @@ class UserTradeInstance {
                 }
             }
         } catch (e) {
-             console.error(`🚨 [Exit Check Error]:`, e.message);
+             console.error(`🚨 [Exit Check Error ${this.accountType}]:`, e.message);
         }
     }
 
@@ -435,19 +492,21 @@ class UserTradeInstance {
             const maxC = this.config.maxContracts || 100;
             if (Number(pos.contracts) + contractsToAdd > maxC) {
                 pos.lastDcaTime = Date.now();
-                await this.saveState();
+                const user = await UserModel.findById(this.userId);
+                await this.saveState(user);
                 this.isTrading = false;
                 return; 
             }
 
             pos.lastDcaTime = Date.now();
-            await this.saveState();
+            const user = await UserModel.findById(this.userId);
+            await this.saveState(user);
             
             let realExecPrice = pos.side === 'long' ? globalMarketData.binance.ask : globalMarketData.binance.bid;
             if (!realExecPrice) realExecPrice = globalMarketData.binance.mid;
 
-            if (!pos.isPaper && this.liveTradingEnabled) {
-                console.log(`[User ${this.userId}] Requesting DCA: ${contractsToAdd} contracts on HTX`);
+            if (!pos.isPaper && this.liveTradingEnabled && this.apiKey && this.apiSecret) {
+                console.log(`[User ${this.userId}/${this.accountType}] Requesting DCA: ${contractsToAdd} contracts on HTX`);
                 try {
                     const res = await this.htx.createMarketOrder(this.config.htxSymbol, orderSide, contractsToAdd, undefined, { offset: 'open', marginMode: 'cross', lever_rate: FORCED_LEVERAGE });
                     await new Promise(r => setTimeout(r, 150)); 
@@ -456,7 +515,7 @@ class UserTradeInstance {
                         realExecPrice = this.config.htxSymbol.includes('SHIB') && !this.config.htxSymbol.includes('1000') ? order.average * 1000 : order.average;
                     }
                 } catch(e) {
-                    console.error(`[User ${this.userId}] HTX API Error, cancelling local state update to prevent desync:`, e.message);
+                    console.error(`[User ${this.userId}/${this.accountType}] HTX API Error:`, e.message);
                     return; 
                 }
             }
@@ -479,10 +538,11 @@ class UserTradeInstance {
             pos.dcaStep = step + 1;
             
             this.metrics.updateMaxMargin(pos.marginUsed);
-            await this.saveState();
-            console.log(`[User ${this.userId}] ${pos.isPaper ? 'Paper' : 'LIVE'} DCA Executed (Step ${pos.dcaStep}). Added ${contractsToAdd} to ${pos.side.toUpperCase()}`);
+            const userFinal = await UserModel.findById(this.userId);
+            await this.saveState(userFinal);
+            console.log(`[User ${this.userId}/${this.accountType}] ${pos.isPaper ? 'Paper' : 'LIVE'} DCA Executed (Step ${pos.dcaStep}). Added ${contractsToAdd} to ${pos.side.toUpperCase()}`);
         } catch (err) {
-            console.error(`🚨 [DCA Error - User ${this.userId}]:`, err.message);
+            console.error(`🚨 [DCA Error - ${this.accountType}]:`, err.message);
         } finally { this.isTrading = false; }
     }
 
@@ -490,7 +550,7 @@ class UserTradeInstance {
         if (this.isTrading || this.activePositions.length > 0) return;
         this.isTrading = true;
         try {
-            const isPaper = !this.liveTradingEnabled; 
+            const isPaper = !this.liveTradingEnabled || !this.apiKey || !this.apiSecret; 
             const orderSide = targetSide === 'long' ? 'buy' : 'sell'; 
             
             let baseC = Number(this.config.startContracts) || 1;
@@ -517,10 +577,12 @@ class UserTradeInstance {
             this.activePositions = [{ id: Date.now(), side: targetSide, entryPrice: Number(executionPrice), contracts: Number(contracts), size: Number(sizeUsd), marginUsed: Number(marginUsed), entryTime: Date.now(), exchangeROI: 0, exchangePnl: 0, isPaper, lastDcaTime: 0, dcaStep: 0, stepHistory: [{ step: 0, type: 'OPEN', price: executionPrice, roi: 0, time: Date.now() }] }];
             
             this.metrics.updateMaxMargin(marginUsed); 
-            await this.saveState();
-            console.log(`[User ${this.userId}] ${isPaper?'Paper':'LIVE'} OPEN: ${targetSide.toUpperCase()} at $${executionPrice}`);
+            const user = await UserModel.findById(this.userId);
+            await this.saveState(user);
+            console.log(`[User ${this.userId}/${this.accountType}] ${isPaper?'Paper':'LIVE'} OPEN: ${targetSide.toUpperCase()} at $${executionPrice}`);
         } catch (err) { 
-            console.error(`🚨 [Open Error - User ${this.userId}]:`, err.message); this.activePositions = []; 
+            console.error(`🚨 [Open Error - ${this.accountType}]:`, err.message); 
+            this.activePositions = []; 
         } finally { this.isTrading = false; }
     }
 
@@ -533,7 +595,7 @@ class UserTradeInstance {
             let realExitPrice = closeSide === 'sell' ? globalMarketData.binance.bid : globalMarketData.binance.ask;
             if (!realExitPrice) realExitPrice = globalMarketData.binance.mid;
 
-            if (!snapPos.isPaper && this.liveTradingEnabled) {
+            if (!snapPos.isPaper && this.liveTradingEnabled && this.apiKey && this.apiSecret) {
                 const closeRes = await this.htx.createMarketOrder(this.config.htxSymbol, closeSide, snapPos.contracts, undefined, { reduceOnly: true, offset: 'close', marginMode: 'cross', lever_rate: FORCED_LEVERAGE });
                 this.activePositions = []; await new Promise(r => setTimeout(r, 150));
                 try { 
@@ -552,30 +614,43 @@ class UserTradeInstance {
                 marginUsed: math.margin, grossPnl: math.grossPnlUsd, grossRoiPct: math.grossRoiPct, netPnl: math.netPnlUsd, roiPct: math.netRoiPct, feeCost: math.feeCost, exitReason: reason 
             });
             
-            this.lastCloseTime = Date.now(); await this.saveState();
-            console.log(`[User ${this.userId}] ${snapPos.isPaper?'Paper':'LIVE'} CLOSED: ${reason}`);
+            this.lastCloseTime = Date.now(); 
+            const user = await UserModel.findById(this.userId);
+            await this.saveState(user);
+            console.log(`[User ${this.userId}/${this.accountType}] ${snapPos.isPaper?'Paper':'LIVE'} CLOSED: ${reason}`);
         } catch (err) {
-            console.error(`🚨 [Close Error - User ${this.userId}]:`, err.message);
+            console.error(`🚨 [Close Error - ${this.accountType}]:`, err.message);
         } finally { this.isTrading = false; }
     }
     
     startExchangeROISync() {
         setInterval(async () => {
             if (this.activePositions.length === 0 || this.isTrading) {
-                if (this.liveTradingEnabled) {
+                if (this.liveTradingEnabled && this.apiKey && this.apiSecret) {
                     try {
                         const bal = await this.htx.fetchBalance({ type: 'swap' });
                         this.walletBalance = (bal.total && bal.total.USDT) ? bal.total.USDT : 0;
+                        if (this.initialWalletBalance === 0 && this.walletBalance > 0) {
+                            this.initialWalletBalance = this.walletBalance;
+                            this.metrics.initialWalletBalance = this.initialWalletBalance;
+                        }
+                        this.metrics.currentWalletBalance = this.walletBalance;
                     } catch(e){}
                 }
                 return;
             }
             const pos = this.activePositions[0];
             
-            if (this.liveTradingEnabled && !pos.isPaper) {
+            if (this.liveTradingEnabled && !pos.isPaper && this.apiKey && this.apiSecret) {
                 try {
                     const bal = await this.htx.fetchBalance({ type: 'swap' });
                     this.walletBalance = (bal.total && bal.total.USDT) ? bal.total.USDT : 0;
+                    if (this.initialWalletBalance === 0 && this.walletBalance > 0) {
+                        this.initialWalletBalance = this.walletBalance;
+                        this.metrics.initialWalletBalance = this.initialWalletBalance;
+                    }
+                    this.metrics.currentWalletBalance = this.walletBalance;
+                    
                     const positions = await this.htx.fetchPositions([this.config.htxSymbol]);
                     const openPos = positions.find(p => p.contracts > 0);
                     
@@ -589,7 +664,8 @@ class UserTradeInstance {
                         return;
                     } else {
                         this.activePositions = [];
-                        await this.saveState();
+                        const user = await UserModel.findById(this.userId);
+                        await this.saveState(user);
                         return;
                     }
                 } catch(e) {}
@@ -610,9 +686,16 @@ class UserTradeInstance {
 
     getExportData() { 
         return { 
-            config: this.config, liveTradingEnabled: this.liveTradingEnabled, uptime: Math.floor((Date.now() - this.startTime) / 1000),
-            metrics: this.metrics, activePositions: this.activePositions, binance: globalMarketData.binance,
-            walletBalance: this.walletBalance, dgrDaysActive: this.metrics.getDaysActive()
+            config: this.config, 
+            liveTradingEnabled: this.liveTradingEnabled, 
+            uptime: Math.floor((Date.now() - this.startTime) / 1000),
+            metrics: this.metrics, 
+            activePositions: this.activePositions, 
+            binance: globalMarketData.binance,
+            walletBalance: this.walletBalance,
+            initialWalletBalance: this.initialWalletBalance,
+            growthPct: this.metrics.getGrowthPct(),
+            accountType: this.accountType
         }; 
     }
 }
@@ -685,9 +768,11 @@ async function startMasterStreams() {
                     }
                 }
 
-                for (const worker of activeWorkers.values()) {
-                    worker.checkExits().catch(()=>{}); 
-                    worker.evaluateManualEntry().catch(()=>{}); 
+                for (const [userId, workers] of activeWorkers.entries()) {
+                    if (workers.main) workers.main.checkExits().catch(()=>{});
+                    if (workers.main) workers.main.evaluateManualEntry().catch(()=>{});
+                    if (workers.second) workers.second.checkExits().catch(()=>{});
+                    if (workers.second) workers.second.evaluateManualEntry().catch(()=>{});
                 }
 
                 await new Promise(r => setTimeout(r, 100)); 
@@ -703,9 +788,16 @@ async function loadAllUsers() {
         const users = await UserModel.find({});
         for(const u of users) {
             try {
-                const worker = new UserTradeInstance(u);
-                await worker.initialize();
-                activeWorkers.set(u._id.toString(), worker);
+                const mainWorker = new UserTradeInstance(u, "main");
+                await mainWorker.initialize();
+                
+                let secondWorker = null;
+                if (u.secondAccount && (u.secondAccount.apiKey || u.secondAccount.liveTradingEnabled)) {
+                    secondWorker = new UserTradeInstance(u, "second");
+                    await secondWorker.initialize();
+                }
+                
+                activeWorkers.set(u._id.toString(), { main: mainWorker, second: secondWorker });
                 if (u.token) tokenCache.set(u.token, { user: u, lastAccessed: Date.now() });
             } catch(we) { console.error(`Worker error for ${u.email}:`, we.message); }
         }
@@ -774,9 +866,10 @@ app.post('/api/auth/register', async (req, res) => {
         const salt = crypto.randomBytes(16).toString('hex');
         const user = await UserModel.create({ name, email, passwordHash: hashPassword(password, salt), salt, token: generateToken() });
         
-        const worker = new UserTradeInstance(user);
-        await worker.initialize();
-        activeWorkers.set(user._id.toString(), worker);
+        const mainWorker = new UserTradeInstance(user, "main");
+        await mainWorker.initialize();
+        
+        activeWorkers.set(user._id.toString(), { main: mainWorker, second: null });
         tokenCache.set(user.token, { user, lastAccessed: Date.now() });
 
         res.json({ token: user.token, user: { name: user.name, email: user.email } });
@@ -796,79 +889,132 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 app.get('/api/user/me', authMiddleware, (req, res) => {
-    res.json({ name: req.user.name, email: req.user.email, apiKey: req.user.apiKey, liveTradingEnabled: req.user.liveTradingEnabled });
+    res.json({ 
+        name: req.user.name, 
+        email: req.user.email, 
+        apiKey: req.user.apiKey, 
+        liveTradingEnabled: req.user.liveTradingEnabled,
+        secondAccount: req.user.secondAccount || { apiKey: "", liveTradingEnabled: false }
+    });
 });
 
 app.post('/api/user/keys', authMiddleware, async (req, res) => {
     try {
-        const { apiKey, apiSecret, liveTradingEnabled } = req.body;
+        const { apiKey, apiSecret, liveTradingEnabled, isSecondAccount } = req.body;
         
-        let worker = activeWorkers.get(req.user._id.toString());
-        if(worker) {
-            if (Boolean(liveTradingEnabled) && worker.activePositions.length > 0 && worker.activePositions[0].isPaper) {
-                worker.activePositions = [];
-            }
-            if (!Boolean(liveTradingEnabled) && worker.activePositions.length > 0 && !worker.activePositions[0].isPaper) {
-                worker.activePositions = [];
-            }
+        let workers = activeWorkers.get(req.user._id.toString());
+        
+        if (isSecondAccount) {
+            if (!req.user.secondAccount) req.user.secondAccount = {};
+            req.user.secondAccount.apiKey = apiKey;
+            req.user.secondAccount.apiSecret = apiSecret;
+            req.user.secondAccount.liveTradingEnabled = Boolean(liveTradingEnabled);
             
-            worker.applyUserKeys({ apiKey, apiSecret, liveTradingEnabled });
-            const connectionResult = await worker.connectExchange();
-            
-            if (liveTradingEnabled && !connectionResult.success) {
-                worker.liveTradingEnabled = false; 
-                return res.json({ error: 'Exchange Error: ' + connectionResult.message });
+            if (workers && workers.second) {
+                workers.second.apiKey = apiKey;
+                workers.second.apiSecret = apiSecret;
+                workers.second.liveTradingEnabled = Boolean(liveTradingEnabled);
+                workers.second.applyUserKeys();
+                const connectionResult = await workers.second.connectExchange();
+                if (Boolean(liveTradingEnabled) && !connectionResult.success) {
+                    workers.second.liveTradingEnabled = false;
+                    req.user.secondAccount.liveTradingEnabled = false;
+                }
+            } else if (workers) {
+                const secondWorker = new UserTradeInstance(req.user, "second");
+                await secondWorker.initialize();
+                workers.second = secondWorker;
             }
-            req.user.liveTradingEnabled = worker.liveTradingEnabled;
         } else {
+            req.user.apiKey = apiKey;
+            req.user.apiSecret = apiSecret;
             req.user.liveTradingEnabled = Boolean(liveTradingEnabled);
+            
+            if (workers && workers.main) {
+                workers.main.apiKey = apiKey;
+                workers.main.apiSecret = apiSecret;
+                workers.main.liveTradingEnabled = Boolean(liveTradingEnabled);
+                workers.main.applyUserKeys();
+                const connectionResult = await workers.main.connectExchange();
+                if (Boolean(liveTradingEnabled) && !connectionResult.success) {
+                    workers.main.liveTradingEnabled = false;
+                    req.user.liveTradingEnabled = false;
+                }
+            }
         }
-
-        req.user.apiKey = apiKey; req.user.apiSecret = apiSecret; 
+        
         await req.user.save();
         res.json({ status: 'ok' });
     } catch(e) { res.status(500).json({ error: 'Failed to update settings' }); }
 });
 
 app.post('/api/user/config', authMiddleware, async (req, res) => {
-    const worker = activeWorkers.get(req.user._id.toString());
-    if(!worker) return res.status(400).json({ error: 'Worker not active' });
+    const workers = activeWorkers.get(req.user._id.toString());
+    if(!workers) return res.status(400).json({ error: 'Worker not active' });
     
-    const { tpPct, slPct, dcaTriggerPct, dcaMultiplier, startContracts, dgrDailyGrowthRate, manualDirection, maxContracts } = req.body;
-    const pSet = (v, f, k) => { if (v !== undefined && v !== "") { const p = f(v); if (!isNaN(p)) worker.config[k] = p; } };
-
-    pSet(tpPct, parseFloat, 'takeProfitPct'); pSet(slPct, parseFloat, 'stopLossPct');
-    pSet(dcaTriggerPct, parseFloat, 'dcaTriggerPct'); pSet(dcaMultiplier, parseFloat, 'dcaMultiplier');
-    pSet(startContracts, parseInt, 'startContracts'); pSet(dgrDailyGrowthRate, parseFloat, 'dgrDailyGrowthRate');
-    pSet(maxContracts, parseInt, 'maxContracts');
+    const { tpPct, slPct, dcaTriggerPct, dcaMultiplier, startContracts, dgrDailyGrowthRate, manualDirection, maxContracts, isSecondAccount } = req.body;
+    const pSet = (v, f, k, targetWorker) => { if (v !== undefined && v !== "") { const p = f(v); if (!isNaN(p)) targetWorker.config[k] = p; } };
+    
+    const targetWorker = isSecondAccount ? workers.second : workers.main;
+    if (!targetWorker) return res.status(400).json({ error: 'Account not initialized' });
+    
+    pSet(tpPct, parseFloat, 'takeProfitPct', targetWorker);
+    pSet(slPct, parseFloat, 'stopLossPct', targetWorker);
+    pSet(dcaTriggerPct, parseFloat, 'dcaTriggerPct', targetWorker);
+    pSet(dcaMultiplier, parseFloat, 'dcaMultiplier', targetWorker);
+    pSet(startContracts, parseInt, 'startContracts', targetWorker);
+    pSet(dgrDailyGrowthRate, parseFloat, 'dgrDailyGrowthRate', targetWorker);
+    pSet(maxContracts, parseInt, 'maxContracts', targetWorker);
     
     if (manualDirection !== undefined && (manualDirection === 'long' || manualDirection === 'short')) {
-        worker.config.manualDirection = manualDirection;
+        targetWorker.config.manualDirection = manualDirection;
     }
-
-    req.user.config = worker.config; req.user.markModified('config'); await req.user.save();
-    res.json({status: 'ok', config: worker.config});
+    
+    if (isSecondAccount) {
+        if (!req.user.secondAccount) req.user.secondAccount = {};
+        req.user.secondAccount.config = targetWorker.config;
+        req.user.markModified('secondAccount');
+    } else {
+        req.user.config = targetWorker.config;
+    }
+    
+    await req.user.save();
+    res.json({status: 'ok', config: targetWorker.config});
 });
 
 app.post('/api/user/reset-metrics', authMiddleware, async (req, res) => {
     try {
-        const worker = activeWorkers.get(req.user._id.toString());
-        if(worker) { await TradeModel.deleteMany({ userId: req.user._id.toString() }); worker.metrics = new PerformanceMetrics(worker.userId); }
+        const { isSecondAccount } = req.body;
+        const workers = activeWorkers.get(req.user._id.toString());
+        if(workers) {
+            const targetWorker = isSecondAccount ? workers.second : workers.main;
+            if (targetWorker) {
+                await TradeModel.deleteMany({ userId: req.user._id.toString(), accountId: targetWorker.accountType });
+                targetWorker.metrics = new PerformanceMetrics(targetWorker.userId, targetWorker.accountType);
+            }
+        }
         res.json({status: 'ok'});
     } catch(err) { res.status(500).json({error: 'Failed to reset metrics'}); }
 });
 
+app.post('/api/user/close-all', authMiddleware, async (req, res) => {
+    const { isSecondAccount } = req.body;
+    const workers = activeWorkers.get(req.user._id.toString());
+    if(workers) {
+        const targetWorker = isSecondAccount ? workers.second : workers.main;
+        if(targetWorker) await targetWorker.forceClosePosition("MANUAL_FORCE_CLOSE").catch(()=>{});
+    }
+    res.json({status: 'ok'});
+});
+
 app.get('/api/data', authMiddleware, (req, res) => {
-    const worker = activeWorkers.get(req.user._id.toString());
-    res.json(worker ? worker.getExportData() : { error: "Worker not found" });
+    const workers = activeWorkers.get(req.user._id.toString());
+    const mainData = workers?.main ? workers.main.getExportData() : null;
+    const secondData = workers?.second ? workers.second.getExportData() : null;
+    res.json({ main: mainData, second: secondData });
 });
 
 app.get('/api/chart-history', (req, res) => res.json(memoryChartHistory.slice(-800))); 
-app.get('/api/close-all', authMiddleware, async (req, res) => { 
-    const worker = activeWorkers.get(req.user._id.toString());
-    if(worker) await worker.forceClosePosition("MANUAL_FORCE_CLOSE").catch(()=>{}); 
-    res.json({status: 'ok'}); 
-});
 
 // ==================== FRONTEND UI ====================
 app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
@@ -876,14 +1022,14 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>TradeBotPille | SHIB DCA Engine</title>
+    <title>TradeBotPille | Multi-Account DCA Engine</title>
     
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet" />
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        :root { --zinc-50: #fafafa; --zinc-100: #f4f4f5; --zinc-200: #e4e4e7; --zinc-800: #27272a; --zinc-950: #09090b; --indigo-600: #4f46e5; }
+        :root { --zinc-50: #fafafa; --zinc-100: #f4f4f5; --zinc-200: #e4e4e7; --zinc-800: #27272a; --zinc-950: #09090b; --indigo-600: #4f46e5; --emerald-600: #059669; --amber-600: #d97706; }
         body { font-family: 'Inter', sans-serif; background-color: var(--zinc-50); color: var(--zinc-950); }
         .font-mono { font-family: 'JetBrains Mono', monospace; }
         
@@ -900,6 +1046,8 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         .btn-secondary:hover { background: var(--zinc-50); border-color: var(--zinc-800); }
 
         .status-pill { padding: 4px 10px; border-radius: 9999px; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; border: 1px solid transparent; }
+        .account-tab { cursor: pointer; transition: all 0.2s; border-bottom: 2px solid transparent; }
+        .account-tab.active { border-bottom-color: var(--zinc-950); color: var(--zinc-950); font-weight: 700; }
 
         .view-section { display: none; animation: slideUp 0.4s ease-out; }
         @keyframes slideUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
@@ -921,7 +1069,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 </div>
                 <div class="flex flex-col leading-tight">
                     <span class="font-extrabold tracking-tighter text-base">TRADEBOT<span class="text-indigo-600">PILLE</span></span>
-                    <span class="text-[9px] uppercase font-bold text-zinc-400 tracking-widest">DCA Engine</span>
+                    <span class="text-[9px] uppercase font-bold text-zinc-400 tracking-widest">Multi-Account DCA</span>
                 </div>
             </div>
             
@@ -936,10 +1084,11 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             <nav id="nav-private" class="hidden items-center gap-4 text-sm">
                 <div class="hidden md:flex flex-col items-end mr-2">
                     <span id="nav-user-name" class="font-bold text-zinc-950"></span>
-                    <span class="text-[9px] text-zinc-400 font-bold uppercase tracking-tighter">Authorized Operator</span>
+                    <span class="text-[9px] text-zinc-400 font-bold uppercase tracking-tighter">Multi-Account Operator</span>
                 </div>
                 <button onclick="nav('dashboard')" class="px-3 py-2 rounded-md hover:bg-zinc-100 transition font-bold text-zinc-600">Terminal</button>
                 <button onclick="nav('step-history')" class="px-3 py-2 rounded-md hover:bg-zinc-100 transition font-bold text-zinc-600">Steps</button>
+                <button onclick="nav('settings')" class="px-3 py-2 rounded-md hover:bg-zinc-100 transition font-bold text-zinc-600">Settings</button>
                 <button onclick="logout()" class="px-3 py-2 text-red-500 font-bold hover:bg-red-50 rounded-md transition">Logout</button>
             </nav>
         </div>
@@ -951,10 +1100,10 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         <section id="view-home" class="view-section active-view">
             <div class="max-w-4xl mx-auto px-4 pt-32 pb-24 text-center">
                 <div class="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-zinc-100 text-[10px] font-black uppercase tracking-widest text-zinc-500 mb-8 border border-zinc-200">
-                    <span class="w-2 h-2 rounded-full bg-indigo-500 animate-ping"></span> Live SHIB DCA Execution
+                    <span class="w-2 h-2 rounded-full bg-indigo-500 animate-ping"></span> Multi-Account DCA Execution
                 </div>
-                <h1 class="text-6xl md:text-8xl font-black tracking-tight mb-8 leading-[0.9]">DCA TRADING<br><span class="text-zinc-400 italic">WITH PRECISION.</span></h1>
-                <p class="text-lg md:text-xl text-zinc-500 mb-12 max-w-2xl mx-auto font-medium leading-relaxed">A specialized DCA trading algorithm using 75x cross-leverage on HTX with configurable DCA triggers and daily growth rate.</p>
+                <h1 class="text-6xl md:text-8xl font-black tracking-tight mb-8 leading-[0.9]">DUAL ACCOUNT<br><span class="text-zinc-400 italic">DCA TRADING.</span></h1>
+                <p class="text-lg md:text-xl text-zinc-500 mb-12 max-w-2xl mx-auto font-medium leading-relaxed">Run two independent DCA bots with different strategies, directions, and API keys simultaneously.</p>
                 <div class="flex flex-col sm:flex-row justify-center gap-4">
                     <button onclick="nav('register')" class="btn-primary text-base px-8 py-4 shadow-xl shadow-indigo-200">Open Terminal <span class="material-symbols-outlined">trending_up</span></button>
                     <button onclick="nav('backtest')" class="btn-secondary text-base px-8 py-4">Explore Backtest</button>
@@ -1037,124 +1186,239 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 
         <!-- DASHBOARD -->
         <section id="view-dashboard" class="view-section max-w-[1440px] mx-auto px-4 sm:px-6 py-10">
-            <div class="flex flex-col md:flex-row justify-between items-end mb-10 gap-6">
-                <div>
-                    <h2 class="text-4xl font-black tracking-tighter mb-2 italic">LIVE TERMINAL</h2>
-                    <div class="flex items-center gap-3">
-                        <span id="statusBadge" class="status-pill">Waking...</span>
-                        <span class="text-[10px] font-black text-zinc-400 uppercase flex items-center gap-1"><span class="material-symbols-outlined text-[14px]">timer</span> Uptime: <span id="uptime" class="text-zinc-950">0s</span></span>
-                    </div>
-                </div>
-                <div class="flex gap-3">
-                    <button onclick="nav('settings')" class="btn-secondary flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">settings</span> Config</button>
-                    <button onclick="closeAll()" class="btn-secondary text-red-600 border-red-200 hover:bg-red-50 flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">cancel</span> Emergency Exit</button>
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-4xl font-black tracking-tighter italic">LIVE TERMINAL</h2>
+                <div class="flex gap-2 bg-zinc-100 rounded-lg p-1">
+                    <button onclick="switchAccount('main')" id="tab-main" class="account-tab px-6 py-2 rounded-md font-bold text-sm transition active">ACCOUNT 1</button>
+                    <button onclick="switchAccount('second')" id="tab-second" class="account-tab px-6 py-2 rounded-md font-bold text-sm transition text-zinc-400">ACCOUNT 2</button>
                 </div>
             </div>
-
-            <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
-                <div class="lg:col-span-8 space-y-8">
-                    <!-- Stat Grid -->
-                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-                        <div class="ui-card p-6 relative group overflow-hidden">
-                            <div class="absolute inset-y-0 left-0 w-1 bg-zinc-950"></div>
-                            <p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Global PnL</p>
-                            <p id="netPnl" class="text-3xl font-mono font-black tracking-tight">$0.0000</p>
-                            <button onclick="resetMetrics()" class="absolute top-4 right-4 text-zinc-300 hover:text-zinc-950 transition"><span class="material-symbols-outlined text-[16px]">restart_alt</span></button>
-                        </div>
-                        <div class="ui-card p-6">
-                            <p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Wallet Core</p>
-                            <p id="marginUsed" class="text-3xl font-mono font-black tracking-tight">$0.0000</p>
-                        </div>
-                        <div class="ui-card p-6">
-                            <p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Live Delta</p>
-                            <p id="activeRoi" class="text-3xl font-mono font-black tracking-tight text-zinc-400 italic">IDLE</p>
-                        </div>
-                        <div class="ui-card p-6 bg-zinc-950 border-zinc-950 shadow-xl shadow-zinc-200">
-                            <p class="text-[10px] font-black text-zinc-800 uppercase tracking-widest mb-1">Current Direction</p>
-                            <div class="flex items-center justify-between">
-                                <span id="directionValue" class="text-3xl font-mono font-black text-white">LONG</span>
-                                <span id="dgrValue" class="text-[10px] font-black text-zinc-500 uppercase italic">DGR: 0%</span>
-                            </div>
+            
+            <div id="main-account-view">
+                <div class="flex flex-col md:flex-row justify-between items-end mb-10 gap-6">
+                    <div>
+                        <div class="flex items-center gap-3">
+                            <span id="main-statusBadge" class="status-pill">Waking...</span>
+                            <span class="text-[10px] font-black text-zinc-400 uppercase flex items-center gap-1"><span class="material-symbols-outlined text-[14px]">timer</span> Uptime: <span id="main-uptime" class="text-zinc-950">0s</span></span>
                         </div>
                     </div>
-
-                    <!-- Chart -->
-                    <div class="ui-card p-6 h-[450px] relative">
-                        <div class="absolute top-6 left-8 z-10">
-                            <div class="flex items-center gap-2 bg-white/80 backdrop-blur px-3 py-1.5 rounded-full border border-zinc-200 text-[9px] font-black uppercase">
-                                <span class="w-2 h-2 rounded-full bg-zinc-950"></span> SHIB PRICE
-                            </div>
-                        </div>
-                        <canvas id="priceChart"></canvas>
-                    </div>
-
-                    <!-- History -->
-                    <div class="ui-card overflow-hidden">
-                        <div class="p-5 border-b flex items-center justify-between">
-                            <h3 class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Exchange Execution Logs</h3>
-                        </div>
-                        <div class="overflow-x-auto">
-                            <table class="w-full text-left">
-                                <thead class="text-[10px] font-black uppercase bg-zinc-50 border-b">
-                                    <tr><th class="p-4">Time</th><th class="p-4">Side</th><th class="p-4">Qty</th><th class="p-4">Trigger</th><th class="p-4 text-right">Net Return</th></tr>
-                                </thead>
-                                <tbody id="tradeHistoryBody" class="font-mono text-xs divide-y"></tbody>
-                            </table>
-                        </div>
+                    <div class="flex gap-3">
+                        <button onclick="closeAccount('main')" class="btn-secondary text-red-600 border-red-200 hover:bg-red-50 flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">cancel</span> Exit Position</button>
                     </div>
                 </div>
 
-                <!-- Config Sidebar -->
-                <aside class="lg:col-span-4 space-y-8">
-                    <div class="ui-card p-8 border-t-4 border-t-indigo-600">
-                        <h3 class="text-sm font-black uppercase tracking-widest mb-8 flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">tune</span> DCA Parameters</h3>
-                        <div class="space-y-6">
-                            <div class="flex justify-between items-center group">
-                                <label class="text-xs font-bold text-zinc-500">TP Target (%)</label>
-                                <input type="number" id="tpPctSens" class="input-minimal w-24 text-right font-mono font-bold text-green-600">
+                <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
+                    <div class="lg:col-span-8 space-y-8">
+                        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                            <div class="ui-card p-6 relative group overflow-hidden">
+                                <div class="absolute inset-y-0 left-0 w-1 bg-zinc-950"></div>
+                                <p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Total PnL</p>
+                                <p id="main-netPnl" class="text-3xl font-mono font-black tracking-tight">$0.0000</p>
+                                <p id="main-growthPct" class="text-[10px] font-bold mt-1">Growth: 0%</p>
+                                <button onclick="resetMetrics('main')" class="absolute top-4 right-4 text-zinc-300 hover:text-zinc-950 transition"><span class="material-symbols-outlined text-[16px]">restart_alt</span></button>
                             </div>
-                            <div class="flex justify-between items-center group">
-                                <label class="text-xs font-bold text-zinc-500">SL Threshold (%)</label>
-                                <input type="number" id="slPctSens" class="input-minimal w-24 text-right font-mono font-bold text-red-600">
+                            <div class="ui-card p-6">
+                                <p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Wallet Balance</p>
+                                <p id="main-walletBalance" class="text-3xl font-mono font-black tracking-tight">$0.0000</p>
+                                <p id="main-initialBalance" class="text-[9px] text-zinc-400 mt-1">Initial: $0</p>
                             </div>
-                            <hr class="border-zinc-100">
-                            <div class="flex justify-between items-center">
-                                <label class="text-xs font-bold text-zinc-500">DCA Trigger (%)</label>
-                                <input type="number" id="dcaTriggerSens" class="input-minimal w-24 text-right font-mono font-bold" step="0.1">
+                            <div class="ui-card p-6">
+                                <p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Live ROI</p>
+                                <p id="main-activeRoi" class="text-3xl font-mono font-black tracking-tight text-zinc-400 italic">IDLE</p>
                             </div>
-                            <div class="flex justify-between items-center">
-                                <label class="text-xs font-bold text-zinc-500">DCA Multiplier</label>
-                                <input type="number" id="dcaMultiplierSens" class="input-minimal w-24 text-right font-mono font-bold" step="0.1">
+                            <div class="ui-card p-6 bg-zinc-950 border-zinc-950 shadow-xl shadow-zinc-200">
+                                <p class="text-[10px] font-black text-zinc-800 uppercase tracking-widest mb-1">Direction</p>
+                                <div class="flex items-center justify-between">
+                                    <span id="main-directionValue" class="text-3xl font-mono font-black text-white">LONG</span>
+                                    <span id="main-dgrValue" class="text-[10px] font-black text-zinc-500 uppercase italic">DGR: 0%</span>
+                                </div>
                             </div>
-                            <div class="flex justify-between items-center">
-                                <label class="text-xs font-bold text-zinc-500">Start Contracts</label>
-                                <input type="number" id="startContractsSens" class="input-minimal w-24 text-right font-mono font-bold">
+                        </div>
+
+                        <div class="ui-card p-6 h-[450px] relative">
+                            <div class="absolute top-6 left-8 z-10">
+                                <div class="flex items-center gap-2 bg-white/80 backdrop-blur px-3 py-1.5 rounded-full border border-zinc-200 text-[9px] font-black uppercase">
+                                    <span class="w-2 h-2 rounded-full bg-zinc-950"></span> SHIB PRICE
+                                </div>
                             </div>
-                            <div class="flex justify-between items-center">
-                                <label class="text-xs font-bold text-zinc-500">DGR Growth (%)</label>
-                                <input type="number" id="dgrSens" class="input-minimal w-24 text-right font-mono font-bold" step="0.1">
+                            <canvas id="priceChart"></canvas>
+                        </div>
+
+                        <div class="ui-card overflow-hidden">
+                            <div class="p-5 border-b flex items-center justify-between">
+                                <h3 class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Trade History</h3>
                             </div>
-                            <div class="flex justify-between items-center">
-                                <label class="text-xs font-bold text-zinc-500">Direction</label>
-                                <select id="directionSens" class="input-minimal w-24 text-right font-mono font-bold">
-                                    <option value="long">LONG</option>
-                                    <option value="short">SHORT</option>
-                                </select>
+                            <div class="overflow-x-auto">
+                                <table class="w-full text-left">
+                                    <thead class="text-[10px] font-black uppercase bg-zinc-50 border-b">
+                                        <tr><th class="p-4">Time</th><th class="p-4">Side</th><th class="p-4">Qty</th><th class="p-4">Trigger</th><th class="p-4 text-right">Net Return</th></tr>
+                                    </thead>
+                                    <tbody id="main-tradeHistoryBody" class="font-mono text-xs divide-y"></tbody>
+                                </table>
                             </div>
-                            <div class="flex justify-between items-center">
-                                <label class="text-xs font-bold text-zinc-500">Max Contracts</label>
-                                <input type="number" id="maxContractsSens" class="input-minimal w-24 text-right font-mono font-bold">
-                            </div>
-                            <button onclick="saveConfig()" class="btn-primary w-full py-4 shadow-xl shadow-zinc-200 mt-4 italic">Apply Config Settings</button>
                         </div>
                     </div>
-                </aside>
+
+                    <aside class="lg:col-span-4 space-y-8">
+                        <div class="ui-card p-8 border-t-4 border-t-indigo-600">
+                            <h3 class="text-sm font-black uppercase tracking-widest mb-8 flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">tune</span> DCA Parameters</h3>
+                            <div class="space-y-6">
+                                <div class="flex justify-between items-center group">
+                                    <label class="text-xs font-bold text-zinc-500">TP Target (%)</label>
+                                    <input type="number" id="main-tpPctSens" class="input-minimal w-24 text-right font-mono font-bold text-green-600">
+                                </div>
+                                <div class="flex justify-between items-center group">
+                                    <label class="text-xs font-bold text-zinc-500">SL Threshold (%)</label>
+                                    <input type="number" id="main-slPctSens" class="input-minimal w-24 text-right font-mono font-bold text-red-600">
+                                </div>
+                                <hr class="border-zinc-100">
+                                <div class="flex justify-between items-center">
+                                    <label class="text-xs font-bold text-zinc-500">DCA Trigger (%)</label>
+                                    <input type="number" id="main-dcaTriggerSens" class="input-minimal w-24 text-right font-mono font-bold" step="0.1">
+                                </div>
+                                <div class="flex justify-between items-center">
+                                    <label class="text-xs font-bold text-zinc-500">DCA Multiplier</label>
+                                    <input type="number" id="main-dcaMultiplierSens" class="input-minimal w-24 text-right font-mono font-bold" step="0.1">
+                                </div>
+                                <div class="flex justify-between items-center">
+                                    <label class="text-xs font-bold text-zinc-500">Start Contracts</label>
+                                    <input type="number" id="main-startContractsSens" class="input-minimal w-24 text-right font-mono font-bold">
+                                </div>
+                                <div class="flex justify-between items-center">
+                                    <label class="text-xs font-bold text-zinc-500">DGR Growth (%)</label>
+                                    <input type="number" id="main-dgrSens" class="input-minimal w-24 text-right font-mono font-bold" step="0.1">
+                                </div>
+                                <div class="flex justify-between items-center">
+                                    <label class="text-xs font-bold text-zinc-500">Direction</label>
+                                    <select id="main-directionSens" class="input-minimal w-24 text-right font-mono font-bold">
+                                        <option value="long">LONG</option>
+                                        <option value="short">SHORT</option>
+                                    </select>
+                                </div>
+                                <div class="flex justify-between items-center">
+                                    <label class="text-xs font-bold text-zinc-500">Max Contracts</label>
+                                    <input type="number" id="main-maxContractsSens" class="input-minimal w-24 text-right font-mono font-bold">
+                                </div>
+                                <button onclick="saveConfig('main')" class="btn-primary w-full py-4 shadow-xl shadow-zinc-200 mt-4 italic">Apply Config</button>
+                            </div>
+                        </div>
+                    </aside>
+                </div>
+            </div>
+            
+            <div id="second-account-view" style="display: none;">
+                <div class="flex flex-col md:flex-row justify-between items-end mb-10 gap-6">
+                    <div>
+                        <div class="flex items-center gap-3">
+                            <span id="second-statusBadge" class="status-pill">Waking...</span>
+                            <span class="text-[10px] font-black text-zinc-400 uppercase flex items-center gap-1"><span class="material-symbols-outlined text-[14px]">timer</span> Uptime: <span id="second-uptime" class="text-zinc-950">0s</span></span>
+                        </div>
+                    </div>
+                    <div class="flex gap-3">
+                        <button onclick="closeAccount('second')" class="btn-secondary text-red-600 border-red-200 hover:bg-red-50 flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">cancel</span> Exit Position</button>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
+                    <div class="lg:col-span-8 space-y-8">
+                        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                            <div class="ui-card p-6 relative group overflow-hidden">
+                                <div class="absolute inset-y-0 left-0 w-1 bg-emerald-600"></div>
+                                <p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Total PnL</p>
+                                <p id="second-netPnl" class="text-3xl font-mono font-black tracking-tight">$0.0000</p>
+                                <p id="second-growthPct" class="text-[10px] font-bold mt-1">Growth: 0%</p>
+                                <button onclick="resetMetrics('second')" class="absolute top-4 right-4 text-zinc-300 hover:text-zinc-950 transition"><span class="material-symbols-outlined text-[16px]">restart_alt</span></button>
+                            </div>
+                            <div class="ui-card p-6">
+                                <p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Wallet Balance</p>
+                                <p id="second-walletBalance" class="text-3xl font-mono font-black tracking-tight">$0.0000</p>
+                                <p id="second-initialBalance" class="text-[9px] text-zinc-400 mt-1">Initial: $0</p>
+                            </div>
+                            <div class="ui-card p-6">
+                                <p class="text-[10px] font-black text-zinc-400 uppercase tracking-widest mb-1">Live ROI</p>
+                                <p id="second-activeRoi" class="text-3xl font-mono font-black tracking-tight text-zinc-400 italic">IDLE</p>
+                            </div>
+                            <div class="ui-card p-6 bg-amber-600 border-amber-600 shadow-xl shadow-amber-200">
+                                <p class="text-[10px] font-black text-amber-100 uppercase tracking-widest mb-1">Direction</p>
+                                <div class="flex items-center justify-between">
+                                    <span id="second-directionValue" class="text-3xl font-mono font-black text-white">LONG</span>
+                                    <span id="second-dgrValue" class="text-[10px] font-black text-amber-100 uppercase italic">DGR: 0%</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="ui-card overflow-hidden">
+                            <div class="p-5 border-b flex items-center justify-between">
+                                <h3 class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Trade History</h3>
+                            </div>
+                            <div class="overflow-x-auto">
+                                <table class="w-full text-left">
+                                    <thead class="text-[10px] font-black uppercase bg-zinc-50 border-b">
+                                        <tr><th class="p-4">Time</th><th class="p-4">Side</th><th class="p-4">Qty</th><th class="p-4">Trigger</th><th class="p-4 text-right">Net Return</th></tr>
+                                    </thead>
+                                    <tbody id="second-tradeHistoryBody" class="font-mono text-xs divide-y"></tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+
+                    <aside class="lg:col-span-4 space-y-8">
+                        <div class="ui-card p-8 border-t-4 border-t-emerald-600">
+                            <h3 class="text-sm font-black uppercase tracking-widest mb-8 flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">tune</span> DCA Parameters</h3>
+                            <div class="space-y-6">
+                                <div class="flex justify-between items-center group">
+                                    <label class="text-xs font-bold text-zinc-500">TP Target (%)</label>
+                                    <input type="number" id="second-tpPctSens" class="input-minimal w-24 text-right font-mono font-bold text-green-600">
+                                </div>
+                                <div class="flex justify-between items-center group">
+                                    <label class="text-xs font-bold text-zinc-500">SL Threshold (%)</label>
+                                    <input type="number" id="second-slPctSens" class="input-minimal w-24 text-right font-mono font-bold text-red-600">
+                                </div>
+                                <hr class="border-zinc-100">
+                                <div class="flex justify-between items-center">
+                                    <label class="text-xs font-bold text-zinc-500">DCA Trigger (%)</label>
+                                    <input type="number" id="second-dcaTriggerSens" class="input-minimal w-24 text-right font-mono font-bold" step="0.1">
+                                </div>
+                                <div class="flex justify-between items-center">
+                                    <label class="text-xs font-bold text-zinc-500">DCA Multiplier</label>
+                                    <input type="number" id="second-dcaMultiplierSens" class="input-minimal w-24 text-right font-mono font-bold" step="0.1">
+                                </div>
+                                <div class="flex justify-between items-center">
+                                    <label class="text-xs font-bold text-zinc-500">Start Contracts</label>
+                                    <input type="number" id="second-startContractsSens" class="input-minimal w-24 text-right font-mono font-bold">
+                                </div>
+                                <div class="flex justify-between items-center">
+                                    <label class="text-xs font-bold text-zinc-500">DGR Growth (%)</label>
+                                    <input type="number" id="second-dgrSens" class="input-minimal w-24 text-right font-mono font-bold" step="0.1">
+                                </div>
+                                <div class="flex justify-between items-center">
+                                    <label class="text-xs font-bold text-zinc-500">Direction</label>
+                                    <select id="second-directionSens" class="input-minimal w-24 text-right font-mono font-bold">
+                                        <option value="long">LONG</option>
+                                        <option value="short">SHORT</option>
+                                    </select>
+                                </div>
+                                <div class="flex justify-between items-center">
+                                    <label class="text-xs font-bold text-zinc-500">Max Contracts</label>
+                                    <input type="number" id="second-maxContractsSens" class="input-minimal w-24 text-right font-mono font-bold">
+                                </div>
+                                <button onclick="saveConfig('second')" class="btn-primary w-full py-4 shadow-xl shadow-zinc-200 mt-4 italic">Apply Config</button>
+                            </div>
+                        </div>
+                    </aside>
+                </div>
             </div>
         </section>
 
         <!-- STEPS -->
         <section id="view-step-history" class="view-section max-w-4xl mx-auto px-4 py-20">
-            <h2 class="text-4xl font-black mb-8 flex items-center gap-4 italic"><span class="material-symbols-outlined text-4xl">layers</span> DCA STEP TRACE</h2>
+            <div class="flex justify-between items-center mb-8">
+                <h2 class="text-4xl font-black flex items-center gap-4 italic"><span class="material-symbols-outlined text-4xl">layers</span> DCA STEP TRACE</h2>
+                <div class="flex gap-2 bg-zinc-100 rounded-lg p-1">
+                    <button onclick="switchStepAccount('main')" id="step-tab-main" class="step-account-tab px-6 py-2 rounded-md font-bold text-sm transition active">ACCOUNT 1</button>
+                    <button onclick="switchStepAccount('second')" id="step-tab-second" class="step-account-tab px-6 py-2 rounded-md font-bold text-sm transition text-zinc-400">ACCOUNT 2</button>
+                </div>
+            </div>
             <div class="ui-card overflow-hidden">
                 <table class="w-full text-left">
                     <thead class="text-[10px] font-black uppercase bg-zinc-950 text-white">
@@ -1166,19 +1430,35 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         </section>
 
         <!-- SETTINGS -->
-        <section id="view-settings" class="view-section max-w-xl mx-auto px-4 py-20">
-            <div class="ui-card p-10 border-t-4 border-t-zinc-950">
-                <h2 class="text-3xl font-black mb-8 italic">API INTEGRATION</h2>
-                <div class="space-y-8">
-                    <div class="flex items-center gap-4 p-5 bg-zinc-50 rounded-xl border-2 border-dashed border-zinc-200 cursor-pointer hover:border-zinc-950 transition" onclick="handleLiveToggle()">
-                        <input type="checkbox" id="liveTrade" class="w-5 h-5 accent-zinc-950 cursor-pointer">
-                        <label class="text-xs font-black uppercase tracking-widest cursor-pointer">Live Exchange Execution</label>
+        <section id="view-settings" class="view-section max-w-2xl mx-auto px-4 py-20">
+            <h2 class="text-4xl font-black mb-8 italic">ACCOUNT SETTINGS</h2>
+            <div class="space-y-8">
+                <div class="ui-card p-8 border-t-4 border-t-zinc-950">
+                    <h3 class="text-xl font-black mb-6 flex items-center gap-2"><span class="material-symbols-outlined">account_balance</span> ACCOUNT 1 (MAIN)</h3>
+                    <div class="space-y-6">
+                        <div class="flex items-center gap-4 p-5 bg-zinc-50 rounded-xl border-2 border-dashed border-zinc-200 cursor-pointer hover:border-zinc-950 transition" onclick="toggleLive('main')">
+                            <input type="checkbox" id="main-liveTrade" class="w-5 h-5 accent-zinc-950 cursor-pointer">
+                            <label class="text-xs font-black uppercase tracking-widest cursor-pointer">Live Exchange Execution</label>
+                        </div>
+                        <div><label class="text-[10px] font-black text-zinc-400 uppercase mb-2 block">HTX API Key</label><input type="password" id="main-apiKey" class="input-minimal font-mono"></div>
+                        <div><label class="text-[10px] font-black text-zinc-400 uppercase mb-2 block">HTX API Secret</label><input type="password" id="main-apiSecret" class="input-minimal font-mono"></div>
+                        <button onclick="saveApiKeys('main')" class="btn-primary w-full py-4">Save Account 1 Keys</button>
                     </div>
-                    <div><label class="text-[10px] font-black text-zinc-400 uppercase mb-2 block">HTX Key</label><input type="password" id="apiKey" class="input-minimal font-mono"></div>
-                    <div><label class="text-[10px] font-black text-zinc-400 uppercase mb-2 block">HTX Secret</label><input type="password" id="apiSecret" class="input-minimal font-mono"></div>
-                    <button onclick="saveApiKeys()" class="btn-primary w-full py-4 text-base italic shadow-xl shadow-zinc-200">Establish Connection</button>
-                    <p id="key-msg" class="text-center text-[10px] font-black uppercase tracking-widest"></p>
                 </div>
+                
+                <div class="ui-card p-8 border-t-4 border-t-emerald-600">
+                    <h3 class="text-xl font-black mb-6 flex items-center gap-2"><span class="material-symbols-outlined">account_balance_wallet</span> ACCOUNT 2 (SECONDARY)</h3>
+                    <div class="space-y-6">
+                        <div class="flex items-center gap-4 p-5 bg-zinc-50 rounded-xl border-2 border-dashed border-zinc-200 cursor-pointer hover:border-emerald-600 transition" onclick="toggleLive('second')">
+                            <input type="checkbox" id="second-liveTrade" class="w-5 h-5 accent-emerald-600 cursor-pointer">
+                            <label class="text-xs font-black uppercase tracking-widest cursor-pointer">Live Exchange Execution</label>
+                        </div>
+                        <div><label class="text-[10px] font-black text-zinc-400 uppercase mb-2 block">HTX API Key</label><input type="password" id="second-apiKey" class="input-minimal font-mono"></div>
+                        <div><label class="text-[10px] font-black text-zinc-400 uppercase mb-2 block">HTX API Secret</label><input type="password" id="second-apiSecret" class="input-minimal font-mono"></div>
+                        <button onclick="saveApiKeys('second')" class="btn-primary w-full py-4 bg-emerald-600 hover:bg-emerald-700">Save Account 2 Keys</button>
+                    </div>
+                </div>
+                <p id="key-msg" class="text-center text-[10px] font-black uppercase tracking-widest text-zinc-500"></p>
             </div>
         </section>
 
@@ -1212,7 +1492,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 
     <footer class="bg-white border-t border-zinc-200 py-12">
         <div class="max-w-7xl mx-auto px-4 text-center">
-            <p class="text-[10px] font-black uppercase tracking-widest text-zinc-400 mb-2">&copy; <script>document.write(new Date().getFullYear())</script> TRADEBOTPILLE DCA ENGINE</p>
+            <p class="text-[10px] font-black uppercase tracking-widest text-zinc-400 mb-2">&copy; <script>document.write(new Date().getFullYear())</script> TRADEBOTPILLE MULTI-ACCOUNT DCA ENGINE</p>
             <p class="text-[9px] text-zinc-300 font-bold uppercase tracking-tighter">Geometric trading carries absolute risk. Non-custodial execution strictly for education.</p>
         </div>
     </footer>
@@ -1220,6 +1500,8 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
     <script>
         let authToken = localStorage.getItem('bot_token');
         let chartPoints = 800;
+        let currentAccount = 'main';
+        let currentStepAccount = 'main';
 
         let sessionTrackId = localStorage.getItem('rdca_visitor_id');
         if (!sessionTrackId) {
@@ -1241,6 +1523,26 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 
             if(viewId === 'dashboard' && authToken) initDashboard();
             if(viewId === 'analytics') fetchAnalyticsData();
+            if(viewId === 'step-history' && authToken) fetchStepHistory();
+        }
+
+        function switchAccount(account) {
+            currentAccount = account;
+            document.getElementById('main-account-view').style.display = account === 'main' ? 'block' : 'none';
+            document.getElementById('second-account-view').style.display = account === 'second' ? 'block' : 'none';
+            document.getElementById('tab-main').classList.toggle('active', account === 'main');
+            document.getElementById('tab-second').classList.toggle('active', account === 'second');
+            document.getElementById('tab-main').classList.toggle('text-zinc-400', account !== 'main');
+            document.getElementById('tab-second').classList.toggle('text-zinc-400', account !== 'second');
+        }
+        
+        function switchStepAccount(account) {
+            currentStepAccount = account;
+            document.getElementById('step-tab-main').classList.toggle('active', account === 'main');
+            document.getElementById('step-tab-second').classList.toggle('active', account === 'second');
+            document.getElementById('step-tab-main').classList.toggle('text-zinc-400', account !== 'main');
+            document.getElementById('step-tab-second').classList.toggle('text-zinc-400', account !== 'second');
+            fetchStepHistory();
         }
 
         function toggleAuthUI() {
@@ -1280,7 +1582,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             document.getElementById('btResDeposit').innerText = "$" + (res.depositNeeded || 0).toFixed(4);
             const tbody = document.getElementById('btTableBody'); tbody.innerHTML = "";
             [...res.trades].reverse().forEach(t => {
-                tbody.innerHTML += '<tr class="border-b"><td class="p-4 font-black ' + (t.side==='long'?'text-green-600':'text-red-600') + '">' + t.side.toUpperCase() + '</td><td class="p-4">' + t.contracts + '</td><td class="p-4 text-[9px] uppercase font-bold text-zinc-400">' + t.exitReason + '</td><td class="p-4 text-right font-black ' + (t.netPnl>=0?'text-green-600':'text-red-600') + '">$' + t.netPnl.toFixed(4) + '</td></tr>';
+                tbody.innerHTML += '<tr class="border-b"><td class="p-4 font-black ' + (t.side==='long'?'text-green-600':'text-red-600') + '">' + t.side.toUpperCase() + '<tr><td class="p-4">' + t.contracts + '</td><td class="p-4 text-[9px] uppercase font-bold text-zinc-400">' + t.exitReason + '</td><td class="p-4 text-right font-black ' + (t.netPnl>=0?'text-green-600':'text-red-600') + '">$' + t.netPnl.toFixed(4) + '</td></tr>';
             });
         }
 
@@ -1296,35 +1598,59 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             else { authToken = res.token; localStorage.setItem('bot_token', authToken); toggleAuthUI(); nav('dashboard'); }
         }
 
-        function handleLiveToggle() { const cb = document.getElementById('liveTrade'); cb.checked = !cb.checked; }
+        function toggleLive(account) { 
+            const cb = document.getElementById(account + '-liveTrade'); 
+            cb.checked = !cb.checked; 
+        }
 
-        async function saveApiKeys() {
-            const res = await doAPI('/api/user/keys', 'POST', { apiKey: document.getElementById('apiKey').value, apiSecret: document.getElementById('apiSecret').value, liveTradingEnabled: document.getElementById('liveTrade').checked });
-            document.getElementById('key-msg').innerText = res.error ? res.error : "KEYS SECURED";
+        async function saveApiKeys(account) {
+            const isSecondAccount = account === 'second';
+            const res = await doAPI('/api/user/keys', 'POST', { 
+                apiKey: document.getElementById(account + '-apiKey').value, 
+                apiSecret: document.getElementById(account + '-apiSecret').value, 
+                liveTradingEnabled: document.getElementById(account + '-liveTrade').checked,
+                isSecondAccount: isSecondAccount
+            });
+            document.getElementById('key-msg').innerText = res.error ? res.error : "KEYS SECURED FOR " + account.toUpperCase();
             if(!res.error) setTimeout(() => nav('dashboard'), 1500);
         }
 
-        async function saveConfig() {
+        async function saveConfig(account) {
+            const isSecondAccount = account === 'second';
             const payload = { 
-                tpPct: document.getElementById("tpPctSens").value, 
-                slPct: document.getElementById("slPctSens").value,
-                dcaTriggerPct: document.getElementById("dcaTriggerSens").value,
-                dcaMultiplier: document.getElementById("dcaMultiplierSens").value,
-                startContracts: document.getElementById("startContractsSens").value,
-                dgrDailyGrowthRate: document.getElementById("dgrSens").value,
-                manualDirection: document.getElementById("directionSens").value,
-                maxContracts: document.getElementById("maxContractsSens").value
+                tpPct: document.getElementById(account + "-tpPctSens").value, 
+                slPct: document.getElementById(account + "-slPctSens").value,
+                dcaTriggerPct: document.getElementById(account + "-dcaTriggerSens").value,
+                dcaMultiplier: document.getElementById(account + "-dcaMultiplierSens").value,
+                startContracts: document.getElementById(account + "-startContractsSens").value,
+                dgrDailyGrowthRate: document.getElementById(account + "-dgrSens").value,
+                manualDirection: document.getElementById(account + "-directionSens").value,
+                maxContracts: document.getElementById(account + "-maxContractsSens").value,
+                isSecondAccount: isSecondAccount
             };
-            await doAPI('/api/user/config', 'POST', payload); alert("CONFIG SYNCED");
+            await doAPI('/api/user/config', 'POST', payload); 
+            alert("CONFIG SYNCED FOR " + account.toUpperCase());
         }
 
-        async function closeAll() { if(confirm("ABORT ALL TRADES?")) await doAPI('/api/close-all', 'GET'); }
-        async function resetMetrics() { if(confirm("PURGE DATA?")) { await doAPI('/api/user/reset-metrics', 'POST'); lastTradesCount = -1; fetchMetrics(); } }
+        async function closeAccount(account) { 
+            if(confirm("ABORT ALL TRADES FOR " + account.toUpperCase() + "?")) {
+                await doAPI('/api/user/close-all', 'POST', { isSecondAccount: account === 'second' });
+            }
+        }
+        
+        async function resetMetrics(account) { 
+            if(confirm("PURGE DATA FOR " + account.toUpperCase() + "?")) { 
+                await doAPI('/api/user/reset-metrics', 'POST', { isSecondAccount: account === 'second' }); 
+                fetchMetrics(); 
+            } 
+        }
 
         async function fetchAnalyticsData() {
             if(currentPageView !== 'analytics') return;
             const data = await (await fetch('/api/analytics/stats')).json();
-            document.getElementById('stat-online').innerText = data.online; document.getElementById('stat-views').innerText = data.views; document.getElementById('stat-uniques').innerText = data.uniques;
+            document.getElementById('stat-online').innerText = data.online; 
+            document.getElementById('stat-views').innerText = data.views; 
+            document.getElementById('stat-uniques').innerText = data.uniques;
             document.getElementById('stat-pages').innerHTML = Object.entries(data.pages).map(([n, c]) => '<div class="flex justify-between p-4"><span class="font-black text-[10px] uppercase tracking-widest text-zinc-500">'+n+'</span><span class="font-mono font-bold">'+c+' OPS</span></div>').join('');
         }
 
@@ -1347,74 +1673,146 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             }
         });
 
-        let dashLoop = null, settingsLoaded = false, lastTradesCount = -1;
+        let dashLoop = null, settingsLoaded = { main: false, second: false };
         
         async function initDashboard() {
             const me = await doAPI('/api/user/me', 'GET');
-            if(!me.error) { document.getElementById('nav-user-name').innerText = me.name; document.getElementById('liveTrade').checked = me.liveTradingEnabled; document.getElementById('apiKey').value = me.apiKey; }
+            if(!me.error) { 
+                document.getElementById('nav-user-name').innerText = me.name;
+                document.getElementById('main-liveTrade').checked = me.liveTradingEnabled;
+                document.getElementById('main-apiKey').value = me.apiKey || '';
+                if(me.secondAccount) {
+                    document.getElementById('second-liveTrade').checked = me.secondAccount.liveTradingEnabled;
+                    document.getElementById('second-apiKey').value = me.secondAccount.apiKey || '';
+                }
+            }
             const history = await doAPI('/api/chart-history', 'GET');
             if(!history.error) { 
-                priceChart.data.labels = history.map(()=>""); priceChart.data.datasets[0].data = history.map(p=>p.priceMid);
+                priceChart.data.labels = history.map(()=>""); 
+                priceChart.data.datasets[0].data = history.map(p=>p.priceMid);
                 priceChart.update(); 
             }
             if(dashLoop) clearInterval(dashLoop);
             dashLoop = setInterval(fetchMetrics, 300);
         }
+        
+        async function fetchStepHistory() {
+            const data = await doAPI('/api/data', 'GET');
+            if(data.error) return;
+            const accountData = currentStepAccount === 'main' ? data.main : data.second;
+            if(accountData && accountData.activePositions && accountData.activePositions.length > 0) {
+                const tbody = document.getElementById("stepHistoryBody");
+                tbody.innerHTML = (accountData.activePositions[0]?.stepHistory || []).map(s => '<tr class="border-b"><td class="p-5 font-black">'+s.step+'</td><td class="p-5 font-black '+(s.type==='DCA'?'text-red-500':'text-indigo-500')+'">'+s.type+'</td><td class="p-5">$'+s.price.toFixed(8)+'</td><td class="p-5 font-black '+(s.roi>=0?'text-green-600':'text-red-600')+'">'+s.roi.toFixed(2)+'%</td><td class="p-5 text-right text-zinc-400">'+new Date(s.time).toLocaleTimeString()+'</td></tr>').join('') || '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">No Trace Data</td></tr>';
+            } else {
+                document.getElementById("stepHistoryBody").innerHTML = '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">No Active Position</td></tr>';
+            }
+        }
 
         async function fetchMetrics() {
             if(currentPageView !== 'dashboard' && currentPageView !== 'step-history') return;
-            const data = await doAPI('/api/data', 'GET'); if(data.error) return;
-
-            if (currentPageView === 'step-history') {
-                const tbody = document.getElementById("stepHistoryBody");
-                tbody.innerHTML = (data.activePositions[0]?.stepHistory || []).map(s => '<tr class="border-b"><td class="p-5 font-black">'+s.step+'</td><td class="p-5 font-black '+(s.type==='DCA'?'text-red-500':'text-indigo-500')+'">'+s.type+'</td><td class="p-5">$'+s.price.toFixed(8)+'</td><td class="p-5 font-black '+(s.roi>=0?'text-green-600':'text-red-600')+'">'+s.roi.toFixed(2)+'%</td><td class="p-5 text-right text-zinc-400">'+new Date(s.time).toLocaleTimeString()+'</td></tr>').join('') || '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">No Trace Data</td></tr>';
+            const data = await doAPI('/api/data', 'GET'); 
+            if(data.error) return;
+            
+            if(currentPageView === 'step-history') {
+                await fetchStepHistory();
             }
-
-            if(!settingsLoaded && data.config) {
-                document.getElementById("tpPctSens").value = data.config.takeProfitPct; 
-                document.getElementById("slPctSens").value = data.config.stopLossPct; 
-                document.getElementById("dcaTriggerSens").value = data.config.dcaTriggerPct || 1.0;
-                document.getElementById("dcaMultiplierSens").value = data.config.dcaMultiplier || 2.0;
-                document.getElementById("startContractsSens").value = data.config.startContracts || 1;
-                document.getElementById("dgrSens").value = data.config.dgrDailyGrowthRate || 0.0;
-                document.getElementById("directionSens").value = data.config.manualDirection || 'long';
-                document.getElementById("maxContractsSens").value = data.config.maxContracts || 100;
-                settingsLoaded = true;
+            
+            const mainData = data.main;
+            const secondData = data.second;
+            
+            if(mainData) {
+                if(!settingsLoaded.main && mainData.config) {
+                    document.getElementById("main-tpPctSens").value = mainData.config.takeProfitPct; 
+                    document.getElementById("main-slPctSens").value = mainData.config.stopLossPct; 
+                    document.getElementById("main-dcaTriggerSens").value = mainData.config.dcaTriggerPct || 1.0;
+                    document.getElementById("main-dcaMultiplierSens").value = mainData.config.dcaMultiplier || 2.0;
+                    document.getElementById("main-startContractsSens").value = mainData.config.startContracts || 1;
+                    document.getElementById("main-dgrSens").value = mainData.config.dgrDailyGrowthRate || 0.0;
+                    document.getElementById("main-directionSens").value = mainData.config.manualDirection || 'long';
+                    document.getElementById("main-maxContractsSens").value = mainData.config.maxContracts || 100;
+                    settingsLoaded.main = true;
+                }
+                
+                document.getElementById("main-uptime").innerText = mainData.uptime + "s";
+                document.getElementById("main-netPnl").innerText = "$" + (mainData.metrics?.totalNetPnl || 0).toFixed(4);
+                document.getElementById("main-netPnl").className = "text-3xl font-mono font-black tracking-tight " + ((mainData.metrics?.totalNetPnl || 0) >= 0 ? "text-green-600" : "text-red-600");
+                document.getElementById("main-growthPct").innerText = "Growth: " + (mainData.growthPct || 0).toFixed(2) + "%";
+                document.getElementById("main-walletBalance").innerText = "$" + Number(mainData.walletBalance || 0).toFixed(4);
+                document.getElementById("main-initialBalance").innerText = "Initial: $" + (mainData.initialWalletBalance || 0).toFixed(4);
+                
+                const mainBadge = document.getElementById("main-statusBadge");
+                if(mainData.activePositions && mainData.activePositions.length > 0) {
+                    const p = mainData.activePositions[0];
+                    mainBadge.innerText = p.isPaper ? "PAPER ACTIVE" : "LIVE ACTIVE"; 
+                    mainBadge.className = "status-pill bg-zinc-950 text-white";
+                    document.getElementById("main-activeRoi").innerText = (p.exchangeROI || 0).toFixed(2) + "%"; 
+                    document.getElementById("main-activeRoi").className = "text-3xl font-mono font-black tracking-tight " + ((p.exchangeROI || 0) >= 0 ? "text-green-600" : "text-red-600");
+                } else {
+                    mainBadge.innerText = mainData.liveTradingEnabled ? "LIVE SCANNING" : "PAPER STANDBY"; 
+                    mainBadge.className = "status-pill bg-zinc-100 text-zinc-400";
+                    document.getElementById("main-activeRoi").innerText = "IDLE"; 
+                    document.getElementById("main-activeRoi").className = "text-3xl font-mono font-black tracking-tight text-zinc-200";
+                }
+                
+                if(mainData.config) {
+                    document.getElementById('main-directionValue').innerText = (mainData.config.manualDirection || 'LONG').toUpperCase();
+                    document.getElementById('main-dgrValue').innerText = 'DGR: ' + (mainData.config.dgrDailyGrowthRate || 0) + '%';
+                }
+                
+                if(mainData.metrics && mainData.metrics.trades) {
+                    const mainTbody = document.getElementById("main-tradeHistoryBody");
+                    mainTbody.innerHTML = [...mainData.metrics.trades].reverse().slice(0, 10).map(t => '<tr class="border-b"><td class="p-4 text-zinc-400">'+new Date(t.timestamp).toLocaleTimeString()+'</td><td class="p-4 font-black '+(t.side==='long'?'text-green-600':'text-red-600')+'">'+t.side.toUpperCase()+'</td><td class="p-4 font-bold">'+t.contracts.toLocaleString()+'</td><td class="p-4 text-[9px] font-black uppercase text-zinc-300">'+t.exitReason+'</td><td class="p-4 text-right font-black '+(t.netPnl>=0?'text-green-600':'text-red-600')+'">$' + t.netPnl.toFixed(4) + '</td></tr>').join('') || '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">No Trades Yet</td></tr>';
+                }
             }
-
-            document.getElementById("uptime").innerText = data.uptime + "s";
-            document.getElementById("netPnl").innerText = "$" + (data.metrics?.totalNetPnl || 0).toFixed(4);
-            document.getElementById("netPnl").className = "text-3xl font-mono font-black tracking-tight " + ((data.metrics?.totalNetPnl || 0) >= 0 ? "text-green-600" : "text-red-600");
-            document.getElementById("marginUsed").innerText = "$" + Number(data.walletBalance || 0).toFixed(4);
-
-            const badge = document.getElementById("statusBadge");
-            if(data.activePositions && data.activePositions.length > 0) {
-                const p = data.activePositions[0];
-                badge.innerText = p.isPaper ? "PAPER ACTIVE" : "LIVE ACTIVE"; 
-                badge.className = "status-pill bg-zinc-950 text-white";
-                document.getElementById("activeRoi").innerText = (p.exchangeROI || 0).toFixed(2) + "%"; 
-                document.getElementById("activeRoi").className = "text-3xl font-mono font-black tracking-tight " + ((p.exchangeROI || 0) >= 0 ? "text-green-600" : "text-red-600");
-            } else {
-                badge.innerText = data.liveTradingEnabled ? "LIVE SCANNING" : "PAPER STANDBY"; 
-                badge.className = "status-pill bg-zinc-100 text-zinc-400";
-                document.getElementById("activeRoi").innerText = "IDLE"; 
-                document.getElementById("activeRoi").className = "text-3xl font-mono font-black tracking-tight text-zinc-200";
+            
+            if(secondData) {
+                if(!settingsLoaded.second && secondData.config) {
+                    document.getElementById("second-tpPctSens").value = secondData.config.takeProfitPct; 
+                    document.getElementById("second-slPctSens").value = secondData.config.stopLossPct; 
+                    document.getElementById("second-dcaTriggerSens").value = secondData.config.dcaTriggerPct || 1.0;
+                    document.getElementById("second-dcaMultiplierSens").value = secondData.config.dcaMultiplier || 2.0;
+                    document.getElementById("second-startContractsSens").value = secondData.config.startContracts || 1;
+                    document.getElementById("second-dgrSens").value = secondData.config.dgrDailyGrowthRate || 0.0;
+                    document.getElementById("second-directionSens").value = secondData.config.manualDirection || 'long';
+                    document.getElementById("second-maxContractsSens").value = secondData.config.maxContracts || 100;
+                    settingsLoaded.second = true;
+                }
+                
+                document.getElementById("second-uptime").innerText = secondData.uptime + "s";
+                document.getElementById("second-netPnl").innerText = "$" + (secondData.metrics?.totalNetPnl || 0).toFixed(4);
+                document.getElementById("second-netPnl").className = "text-3xl font-mono font-black tracking-tight " + ((secondData.metrics?.totalNetPnl || 0) >= 0 ? "text-green-600" : "text-red-600");
+                document.getElementById("second-growthPct").innerText = "Growth: " + (secondData.growthPct || 0).toFixed(2) + "%";
+                document.getElementById("second-walletBalance").innerText = "$" + Number(secondData.walletBalance || 0).toFixed(4);
+                document.getElementById("second-initialBalance").innerText = "Initial: $" + (secondData.initialWalletBalance || 0).toFixed(4);
+                
+                const secondBadge = document.getElementById("second-statusBadge");
+                if(secondData.activePositions && secondData.activePositions.length > 0) {
+                    const p = secondData.activePositions[0];
+                    secondBadge.innerText = p.isPaper ? "PAPER ACTIVE" : "LIVE ACTIVE"; 
+                    secondBadge.className = "status-pill bg-emerald-600 text-white";
+                    document.getElementById("second-activeRoi").innerText = (p.exchangeROI || 0).toFixed(2) + "%"; 
+                    document.getElementById("second-activeRoi").className = "text-3xl font-mono font-black tracking-tight " + ((p.exchangeROI || 0) >= 0 ? "text-green-600" : "text-red-600");
+                } else {
+                    secondBadge.innerText = secondData.liveTradingEnabled ? "LIVE SCANNING" : "PAPER STANDBY"; 
+                    secondBadge.className = "status-pill bg-zinc-100 text-zinc-400";
+                    document.getElementById("second-activeRoi").innerText = "IDLE"; 
+                    document.getElementById("second-activeRoi").className = "text-3xl font-mono font-black tracking-tight text-zinc-200";
+                }
+                
+                if(secondData.config) {
+                    document.getElementById('second-directionValue').innerText = (secondData.config.manualDirection || 'LONG').toUpperCase();
+                    document.getElementById('second-dgrValue').innerText = 'DGR: ' + (secondData.config.dgrDailyGrowthRate || 0) + '%';
+                }
+                
+                if(secondData.metrics && secondData.metrics.trades) {
+                    const secondTbody = document.getElementById("second-tradeHistoryBody");
+                    secondTbody.innerHTML = [...secondData.metrics.trades].reverse().slice(0, 10).map(t => '<tr class="border-b"><td class="p-4 text-zinc-400">'+new Date(t.timestamp).toLocaleTimeString()+'</td><td class="p-4 font-black '+(t.side==='long'?'text-green-600':'text-red-600')+'">'+t.side.toUpperCase()+'</td><td class="p-4 font-bold">'+t.contracts.toLocaleString()+'</td><td class="p-4 text-[9px] font-black uppercase text-zinc-300">'+t.exitReason+'</td><td class="p-4 text-right font-black '+(t.netPnl>=0?'text-green-600':'text-red-600')+'">$' + t.netPnl.toFixed(4) + '</td></tr>').join('') || '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">No Trades Yet</td></tr>';
+                }
             }
-
-            if(data.config) {
-                document.getElementById('directionValue').innerText = (data.config.manualDirection || 'LONG').toUpperCase();
-                document.getElementById('dgrValue').innerText = 'DGR: ' + (data.config.dgrDailyGrowthRate || 0) + '%';
-            }
-
-            if(data.metrics && data.metrics.totalTradesCount !== lastTradesCount && data.metrics.trades) {
-                lastTradesCount = data.metrics.totalTradesCount;
-                const tbody = document.getElementById("tradeHistoryBody");
-                tbody.innerHTML = [...data.metrics.trades].reverse().slice(0, 10).map(t => '<tr class="border-b"><td class="p-4 text-zinc-400">'+new Date(t.timestamp).toLocaleTimeString()+'</td><td class="p-4 font-black '+(t.side==='long'?'text-green-600':'text-red-600')+'">'+t.side.toUpperCase()+'</td><td class="p-4 font-bold">'+t.contracts.toLocaleString()+'</td><td class="p-4 text-[9px] font-black uppercase text-zinc-300">'+t.exitReason+'</td><td class="p-4 text-right font-black '+(t.netPnl>=0?'text-green-600':'text-red-600')+'">$' + t.netPnl.toFixed(4) + '</td></tr>').join('') || '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">Scanning Tape...</td></tr>';
-            }
-
-            if(data.binance) { 
+            
+            if(globalMarketData && globalMarketData.binance) { 
                 priceChart.data.labels.push(""); 
-                priceChart.data.datasets[0].data.push(data.binance.mid);
+                priceChart.data.datasets[0].data.push(globalMarketData.binance.mid);
                 if(priceChart.data.labels.length > chartPoints) { 
                     priceChart.data.labels.shift(); 
                     priceChart.data.datasets[0].data.shift(); 
@@ -1423,8 +1821,10 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             }
         }
 
-        pingAnalytics(true); setInterval(fetchAnalyticsData, 4000); 
-        if(authToken) { toggleAuthUI(); nav('dashboard'); } else { toggleAuthUI(); nav('home'); }
+        pingAnalytics(true); 
+        setInterval(fetchAnalyticsData, 4000); 
+        if(authToken) { toggleAuthUI(); nav('dashboard'); } 
+        else { toggleAuthUI(); nav('home'); }
     </script>
 </body>
 </html>`);
