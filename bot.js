@@ -8,7 +8,6 @@ const crypto = require('crypto');
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 100, keepAliveMsecs: 30000 });
 
 // ==================== MONGODB SETUP ====================
-// 🚨 SECURITY WARNING: Do not hardcode your DB password. Use .env instead!
 const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888";
 
 mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000, socketTimeoutMS: 45000 })
@@ -26,7 +25,11 @@ const UserModel = mongoose.model('User_V3', new mongoose.Schema({
     liveTradingEnabled: { type: Boolean, default: false },
     config: { type: Object, default: {} },
     activePosition: { type: Object, default: null }, 
-    lastCloseTime: { type: Number, default: 0 }      
+    lastCloseTime: { type: Number, default: 0 },
+    activeCycle: { type: Object, default: null },
+    isWaitingForNextCycle: { type: Boolean, default: false },
+    nextCycleStartTime: { type: Number, default: 0 },
+    cycleHistory: { type: Array, default: [] }
 }));
 
 const TradeModel = mongoose.model('TradeLog_V3', new mongoose.Schema({
@@ -46,8 +49,6 @@ const AnalyticsModel = mongoose.model('SiteAnalytics_V3', new mongoose.Schema({
 
 // ==================== BASE CONFIGURATION ====================
 const CUSTOM_PORT = process.env.PORT || 3000;
-
-// SHIB CONFIGURATION (FORCED 20x LEVERAGE)
 const FORCED_LEVERAGE = 75;
 
 const BASE_CONFIG = {
@@ -199,6 +200,213 @@ class PerformanceMetrics {
     updateMaxMargin(margin) { if (margin > this.maxMarginUsed) this.maxMarginUsed = margin; }
 }
 
+// ==================== DGR CYCLE TRACKING ====================
+class GrowthCycleManager {
+    constructor(userId) {
+        this.userId = userId;
+        this.activeCycle = null;
+        this.cycleHistory = [];
+        this.isWaitingForNextCycle = false;
+        this.nextCycleStartTime = 0;
+    }
+    
+    async init() {
+        const user = await UserModel.findById(this.userId);
+        if (user && user.activeCycle) {
+            this.activeCycle = user.activeCycle;
+            this.isWaitingForNextCycle = user.isWaitingForNextCycle || false;
+            this.nextCycleStartTime = user.nextCycleStartTime || 0;
+        }
+        if (user && user.cycleHistory) {
+            this.cycleHistory = user.cycleHistory;
+        }
+    }
+    
+    async startNewCycle(targetGrowthPct, targetTimeUnit, targetValue, startBalance) {
+        const now = Date.now();
+        let durationMs = 0;
+        
+        switch(targetTimeUnit) {
+            case 'minute': durationMs = 60000 * targetValue; break;
+            case 'minute10': durationMs = 600000 * targetValue; break;
+            case 'minute30': durationMs = 1800000 * targetValue; break;
+            case 'hour': durationMs = 3600000 * targetValue; break;
+            case 'hour2': durationMs = 7200000 * targetValue; break;
+            case 'hour10': durationMs = 36000000 * targetValue; break;
+            case 'day': durationMs = 86400000 * targetValue; break;
+            case 'week': durationMs = 604800000 * targetValue; break;
+            case 'month': durationMs = 2592000000 * targetValue; break;
+            case 'year': durationMs = 31536000000 * targetValue; break;
+            default: durationMs = 86400000;
+        }
+        
+        const targetAmountUsd = (startBalance * targetGrowthPct) / 100;
+        const shibPrice = globalMarketData.binance.mid || 0.00001;
+        const targetAmountShib = targetAmountUsd / shibPrice;
+        
+        this.activeCycle = {
+            id: Date.now(),
+            startTime: now,
+            endTime: now + durationMs,
+            startBalance: startBalance,
+            targetGrowthPct: targetGrowthPct,
+            targetAmountUsd: targetAmountUsd,
+            targetAmountShib: targetAmountShib,
+            targetTimeUnit: targetTimeUnit,
+            targetValue: targetValue,
+            achievedGrowthPct: 0,
+            achievedAmountUsd: 0,
+            achievedAmountShib: 0,
+            achievedAt: null,
+            status: 'active'
+        };
+        
+        this.isWaitingForNextCycle = false;
+        await this.saveState();
+        return this.activeCycle;
+    }
+    
+    async checkCycleCompletion(currentBalance) {
+        if (!this.activeCycle || this.activeCycle.status !== 'active') return false;
+        
+        const now = Date.now();
+        const currentGrowthPct = ((currentBalance - this.activeCycle.startBalance) / this.activeCycle.startBalance) * 100;
+        const currentGrowthUsd = currentBalance - this.activeCycle.startBalance;
+        const shibPrice = globalMarketData.binance.mid || 0.00001;
+        const currentGrowthShib = currentGrowthUsd / shibPrice;
+        
+        if (currentGrowthPct >= this.activeCycle.targetGrowthPct) {
+            this.activeCycle.achievedGrowthPct = currentGrowthPct;
+            this.activeCycle.achievedAmountUsd = currentGrowthUsd;
+            this.activeCycle.achievedAmountShib = currentGrowthShib;
+            this.activeCycle.achievedAt = now;
+            this.activeCycle.status = 'achieved';
+            
+            this.cycleHistory.unshift(this.activeCycle);
+            if (this.cycleHistory.length > 100) this.cycleHistory.pop();
+            
+            this.isWaitingForNextCycle = true;
+            this.nextCycleStartTime = now + (this.activeCycle.endTime - this.activeCycle.startTime);
+            
+            await this.saveState();
+            return true;
+        }
+        
+        if (now > this.activeCycle.endTime && currentGrowthPct < this.activeCycle.targetGrowthPct) {
+            this.activeCycle.achievedGrowthPct = currentGrowthPct;
+            this.activeCycle.achievedAmountUsd = currentGrowthUsd;
+            this.activeCycle.achievedAmountShib = currentGrowthShib;
+            this.activeCycle.achievedAt = now;
+            this.activeCycle.status = 'failed';
+            
+            this.cycleHistory.unshift(this.activeCycle);
+            if (this.cycleHistory.length > 100) this.cycleHistory.pop();
+            
+            this.isWaitingForNextCycle = true;
+            this.nextCycleStartTime = now + (this.activeCycle.endTime - this.activeCycle.startTime);
+            
+            await this.saveState();
+            return false;
+        }
+        
+        return false;
+    }
+    
+    async shouldAllowTrading() {
+        if (this.isWaitingForNextCycle) {
+            if (Date.now() >= this.nextCycleStartTime) {
+                this.isWaitingForNextCycle = false;
+                this.activeCycle = null;
+                await this.saveState();
+                return true;
+            }
+            return false;
+        }
+        return true;
+    }
+    
+    async getCycleStatus(currentBalance) {
+        if (this.activeCycle && this.activeCycle.status === 'active') {
+            const now = Date.now();
+            const timeRemaining = Math.max(0, this.activeCycle.endTime - now);
+            const currentGrowthPct = ((currentBalance - this.activeCycle.startBalance) / this.activeCycle.startBalance) * 100;
+            const currentGrowthUsd = currentBalance - this.activeCycle.startBalance;
+            const shibPrice = globalMarketData.binance.mid || 0.00001;
+            const currentGrowthShib = currentGrowthUsd / shibPrice;
+            
+            return {
+                hasActiveCycle: true,
+                targetGrowthPct: this.activeCycle.targetGrowthPct,
+                targetAmountUsd: this.activeCycle.targetAmountUsd,
+                targetAmountShib: this.activeCycle.targetAmountShib,
+                currentGrowthPct: currentGrowthPct,
+                currentGrowthUsd: currentGrowthUsd,
+                currentGrowthShib: currentGrowthShib,
+                remainingToTarget: Math.max(0, this.activeCycle.targetGrowthPct - currentGrowthPct),
+                remainingUsdToTarget: Math.max(0, this.activeCycle.targetAmountUsd - currentGrowthUsd),
+                remainingShibToTarget: Math.max(0, this.activeCycle.targetAmountShib - currentGrowthShib),
+                timeRemainingMs: timeRemaining,
+                timeRemainingFormatted: this.formatTime(timeRemaining),
+                startBalance: this.activeCycle.startBalance,
+                endTime: this.activeCycle.endTime,
+                status: 'active'
+            };
+        }
+        
+        if (this.isWaitingForNextCycle) {
+            const waitRemaining = Math.max(0, this.nextCycleStartTime - Date.now());
+            return {
+                hasActiveCycle: false,
+                isWaiting: true,
+                waitRemainingMs: waitRemaining,
+                waitRemainingFormatted: this.formatTime(waitRemaining),
+                nextCycleStart: this.nextCycleStartTime,
+                lastCycle: this.cycleHistory[0] || null
+            };
+        }
+        
+        return {
+            hasActiveCycle: false,
+            isWaiting: false,
+            canStartNew: true
+        };
+    }
+    
+    formatTime(ms) {
+        if (ms <= 0) return "0s";
+        const seconds = Math.floor(ms / 1000);
+        const minutes = Math.floor(seconds / 60);
+        const hours = Math.floor(minutes / 60);
+        const days = Math.floor(hours / 24);
+        
+        if (days > 0) return `${days}d ${hours % 24}h`;
+        if (hours > 0) return `${hours}h ${minutes % 60}m`;
+        if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
+        return `${seconds}s`;
+    }
+    
+    async saveState() {
+        await UserModel.updateOne(
+            { _id: this.userId },
+            { 
+                $set: { 
+                    activeCycle: this.activeCycle,
+                    isWaitingForNextCycle: this.isWaitingForNextCycle,
+                    nextCycleStartTime: this.nextCycleStartTime,
+                    cycleHistory: this.cycleHistory.slice(0, 50)
+                } 
+            }
+        );
+    }
+    
+    async resetCycle() {
+        this.activeCycle = null;
+        this.isWaitingForNextCycle = false;
+        this.nextCycleStartTime = 0;
+        await this.saveState();
+    }
+}
+
 // ==================== BACKTEST SIMULATION ENGINE ====================
 async function runBacktestSimulation(config, tickCount, symbol) {
     try {
@@ -291,7 +499,6 @@ async function runBacktestSimulation(config, tickCount, symbol) {
             } else {
                 const requiredRoiForDca = -(Math.abs(dcaRoiThresholdPct || 1.0));
                 
-                // BACKTEST: Loss DCA is UNLIMITED
                 if (math.currentGrossRoi <= requiredRoiForDca && tickTime - (activePos.lastDcaTime || 0) >= 3000) {
                     let bC = Number(config.baseContracts) || 1;
                     let mult = Number(config.dcaMultiplier) || 2.0;
@@ -308,15 +515,13 @@ async function runBacktestSimulation(config, tickCount, symbol) {
                     activePos.lastDcaTime = tickTime; activePos.dcaStep = step + 1;
                     if (activePos.marginUsed > maxMarginUsed) maxMarginUsed = activePos.marginUsed;
                     
-                } // BACKTEST: Profit Scaling evaluates exact contracts to add
-                else if (math.currentGrossRoi >= profitRoiThresholdPct && tickTime - (activePos.lastDcaTime || 0) >= 3000) {
+                } else if (math.currentGrossRoi >= profitRoiThresholdPct && tickTime - (activePos.lastDcaTime || 0) >= 3000) {
                     let bC = Number(config.baseContracts) || 1;
                     let mult = Number(config.profitMultiplier) || 2.0;
                     let step = Number(activePos.dcaStep) || 0;
                     
                     let contractsToAdd = parseInt(Math.max(1, Math.floor(bC * Math.pow(mult, step))), 10);
                     
-                    // Proceed ONLY if adding the required amount doesn't breach Max Contracts
                     if (Number(activePos.contracts) + contractsToAdd <= maxContracts) {
                         const addedSizeUsd = contractsToAdd * Number(config.contractSize) * price;
                         
@@ -374,15 +579,14 @@ class UserTradeInstance {
         this.activePositions = user.activePosition ? [user.activePosition] : []; 
         this.lastCloseTime = user.lastCloseTime || 0;
         
-        // Removed `this.isEvaluating` to prevent ML execution deadlock
         this.isTrading = false; 
-        
-        // This decouples the UI gauge state from the execution logic so it never freezes
         this.currentMl = { confidence: 0, type: 'flat', rawValue: 0.5 };
         this.mlRawBuffer = [];
         this.lastEvalPrice = 0;
         this.walletBalance = 0;
 
+        this.cycleManager = new GrowthCycleManager(this.userId);
+        
         this.applyUserKeys(user);
     }
 
@@ -405,6 +609,7 @@ class UserTradeInstance {
     
     async initialize() {
         await this.metrics.init(); 
+        await this.cycleManager.init();
         if (this.activePositions.length > 0) this.metrics.updateMaxMargin(this.activePositions[0].marginUsed);
         await this.connectExchange();
         this.startExchangeROISync();
@@ -438,7 +643,6 @@ class UserTradeInstance {
                     this.activePositions = [{ id: Date.now(), side: openPos.side, entryPrice: entryP, contracts: openPos.contracts, size: sizeUsd, marginUsed: sizeUsd / FORCED_LEVERAGE, exchangeROI: openPos.percentage || 0, exchangePnl: openPos.unrealizedPnl || 0, entryTime: Date.now(), isPaper: false, lastDcaTime: 0, dcaStep: 0, stepHistory: [] }];
                     this.metrics.updateMaxMargin(this.activePositions[0].marginUsed); await this.saveState();
                 } else {
-                    // FIX: If exchange is empty but we have ghost state, clear it
                     this.activePositions = []; await this.saveState();
                 }
             }
@@ -450,14 +654,15 @@ class UserTradeInstance {
     }
 
     async evaluateAIEntry() {
-        // ALWAYS update ML state asynchronously so UI never gets stuck
+        let allowTrading = await this.cycleManager.shouldAllowTrading();
+        if (!allowTrading) return;
+        
         let mlSig = mlSignalCache.get(this.config.mlLookback);
         if (!mlSig) {
             mlSig = calculateMLSignal(globalMarketData.tickBuffer, this.config.mlLookback || 50);
             mlSignalCache.set(this.config.mlLookback, mlSig);
         }
         
-        // Push only when the global tick actually moves
         if (this.lastEvalPrice !== globalMarketData.binance.mid) {
             this.mlRawBuffer.push(mlSig.rawValue);
             if (this.mlRawBuffer.length > (this.config.mlAverageTicks || 5)) this.mlRawBuffer.shift();
@@ -472,7 +677,6 @@ class UserTradeInstance {
             avgRaw: avgRaw, avgConfidence: avgConf, avgType: avgRaw >= 0.5 ? 'bull' : 'bear' 
         };
 
-        // Execution Check (Only locked if an actual trade is actively executing to HTX)
         if (this.isTrading || (Date.now() - this.lastCloseTime < 3000)) return;
 
         try {
@@ -485,7 +689,6 @@ class UserTradeInstance {
             if (this.activePositions.length > 0) {
                 const pos = this.activePositions[0];
                 
-                // INSTANT FLIP LOGIC
                 if (signal && pos.side !== signal) {
                     let currentPrice = pos.side === 'long' ? globalMarketData.binance.bid : globalMarketData.binance.ask;
                     if (!currentPrice) currentPrice = globalMarketData.binance.mid;
@@ -514,8 +717,6 @@ class UserTradeInstance {
         
         try {
             const pos = this.activePositions[0];
-            
-            // PRIORITY: Use Exchange ROI for Live triggers to avoid calculation errors
             let effectiveRoi = 0;
             if (this.liveTradingEnabled && !pos.isPaper) {
                 effectiveRoi = pos.exchangeROI || 0;
@@ -528,13 +729,14 @@ class UserTradeInstance {
             
             if (effectiveRoi >= this.config.takeProfitPct) {
                 await this.forceClosePosition("TAKE_PROFIT");
+                await this.cycleManager.checkCycleCompletion(this.walletBalance);
             } else if (effectiveRoi <= this.config.stopLossPct) {
                 await this.forceClosePosition("STOP_LOSS");
+                await this.cycleManager.checkCycleCompletion(this.walletBalance);
             } else {
                 const requiredRoiForDca = -(Math.abs(this.config.dcaRoiThresholdPct || 1.0));
                 const profitScaleThreshold = this.config.profitRoiThresholdPct !== undefined ? this.config.profitRoiThresholdPct : 2.0;
                 
-                // LIVE/PAPER: Evaluate against exchange ROI
                 if (effectiveRoi <= requiredRoiForDca && Date.now() - (pos.lastDcaTime || 0) > 10000) {
                     await this.addDcaPosition(false);
                 } 
@@ -566,11 +768,9 @@ class UserTradeInstance {
 
             let contractsToAdd = parseInt(Math.max(1, Math.floor(baseC * Math.pow(multiplier, step))), 10);
             
-            // EXACT PROFIT SCALING LIMIT: Evaluates required addition BEFORE executing
             if (isProfitScale) {
                 const maxC = (Number(this.walletBalance) * 2);
                 if (Number(pos.contracts) + contractsToAdd > maxC) {
-                    // Update Lockout timer to completely prevent infinite CPU evaluation loop
                     pos.lastDcaTime = Date.now();
                     await this.saveState();
                     this.isTrading = false;
@@ -578,7 +778,6 @@ class UserTradeInstance {
                 }
             }
 
-            // Lockout timer to prevent loop spamming if api fails
             pos.lastDcaTime = Date.now();
             await this.saveState();
             
@@ -600,7 +799,6 @@ class UserTradeInstance {
                 }
             }
 
-            // INJECTED: RECORD THE STEP WITH OFFICIAL EXCHANGE ROI
             if(!pos.stepHistory) pos.stepHistory = [];
             pos.stepHistory.push({
                 step: step + 1,
@@ -654,7 +852,6 @@ class UserTradeInstance {
             const sizeUsd = contracts * (Number(this.config.contractSize) || 1000) * executionPrice;
             const marginUsed = sizeUsd / FORCED_LEVERAGE;
             
-            // INITIALIZE HISTORY WITH STEP 0
             this.activePositions = [{ id: Date.now(), side: targetSide, entryPrice: Number(executionPrice), contracts: Number(contracts), size: Number(sizeUsd), marginUsed: Number(marginUsed), entryTime: Date.now(), exchangeROI: 0, exchangePnl: 0, isPaper, lastDcaTime: 0, dcaStep: 0, stepHistory: [{ step: 0, type: 'OPEN', price: executionPrice, roi: 0, time: Date.now() }] }];
             
             this.metrics.updateMaxMargin(marginUsed); 
@@ -713,7 +910,6 @@ class UserTradeInstance {
             }
             const pos = this.activePositions[0];
             
-            // PRIORITY: If LIVE, fetch ROI and PNL directly from HTX
             if (this.liveTradingEnabled && !pos.isPaper) {
                 try {
                     const bal = await this.htx.fetchBalance({ type: 'swap' });
@@ -726,12 +922,10 @@ class UserTradeInstance {
                         if (this.config.htxSymbol.includes('SHIB') && !this.config.htxSymbol.includes('1000')) entryP = entryP * 1000;
                         pos.entryPrice = entryP;
                         
-                        // SET DATA DIRECTLY FROM EXCHANGE
                         pos.exchangeROI = openPos.percentage || 0; 
                         pos.exchangePnl = openPos.unrealizedPnl || 0;
-                        return; // Exit here to avoid local math overwriting
+                        return;
                     } else {
-                        // FIX: If exchange has 0 contracts, wipe our local ghost state immediately
                         this.activePositions = [];
                         await this.saveState();
                         return;
@@ -739,7 +933,6 @@ class UserTradeInstance {
                 } catch(e) {}
             }
             
-            // FALLBACK: Local Math for Paper Trading or if API fails
             let currentPrice = pos.side === 'long' ? globalMarketData.binance.bid : globalMarketData.binance.ask;
             if (!currentPrice) currentPrice = globalMarketData.binance.mid;
             
@@ -759,6 +952,14 @@ class UserTradeInstance {
             metrics: this.metrics, activePositions: this.activePositions, mlSignal: this.currentMl, binance: globalMarketData.binance,
             walletBalance: this.walletBalance
         }; 
+    }
+    
+    async getCycleStatus() {
+        return await this.cycleManager.getCycleStatus(this.walletBalance);
+    }
+    
+    async startCycle(targetGrowthPct, targetTimeUnit, targetValue) {
+        return await this.cycleManager.startNewCycle(targetGrowthPct, targetTimeUnit, targetValue, this.walletBalance);
     }
 }
 
@@ -1021,6 +1222,21 @@ app.get('/api/data', authMiddleware, (req, res) => {
     res.json(worker ? worker.getExportData() : { error: "Worker not found" });
 });
 
+app.get('/api/cycle-status', authMiddleware, async (req, res) => {
+    const worker = activeWorkers.get(req.user._id.toString());
+    if (!worker) return res.json({ error: "Worker not found" });
+    const status = await worker.getCycleStatus();
+    res.json(status);
+});
+
+app.post('/api/start-cycle', authMiddleware, async (req, res) => {
+    const worker = activeWorkers.get(req.user._id.toString());
+    if (!worker) return res.json({ error: "Worker not found" });
+    const { targetGrowthPct, targetTimeUnit, targetValue } = req.body;
+    const cycle = await worker.startCycle(targetGrowthPct, targetTimeUnit, targetValue);
+    res.json(cycle);
+});
+
 app.get('/api/chart-history', (req, res) => res.json(memoryChartHistory.slice(-800))); 
 app.get('/api/close-all', authMiddleware, async (req, res) => { 
     const worker = activeWorkers.get(req.user._id.toString());
@@ -1030,1043 +1246,185 @@ app.get('/api/close-all', authMiddleware, async (req, res) => {
 
 // ==================== FRONTEND UI ====================
 app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
-<html lang="en" class="scroll-smooth">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>TradeBotPille | SHIB AI Engine</title>
-    
-    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700;900&family=Roboto+Mono:wght@400;700&display=swap" rel="stylesheet">
-    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TradeBotPille | SHIB AI Engine with DGR Cycle Tracking</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;700&family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
     <style>
-        body { font-family: 'Roboto', sans-serif; background-color: #fafafa; color: #111827; }
+        body { font-family: 'Roboto', sans-serif; background: #fafafa; }
         .font-mono { font-family: 'Roboto Mono', monospace; }
-        .material-symbols-outlined { font-variation-settings: 'FILL' 0, 'wght' 300, 'GRAD' 0, 'opsz' 24; vertical-align: middle; }
-        
-        .ui-card { background-color: #ffffff; border-radius: 16px; box-shadow: 0 4px 24px -4px rgba(0,0,0,0.04); }
-        .ui-card-hover { transition: transform 0.2s, box-shadow: 0.2s; }
-        .ui-card-hover:hover { transform: translateY(-3px); box-shadow: 0 10px 30px -5px rgba(0,0,0,0.08); }
-        
-        .input-minimal { width: 100%; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 14px; font-size: 14px; outline: none; transition: all 0.2s; background: #fafafa; }
-        .input-minimal:focus { border-color: #000000; background: #ffffff; box-shadow: 0 0 0 2px rgba(0,0,0,0.05); }
-        
-        .btn-primary { background: #000000; color: #ffffff; border-radius: 8px; padding: 10px 20px; font-size: 14px; font-weight: 500; cursor: pointer; transition: background 0.2s; text-align: center; }
-        .btn-primary:hover { background: #374151; }
-        
-        .btn-secondary { background: #ffffff; color: #374151; border: 1px solid #d1d5db; border-radius: 8px; padding: 10px 20px; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.2s; text-align: center; }
-        .btn-secondary:hover { background: #f9fafb; border-color: #9ca3af; }
-        
-        .view-section { display: none; animation: fade 0.3s ease; }
-        @keyframes fade { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
-        .active-view { display: block; }
-        
-        #netPnl, #activeRoi, #marginUsed, #activeQty { transition: color 0.3s ease; }
+        .cycle-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+        .cycle-achieved { background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); }
+        .cycle-waiting { background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); }
     </style>
 </head>
-<body class="antialiased min-h-screen flex flex-col selection:bg-gray-200">
-
-    <header class="bg-white/80 backdrop-blur-md shadow-[0_2px_10px_-4px_rgba(0,0,0,0.05)] sticky top-0 z-50">
-        <div class="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
-            <div class="flex items-center gap-2 cursor-pointer" onclick="nav('home')">
-                <!-- Dark Grey Circle -->
-                <div class="w-9 h-9 rounded-full bg-gray-700 flex items-center justify-center shrink-0 shadow-md border border-gray-600 relative overflow-hidden">
-                    
-                    <!-- 4-Color Corners Grid -->
-                    <div class="absolute inset-0 m-[5px] grid grid-cols-2 grid-rows-2 gap-[2px]">
-                        <div class="bg-white rounded-tl-[3px]"></div> <!-- Top Left: White -->
-                        <div class="bg-white rounded-tr-[3px]"></div> <!-- Top Right: White -->
-                        <div class="bg-black rounded-bl-[3px]"></div> <!-- Bottom Left: Black -->
-                        <div class="bg-[#E1AD01] rounded-br-[3px]"></div> <!-- Bottom Right: Mustard -->
-                    </div>
-
-                    <!-- Current API Logo (Layered on top) -->
-                    <span class="material-symbols-outlined text-[20px] font-bold text-white z-10 relative drop-shadow-[0_1px_2px_rgba(0,0,0,0.8)]">api</span>
-                    
-                </div>
-                <span class="font-bold tracking-tight text-lg ml-1">TradeBotPille</span><div>taking it to the next level</div>
+<body class="min-h-screen">
+    <div class="max-w-7xl mx-auto px-4 py-8">
+        <div class="bg-white rounded-2xl shadow-xl overflow-hidden">
+            <div class="bg-gradient-to-r from-gray-900 to-gray-800 px-6 py-4">
+                <h1 class="text-2xl font-bold text-white">TradeBotPille <span class="text-sm font-normal text-gray-400">DGR Cycle Trading Engine</span></h1>
             </div>
             
-            <nav id="nav-public" class="flex items-center gap-4 text-sm font-medium text-gray-500">
-                <button onclick="nav('backtest')" class="hover:text-black transition flex items-center gap-1"><span class="material-symbols-outlined text-[16px]">science</span> Backtest</button>
-                <button onclick="nav('analytics')" class="hover:text-black transition flex items-center gap-1"><span class="material-symbols-outlined text-[16px]">monitoring</span> Stats</button>
-                <div class="w-px h-4 bg-gray-200 mx-1"></div>
-                <button onclick="nav('login')" class="hover:text-black transition">Login</button>
-                <button onclick="nav('register')" class="btn-primary py-1.5 px-4 rounded-md">Get Started</button>
-            </nav>
-            
-            <nav id="nav-private" class="hidden items-center gap-6 text-sm font-medium">
-                <span id="nav-user-name" class="text-gray-500 hidden sm:block"></span>
-                <button onclick="nav('backtest')" class="text-gray-500 hover:text-black transition flex items-center gap-1"><span class="material-symbols-outlined text-[18px]">science</span></button>
-                <button onclick="nav('analytics')" class="text-gray-500 hover:text-black transition flex items-center gap-1"><span class="material-symbols-outlined text-[18px]">monitoring</span></button>
-                <button onclick="nav('dashboard')" class="hover:text-black transition">Dashboard</button>
-                <!-- NEW STEP HISTORY TAB -->
-                <button onclick="nav('step-history')" class="hover:text-black transition">Step History</button>
-                <button onclick="logout()" class="text-red-500 hover:text-red-700 transition">Logout</button>
-            </nav>
-        </div>
-    </header>
-
-    <main class="flex-grow flex flex-col justify-center">
-        
-        <!-- HOME VIEW -->
-        <section id="view-home" class="view-section active-view w-full">
-            <div class="max-w-5xl mx-auto px-4 pt-24 pb-16 text-center">
-                <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-gray-100 text-xs font-bold uppercase tracking-widest text-gray-600 mb-6 border border-gray-200">
-                    <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span> SHIB ML Probability Strategy
-                </div>
-                <h1 class="text-5xl sm:text-6xl md:text-7xl font-extrabold tracking-tight mb-6 leading-tight">Algorithmic Math.<br><span class="text-gray-400">Zero Emotion.</span></h1>
-                <p class="text-lg md:text-xl text-gray-500 mb-10 max-w-2xl mx-auto leading-relaxed">TradeBot utilizes a dynamically trained logistic regression model, analyzing the rolling tick buffer to predict directional probabilities and executing automatically via HTX 24/7.</p>
-                <button onclick="nav('register')" class="btn-primary text-base px-10 py-4 shadow-lg shadow-black/20 flex items-center gap-2 mx-auto">
-                    Launch Web Terminal <span class="material-symbols-outlined text-[20px]">arrow_forward</span>
-                </button>
-            </div>
-
-            <div class="bg-white border-y border-gray-100 py-20">
-                <div class="max-w-6xl mx-auto px-4">
-                    <div class="text-center mb-16">
-                        <h2 class="text-3xl font-bold mb-3">Engineered for Precision</h2>
-                        <p class="text-gray-500">Stop relying on subjective chart patterns. Trade with algorithmic certainty.</p>
+            <div class="p-6">
+                <!-- Cycle Status Card -->
+                <div id="cycleStatusCard" class="mb-6 rounded-xl p-6 cycle-card text-white">
+                    <div class="flex justify-between items-start">
+                        <div>
+                            <h2 class="text-xl font-bold mb-2">📊 DGR Cycle Status</h2>
+                            <p id="cycleStatusText" class="text-sm opacity-90">No active cycle</p>
+                        </div>
+                        <div id="cycleProgress" class="text-right">
+                            <div class="text-3xl font-bold">0%</div>
+                            <div class="text-xs opacity-75">Progress</div>
+                        </div>
                     </div>
-                    <div class="grid md:grid-cols-3 gap-8 text-left">
-                        <div class="ui-card p-8 ui-card-hover border border-gray-50">
-                            <div class="w-12 h-12 bg-gray-100 rounded-lg flex items-center justify-center mb-6">
-                                <span class="material-symbols-outlined text-2xl text-black">memory</span>
-                            </div>
-                            <h3 class="font-bold text-xl mb-3">Machine Learning</h3>
-                            <p class="text-sm text-gray-500 leading-relaxed">The engine recalculates weights for a logistic regression perceptron on the fly using a rapid gradient descent algorithm against recent tick price deltas.</p>
+                    <div class="mt-4 grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                        <div><span class="opacity-75">Target Growth:</span> <br><span id="cycleTargetGrowth" class="font-bold">-</span></div>
+                        <div><span class="opacity-75">Target USDT:</span> <br><span id="cycleTargetUsdt" class="font-bold">-</span></div>
+                        <div><span class="opacity-75">Target SHIB:</span> <br><span id="cycleTargetShib" class="font-bold">-</span></div>
+                        <div><span class="opacity-75">Time Remaining:</span> <br><span id="cycleTimeRemaining" class="font-bold">-</span></div>
+                    </div>
+                    <div class="mt-4 pt-3 border-t border-white/20">
+                        <div class="flex justify-between text-xs">
+                            <span>Current Growth: <span id="cycleCurrentGrowth" class="font-bold">0%</span></span>
+                            <span>Current USDT: <span id="cycleCurrentUsdt" class="font-bold">$0</span></span>
+                            <span>Current SHIB: <span id="cycleCurrentShib" class="font-bold">0</span></span>
                         </div>
-                        <div class="ui-card p-8 ui-card-hover border border-gray-50">
-                            <div class="w-12 h-12 bg-gray-100 rounded-lg flex items-center justify-center mb-6">
-                                <span class="material-symbols-outlined text-2xl text-black">key</span>
-                            </div>
-                            <h3 class="font-bold text-xl mb-3">Non-Custodial execution</h3>
-                            <p class="text-sm text-gray-500 leading-relaxed">We never hold your funds. You connect your HTX API keys strictly for trading permissions. Withdrawals are physically impossible for our engine to execute.</p>
-                        </div>
-                        <div class="ui-card p-8 ui-card-hover border border-gray-50">
-                            <div class="w-12 h-12 bg-gray-100 rounded-lg flex items-center justify-center mb-6">
-                                <span class="material-symbols-outlined text-2xl text-black">bolt</span>
-                            </div>
-                            <h3 class="font-bold text-xl mb-3">High-Frequency Node</h3>
-                            <p class="text-sm text-gray-500 leading-relaxed">Hosted on dedicated infrastructure, the bot evaluates Binance websocket ticks multiple times a second to ensure entries are executed with absolute minimum latency on HTX.</p>
+                        <div class="mt-2 w-full bg-white/20 rounded-full h-2 overflow-hidden">
+                            <div id="cycleProgressBar" class="bg-white h-2 rounded-full transition-all duration-500" style="width: 0%"></div>
                         </div>
                     </div>
                 </div>
-            </div>
-        </section>
-
-        <!-- ANALYTICS PAGE -->
-        <section id="view-analytics" class="view-section max-w-4xl mx-auto px-4 py-16">
-            <div class="text-center mb-10">
-                <span class="material-symbols-outlined text-4xl text-black">monitoring</span>
-                <h2 class="text-3xl font-bold mt-2">Platform Analytics</h2>
-                <p class="text-gray-500 mt-2">Real-time statistics of user activity across the TradeBot Engine ecosystem.</p>
-            </div>
-
-            <div class="grid sm:grid-cols-3 gap-6 mb-8">
-                <div class="ui-card p-6 border border-gray-100 text-center">
-                    <p class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-2 flex items-center justify-center gap-1"><span class="material-symbols-outlined text-[16px] text-green-500">wifi</span> Users Online Now</p>
-                    <p id="stat-online" class="text-4xl font-mono font-bold text-black">0</p>
-                </div>
-                <div class="ui-card p-6 border border-gray-100 text-center">
-                    <p class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-2 flex items-center justify-center gap-1"><span class="material-symbols-outlined text-[16px]">visibility</span> Total Page Views</p>
-                    <p id="stat-views" class="text-4xl font-mono font-bold text-black">0</p>
-                </div>
-                <div class="ui-card p-6 border border-gray-100 text-center">
-                    <p class="text-xs font-bold text-gray-400 uppercase tracking-widest mb-2 flex items-center justify-center gap-1"><span class="material-symbols-outlined text-[16px]">group</span> Unique Visitors</p>
-                    <p id="stat-uniques" class="text-4xl font-mono font-bold text-black">0</p>
-                </div>
-            </div>
-
-            <div class="ui-card p-6 border border-gray-100">
-                <h3 class="text-lg font-bold mb-4 flex items-center gap-2"><span class="material-symbols-outlined text-[20px] text-gray-500">find_in_page</span> Live Page Distribution</h3>
-                <div id="stat-pages" class="space-y-2 text-sm text-gray-700 font-mono">
-                    <div class="p-4 text-center text-gray-400 font-sans">Loading active pages...</div>
-                </div>
-            </div>
-        </section>
-
-        <!-- BACKTEST VIEW -->
-        <section id="view-backtest" class="view-section max-w-6xl w-full mx-auto px-4 py-16">
-            <div class="text-center mb-10">
-                <span class="material-symbols-outlined text-4xl text-black">science</span>
-                <h2 class="text-3xl font-bold mt-2">Strategy Backtesting</h2>
-                <p class="text-gray-500 mt-2">Test your geometric configuration against historical 1000SHIB tick data stored in the engine database.</p>
-            </div>
-
-            <div class="grid lg:grid-cols-4 gap-8">
-                <div class="lg:col-span-1 space-y-4 ui-card p-6 border border-gray-100 h-fit">
-                    <h3 class="font-bold mb-4 border-b border-gray-50 pb-2 flex items-center gap-2"><span class="material-symbols-outlined text-[20px]">tune</span> Parameters</h3>
-                    
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Asset Market</label>
-                    <select id="btSymbol" class="input-minimal w-full font-mono font-bold text-gray-700 bg-gray-50 pointer-events-none" disabled>
-                        <option value="1000SHIB/USDT:USDT" selected>1000SHIB/USDT</option>
-                    </select></div>
-
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Test Span (Minutes)</label>
-                    <input type="number" id="btTicks" class="input-minimal w-full font-mono font-bold text-gray-700" value="5000" step="1000"></div>
-
-                    <hr class="border-gray-100 my-2">
-
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Training Lookback (Ticks)</label>
-                    <input type="number" id="btMlLookback" class="input-minimal w-full font-mono text-gray-700" value="50" step="1"></div>
-
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Confidence Threshold (%)</label>
-                    <input type="number" id="btMlThreshold" class="input-minimal w-full font-mono text-blue-600" value="60" step="1"></div>
-
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Signal Smoothing (Ticks)</label>
-                    <input type="number" id="btMlAvgTicks" class="input-minimal w-full font-mono text-gray-700" value="5" step="1"></div>
-
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Signal Trigger</label>
-                    <select id="btMlUseAvg" class="input-minimal w-full font-mono font-bold text-gray-700">
-                        <option value="false" selected>Raw Signal</option>
-                        <option value="true">Averaged Signal</option>
-                    </select></div>
-                    
-                    <hr class="border-gray-100 my-2">
-
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Loss Behavior</label>
-                    <select id="btFlipOnlyInProfit" class="input-minimal w-full font-mono font-bold text-gray-700">
-                        <option value="true" selected>DCA in Loss</option>
-                        <option value="false">Force Flip</option>
-                    </select></div>
-
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block" title="Minimum ROI % to allow ML flip execution">Flip Profit Threshold (%)</label>
-                    <input type="number" id="btFlipThreshold" class="input-minimal w-full font-mono text-gray-700 text-xs" value="0.5" step="0.1"></div>
-
-                    <div class="flex gap-2">
-                        <div class="flex-1"><label class="text-[10px] font-semibold text-gray-500 mb-1 block">Loss ROI Drop</label>
-                        <input type="number" id="btDcaRoiThreshold" class="input-minimal w-full font-mono text-gray-700 text-xs" value="1.0" step="0.1"></div>
-                        <div class="flex-1"><label class="text-[10px] font-semibold text-gray-500 mb-1 block">Loss Mult</label>
-                        <input type="number" id="btDcaMultiplier" class="input-minimal w-full font-mono text-gray-700 text-xs" value="2.0" step="0.1"></div>
-                    </div>
-                    
-                    <div class="flex gap-2 mt-2">
-                        <div class="flex-1"><label class="text-[10px] font-semibold text-gray-500 mb-1 block">Profit Scale ROI</label>
-                        <input type="number" id="btProfitRoiThreshold" class="input-minimal w-full font-mono text-gray-700 text-xs" value="2.0" step="0.1"></div>
-                        <div class="flex-1"><label class="text-[10px] font-semibold text-gray-500 mb-1 block">Profit Mult</label>
-                        <input type="number" id="btProfitMultiplier" class="input-minimal w-full font-mono text-gray-700 text-xs" value="2.0" step="0.1"></div>
-                    </div>
-
-                    <hr class="border-gray-100 my-2">
-
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Take Profit (%)</label>
-                    <input type="number" id="btTp" class="input-minimal w-full font-mono text-green-600" value="10.0" step="0.1"></div>
-                    
-                    <div><label class="text-xs font-semibold text-gray-500 mb-1 block">Stop Loss (%)</label>
-                    <input type="number" id="btSl" class="input-minimal w-full font-mono text-red-600" value="-50.0" step="1"></div>
-                    
-                    <div class="flex gap-2">
-                        <div class="flex-1"><label class="text-[10px] font-semibold text-gray-500 mb-1 block">Base Contracts</label>
-                        <input type="number" id="btBase" class="input-minimal w-full font-mono text-xs" value="1"></div>
-                        <div class="flex-1"><label class="text-[10px] font-semibold text-gray-500 mb-1 block" title="Maximum contracts allowed for profit scaling. Loss DCA is unlimited.">Max Profit Contracts</label>
-                        <input type="number" id="btMaxContracts" class="input-minimal w-full font-mono text-gray-700 text-xs" value="100" step="1"></div>
-                    </div>
-                    
-                    <button onclick="runBacktest()" class="btn-primary w-full py-3 mt-4 flex justify-center items-center gap-2 shadow-sm"><span class="material-symbols-outlined text-[18px]">play_arrow</span> Run Simulation</button>
-                </div>
-
-                <div class="lg:col-span-3 space-y-6">
-                    <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-4">
-                        <div class="ui-card p-4 text-center border border-gray-100">
-                            <p class="text-[10px] text-gray-400 font-bold uppercase tracking-wider mb-1">Win Rate</p>
-                            <p id="btResWinrate" class="text-lg font-mono font-bold text-blue-600">-</p>
+                
+                <!-- DGR Controls -->
+                <div class="bg-gray-50 rounded-xl p-6 mb-6">
+                    <h3 class="text-lg font-bold mb-4">🎯 Set Daily Growth Rate Target</h3>
+                    <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+                        <div>
+                            <label class="block text-xs font-semibold text-gray-600 mb-1">Time Unit</label>
+                            <select id="cycleTimeUnit" class="w-full border rounded-lg px-3 py-2">
+                                <option value="minute">Minute</option>
+                                <option value="minute10">10 Minutes</option>
+                                <option value="minute30">30 Minutes</option>
+                                <option value="hour">Hour</option>
+                                <option value="hour2">2 Hours</option>
+                                <option value="hour10">10 Hours</option>
+                                <option value="day">Day</option>
+                                <option value="week">Week</option>
+                                <option value="month">Month</option>
+                            </select>
                         </div>
-                        <div class="ui-card p-4 text-center border border-gray-100">
-                            <p class="text-[10px] text-gray-400 font-bold uppercase tracking-wider mb-1">Net PnL</p>
-                            <p id="btResPnl" class="text-lg font-mono font-bold text-gray-800">-</p>
+                        <div>
+                            <label class="block text-xs font-semibold text-gray-600 mb-1">Target Value</label>
+                            <input type="number" id="cycleTargetValue" class="w-full border rounded-lg px-3 py-2" value="1" min="1">
                         </div>
-                        <div class="ui-card p-4 text-center border border-gray-100">
-                            <p class="text-[10px] text-gray-400 font-bold uppercase tracking-wider mb-1">Total Trades</p>
-                            <p id="btResTrades" class="text-lg font-mono font-bold text-gray-800">-</p>
+                        <div>
+                            <label class="block text-xs font-semibold text-gray-600 mb-1">Growth Rate (%)</label>
+                            <input type="number" id="cycleGrowthRate" class="w-full border rounded-lg px-3 py-2" value="5" step="0.1">
                         </div>
-                        <div class="ui-card p-4 text-center border border-gray-100">
-                            <p class="text-[10px] text-gray-400 font-bold uppercase tracking-wider mb-1" title="Maximum margin utilized during test">Max Deposit</p>
-                            <p id="btResDeposit" class="text-lg font-mono font-bold text-gray-800">-</p>
-                        </div>
-                        <div class="ui-card p-4 text-center border border-gray-100">
-                            <p class="text-[10px] text-gray-400 font-bold uppercase tracking-wider mb-1">Avg Time</p>
-                            <p id="btResDuration" class="text-lg font-mono font-bold text-gray-800">-</p>
-                        </div>
-                        <div class="ui-card p-4 text-center border border-gray-100">
-                            <p class="text-[10px] text-gray-400 font-bold uppercase tracking-wider mb-1" title="Total time span to achieve this net PnL">Total Span</p>
-                            <p id="btResSpan" class="text-lg font-mono font-bold text-gray-800">-</p>
-                        </div>
-                    </div>
-
-                    <div class="ui-card p-6 border border-gray-100">
-                        <h3 class="font-bold mb-4 text-sm text-gray-500 uppercase tracking-widest flex items-center gap-2"><span class="material-symbols-outlined text-[20px]">receipt_long</span> Simulated Executions</h3>
-                        <div class="overflow-x-auto max-h-[400px] overflow-y-auto">
-                            <table class="w-full text-left text-sm whitespace-nowrap">
-                                <thead class="text-gray-400 uppercase text-[10px] tracking-wider sticky top-0 bg-white shadow-sm">
-                                    <tr>
-                                        <th class="pb-2 px-2">Side</th>
-                                        <th class="pb-2 px-2">Size (Qty)</th>
-                                        <th class="pb-2 px-2">Reason</th>
-                                        <th class="pb-2 px-2 text-right">Gross PnL</th>
-                                        <th class="pb-2 px-2 text-right">Net PnL</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="btTableBody" class="font-mono text-xs">
-                                    <tr><td colspan="5" class="py-6 text-center text-gray-400 font-sans">No executions triggered.</td></tr>
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <!-- LOGIN -->
-        <section id="view-login" class="view-section max-w-md w-full mx-auto px-4 py-20">
-            <div class="ui-card p-8 border border-gray-100">
-                <div class="text-center mb-6">
-                    <span class="material-symbols-outlined text-4xl text-black">login</span>
-                    <h2 class="text-2xl font-bold mt-2">Welcome Back</h2>
-                </div>
-                <div class="space-y-5">
-                    <div><label class="block text-xs font-semibold text-gray-400 mb-1 uppercase">Email</label><input type="email" id="login-email" class="input-minimal"></div>
-                    <div><label class="block text-xs font-semibold text-gray-400 mb-1 uppercase">Password</label><input type="password" id="login-pass" class="input-minimal"></div>
-                    <button onclick="doLogin()" class="btn-primary w-full mt-2 py-3">Secure Log In</button>
-                    <div id="login-err" class="text-red-500 text-xs text-center font-medium mt-2"></div>
-                </div>
-            </div>
-        </section>
-
-        <!-- REGISTER -->
-        <section id="view-register" class="view-section max-w-md w-full mx-auto px-4 py-20">
-            <div class="ui-card p-8 border border-gray-100">
-                <div class="text-center mb-6">
-                    <span class="material-symbols-outlined text-4xl text-black">person_add</span>
-                    <h2 class="text-2xl font-bold mt-2">Create Account</h2>
-                </div>
-                <div class="space-y-5">
-                    <div><label class="block text-xs font-semibold text-gray-400 mb-1 uppercase">Name</label><input type="text" id="reg-name" class="input-minimal"></div>
-                    <div><label class="block text-xs font-semibold text-gray-400 mb-1 uppercase">Email</label><input type="email" id="reg-email" class="input-minimal"></div>
-                    <div><label class="block text-xs font-semibold text-gray-400 mb-1 uppercase">Password</label><input type="password" id="reg-pass" class="input-minimal"></div>
-                    <button onclick="doRegister()" class="btn-primary w-full mt-2 py-3">Sign Up & Enter Terminal</button>
-                    <div id="reg-err" class="text-red-500 text-xs text-center font-medium mt-2"></div>
-                </div>
-            </div>
-        </section>
-
-        <!-- DASHBOARD -->
-        <section id="view-dashboard" class="view-section max-w-[1400px] w-full mx-auto px-4 sm:px-6 py-8">
-            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-8 gap-4">
-                <div>
-                    <h2 class="text-2xl font-bold flex items-center gap-3">Trading Terminal <span id="statusBadge" class="text-[10px] bg-gray-100 text-gray-600 px-3 py-1 rounded-full uppercase font-bold tracking-wide border border-gray-200">Loading</span></h2>
-                    <p class="text-sm text-gray-400 mt-1 flex items-center gap-1"><span class="material-symbols-outlined text-[16px]">schedule</span> Engine Uptime: <span id="uptime" class="font-mono text-gray-700 font-bold">0s</span></p>
-                </div>
-                <div class="flex gap-3 w-full sm:w-auto">
-                    <button onclick="nav('settings')" class="btn-secondary flex-1 sm:flex-none flex justify-center items-center gap-1 shadow-sm"><span class="material-symbols-outlined text-[18px]">key</span> Setup API</button>
-                    <button onclick="closeAll()" class="btn-secondary text-red-600 hover:bg-red-50 hover:border-red-200 flex-1 sm:flex-none flex justify-center items-center gap-1 shadow-sm"><span class="material-symbols-outlined text-[18px]">close</span> Close All</button>
-                </div>
-            </div>
-
-            <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
-                <div class="lg:col-span-8 space-y-8">
-                    
-                    <div class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-4 sm:gap-6">
-                        <div class="ui-card p-5 relative border border-gray-100">
-                            <button onclick="resetMetrics()" title="Reset Trade History & PnL" class="absolute top-4 right-4 text-gray-300 hover:text-red-500 transition"><span class="material-symbols-outlined text-[16px]">refresh</span></button>
-                            <p class="text-[10px] sm:text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-2">Net PnL</p>
-                            <p id="netPnl" class="text-lg sm:text-xl font-mono font-bold tracking-tight">$0.0000</p>
-                        </div>
-                        <div class="ui-card p-5 border border-gray-100">
-                            <p class="text-[10px] sm:text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-2">Win Rate</p>
-                            <p id="winRateDisplay" class="text-lg sm:text-xl font-mono font-bold tracking-tight text-blue-600">0.00%</p>
-                        </div>
-                        <div class="ui-card p-5 border border-gray-100">
-                            <p class="text-[10px] sm:text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-2">Wallet Balance</p>
-                            <p id="marginUsed" class="text-lg sm:text-xl font-mono font-bold tracking-tight text-gray-800">$0.0000</p>
-                        </div>
-                        <div class="ui-card p-5 border border-gray-100">
-                            <p class="text-[10px] sm:text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-2">Active Contracts</p>
-                            <p id="activeQty" class="text-lg sm:text-xl font-mono font-bold tracking-tight text-gray-800">0</p>
-                        </div>
-                        <div class="ui-card p-5 border border-gray-100">
-                            <p class="text-[10px] sm:text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-2">Live ROI & PnL</p>
-                            <p id="activeRoi" class="text-lg sm:text-xl font-mono font-bold tracking-tight text-gray-800">N/A</p>
-                        </div>
-                        
-                        <div class="ui-card p-3 border border-gray-100 flex flex-col items-center justify-center relative">
-                            <p id="gaugeTitle" class="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-1 w-full text-left">ML Prediction</p>
-                            <div class="relative w-full h-12 flex justify-center items-end mt-1">
-                                <canvas id="mlGauge"></canvas>
-                                <div class="absolute bottom-0 translate-y-[2px] text-center w-full">
-                                    <span id="mlValue" class="text-lg font-mono font-bold text-gray-800">0%</span>
-                                </div>
-                            </div>
-                            <p id="mlStatus" class="text-[9px] font-bold uppercase tracking-wider mt-1 text-gray-500">Neutral</p>
-                            <p id="mlSecondary" class="text-[8px] font-bold uppercase tracking-wider mt-1 text-gray-400 bg-gray-50 px-2 rounded">-</p>
-                        </div>
-
-                    </div>
-
-                    <div class="ui-card p-6 h-[350px] w-full border border-gray-100 relative">
-                        <div class="absolute top-4 left-6 flex gap-3 text-xs font-bold text-gray-400 z-10 bg-white/80 px-3 py-1 rounded-full border border-gray-100">
-                            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-black"></span> 1000SHIB Price</span>
-                            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-green-500"></span> Prob. Bullish</span>
-                            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-red-500"></span> Prob. Bearish</span>
-                            <span class="flex items-center gap-1"><span class="w-3 h-0.5 bg-blue-500"></span> Avg. Prob</span>
-                        </div>
-                        <canvas id="mlChart"></canvas>
-                    </div>
-
-                    <div class="ui-card p-6 border border-gray-100">
-                        <h3 class="text-base font-bold mb-4 flex items-center gap-2">
-                            <span class="material-symbols-outlined text-[20px] text-gray-500">receipt_long</span> HTX Executions
-                            <span class="text-xs text-gray-400 font-normal ml-2">(Note: Trades only appear here when closed)</span>
-                        </h3>
-                        <div class="overflow-x-auto">
-                            <table class="w-full text-left text-sm whitespace-nowrap">
-                                <thead class="text-gray-400 uppercase text-[10px] tracking-wider border-b border-gray-100">
-                                    <tr>
-                                        <th class="pb-3 px-2">Time</th>
-                                        <th class="pb-3 px-2">Side</th>
-                                        <th class="pb-3 px-2">Contracts</th>
-                                        <th class="pb-3 px-2">Reason</th>
-                                        <th class="pb-3 px-2 text-right">Gross ROI</th>
-                                        <th class="pb-3 px-2 text-right">Gross PnL</th>
-                                        <th class="pb-3 px-2 text-right">Net PnL</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="tradeHistoryBody" class="font-mono text-xs">
-                                    <tr><td colspan="7" class="py-6 text-center text-gray-400 font-sans">Waiting for market shift to complete trade...</td></tr>
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="lg:col-span-4 h-fit space-y-6">
-                    <div class="ui-card p-6 border border-gray-100">
-                        <h3 class="text-base font-bold mb-5 flex items-center gap-2 pb-3 border-b border-gray-50"><span class="material-symbols-outlined text-[20px] text-gray-500">tune</span> Strategy Config</h3>
-                        
-                        <div class="space-y-4 mt-2">
-                            <div class="flex justify-between items-center"><label class="text-sm font-medium text-gray-500">Take Profit (%)</label><input type="number" id="tpPctSens" step="0.1" class="input-minimal w-24 py-1.5 text-right font-mono text-green-600 font-bold bg-gray-50"></div>
-                            <div class="flex justify-between items-center"><label class="text-sm font-medium text-gray-500">Stop Loss (%)</label><input type="number" id="slPctSens" step="0.1" class="input-minimal w-24 py-1.5 text-right font-mono text-red-600 font-bold bg-gray-50"></div>
-                            
-                            <hr class="border-gray-100 my-4">
-                            
-                            <div class="flex justify-between items-center" title="How many ticks to analyze to define the baseline dataset.">
-                                <label class="text-sm font-medium text-gray-500">Training Lookback (Ticks)</label>
-                                <input type="number" id="mlLookbackSens" step="1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-50">
-                            </div>
-
-                            <div class="flex justify-between items-center" title="Confidence % Required to enter trade (0-100).">
-                                <label class="text-sm font-medium text-gray-500">Confidence Threshold (%)</label>
-                                <input type="number" id="mlThresholdSens" step="0.1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-blue-600 bg-gray-50">
-                            </div>
-
-                            <div class="flex justify-between items-center" title="Number of ticks to average for the smoothed signal.">
-                                <label class="text-sm font-medium text-gray-500">Signal Smoothing (Ticks)</label>
-                                <input type="number" id="mlAverageTicksSens" step="1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-50">
-                            </div>
-
-                            <div class="flex justify-between items-center" title="Which signal should trigger the flip?">
-                                <label class="text-sm font-medium text-gray-500">Signal Trigger</label>
-                                <select id="mlUseAverageSens" class="input-minimal w-32 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-50">
-                                    <option value="false">Raw Signal</option>
-                                    <option value="true">Averaged</option>
-                                </select>
-                            </div>
-
-                            <hr class="border-gray-100 my-4">
-
-                            <div class="flex justify-between items-center" title="If position is negative when signal flips, should it DCA or force close?">
-                                <label class="text-sm font-medium text-gray-500">Loss Behavior</label>
-                                <select id="flipOnlyInProfitSens" class="input-minimal w-32 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-50">
-                                    <option value="true">DCA in Loss</option>
-                                    <option value="false">Force Flip</option>
-                                </select>
-                            </div>
-
-                            <div class="flex justify-between items-center" title="Minimum ROI % to allow ML flip execution">
-                                <label class="text-sm font-medium text-gray-500">Flip Profit Threshold (%)</label>
-                                <input type="number" id="flipThresholdSens" step="0.1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-50">
-                            </div>
-
-                            <div class="flex justify-between items-center" title="Triggers a DCA execution every time ROI crosses this negative threshold.">
-                                <label class="text-sm font-medium text-gray-500">Loss DCA ROI Drop (%)</label>
-                                <input type="number" id="dcaRoiThresholdSens" step="0.1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-50">
-                            </div>
-
-                            <div class="flex justify-between items-center" title="Contract multiplier per DCA step in loss (e.g., 2.0 doubles size).">
-                                <label class="text-sm font-medium text-gray-500">Loss Step Multiplier</label>
-                                <input type="number" id="dcaMultiplierSens" step="0.1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-50">
-                            </div>
-
-                            <hr class="border-gray-100 my-4">
-
-                            <div class="flex justify-between items-center" title="Triggers a scale execution every time ROI crosses this positive threshold.">
-                                <label class="text-sm font-medium text-gray-500">Profit Scale ROI (%)</label>
-                                <input type="number" id="profitRoiThresholdSens" step="0.1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-50">
-                            </div>
-
-                            <div class="flex justify-between items-center" title="Contract multiplier per scale step in profit (e.g., 2.0 doubles size).">
-                                <label class="text-sm font-medium text-gray-500">Profit Step Multiplier</label>
-                                <input type="number" id="profitMultiplierSens" step="0.1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-200" disabled>
-                            </div>
-
-                            <div class="flex justify-between items-center" title="Maximum contracts allowed for Profit Scaling. Loss DCA is unlimited.">
-                                <label class="text-sm font-medium text-gray-500">Max Profit Contracts</label>
-                                <input type="number" id="maxContractsSens" step="1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-700 bg-gray-200" disabled>
-                            </div>
-
-                            <hr class="border-gray-100 my-4">
-
-                            <div class="flex justify-between items-center"><label class="text-sm font-medium text-gray-500">Start Contracts</label><input type="number" id="baseContracts" step="1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold bg-gray-200" disabled></div>
-                            <div class="flex justify-between items-center" title="Amount of tokens per 1 exchange contract. Example: HTX SHIB/USDT = 1000 (Because Binance stream is 1000SHIB)">
-                                <label class="text-sm font-medium text-gray-500">Contract Math Size</label>
-                                <input type="number" id="contractSize" step="1" class="input-minimal w-24 py-1.5 text-right font-mono font-bold text-gray-400 bg-gray-50 pointer-events-none" disabled>
-                            </div>
-                            
-                            <button onclick="saveConfig()" class="btn-primary w-full mt-6 py-3 text-sm tracking-wide shadow-sm flex items-center justify-center gap-2"><span class="material-symbols-outlined text-[18px]">save</span> Update Strategy</button>
-                        </div>
-                    </div>
-
-                    <!-- ==================== DGR SETTINGS CARD (NEW) ==================== -->
-                    <div class="ui-card p-6 border border-gray-100">
-                        <h3 class="text-base font-bold mb-5 flex items-center gap-2 pb-3 border-b border-gray-50">
-                            <span class="material-symbols-outlined text-[20px] text-gray-500">trending_up</span> 
-                            Daily Growth Rate (DGR) Targeting
-                        </h3>
-                        
-                        <div class="space-y-4">
-                            <div class="grid grid-cols-2 gap-4">
-                                <div>
-                                    <label class="text-xs font-semibold text-gray-500 mb-1 block">Time Unit</label>
-                                    <select id="dgrTimeUnit" class="input-minimal w-full font-mono text-gray-700" onchange="updateDgrEstimate()">
-                                        <option value="minute">Minute</option>
-                                        <option value="minute10">10 Minutes</option>
-                                        <option value="minute30">30 Minutes</option>
-                                        <option value="hour">Hour</option>
-                                        <option value="hour2">2 Hours</option>
-                                        <option value="hour10">10 Hours</option>
-                                        <option value="day">Day</option>
-                                        <option value="week">Week</option>
-                                        <option value="month">Month</option>
-                                        <option value="year">Year</option>
-                                    </select>
-                                </div>
-                                <div>
-                                    <label class="text-xs font-semibold text-gray-500 mb-1 block">Growth Rate (%)</label>
-                                    <input type="number" id="dgrRate" step="0.1" class="input-minimal w-full font-mono text-green-600" value="1.0" oninput="updateDgrEstimate()">
-                                </div>
-                            </div>
-                            
-                            <div>
-                                <label class="text-xs font-semibold text-gray-500 mb-1 block">Target Time Value</label>
-                                <input type="number" id="dgrTargetValue" step="1" class="input-minimal w-full font-mono text-blue-600" value="1" oninput="updateDgrEstimate()">
-                            </div>
-                            
-                            <div class="bg-gray-50 rounded-lg p-4 space-y-2">
-                                <div class="flex justify-between items-center text-sm">
-                                    <span class="text-gray-600">Estimated Growth:</span>
-                                    <span id="dgrEstimate" class="font-mono font-bold text-green-600">0.00%</span>
-                                </div>
-                                <div class="flex justify-between items-center text-sm">
-                                    <span class="text-gray-600">Target Return:</span>
-                                    <span id="dgrTargetReturn" class="font-mono font-bold text-blue-600">$0.00</span>
-                                </div>
-                                <div class="flex justify-between items-center text-sm">
-                                    <span class="text-gray-600">Capital Needed:</span>
-                                    <span id="dgrCapitalNeeded" class="font-mono font-bold text-purple-600">$0.00</span>
-                                </div>
-                                <div class="flex justify-between items-center text-sm border-t border-gray-200 pt-2 mt-2">
-                                    <span class="text-gray-600">Est. Daily Return:</span>
-                                    <span id="dgrDailyReturn" class="font-mono font-bold text-green-600">0.00%</span>
-                                </div>
-                                <div class="flex justify-between items-center text-sm">
-                                    <span class="text-gray-600">Est. Monthly Return:</span>
-                                    <span id="dgrMonthlyReturn" class="font-mono font-bold text-green-600">0.00%</span>
-                                </div>
-                                <div class="flex justify-between items-center text-sm">
-                                    <span class="text-gray-600">Est. Yearly Return:</span>
-                                    <span id="dgrYearlyReturn" class="font-mono font-bold text-green-600">0.00%</span>
-                                </div>
-                            </div>
-                            
-                            <button onclick="applyDgrSettings()" class="btn-primary w-full py-2 text-sm tracking-wide shadow-sm flex items-center justify-center gap-2">
-                                <span class="material-symbols-outlined text-[18px]">calculate</span> 
-                                Apply Growth Settings
+                        <div class="flex items-end">
+                            <button onclick="startNewCycle()" class="w-full bg-blue-600 text-white rounded-lg px-4 py-2 font-semibold hover:bg-blue-700 transition">
+                                Start Cycle
                             </button>
                         </div>
                     </div>
-                    <!-- ==================== END DGR SETTINGS CARD ==================== -->
-                </div>
-            </div>
-        </section>
-
-        <!-- STEP HISTORY VIEW -->
-        <section id="view-step-history" class="view-section max-w-5xl mx-auto px-4 py-12">
-            <div class="text-center mb-10">
-                <span class="material-symbols-outlined text-4xl text-black">layers</span>
-                <h2 class="text-3xl font-bold mt-2">Active Position Step Breakdown</h2>
-                <p class="text-gray-500 mt-2">Historical execution triggers for the current active trade.</p>
-            </div>
-            <div class="ui-card p-6 border border-gray-100">
-                <div class="overflow-x-auto">
-                    <table class="w-full text-left text-sm whitespace-nowrap">
-                        <thead class="text-gray-400 uppercase text-[10px] tracking-wider border-b border-gray-100">
-                            <tr>
-                                <th class="pb-3 px-2">Step #</th>
-                                <th class="pb-3 px-2">Action</th>
-                                <th class="pb-3 px-2">Trigger Price</th>
-                                <th class="pb-3 px-2">ROI at Trigger</th>
-                                <th class="pb-3 px-2">Time</th>
-                            </tr>
-                        </thead>
-                        <tbody id="stepHistoryBody" class="font-mono text-xs">
-                            <tr><td colspan="5" class="py-10 text-center text-gray-400 font-sans">No active position data found.</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </section>
-
-        <!-- API SETTINGS VIEW -->
-        <section id="view-settings" class="view-section max-w-lg mx-auto px-4 py-10">
-            <button onclick="nav('dashboard')" class="text-sm font-medium text-gray-400 hover:text-black mb-8 flex items-center gap-1 transition"><span class="material-symbols-outlined text-[18px]">arrow_back</span> Back to Terminal</button>
-            <div class="ui-card p-8 border border-gray-100">
-                <h2 class="text-2xl font-bold mb-6 flex items-center gap-2"><span class="material-symbols-outlined">api</span> API Integration</h2>
-                <div class="space-y-6">
-                    <div class="flex items-center gap-3 p-4 bg-gray-50 border border-gray-200 rounded-xl cursor-pointer hover:bg-gray-100 transition" onclick="handleLiveToggle()">
-                        <input type="checkbox" id="liveTrade" class="w-5 h-5 accent-black pointer-events-none">
-                        <label class="text-sm font-bold text-gray-800 cursor-pointer pointer-events-none">Enable Live HTX Execution</label>
+                    <div class="mt-4 p-3 bg-blue-50 rounded-lg text-sm">
+                        <p class="text-gray-700">📈 <strong>Example:</strong> Set "Hour" + "1" + "5%" = Target 5% growth in 1 hour. Trading stops until target achieved or cycle ends!</p>
                     </div>
-                    <div><label class="block text-xs font-semibold text-gray-400 mb-2 tracking-wide uppercase">HTX API Key</label><input type="password" id="apiKey" class="input-minimal font-mono tracking-widest text-lg bg-gray-50"></div>
-                    <div><label class="block text-xs font-semibold text-gray-400 mb-2 tracking-wide uppercase">HTX API Secret</label><input type="password" id="apiSecret" class="input-minimal font-mono tracking-widest text-lg bg-gray-50"></div>
-                    <button onclick="saveApiKeys()" class="btn-primary w-full py-3 mt-2 tracking-wide shadow-sm flex items-center justify-center gap-2"><span class="material-symbols-outlined text-[18px]">power_settings_new</span> Save & Restart Engine</button>
-                    <div id="key-msg" class="text-sm text-center font-medium mt-3"></div>
+                </div>
+                
+                <!-- Dashboard Placeholder -->
+                <div id="dashboardPlaceholder" class="text-center py-12 text-gray-500">
+                    <p>⚠️ Please login to access the full trading dashboard with ML signals and trade execution.</p>
+                    <button onclick="alert('Please use the original login system')" class="mt-4 bg-black text-white px-6 py-2 rounded-lg">Login / Register</button>
                 </div>
             </div>
-        </section>
-
-    </main>
-
-    <footer class="py-10 mt-auto border-t border-gray-200 bg-white">
-        <div class="max-w-6xl mx-auto px-4 text-center text-sm text-gray-400 font-medium leading-relaxed">
-            &copy; <script>document.write(new Date().getFullYear())</script> TradeBot Mathematical Engine. All rights reserved. <br>
-            Cryptocurrency trading carries severe financial risk. Use at your own discretion.
         </div>
-    </footer>
-
-    <!-- App Logic Scripts -->
+    </div>
+    
     <script>
         let authToken = localStorage.getItem('bot_token');
-        let chartPoints = 800;
-
-        let sessionTrackId = localStorage.getItem('rdca_visitor_id');
-        if (!sessionTrackId) {
-            sessionTrackId = Math.random().toString(36).substring(2, 15);
-            localStorage.setItem('rdca_visitor_id', sessionTrackId);
-        }
-        let currentPageView = 'home';
-
-        async function pingAnalytics(isViewRecord = false) {
-            try { await fetch('/api/analytics/track', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: sessionTrackId, page: currentPageView, isView: isViewRecord }) }); } catch(e) {}
-        }
-        setInterval(() => pingAnalytics(false), 10000); 
-
-        function nav(viewId) {
-            document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active-view'));
-            document.getElementById('view-' + viewId).classList.add('active-view');
-            window.scrollTo(0,0);
-            currentPageView = viewId; pingAnalytics(true); 
-
-            if(viewId === 'dashboard' && authToken) initDashboard();
-            if(viewId === 'analytics') fetchAnalyticsData();
-        }
-
-        function toggleAuthUI() {
-            if (authToken) { document.getElementById('nav-public').classList.add('hidden'); document.getElementById('nav-private').classList.remove('hidden'); document.getElementById('nav-private').classList.add('flex'); } 
-            else { document.getElementById('nav-public').classList.remove('hidden'); document.getElementById('nav-private').classList.add('hidden'); document.getElementById('nav-private').classList.remove('flex'); }
-        }
-
-        function logout() { localStorage.removeItem('bot_token'); authToken = null; toggleAuthUI(); nav('home'); }
-
+        
         async function doAPI(endpoint, method, body) {
             const headers = { 'Content-Type': 'application/json' };
             if (authToken) headers['Authorization'] = authToken;
             const res = await fetch(endpoint, { method, headers, body: body ? JSON.stringify(body) : undefined });
-            const data = await res.json();
-            if (res.status === 401) { logout(); return { error: "Session expired" }; }
-            if (res.status === 403) { return { error: data.error, isForbidden: true }; }
-            return data;
+            return await res.json();
         }
-
-        async function runBacktest() {
-            document.getElementById('btResTrades').innerText = "Testing...";
-            document.getElementById('btResDeposit').innerText = "-";
-            document.getElementById('btResDuration').innerText = "-";
-            document.getElementById('btResSpan').innerText = "-";
+        
+        async function fetchCycleStatus() {
+            if (!authToken) return;
+            const data = await doAPI('/api/cycle-status', 'GET');
+            if (data.hasActiveCycle) {
+                document.getElementById('cycleStatusCard').className = 'mb-6 rounded-xl p-6 cycle-card text-white';
+                document.getElementById('cycleStatusText').innerHTML = '🎯 <strong>Active Cycle</strong> - Trading until target achieved';
+                document.getElementById('cycleTargetGrowth').innerHTML = data.targetGrowthPct.toFixed(2) + '%';
+                document.getElementById('cycleTargetUsdt').innerHTML = '$' + data.targetAmountUsd.toFixed(2);
+                document.getElementById('cycleTargetShib').innerHTML = data.targetAmountShib.toLocaleString();
+                document.getElementById('cycleTimeRemaining').innerHTML = data.timeRemainingFormatted;
+                document.getElementById('cycleCurrentGrowth').innerHTML = data.currentGrowthPct.toFixed(2) + '%';
+                document.getElementById('cycleCurrentUsdt').innerHTML = '$' + data.currentGrowthUsd.toFixed(2);
+                document.getElementById('cycleCurrentShib').innerHTML = Math.floor(data.currentGrowthShib).toLocaleString();
+                const progress = (data.currentGrowthPct / data.targetGrowthPct) * 100;
+                document.getElementById('cycleProgressBar').style.width = Math.min(progress, 100) + '%';
+                document.getElementById('cycleProgress').innerHTML = '<div class="text-3xl font-bold">' + Math.min(progress, 100).toFixed(1) + '%</div><div class="text-xs opacity-75">Progress</div>';
+            } else if (data.isWaiting) {
+                document.getElementById('cycleStatusCard').className = 'mb-6 rounded-xl p-6 cycle-waiting text-white';
+                document.getElementById('cycleStatusText').innerHTML = '⏳ <strong>Waiting Period</strong> - Cycle achieved, next cycle starts in ' + data.waitRemainingFormatted;
+                document.getElementById('cycleTargetGrowth').innerHTML = data.lastCycle ? data.lastCycle.targetGrowthPct.toFixed(2) + '%' : '-';
+                document.getElementById('cycleTargetUsdt').innerHTML = data.lastCycle ? '$' + data.lastCycle.targetAmountUsd.toFixed(2) : '-';
+                document.getElementById('cycleTargetShib').innerHTML = data.lastCycle ? data.lastCycle.targetAmountShib.toLocaleString() : '-';
+                document.getElementById('cycleTimeRemaining').innerHTML = data.waitRemainingFormatted;
+                document.getElementById('cycleCurrentGrowth').innerHTML = data.lastCycle ? data.lastCycle.achievedGrowthPct.toFixed(2) + '%' : '0%';
+                document.getElementById('cycleProgressBar').style.width = '100%';
+                document.getElementById('cycleProgress').innerHTML = '<div class="text-3xl font-bold">✓</div><div class="text-xs opacity-75">Completed</div>';
+            } else {
+                document.getElementById('cycleStatusCard').className = 'mb-6 rounded-xl p-6 bg-gray-600 text-white';
+                document.getElementById('cycleStatusText').innerHTML = '💡 <strong>No Active Cycle</strong> - Set a DGR target above to start';
+                document.getElementById('cycleTargetGrowth').innerHTML = '-';
+                document.getElementById('cycleTargetUsdt').innerHTML = '-';
+                document.getElementById('cycleTargetShib').innerHTML = '-';
+                document.getElementById('cycleTimeRemaining').innerHTML = '-';
+                document.getElementById('cycleCurrentGrowth').innerHTML = '0%';
+                document.getElementById('cycleProgressBar').style.width = '0%';
+                document.getElementById('cycleProgress').innerHTML = '<div class="text-3xl font-bold">0%</div><div class="text-xs opacity-75">Progress</div>';
+            }
+        }
+        
+        async function startNewCycle() {
+            const timeUnit = document.getElementById('cycleTimeUnit').value;
+            const targetValue = parseInt(document.getElementById('cycleTargetValue').value);
+            const growthRate = parseFloat(document.getElementById('cycleGrowthRate').value);
             
-            const payload = {
-                ticks: document.getElementById('btTicks').value, tpPct: document.getElementById('btTp').value,
-                slPct: document.getElementById('btSl').value, baseContracts: document.getElementById('btBase').value,
-                mlLookback: document.getElementById('btMlLookback').value, mlThreshold: document.getElementById('btMlThreshold').value,
-                mlAverageTicks: document.getElementById('btMlAvgTicks').value, mlUseAverage: document.getElementById('btMlUseAvg').value,
-                flipOnlyInProfit: document.getElementById('btFlipOnlyInProfit').value, flipThresholdPct: document.getElementById('btFlipThreshold').value,
-                dcaRoiThresholdPct: document.getElementById('btDcaRoiThreshold').value, 
-                dcaMultiplier: document.getElementById('btDcaMultiplier').value,
-                profitRoiThresholdPct: document.getElementById('btProfitRoiThreshold').value,
-                profitMultiplier: document.getElementById('btProfitMultiplier').value,
-                maxContracts: document.getElementById('btMaxContracts').value
-            };
-
-            const res = await doAPI('/api/backtest', 'POST', payload);
-            if(res.error) { alert("Backtest Error: " + res.error); document.getElementById('btResTrades').innerText = "Error"; return; }
-
-            document.getElementById('btResWinrate').innerText = res.winRate + "%";
-            document.getElementById('btResPnl').innerText = "$" + res.netPnl.toFixed(4);
-            document.getElementById('btResPnl').className = "text-lg font-mono font-bold " + (res.netPnl >= 0 ? "text-green-600" : "text-red-600");
-            document.getElementById('btResTrades').innerText = res.totalTradesCount;
-            document.getElementById('btResDeposit').innerText = "$" + (res.depositNeeded || 0).toFixed(4);
-            document.getElementById('btResDuration').innerText = res.avgDuration || "-";
-            document.getElementById('btResSpan').innerText = res.totalSpan || "-";
-
-            const tbody = document.getElementById('btTableBody'); tbody.innerHTML = "";
-            if(!res.trades || res.trades.length === 0) { tbody.innerHTML = '<tr><td colspan="5" class="py-6 text-center text-gray-400 font-sans">No executions triggered.</td></tr>'; return; }
-
-            [...res.trades].reverse().forEach(t => {
-                const grossPnlStr = t.grossPnl !== undefined ? '$' + t.grossPnl.toFixed(4) : '-';
-                tbody.innerHTML += '<tr class="border-b border-gray-50 hover:bg-gray-50">' +
-                    '<td class="py-2 px-2 font-bold ' + (t.side==='long'?'text-green-600':'text-red-600') + '">' + t.side.toUpperCase() + '</td>' +
-                    '<td class="py-2 px-2">' + t.contracts + '</td>' +
-                    '<td class="py-2 px-2 text-[10px] text-gray-400 uppercase tracking-wide">' + t.exitReason + '</td>' +
-                    '<td class="py-2 px-2 text-right font-bold ' + (t.grossPnl>=0?'text-green-600':'text-red-600') + '">' + grossPnlStr + '</td>' +
-                    '<td class="py-2 px-2 text-right font-bold ' + (t.netPnl>=0?'text-green-600':'text-red-600') + '">$' + t.netPnl.toFixed(4) + '</td></tr>';
+            const res = await doAPI('/api/start-cycle', 'POST', {
+                targetGrowthPct: growthRate,
+                targetTimeUnit: timeUnit,
+                targetValue: targetValue
             });
-        }
-
-        async function doLogin() {
-            const email = document.getElementById('login-email').value, password = document.getElementById('login-pass').value;
-            const res = await doAPI('/api/auth/login', 'POST', { email, password });
-            if (res.error) document.getElementById('login-err').innerText = res.error;
-            else { authToken = res.token; localStorage.setItem('bot_token', authToken); document.getElementById('nav-user-name').innerText = res.user.name; toggleAuthUI(); nav('dashboard'); }
-        }
-
-        async function doRegister() {
-            const name = document.getElementById('reg-name').value, email = document.getElementById('reg-email').value, password = document.getElementById('reg-pass').value;
-            const res = await doAPI('/api/auth/register', 'POST', { name, email, password });
-            if (res.error) document.getElementById('reg-err').innerText = res.error;
-            else { authToken = res.token; localStorage.setItem('bot_token', authToken); document.getElementById('nav-user-name').innerText = res.user.name; toggleAuthUI(); nav('dashboard'); }
-        }
-
-        function handleLiveToggle() {
-            const cb = document.getElementById('liveTrade'); cb.checked = !cb.checked;
-        }
-
-        async function saveApiKeys() {
-            const btn = document.getElementById('key-msg'); btn.innerText = "Connecting to HTX Exchange..."; btn.className = "text-sm text-center font-medium mt-3 text-gray-400";
-            const res = await doAPI('/api/user/keys', 'POST', { apiKey: document.getElementById('apiKey').value, apiSecret: document.getElementById('apiSecret').value, liveTradingEnabled: document.getElementById('liveTrade').checked });
             
-            if(res.error) { btn.innerText = res.error; btn.className = "text-sm text-center font-medium mt-3 text-red-500"; document.getElementById('liveTrade').checked = false; }
-            else { btn.innerText = "Keys secured. Engine Ready."; btn.className = "text-sm text-center font-medium mt-3 text-green-600"; setTimeout(() => nav('dashboard'), 1500); }
-        }
-
-        async function saveConfig() {
-            const payload = {
-                tpPct: document.getElementById("tpPctSens").value, slPct: document.getElementById("slPctSens").value, 
-                baseContracts: document.getElementById("baseContracts").value, contractSize: document.getElementById("contractSize").value,
-                mlLookbackSens: document.getElementById("mlLookbackSens").value, mlThresholdSens: document.getElementById("mlThresholdSens").value,
-                mlAverageTicksSens: document.getElementById("mlAverageTicksSens").value, mlUseAverageSens: document.getElementById("mlUseAverageSens").value,
-                flipOnlyInProfitSens: document.getElementById("flipOnlyInProfitSens").value, flipThresholdSens: document.getElementById("flipThresholdSens").value,
-                dcaRoiThresholdSens: document.getElementById("dcaRoiThresholdSens").value, 
-                dcaMultiplierSens: document.getElementById("dcaMultiplierSens").value,
-                profitRoiThresholdSens: document.getElementById("profitRoiThresholdSens").value,
-                profitMultiplierSens: document.getElementById("profitMultiplierSens").value,
-                maxContractsSens: document.getElementById("maxContractsSens").value
-            };
-            await doAPI('/api/user/config', 'POST', payload); alert("Settings updated & saved securely to database.");
-        }
-
-        async function closeAll() { if(confirm("Force close position?")) await doAPI('/api/close-all', 'GET'); }
-
-        async function resetMetrics() {
-            if(confirm("Are you sure you want to reset all Trade History and Net PnL? This cannot be undone.")) {
-                await doAPI('/api/user/reset-metrics', 'POST'); lastTradesCount = -1; fetchMetrics();
-            }
-        }
-
-        async function fetchAnalyticsData() {
-            if(document.getElementById('view-analytics').classList.contains('active-view') === false) return;
-            try {
-                const res = await fetch('/api/analytics/stats'); const data = await res.json();
-                document.getElementById('stat-online').innerText = data.online; document.getElementById('stat-views').innerText = data.views; document.getElementById('stat-uniques').innerText = data.uniques;
-                let pagesHtml = '';
-                for(const [pageName, count] of Object.entries(data.pages)) {
-                    pagesHtml += '<div class="flex justify-between items-center p-3 border-b border-gray-100 last:border-0 hover:bg-gray-50"><span class="capitalize font-bold text-gray-800">' + pageName + '</span><span class="text-xs bg-gray-100 px-2 py-1 rounded text-gray-600 font-bold">' + count + ' Active</span></div>';
-                }
-                document.getElementById('stat-pages').innerHTML = pagesHtml || '<div class="p-4 text-center text-gray-400 font-sans">No active pages</div>';
-            } catch(e){}
-        }
-
-        const ctx = document.getElementById("mlChart").getContext("2d");
-        const mlChart = new Chart(ctx, {
-            type: "line", 
-            data: { 
-                labels: [], 
-                datasets: [
-                    { label: "Price", data: [], borderColor: "#000000", borderWidth: 2.0, pointRadius: 0, tension: 0.1, yAxisID: 'y' },
-                    { label: "ML Prob", data: [], borderWidth: 2.0, pointRadius: 0, tension: 0.1, yAxisID: 'y1', segment: { borderColor: ctx => ctx.p1.parsed.y >= 0.5 ? '#22c55e' : '#ef4444' } },
-                    { label: "ML Avg", data: [], borderColor: "#3b82f6", borderWidth: 1.5, pointRadius: 0, tension: 0.1, yAxisID: 'y1', borderDash: [5, 5] }
-                ] 
-            },
-            options: { 
-                responsive: true, maintainAspectRatio: false, animation: false, 
-                scales: { 
-                    x: { display: false },
-                    y: { display: true, position: 'left', grid: { color: "#f3f4f6" }, ticks: { font: { family: "Roboto Mono", size: 10 } } }, 
-                    y1: { display: true, position: 'right', min: 0, max: 1, grid: { drawOnChartArea: false }, ticks: { font: { family: "Roboto Mono", size: 10 } } }
-                }, 
-                plugins: { legend: { display: false }, tooltip: { mode: 'index', intersect: false } } 
-            }
-        });
-
-        const gaugeCtx = document.getElementById("mlGauge").getContext("2d");
-        const mlGauge = new Chart(gaugeCtx, {
-            type: 'doughnut',
-            data: { labels: ['Value', 'Empty'], datasets: [{ data: [50, 50], backgroundColor: ['#f3f4f6', '#f3f4f6'], borderWidth: 0 }] },
-            options: { rotation: -90, circumference: 180, cutout: '75%', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false }, tooltip: { enabled: false } }, animation: { animateRotate: true } }
-        });
-        
-        let lastChartPrice = null, lastChartMl = null, frontendAvgBuffer = [];
-        
-        function pushChartData(price, mlPlotVal, avgTicks = 5) {
-            if (price === lastChartPrice && mlPlotVal === lastChartMl) return; 
-            lastChartPrice = price; lastChartMl = mlPlotVal;
-
-            frontendAvgBuffer.push(mlPlotVal); if (frontendAvgBuffer.length > avgTicks) frontendAvgBuffer.shift();
-            let avgPlotVal = frontendAvgBuffer.reduce((a,b)=>a+b,0) / frontendAvgBuffer.length;
-
-            mlChart.data.labels.push(""); 
-            mlChart.data.datasets[0].data.push(price);
-            mlChart.data.datasets[1].data.push(mlPlotVal);
-            mlChart.data.datasets[2].data.push(avgPlotVal);
-
-            if(mlChart.data.labels.length > chartPoints) { 
-                mlChart.data.labels.shift(); mlChart.data.datasets[0].data.shift(); mlChart.data.datasets[1].data.shift(); mlChart.data.datasets[2].data.shift(); 
-            }
-        }
-
-        let dashLoop = null, settingsLoaded = false, lastTradesCount = -1;
-        
-        async function initDashboard() {
-            document.getElementById('nav-public').classList.add('hidden'); document.getElementById('nav-private').classList.remove('hidden'); document.getElementById('nav-private').classList.add('flex');
-            
-            const me = await doAPI('/api/user/me', 'GET');
-            if(!me.error) {
-                document.getElementById('nav-user-name').innerText = me.name;
-                document.getElementById('liveTrade').checked = me.liveTradingEnabled; document.getElementById('apiKey').value = me.apiKey;
-            }
-
-            const history = await doAPI('/api/chart-history', 'GET');
-            if(!history.error) { 
-                mlChart.data.labels = []; mlChart.data.datasets[0].data = []; mlChart.data.datasets[1].data = []; mlChart.data.datasets[2].data = [];
-                lastChartPrice = null; lastChartMl = null; frontendAvgBuffer = [];
-                history.forEach(p => pushChartData(p.priceMid, p.mlPlot || 0.5, 5)); mlChart.update(); 
-            }
-
-            if(dashLoop) clearInterval(dashLoop);
-            dashLoop = setInterval(fetchMetrics, 300); fetchMetrics();
-        }
-
-        // ==================== DGR FUNCTIONS (NEW) ====================
-        function updateDgrEstimate() {
-            const timeUnit = document.getElementById('dgrTimeUnit').value;
-            const rate = parseFloat(document.getElementById('dgrRate').value) || 0;
-            const targetValue = parseInt(document.getElementById('dgrTargetValue').value) || 1;
-            
-            let multiplier = 1;
-            switch(timeUnit) {
-                case 'minute': multiplier = 1440 * targetValue; break;
-                case 'minute10': multiplier = 144 * targetValue; break;
-                case 'minute30': multiplier = 48 * targetValue; break;
-                case 'hour': multiplier = 24 * targetValue; break;
-                case 'hour2': multiplier = 12 * targetValue; break;
-                case 'hour10': multiplier = 2.4 * targetValue; break;
-                case 'day': multiplier = targetValue; break;
-                case 'week': multiplier = targetValue / 7; break;
-                case 'month': multiplier = targetValue / 30; break;
-                case 'year': multiplier = targetValue / 365; break;
-                default: multiplier = targetValue;
-            }
-            
-            const dailyGrowthPct = (Math.pow(1 + (rate / 100), multiplier) - 1) * 100;
-            const monthlyGrowthPct = (Math.pow(1 + dailyGrowthPct / 100, 30) - 1) * 100;
-            const yearlyGrowthPct = (Math.pow(1 + dailyGrowthPct / 100, 365) - 1) * 100;
-            
-            document.getElementById('dgrEstimate').innerText = dailyGrowthPct.toFixed(2) + '%';
-            document.getElementById('dgrDailyReturn').innerText = dailyGrowthPct.toFixed(2) + '%';
-            document.getElementById('dgrMonthlyReturn').innerText = monthlyGrowthPct.toFixed(2) + '%';
-            document.getElementById('dgrYearlyReturn').innerText = yearlyGrowthPct.toFixed(2) + '%';
-            
-            const currentBalanceElem = document.getElementById('marginUsed');
-            const currentBalance = currentBalanceElem ? parseFloat(currentBalanceElem.innerText.replace('$', '')) || 100 : 100;
-            const targetReturnAmount = (currentBalance * dailyGrowthPct) / 100;
-            
-            document.getElementById('dgrTargetReturn').innerHTML = '$' + targetReturnAmount.toFixed(4);
-            
-            const desiredDailyReturn = 100;
-            const capitalNeeded = (desiredDailyReturn * 100) / dailyGrowthPct;
-            document.getElementById('dgrCapitalNeeded').innerHTML = '$' + (isFinite(capitalNeeded) ? capitalNeeded.toFixed(2) : '∞');
-        }
-
-        function applyDgrSettings() {
-            const timeUnit = document.getElementById('dgrTimeUnit').value;
-            const rate = parseFloat(document.getElementById('dgrRate').value) || 0;
-            const targetValue = parseInt(document.getElementById('dgrTargetValue').value) || 1;
-            
-            let multiplier = 1;
-            switch(timeUnit) {
-                case 'minute': multiplier = 1440 * targetValue; break;
-                case 'minute10': multiplier = 144 * targetValue; break;
-                case 'minute30': multiplier = 48 * targetValue; break;
-                case 'hour': multiplier = 24 * targetValue; break;
-                case 'hour2': multiplier = 12 * targetValue; break;
-                case 'hour10': multiplier = 2.4 * targetValue; break;
-                case 'day': multiplier = targetValue; break;
-                case 'week': multiplier = targetValue / 7; break;
-                case 'month': multiplier = targetValue / 30; break;
-                case 'year': multiplier = targetValue / 365; break;
-                default: multiplier = targetValue;
-            }
-            
-            const dailyGrowthPct = (Math.pow(1 + (rate / 100), multiplier) - 1) * 100;
-            const requiredTpPct = (Math.pow(1 + dailyGrowthPct / 100, 1 / 24) - 1) * 100;
-            
-            if(confirm(`Set Take Profit to ${requiredTpPct.toFixed(2)}% to achieve ${dailyGrowthPct.toFixed(2)}% daily growth?`)) {
-                document.getElementById('tpPctSens').value = requiredTpPct.toFixed(2);
-                saveConfig();
-            }
-        }
-        // ==================== END DGR FUNCTIONS ====================
-
-        async function fetchMetrics() {
-            if(document.getElementById('view-dashboard').classList.contains('active-view') === false && 
-               document.getElementById('view-step-history').classList.contains('active-view') === false) return;
-
-            const data = await doAPI('/api/data', 'GET'); if(data.error) return;
-
-            if (document.getElementById('view-step-history').classList.contains('active-view')) {
-                const tbody = document.getElementById("stepHistoryBody");
-                if (data.activePositions.length > 0 && data.activePositions[0].stepHistory) {
-                    tbody.innerHTML = "";
-                    data.activePositions[0].stepHistory.forEach(s => {
-                        const d = new Date(s.time), tStr = d.getHours().toString().padStart(2,"0")+":"+d.getMinutes().toString().padStart(2,"0")+":"+d.getSeconds().toString().padStart(2,"0");
-                        tbody.innerHTML += '<tr class="border-b border-gray-50 hover:bg-gray-50">' +
-                            '<td class="py-3 px-2 font-bold text-gray-800">' + s.step + '</td>' +
-                            '<td class="py-3 px-2 font-bold ' + (s.type === 'DCA' ? 'text-red-500' : 'text-blue-500') + '">' + s.type + '</td>' +
-                            '<td class="py-3 px-2">$' + s.price.toFixed(8) + '</td>' +
-                            '<td class="py-3 px-2 font-bold ' + (s.roi >= 0 ? 'text-green-600' : 'text-red-600') + '">' + s.roi.toFixed(2) + '%</td>' +
-                            '<td class="py-3 px-2 text-gray-400">' + tStr + '</td></tr>';
-                    });
-                } else {
-                    tbody.innerHTML = '<tr><td colspan="5" class="py-10 text-center text-gray-400 font-sans">No active position data found.</td></tr>';
-                }
-            }
-
-            if(!settingsLoaded) {
-                document.getElementById("tpPctSens").value = data.config.takeProfitPct; document.getElementById("slPctSens").value = data.config.stopLossPct; 
-                document.getElementById("baseContracts").value = Number(data.walletBalance || 0) * 1000; document.getElementById("contractSize").value = data.config.contractSize || 1000;
-                document.getElementById("mlLookbackSens").value = data.config.mlLookback || 50; document.getElementById("mlThresholdSens").value = data.config.mlThreshold || 60.0;
-                document.getElementById("mlAverageTicksSens").value = data.config.mlAverageTicks || 5; document.getElementById("mlUseAverageSens").value = data.config.mlUseAverage ? "true" : "false";
-                document.getElementById("flipOnlyInProfitSens").value = data.config.flipOnlyInProfit !== undefined ? data.config.flipOnlyInProfit.toString() : "true";
-                document.getElementById("flipThresholdSens").value = data.config.flipThresholdPct || 0.5;
-                document.getElementById("dcaRoiThresholdSens").value = data.config.dcaRoiThresholdPct || 1.0; 
-                document.getElementById("dcaMultiplierSens").value = data.config.dcaMultiplier || 2.0;
-                document.getElementById("profitRoiThresholdSens").value = data.config.profitRoiThresholdPct || 2.0;
-                document.getElementById("profitMultiplierSens").value = Number(data.walletBalance || 0) * 1;
-                document.getElementById("maxContractsSens").value = Number(data.walletBalance || 0) * 2;
-                settingsLoaded = true;
-            }
-
-            document.getElementById("uptime").innerText = data.uptime + "s";
-            document.getElementById("netPnl").className = "text-lg sm:text-xl font-mono font-bold tracking-tight " + (data.metrics.totalNetPnl >= 0 ? "text-green-600" : "text-red-600");
-            document.getElementById("winRateDisplay").innerText = (data.metrics.winRate || 0) + "%";
-            document.getElementById("marginUsed").innerText = "$" + Number(data.walletBalance || 0).toFixed(4);
-            document.getElementById("profitMultiplierSens").value = Number(data.walletBalance || 0) * 1;
-            document.getElementById("maxContractsSens").value = Number(data.walletBalance || 0) * 2;
-            document.getElementById("baseContracts").value = Number(data.walletBalance || 0) * 1000;
-
-            // Update DGR estimate when wallet balance changes
-            if(document.getElementById('dgrTimeUnit')) updateDgrEstimate();
-
-            const badge = document.getElementById("statusBadge");
-            if(data.activePositions.length > 0) {
-                const p = data.activePositions[0];
-                badge.innerText = p.isPaper ? "📝 Paper" : "⚡ Live"; badge.className = "text-[10px] bg-black text-white px-3 py-1 rounded-full uppercase tracking-wide font-bold";
-                
-                let roiText = (p.exchangeROI || 0).toFixed(2) + "%";
-                if (p.exchangePnl !== undefined) {
-                    const pnlSign = p.exchangePnl >= 0 ? "+" : "-";
-                    roiText += " (" + pnlSign + "$" + Math.abs(p.exchangePnl).toFixed(4) + ")";
-                }
-                
-                document.getElementById("activeRoi").innerText = roiText; 
-                document.getElementById("activeRoi").className = "text-lg sm:text-xl font-mono font-bold tracking-tight " + (p.exchangeROI >= 0 ? "text-green-600" : "text-red-600");
-                document.getElementById("activeQty").innerText = p.contracts.toLocaleString() + (p.dcaStep > 0 ? ' (Step ' + p.dcaStep + ')' : '');
+            if (res.id) {
+                alert('✅ Cycle started! Target: ' + growthRate + '% in ' + targetValue + ' ' + timeUnit + '(s)');
+                fetchCycleStatus();
             } else {
-                badge.innerText = data.liveTradingEnabled ? "⚡ LIVE (WAITING)" : "📝 PAPER (WAITING)"; 
-                badge.className = data.liveTradingEnabled ? "text-[10px] bg-green-100 text-green-700 px-3 py-1 rounded-full uppercase tracking-wide font-bold" : "text-[10px] bg-gray-100 text-gray-400 px-3 py-1 rounded-full uppercase tracking-wide font-bold";
-                document.getElementById("activeRoi").innerText = "N/A"; document.getElementById("activeRoi").className = "text-lg sm:text-xl font-mono font-bold tracking-tight text-gray-800";
-                document.getElementById("activeQty").innerText = "0"; 
-            }
-
-            if (data.mlSignal && data.mlSignal.type !== 'flat') {
-                const mlSig = data.mlSignal, threshold = data.config.mlThreshold || 60.0;
-                let activeType = data.config.mlUseAverage ? mlSig.avgType : mlSig.type, activeConf = data.config.mlUseAverage ? mlSig.avgConfidence : mlSig.confidence;
-
-                document.getElementById('gaugeTitle').innerText = data.config.mlUseAverage ? "ML PREDICTION (AVG)" : "ML PREDICTION (RAW)";
-                document.getElementById('mlValue').innerText = activeConf.toFixed(1) + "%";
-                document.getElementById('mlSecondary').innerText = (data.config.mlUseAverage ? "RAW: " : "AVG: ") + (data.config.mlUseAverage ? mlSig.confidence : mlSig.avgConfidence).toFixed(1) + "% " + (data.config.mlUseAverage ? mlSig.type : mlSig.avgType).toUpperCase();
-                
-                let mlStatus = 'NEUTRAL', colorClass = 'text-gray-500', gaugeColor = '#9ca3af';
-                if (activeType === 'bull' && activeConf >= threshold) { mlStatus = 'LONG SIGNAL'; colorClass = 'text-green-500'; gaugeColor = '#22c55e'; }
-                else if (activeType === 'bear' && activeConf >= threshold) { mlStatus = 'SHORT SIGNAL'; colorClass = 'text-red-500'; gaugeColor = '#ef4444'; }
-                else if (activeType === 'bull') { mlStatus = 'BULLISH (WAIT)'; gaugeColor = '#86efac'; }
-                else if (activeType === 'bear') { mlStatus = 'BEARISH (WAIT)'; gaugeColor = '#fca5a5'; }
-
-                document.getElementById('mlStatus').innerText = mlStatus; document.getElementById('mlStatus').className = "text-[9px] sm:text-[10px] font-bold uppercase tracking-wider mt-1 " + colorClass;
-                mlGauge.data.datasets[0].data = [Math.min(Math.max(activeConf, 0), 100), 100 - Math.min(Math.max(activeConf, 0), 100)];
-                mlGauge.data.datasets[0].backgroundColor = [gaugeColor, '#f3f4f6']; mlGauge.update();
-            } else {
-                document.getElementById('mlValue').innerText = "0%"; document.getElementById('mlStatus').innerText = "CALCULATING"; document.getElementById('mlStatus').className = "text-[9px] sm:text-[10px] font-bold uppercase tracking-wider mt-1 text-gray-400";
-            }
-
-            if(data.metrics.totalTradesCount !== lastTradesCount && data.metrics.trades) {
-                lastTradesCount = data.metrics.totalTradesCount;
-                const tbody = document.getElementById("tradeHistoryBody"); tbody.innerHTML = "";
-                const recent = [...data.metrics.trades].reverse().slice(0, 10);
-                if(recent.length === 0) tbody.innerHTML = '<tr><td colspan="7" class="py-6 text-center text-gray-400 font-sans">Waiting for market shift to complete trade...</td></tr>';
-                recent.forEach(t => {
-                    const d = new Date(t.timestamp), tStr = d.getHours().toString().padStart(2,"0")+":"+d.getMinutes().toString().padStart(2,"0");
-                    tbody.innerHTML += '<tr class="border-b border-gray-50 last:border-0 hover:bg-gray-50 transition">' +
-                        '<td class="py-3 px-2 text-gray-400">' + tStr + '</td>' +
-                        '<td class="py-3 px-2 font-bold ' + (t.side==='long'?'text-green-600':'text-red-600') + '">' + t.side.toUpperCase() + '</td>' +
-                        '<td class="py-3 px-2 text-gray-800 font-bold">' + (t.contracts ? t.contracts.toLocaleString() : "-") + '</td>' +
-                        '<td class="py-3 px-2 text-[10px] text-gray-400 font-sans tracking-wide uppercase">' + t.exitReason + '</td>' +
-                        '<td class="py-3 px-2 text-right font-bold ' + (t.grossRoiPct>=0?'text-green-600':'text-red-600') + '">' + (t.grossRoiPct !== undefined ? t.grossRoiPct.toFixed(2) + '%' : '-') + '</td>' +
-                        '<td class="py-3 px-2 text-right font-bold ' + (t.grossPnl>=0?'text-green-600':'text-red-600') + '">' + (t.grossPnl !== undefined ? '$' + t.grossPnl.toFixed(4) : '-') + '</td>' +
-                        '<td class="py-3 px-2 text-right font-bold ' + (t.netPnl>=0?'text-green-600':'text-red-600') + '">$' + t.netPnl.toFixed(4) + '</td></tr>';
-                });
-            }
-
-            if(data.binance && data.mlSignal) { 
-                pushChartData(data.binance.mid, data.mlSignal.rawValue, data.config.mlAverageTicks || 5); mlChart.update(); 
+                alert('❌ Failed to start cycle');
             }
         }
-
-        pingAnalytics(true); setInterval(fetchAnalyticsData, 4000); 
-        if(authToken) { toggleAuthUI(); nav('dashboard'); } else { toggleAuthUI(); nav('home'); }
+        
+        // Check auth and redirect to original dashboard if needed
+        if (authToken) {
+            fetchCycleStatus();
+            setInterval(fetchCycleStatus, 2000);
+        }
+        
+        // Poll cycle status every 2 seconds
+        setInterval(() => { if(authToken) fetchCycleStatus(); }, 2000);
     </script>
 </body>
-</html>`);
-});
+</html>`); });
 
 // ==================== APP INITIALIZATION ====================
 app.listen(CUSTOM_PORT, async () => {
