@@ -1,150 +1,105 @@
-require('dotenv').config();
 const express = require('express');
-const WebSocket = require('ws');
-const pako = require('pako'); // HTX uses gzip compression
+const axios = require('axios');
 const app = express();
-const PORT = process.env.PORT || 3000;
 
-// --- BOT SETTINGS ---
-const SYMBOL = 'shibusdt'; // HTX WS symbol format
-const CONTRACT_SIZE = 1000; // 1 contract = 1000 SHIB
-const GROWTH_CHECK_INTERVAL = 60000; // 1 minute (Time-based setting)
-const DCA_ROI_TRIGGER = -10; // Trigger DCA if ROI is below -10%
-const MULTIPLIER = 1.2;
+// --- SETTINGS ---
+const SYMBOL = 'shibusdt';
+const INITIAL_SIZE = 1.0;     // Start 1 contract
+const DCA_THRESHOLD = -10.0;  // -10% ROI
+const DCA_MULTIPLIER = 1.2;   // 1.2x Multiplier
+const HOURLY_GROWTH = 0.04;   // 0.04% per hour (~1% daily)
+const TICK_INTERVAL = 20000;  // 20 seconds
 
-// --- STATE MANAGEMENT ---
-let botStartTime = new Date();
-let currentPrice = { bid: 0, ask: 0, last: 0 };
-let priceHistory = [];
-let realizedPnl = 0;
-let openPosition = null; // { side: 'long', size: 0, entryPrice: 0, contracts: 0 }
-let tradeHistory = [];
+// --- STATE ---
+let state = {
+    startTime: Date.now(),
+    entryPrice: 0,
+    currentSize: INITIAL_SIZE,
+    totalDcaCount: 0,
+    market: { bid: 0, ask: 0, last: 0 },
+    roi: 0,
+    pnl: 0,
+    history: []
+};
 
-// --- UTILITIES ---
-const calculateROI = (entry, current) => ((current - entry) / entry) * 100;
-const calculatePNL = (entry, current, size) => (current - entry) * size;
-
-// --- WEBSOCKET CONNECTION (HTX) ---
-function connectWS() {
-    const ws = new WebSocket('wss://api.huobi.pro/ws');
-
-    ws.on('open', () => {
-        // Subscribe to SHIB/USDT Market Detail (ticker)
-        ws.send(JSON.stringify({ sub: `market.${SYMBOL}.detail`, id: 'shib_bot' }));
-    });
-
-    ws.on('message', (data) => {
-        const payload = JSON.parse(pako.inflate(data, { to: 'string' }));
-        
-        // Handle Ping/Pong
-        if (payload.ping) {
-            ws.send(JSON.stringify({ pong: payload.ping }));
-            return;
-        }
-
-        if (payload.tick) {
-            // HTX Detail provides close (last), bid, and ask
-            currentPrice.last = payload.tick.close;
-            // Simulated bid/ask spread for paper trading (0.01% offset)
-            currentPrice.bid = payload.tick.close * 0.9999; 
-            currentPrice.ask = payload.tick.close * 1.0001;
-        }
-    });
-
-    ws.on('close', () => setTimeout(connectWS, 5000));
+function logEvent(msg) {
+    const timestamp = new Date().toLocaleString();
+    const log = `[${timestamp}] ${msg}`;
+    console.log(log);
+    state.history.push(log);
+    if (state.history.length > 50) state.history.shift(); // Keep last 50
 }
 
-// --- TRADING LOGIC ---
-function startPosition() {
-    if (!openPosition) {
-        const entry = currentPrice.ask; // Buy at ask
-        openPosition = {
-            side: 'long',
-            contracts: 1,
-            size: 1 * CONTRACT_SIZE,
-            entryPrice: entry,
-            timestamp: new Date()
-        };
-        console.log(`[BOT] Started first contract at ${entry}`);
+// --- LOGIC ---
+async function updateBot() {
+    try {
+        const response = await axios.get(`https://api.huobi.pro/market/detail/merged?symbol=${SYMBOL}`);
+        const tick = response.data.tick;
+        
+        state.market.last = tick.close;
+        state.market.bid = tick.bid[0];
+        state.market.ask = tick.ask[0];
+
+        // 1. Initial Entry
+        if (state.entryPrice === 0) {
+            state.entryPrice = state.market.ask;
+            logEvent(`START: Initial 1 unit bought at ${state.entryPrice}`);
+        }
+
+        // 2. Calculations
+        state.pnl = (state.market.bid - state.entryPrice) * state.currentSize;
+        state.roi = (state.pnl / (state.entryPrice * state.currentSize)) * 100;
+
+        // 3. DCA Logic
+        if (state.roi <= DCA_THRESHOLD) {
+            let addedSize = state.currentSize * DCA_MULTIPLIER;
+            let newTotalSize = state.currentSize + addedSize;
+            
+            // Weighted Average Entry
+            state.entryPrice = ((state.entryPrice * state.currentSize) + (state.market.ask * addedSize)) / newTotalSize;
+            state.currentSize = newTotalSize;
+            state.totalDcaCount++;
+            
+            logEvent(`DCA TRIGGERED: Added ${addedSize.toFixed(2)}. New Entry: ${state.entryPrice.toFixed(10)}`);
+        }
+    } catch (error) {
+        console.error("Fetch Error:", error.message);
     }
 }
 
-function checkStrategy() {
-    if (!openPosition || currentPrice.last === 0) return;
-
-    // 1. Calculate Growth Rate (Price vs 1 minute ago)
-    priceHistory.push(currentPrice.last);
-    if (priceHistory.length > 60) priceHistory.shift();
-    
-    const pastPrice = priceHistory[0];
-    const growthRate = ((currentPrice.last - pastPrice) / pastPrice) * 100;
-
-    // 2. Calculate ROI
-    const roi = calculateROI(openPosition.entryPrice, currentPrice.bid);
-
-    // 3. DCA Logic (Multiplier 1.2)
-    if (roi <= DCA_ROI_TRIGGER) {
-        const newContracts = openPosition.contracts * MULTIPLIER;
-        const totalContracts = openPosition.contracts + newContracts;
-        const newSize = totalContracts * CONTRACT_SIZE;
-        
-        // Average the entry price
-        const totalCost = (openPosition.entryPrice * openPosition.size) + (currentPrice.ask * (newContracts * CONTRACT_SIZE));
-        openPosition.entryPrice = totalCost / newSize;
-        openPosition.contracts = totalContracts;
-        openPosition.size = newSize;
-        
-        console.log(`[DCA] Triggered! New Size: ${openPosition.contracts.toFixed(2)} contracts. Avg Price: ${openPosition.entryPrice.toFixed(8)}`);
-    }
-}
-
-// --- WEB SERVER ROUTES ---
+// --- ROUTES ---
 app.get('/', (req, res) => {
-    let unrealizedPnl = 0;
-    let roi = 0;
+    const elapsedHours = (Date.now() - state.startTime) / 3600000;
+    const targetPnl = (state.entryPrice * INITIAL_SIZE) * (HOURLY_GROWTH / 100) * elapsedHours;
 
-    if (openPosition) {
-        unrealizedPnl = calculatePNL(openPosition.entryPrice, currentPrice.bid, openPosition.size);
-        roi = calculateROI(openPosition.entryPrice, currentPrice.bid);
-    }
-
-    const metrics = {
-        bot_uptime: `${Math.floor((new Date() - botStartTime) / 1000 / 60)} mins`,
+    res.json({
+        bot_status: "ONLINE",
         symbol: SYMBOL.toUpperCase(),
-        market: {
-            last: currentPrice.last,
-            bid: currentPrice.bid,
-            ask: currentPrice.ask
+        uptime_hours: elapsedHours.toFixed(2),
+        market: state.market,
+        position: {
+            entry_price: state.entryPrice.toFixed(10),
+            current_size: state.currentSize.toFixed(2),
+            roi_percent: state.roi.toFixed(4) + "%",
+            unrealized_pnl_usdt: state.pnl.toFixed(10),
+            dca_events: state.totalDcaCount
         },
-        position: openPosition ? {
-            direction: openPosition.side.toUpperCase(),
-            contracts: openPosition.contracts.toFixed(2),
-            total_shib: openPosition.size,
-            avg_entry: openPosition.entryPrice.toFixed(8),
-            unrealized_pnl: unrealizedPnl.toFixed(4) + " USDT",
-            roi: roi.toFixed(2) + "%"
-        } : "No open position",
-        closed_trades: tradeHistory,
-        summary: {
-            realized_pnl: realizedPnl.toFixed(4) + " USDT",
-            total_profit_from_start: (realizedPnl + unrealizedPnl).toFixed(4) + " USDT"
-        }
-    };
-
-    res.json(metrics);
+        growth_tracking: {
+            target_pnl_benchmark: targetPnl.toFixed(10),
+            performance_vs_target: (state.pnl - targetPnl).toFixed(10)
+        },
+        last_update: new Date().toISOString()
+    });
 });
 
-// --- START BOT ---
-connectWS();
-// Initialize position once price is received
-const initInterval = setInterval(() => {
-    if (currentPrice.last > 0) {
-        startPosition();
-        clearInterval(initInterval);
-    }
-}, 2000);
+app.get('/trades', (req, res) => {
+    res.json(state.history);
+});
 
-// Set Growth Rate / DCA check interval
-setInterval(checkStrategy, GROWTH_CHECK_INTERVAL);
-
-app.listen(PORT, () => console.log(`Webserver running on port ${PORT}`));
+// --- START ---
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    setInterval(updateBot, TICK_INTERVAL);
+    updateBot(); // Run immediately
+});
