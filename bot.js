@@ -36,7 +36,7 @@ const TradeModel = mongoose.model('TradeLog_V3', new mongoose.Schema({
 }));
 
 const ChartDataModel = mongoose.model('ChartData_V8', new mongoose.Schema({
-    priceMid: Number, mlPlot: Number, timestamp: { type: Date, default: Date.now, expires: 86400 } 
+    priceMid: Number, timestamp: { type: Date, default: Date.now, expires: 86400 } 
 }));
 
 const AnalyticsModel = mongoose.model('SiteAnalytics_V3', new mongoose.Schema({
@@ -54,10 +54,11 @@ const BASE_CONFIG = {
     htxSymbol: 'SHIB/USDT:USDT',         
     binanceSymbol: '1000SHIB/USDT:USDT', 
     leverage: FORCED_LEVERAGE, baseContracts: 1, contractSize: 1000, marginMode: 'cross', fees: { taker: 0.0004 }, 
-    takeProfitPct: 10.0, stopLossPct: -50.0, mlLookback: 50, mlThreshold: 60.0, 
-    mlAverageTicks: 5, mlUseAverage: false, flipOnlyInProfit: true, flipThresholdPct: 0.5, 
-    dcaRoiThresholdPct: 1.0, dcaMultiplier: 2.0, 
-    profitRoiThresholdPct: 2.0, profitMultiplier: 2.0, 
+    takeProfitPct: 10.0, stopLossPct: -50.0, 
+    dcaTriggerPct: 1.0, dcaMultiplier: 2.0, 
+    startContracts: 1,
+    dgrDailyGrowthRate: 0.0,
+    manualDirection: 'long',
     maxContracts: 100, 
     chartTicks: 800
 };
@@ -65,14 +66,11 @@ const BASE_CONFIG = {
 const globalMarketData = { 
     binance: { bid: 0, ask: 0, mid: 0, timestamp: 0 },
     htx: { bid: 0, ask: 0, mid: 0, timestamp: 0 },
-    tickBuffer: [],
-    mlSignal: { confidence: 0, type: 'flat', rawValue: 0.5 } 
+    tickBuffer: []
 };
 const memoryChartHistory = []; 
 const publicBinance = new ccxt.pro.binance({ options: { defaultType: 'swap', defaultSubType: 'linear' } });
 const publicHtx = new ccxt.pro.htx({ options: { defaultType: 'swap', defaultSubType: 'linear' } });
-
-const mlSignalCache = new Map();
 
 // ==================== SECURITY & AUTH ====================
 function hashPassword(password, salt) { return crypto.scryptSync(password, salt, 64).toString('hex'); }
@@ -116,63 +114,10 @@ function calculateTradeMath(side, entryPrice, currentPrice, sizeUsd, leverage, t
     return { grossPnlPercent, currentGrossRoi: grossPnlPercent * leverage, grossPnlUsd, grossRoiPct, netPnlUsd, netRoiPct: (netPnlUsd / margin) * 100, feeCost, margin };
 }
 
-// ==================== MACHINE LEARNING MATH ENGINE ====================
-function calculateMLSignal(prices, lookback) {
-    if (prices.length < lookback + 15 || lookback < 10) return { confidence: 0, type: 'flat', rawValue: 0.5 };
-    
-    let X = [], y = [];
-    const getFeatures = (idx) => [
-        ((prices[idx] - prices[idx-1]) / prices[idx-1]) * 1000,
-        ((prices[idx] - prices[idx-3]) / prices[idx-3]) * 1000,
-        ((prices[idx] - prices[idx-5]) / prices[idx-5]) * 1000,
-        ((prices[idx] - prices[idx-10]) / prices[idx-10]) * 1000
-    ];
-
-    const trainEnd = prices.length - 2; 
-    const trainStart = trainEnd - lookback;
-    let upCount = 0, downCount = 0;
-
-    for (let i = trainStart; i <= trainEnd; i++) {
-        X.push(getFeatures(i));
-        let diff = prices[i+1] - prices[i];
-        let label = 0.5;
-        if (diff > 0) { label = 1; upCount++; } else if (diff < 0) { label = 0; downCount++; }
-        y.push(label);
-    }
-
-    let n = X.length, totalDirectional = upCount + downCount;
-    let upWeight = totalDirectional > 0 && upCount > 0 ? (totalDirectional / (2 * upCount)) : 1;
-    let downWeight = totalDirectional > 0 && downCount > 0 ? (totalDirectional / (2 * downCount)) : 1;
-
-    let means = [0, 0, 0, 0], stds = [0, 0, 0, 0];
-    for(let i=0; i<n; i++) for(let j=0; j<4; j++) means[j] += X[i][j];
-    for(let j=0; j<4; j++) means[j] /= n;
-    
-    for(let i=0; i<n; i++) for(let j=0; j<4; j++) stds[j] += Math.pow(X[i][j] - means[j], 2);
-    for(let j=0; j<4; j++) { stds[j] = Math.sqrt(stds[j] / n); if (stds[j] === 0) stds[j] = 1; }
-    for(let i=0; i<n; i++) for(let j=0; j<4; j++) X[i][j] = (X[i][j] - means[j]) / stds[j];
-
-    let w = [0, 0, 0, 0], b = 0, lr = 0.05, epochs = 20; 
-    for (let e = 0; e < epochs; e++) {
-        for (let i = 0; i < n; i++) {
-            let z = w[0]*X[i][0] + w[1]*X[i][1] + w[2]*X[i][2] + w[3]*X[i][3] + b;
-            let pred = 1 / (1 + Math.exp(-Math.max(Math.min(z, 20), -20))); 
-            let weight = y[i] === 1 ? upWeight : (y[i] === 0 ? downWeight : 1);
-            let err = (pred - y[i]) * weight;
-            for(let j=0; j<4; j++) w[j] -= lr * err * X[i][j];
-            b -= lr * err;
-        }
-    }
-
-    let currX = getFeatures(prices.length - 1);
-    for(let j=0; j<4; j++) currX[j] = (currX[j] - means[j]) / stds[j];
-    let zCur = w[0]*currX[0] + w[1]*currX[1] + w[2]*currX[2] + w[3]*currX[3] + b;
-    let finalPred = 1 / (1 + Math.exp(-Math.max(Math.min(zCur, 20), -20)));
-    
-    finalPred = 1 - finalPred;
-    
-    let confidence = Math.abs(finalPred - 0.5) * 200; 
-    return { confidence: Math.min(confidence, 100), type: finalPred >= 0.5 ? 'bull' : 'bear', rawValue: finalPred };
+// ==================== DGR CALCULATION ENGINE ====================
+function calculateDGRAdjustment(dgrDailyGrowthRate, daysActive) {
+    if (dgrDailyGrowthRate <= 0) return 1.0;
+    return Math.pow(1 + (dgrDailyGrowthRate / 100), daysActive);
 }
 
 // ==================== METRICS ENGINE ====================
@@ -181,6 +126,7 @@ class PerformanceMetrics {
         this.userId = userId; this.trades = []; 
         this.totalGrossPnl = 0; this.totalNetPnl = 0; this.totalFees = 0; this.totalRoiPct = 0;
         this.wins = 0; this.losses = 0; this.winRate = 0; this.totalTradesCount = 0; this.maxMarginUsed = 0; 
+        this.startDate = Date.now();
     }
     async init() { 
         const dbTrades = await TradeModel.find({ userId: this.userId }).sort({ timestamp: -1 }).limit(2000).lean(); 
@@ -197,6 +143,7 @@ class PerformanceMetrics {
         if (saveToDb) TradeModel.create({ ...trade, userId: this.userId }).catch(()=>{});
     }
     updateMaxMargin(margin) { if (margin > this.maxMarginUsed) this.maxMarginUsed = margin; }
+    getDaysActive() { return (Date.now() - this.startDate) / (1000 * 60 * 60 * 24); }
 }
 
 // ==================== BACKTEST SIMULATION ENGINE ====================
@@ -223,12 +170,13 @@ async function runBacktestSimulation(config, tickCount, symbol) {
     if (!ticks || ticks.length === 0) return { error: `No historical tick data fetched for ${symbol}.` };
 
     let activePos = null, closedTrades = [], netPnl = 0, wins = 0, losses = 0, totalTradeDurationMs = 0, maxMarginUsed = 0;
-    const { mlLookback=50, mlThreshold=60.0, mlAverageTicks=5, mlUseAverage=false, flipOnlyInProfit=true, flipThresholdPct=0.5 } = config;
-    const dcaRoiThresholdPct = config.dcaRoiThresholdPct || 1.0;
-    const profitRoiThresholdPct = config.profitRoiThresholdPct !== undefined ? config.profitRoiThresholdPct : 2.0;
+    const { dcaTriggerPct=1.0, dcaMultiplier=2.0, startContracts=1, dgrDailyGrowthRate=0.0, manualDirection='long' } = config;
     const maxContracts = config.maxContracts !== undefined ? Number(config.maxContracts) : 100;
     
-    let priceBuffer = [], mlRawBuffer = [];
+    let totalDaysSimulated = (ticks[ticks.length - 1].timestamp - ticks[0].timestamp) / (1000 * 60 * 60 * 24);
+    let dgrAdjustment = calculateDGRAdjustment(dgrDailyGrowthRate, totalDaysSimulated);
+    
+    let priceBuffer = [];
     const totalSpanMs = ticks[ticks.length - 1].timestamp - ticks[0].timestamp;
 
     for (const tick of ticks) {
@@ -242,20 +190,10 @@ async function runBacktestSimulation(config, tickCount, symbol) {
             await new Promise(resolve => setImmediate(resolve));
         }
 
-        const mlSig = calculateMLSignal(priceBuffer, mlLookback);
-
-        mlRawBuffer.push(mlSig.rawValue); if (mlRawBuffer.length > mlAverageTicks) mlRawBuffer.shift();
-        let avgRaw = mlRawBuffer.reduce((a,b)=>a+b,0) / mlRawBuffer.length;
-        let avgConf = Math.min(Math.abs(avgRaw - 0.5) * 200, 100);
-        let avgType = avgRaw >= 0.5 ? 'bull' : 'bear';
-
-        let activeType = mlUseAverage ? avgType : mlSig.type;
-        let activeConf = mlUseAverage ? avgConf : mlSig.confidence;
-
-        let signal = (activeType === 'bull' && activeConf >= mlThreshold) ? 'long' : (activeType === 'bear' && activeConf >= mlThreshold) ? 'short' : null;
+        let signal = manualDirection === 'long' ? 'long' : (manualDirection === 'short' ? 'short' : null);
 
         if (!activePos && signal) {
-            let bC = parseInt(config.baseContracts) || 1;
+            let bC = parseInt(startContracts) || 1;
             const sizeUsd = bC * config.contractSize * price; 
             const margin = sizeUsd / FORCED_LEVERAGE;
             activePos = { side: signal, entryPrice: price, contracts: bC, size: sizeUsd, marginUsed: margin, entryTime: tickTime, lastDcaTime: 0, dcaStep: 0 };
@@ -267,14 +205,8 @@ async function runBacktestSimulation(config, tickCount, symbol) {
             const math = calculateTradeMath(activePos.side, activePos.entryPrice, price, activePos.size, FORCED_LEVERAGE, config.fees.taker);
             let forceExitReason = null;
             
-            if (signal && activePos.side !== signal) {
-                if (flipOnlyInProfit) {
-                    if (math.currentGrossRoi >= flipThresholdPct) forceExitReason = "ML_FLIP";
-                } else forceExitReason = "ML_FLIP";
-            }
-            
-            if (!forceExitReason && math.currentGrossRoi >= config.takeProfitPct) forceExitReason = "TAKE_PROFIT";
-            else if (!forceExitReason && math.currentGrossRoi <= config.stopLossPct) forceExitReason = "STOP_LOSS";
+            if (math.currentGrossRoi >= config.takeProfitPct) forceExitReason = "TAKE_PROFIT";
+            else if (math.currentGrossRoi <= config.stopLossPct) forceExitReason = "STOP_LOSS";
 
             if (forceExitReason) {
                 netPnl += math.netPnlUsd; math.netPnlUsd > 0 ? wins++ : losses++;
@@ -282,41 +214,17 @@ async function runBacktestSimulation(config, tickCount, symbol) {
 
                 closedTrades.push({ side: activePos.side, entryPrice: activePos.entryPrice, exitPrice: price, contracts: activePos.contracts, grossPnl: math.grossPnlUsd, grossRoiPct: math.grossRoiPct, netPnl: math.netPnlUsd, roiPct: math.netRoiPct, exitReason: forceExitReason, time: tick.timestamp });
                 
-                if (forceExitReason === "ML_FLIP") {
-                    let bC = parseInt(config.baseContracts) || 1;
-                    const sizeUsd = bC * config.contractSize * price; 
-                    activePos = { side: signal, entryPrice: price, contracts: bC, size: sizeUsd, marginUsed: sizeUsd / FORCED_LEVERAGE, entryTime: tickTime, lastDcaTime: 0, dcaStep: 0 };
-                    if (activePos.marginUsed > maxMarginUsed) maxMarginUsed = activePos.marginUsed;
-                } else activePos = null;
+                activePos = null;
             } else {
-                const requiredRoiForDca = -(Math.abs(dcaRoiThresholdPct || 1.0));
+                const requiredRoiForDca = -(Math.abs(dcaTriggerPct || 1.0));
                 
-                // BACKTEST: Loss DCA is UNLIMITED
                 if (math.currentGrossRoi <= requiredRoiForDca && tickTime - (activePos.lastDcaTime || 0) >= 3000) {
-                    let bC = Number(config.baseContracts) || 1;
-                    let mult = Number(config.dcaMultiplier) || 2.0;
+                    let bC = Number(startContracts) || 1;
+                    let mult = Number(dcaMultiplier) || 2.0;
                     let step = Number(activePos.dcaStep) || 0;
                     
-                    let contractsToAdd = parseInt(Math.max(1, Math.floor(bC * Math.pow(mult, step))), 10);
+                    let contractsToAdd = parseInt(Math.max(1, Math.floor(bC * Math.pow(mult, step) * dgrAdjustment)), 10);
                     
-                    const addedSizeUsd = contractsToAdd * Number(config.contractSize) * price;
-                    
-                    activePos.entryPrice = ((Number(activePos.entryPrice) * Number(activePos.size)) + (price * addedSizeUsd)) / (Number(activePos.size) + addedSizeUsd);
-                    activePos.size = Number(activePos.size) + addedSizeUsd; 
-                    activePos.contracts = Number(activePos.contracts) + contractsToAdd;
-                    activePos.marginUsed = Number(activePos.marginUsed) + (addedSizeUsd / FORCED_LEVERAGE);
-                    activePos.lastDcaTime = tickTime; activePos.dcaStep = step + 1;
-                    if (activePos.marginUsed > maxMarginUsed) maxMarginUsed = activePos.marginUsed;
-                    
-                } // BACKTEST: Profit Scaling evaluates exact contracts to add
-                else if (math.currentGrossRoi >= profitRoiThresholdPct && tickTime - (activePos.lastDcaTime || 0) >= 3000) {
-                    let bC = Number(config.baseContracts) || 1;
-                    let mult = Number(config.profitMultiplier) || 2.0;
-                    let step = Number(activePos.dcaStep) || 0;
-                    
-                    let contractsToAdd = parseInt(Math.max(1, Math.floor(bC * Math.pow(mult, step))), 10);
-                    
-                    // Proceed ONLY if adding the required amount doesn't breach Max Contracts
                     if (Number(activePos.contracts) + contractsToAdd <= maxContracts) {
                         const addedSizeUsd = contractsToAdd * Number(config.contractSize) * price;
                         
@@ -374,12 +282,8 @@ class UserTradeInstance {
         this.activePositions = user.activePosition ? [user.activePosition] : []; 
         this.lastCloseTime = user.lastCloseTime || 0;
         
-        // Removed `this.isEvaluating` to prevent ML execution deadlock
         this.isTrading = false; 
         
-        // This decouples the UI gauge state from the execution logic so it never freezes
-        this.currentMl = { confidence: 0, type: 'flat', rawValue: 0.5 };
-        this.mlRawBuffer = [];
         this.lastEvalPrice = 0;
         this.walletBalance = 0;
 
@@ -438,7 +342,6 @@ class UserTradeInstance {
                     this.activePositions = [{ id: Date.now(), side: openPos.side, entryPrice: entryP, contracts: openPos.contracts, size: sizeUsd, marginUsed: sizeUsd / FORCED_LEVERAGE, exchangeROI: openPos.percentage || 0, exchangePnl: openPos.unrealizedPnl || 0, entryTime: Date.now(), isPaper: false, lastDcaTime: 0, dcaStep: 0, stepHistory: [] }];
                     this.metrics.updateMaxMargin(this.activePositions[0].marginUsed); await this.saveState();
                 } else {
-                    // FIX: If exchange is empty but we have ghost state, clear it
                     this.activePositions = []; await this.saveState();
                 }
             }
@@ -449,56 +352,23 @@ class UserTradeInstance {
         }
     }
 
-    async evaluateAIEntry() {
-        // ALWAYS update ML state asynchronously so UI never gets stuck
-        let mlSig = mlSignalCache.get(this.config.mlLookback);
-        if (!mlSig) {
-            mlSig = calculateMLSignal(globalMarketData.tickBuffer, this.config.mlLookback || 50);
-            mlSignalCache.set(this.config.mlLookback, mlSig);
-        }
-        
-        // Push only when the global tick actually moves
-        if (this.lastEvalPrice !== globalMarketData.binance.mid) {
-            this.mlRawBuffer.push(mlSig.rawValue);
-            if (this.mlRawBuffer.length > (this.config.mlAverageTicks || 5)) this.mlRawBuffer.shift();
-            this.lastEvalPrice = globalMarketData.binance.mid;
-        }
-        
-        let avgRaw = this.mlRawBuffer.length > 0 ? (this.mlRawBuffer.reduce((a,b)=>a+b,0) / this.mlRawBuffer.length) : mlSig.rawValue;
-        let avgConf = Math.min(Math.abs(avgRaw - 0.5) * 200, 100);
-        
-        this.currentMl = { 
-            confidence: mlSig.confidence, type: mlSig.type, rawValue: mlSig.rawValue,
-            avgRaw: avgRaw, avgConfidence: avgConf, avgType: avgRaw >= 0.5 ? 'bull' : 'bear' 
-        };
-
-        // Execution Check (Only locked if an actual trade is actively executing to HTX)
+    async evaluateManualEntry() {
         if (this.isTrading || (Date.now() - this.lastCloseTime < 3000)) return;
 
         try {
-            let activeType = this.config.mlUseAverage ? this.currentMl.avgType : mlSig.type;
-            let activeConf = this.config.mlUseAverage ? this.currentMl.avgConfidence : mlSig.confidence;
-
-            let signal = (activeType === 'bull' && activeConf >= (this.config.mlThreshold || 60.0)) ? 'long' : 
-                         (activeType === 'bear' && activeConf >= (this.config.mlThreshold || 60.0)) ? 'short' : null;
+            let signal = this.config.manualDirection === 'long' ? 'long' : (this.config.manualDirection === 'short' ? 'short' : null);
             
             if (this.activePositions.length > 0) {
                 const pos = this.activePositions[0];
                 
-                // INSTANT FLIP LOGIC
                 if (signal && pos.side !== signal) {
                     let currentPrice = pos.side === 'long' ? globalMarketData.binance.bid : globalMarketData.binance.ask;
                     if (!currentPrice) currentPrice = globalMarketData.binance.mid;
                     const pnlPercent = pos.side === 'long' ? ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100 : ((pos.entryPrice - currentPrice) / pos.entryPrice) * 100;
                     let instantRoi = pnlPercent * FORCED_LEVERAGE;
 
-                    if (this.config.flipOnlyInProfit !== false) {
-                        const threshold = this.config.flipThresholdPct || 0.0;
-                        if (instantRoi >= threshold) {
-                            await this.forceClosePosition("ML_FLIP"); setTimeout(() => this.syncState(signal), 50);
-                        }
-                    } else {
-                        await this.forceClosePosition("ML_FLIP"); setTimeout(() => this.syncState(signal), 50);
+                    if (instantRoi >= 0) {
+                        await this.forceClosePosition("MANUAL_FLIP"); setTimeout(() => this.syncState(signal), 50);
                     }
                 }
             } else {
@@ -515,7 +385,6 @@ class UserTradeInstance {
         try {
             const pos = this.activePositions[0];
             
-            // PRIORITY: Use Exchange ROI for Live triggers to avoid calculation errors
             let effectiveRoi = 0;
             if (this.liveTradingEnabled && !pos.isPaper) {
                 effectiveRoi = pos.exchangeROI || 0;
@@ -531,15 +400,10 @@ class UserTradeInstance {
             } else if (effectiveRoi <= this.config.stopLossPct) {
                 await this.forceClosePosition("STOP_LOSS");
             } else {
-                const requiredRoiForDca = -(Math.abs(this.config.dcaRoiThresholdPct || 1.0));
-                const profitScaleThreshold = this.config.profitRoiThresholdPct !== undefined ? this.config.profitRoiThresholdPct : 2.0;
+                const requiredRoiForDca = -(Math.abs(this.config.dcaTriggerPct || 1.0));
                 
-                // LIVE/PAPER: Evaluate against exchange ROI
                 if (effectiveRoi <= requiredRoiForDca && Date.now() - (pos.lastDcaTime || 0) > 10000) {
-                    await this.addDcaPosition(false);
-                } 
-                else if (effectiveRoi >= profitScaleThreshold && Date.now() - (pos.lastDcaTime || 0) > 10000) {
-                    await this.addDcaPosition(true);
+                    await this.addDcaPosition();
                 }
             }
         } catch (e) {
@@ -547,38 +411,35 @@ class UserTradeInstance {
         }
     }
 
-    async addDcaPosition(isProfitScale = false) {
+    async addDcaPosition() {
         if (this.isTrading || this.activePositions.length === 0) return;
         this.isTrading = true;
         try {
             const pos = this.activePositions[0];
             const orderSide = pos.side === 'long' ? 'buy' : 'sell';
             
-            let multiplier = isProfitScale ? (Number(this.walletBalance) * 1) : this.config.dcaMultiplier;
+            let dgrAdjustment = calculateDGRAdjustment(this.config.dgrDailyGrowthRate || 0, this.metrics.getDaysActive());
+            
+            let multiplier = this.config.dcaMultiplier;
             multiplier = Number(multiplier);
             if (isNaN(multiplier) || multiplier < 1.0) multiplier = 2.0;
             
-            let baseC = Number(this.walletBalance) * 1000;
+            let baseC = Number(this.config.startContracts) || 1;
             if (isNaN(baseC) || baseC < 1) baseC = 1;
             
             let step = Number(pos.dcaStep);
             if (isNaN(step)) step = 0;
 
-            let contractsToAdd = parseInt(Math.max(1, Math.floor(baseC * Math.pow(multiplier, step))), 10);
+            let contractsToAdd = parseInt(Math.max(1, Math.floor(baseC * Math.pow(multiplier, step) * dgrAdjustment)), 10);
             
-            // EXACT PROFIT SCALING LIMIT: Evaluates required addition BEFORE executing
-            if (isProfitScale) {
-                const maxC = (Number(this.walletBalance) * 2);
-                if (Number(pos.contracts) + contractsToAdd > maxC) {
-                    // Update Lockout timer to completely prevent infinite CPU evaluation loop
-                    pos.lastDcaTime = Date.now();
-                    await this.saveState();
-                    this.isTrading = false;
-                    return; 
-                }
+            const maxC = this.config.maxContracts || 100;
+            if (Number(pos.contracts) + contractsToAdd > maxC) {
+                pos.lastDcaTime = Date.now();
+                await this.saveState();
+                this.isTrading = false;
+                return; 
             }
 
-            // Lockout timer to prevent loop spamming if api fails
             pos.lastDcaTime = Date.now();
             await this.saveState();
             
@@ -586,7 +447,7 @@ class UserTradeInstance {
             if (!realExecPrice) realExecPrice = globalMarketData.binance.mid;
 
             if (!pos.isPaper && this.liveTradingEnabled) {
-                console.log(`[User ${this.userId}] Requesting Scale: ${contractsToAdd} contracts on HTX`);
+                console.log(`[User ${this.userId}] Requesting DCA: ${contractsToAdd} contracts on HTX`);
                 try {
                     const res = await this.htx.createMarketOrder(this.config.htxSymbol, orderSide, contractsToAdd, undefined, { offset: 'open', marginMode: 'cross', lever_rate: FORCED_LEVERAGE });
                     await new Promise(r => setTimeout(r, 150)); 
@@ -600,11 +461,10 @@ class UserTradeInstance {
                 }
             }
 
-            // INJECTED: RECORD THE STEP WITH OFFICIAL EXCHANGE ROI
             if(!pos.stepHistory) pos.stepHistory = [];
             pos.stepHistory.push({
                 step: step + 1,
-                type: isProfitScale ? 'SCALE' : 'DCA',
+                type: 'DCA',
                 price: realExecPrice,
                 roi: pos.exchangeROI || 0,
                 time: Date.now()
@@ -620,9 +480,9 @@ class UserTradeInstance {
             
             this.metrics.updateMaxMargin(pos.marginUsed);
             await this.saveState();
-            console.log(`[User ${this.userId}] ${pos.isPaper ? 'Paper' : 'LIVE'} ${isProfitScale ? 'PROFIT SCALE' : 'LOSS DCA'} Executed (Step ${pos.dcaStep}). Added ${contractsToAdd} to ${pos.side.toUpperCase()}`);
+            console.log(`[User ${this.userId}] ${pos.isPaper ? 'Paper' : 'LIVE'} DCA Executed (Step ${pos.dcaStep}). Added ${contractsToAdd} to ${pos.side.toUpperCase()}`);
         } catch (err) {
-            console.error(`🚨 [Scale Error - User ${this.userId}]:`, err.message);
+            console.error(`🚨 [DCA Error - User ${this.userId}]:`, err.message);
         } finally { this.isTrading = false; }
     }
 
@@ -633,7 +493,7 @@ class UserTradeInstance {
             const isPaper = !this.liveTradingEnabled; 
             const orderSide = targetSide === 'long' ? 'buy' : 'sell'; 
             
-            let baseC = Number(this.walletBalance) * 1000;
+            let baseC = Number(this.config.startContracts) || 1;
             if (isNaN(baseC) || baseC < 1) baseC = 1;
             const contracts = parseInt(Math.max(1, Math.floor(baseC)), 10);
             
@@ -654,7 +514,6 @@ class UserTradeInstance {
             const sizeUsd = contracts * (Number(this.config.contractSize) || 1000) * executionPrice;
             const marginUsed = sizeUsd / FORCED_LEVERAGE;
             
-            // INITIALIZE HISTORY WITH STEP 0
             this.activePositions = [{ id: Date.now(), side: targetSide, entryPrice: Number(executionPrice), contracts: Number(contracts), size: Number(sizeUsd), marginUsed: Number(marginUsed), entryTime: Date.now(), exchangeROI: 0, exchangePnl: 0, isPaper, lastDcaTime: 0, dcaStep: 0, stepHistory: [{ step: 0, type: 'OPEN', price: executionPrice, roi: 0, time: Date.now() }] }];
             
             this.metrics.updateMaxMargin(marginUsed); 
@@ -713,7 +572,6 @@ class UserTradeInstance {
             }
             const pos = this.activePositions[0];
             
-            // PRIORITY: If LIVE, fetch ROI and PNL directly from HTX
             if (this.liveTradingEnabled && !pos.isPaper) {
                 try {
                     const bal = await this.htx.fetchBalance({ type: 'swap' });
@@ -726,12 +584,10 @@ class UserTradeInstance {
                         if (this.config.htxSymbol.includes('SHIB') && !this.config.htxSymbol.includes('1000')) entryP = entryP * 1000;
                         pos.entryPrice = entryP;
                         
-                        // SET DATA DIRECTLY FROM EXCHANGE
                         pos.exchangeROI = openPos.percentage || 0; 
                         pos.exchangePnl = openPos.unrealizedPnl || 0;
-                        return; // Exit here to avoid local math overwriting
+                        return;
                     } else {
-                        // FIX: If exchange has 0 contracts, wipe our local ghost state immediately
                         this.activePositions = [];
                         await this.saveState();
                         return;
@@ -739,7 +595,6 @@ class UserTradeInstance {
                 } catch(e) {}
             }
             
-            // FALLBACK: Local Math for Paper Trading or if API fails
             let currentPrice = pos.side === 'long' ? globalMarketData.binance.bid : globalMarketData.binance.ask;
             if (!currentPrice) currentPrice = globalMarketData.binance.mid;
             
@@ -756,8 +611,8 @@ class UserTradeInstance {
     getExportData() { 
         return { 
             config: this.config, liveTradingEnabled: this.liveTradingEnabled, uptime: Math.floor((Date.now() - this.startTime) / 1000),
-            metrics: this.metrics, activePositions: this.activePositions, mlSignal: this.currentMl, binance: globalMarketData.binance,
-            walletBalance: this.walletBalance
+            metrics: this.metrics, activePositions: this.activePositions, binance: globalMarketData.binance,
+            walletBalance: this.walletBalance, dgrDaysActive: this.metrics.getDaysActive()
         }; 
     }
 }
@@ -774,11 +629,11 @@ async function startMasterStreams() {
 
     try {
         const history = await ChartDataModel.find().sort({ timestamp: -1 }).limit(800).lean();
-        if (history) history.reverse().forEach(doc => memoryChartHistory.push({ priceMid: doc.priceMid, mlPlot: doc.mlPlot || 0.5, timestamp: doc.timestamp }));
+        if (history) history.reverse().forEach(doc => memoryChartHistory.push({ priceMid: doc.priceMid, timestamp: doc.timestamp }));
     } catch(e) {}
 
     (async function streamBinance() {
-        let lastHistorySave = 0, lastSavedMid = null, lastSavedMlPlot = null;
+        let lastHistorySave = 0, lastSavedMid = null;
         
         try {
             const seedData = await publicBinance.fetchOHLCV(BASE_CONFIG.binanceSymbol, '1m', undefined, 100);
@@ -821,23 +676,18 @@ async function startMasterStreams() {
                     if (globalMarketData.tickBuffer.length > 500) globalMarketData.tickBuffer.shift();
                 }
 
-                mlSignalCache.clear();
-                const globalMl = calculateMLSignal(globalMarketData.tickBuffer, BASE_CONFIG.mlLookback);
-                globalMarketData.mlSignal = globalMl;
-                mlSignalCache.set(BASE_CONFIG.mlLookback, globalMl); 
-
                 if (Date.now() - lastHistorySave > 2000) { 
-                    if (mid !== lastSavedMid || globalMl.rawValue !== lastSavedMlPlot) {
-                        const doc = { priceMid: mid, mlPlot: globalMl.rawValue, timestamp: Date.now() };
+                    if (mid !== lastSavedMid) {
+                        const doc = { priceMid: mid, timestamp: Date.now() };
                         memoryChartHistory.push(doc); if (memoryChartHistory.length > 800) memoryChartHistory.shift(); 
                         ChartDataModel.create(doc).catch(()=>{}); 
-                        lastHistorySave = Date.now(); lastSavedMid = mid; lastSavedMlPlot = globalMl.rawValue;
+                        lastHistorySave = Date.now(); lastSavedMid = mid;
                     }
                 }
 
                 for (const worker of activeWorkers.values()) {
                     worker.checkExits().catch(()=>{}); 
-                    worker.evaluateAIEntry().catch(()=>{}); 
+                    worker.evaluateManualEntry().catch(()=>{}); 
                 }
 
                 await new Promise(r => setTimeout(r, 100)); 
@@ -903,14 +753,11 @@ app.get('/api/analytics/stats', async (req, res) => {
 app.post('/api/backtest', async (req, res) => {
     const bConfig = { ...BASE_CONFIG,
         takeProfitPct: parseFloat(req.body.tpPct) || 10.0, stopLossPct: parseFloat(req.body.slPct) || -50.0,
-        baseContracts: parseInt(req.body.baseContracts) || 1, mlLookback: parseInt(req.body.mlLookback) || 50,
-        mlThreshold: parseFloat(req.body.mlThreshold) || 60.0, mlAverageTicks: parseInt(req.body.mlAverageTicks) || 5,
-        mlUseAverage: (req.body.mlUseAverage === 'true'), flipOnlyInProfit: (req.body.flipOnlyInProfit === 'true'),
-        flipThresholdPct: parseFloat(req.body.flipThresholdPct) || 0.5,
-        dcaRoiThresholdPct: parseFloat(req.body.dcaRoiThresholdPct) || 1.0, 
+        dcaTriggerPct: parseFloat(req.body.dcaTriggerPct) || 1.0,
         dcaMultiplier: parseFloat(req.body.dcaMultiplier) || 2.0,
-        profitRoiThresholdPct: parseFloat(req.body.profitRoiThresholdPct) || 2.0,
-        profitMultiplier: parseFloat(req.body.profitMultiplier) || 2.0,
+        startContracts: parseInt(req.body.startContracts) || 1,
+        dgrDailyGrowthRate: parseFloat(req.body.dgrDailyGrowthRate) || 0.0,
+        manualDirection: req.body.manualDirection || 'long',
         maxContracts: parseInt(req.body.maxContracts) || 100
     };
     try {
@@ -987,22 +834,17 @@ app.post('/api/user/config', authMiddleware, async (req, res) => {
     const worker = activeWorkers.get(req.user._id.toString());
     if(!worker) return res.status(400).json({ error: 'Worker not active' });
     
-    const { tpPct, slPct, baseContracts, contractSize, mlLookbackSens, mlThresholdSens, mlAverageTicksSens, mlUseAverageSens, flipOnlyInProfitSens, flipThresholdSens, dcaRoiThresholdSens, dcaMultiplierSens, profitRoiThresholdSens, profitMultiplierSens, maxContractsSens } = req.body;
+    const { tpPct, slPct, dcaTriggerPct, dcaMultiplier, startContracts, dgrDailyGrowthRate, manualDirection, maxContracts } = req.body;
     const pSet = (v, f, k) => { if (v !== undefined && v !== "") { const p = f(v); if (!isNaN(p)) worker.config[k] = p; } };
 
     pSet(tpPct, parseFloat, 'takeProfitPct'); pSet(slPct, parseFloat, 'stopLossPct');
-    pSet(baseContracts, parseInt, 'baseContracts'); pSet(contractSize, parseFloat, 'contractSize'); 
-    pSet(mlLookbackSens, parseInt, 'mlLookback'); pSet(mlThresholdSens, parseFloat, 'mlThreshold');
-    pSet(mlAverageTicksSens, parseInt, 'mlAverageTicks'); 
-    pSet(dcaRoiThresholdSens, parseFloat, 'dcaRoiThresholdPct'); 
-    pSet(dcaMultiplierSens, parseFloat, 'dcaMultiplier'); 
-    pSet(profitRoiThresholdSens, parseFloat, 'profitRoiThresholdPct');
-    pSet(profitMultiplierSens, parseFloat, 'profitMultiplier');
-    pSet(flipThresholdSens, parseFloat, 'flipThresholdPct');
-    pSet(maxContractsSens, parseInt, 'maxContracts'); 
+    pSet(dcaTriggerPct, parseFloat, 'dcaTriggerPct'); pSet(dcaMultiplier, parseFloat, 'dcaMultiplier');
+    pSet(startContracts, parseInt, 'startContracts'); pSet(dgrDailyGrowthRate, parseFloat, 'dgrDailyGrowthRate');
+    pSet(maxContracts, parseInt, 'maxContracts');
     
-    if (mlUseAverageSens !== undefined) worker.config.mlUseAverage = (mlUseAverageSens === 'true');
-    if (flipOnlyInProfitSens !== undefined) worker.config.flipOnlyInProfit = (flipOnlyInProfitSens === 'true');
+    if (manualDirection !== undefined && (manualDirection === 'long' || manualDirection === 'short')) {
+        worker.config.manualDirection = manualDirection;
+    }
 
     req.user.config = worker.config; req.user.markModified('config'); await req.user.save();
     res.json({status: 'ok', config: worker.config});
@@ -1034,7 +876,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>TradeBotPille | SHIB AI Engine</title>
+    <title>TradeBotPille | SHIB DCA Engine</title>
     
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet" />
@@ -1079,7 +921,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 </div>
                 <div class="flex flex-col leading-tight">
                     <span class="font-extrabold tracking-tighter text-base">TRADEBOT<span class="text-indigo-600">PILLE</span></span>
-                    <span class="text-[9px] uppercase font-bold text-zinc-400 tracking-widest">Neural Math Engine</span>
+                    <span class="text-[9px] uppercase font-bold text-zinc-400 tracking-widest">DCA Engine</span>
                 </div>
             </div>
             
@@ -1109,10 +951,10 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         <section id="view-home" class="view-section active-view">
             <div class="max-w-4xl mx-auto px-4 pt-32 pb-24 text-center">
                 <div class="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-zinc-100 text-[10px] font-black uppercase tracking-widest text-zinc-500 mb-8 border border-zinc-200">
-                    <span class="w-2 h-2 rounded-full bg-indigo-500 animate-ping"></span> Live SHIB Neural Execution
+                    <span class="w-2 h-2 rounded-full bg-indigo-500 animate-ping"></span> Live SHIB DCA Execution
                 </div>
-                <h1 class="text-6xl md:text-8xl font-black tracking-tight mb-8 leading-[0.9]">TRADE WITH<br><span class="text-zinc-400 italic">PRECISION.</span></h1>
-                <p class="text-lg md:text-xl text-zinc-500 mb-12 max-w-2xl mx-auto font-medium leading-relaxed">A specialized high-frequency trading algorithm using real-time logistic regression and 75x cross-leverage on HTX.</p>
+                <h1 class="text-6xl md:text-8xl font-black tracking-tight mb-8 leading-[0.9]">DCA TRADING<br><span class="text-zinc-400 italic">WITH PRECISION.</span></h1>
+                <p class="text-lg md:text-xl text-zinc-500 mb-12 max-w-2xl mx-auto font-medium leading-relaxed">A specialized DCA trading algorithm using 75x cross-leverage on HTX with configurable DCA triggers and daily growth rate.</p>
                 <div class="flex flex-col sm:flex-row justify-center gap-4">
                     <button onclick="nav('register')" class="btn-primary text-base px-8 py-4 shadow-xl shadow-indigo-200">Open Terminal <span class="material-symbols-outlined">trending_up</span></button>
                     <button onclick="nav('backtest')" class="btn-secondary text-base px-8 py-4">Explore Backtest</button>
@@ -1151,7 +993,16 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                         <h3 class="font-black text-sm uppercase tracking-widest mb-6 border-b pb-4">Backtest Config</h3>
                         <div class="space-y-4">
                             <div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Data Span (Min)</label><input type="number" id="btTicks" class="input-minimal font-mono font-bold" value="5000"></div>
-                            <div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Neural Confidence (%)</label><input type="number" id="btMlThreshold" class="input-minimal font-mono font-bold text-indigo-600" value="60"></div>
+                            <div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">DCA Trigger (%)</label><input type="number" id="btDcaTrigger" class="input-minimal font-mono font-bold" value="1.0" step="0.1"></div>
+                            <div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">DCA Multiplier</label><input type="number" id="btDcaMultiplier" class="input-minimal font-mono font-bold" value="2.0" step="0.1"></div>
+                            <div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Start Contracts</label><input type="number" id="btStartContracts" class="input-minimal font-mono font-bold" value="1"></div>
+                            <div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">DGR Daily Growth (%)</label><input type="number" id="btDgr" class="input-minimal font-mono font-bold" value="0.0" step="0.1"></div>
+                            <div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">Direction</label>
+                                <select id="btDirection" class="input-minimal font-mono font-bold">
+                                    <option value="long">Long Only</option>
+                                    <option value="short">Short Only</option>
+                                </select>
+                            </div>
                             <div class="grid grid-cols-2 gap-2">
                                 <div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">TP %</label><input type="number" id="btTp" class="input-minimal font-mono text-green-600 font-bold" value="10.0"></div>
                                 <div><label class="text-[10px] font-black text-zinc-400 uppercase mb-1 block">SL %</label><input type="number" id="btSl" class="input-minimal font-mono text-red-600 font-bold" value="-50.0"></div>
@@ -1165,7 +1016,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                         <div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase mb-1">Win Rate</p><p id="btResWinrate" class="text-3xl font-mono font-black text-indigo-600">-</p></div>
                         <div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase mb-1">Net Yield</p><p id="btResPnl" class="text-3xl font-mono font-black">-</p></div>
                         <div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase mb-1">Volume (Trades)</p><p id="btResTrades" class="text-3xl font-mono font-black">-</p></div>
-                        <div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase mb-1">Max Drawdown</p><p id="btResDeposit" class="text-3xl font-mono font-black">-</p></div>
+                        <div class="ui-card p-6"><p class="text-[10px] font-black text-zinc-400 uppercase mb-1">Max Deposit</p><p id="btResDeposit" class="text-3xl font-mono font-black">-</p></div>
                     </div>
                     <div class="ui-card overflow-hidden">
                         <div class="p-4 bg-zinc-50 border-b border-zinc-200 flex justify-between items-center">
@@ -1219,25 +1070,22 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                             <p id="activeRoi" class="text-3xl font-mono font-black tracking-tight text-zinc-400 italic">IDLE</p>
                         </div>
                         <div class="ui-card p-6 bg-zinc-950 border-zinc-950 shadow-xl shadow-zinc-200">
-                            <p class="text-[10px] font-black text-zinc-800 uppercase tracking-widest mb-1">Neural Prediction</p>
+                            <p class="text-[10px] font-black text-zinc-800 uppercase tracking-widest mb-1">Current Direction</p>
                             <div class="flex items-center justify-between">
-                                <span id="mlValue" class="text-3xl font-mono font-black text-white">0%</span>
-                                <span id="mlStatus" class="text-[10px] font-black text-zinc-500 uppercase italic">Init...</span>
+                                <span id="directionValue" class="text-3xl font-mono font-black text-white">LONG</span>
+                                <span id="dgrValue" class="text-[10px] font-black text-zinc-500 uppercase italic">DGR: 0%</span>
                             </div>
                         </div>
                     </div>
 
                     <!-- Chart -->
                     <div class="ui-card p-6 h-[450px] relative">
-                        <div class="absolute top-6 left-8 flex gap-4 z-10">
+                        <div class="absolute top-6 left-8 z-10">
                             <div class="flex items-center gap-2 bg-white/80 backdrop-blur px-3 py-1.5 rounded-full border border-zinc-200 text-[9px] font-black uppercase">
                                 <span class="w-2 h-2 rounded-full bg-zinc-950"></span> SHIB PRICE
                             </div>
-                            <div class="flex items-center gap-2 bg-white/80 backdrop-blur px-3 py-1.5 rounded-full border border-zinc-200 text-[9px] font-black uppercase">
-                                <span class="w-2 h-2 rounded-full bg-indigo-500"></span> Neural Probability
-                            </div>
                         </div>
-                        <canvas id="mlChart"></canvas>
+                        <canvas id="priceChart"></canvas>
                     </div>
 
                     <!-- History -->
@@ -1259,7 +1107,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 <!-- Config Sidebar -->
                 <aside class="lg:col-span-4 space-y-8">
                     <div class="ui-card p-8 border-t-4 border-t-indigo-600">
-                        <h3 class="text-sm font-black uppercase tracking-widest mb-8 flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">tune</span> Neural Parameters</h3>
+                        <h3 class="text-sm font-black uppercase tracking-widest mb-8 flex items-center gap-2"><span class="material-symbols-outlined text-[18px]">tune</span> DCA Parameters</h3>
                         <div class="space-y-6">
                             <div class="flex justify-between items-center group">
                                 <label class="text-xs font-bold text-zinc-500">TP Target (%)</label>
@@ -1271,12 +1119,31 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                             </div>
                             <hr class="border-zinc-100">
                             <div class="flex justify-between items-center">
-                                <label class="text-xs font-bold text-zinc-500">Neural Confidence (%)</label>
-                                <input type="number" id="mlThresholdSens" class="input-minimal w-24 text-right font-mono font-bold text-indigo-600">
+                                <label class="text-xs font-bold text-zinc-500">DCA Trigger (%)</label>
+                                <input type="number" id="dcaTriggerSens" class="input-minimal w-24 text-right font-mono font-bold" step="0.1">
                             </div>
                             <div class="flex justify-between items-center">
-                                <label class="text-xs font-bold text-zinc-500">Signal Smoothing</label>
-                                <input type="number" id="mlAverageTicksSens" class="input-minimal w-24 text-right font-mono font-bold">
+                                <label class="text-xs font-bold text-zinc-500">DCA Multiplier</label>
+                                <input type="number" id="dcaMultiplierSens" class="input-minimal w-24 text-right font-mono font-bold" step="0.1">
+                            </div>
+                            <div class="flex justify-between items-center">
+                                <label class="text-xs font-bold text-zinc-500">Start Contracts</label>
+                                <input type="number" id="startContractsSens" class="input-minimal w-24 text-right font-mono font-bold">
+                            </div>
+                            <div class="flex justify-between items-center">
+                                <label class="text-xs font-bold text-zinc-500">DGR Growth (%)</label>
+                                <input type="number" id="dgrSens" class="input-minimal w-24 text-right font-mono font-bold" step="0.1">
+                            </div>
+                            <div class="flex justify-between items-center">
+                                <label class="text-xs font-bold text-zinc-500">Direction</label>
+                                <select id="directionSens" class="input-minimal w-24 text-right font-mono font-bold">
+                                    <option value="long">LONG</option>
+                                    <option value="short">SHORT</option>
+                                </select>
+                            </div>
+                            <div class="flex justify-between items-center">
+                                <label class="text-xs font-bold text-zinc-500">Max Contracts</label>
+                                <input type="number" id="maxContractsSens" class="input-minimal w-24 text-right font-mono font-bold">
                             </div>
                             <button onclick="saveConfig()" class="btn-primary w-full py-4 shadow-xl shadow-zinc-200 mt-4 italic">Apply Config Settings</button>
                         </div>
@@ -1287,7 +1154,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 
         <!-- STEPS -->
         <section id="view-step-history" class="view-section max-w-4xl mx-auto px-4 py-20">
-            <h2 class="text-4xl font-black mb-8 flex items-center gap-4 italic"><span class="material-symbols-outlined text-4xl">layers</span> STEP TRACE</h2>
+            <h2 class="text-4xl font-black mb-8 flex items-center gap-4 italic"><span class="material-symbols-outlined text-4xl">layers</span> DCA STEP TRACE</h2>
             <div class="ui-card overflow-hidden">
                 <table class="w-full text-left">
                     <thead class="text-[10px] font-black uppercase bg-zinc-950 text-white">
@@ -1345,7 +1212,7 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
 
     <footer class="bg-white border-t border-zinc-200 py-12">
         <div class="max-w-7xl mx-auto px-4 text-center">
-            <p class="text-[10px] font-black uppercase tracking-widest text-zinc-400 mb-2">&copy; <script>document.write(new Date().getFullYear())</script> TRADEBOTPILLE NEURAL ENGINE</p>
+            <p class="text-[10px] font-black uppercase tracking-widest text-zinc-400 mb-2">&copy; <script>document.write(new Date().getFullYear())</script> TRADEBOTPILLE DCA ENGINE</p>
             <p class="text-[9px] text-zinc-300 font-bold uppercase tracking-tighter">Geometric trading carries absolute risk. Non-custodial execution strictly for education.</p>
         </div>
     </footer>
@@ -1397,10 +1264,13 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             document.getElementById('btResTrades').innerText = "...";
             const payload = {
                 ticks: document.getElementById('btTicks').value, tpPct: document.getElementById('btTp').value,
-                slPct: document.getElementById('btSl').value, baseContracts: 1,
-                mlLookback: 50, mlThreshold: document.getElementById('btMlThreshold').value,
-                mlAverageTicks: 5, mlUseAverage: false, flipOnlyInProfit: true, flipThresholdPct: 0.5,
-                dcaRoiThresholdPct: 1.0, dcaMultiplier: 2.0, profitRoiThresholdPct: 2.0, profitMultiplier: 2.0, maxContracts: 100
+                slPct: document.getElementById('btSl').value,
+                dcaTriggerPct: document.getElementById('btDcaTrigger').value,
+                dcaMultiplier: document.getElementById('btDcaMultiplier').value,
+                startContracts: document.getElementById('btStartContracts').value,
+                dgrDailyGrowthRate: document.getElementById('btDgr').value,
+                manualDirection: document.getElementById('btDirection').value,
+                maxContracts: 100
             };
             const res = await doAPI('/api/backtest', 'POST', payload);
             if(res.error) return;
@@ -1435,7 +1305,16 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
         }
 
         async function saveConfig() {
-            const payload = { tpPct: document.getElementById("tpPctSens").value, slPct: document.getElementById("slPctSens").value, mlThresholdSens: document.getElementById("mlThresholdSens").value, mlAverageTicksSens: document.getElementById("mlAverageTicksSens").value };
+            const payload = { 
+                tpPct: document.getElementById("tpPctSens").value, 
+                slPct: document.getElementById("slPctSens").value,
+                dcaTriggerPct: document.getElementById("dcaTriggerSens").value,
+                dcaMultiplier: document.getElementById("dcaMultiplierSens").value,
+                startContracts: document.getElementById("startContractsSens").value,
+                dgrDailyGrowthRate: document.getElementById("dgrSens").value,
+                manualDirection: document.getElementById("directionSens").value,
+                maxContracts: document.getElementById("maxContractsSens").value
+            };
             await doAPI('/api/user/config', 'POST', payload); alert("CONFIG SYNCED");
         }
 
@@ -1449,22 +1328,20 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             document.getElementById('stat-pages').innerHTML = Object.entries(data.pages).map(([n, c]) => '<div class="flex justify-between p-4"><span class="font-black text-[10px] uppercase tracking-widest text-zinc-500">'+n+'</span><span class="font-mono font-bold">'+c+' OPS</span></div>').join('');
         }
 
-        const ctx = document.getElementById("mlChart").getContext("2d");
-        const mlChart = new Chart(ctx, {
+        const ctx = document.getElementById("priceChart").getContext("2d");
+        const priceChart = new Chart(ctx, {
             type: "line", 
             data: { 
                 labels: [], 
                 datasets: [
-                    { label: "Price", data: [], borderColor: "#09090b", borderWidth: 2, pointRadius: 0, tension: 0.1, yAxisID: 'y' },
-                    { label: "Neural", data: [], borderWidth: 2, pointRadius: 0, tension: 0.1, yAxisID: 'y1', segment: { borderColor: ctx => ctx.p1.parsed.y >= 0.5 ? '#6366f1' : '#ef4444' } }
+                    { label: "Price", data: [], borderColor: "#09090b", borderWidth: 2, pointRadius: 0, tension: 0.1, yAxisID: 'y' }
                 ] 
             },
             options: { 
                 responsive: true, maintainAspectRatio: false, animation: false, 
                 scales: { 
                     x: { display: false },
-                    y: { display: true, position: 'left', grid: { display: false }, ticks: { font: { family: "JetBrains Mono", size: 9 } } }, 
-                    y1: { display: true, position: 'right', min: 0, max: 1, grid: { color: "#f4f4f5" }, ticks: { font: { family: "JetBrains Mono", size: 9 } } }
+                    y: { display: true, position: 'left', grid: { display: false }, ticks: { font: { family: "JetBrains Mono", size: 9 } } }
                 }, 
                 plugins: { legend: { display: false } } 
             }
@@ -1477,8 +1354,8 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             if(!me.error) { document.getElementById('nav-user-name').innerText = me.name; document.getElementById('liveTrade').checked = me.liveTradingEnabled; document.getElementById('apiKey').value = me.apiKey; }
             const history = await doAPI('/api/chart-history', 'GET');
             if(!history.error) { 
-                mlChart.data.labels = history.map(()=>""); mlChart.data.datasets[0].data = history.map(p=>p.priceMid); mlChart.data.datasets[1].data = history.map(p=>p.mlPlot);
-                mlChart.update(); 
+                priceChart.data.labels = history.map(()=>""); priceChart.data.datasets[0].data = history.map(p=>p.priceMid);
+                priceChart.update(); 
             }
             if(dashLoop) clearInterval(dashLoop);
             dashLoop = setInterval(fetchMetrics, 300);
@@ -1493,45 +1370,56 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
                 tbody.innerHTML = (data.activePositions[0]?.stepHistory || []).map(s => '<tr class="border-b"><td class="p-5 font-black">'+s.step+'</td><td class="p-5 font-black '+(s.type==='DCA'?'text-red-500':'text-indigo-500')+'">'+s.type+'</td><td class="p-5">$'+s.price.toFixed(8)+'</td><td class="p-5 font-black '+(s.roi>=0?'text-green-600':'text-red-600')+'">'+s.roi.toFixed(2)+'%</td><td class="p-5 text-right text-zinc-400">'+new Date(s.time).toLocaleTimeString()+'</td></tr>').join('') || '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">No Trace Data</td></tr>';
             }
 
-            if(!settingsLoaded) {
-                document.getElementById("tpPctSens").value = data.config.takeProfitPct; document.getElementById("slPctSens").value = data.config.stopLossPct; 
-                document.getElementById("mlThresholdSens").value = data.config.mlThreshold || 60.0; document.getElementById("mlAverageTicksSens").value = data.config.mlAverageTicks || 5;
+            if(!settingsLoaded && data.config) {
+                document.getElementById("tpPctSens").value = data.config.takeProfitPct; 
+                document.getElementById("slPctSens").value = data.config.stopLossPct; 
+                document.getElementById("dcaTriggerSens").value = data.config.dcaTriggerPct || 1.0;
+                document.getElementById("dcaMultiplierSens").value = data.config.dcaMultiplier || 2.0;
+                document.getElementById("startContractsSens").value = data.config.startContracts || 1;
+                document.getElementById("dgrSens").value = data.config.dgrDailyGrowthRate || 0.0;
+                document.getElementById("directionSens").value = data.config.manualDirection || 'long';
+                document.getElementById("maxContractsSens").value = data.config.maxContracts || 100;
                 settingsLoaded = true;
             }
 
             document.getElementById("uptime").innerText = data.uptime + "s";
-            document.getElementById("netPnl").innerText = "$" + data.metrics.totalNetPnl.toFixed(4);
-            document.getElementById("netPnl").className = "text-3xl font-mono font-black tracking-tight " + (data.metrics.totalNetPnl >= 0 ? "text-green-600" : "text-red-600");
+            document.getElementById("netPnl").innerText = "$" + (data.metrics?.totalNetPnl || 0).toFixed(4);
+            document.getElementById("netPnl").className = "text-3xl font-mono font-black tracking-tight " + ((data.metrics?.totalNetPnl || 0) >= 0 ? "text-green-600" : "text-red-600");
             document.getElementById("marginUsed").innerText = "$" + Number(data.walletBalance || 0).toFixed(4);
 
             const badge = document.getElementById("statusBadge");
-            if(data.activePositions.length > 0) {
+            if(data.activePositions && data.activePositions.length > 0) {
                 const p = data.activePositions[0];
-                badge.innerText = p.isPaper ? "PAPER LIVE" : "COMMAND ACTIVE"; badge.className = "status-pill bg-zinc-950 text-white";
-                document.getElementById("activeRoi").innerText = p.exchangeROI.toFixed(2) + "%"; 
-                document.getElementById("activeRoi").className = "text-3xl font-mono font-black tracking-tight " + (p.exchangeROI >= 0 ? "text-green-600" : "text-red-600");
+                badge.innerText = p.isPaper ? "PAPER ACTIVE" : "LIVE ACTIVE"; 
+                badge.className = "status-pill bg-zinc-950 text-white";
+                document.getElementById("activeRoi").innerText = (p.exchangeROI || 0).toFixed(2) + "%"; 
+                document.getElementById("activeRoi").className = "text-3xl font-mono font-black tracking-tight " + ((p.exchangeROI || 0) >= 0 ? "text-green-600" : "text-red-600");
             } else {
-                badge.innerText = data.liveTradingEnabled ? "LIVE SCANNING" : "PAPER STANDBY"; badge.className = "status-pill bg-zinc-100 text-zinc-400";
-                document.getElementById("activeRoi").innerText = "IDLE"; document.getElementById("activeRoi").className = "text-3xl font-mono font-black tracking-tight text-zinc-200";
+                badge.innerText = data.liveTradingEnabled ? "LIVE SCANNING" : "PAPER STANDBY"; 
+                badge.className = "status-pill bg-zinc-100 text-zinc-400";
+                document.getElementById("activeRoi").innerText = "IDLE"; 
+                document.getElementById("activeRoi").className = "text-3xl font-mono font-black tracking-tight text-zinc-200";
             }
 
-            if (data.mlSignal && data.mlSignal.type !== 'flat') {
-                const mlSig = data.mlSignal;
-                document.getElementById('mlValue').innerText = mlSig.confidence.toFixed(1) + "%";
-                document.getElementById('mlStatus').innerText = mlSig.type === 'bull' ? 'BULLISH' : 'BEARISH';
-                document.getElementById('mlStatus').className = "text-[10px] font-black uppercase tracking-widest italic " + (mlSig.type === 'bull' ? 'text-indigo-400' : 'text-red-400');
+            if(data.config) {
+                document.getElementById('directionValue').innerText = (data.config.manualDirection || 'LONG').toUpperCase();
+                document.getElementById('dgrValue').innerText = 'DGR: ' + (data.config.dgrDailyGrowthRate || 0) + '%';
             }
 
-            if(data.metrics.totalTradesCount !== lastTradesCount && data.metrics.trades) {
+            if(data.metrics && data.metrics.totalTradesCount !== lastTradesCount && data.metrics.trades) {
                 lastTradesCount = data.metrics.totalTradesCount;
                 const tbody = document.getElementById("tradeHistoryBody");
                 tbody.innerHTML = [...data.metrics.trades].reverse().slice(0, 10).map(t => '<tr class="border-b"><td class="p-4 text-zinc-400">'+new Date(t.timestamp).toLocaleTimeString()+'</td><td class="p-4 font-black '+(t.side==='long'?'text-green-600':'text-red-600')+'">'+t.side.toUpperCase()+'</td><td class="p-4 font-bold">'+t.contracts.toLocaleString()+'</td><td class="p-4 text-[9px] font-black uppercase text-zinc-300">'+t.exitReason+'</td><td class="p-4 text-right font-black '+(t.netPnl>=0?'text-green-600':'text-red-600')+'">$' + t.netPnl.toFixed(4) + '</td></tr>').join('') || '<tr><td colspan="5" class="p-20 text-center font-black uppercase text-zinc-300">Scanning Tape...</td></tr>';
             }
 
-            if(data.binance && data.mlSignal) { 
-                mlChart.data.labels.push(""); mlChart.data.datasets[0].data.push(data.binance.mid); mlChart.data.datasets[1].data.push(data.mlSignal.rawValue);
-                if(mlChart.data.labels.length > chartPoints) { mlChart.data.labels.shift(); mlChart.data.datasets[0].data.shift(); mlChart.data.datasets[1].data.shift(); }
-                mlChart.update(); 
+            if(data.binance) { 
+                priceChart.data.labels.push(""); 
+                priceChart.data.datasets[0].data.push(data.binance.mid);
+                if(priceChart.data.labels.length > chartPoints) { 
+                    priceChart.data.labels.shift(); 
+                    priceChart.data.datasets[0].data.shift(); 
+                }
+                priceChart.update(); 
             }
         }
 
