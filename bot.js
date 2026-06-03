@@ -30,7 +30,7 @@ const config = {
     baseVolume: 1, 
     multiplier: 1.2,
     stepDistancePct: 0.1,
-    takeProfitPct: 1.0,
+    takeProfitPct: 15.0,
     maxStartSpread: 0.1, 
     takerFeeRate: 0.0005, 
     pollInterval: 1000 
