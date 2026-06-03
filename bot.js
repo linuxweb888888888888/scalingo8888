@@ -30,7 +30,7 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
     multiplier: 1.2,
-    stepDistancePct: 10, // Now represents 10% ROI trigger
+    stepDistancePct: -10, // Now represents 10% ROI trigger
     takeProfitPct: 15,
     maxStartSpread: parseFloat(process.env.MAX_START_SPREAD) || 0.1,
     takerFeeRate: 0.0005,
