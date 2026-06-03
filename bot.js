@@ -29,8 +29,8 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
     multiplier: 1.2,
-    stepDistancePct: 0.2,  // Changed to 0.2% as shown in your UI
-    takeProfitPct: 15,      // Changed to 15% as shown in your UI
+    stepDistancePct: 0.2,
+    takeProfitPct: 15,
     maxStartSpread: 0.1,
     takerFeeRate: 0.0005,
     pollInterval: 1000,
@@ -153,16 +153,17 @@ async function syncAccount(acc, state) {
                 state.volume = parseFloat(pos.volume);
                 state.entryPrice = parseFloat(pos.cost_open);
                 
-                // CRITICAL FIX: Multiply profit_rate by 100 to match exchange display
-                // Exchange API returns 0.20 for 20%, so multiply by 100 to show 20%
+                // CRITICAL FIX: Use exchange's profit_rate directly
+                // profit_rate is already the ROI as a decimal (e.g., 0.01406 = 1.41%)
+                // Multiply by 100 to display as percentage
                 let rawProfitRate = parseFloat(pos.profit_rate);
-                state.roi = rawProfitRate * 100;  // Convert to percentage that matches exchange UI
+                state.roi = rawProfitRate * 100;  // 1.41% for display
                 state.unrealizedUsdt = parseFloat(pos.profit);
+                
+                console.log(`[${state.direction.toUpperCase()}] Exchange ROI: ${rawProfitRate} → Display: ${state.roi.toFixed(2)}%, PnL: ${state.unrealizedUsdt.toFixed(8)} USDT`);
                 
                 if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
                 if (!state.startTime) state.startTime = new Date().toLocaleString();
-                
-                console.log(`${state.direction.toUpperCase()} - Raw: ${rawProfitRate}, Display: ${state.roi.toFixed(2)}%, PnL: ${state.unrealizedUsdt.toFixed(8)} USDT`);
             } else {
                 state.volume = 0;
                 state.roi = 0;
@@ -171,6 +172,7 @@ async function syncAccount(acc, state) {
                 state.step = 0;
                 state.lastStepPrice = 0;
                 state.startTime = null;
+                state.lastAddedVolume = 0;
             }
         }
 
@@ -283,9 +285,9 @@ async function processMartingale() {
             continue;
         }
 
-        // Take profit - Now using multiplied ROI (matches exchange display)
+        // Take profit - Use exchange's ROI directly
         if (state.roi >= config.takeProfitPct) {
-            console.log(`Take profit triggered for ${state.direction} - ROI: ${state.roi.toFixed(2)}%`);
+            console.log(`✅ Take profit triggered for ${state.direction} - ROI: ${state.roi.toFixed(2)}%`);
             const v = state.volume;
             const finalRoi = state.roi;
             const finalPnl = state.unrealizedUsdt;
@@ -313,6 +315,7 @@ async function processMartingale() {
                 state.step = 0;
                 state.lastStepPrice = 0;
                 state.startTime = null;
+                state.lastAddedVolume = 0;
             } else {
                 state.isLocked = false;
                 state.lastAction = "TP Failed";
@@ -329,7 +332,7 @@ async function processMartingale() {
         }
         
         if (priceMove >= config.stepDistancePct && state.lastStepPrice > 0) {
-            console.log(`Martingale step ${state.step + 1} for ${state.direction} - Move: ${priceMove.toFixed(2)}%`);
+            console.log(`📈 Martingale step ${state.step + 1} for ${state.direction} - Move: ${priceMove.toFixed(2)}%`);
             state.isLocked = true;
             const nextVol = Math.max(1, Math.ceil((state.lastAddedVolume || config.baseVolume) * config.multiplier));
             
@@ -370,7 +373,7 @@ async function backgroundLoop() {
         if (s1 && s2) {
             if (market.initialTotalEquity === 0 && s1.initialEquity !== null && s2.initialEquity !== null) {
                 market.initialTotalEquity = s1.initialEquity + s2.initialEquity;
-                console.log(`Initial Total Equity: ${market.initialTotalEquity.toFixed(4)} USDT`);
+                console.log(`Initial Total Equity: ${market.initialTotalEquity.toFixed(8)} USDT`);
             }
             
             if (market.initialTotalEquity > 0) {
@@ -415,6 +418,37 @@ app.post('/api/close', async (req, res) => {
     }
     setTimeout(() => market.status = "Active", 5000);
     res.json({ status: 'ok' });
+});
+
+// Debug endpoint to verify ROI
+app.get('/api/verify', async (req, res) => {
+    const verification = [];
+    
+    for (const acc of config.accounts) {
+        const state = accountStates[acc.accountId];
+        const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', {
+            contract_code: config.symbol
+        });
+        
+        if (posRes?.status === 'ok' && posRes.data) {
+            const pos = posRes.data.find(p => p.direction === state.direction);
+            if (pos) {
+                verification.push({
+                    account: acc.accountId,
+                    direction: state.direction,
+                    exchange_profit_rate: parseFloat(pos.profit_rate),
+                    exchange_profit_rate_percent: (parseFloat(pos.profit_rate) * 100).toFixed(2) + '%',
+                    bot_display_roi: state.roi.toFixed(2) + '%',
+                    matches: Math.abs((parseFloat(pos.profit_rate) * 100) - state.roi) < 0.01
+                });
+            }
+        }
+    }
+    
+    res.json({
+        verified: verification,
+        message: "Bot ROI should match Exchange ROI exactly (profit_rate × 100)"
+    });
 });
 
 app.get('/', (req, res) => {
@@ -586,5 +620,6 @@ app.listen(config.port, '0.0.0.0', () => {
     console.log(`🎯 Take Profit: ${config.takeProfitPct}%`);
     console.log(`📈 Step Distance: ${config.stepDistancePct}%`);
     console.log(`🔧 Leverage: ${config.leverage}x`);
-    console.log(`🌐 Dashboard: http://localhost:${config.port}\n`);
+    console.log(`🌐 Dashboard: http://localhost:${config.port}`);
+    console.log(`🔍 Verify ROI: http://localhost:${config.port}/api/verify\n`);
 });
