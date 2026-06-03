@@ -8,6 +8,9 @@ const zlib = require('zlib');
 const app = express();
 app.use(express.json());
 
+// ==================== PAPER TRADING MODE ====================
+const PAPER_TRADING = true; // Set to true for paper trading, false for real trading
+
 // ==================== CONFIGURATION ====================
 const apiAccounts = [];
 let accountIndex = 1;
@@ -65,19 +68,21 @@ let accountStates = {};
 let lastPositionFetch = {};
 let lastBalanceFetch = {};
 
+// ==================== PAPER TRADING STATE ====================
+let paperWallet = {
+    totalEquity: 1000, // Starting with $1000 paper money
+    initialEquity: 1000,
+    lastUpdate: Date.now()
+};
+
 function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
     if (!config.autoCompound || totalEquity <= 0) {
         return config.baseVolume;
     }
     
-    // Formula: $0.0066135 wallet = 1 contract at 75x leverage
-    // So: volume = totalEquity ÷ 0.0066135
     let volume = Math.floor(totalEquity / config.walletPerContract);
-    
-    // Ensure minimum 1 contract
     volume = Math.max(1, volume);
     
-    // Cap at 1,000,000 contracts for safety
     const MAX_VOLUME = 1000000;
     if (volume > MAX_VOLUME) {
         volume = MAX_VOLUME;
@@ -178,7 +183,8 @@ config.accounts.forEach((account, idx) => {
     accountStates[account.accountId] = {
         direction: idx === 0 ? 'buy' : 'sell',
         roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
-        currentEquity: 0, availableMargin: 0, initialEquity: null,
+        currentEquity: PAPER_TRADING ? (paperWallet.totalEquity / config.accounts.length) : 0, 
+        availableMargin: 0, initialEquity: PAPER_TRADING ? (paperWallet.totalEquity / config.accounts.length) : null,
         isLocked: false,
         pendingOrderId: null,
         lastAction: 'Idle',
@@ -193,24 +199,180 @@ config.accounts.forEach((account, idx) => {
     };
 });
 
-function getSignature(account, method, path, params = {}) {
-    const timestamp = new Date().toISOString().split('.')[0];
-    const allParams = {
-        AccessKeyId: account.apiKey,
-        SignatureMethod: 'HmacSHA256',
-        SignatureVersion: '2',
-        Timestamp: timestamp,
-        ...params
-    };
+// ==================== PAPER TRADING SIMULATION FUNCTIONS ====================
+function simulateOrderExecution(account, state, action, volume, price) {
+    const fee = volume * config.contractMultiplier * price * config.takerFeeRate;
+    const positionValue = volume * config.contractMultiplier * price;
+    const requiredMargin = positionValue / config.leverage;
     
-    const sortedParams = Object.keys(allParams).sort().map(key => `${key}=${encodeURIComponent(allParams[key])}`).join('&');
-    const payload = [method.toUpperCase(), config.restHost, path, sortedParams].join('\n');
-    const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
+    if (action === 'open') {
+        // Check if enough margin
+        if (state.availableMargin < requiredMargin) {
+            console.log(`❌ PAPER: Insufficient margin for ${state.direction} - Need $${requiredMargin.toFixed(8)}, Have $${state.availableMargin.toFixed(8)}`);
+            return { success: false, error: 'Insufficient margin' };
+        }
+        
+        // Deduct margin
+        state.availableMargin -= requiredMargin;
+        state.currentEquity -= requiredMargin;
+        
+        // Update position
+        const oldVolume = state.volume;
+        const oldEntryPrice = state.entryPrice;
+        
+        if (oldVolume === 0) {
+            state.volume = volume;
+            state.entryPrice = price;
+        } else {
+            // Average down
+            const totalValue = (oldVolume * oldEntryPrice) + (volume * price);
+            state.volume = oldVolume + volume;
+            state.entryPrice = totalValue / state.volume;
+        }
+        
+        console.log(`✅ PAPER OPENED: ${state.direction.toUpperCase()} ${volume} contracts @ $${price.toFixed(8)} | Avg Price: $${state.entryPrice.toFixed(8)} | Margin: $${requiredMargin.toFixed(8)}`);
+        
+    } else if (action === 'close') {
+        // Calculate PnL
+        let pnl = 0;
+        if (state.direction === 'buy') {
+            pnl = (price - state.entryPrice) * state.volume * config.contractMultiplier;
+        } else {
+            pnl = (state.entryPrice - price) * state.volume * config.contractMultiplier;
+        }
+        
+        const netPnl = pnl - fee;
+        
+        // Return margin
+        const returnedMargin = (state.volume * config.contractMultiplier * state.entryPrice) / config.leverage;
+        state.availableMargin += returnedMargin;
+        state.currentEquity += returnedMargin + netPnl;
+        
+        // Update paper wallet
+        paperWallet.totalEquity += netPnl;
+        
+        console.log(`✅ PAPER CLOSED: ${state.direction.toUpperCase()} ${state.volume} contracts @ $${price.toFixed(8)} | PnL: $${netPnl.toFixed(8)} | ROI: ${((netPnl / returnedMargin) * 100).toFixed(2)}%`);
+        
+        return { success: true, pnl: netPnl, fee: fee, exitPrice: price };
+    }
     
-    return { timestamp, signature, sortedParams };
+    return { success: true };
 }
 
+function updatePaperPositions() {
+    for (const acc of config.accounts) {
+        const state = accountStates[acc.accountId];
+        if (state.volume > 0 && market.bid > 0 && market.ask > 0) {
+            const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
+            
+            // Calculate unrealized PnL
+            let unrealizedPnl = 0;
+            if (state.direction === 'buy') {
+                unrealizedPnl = (currentPrice - state.entryPrice) * state.volume * config.contractMultiplier;
+            } else {
+                unrealizedPnl = (state.entryPrice - currentPrice) * state.volume * config.contractMultiplier;
+            }
+            
+            // Calculate ROI based on margin used
+            const usedMargin = (state.volume * config.contractMultiplier * state.entryPrice) / config.leverage;
+            const roi = usedMargin > 0 ? (unrealizedPnl / usedMargin) * 100 : 0;
+            
+            state.unrealizedUsdt = unrealizedPnl;
+            state.roi = roi;
+            
+            // Update target price
+            state.targetPrice = calculateTargetPrice(state);
+        }
+    }
+}
+
+// ==================== HTX API FUNCTIONS (Mocked for Paper Trading) ====================
 async function htxRequest(account, method, path, data = {}) {
+    if (PAPER_TRADING && (path.includes('/swap_cross_order') || path.includes('/swap_cross_order_info'))) {
+        // Paper trading simulation
+        const state = accountStates[account.accountId];
+        
+        if (path.includes('/swap_cross_order')) {
+            // Simulate order
+            const orderId = `paper_${Date.now()}_${Math.random()}`;
+            const volume = data.volume;
+            const direction = data.direction;
+            const offset = data.offset;
+            const currentPrice = direction === 'buy' ? market.ask : market.bid;
+            
+            if (offset === 'open') {
+                const result = simulateOrderExecution(account, state, 'open', volume, currentPrice);
+                if (result.success) {
+                    return { 
+                        status: 'ok', 
+                        data: { 
+                            order_id_str: orderId,
+                            status: 6 // Filled
+                        } 
+                    };
+                } else {
+                    return { status: 'error', msg: result.error };
+                }
+            } else if (offset === 'close') {
+                const result = simulateOrderExecution(account, state, 'close', volume, currentPrice);
+                if (result.success) {
+                    return { 
+                        status: 'ok', 
+                        data: { 
+                            order_id_str: orderId,
+                            status: 6 // Filled
+                        } 
+                    };
+                } else {
+                    return { status: 'error', msg: result.error };
+                }
+            }
+        }
+        
+        if (path.includes('/swap_cross_order_info')) {
+            // Return filled order
+            return {
+                status: 'ok',
+                data: [{
+                    status: 6, // Filled
+                    price_avg: state.entryPrice || market.bid,
+                    volume: state.volume
+                }]
+            };
+        }
+        
+        if (path.includes('/swap_cross_position_info')) {
+            // Return current position
+            if (state.volume > 0) {
+                const usedMargin = (state.volume * config.contractMultiplier * state.entryPrice) / config.leverage;
+                return {
+                    status: 'ok',
+                    data: [{
+                        direction: state.direction,
+                        volume: state.volume.toString(),
+                        cost_open: state.entryPrice.toString(),
+                        profit: state.unrealizedUsdt.toString(),
+                        profit_rate: (state.roi / 100).toString()
+                    }]
+                };
+            } else {
+                return { status: 'ok', data: [] };
+            }
+        }
+        
+        if (path.includes('/swap_cross_account_info')) {
+            // Return account info
+            return {
+                status: 'ok',
+                data: [{
+                    margin_balance: state.currentEquity.toString(),
+                    withdraw_available: state.availableMargin.toString()
+                }]
+            };
+        }
+    }
+    
+    // Real trading mode - actual API call
     try {
         const { timestamp, signature, sortedParams } = getSignature(account, method, path, method === 'GET' ? data : {});
         const url = `https://${config.restHost}${path}?${sortedParams}&Signature=${encodeURIComponent(signature)}`;
@@ -235,6 +397,23 @@ async function htxRequest(account, method, path, data = {}) {
         console.error(`API Error: ${e.message}`);
         return { status: 'error', msg: e.message };
     }
+}
+
+function getSignature(account, method, path, params = {}) {
+    const timestamp = new Date().toISOString().split('.')[0];
+    const allParams = {
+        AccessKeyId: account.apiKey,
+        SignatureMethod: 'HmacSHA256',
+        SignatureVersion: '2',
+        Timestamp: timestamp,
+        ...params
+    };
+    
+    const sortedParams = Object.keys(allParams).sort().map(key => `${key}=${encodeURIComponent(allParams[key])}`).join('&');
+    const payload = [method.toUpperCase(), config.restHost, path, sortedParams].join('\n');
+    const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
+    
+    return { timestamp, signature, sortedParams };
 }
 
 async function fetchPriceRest() {
@@ -390,7 +569,8 @@ function logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl) {
         exitPrice: exitPrice.toFixed(8),
         roi: finalRoi.toFixed(2) + '%',
         netPnlUsdt: finalPnl.toFixed(8),
-        estimatedFee: estimatedFee.toFixed(8)
+        estimatedFee: estimatedFee.toFixed(8),
+        paperTrading: PAPER_TRADING
     });
     
     if (tradeHistory.length > 20) tradeHistory.pop();
@@ -419,6 +599,11 @@ function startWS() {
                     market.ask = msg.tick.ask[0];
                     market.spread = ((market.ask - market.bid) / market.bid) * 100;
                     market.lastPriceUpdate = Date.now();
+                    
+                    // Update paper positions when price changes
+                    if (PAPER_TRADING) {
+                        updatePaperPositions();
+                    }
                 }
                 if (msg.ping) {
                     ws.send(JSON.stringify({ pong: msg.ping }));
@@ -549,7 +734,6 @@ async function processMartingale() {
 
         const currentStep = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
         
-        // Trigger martingale step when ROI reaches -10% or lower (negative)
         if (state.roi <= -10 && state.volume > 0) {
             const nextStepNumber = currentStep + 1;
             let nextVol;
@@ -604,13 +788,19 @@ async function backgroundLoop() {
         
         if (s1 && s2) {
             if (market.initialTotalEquity === 0 && s1.initialEquity !== null && s2.initialEquity !== null) {
-                market.initialTotalEquity = s1.initialEquity + s2.initialEquity;
-                market.peakEquity = market.initialTotalEquity;
-                console.log(`\n💰 INITIAL TOTAL EQUITY: $${market.initialTotalEquity.toFixed(8)} USDT\n`);
+                if (PAPER_TRADING) {
+                    market.initialTotalEquity = paperWallet.initialEquity;
+                    market.peakEquity = market.initialTotalEquity;
+                    console.log(`\n💰 PAPER TRADING - INITIAL TOTAL EQUITY: $${market.initialTotalEquity.toFixed(8)} USDT\n`);
+                } else {
+                    market.initialTotalEquity = s1.initialEquity + s2.initialEquity;
+                    market.peakEquity = market.initialTotalEquity;
+                    console.log(`\n💰 INITIAL TOTAL EQUITY: $${market.initialTotalEquity.toFixed(8)} USDT\n`);
+                }
             }
             
             if (market.initialTotalEquity > 0) {
-                const totalEquity = s1.currentEquity + s2.currentEquity;
+                const totalEquity = PAPER_TRADING ? paperWallet.totalEquity : (s1.currentEquity + s2.currentEquity);
                 const totalRealizedPnl = s1.realizedPnl + s2.realizedPnl;
                 const totalFees = s1.totalFees + s2.totalFees;
                 
@@ -646,10 +836,11 @@ async function backgroundLoop() {
     }
 }
 
+// ==================== EXPRESS ROUTES ====================
 app.get('/api/status', (req, res) => {
     const s1 = accountStates[1];
     const s2 = accountStates[2];
-    const totalEquity = (s1?.currentEquity || 0) + (s2?.currentEquity || 0);
+    const totalEquity = PAPER_TRADING ? paperWallet.totalEquity : ((s1?.currentEquity || 0) + (s2?.currentEquity || 0));
     const totalRealizedPnl = (s1?.realizedPnl || 0) + (s2?.realizedPnl || 0);
     const totalFees = (s1?.totalFees || 0) + (s2?.totalFees || 0);
     
@@ -700,7 +891,8 @@ app.get('/api/status', (req, res) => {
             currentBaseShib: market.currentBaseShib,
             currentRiskAmount: market.currentRiskAmount,
             shibPerContract: config.shibPerContract,
-            walletPerContract: config.walletPerContract
+            walletPerContract: config.walletPerContract,
+            paperTrading: PAPER_TRADING
         },
         accounts: accountsWithInfo,
         tradeHistory,
@@ -714,7 +906,8 @@ app.get('/api/status', (req, res) => {
             multiplier: config.multiplier,
             autoCompound: config.autoCompound,
             riskPercent: config.riskPercent,
-            walletPerContract: config.walletPerContract
+            walletPerContract: config.walletPerContract,
+            paperTrading: PAPER_TRADING
         }
     });
 });
@@ -728,19 +921,31 @@ app.post('/api/close', async (req, res) => {
         if (s.volume > 0) {
             const step = calculateStepFromVolume(s.volume, market.currentBaseVolume, config.multiplier);
             console.log(`Closing ${s.direction} position (Step ${step}, Vol: ${s.volume})...`);
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol,
-                volume: s.volume,
-                direction: s.direction === 'buy' ? 'sell' : 'buy',
-                offset: 'close',
-                lever_rate: config.leverage,
-                order_price_type: 'optimal_20'
-            });
+            
+            if (PAPER_TRADING) {
+                const currentPrice = s.direction === 'buy' ? market.bid : market.ask;
+                simulateOrderExecution(acc, s, 'close', s.volume, currentPrice);
+                s.volume = 0;
+                s.roi = 0;
+                s.unrealizedUsdt = 0;
+                s.entryPrice = 0;
+                s.startTime = null;
+                s.targetPrice = 0;
+            } else {
+                await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                    contract_code: config.symbol,
+                    volume: s.volume,
+                    direction: s.direction === 'buy' ? 'sell' : 'buy',
+                    offset: 'close',
+                    lever_rate: config.leverage,
+                    order_price_type: 'optimal_20'
+                });
+            }
         }
     }
     
     setTimeout(() => market.status = "Active", 5000);
-    res.json({ status: 'ok' });
+    res.json({ status: 'ok', paperTrading: PAPER_TRADING });
 });
 
 app.post('/api/force-sync', async (req, res) => {
@@ -749,16 +954,69 @@ app.post('/api/force-sync', async (req, res) => {
         const state = accountStates[acc.accountId];
         await syncAccount(acc, state);
     }
-    res.json({ status: 'ok', message: 'Force sync completed' });
+    res.json({ status: 'ok', message: 'Force sync completed', paperTrading: PAPER_TRADING });
+});
+
+app.post('/api/reset-paper', (req, res) => {
+    if (!PAPER_TRADING) {
+        return res.json({ status: 'error', message: 'Only available in paper trading mode' });
+    }
+    
+    paperWallet = {
+        totalEquity: 1000,
+        initialEquity: 1000,
+        lastUpdate: Date.now()
+    };
+    
+    // Reset account states
+    config.accounts.forEach((account, idx) => {
+        accountStates[account.accountId] = {
+            direction: idx === 0 ? 'buy' : 'sell',
+            roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
+            currentEquity: paperWallet.totalEquity / config.accounts.length,
+            availableMargin: paperWallet.totalEquity / config.accounts.length,
+            initialEquity: paperWallet.totalEquity / config.accounts.length,
+            isLocked: false,
+            pendingOrderId: null,
+            lastAction: 'Idle',
+            lastStepPrice: 0, lastAddedVolume: 0, startTime: null,
+            lastExchangeRoi: 0,
+            roiLatencyMs: 0,
+            roiLatencyHistory: [],
+            lastRoiUpdateTime: Date.now(),
+            targetPrice: 0,
+            realizedPnl: 0,
+            totalFees: 0
+        };
+    });
+    
+    market = {
+        ...market,
+        totalNetGain: 0, growthPct: 0, dgr: 0,
+        initialTotalEquity: 1000, startTime: Date.now(),
+        walletHistory: [],
+        peakEquity: 1000,
+        maxDrawdown: 0,
+        totalTrades: 0,
+        winningTrades: 0,
+        losingTrades: 0,
+        totalFeesPaid: 0
+    };
+    
+    tradeHistory = [];
+    
+    console.log("🔄 Paper trading wallet reset to $1000");
+    res.json({ status: 'ok', message: 'Paper wallet reset to $1000' });
 });
 
 app.get('/api/wallet-history', (req, res) => {
     const s1 = accountStates[1];
     const s2 = accountStates[2];
+    const totalEquity = PAPER_TRADING ? paperWallet.totalEquity : ((s1?.currentEquity || 0) + (s2?.currentEquity || 0));
     
     res.json({
         currentWallet: {
-            totalEquity: (s1?.currentEquity || 0) + (s2?.currentEquity || 0),
+            totalEquity: totalEquity,
             totalRealizedPnl: (s1?.realizedPnl || 0) + (s2?.realizedPnl || 0),
             totalFees: (s1?.totalFees || 0) + (s2?.totalFees || 0),
             growthPct: market.growthPct,
@@ -774,7 +1032,9 @@ app.get('/api/wallet-history', (req, res) => {
                 currentRiskAmount: market.currentRiskAmount,
                 shibPerContract: config.shibPerContract,
                 walletPerContract: config.walletPerContract
-            }
+            },
+            paperTrading: PAPER_TRADING,
+            initialPaperBalance: PAPER_TRADING ? paperWallet.initialEquity : null
         },
         history: market.walletHistory,
         trades: tradeHistory.slice(0, 20)
@@ -818,7 +1078,7 @@ app.get('/api/verify', async (req, res) => {
         verified: verification,
         wallet: {
             initialEquity: market.initialTotalEquity,
-            currentEquity: (accountStates[1]?.currentEquity || 0) + (accountStates[2]?.currentEquity || 0),
+            currentEquity: PAPER_TRADING ? paperWallet.totalEquity : ((accountStates[1]?.currentEquity || 0) + (accountStates[2]?.currentEquity || 0)),
             totalPnL: market.totalNetGain,
             totalPnLPercent: market.growthPct,
             totalRealizedPnL: (accountStates[1]?.realizedPnl || 0) + (accountStates[2]?.realizedPnl || 0),
@@ -836,14 +1096,17 @@ app.get('/api/verify', async (req, res) => {
                 shibPerContract: config.shibPerContract,
                 walletPerContract: config.walletPerContract,
                 formula: "Volume = Total Wallet ÷ 0.0066135"
-            }
+            },
+            paperTrading: PAPER_TRADING
         },
-        message: `Auto-compounding: ${config.riskPercent}% of wallet. $${config.walletPerContract.toFixed(8)} wallet = 1 contract at ${config.leverage}x leverage.`
+        message: `Auto-compounding: ${config.riskPercent}% of wallet. $${config.walletPerContract.toFixed(8)} wallet = 1 contract at ${config.leverage}x leverage. ${PAPER_TRADING ? 'PAPER TRADING MODE - No real funds are being traded.' : 'LIVE TRADING MODE - Real funds are at risk.'}`
     });
 });
 
+// ==================== HTML DASHBOARD ====================
 app.get('/', (req, res) => {
     const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
+    const paperMode = PAPER_TRADING;
     
     res.send(`
 <!DOCTYPE html>
@@ -851,7 +1114,7 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Martingale Pro - Auto-Compounding</title>
+    <title>Martingale Pro - ${paperMode ? 'PAPER TRADING' : 'LIVE'} Mode</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
@@ -871,22 +1134,29 @@ app.get('/', (req, res) => {
         .stat-number { font-size: 28px; font-weight: 900; }
         .chart-container { position: relative; height: 280px; width: 100%; }
         .compound-info { background: #00D1B210; border: 1px solid #00D1B230; border-radius: 8px; padding: 12px; margin-top: 10px; }
+        .paper-badge { background: #F59E0B20; border: 1px solid #F59E0B; color: #F59E0B; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: bold; }
+        .reset-btn { background: #6366F120; border-color: #6366F1; color: #6366F1; }
     </style>
 </head>
 <body class="p-6">
     <div class="max-w-7xl mx-auto">
         <div class="flex justify-between items-center mb-8">
             <div>
-                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">AUTO-COMPOUND</span></h1>
+                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO</span> 
+                    <span class="text-xs ${paperMode ? 'bg-yellow-500/20 text-yellow-500' : 'bg-green-500/20 text-green-500'} px-2 py-1 rounded">
+                        ${paperMode ? '📝 PAPER TRADING' : '🔴 LIVE'}
+                    </span>
+                </h1>
                 <div class="flex items-center gap-3 mt-2">
-                    <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
-                    <span class="text-[10px] font-bold text-emerald-400">LIVE</span>
+                    <div class="w-2 h-2 rounded-full ${paperMode ? 'bg-yellow-500' : 'bg-emerald-500'} animate-pulse"></div>
+                    <span class="text-[10px] font-bold ${paperMode ? 'text-yellow-500' : 'text-emerald-400'}">${paperMode ? 'SIMULATED' : 'LIVE'}</span>
                     <span class="text-[10px] text-slate-500">${config.symbol}</span>
                     <span class="text-[10px] text-slate-500">${config.leverage}x LEVERAGE</span>
                     <span class="tp-target">🎯 TP: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price move</span>
                 </div>
             </div>
             <div>
+                ${paperMode ? '<button onclick="resetPaperWallet()" class="reset-btn mr-2">🔄 RESET WALLET</button>' : ''}
                 <button onclick="forceSync()" class="sync-btn">🔄 FORCE SYNC</button>
                 <button onclick="emergencyClose()">⚠️ EMERGENCY CLOSE</button>
             </div>
@@ -895,7 +1165,7 @@ app.get('/', (req, res) => {
         <div class="wallet-card rounded-2xl p-6 mb-8">
             <div class="grid grid-cols-1 md:grid-cols-5 gap-6">
                 <div>
-                    <p class="stat-label">TOTAL WALLET</p>
+                    <p class="stat-label">TOTAL WALLET ${paperMode ? '(PAPER)' : ''}</p>
                     <p id="totalWallet" class="stat-number value-positive">$0.00000000</p>
                     <p id="walletChange" class="text-xs"></p>
                 </div>
@@ -930,7 +1200,7 @@ app.get('/', (req, res) => {
                         <p class="text-xs text-slate-400" id="formulaDisplay">Formula: $${config.walletPerContract.toFixed(8)} wallet = 1 contract at ${config.leverage}x leverage</p>
                     </div>
                     <div class="text-right">
-                        <p class="text-xs text-slate-400">Risk Amount (2%)</p>
+                        <p class="text-xs text-slate-400">Risk Amount (${config.riskPercent}%)</p>
                         <p class="text-sm font-bold" id="riskAmount">$0.00</p>
                         <p class="text-xs text-slate-400" id="compoundStatus">🟢 Active</p>
                     </div>
@@ -951,6 +1221,7 @@ app.get('/', (req, res) => {
                 <p class="text-sm">Base Vol: <span id="configBaseVol">${config.baseVolume}</span></p>
                 <p class="text-sm">Multiplier: ${config.multiplier}x</p>
                 <p class="text-sm">Step Trigger: <span class="text-red-400">-${config.stepDistancePct}% ROI</span></p>
+                <p class="text-xs text-yellow-500 mt-2">${paperMode ? '📝 Paper Trading Mode' : '🔴 Live Mode'}</p>
             </div>
             <div class="card">
                 <p class="stat-label mb-2">MARKET</p>
@@ -979,7 +1250,7 @@ app.get('/', (req, res) => {
         </div>
 
         <div class="card">
-            <h3 class="font-bold mb-4">📋 CLOSED TRADES</h3>
+            <h3 class="font-bold mb-4">📋 CLOSED TRADES ${paperMode ? '(Paper Trading)' : ''}</h3>
             <div class="overflow-x-auto max-h-96 overflow-y-auto">
                 <table class="w-full border-collapse">
                     <thead class="bg-[#0F141C] sticky top-0">
@@ -1006,6 +1277,7 @@ app.get('/', (req, res) => {
 
     <script>
         let walletChart = null;
+        const paperMode = ${paperMode};
         
         async function forceSync() {
             const btn = event.target;
@@ -1018,6 +1290,14 @@ app.get('/', (req, res) => {
             if(confirm('Close ALL positions?')) {
                 await fetch('/api/close', {method: 'POST'});
                 alert('Emergency liquidation initiated');
+            }
+        }
+        
+        async function resetPaperWallet() {
+            if(confirm('Reset paper wallet to $1000? This will close all positions and reset history.')) {
+                await fetch('/api/reset-paper', {method: 'POST'});
+                alert('Paper wallet reset to $1000');
+                setTimeout(() => location.reload(), 1000);
             }
         }
         
@@ -1187,7 +1467,7 @@ app.get('/', (req, res) => {
                     data.tradeHistory.slice(0, 20).forEach(t => {
                         const roiVal = parseFloat(t.roi);
                         tradesHtml += '<tr class="border-b border-[#1A212E]">' +
-                            '<td class="p-3"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + ' font-bold">' + t.side + '</span><tr>' +
+                            '<td class="p-3"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + ' font-bold">' + t.side + '</span></td>' +
                             '<td class="p-3 text-xs">' + (t.openTime || '--') + '</td>' +
                             '<td class="p-3 text-xs">' + (t.closeTime || '--') + '</td>' +
                             '<td class="p-3 text-right">' + (t.step || 0) + '</td>' +
@@ -1212,12 +1492,26 @@ app.get('/', (req, res) => {
     `);
 });
 
+// ==================== STARTUP ====================
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
+
+if (PAPER_TRADING) {
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`📝 PAPER TRADING MODE ENABLED`);
+    console.log(`${'='.repeat(60)}`);
+    console.log(`✅ No real funds will be traded`);
+    console.log(`💰 Starting Paper Wallet: $${paperWallet.totalEquity.toFixed(2)} USDT`);
+    console.log(`🔄 All orders are simulated`);
+    console.log(`📊 Real market data is still being fetched`);
+    console.log(`🎮 Use /api/reset-paper to reset wallet to $1000`);
+    console.log(`${'='.repeat(60)}\n`);
+}
+
 app.listen(config.port, '0.0.0.0', () => {
     const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
     
-    console.log(`\n✅ Martingale Pro Started (AUTO-COMPOUNDING CORRECTED)`);
+    console.log(`\n✅ Martingale Pro Started (${PAPER_TRADING ? 'PAPER TRADING' : 'LIVE'} Mode)`);
     console.log(`📊 Symbol: ${config.symbol}`);
     console.log(`🔧 Leverage: ${config.leverage}x`);
     console.log(`🎯 Take Profit: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price movement`);
