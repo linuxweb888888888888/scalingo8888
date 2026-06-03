@@ -38,7 +38,8 @@ const config = {
     contractMultiplier: 0.001,
     autoCompound: true,
     riskPercent: 2,
-    shibPerContract: 1000
+    shibPerContract: 1000,
+    walletPerContract: 0.0066135  // $0.0066135 wallet = 1 contract at 75x leverage
 };
 
 let market = {
@@ -69,12 +70,9 @@ function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
         return config.baseVolume;
     }
     
-    // Formula: Volume = Total Wallet × 200
-    // Because: 2% of wallet × 100 = contracts
-    // $0.01 × 200 = 2 contracts ✅
-    // $0.10 × 200 = 20 contracts ✅
-    // $1.00 × 200 = 200 contracts ✅
-    let volume = Math.floor(totalEquity * 200);
+    // Formula: $0.0066135 wallet = 1 contract at 75x leverage
+    // So: volume = totalEquity ÷ 0.0066135
+    let volume = Math.floor(totalEquity / config.walletPerContract);
     
     // Ensure minimum 1 contract
     volume = Math.max(1, volume);
@@ -93,12 +91,12 @@ function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
     market.currentBaseShib = shibAmount;
     
     console.log(`\n💰 AUTO-COMPOUNDING CALCULATION:`);
-    console.log(`   Wallet: $${totalEquity.toFixed(4)}`);
-    console.log(`   ${config.riskPercent}% Risk: $${riskAmount.toFixed(4)}`);
-    console.log(`   @ ${config.leverage}x → $${positionUsdt.toFixed(4)} position`);
-    console.log(`   Formula: $${totalEquity.toFixed(4)} × 200 = ${volume} contracts`);
-    console.log(`   Volume: ${volume.toLocaleString()} contracts = ${shibAmount.toLocaleString()} SHIB`);
-    console.log(`   (1 contract = ${config.shibPerContract.toLocaleString()} SHIB)\n`);
+    console.log(`   Wallet: $${totalEquity.toFixed(8)}`);
+    console.log(`   ${config.riskPercent}% Risk: $${riskAmount.toFixed(8)}`);
+    console.log(`   @ ${config.leverage}x → $${positionUsdt.toFixed(8)} position`);
+    console.log(`   Formula: $${config.walletPerContract.toFixed(8)} wallet = 1 contract`);
+    console.log(`   Volume: ${volume.toLocaleString()} contract(s) = ${shibAmount.toLocaleString()} SHIB`);
+    console.log(`   Risk per contract: $${(riskAmount/volume).toFixed(8)}\n`);
     
     return volume;
 }
@@ -454,7 +452,7 @@ async function processMartingale() {
                 continue;
             }
             
-            console.log(`🚀 Opening ${state.direction} position at ${currentPrice.toFixed(8)}`);
+            console.log(`🚀 Opening ${state.direction} position at ${currentPrice.toFixed(8)} with ${market.currentBaseVolume} contract(s)`);
             state.isLocked = true;
             state.lastAction = "Opening Position...";
             
@@ -630,7 +628,7 @@ async function backgroundLoop() {
                 if (config.autoCompound && market.bid > 0) {
                     const newBaseVolume = calculateBaseVolumeFromWallet(totalEquity, market.bid);
                     if (newBaseVolume !== market.currentBaseVolume) {
-                        console.log(`📈 AUTO-COMPOUND: Base volume updated: ${market.currentBaseVolume} → ${newBaseVolume} contracts`);
+                        console.log(`📈 AUTO-COMPOUND: Base volume updated: ${market.currentBaseVolume} → ${newBaseVolume} contract(s)`);
                         market.currentBaseVolume = newBaseVolume;
                         market.lastBaseUpdate = Date.now();
                     }
@@ -641,7 +639,7 @@ async function backgroundLoop() {
                 const lastRecord = market.walletHistory[market.walletHistory.length - 2];
                 if (lastRecord && Math.abs(market.growthPct - lastRecord.pnlPercent) > 0.1) {
                     console.log(`💰 WALLET: $${totalEquity.toFixed(8)} | PnL: ${market.totalNetGain >= 0 ? '+' : ''}$${market.totalNetGain.toFixed(8)} (${market.growthPct >= 0 ? '+' : ''}${market.growthPct.toFixed(2)}%)`);
-                    console.log(`   Base Volume: ${market.currentBaseVolume} contracts (${market.currentBaseShib.toLocaleString()} SHIB) | Risk: ${config.riskPercent}% = $${market.currentRiskAmount.toFixed(8)}`);
+                    console.log(`   Base Volume: ${market.currentBaseVolume} contract(s) (${market.currentBaseShib.toLocaleString()} SHIB) | Risk: $${market.currentRiskAmount.toFixed(8)}`);
                 }
             }
         }
@@ -707,7 +705,8 @@ app.get('/api/status', (req, res) => {
             currentBaseVolume: market.currentBaseVolume,
             currentBaseShib: market.currentBaseShib,
             currentRiskAmount: market.currentRiskAmount,
-            shibPerContract: config.shibPerContract
+            shibPerContract: config.shibPerContract,
+            walletPerContract: config.walletPerContract
         },
         accounts: accountsWithInfo,
         tradeHistory,
@@ -720,7 +719,8 @@ app.get('/api/status', (req, res) => {
             baseVolume: market.currentBaseVolume,
             multiplier: config.multiplier,
             autoCompound: config.autoCompound,
-            riskPercent: config.riskPercent
+            riskPercent: config.riskPercent,
+            walletPerContract: config.walletPerContract
         }
     });
 });
@@ -778,7 +778,8 @@ app.get('/api/wallet-history', (req, res) => {
                 currentBaseVolume: market.currentBaseVolume,
                 currentBaseShib: market.currentBaseShib,
                 currentRiskAmount: market.currentRiskAmount,
-                shibPerContract: config.shibPerContract
+                shibPerContract: config.shibPerContract,
+                walletPerContract: config.walletPerContract
             }
         },
         history: market.walletHistory,
@@ -839,10 +840,11 @@ app.get('/api/verify', async (req, res) => {
                 currentBaseShib: market.currentBaseShib,
                 currentRiskAmount: market.currentRiskAmount,
                 shibPerContract: config.shibPerContract,
-                formula: "Volume = Total Wallet × 200"
+                walletPerContract: config.walletPerContract,
+                formula: "Volume = Total Wallet ÷ 0.0066135"
             }
         },
-        message: `Auto-compounding: ${config.riskPercent}% of wallet = Volume × 200 contracts. Example: $0.01 wallet = 2 contracts.`
+        message: `Auto-compounding: ${config.riskPercent}% of wallet. $${config.walletPerContract.toFixed(8)} wallet = 1 contract at ${config.leverage}x leverage.`
     });
 });
 
@@ -928,13 +930,13 @@ app.get('/', (req, res) => {
             <div class="compound-info mt-4">
                 <div class="flex justify-between items-center">
                     <div>
-                        <p class="text-xs text-slate-400">📈 AUTO-COMPOUNDING (${config.riskPercent}% of Wallet = Wallet × 200)</p>
+                        <p class="text-xs text-slate-400">📈 AUTO-COMPOUNDING (${config.riskPercent}% of Wallet)</p>
                         <p class="text-sm font-bold text-green-400" id="baseVolumeDisplay">Base Volume: 0 contracts</p>
-                        <p class="text-xs text-slate-400" id="shibDisplay">0 SHIB per trade (1 contract = ${config.shibPerContract.toLocaleString()} SHIB)</p>
-                        <p class="text-xs text-slate-400" id="formulaDisplay">Formula: $0.01 wallet = 2 contracts</p>
+                        <p class="text-xs text-slate-400" id="shibDisplay">0 SHIB per trade</p>
+                        <p class="text-xs text-slate-400" id="formulaDisplay">Formula: $${config.walletPerContract.toFixed(8)} wallet = 1 contract at ${config.leverage}x leverage</p>
                     </div>
                     <div class="text-right">
-                        <p class="text-xs text-slate-400">Risk Amount</p>
+                        <p class="text-xs text-slate-400">Risk Amount (2%)</p>
                         <p class="text-sm font-bold" id="riskAmount">$0.00</p>
                         <p class="text-xs text-slate-400" id="compoundStatus">🟢 Active</p>
                     </div>
@@ -1138,7 +1140,7 @@ app.get('/', (req, res) => {
                 document.getElementById('tradeStats').innerHTML = 'Trades: ' + (data.market.totalTrades || 0);
                 document.getElementById('winRate').innerHTML = 'Win Rate: ' + (data.market.winRate || 0) + '%';
                 
-                document.getElementById('baseVolumeDisplay').innerHTML = 'Base Volume: ' + (data.market.currentBaseVolume || 0).toLocaleString() + ' contracts';
+                document.getElementById('baseVolumeDisplay').innerHTML = 'Base Volume: ' + (data.market.currentBaseVolume || 0).toLocaleString() + ' contract(s)';
                 document.getElementById('shibDisplay').innerHTML = (data.market.currentBaseShib || 0).toLocaleString() + ' SHIB per trade';
                 document.getElementById('riskAmount').innerHTML = '$' + formatNumber(data.market.currentRiskAmount || 0);
                 document.getElementById('configBaseVol').innerHTML = data.market.currentBaseVolume || 0;
@@ -1221,17 +1223,16 @@ setInterval(backgroundLoop, config.pollInterval);
 app.listen(config.port, '0.0.0.0', () => {
     const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
     
-    console.log(`\n✅ Martingale Pro Started (AUTO-COMPOUNDING FIXED)`);
+    console.log(`\n✅ Martingale Pro Started (AUTO-COMPOUNDING CORRECTED)`);
     console.log(`📊 Symbol: ${config.symbol}`);
     console.log(`🔧 Leverage: ${config.leverage}x`);
     console.log(`🎯 Take Profit: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price movement`);
-    console.log(`💰 Auto-Compounding: ${config.riskPercent}% of wallet = Wallet × 200 contracts`);
+    console.log(`💰 Auto-Compounding: ${config.riskPercent}% of wallet`);
+    console.log(`📐 Formula: $${config.walletPerContract.toFixed(8)} wallet = 1 contract`);
     console.log(`📈 Step Distance: ${config.stepDistancePct}%`);
     console.log(`🌐 Dashboard: http://localhost:${config.port}`);
-    console.log(`\n📊 AUTO-COMPOUNDING FORMULA:`);
-    console.log(`   Volume = Total Wallet × 200`);
-    console.log(`   Example: $0.01 wallet = 2 contracts`);
-    console.log(`   Example: $0.10 wallet = 20 contracts`);
-    console.log(`   Example: $1.00 wallet = 200 contracts`);
-    console.log(`   1 contract = ${config.shibPerContract.toLocaleString()} SHIB\n`);
+    console.log(`\n📊 AUTO-COMPOUNDING EXAMPLES:`);
+    console.log(`   Wallet $${config.walletPerContract.toFixed(8)} → 1 contract → Risk $${(config.walletPerContract * 0.02).toFixed(8)}`);
+    console.log(`   Wallet $${(config.walletPerContract * 2).toFixed(8)} → 2 contracts → Risk $${(config.walletPerContract * 2 * 0.02).toFixed(8)}`);
+    console.log(`   Wallet $${(config.walletPerContract * 3).toFixed(8)} → 3 contracts → Risk $${(config.walletPerContract * 3 * 0.02).toFixed(8)}\n`);
 });
