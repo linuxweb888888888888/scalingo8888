@@ -63,7 +63,7 @@ config.accounts.forEach((account, idx) => {
         roiLatencyMs: 0,
         roiLatencyHistory: [],
         lastRoiUpdateTime: Date.now(),
-        targetPrice: 0  // Store target take profit price
+        targetPrice: 0
     };
 });
 
@@ -127,25 +127,14 @@ async function fetchPriceRest() {
     }
 }
 
-// Calculate exact take profit target price using order book
-function calculateTargetPrice(state, currentPrice) {
+function calculateTargetPrice(state) {
     if (state.direction === 'buy') {
-        // For LONG: Need to exit when ASK price reaches target
-        // Target = entry price × (1 + takeProfit%)
         const targetPrice = state.entryPrice * (1 + (config.takeProfitPct / 100));
-        // Adjust for fees (add fee since you pay when selling)
         const feeAdjustedTarget = targetPrice * (1 + config.takerFeeRate);
-        
-        console.log(`[LONG TP Calc] Entry: ${state.entryPrice.toFixed(8)}, Target: ${targetPrice.toFixed(8)}, Fee Adj: ${feeAdjustedTarget.toFixed(8)}`);
         return feeAdjustedTarget;
     } else {
-        // For SHORT: Need to exit when BID price reaches target
-        // Target = entry price × (1 - takeProfit%)
         const targetPrice = state.entryPrice * (1 - (config.takeProfitPct / 100));
-        // Adjust for fees (subtract fee since you pay when buying to close)
         const feeAdjustedTarget = targetPrice * (1 - config.takerFeeRate);
-        
-        console.log(`[SHORT TP Calc] Entry: ${state.entryPrice.toFixed(8)}, Target: ${targetPrice.toFixed(8)}, Fee Adj: ${feeAdjustedTarget.toFixed(8)}`);
         return feeAdjustedTarget;
     }
 }
@@ -153,7 +142,6 @@ function calculateTargetPrice(state, currentPrice) {
 async function syncAccount(acc, state) {
     const now = Date.now();
     
-    // Check pending orders
     if (state.pendingOrderId) {
         const orderRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order_info', {
             contract_code: config.symbol,
@@ -172,13 +160,11 @@ async function syncAccount(acc, state) {
 
     if (state.isLocked) return;
 
-    // Rate limit position fetches
     if (lastPositionFetch[acc.accountId] && (now - lastPositionFetch[acc.accountId]) < config.pollInterval) {
         return;
     }
     lastPositionFetch[acc.accountId] = now;
 
-    // Get position info
     const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', {
         contract_code: config.symbol
     });
@@ -198,7 +184,6 @@ async function syncAccount(acc, state) {
             state.entryPrice = newEntryPrice;
             state.unrealizedUsdt = newUnrealizedUsdt;
             
-            // Use exchange's ROI - this is always correct
             if (Math.abs(newExchangeRoi - state.roi) > 0.01) {
                 const timeSinceLastUpdate = now - state.lastRoiUpdateTime;
                 
@@ -220,13 +205,11 @@ async function syncAccount(acc, state) {
                 state.lastRoiUpdateTime = now;
             }
             
-            // Update target price whenever entry price changes (Martingale steps)
-            state.targetPrice = calculateTargetPrice(state, state.direction === 'buy' ? market.ask : market.bid);
+            state.targetPrice = calculateTargetPrice(state);
             
             if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
             if (!state.startTime) state.startTime = new Date().toLocaleString();
         } else {
-            // Position closed
             if (state.volume !== 0) {
                 console.log(`✅ [${state.direction.toUpperCase()}] Position closed at ${new Date().toLocaleTimeString()}`);
                 state.volume = 0;
@@ -243,13 +226,11 @@ async function syncAccount(acc, state) {
         }
     }
 
-    // Rate limit balance fetches to once per 10 seconds
     if (lastBalanceFetch[acc.accountId] && (now - lastBalanceFetch[acc.accountId]) < 10000) {
         return;
     }
     lastBalanceFetch[acc.accountId] = now;
 
-    // Get account balance
     const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', {
         margin_asset: 'USDT'
     });
@@ -277,7 +258,6 @@ function logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl) {
     if (tradeHistory.length > 20) tradeHistory.pop();
 }
 
-// ==================== WS ENGINE ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
     
@@ -314,7 +294,6 @@ function startWS() {
     });
 }
 
-// ==================== MARTINGALE LOGIC WITH EXACT TAKE PROFIT ====================
 async function processMartingale() {
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
@@ -324,14 +303,13 @@ async function processMartingale() {
         
         if (currentPrice === 0) continue;
 
-        // Open initial position
         if (state.volume === 0) {
             if (market.spread > config.maxStartSpread && market.spread > 0) {
                 state.lastAction = `Wait Spread (${market.spread.toFixed(2)}% > ${config.maxStartSpread}%)`;
                 continue;
             }
             
-            console.log(`🚀 Opening ${state.direction} position at ${currentPrice.toFixed(8)} (spread: ${market.spread.toFixed(2)}%)`);
+            console.log(`🚀 Opening ${state.direction} position at ${currentPrice.toFixed(8)}`);
             state.isLocked = true;
             state.lastAction = "Opening Position...";
             
@@ -348,7 +326,6 @@ async function processMartingale() {
                 state.pendingOrderId = res.data.order_id_str;
                 state.lastAction = "Position Opening";
                 
-                // Wait for order to fill and get actual entry price
                 setTimeout(async () => {
                     const orderInfo = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order_info', {
                         contract_code: config.symbol,
@@ -357,7 +334,7 @@ async function processMartingale() {
                     
                     if (orderInfo?.data?.[0]?.status === 6) {
                         state.entryPrice = parseFloat(orderInfo.data[0].price_avg);
-                        state.targetPrice = calculateTargetPrice(state, currentPrice);
+                        state.targetPrice = calculateTargetPrice(state);
                         console.log(`✅ Position opened at ${state.entryPrice.toFixed(8)}, TP target: ${state.targetPrice.toFixed(8)}`);
                         state.isLocked = false;
                     }
@@ -370,19 +347,16 @@ async function processMartingale() {
             continue;
         }
 
-        // ============ TAKE PROFIT CHECK USING ORDER BOOK PRICES ============
         let shouldTakeProfit = false;
         let exitPrice = 0;
         
         if (state.direction === 'buy') {
-            // For LONG: Check if ASK price reached target
             if (market.ask >= state.targetPrice && state.targetPrice > 0) {
                 shouldTakeProfit = true;
                 exitPrice = market.ask;
                 console.log(`🎯 LONG TP triggered! ASK: ${market.ask.toFixed(8)} >= Target: ${state.targetPrice.toFixed(8)}`);
             }
         } else {
-            // For SHORT: Check if BID price reached target
             if (market.bid <= state.targetPrice && state.targetPrice > 0) {
                 shouldTakeProfit = true;
                 exitPrice = market.bid;
@@ -395,7 +369,7 @@ async function processMartingale() {
             const finalPnl = state.unrealizedUsdt;
             const exitTime = new Date().toLocaleString();
             
-            console.log(`✅ Taking ${state.direction} profit at ${exitPrice.toFixed(8)} (Target: ${state.targetPrice.toFixed(8)})`);
+            console.log(`✅ Taking ${state.direction} profit at ${exitPrice.toFixed(8)}`);
             state.isLocked = true;
             state.lastAction = "Taking Profit...";
             
@@ -405,7 +379,7 @@ async function processMartingale() {
                 direction: state.direction === 'buy' ? 'sell' : 'buy',
                 offset: 'close',
                 lever_rate: config.leverage,
-                order_price_type: 'optimal_20'  // Market order
+                order_price_type: 'optimal_20'
             });
             
             if (res?.status === 'ok' && res.data?.order_id_str) {
@@ -413,7 +387,6 @@ async function processMartingale() {
                 state.lastAction = "Take Profit Close";
                 logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl);
                 
-                // Reset position data
                 state.volume = 0;
                 state.roi = 0;
                 state.unrealizedUsdt = 0;
@@ -431,7 +404,6 @@ async function processMartingale() {
             continue;
         }
 
-        // Martingale step logic
         let priceMove = 0;
         if (state.direction === 'buy') {
             priceMove = ((state.lastStepPrice - currentPrice) / state.lastStepPrice) * 100;
@@ -459,8 +431,6 @@ async function processMartingale() {
                 state.lastStepPrice = currentPrice;
                 state.lastAddedVolume = nextVol;
                 state.lastAction = `Martingale Step ${state.step}`;
-                
-                // Target price will be recalculated on next sync with new weighted average entry
             } else {
                 state.isLocked = false;
                 state.lastAction = "Step Failed";
@@ -471,17 +441,14 @@ async function processMartingale() {
 
 async function backgroundLoop() {
     try {
-        // Update prices if WebSocket hasn't updated recently
         if (Date.now() - market.lastPriceUpdate > 2000) {
             await fetchPriceRest();
         }
         
-        // Sync accounts sequentially to avoid rate limits
         for (const acc of config.accounts) {
             await syncAccount(acc, accountStates[acc.accountId]);
         }
         
-        // Calculate totals
         const s1 = accountStates[1];
         const s2 = accountStates[2];
         
@@ -507,7 +474,6 @@ async function backgroundLoop() {
     }
 }
 
-// ==================== ENDPOINTS ====================
 app.get('/api/status', (req, res) => {
     const latencySummary = {};
     Object.keys(accountStates).forEach(accId => {
@@ -592,8 +558,7 @@ app.get('/api/verify', async (req, res) => {
                     target_price: state.targetPrice,
                     entry_price: state.entryPrice,
                     current_ask: market.ask,
-                    current_bid: market.bid,
-                    matches: Math.abs((parseFloat(pos.profit_rate) * 100) - state.roi) < 0.01
+                    current_bid: market.bid
                 });
             }
         }
@@ -601,14 +566,14 @@ app.get('/api/verify', async (req, res) => {
     
     res.json({
         verified: verification,
-        message: "Take profit now uses ORDER BOOK prices (BID/ASK) with fee adjustment for exact 15%",
-        take_profit_logic: "LONG: market.ask >= targetPrice | SHORT: market.bid <= targetPrice",
-        fee_adjustment: `${config.takerFeeRate * 100}% included`
+        message: "Take profit uses ORDER BOOK prices with fee adjustment",
+        take_profit_logic: "LONG: market.ask >= targetPrice | SHORT: market.bid <= targetPrice"
     });
 });
 
 app.get('/', (req, res) => {
-    res.send(`<!DOCTYPE html>
+    res.send(`
+<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -622,7 +587,7 @@ app.get('/', (req, res) => {
         .stat-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #6B7A8F; }
         .value-positive { color: #00D1B2; }
         .value-negative { color: #FF4D6D; }
-        .mono { font-family: 'SF Mono', monospace; font-size: 12px; }
+        .mono { font-family: monospace; font-size: 12px; }
         .tp-target { background: #00D1B220; color: #00D1B2; padding: 2px 8px; border-radius: 4px; font-size: 10px; }
         button { background: #FF4D6D20; border: 1px solid #FF4D6D; color: #FF4D6D; padding: 8px 16px; border-radius: 6px; cursor: pointer; }
         button:hover { background: #FF4D6D40; }
@@ -679,18 +644,6 @@ app.get('/', (req, res) => {
         </div>
 
         <div class="card">
-            <h3 class="font-bold mb-4">📊 ROI SYNC HISTORY</h3>
-            <div id="longHistory" class="mb-4">
-                <p class="text-xs text-slate-500 mb-2">LONG POSITION</p>
-                <div id="longHistoryList" class="space-y-1 max-h-32 overflow-y-auto"></div>
-            </div>
-            <div id="shortHistory">
-                <p class="text-xs text-slate-500 mb-2">SHORT POSITION</p>
-                <div id="shortHistoryList" class="space-y-1 max-h-32 overflow-y-auto"></div>
-            </div>
-        </div>
-
-        <div class="card">
             <h3 class="font-bold mb-4">📋 CLOSED TRADES</h3>
             <div class="overflow-x-auto">
                 <table class="w-full border-collapse">
@@ -729,20 +682,14 @@ app.get('/', (req, res) => {
             }
         }
         
-        function getDelayColor(ms) {
-            if (ms < 1000) return '#00D1B2';
-            if (ms < 5000) return '#FFB700';
-            return '#FF4D6D';
-        }
-        
         setInterval(async () => {
             try {
                 const res = await fetch('/api/status');
                 const data = await res.json();
                 
-                document.getElementById('spread').textContent = data.market.spread?.toFixed(3) + '%';
-                document.getElementById('bidPrice').textContent = data.market.bid?.toFixed(8) || '0';
-                document.getElementById('askPrice').textContent = data.market.ask?.toFixed(8) || '0';
+                document.getElementById('spread').textContent = (data.market.spread || 0).toFixed(3) + '%';
+                document.getElementById('bidPrice').textContent = (data.market.bid || 0).toFixed(8);
+                document.getElementById('askPrice').textContent = (data.market.ask || 0).toFixed(8);
                 
                 const long = data.accounts.find(a => a.direction === 'buy');
                 const short = data.accounts.find(a => a.direction === 'sell');
@@ -753,7 +700,7 @@ app.get('/', (req, res) => {
                     roiElem.textContent = (roi >= 0 ? '+' : '') + roi.toFixed(2) + '%';
                     roiElem.className = 'text-2xl font-black ' + (roi >= 0 ? 'value-positive' : 'value-negative');
                     
-                    document.getElementById('lPnl').textContent = (long.unrealizedUsdt >= 0 ? '+' : '') + long.unrealizedUsdt?.toFixed(8) || '0';
+                    document.getElementById('lPnl').textContent = (long.unrealizedUsdt >= 0 ? '+' : '') + (long.unrealizedUsdt || 0).toFixed(8);
                     document.getElementById('lStep').textContent = 'STEP ' + (long.step || 0) + ' | VOL ' + (long.volume || 0);
                     document.getElementById('lAction').textContent = long.lastAction || 'Idle';
                     
@@ -761,14 +708,6 @@ app.get('/', (req, res) => {
                         document.getElementById('lTarget').innerHTML = '🎯 TP: ' + long.targetPrice.toFixed(8);
                     } else {
                         document.getElementById('lTarget').innerHTML = '';
-                    }
-                    
-                    if (long.roiLatencyHistory && long.roiLatencyHistory.length > 0) {
-                        let html = '';
-                        long.roiLatencyHistory.slice(0, 5).forEach(h => {
-                            html += `<div class="text-xs"><span class="text-slate-500">${new Date(h.timestamp).toLocaleTimeString()}</span> - ROI: <span class="font-bold">${h.exchangeRoi.toFixed(2)}%</span> <span style="color: ${getDelayColor(h.latencyMs)}">(delay: ${h.latencyMs}ms)</span></div>`;
-                        });
-                        document.getElementById('longHistoryList').innerHTML = html;
                     }
                 }
                 
@@ -778,7 +717,7 @@ app.get('/', (req, res) => {
                     roiElem.textContent = (roi >= 0 ? '+' : '') + roi.toFixed(2) + '%';
                     roiElem.className = 'text-2xl font-black ' + (roi >= 0 ? 'value-positive' : 'value-negative');
                     
-                    document.getElementById('sPnl').textContent = (short.unrealizedUsdt >= 0 ? '+' : '') + short.unrealizedUsdt?.toFixed(8) || '0';
+                    document.getElementById('sPnl').textContent = (short.unrealizedUsdt >= 0 ? '+' : '') + (short.unrealizedUsdt || 0).toFixed(8);
                     document.getElementById('sStep').textContent = 'STEP ' + (short.step || 0) + ' | VOL ' + (short.volume || 0);
                     document.getElementById('sAction').textContent = short.lastAction || 'Idle';
                     
@@ -787,31 +726,22 @@ app.get('/', (req, res) => {
                     } else {
                         document.getElementById('sTarget').innerHTML = '';
                     }
-                    
-                    if (short.roiLatencyHistory && short.roiLatencyHistory.length > 0) {
-                        let html = '';
-                        short.roiLatencyHistory.slice(0, 5).forEach(h => {
-                            html += `<div class="text-xs"><span class="text-slate-500">${new Date(h.timestamp).toLocaleTimeString()}</span> - ROI: <span class="font-bold">${h.exchangeRoi.toFixed(2)}%</span> <span style="color: ${getDelayColor(h.latencyMs)}">(delay: ${h.latencyMs}ms)</span></div>`;
-                        });
-                        document.getElementById('shortHistoryList').innerHTML = html;
-                    }
                 }
                 
-                // Build trades table
                 let tradesHtml = '';
                 if (data.tradeHistory && data.tradeHistory.length > 0) {
                     data.tradeHistory.slice(0, 10).forEach(t => {
                         const roiVal = parseFloat(t.roi);
-                        tradesHtml += `<tr class="border-b border-[#1A212E]">
-                            <td class="p-3"><span class="${t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400'} font-bold">${t.side}</span></td>
-                            <td class="p-3 text-xs">${t.openTime || '--'}</td>
-                            <td class="p-3 text-xs">${t.closeTime || '--'}</td>
-                            <td class="p-3 text-right">${t.volume}</td>
-                            <td class="p-3 text-right mono">${t.entryPrice}</td>
-                            <td class="p-3 text-right mono">${t.exitPrice}</td>
-                            <td class="p-3 text-right ${roiVal >= 0 ? 'value-positive' : 'value-negative'}">${roiVal >= 0 ? '+' : ''}${t.roi}</td>
-                            <td class="p-3 text-right mono">${t.netPnlUsdt} USDT</td>
-                        </tr>`;
+                        tradesHtml += '<tr class="border-b border-[#1A212E]">' +
+                            '<td class="p-3"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + ' font-bold">' + t.side + '</span></td>' +
+                            '<td class="p-3 text-xs">' + (t.openTime || '--') + '</td>' +
+                            '<td class="p-3 text-xs">' + (t.closeTime || '--') + '</td>' +
+                            '<td class="p-3 text-right">' + t.volume + '</td>' +
+                            '<td class="p-3 text-right mono">' + t.entryPrice + '</td>' +
+                            '<td class="p-3 text-right mono">' + t.exitPrice + '</td>' +
+                            '<td class="p-3 text-right ' + (roiVal >= 0 ? 'value-positive' : 'value-negative') + '">' + (roiVal >= 0 ? '+' : '') + t.roi + '</td>' +
+                            '<td class="p-3 text-right mono">' + t.netPnlUsdt + ' USDT</td>' +
+                        '</tr>';
                     });
                 } else {
                     tradesHtml = '<tr><td colspan="8" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>';
@@ -822,22 +752,22 @@ app.get('/', (req, res) => {
         }, 1000);
     </script>
 </body>
-</html>`);
+</html>
+    `);
 });
 
-// ==================== START ====================
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
 app.listen(config.port, '0.0.0.0', () => {
-    console.log(`\n✅ Martingale Pro Started (EXACT TAKE PROFIT VERSION)`);
+    console.log(`\\n✅ Martingale Pro Started (EXACT TAKE PROFIT VERSION)`);
     console.log(`📊 Symbol: ${config.symbol}`);
     console.log(`🎯 Take Profit: ${config.takeProfitPct}% (using ORDER BOOK prices)`);
     console.log(`📈 Step Distance: ${config.stepDistancePct}%`);
     console.log(`🔧 Leverage: ${config.leverage}x`);
     console.log(`💰 Fee Adjustment: ${config.takerFeeRate * 100}% included`);
     console.log(`🌐 Dashboard: http://localhost:${config.port}`);
-    console.log(`\n🔴 HOW TP WORKS NOW:`);
+    console.log(`\\n🔴 HOW TP WORKS NOW:`);
     console.log(`   LONG: Closes when ASK price >= Target (${config.takeProfitPct}% above entry + fee)`);
     console.log(`   SHORT: Closes when BID price <= Target (${config.takeProfitPct}% below entry - fee)`);
-    console.log(`   Market orders with exact target calculation\n`);
+    console.log(`   Market orders with exact target calculation\\n`);
 });
