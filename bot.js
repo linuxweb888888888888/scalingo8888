@@ -119,13 +119,11 @@ async function logFinalSettledTrade(state, orderData) {
     try {
         const exitPrice = parseFloat(orderData.trade_avg_price);
         const volume = parseFloat(orderData.trade_volume);
-        const fee = parseFloat(orderData.fee); // HTX returns fees as negative numbers
-        const profit = parseFloat(orderData.profit); // Realized PnL before fees
+        const fee = parseFloat(orderData.fee); 
+        const profit = parseFloat(orderData.profit); 
         
-        // Net PnL is the exact USDT change in the wallet
         const netPnlUsdt = profit + fee;
         
-        // Calculate Exact ROI based on actual entry and actual fill price
         const priceDiff = state.direction === 'buy' ? (exitPrice - state.entryPrice) : (state.entryPrice - exitPrice);
         const finalRoi = (priceDiff / state.entryPrice) * config.leverage * 100;
 
@@ -142,7 +140,6 @@ async function logFinalSettledTrade(state, orderData) {
         });
         
         if (tradeHistory.length > 20) tradeHistory.pop();
-        console.log(`[EXCHANGE MATCH] ${state.direction.toUpperCase()} Closed. Net PnL: ${netPnlUsdt.toFixed(8)} USDT (Fee: ${fee})`);
     } catch (e) {
         console.error("Settlement Log Error:", e);
     }
@@ -157,10 +154,9 @@ async function syncAccount(acc, state) {
             });
 
             const orderData = orderRes?.data?.[0];
-            if (orderData?.status === 6) { // 6 = Fully Executed
+            if (orderData?.status === 6) { 
                 if (orderData.offset === 'close') {
                     await logFinalSettledTrade(state, orderData);
-                    // Reset position data ONLY after logging the settlement
                     state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.entryPrice = 0;
                     state.step = 0; state.lastStepPrice = 0; state.startTime = null; state.lastAddedVolume = 0;
                 }
@@ -189,7 +185,6 @@ async function syncAccount(acc, state) {
                 if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
                 if (!state.startTime) state.startTime = new Date().toLocaleString();
             } else {
-                // Only clear if not waiting for a close order to be logged
                 if (!state.pendingOrderId) {
                     state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.entryPrice = 0;
                     state.step = 0; state.lastStepPrice = 0; state.startTime = null;
@@ -204,17 +199,14 @@ async function syncAccount(acc, state) {
             if (state.initialEquity === null) state.initialEquity = state.currentEquity;
         }
     } catch (e) {
-        console.error(`Sync error for account ${acc.accountId}:`, e.message);
+        console.error(`Sync error:`, e.message);
     }
 }
 
 // ==================== WS ENGINE ====================
 function startWS() {
     const ws = new WebSocket(config.wsHost);
-    ws.on('open', () => {
-        console.log('WebSocket connected');
-        ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' }));
-    });
+    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
     ws.on('message', (data) => {
         zlib.gunzip(data, (err, dec) => {
             if (err) return;
@@ -230,11 +222,7 @@ function startWS() {
             } catch (e) {}
         });
     });
-    ws.on('error', (err) => console.error('WebSocket error:', err.message));
-    ws.on('close', () => {
-        console.log('WebSocket disconnected, reconnecting...');
-        setTimeout(startWS, 5000);
-    });
+    ws.on('close', () => setTimeout(startWS, 5000));
 }
 
 // ==================== MARTINGALE LOGIC ====================
@@ -242,11 +230,8 @@ async function processMartingale() {
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.isLocked || market.bid === 0 || market.ask === 0) continue;
-        
         const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
-        if (currentPrice === 0) continue;
-
-        // Open initial position
+        
         if (state.volume === 0) {
             if (market.spread > config.maxStartSpread && market.spread > 0) {
                 state.lastAction = `Wait Spread (${market.spread.toFixed(2)}%)`;
@@ -257,28 +242,23 @@ async function processMartingale() {
                 contract_code: config.symbol, volume: config.baseVolume, direction: state.direction,
                 offset: 'open', lever_rate: config.leverage, order_price_type: 'optimal_20'
             });
-            if (res?.status === 'ok') { state.pendingOrderId = res.data.order_id_str; } 
+            if (res?.status === 'ok') state.pendingOrderId = res.data.order_id_str;
             else { state.isLocked = false; state.lastAction = "Open Failed"; }
             continue;
         }
 
-        // Take profit
         if (state.roi >= config.takeProfitPct) {
-            state.isLocked = true; state.lastAction = "Taking Profit...";
+            state.isLocked = true; state.lastAction = "Closing Position...";
             const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol, volume: state.volume,
                 direction: state.direction === 'buy' ? 'sell' : 'buy',
                 offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20'
             });
-            if (res?.status === 'ok') { 
-                state.pendingOrderId = res.data.order_id_str; 
-            } else { 
-                state.isLocked = false; state.lastAction = "TP Failed"; 
-            }
+            if (res?.status === 'ok') state.pendingOrderId = res.data.order_id_str;
+            else { state.isLocked = false; state.lastAction = "TP Failed"; }
             continue;
         }
 
-        // Martingale step
         let priceMove = state.direction === 'buy' ? 
             ((state.lastStepPrice - currentPrice) / state.lastStepPrice) * 100 : 
             ((currentPrice - state.lastStepPrice) / state.lastStepPrice) * 100;
@@ -305,45 +285,28 @@ async function backgroundLoop() {
         await Promise.all(config.accounts.map(acc => syncAccount(acc, accountStates[acc.accountId])));
         
         const s1 = accountStates[1], s2 = accountStates[2];
-        if (s1 && s2) {
-            if (market.initialTotalEquity === 0 && s1.initialEquity !== null && s2.initialEquity !== null) {
-                market.initialTotalEquity = s1.initialEquity + s2.initialEquity;
-            }
-            if (market.initialTotalEquity > 0) {
-                market.totalNetGain = (s1.currentEquity + s2.currentEquity) - market.initialTotalEquity;
-                market.growthPct = (market.totalNetGain / market.initialTotalEquity) * 100;
-                const elapsedDays = (Date.now() - market.startTime) / (1000 * 60 * 60 * 24);
-                market.dgr = elapsedDays > 0 ? (market.growthPct / elapsedDays) : 0;
-            }
+        if (s1 && s2 && market.initialTotalEquity === 0 && s1.initialEquity !== null && s2.initialEquity !== null) {
+            market.initialTotalEquity = s1.initialEquity + s2.initialEquity;
+        }
+        if (market.initialTotalEquity > 0 && s1 && s2) {
+            market.totalNetGain = (s1.currentEquity + s2.currentEquity) - market.initialTotalEquity;
+            market.growthPct = (market.totalNetGain / market.initialTotalEquity) * 100;
+            const elapsedDays = (Date.now() - market.startTime) / (1000 * 60 * 60 * 24);
+            market.dgr = elapsedDays > 0 ? (market.growthPct / elapsedDays) : 0;
         }
         if (market.status === 'Active') await processMartingale();
-    } catch (e) { console.error('Loop error:', e); }
+    } catch (e) {}
 }
 
-// ==================== ENDPOINTS & UI ====================
+// ==================== UI DASHBOARD ====================
 app.get('/api/status', (req, res) => res.json({ market, accounts: Object.values(accountStates), tradeHistory }));
-app.post('/api/close', async (req, res) => {
-    market.status = "LIQUIDATING";
-    for (const acc of config.accounts) {
-        const s = accountStates[acc.accountId];
-        if (s.volume > 0) {
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: s.volume, direction: s.direction === 'buy' ? 'sell' : 'buy',
-                offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20'
-            });
-        }
-    }
-    setTimeout(() => market.status = "Active", 5000);
-    res.json({ status: 'ok' });
-});
-
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Martingale Pro - Official Exchange Sync</title>
+    <title>Martingale Pro</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap" rel="stylesheet">
     <style>
@@ -353,12 +316,12 @@ app.get('/', (req, res) => {
         .stat-label { font-size: 11px; font-weight: 700; color: #6B7A8F; text-transform: uppercase; }
         .value-positive { color: #00D1B2; }
         .value-negative { color: #FF4D6D; }
-        .badge-long { background: rgba(0, 209, 178, 0.12); color: #00D1B2; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
-        .badge-short { background: rgba(255, 77, 109, 0.12); color: #FF4D6D; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
         .exchange-table { width: 100%; border-collapse: collapse; }
         .exchange-table th { text-align: left; padding: 14px 12px; background: #0F141C; color: #6B7A8F; font-size: 11px; border-bottom: 1px solid #1F2A3E; }
         .exchange-table td { padding: 12px; border-bottom: 1px solid #1A212E; font-size: 13px; }
         .mono { font-family: 'SF Mono', monospace; font-size: 12px; }
+        .badge-long { background: rgba(0, 209, 178, 0.12); color: #00D1B2; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
+        .badge-short { background: rgba(255, 77, 109, 0.12); color: #FF4D6D; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
     </style>
 </head>
 <body class="p-6">
@@ -369,48 +332,60 @@ app.get('/', (req, res) => {
                 <p class="text-[10px] text-slate-500 mt-1">${config.symbol} | ${config.leverage}x LEVERAGE</p>
             </div>
             <div class="text-right">
-                <p class="stat-label mb-1">TOTAL NET GAIN (REALIZED)</p>
+                <p class="stat-label">TOTAL NET GAIN</p>
                 <p id="totalNetGain" class="text-3xl font-black mono">$0.00000000</p>
-                <p id="growthPct" class="text-[10px] font-bold text-emerald-400 mt-1">+0.00%</p>
             </div>
         </div>
 
-        <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
-            <div class="exchange-card p-5">
-                <p class="stat-label mb-2">MARKET SPREAD</p>
-                <p id="uiSpread" class="text-2xl font-black">0.000%</p>
-                <p class="text-[10px] text-slate-500 mt-1">BID: <span id="bidPrice" class="mono">0.00</span></p>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
+            <!-- LONG ACCOUNT -->
+            <div class="exchange-card p-6">
+                <div class="flex justify-between items-start mb-4">
+                    <div>
+                        <p class="stat-label">LONG POSITION</p>
+                        <p id="lRoi" class="text-3xl font-black">0.00%</p>
+                    </div>
+                    <div class="text-right">
+                        <p class="stat-label">AVAILABLE BAL</p>
+                        <p id="lBal" class="mono font-bold">0.00 USDT</p>
+                    </div>
+                </div>
+                <div class="grid grid-cols-3 gap-4 border-t border-[#1F2A3E] pt-4">
+                    <div><p class="stat-label">STEP</p><p id="lStep" class="font-bold">0</p></div>
+                    <div><p class="stat-label">VOL</p><p id="lVol" class="font-bold">0</p></div>
+                    <div><p class="stat-label">PNL</p><p id="lPnl" class="mono text-xs">0.0000</p></div>
+                </div>
+                <p id="lAction" class="text-[10px] text-indigo-400 mt-4 font-bold uppercase tracking-wider"></p>
             </div>
-            <div class="exchange-card p-5">
-                <p class="stat-label mb-2">LONG ROI</p>
-                <p id="lRoi" class="text-2xl font-black">0.00%</p>
-                <p id="lPnl" class="text-sm mono mt-1">0.0000</p>
-            </div>
-            <div class="exchange-card p-5">
-                <p class="stat-label mb-2">SHORT ROI</p>
-                <p id="sRoi" class="text-2xl font-black">0.00%</p>
-                <p id="sPnl" class="text-sm mono mt-1">0.0000</p>
-            </div>
-            <div class="exchange-card p-5">
-                <p class="stat-label mb-2">STATUS</p>
-                <p id="botStatus" class="text-2xl font-black text-emerald-400">ACTIVE</p>
-                <p id="lastUpdateTime" class="text-[10px] text-slate-500 mt-1">Syncing...</p>
+
+            <!-- SHORT ACCOUNT -->
+            <div class="exchange-card p-6">
+                <div class="flex justify-between items-start mb-4">
+                    <div>
+                        <p class="stat-label">SHORT POSITION</p>
+                        <p id="sRoi" class="text-3xl font-black">0.00%</p>
+                    </div>
+                    <div class="text-right">
+                        <p class="stat-label">AVAILABLE BAL</p>
+                        <p id="sBal" class="mono font-bold">0.00 USDT</p>
+                    </div>
+                </div>
+                <div class="grid grid-cols-3 gap-4 border-t border-[#1F2A3E] pt-4">
+                    <div><p class="stat-label">STEP</p><p id="sStep" class="font-bold">0</p></div>
+                    <div><p class="stat-label">VOL</p><p id="sVol" class="font-bold">0</p></div>
+                    <div><p class="stat-label">PNL</p><p id="sPnl" class="mono text-xs">0.0000</p></div>
+                </div>
+                <p id="sAction" class="text-[10px] text-indigo-400 mt-4 font-bold uppercase tracking-wider"></p>
             </div>
         </div>
 
         <div class="exchange-card overflow-hidden">
-            <div class="px-6 py-4 border-b border-[#1F2A3E] bg-[#0F141C]">
-                <p class="font-bold text-sm">📋 EXCHANGE STYLE HISTORY</p>
-                <p class="text-[9px] text-slate-500 uppercase tracking-widest">Data Pulled From HTX Final Settlement</p>
-            </div>
-            <div class="overflow-x-auto">
-                <table class="exchange-table">
-                    <thead>
-                        <tr><th>CONTRACT</th><th>SIDE</th><th>OPEN TIME</th><th>CLOSE TIME</th><th>VOL</th><th>ENTRY</th><th>EXIT</th><th>ROI</th><th>NET PNL</th></tr>
-                    </thead>
-                    <tbody id="historyBody"></tbody>
-                </table>
-            </div>
+            <table class="exchange-table">
+                <thead>
+                    <tr><th>SIDE</th><th>OPEN TIME</th><th>CLOSE TIME</th><th>VOL</th><th>ENTRY</th><th>EXIT</th><th>ROI</th><th>NET PNL</th></tr>
+                </thead>
+                <tbody id="historyBody"></tbody>
+            </table>
         </div>
     </div>
 
@@ -419,27 +394,32 @@ app.get('/', (req, res) => {
             try {
                 const r = await fetch('/api/status'); 
                 const d = await r.json();
-                document.getElementById('totalNetGain').innerText = (d.market.totalNetGain >= 0 ? '+' : '') + d.market.totalNetGain.toFixed(8);
-                document.getElementById('growthPct').innerText = (d.market.growthPct >= 0 ? '+' : '') + d.market.growthPct.toFixed(2) + '%';
-                document.getElementById('uiSpread').innerText = d.market.spread.toFixed(3) + '%';
-                document.getElementById('bidPrice').innerText = d.market.bid.toFixed(8);
-                document.getElementById('lastUpdateTime').innerText = 'Last Sync: ' + new Date().toLocaleTimeString();
+                document.getElementById('totalNetGain').innerText = d.market.totalNetGain.toFixed(8) + ' USDT';
                 
                 if (d.accounts.length >= 2) {
                     const l = d.accounts[0], s = d.accounts[1];
+                    // Update Long
                     document.getElementById('lRoi').innerText = l.roi.toFixed(2) + '%';
-                    document.getElementById('lRoi').className = 'text-2xl font-black ' + (l.roi >= 0 ? 'value-positive' : 'value-negative');
-                    document.getElementById('lPnl').innerText = l.unrealizedUsdt.toFixed(8) + ' USDT';
-                    
+                    document.getElementById('lRoi').className = 'text-3xl font-black ' + (l.roi >= 0 ? 'value-positive' : 'value-negative');
+                    document.getElementById('lBal').innerText = l.availableMargin.toFixed(2) + ' USDT';
+                    document.getElementById('lStep').innerText = l.step;
+                    document.getElementById('lVol').innerText = l.volume;
+                    document.getElementById('lPnl').innerText = l.unrealizedUsdt.toFixed(6);
+                    document.getElementById('lAction').innerText = l.lastAction;
+
+                    // Update Short
                     document.getElementById('sRoi').innerText = s.roi.toFixed(2) + '%';
-                    document.getElementById('sRoi').className = 'text-2xl font-black ' + (s.roi >= 0 ? 'value-positive' : 'value-negative');
-                    document.getElementById('sPnl').innerText = s.unrealizedUsdt.toFixed(8) + ' USDT';
+                    document.getElementById('sRoi').className = 'text-3xl font-black ' + (s.roi >= 0 ? 'value-positive' : 'value-negative');
+                    document.getElementById('sBal').innerText = s.availableMargin.toFixed(2) + ' USDT';
+                    document.getElementById('sStep').innerText = s.step;
+                    document.getElementById('sVol').innerText = s.volume;
+                    document.getElementById('sPnl').innerText = s.unrealizedUsdt.toFixed(6);
+                    document.getElementById('sAction').innerText = s.lastAction;
                 }
                 
                 let html = '';
                 d.tradeHistory.forEach(h => {
-                    html += '<tr class="hover:bg-[#1A212E] animate-in fade-in">';
-                    html += '<td class="font-bold">' + h.symbol + '</td>';
+                    html += '<tr>';
                     html += '<td><span class="' + (h.side === 'LONG' ? 'badge-long' : 'badge-short') + '">' + h.side + '</span></td>';
                     html += '<td class="mono text-[11px]">' + h.openTime + '</td>';
                     html += '<td class="mono text-[11px]">' + h.closeTime + '</td>';
@@ -447,10 +427,10 @@ app.get('/', (req, res) => {
                     html += '<td class="mono">' + h.entryPrice + '</td>';
                     html += '<td class="mono">' + h.exitPrice + '</td>';
                     html += '<td class="font-bold ' + (parseFloat(h.roi) >= 0 ? 'value-positive' : 'value-negative') + '">' + h.roi + '</td>';
-                    html += '<td class="mono font-bold ' + (parseFloat(h.netPnlUsdt) >= 0 ? 'value-positive' : 'value-negative') + '">' + (parseFloat(h.netPnlUsdt) >= 0 ? '+' : '') + h.netPnlUsdt + ' USDT</td>';
+                    html += '<td class="mono font-bold">' + h.netPnlUsdt + '</td>';
                     html += '</tr>';
                 });
-                document.getElementById('historyBody').innerHTML = html || '<tr><td colspan="9" class="text-center py-10 text-slate-500">Waiting for first settlement...</td></tr>';
+                document.getElementById('historyBody').innerHTML = html || '<tr><td colspan="8" class="text-center py-10">No history yet</td></tr>';
             } catch(e) {}
         }, 1000);
     </script>
@@ -460,4 +440,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log(`✅ Martingale Pro - Exchange Sync Mode Active on Port ${config.port}`));
+app.listen(config.port, '0.0.0.0', () => console.log(`✅ Started on Port ${config.port}`));
