@@ -32,7 +32,7 @@ const config = {
     multiplier: 1.2,
     stepDistancePct: 0.2,
     takeProfitPct: 15,
-    maxStartSpread: parseFloat(process.env.MAX_START_SPREAD) || 0.2,
+    maxStartSpread: parseFloat(process.env.MAX_START_SPREAD) || 0.1,
     takerFeeRate: 0.0005,
     pollInterval: 500,
     contractMultiplier: 0.001
@@ -50,6 +50,62 @@ let accountStates = {};
 let lastPositionFetch = {};
 let lastBalanceFetch = {};
 
+// Function to calculate step number from volume
+function calculateStepFromVolume(volume, baseVolume, multiplier) {
+    if (volume === 0) return 0;
+    
+    let totalVolume = 0;
+    let step = 0;
+    
+    while (totalVolume < volume) {
+        const stepVolume = step === 0 ? baseVolume : Math.ceil(baseVolume * Math.pow(multiplier, step));
+        totalVolume += stepVolume;
+        if (totalVolume <= volume) {
+            step++;
+        } else {
+            break;
+        }
+    }
+    
+    return step;
+}
+
+// Function to calculate expected volume for a given step
+function calculateVolumeForStep(step, baseVolume, multiplier) {
+    let totalVolume = 0;
+    for (let i = 0; i <= step; i++) {
+        const stepVolume = i === 0 ? baseVolume : Math.ceil(baseVolume * Math.pow(multiplier, i));
+        totalVolume += stepVolume;
+    }
+    return totalVolume;
+}
+
+// FIXED: Calculate target price based on leverage
+// At 75x leverage, 15% ROI = 0.2% price movement
+function calculateTargetPrice(state) {
+    // Required price movement percentage for target ROI
+    // Example: 15% ROI at 75x leverage = 0.2% price movement
+    const requiredPriceMovePct = config.takeProfitPct / config.leverage;
+    
+    if (state.direction === 'buy') {
+        // LONG: Need price to go UP by requiredPriceMovePct
+        const targetPrice = state.entryPrice * (1 + (requiredPriceMovePct / 100));
+        // Add fee (you pay taker fee when selling to close)
+        const feeAdjustedTarget = targetPrice * (1 + config.takerFeeRate);
+        
+        console.log(`[LONG TP Calc] Entry: ${state.entryPrice.toFixed(8)}, Required Move: ${requiredPriceMovePct}%, Target Price: ${targetPrice.toFixed(8)}, +Fee: ${feeAdjustedTarget.toFixed(8)}`);
+        return feeAdjustedTarget;
+    } else {
+        // SHORT: Need price to go DOWN by requiredPriceMovePct
+        const targetPrice = state.entryPrice * (1 - (requiredPriceMovePct / 100));
+        // Subtract fee (you pay taker fee when buying to close)
+        const feeAdjustedTarget = targetPrice * (1 - config.takerFeeRate);
+        
+        console.log(`[SHORT TP Calc] Entry: ${state.entryPrice.toFixed(8)}, Required Move: ${requiredPriceMovePct}%, Target Price: ${targetPrice.toFixed(8)}, -Fee: ${feeAdjustedTarget.toFixed(8)}`);
+        return feeAdjustedTarget;
+    }
+}
+
 config.accounts.forEach((account, idx) => {
     accountStates[account.accountId] = {
         direction: idx === 0 ? 'buy' : 'sell',
@@ -58,7 +114,7 @@ config.accounts.forEach((account, idx) => {
         isLocked: false,
         pendingOrderId: null,
         lastAction: 'Idle',
-        step: 0, lastStepPrice: 0, lastAddedVolume: 0, startTime: null,
+        lastStepPrice: 0, lastAddedVolume: 0, startTime: null,
         lastExchangeRoi: 0,
         roiLatencyMs: 0,
         roiLatencyHistory: [],
@@ -127,18 +183,6 @@ async function fetchPriceRest() {
     }
 }
 
-function calculateTargetPrice(state) {
-    if (state.direction === 'buy') {
-        const targetPrice = state.entryPrice * (1 + (config.takeProfitPct / 100));
-        const feeAdjustedTarget = targetPrice * (1 + config.takerFeeRate);
-        return feeAdjustedTarget;
-    } else {
-        const targetPrice = state.entryPrice * (1 - (config.takeProfitPct / 100));
-        const feeAdjustedTarget = targetPrice * (1 - config.takerFeeRate);
-        return feeAdjustedTarget;
-    }
-}
-
 async function syncAccount(acc, state) {
     const now = Date.now();
     
@@ -184,6 +228,9 @@ async function syncAccount(acc, state) {
             state.entryPrice = newEntryPrice;
             state.unrealizedUsdt = newUnrealizedUsdt;
             
+            // Calculate step based on volume
+            const calculatedStep = calculateStepFromVolume(newVolume, config.baseVolume, config.multiplier);
+            
             if (Math.abs(newExchangeRoi - state.roi) > 0.01) {
                 const timeSinceLastUpdate = now - state.lastRoiUpdateTime;
                 
@@ -193,18 +240,21 @@ async function syncAccount(acc, state) {
                     exchangeRoi: newExchangeRoi,
                     botRoi: state.roi,
                     latencyMs: timeSinceLastUpdate,
-                    difference: Math.abs(newExchangeRoi - state.roi).toFixed(2)
+                    difference: Math.abs(newExchangeRoi - state.roi).toFixed(2),
+                    volume: newVolume,
+                    step: calculatedStep
                 });
                 
                 if (state.roiLatencyHistory.length > 10) state.roiLatencyHistory.pop();
                 
-                console.log(`[${state.direction.toUpperCase()}] Exchange ROI: ${newExchangeRoi.toFixed(2)}% (delay: ${timeSinceLastUpdate}ms)`);
+                console.log(`[${state.direction.toUpperCase()}] ROI: ${newExchangeRoi.toFixed(2)}% | Vol: ${newVolume} | Step: ${calculatedStep} (delay: ${timeSinceLastUpdate}ms)`);
                 
                 state.roi = newExchangeRoi;
                 state.lastExchangeRoi = newExchangeRoi;
                 state.lastRoiUpdateTime = now;
             }
             
+            // Update target price whenever entry price changes
             state.targetPrice = calculateTargetPrice(state);
             
             if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
@@ -216,7 +266,6 @@ async function syncAccount(acc, state) {
                 state.roi = 0;
                 state.unrealizedUsdt = 0;
                 state.entryPrice = 0;
-                state.step = 0;
                 state.lastStepPrice = 0;
                 state.startTime = null;
                 state.lastAddedVolume = 0;
@@ -243,12 +292,15 @@ async function syncAccount(acc, state) {
 }
 
 function logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl) {
+    const step = calculateStepFromVolume(state.volume, config.baseVolume, config.multiplier);
+    
     tradeHistory.unshift({
         symbol: config.symbol.replace('-', '') + 'Perpetual',
         side: state.direction === 'buy' ? 'LONG' : 'SHORT',
         openTime: state.startTime,
         closeTime: exitTime,
         volume: state.volume,
+        step: step,
         entryPrice: state.entryPrice.toFixed(8),
         exitPrice: exitPrice.toFixed(8),
         roi: finalRoi.toFixed(2) + '%',
@@ -335,7 +387,7 @@ async function processMartingale() {
                     if (orderInfo?.data?.[0]?.status === 6) {
                         state.entryPrice = parseFloat(orderInfo.data[0].price_avg);
                         state.targetPrice = calculateTargetPrice(state);
-                        console.log(`✅ Position opened at ${state.entryPrice.toFixed(8)}, TP target: ${state.targetPrice.toFixed(8)}`);
+                        console.log(`✅ Position opened at ${state.entryPrice.toFixed(8)}, TP target: ${state.targetPrice.toFixed(8)} (${config.takeProfitPct}% ROI = ${config.takeProfitPct/config.leverage}% price move)`);
                         state.isLocked = false;
                     }
                 }, 2000);
@@ -347,6 +399,7 @@ async function processMartingale() {
             continue;
         }
 
+        // TAKE PROFIT CHECK using order book prices
         let shouldTakeProfit = false;
         let exitPrice = 0;
         
@@ -368,8 +421,9 @@ async function processMartingale() {
             const finalRoi = config.takeProfitPct;
             const finalPnl = state.unrealizedUsdt;
             const exitTime = new Date().toLocaleString();
+            const currentStep = calculateStepFromVolume(state.volume, config.baseVolume, config.multiplier);
             
-            console.log(`✅ Taking ${state.direction} profit at ${exitPrice.toFixed(8)}`);
+            console.log(`✅ Taking ${state.direction} profit at ${exitPrice.toFixed(8)} (Target ROI: ${finalRoi}% = ${finalRoi/config.leverage}% price move, Step ${currentStep}, Vol: ${state.volume})`);
             state.isLocked = true;
             state.lastAction = "Taking Profit...";
             
@@ -390,11 +444,10 @@ async function processMartingale() {
                 state.volume = 0;
                 state.roi = 0;
                 state.unrealizedUsdt = 0;
-                state.step = 0;
+                state.entryPrice = 0;
                 state.lastStepPrice = 0;
                 state.startTime = null;
                 state.lastAddedVolume = 0;
-                state.entryPrice = 0;
                 state.targetPrice = 0;
             } else {
                 state.isLocked = false;
@@ -404,6 +457,7 @@ async function processMartingale() {
             continue;
         }
 
+        // Calculate price move since last step
         let priceMove = 0;
         if (state.direction === 'buy') {
             priceMove = ((state.lastStepPrice - currentPrice) / state.lastStepPrice) * 100;
@@ -411,10 +465,22 @@ async function processMartingale() {
             priceMove = ((currentPrice - state.lastStepPrice) / state.lastStepPrice) * 100;
         }
         
+        // Calculate current step from volume
+        const currentStep = calculateStepFromVolume(state.volume, config.baseVolume, config.multiplier);
+        
+        // Check if we need to add more (price moved against us by stepDistancePct)
         if (priceMove >= config.stepDistancePct && state.lastStepPrice > 0) {
-            console.log(`📈 Martingale step ${state.step + 1} for ${state.direction} - Move: ${priceMove.toFixed(2)}%`);
+            const nextStepNumber = currentStep + 1;
+            let nextVol;
+            
+            if (nextStepNumber === 1) {
+                nextVol = Math.ceil(config.baseVolume * config.multiplier);
+            } else {
+                nextVol = Math.ceil(config.baseVolume * Math.pow(config.multiplier, nextStepNumber));
+            }
+            
+            console.log(`📈 Martingale step ${nextStepNumber} for ${state.direction} - Move: ${priceMove.toFixed(2)}% | Current Vol: ${state.volume} | Adding: ${nextVol}`);
             state.isLocked = true;
-            const nextVol = Math.max(1, Math.ceil((state.lastAddedVolume || config.baseVolume) * config.multiplier));
             
             const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol,
@@ -427,14 +493,17 @@ async function processMartingale() {
             
             if (res?.status === 'ok' && res.data?.order_id_str) {
                 state.pendingOrderId = res.data.order_id_str;
-                state.step++;
                 state.lastStepPrice = currentPrice;
                 state.lastAddedVolume = nextVol;
-                state.lastAction = `Martingale Step ${state.step}`;
+                state.lastAction = `Martingale Step ${nextStepNumber} (Vol: ${state.volume + nextVol})`;
             } else {
                 state.isLocked = false;
                 state.lastAction = "Step Failed";
             }
+        } else {
+            const step = calculateStepFromVolume(state.volume, config.baseVolume, config.multiplier);
+            const requiredMove = (config.takeProfitPct / config.leverage).toFixed(3);
+            state.lastAction = `Active - Step ${step} | Vol: ${state.volume} | ROI: ${state.roi.toFixed(2)}% | Need ${requiredMove}% price move for ${config.takeProfitPct}% ROI`;
         }
     }
 }
@@ -475,32 +544,39 @@ async function backgroundLoop() {
 }
 
 app.get('/api/status', (req, res) => {
-    const latencySummary = {};
-    Object.keys(accountStates).forEach(accId => {
-        const state = accountStates[accId];
-        const avgLatency = state.roiLatencyHistory.length > 0 
-            ? state.roiLatencyHistory.reduce((sum, record) => sum + record.latencyMs, 0) / state.roiLatencyHistory.length 
-            : 0;
+    const accountsWithInfo = Object.values(accountStates).map(state => {
+        const step = calculateStepFromVolume(state.volume, config.baseVolume, config.multiplier);
+        const expectedVol = calculateVolumeForStep(step, config.baseVolume, config.multiplier);
+        const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
         
-        latencySummary[`account_${accId}_${state.direction}`] = {
-            currentLatencyMs: state.roiLatencyMs,
-            avgLatencyMs: Math.round(avgLatency),
-            lastUpdateTime: new Date(state.lastRoiUpdateTime).toLocaleTimeString(),
-            history: state.roiLatencyHistory.slice(0, 5),
+        return {
+            direction: state.direction,
+            roi: state.roi,
+            volume: state.volume,
+            step: step,
+            expectedVolumeForStep: expectedVol,
+            unrealizedUsdt: state.unrealizedUsdt,
+            entryPrice: state.entryPrice,
+            lastAction: state.lastAction,
+            startTime: state.startTime,
             targetPrice: state.targetPrice,
-            entryPrice: state.entryPrice
+            requiredPriceMoveForTP: `${requiredPriceMovePct}%`,
+            roiLatencyHistory: state.roiLatencyHistory.slice(0, 5)
         };
     });
     
     res.json({
         market,
-        accounts: Object.values(accountStates),
+        accounts: accountsWithInfo,
         tradeHistory,
-        latency: latencySummary,
         config: {
             maxStartSpread: config.maxStartSpread,
             takeProfitPct: config.takeProfitPct,
-            pollInterval: config.pollInterval
+            leverage: config.leverage,
+            requiredPriceMovePct: (config.takeProfitPct / config.leverage).toFixed(3) + '%',
+            pollInterval: config.pollInterval,
+            baseVolume: config.baseVolume,
+            multiplier: config.multiplier
         }
     });
 });
@@ -512,7 +588,8 @@ app.post('/api/close', async (req, res) => {
     for (const acc of config.accounts) {
         const s = accountStates[acc.accountId];
         if (s.volume > 0) {
-            console.log(`Closing ${s.direction} position...`);
+            const step = calculateStepFromVolume(s.volume, config.baseVolume, config.multiplier);
+            console.log(`Closing ${s.direction} position (Step ${step}, Vol: ${s.volume})...`);
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol,
                 volume: s.volume,
@@ -538,6 +615,8 @@ app.post('/api/force-sync', async (req, res) => {
 });
 
 app.get('/api/verify', async (req, res) => {
+    const requiredPriceMovePct = config.takeProfitPct / config.leverage;
+    
     const verification = [];
     
     for (const acc of config.accounts) {
@@ -558,7 +637,9 @@ app.get('/api/verify', async (req, res) => {
                     target_price: state.targetPrice,
                     entry_price: state.entryPrice,
                     current_ask: market.ask,
-                    current_bid: market.bid
+                    current_bid: market.bid,
+                    required_price_move_for_tp: requiredPriceMovePct.toFixed(3) + '%',
+                    leverage: config.leverage
                 });
             }
         }
@@ -566,19 +647,21 @@ app.get('/api/verify', async (req, res) => {
     
     res.json({
         verified: verification,
-        message: "Take profit uses ORDER BOOK prices with fee adjustment",
-        take_profit_logic: "LONG: market.ask >= targetPrice | SHORT: market.bid <= targetPrice"
+        message: `At ${config.leverage}x leverage, ${config.takeProfitPct}% ROI = ${requiredPriceMovePct.toFixed(3)}% price movement`,
+        take_profit_logic: `LONG: market.ask >= targetPrice (entry × ${(1 + requiredPriceMovePct/100).toFixed(6)}) | SHORT: market.bid <= targetPrice (entry × ${(1 - requiredPriceMovePct/100).toFixed(6)})`
     });
 });
 
 app.get('/', (req, res) => {
+    const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
+    
     res.send(`
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Martingale Pro - Exact Take Profit</title>
+    <title>Martingale Pro - Fixed TP Calculation</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         * { font-family: system-ui, -apple-system, sans-serif; }
@@ -592,19 +675,21 @@ app.get('/', (req, res) => {
         button { background: #FF4D6D20; border: 1px solid #FF4D6D; color: #FF4D6D; padding: 8px 16px; border-radius: 6px; cursor: pointer; }
         button:hover { background: #FF4D6D40; }
         .sync-btn { background: #00D1B220; border-color: #00D1B2; color: #00D1B2; margin-left: 10px; }
+        .step-badge { background: #6366F120; color: #6366F1; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }
+        .info-box { background: #1A212E; padding: 10px; border-radius: 8px; margin-top: 10px; }
     </style>
 </head>
 <body class="p-6">
     <div class="max-w-7xl mx-auto">
         <div class="flex justify-between items-center mb-8">
             <div>
-                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">EXACT TP</span></h1>
+                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">FIXED TP</span></h1>
                 <div class="flex items-center gap-3 mt-2">
                     <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
                     <span class="text-[10px] font-bold text-emerald-400">LIVE</span>
                     <span class="text-[10px] text-slate-500">${config.symbol}</span>
                     <span class="text-[10px] text-slate-500">${config.leverage}x LEVERAGE</span>
-                    <span class="tp-target">🎯 TP: ${config.takeProfitPct}% (Order Book)</span>
+                    <span class="tp-target">🎯 TP: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price move</span>
                 </div>
             </div>
             <div>
@@ -613,31 +698,38 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
+        <div class="info-box mb-4">
+            <p class="text-xs text-green-400">✅ FIXED: Target price now correctly calculated for leverage</p>
+            <p class="text-xs text-slate-400">At ${config.leverage}x leverage, ${config.takeProfitPct}% ROI requires only ${requiredPriceMovePct}% price movement</p>
+            <p class="text-xs text-slate-400">Example: Entry $100 → Target $${(100 * (1 + requiredPriceMovePct/100)).toFixed(2)} (${requiredPriceMovePct}% move)</p>
+        </div>
+
         <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
             <div class="card">
-                <p class="stat-label mb-2">TARGET TP</p>
-                <p class="text-2xl font-black">${config.takeProfitPct}%</p>
-                <p class="text-[10px] text-slate-500 mt-1">STEP: ${config.stepDistancePct}%</p>
+                <p class="stat-label mb-2">CONFIG</p>
+                <p class="text-sm">Base Vol: ${config.baseVolume}</p>
+                <p class="text-sm">Multiplier: ${config.multiplier}x</p>
+                <p class="text-sm">Step Dist: ${config.stepDistancePct}%</p>
             </div>
             <div class="card">
-                <p class="stat-label mb-2">MARKET SPREAD</p>
+                <p class="stat-label mb-2">MARKET</p>
                 <p id="spread" class="text-2xl font-black">0.000%</p>
                 <p class="text-[10px] text-slate-500 mt-1">Max Start: ${config.maxStartSpread}%</p>
                 <p class="text-[10px] text-slate-500">BID: <span id="bidPrice">0.00000000</span> | ASK: <span id="askPrice">0.00000000</span></p>
             </div>
             <div class="card">
-                <p class="stat-label mb-2">LONG ACCOUNT</p>
+                <p class="stat-label mb-2">LONG</p>
                 <p id="lRoi" class="text-2xl font-black">0.00%</p>
                 <p id="lPnl" class="text-sm mono mt-1">$0.00000000</p>
-                <p id="lStep" class="text-[10px] text-slate-500 mt-2">STEP 0 | VOL 0</p>
+                <p id="lStep" class="text-[10px] text-slate-500 mt-2"></p>
                 <p id="lAction" class="text-[9px] text-indigo-400 mt-1"></p>
                 <p id="lTarget" class="text-[9px] text-green-400 mt-1"></p>
             </div>
             <div class="card">
-                <p class="stat-label mb-2">SHORT ACCOUNT</p>
+                <p class="stat-label mb-2">SHORT</p>
                 <p id="sRoi" class="text-2xl font-black">0.00%</p>
                 <p id="sPnl" class="text-sm mono mt-1">$0.00000000</p>
-                <p id="sStep" class="text-[10px] text-slate-500 mt-2">STEP 0 | VOL 0</p>
+                <p id="sStep" class="text-[10px] text-slate-500 mt-2"></p>
                 <p id="sAction" class="text-[9px] text-indigo-400 mt-1"></p>
                 <p id="sTarget" class="text-[9px] text-green-400 mt-1"></p>
             </div>
@@ -652,6 +744,7 @@ app.get('/', (req, res) => {
                             <th class="text-left p-3 text-xs text-slate-500">SIDE</th>
                             <th class="text-left p-3 text-xs text-slate-500">OPEN</th>
                             <th class="text-left p-3 text-xs text-slate-500">CLOSE</th>
+                            <th class="text-right p-3 text-xs text-slate-500">STEP</th>
                             <th class="text-right p-3 text-xs text-slate-500">VOL</th>
                             <th class="text-right p-3 text-xs text-slate-500">ENTRY</th>
                             <th class="text-right p-3 text-xs text-slate-500">EXIT</th>
@@ -660,7 +753,7 @@ app.get('/', (req, res) => {
                         </tr>
                     </thead>
                     <tbody id="tradesBody">
-                        <tr><td colspan="8" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>
+                        <tr><td colspan="9" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -701,11 +794,11 @@ app.get('/', (req, res) => {
                     roiElem.className = 'text-2xl font-black ' + (roi >= 0 ? 'value-positive' : 'value-negative');
                     
                     document.getElementById('lPnl').textContent = (long.unrealizedUsdt >= 0 ? '+' : '') + (long.unrealizedUsdt || 0).toFixed(8);
-                    document.getElementById('lStep').textContent = 'STEP ' + (long.step || 0) + ' | VOL ' + (long.volume || 0);
+                    document.getElementById('lStep').innerHTML = '<span class="step-badge">STEP ' + (long.step || 0) + '</span> | VOL ' + (long.volume || 0);
                     document.getElementById('lAction').textContent = long.lastAction || 'Idle';
                     
                     if (long.targetPrice > 0) {
-                        document.getElementById('lTarget').innerHTML = '🎯 TP: ' + long.targetPrice.toFixed(8);
+                        document.getElementById('lTarget').innerHTML = '🎯 TP: ' + long.targetPrice.toFixed(8) + ' (need ' + long.requiredPriceMoveForTP + ' move)';
                     } else {
                         document.getElementById('lTarget').innerHTML = '';
                     }
@@ -718,11 +811,11 @@ app.get('/', (req, res) => {
                     roiElem.className = 'text-2xl font-black ' + (roi >= 0 ? 'value-positive' : 'value-negative');
                     
                     document.getElementById('sPnl').textContent = (short.unrealizedUsdt >= 0 ? '+' : '') + (short.unrealizedUsdt || 0).toFixed(8);
-                    document.getElementById('sStep').textContent = 'STEP ' + (short.step || 0) + ' | VOL ' + (short.volume || 0);
+                    document.getElementById('sStep').innerHTML = '<span class="step-badge">STEP ' + (short.step || 0) + '</span> | VOL ' + (short.volume || 0);
                     document.getElementById('sAction').textContent = short.lastAction || 'Idle';
                     
                     if (short.targetPrice > 0) {
-                        document.getElementById('sTarget').innerHTML = '🎯 TP: ' + short.targetPrice.toFixed(8);
+                        document.getElementById('sTarget').innerHTML = '🎯 TP: ' + short.targetPrice.toFixed(8) + ' (need ' + short.requiredPriceMoveForTP + ' move)';
                     } else {
                         document.getElementById('sTarget').innerHTML = '';
                     }
@@ -736,6 +829,7 @@ app.get('/', (req, res) => {
                             '<td class="p-3"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + ' font-bold">' + t.side + '</span></td>' +
                             '<td class="p-3 text-xs">' + (t.openTime || '--') + '</td>' +
                             '<td class="p-3 text-xs">' + (t.closeTime || '--') + '</td>' +
+                            '<td class="p-3 text-right">' + (t.step || 0) + '</td>' +
                             '<td class="p-3 text-right">' + t.volume + '</td>' +
                             '<td class="p-3 text-right mono">' + t.entryPrice + '</td>' +
                             '<td class="p-3 text-right mono">' + t.exitPrice + '</td>' +
@@ -744,7 +838,7 @@ app.get('/', (req, res) => {
                         '</tr>';
                     });
                 } else {
-                    tradesHtml = '<tr><td colspan="8" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>';
+                    tradesHtml = '<tr><td colspan="9" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>';
                 }
                 document.getElementById('tradesBody').innerHTML = tradesHtml;
                 
@@ -759,15 +853,18 @@ app.get('/', (req, res) => {
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
 app.listen(config.port, '0.0.0.0', () => {
-    console.log(`\\n✅ Martingale Pro Started (EXACT TAKE PROFIT VERSION)`);
+    const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
+    
+    console.log(`\n✅ Martingale Pro Started (FIXED TP CALCULATION)`);
     console.log(`📊 Symbol: ${config.symbol}`);
-    console.log(`🎯 Take Profit: ${config.takeProfitPct}% (using ORDER BOOK prices)`);
-    console.log(`📈 Step Distance: ${config.stepDistancePct}%`);
     console.log(`🔧 Leverage: ${config.leverage}x`);
+    console.log(`🎯 Take Profit: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price movement`);
+    console.log(`📈 Step Distance: ${config.stepDistancePct}%`);
     console.log(`💰 Fee Adjustment: ${config.takerFeeRate * 100}% included`);
     console.log(`🌐 Dashboard: http://localhost:${config.port}`);
-    console.log(`\\n🔴 HOW TP WORKS NOW:`);
-    console.log(`   LONG: Closes when ASK price >= Target (${config.takeProfitPct}% above entry + fee)`);
-    console.log(`   SHORT: Closes when BID price <= Target (${config.takeProfitPct}% below entry - fee)`);
-    console.log(`   Market orders with exact target calculation\\n`);
+    console.log(`\n🔴 HOW TP WORKS NOW (CORRECTED):`);
+    console.log(`   ${config.takeProfitPct}% ROI at ${config.leverage}x leverage = ${requiredPriceMovePct}% price move`);
+    console.log(`   LONG: Target = Entry × ${(1 + requiredPriceMovePct/100).toFixed(6)} (ASK price)`);
+    console.log(`   SHORT: Target = Entry × ${(1 - requiredPriceMovePct/100).toFixed(6)} (BID price)`);
+    console.log(`   Example: Entry $100 → Target $${(100 * (1 + requiredPriceMovePct/100)).toFixed(4)}\n`);
 });
