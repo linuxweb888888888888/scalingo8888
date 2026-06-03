@@ -22,6 +22,7 @@ while (process.env[`HTX_API_KEY_${accountIndex}`]) {
 
 const config = {
     symbol: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase(),
+    symbolClean: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase().replace('-', ''),
     leverage: parseInt(process.env.LEVERAGE) || 75,
     port: process.env.PORT || 3000,
     restHost: 'api.hbdm.com',
@@ -33,9 +34,8 @@ const config = {
     takeProfitPct: 15,
     maxStartSpread: 0.1,
     takerFeeRate: 0.0005,
-    pollInterval: 200, // REDUCED FROM 1000ms TO 200ms
+    pollInterval: 500, // Increased to avoid rate limits
     contractMultiplier: 0.001,
-    // New: WebSocket reconnect delay
     wsReconnectDelay: 5000
 };
 
@@ -48,7 +48,9 @@ let market = {
 
 let tradeHistory = [];
 let accountStates = {};
-let wsInstance = null; // Track WebSocket instance
+let wsInstance = null;
+let lastWsPing = Date.now();
+let positionSyncCounter = 0;
 
 config.accounts.forEach((account, idx) => {
     accountStates[account.accountId] = {
@@ -59,14 +61,13 @@ config.accounts.forEach((account, idx) => {
         pendingOrderId: null,
         lastAction: 'Idle',
         step: 0, lastStepPrice: 0, lastAddedVolume: 0, startTime: null,
-        // Latency tracking
         lastExchangeRoi: 0,
         lastBotRoi: 0,
         roiLatencyMs: 0,
         roiLatencyHistory: [],
         lastRoiUpdateTime: Date.now(),
-        // New: Track retry attempts
-        consecutiveErrors: 0
+        consecutiveErrors: 0,
+        lastWsUpdate: 0  // Track last WebSocket update time
     };
 });
 
@@ -130,21 +131,20 @@ async function fetchPriceRest() {
     }
 }
 
-// New: Retry wrapper for syncAccount
-async function syncAccountWithRetry(acc, state, retries = 3) {
+async function syncAccountWithRetry(acc, state, retries = 2) {
     for (let i = 0; i < retries; i++) {
         try {
             await syncAccount(acc, state);
-            state.consecutiveErrors = 0; // Reset error counter on success
+            state.consecutiveErrors = 0;
             return;
         } catch (e) {
             state.consecutiveErrors++;
-            const waitTime = Math.min(Math.pow(2, i) * 1000, 10000); // Max 10 seconds
-            console.log(`⚠️ Retry ${i+1}/${retries} for account ${acc.accountId} in ${waitTime}ms: ${e.message}`);
-            await new Promise(r => setTimeout(r, waitTime));
+            const waitTime = Math.min(Math.pow(2, i) * 500, 2000);
+            if (i < retries - 1) {
+                await new Promise(r => setTimeout(r, waitTime));
+            }
         }
     }
-    console.error(`❌ All retries failed for account ${acc.accountId}`);
 }
 
 async function syncAccount(acc, state) {
@@ -178,79 +178,95 @@ async function syncAccount(acc, state) {
             const pos = positions.find(p => p.direction === state.direction);
             
             if (pos && parseFloat(pos.volume) > 0) {
-                state.volume = parseFloat(pos.volume);
-                state.entryPrice = parseFloat(pos.cost_open);
+                const newVolume = parseFloat(pos.volume);
+                const newEntryPrice = parseFloat(pos.cost_open);
+                const rawProfitRate = parseFloat(pos.profit_rate);
+                const newExchangeRoi = rawProfitRate * 100;
+                const newUnrealizedUsdt = parseFloat(pos.profit);
                 
-                // Get exchange ROI
-                let rawProfitRate = parseFloat(pos.profit_rate);
-                let newExchangeRoi = rawProfitRate * 100;
+                let updated = false;
                 
-                // Check if exchange ROI changed
-                if (newExchangeRoi !== state.lastExchangeRoi) {
+                if (newVolume !== state.volume) {
+                    state.volume = newVolume;
+                    updated = true;
+                }
+                if (newEntryPrice !== state.entryPrice) {
+                    state.entryPrice = newEntryPrice;
+                    updated = true;
+                }
+                
+                // Check if ROI changed significantly
+                if (Math.abs(newExchangeRoi - state.roi) > 0.001) {
                     const now = Date.now();
                     const timeSinceLastUpdate = now - state.lastRoiUpdateTime;
                     
-                    // Calculate latency if bot ROI is different
-                    if (Math.abs(state.lastBotRoi - newExchangeRoi) > 0.001) {
-                        state.roiLatencyMs = timeSinceLastUpdate;
-                        state.roiLatencyHistory.unshift({
-                            timestamp: now,
-                            exchangeRoi: newExchangeRoi,
-                            botRoi: state.roi,
-                            latencyMs: timeSinceLastUpdate,
-                            difference: Math.abs(newExchangeRoi - state.roi).toFixed(4)
-                        });
-                        
-                        // Keep last 10 latency records
-                        if (state.roiLatencyHistory.length > 10) state.roiLatencyHistory.pop();
-                        
-                        console.log(`[LATENCY][${state.direction.toUpperCase()}] Exchange ROI changed to ${newExchangeRoi.toFixed(4)}% | Bot ROI: ${state.roi.toFixed(4)}% | Delay: ${timeSinceLastUpdate}ms | Diff: ${Math.abs(newExchangeRoi - state.roi).toFixed(4)}%`);
-                    }
+                    // Determine if this came from WebSocket or REST
+                    const isFromWs = (now - state.lastWsUpdate) < 100; // Within 100ms of WebSocket update
+                    const source = isFromWs ? 'websocket' : 'rest';
                     
+                    state.roiLatencyMs = timeSinceLastUpdate;
+                    state.roiLatencyHistory.unshift({
+                        timestamp: now,
+                        exchangeRoi: newExchangeRoi,
+                        botRoi: state.roi,
+                        latencyMs: timeSinceLastUpdate,
+                        difference: Math.abs(newExchangeRoi - state.roi).toFixed(4),
+                        source: source
+                    });
+                    
+                    if (state.roiLatencyHistory.length > 10) state.roiLatencyHistory.pop();
+                    
+                    console.log(`[${source.toUpperCase()}][${state.direction.toUpperCase()}] ROI: ${state.roi.toFixed(2)}% → ${newExchangeRoi.toFixed(2)}% (delay: ${timeSinceLastUpdate}ms)`);
+                    
+                    state.roi = newExchangeRoi;
                     state.lastExchangeRoi = newExchangeRoi;
+                    state.lastBotRoi = newExchangeRoi;
                     state.lastRoiUpdateTime = now;
+                    updated = true;
                 }
                 
-                // Update bot ROI to match exchange
-                const oldBotRoi = state.roi;
-                state.roi = newExchangeRoi;
-                state.lastBotRoi = state.roi;
-                
-                if (Math.abs(oldBotRoi - state.roi) > 0.001) {
-                    console.log(`[SYNC][${state.direction.toUpperCase()}] Bot ROI updated from ${oldBotRoi.toFixed(4)}% to ${state.roi.toFixed(4)}%`);
+                if (newUnrealizedUsdt !== state.unrealizedUsdt) {
+                    state.unrealizedUsdt = newUnrealizedUsdt;
+                    updated = true;
                 }
                 
-                state.unrealizedUsdt = parseFloat(pos.profit);
-                
-                if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
-                if (!state.startTime) state.startTime = new Date().toLocaleString();
+                if (updated) {
+                    if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
+                    if (!state.startTime) state.startTime = new Date().toLocaleString();
+                }
             } else {
-                state.volume = 0;
-                state.roi = 0;
-                state.unrealizedUsdt = 0;
-                state.entryPrice = 0;
-                state.step = 0;
-                state.lastStepPrice = 0;
-                state.startTime = null;
-                state.lastAddedVolume = 0;
-                state.lastExchangeRoi = 0;
-                state.lastBotRoi = 0;
+                if (state.volume !== 0) {
+                    console.log(`[REST][${state.direction.toUpperCase()}] Position closed`);
+                    state.volume = 0;
+                    state.roi = 0;
+                    state.unrealizedUsdt = 0;
+                    state.entryPrice = 0;
+                    state.step = 0;
+                    state.lastStepPrice = 0;
+                    state.startTime = null;
+                    state.lastAddedVolume = 0;
+                    state.lastExchangeRoi = 0;
+                    state.lastBotRoi = 0;
+                }
             }
         }
 
-        // Get account balance
-        const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', {
-            margin_asset: 'USDT'
-        });
-
-        if (accRes?.status === 'ok' && accRes.data?.[0]) {
-            state.currentEquity = parseFloat(accRes.data[0].margin_balance);
-            state.availableMargin = parseFloat(accRes.data[0].withdraw_available);
-            if (state.initialEquity === null) state.initialEquity = state.currentEquity;
+        // Get account balance (every 5 seconds only)
+        if (Date.now() - (state.lastBalanceCheck || 0) > 5000) {
+            const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', {
+                margin_asset: 'USDT'
+            });
+            
+            if (accRes?.status === 'ok' && accRes.data?.[0]) {
+                state.currentEquity = parseFloat(accRes.data[0].margin_balance);
+                state.availableMargin = parseFloat(accRes.data[0].withdraw_available);
+                if (state.initialEquity === null) state.initialEquity = state.currentEquity;
+            }
+            state.lastBalanceCheck = Date.now();
         }
     } catch (e) {
         console.error(`Sync error for account ${acc.accountId}:`, e.message);
-        throw e; // Throw for retry logic
+        throw e;
     }
 }
 
@@ -270,7 +286,7 @@ function logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl) {
     if (tradeHistory.length > 20) tradeHistory.pop();
 }
 
-// ==================== WS ENGINE WITH POSITION UPDATES ====================
+// ==================== WS ENGINE WITH CORRECT POSITION SUBSCRIPTIONS ====================
 function startWS() {
     if (wsInstance) {
         try { wsInstance.close(); } catch(e) {}
@@ -281,23 +297,58 @@ function startWS() {
     
     ws.on('open', () => {
         console.log('✅ WebSocket connected');
-        // Subscribe to market data
-        ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' }));
+        lastWsPing = Date.now();
         
-        // NEW: Subscribe to position updates for real-time ROI
-        // This gives us instant ROI updates without polling
-        config.accounts.forEach(account => {
-            const state = accountStates[account.accountId];
-            if (state) {
-                const subMsg = {
-                    op: 'sub',
-                    topic: `positions.${account.accountId}`,
-                    cid: `pos_${account.accountId}`
+        // Subscribe to market data (public, no auth needed)
+        ws.send(JSON.stringify({ 
+            sub: `market.${config.symbol}.bbo`, 
+            id: 'bbo' 
+        }));
+        
+        // Subscribe to position updates - CORRECT FORMAT FOR HTX
+        // Need to authenticate first, then subscribe to private channels
+        setTimeout(() => {
+            config.accounts.forEach(account => {
+                // Generate auth for WebSocket
+                const timestamp = Date.now();
+                const signatureData = {
+                    AccessKeyId: account.apiKey,
+                    SignatureMethod: 'HmacSHA256',
+                    SignatureVersion: '2.1',
+                    Timestamp: timestamp
                 };
-                ws.send(JSON.stringify(subMsg));
-                console.log(`📡 Subscribed to position updates for account ${account.accountId}`);
-            }
-        });
+                
+                const sortedParams = Object.keys(signatureData).sort().map(key => `${key}=${signatureData[key]}`).join('&');
+                const payload = `GET\napi.hbdm.com\n/linear-swap-ws\n${sortedParams}`;
+                const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
+                
+                // Send auth request
+                const authMsg = {
+                    op: 'auth',
+                    type: 'api',
+                    AccessKeyId: account.apiKey,
+                    SignatureMethod: 'HmacSHA256',
+                    SignatureVersion: '2.1',
+                    Timestamp: timestamp,
+                    Signature: signature
+                };
+                
+                ws.send(JSON.stringify(authMsg));
+                console.log(`🔐 Auth request sent for account ${account.accountId}`);
+                
+                // After auth, subscribe to position updates
+                setTimeout(() => {
+                    // Subscribe to position updates for this contract
+                    const subMsg = {
+                        op: 'sub',
+                        topic: `positions.${config.symbolClean}`,
+                        cid: `pos_${account.accountId}`
+                    };
+                    ws.send(JSON.stringify(subMsg));
+                    console.log(`📡 Subscribed to positions.${config.symbolClean} for account ${account.accountId}`);
+                }, 1000);
+            });
+        }, 500);
     });
     
     ws.on('message', (data) => {
@@ -305,6 +356,13 @@ function startWS() {
             if (err) return;
             try {
                 const msg = JSON.parse(dec.toString());
+                
+                // Handle auth response
+                if (msg.op === 'auth' && msg.err_code === 0) {
+                    console.log('✅ WebSocket authentication successful');
+                } else if (msg.op === 'auth' && msg.err_code !== 0) {
+                    console.log(`⚠️ Auth failed: ${msg.err_msg} (code: ${msg.err_code})`);
+                }
                 
                 // Handle market data (price updates)
                 if (msg.tick && msg.ch && msg.ch.includes('bbo')) {
@@ -314,58 +372,97 @@ function startWS() {
                     market.lastPriceUpdate = Date.now();
                 }
                 
-                // NEW: Handle position updates (REAL-TIME ROI)
+                // Handle position updates from WebSocket
                 if (msg.op === 'notify' && msg.topic && msg.topic.includes('positions')) {
                     const positionData = msg.data;
-                    if (positionData && positionData.length > 0) {
-                        positionData.forEach(pos => {
-                            // Find matching account state
-                            for (const [accId, state] of Object.entries(accountStates)) {
-                                if (pos.direction === state.direction && parseFloat(pos.volume) > 0) {
-                                    const now = Date.now();
-                                    const newExchangeRoi = parseFloat(pos.profit_rate) * 100;
-                                    
-                                    // Immediate update - no polling delay!
-                                    if (Math.abs(newExchangeRoi - state.roi) > 0.001) {
-                                        const latency = now - state.lastRoiUpdateTime;
-                                        console.log(`[WS REAL-TIME][${state.direction.toUpperCase()}] ROI updated via WebSocket: ${state.roi.toFixed(4)}% → ${newExchangeRoi.toFixed(4)}% (latency: ${latency}ms)`);
-                                        
-                                        state.roi = newExchangeRoi;
-                                        state.unrealizedUsdt = parseFloat(pos.profit);
-                                        state.volume = parseFloat(pos.volume);
-                                        state.entryPrice = parseFloat(pos.cost_open);
-                                        state.lastExchangeRoi = newExchangeRoi;
-                                        state.lastBotRoi = newExchangeRoi;
-                                        state.lastRoiUpdateTime = now;
-                                        
-                                        // Record near-zero latency for WebSocket updates
-                                        state.roiLatencyHistory.unshift({
-                                            timestamp: now,
-                                            exchangeRoi: newExchangeRoi,
-                                            botRoi: newExchangeRoi,
-                                            latencyMs: latency,
-                                            difference: '0.0000',
-                                            source: 'websocket'
-                                        });
-                                        if (state.roiLatencyHistory.length > 10) state.roiLatencyHistory.pop();
-                                    }
-                                    break;
+                    if (positionData) {
+                        const now = Date.now();
+                        
+                        // Find matching account based on direction
+                        for (const [accId, state] of Object.entries(accountStates)) {
+                            if (positionData.direction === state.direction && parseFloat(positionData.volume) > 0) {
+                                const newExchangeRoi = parseFloat(positionData.profit_rate) * 100;
+                                const newVolume = parseFloat(positionData.volume);
+                                const newEntryPrice = parseFloat(positionData.cost_open);
+                                const newUnrealizedUsdt = parseFloat(positionData.profit);
+                                
+                                // Mark that we got a WebSocket update
+                                state.lastWsUpdate = now;
+                                
+                                // Update position data immediately
+                                let changed = false;
+                                
+                                if (newVolume !== state.volume) {
+                                    state.volume = newVolume;
+                                    changed = true;
                                 }
+                                if (newEntryPrice !== state.entryPrice) {
+                                    state.entryPrice = newEntryPrice;
+                                    changed = true;
+                                }
+                                if (Math.abs(newExchangeRoi - state.roi) > 0.001) {
+                                    const latency = now - state.lastRoiUpdateTime;
+                                    console.log(`[🔌 WS REAL-TIME][${state.direction.toUpperCase()}] ROI: ${state.roi.toFixed(2)}% → ${newExchangeRoi.toFixed(2)}% (latency: ${latency}ms)`);
+                                    
+                                    state.roi = newExchangeRoi;
+                                    state.lastExchangeRoi = newExchangeRoi;
+                                    state.lastBotRoi = newExchangeRoi;
+                                    state.lastRoiUpdateTime = now;
+                                    
+                                    // Record near-zero latency for WebSocket
+                                    state.roiLatencyHistory.unshift({
+                                        timestamp: now,
+                                        exchangeRoi: newExchangeRoi,
+                                        botRoi: newExchangeRoi,
+                                        latencyMs: latency,
+                                        difference: '0.0000',
+                                        source: 'websocket'
+                                    });
+                                    if (state.roiLatencyHistory.length > 10) state.roiLatencyHistory.pop();
+                                    changed = true;
+                                }
+                                if (newUnrealizedUsdt !== state.unrealizedUsdt) {
+                                    state.unrealizedUsdt = newUnrealizedUsdt;
+                                    changed = true;
+                                }
+                                
+                                if (changed) {
+                                    if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
+                                    if (!state.startTime) state.startTime = new Date().toLocaleString();
+                                }
+                                break;
+                            } else if (positionData.direction === state.direction && parseFloat(positionData.volume) === 0) {
+                                // Position closed
+                                if (state.volume !== 0) {
+                                    console.log(`[🔌 WS][${state.direction.toUpperCase()}] Position closed via WebSocket`);
+                                    state.volume = 0;
+                                    state.roi = 0;
+                                    state.unrealizedUsdt = 0;
+                                    state.entryPrice = 0;
+                                    state.step = 0;
+                                    state.lastStepPrice = 0;
+                                    state.startTime = null;
+                                    state.lastAddedVolume = 0;
+                                }
+                                break;
                             }
-                        });
+                        }
                     }
                 }
                 
-                // Handle ping/pong for keepalive
-                if (msg.ping) {
-                    ws.send(JSON.stringify({ pong: msg.ping }));
+                // Handle subscription responses
+                if (msg.op === 'sub') {
+                    if (msg.err_code === 0) {
+                        console.log(`✅ Subscribed to: ${msg.topic}`);
+                    } else {
+                        console.log(`⚠️ Subscription failed: ${msg.topic} - ${msg.err_msg}`);
+                    }
                 }
                 
-                // Handle subscription responses
-                if (msg.op === 'sub' && msg.err_code === 0) {
-                    console.log(`✅ Subscribed to: ${msg.topic}`);
-                } else if (msg.op === 'sub' && msg.err_code !== 0) {
-                    console.log(`⚠️ Subscription failed: ${msg.topic} - ${msg.err_msg}`);
+                // Handle ping/pong
+                if (msg.ping) {
+                    ws.send(JSON.stringify({ pong: msg.ping }));
+                    lastWsPing = Date.now();
                 }
                 
             } catch (e) {
@@ -379,7 +476,7 @@ function startWS() {
     });
     
     ws.on('close', (code, reason) => {
-        console.log(`WebSocket disconnected (${code}: ${reason}), reconnecting in ${config.wsReconnectDelay/1000}s...`);
+        console.log(`WebSocket disconnected (${code}), reconnecting in ${config.wsReconnectDelay/1000}s...`);
         setTimeout(startWS, config.wsReconnectDelay);
     });
 }
@@ -425,7 +522,7 @@ async function processMartingale() {
             continue;
         }
 
-        // Take profit - Use exchange's ROI directly
+        // Take profit
         if (state.roi >= config.takeProfitPct) {
             console.log(`✅ Take profit triggered for ${state.direction} - ROI: ${state.roi.toFixed(2)}%`);
             const v = state.volume;
@@ -448,7 +545,6 @@ async function processMartingale() {
                 state.pendingOrderId = res.data.order_id_str;
                 state.lastAction = "Take Profit Close";
                 logTradeExchangeStyle(state, currentPrice, exitTime, finalRoi, finalPnl);
-                // Reset position data after close
                 state.volume = 0;
                 state.roi = 0;
                 state.unrealizedUsdt = 0;
@@ -502,12 +598,15 @@ async function processMartingale() {
 async function backgroundLoop() {
     try {
         // Fetch price if WebSocket hasn't updated recently
-        if (Date.now() - market.lastPriceUpdate > 1000) { // Reduced from 3000ms to 1000ms
+        if (Date.now() - market.lastPriceUpdate > 2000) {
             await fetchPriceRest();
         }
         
-        // Use retry wrapper for account syncs
-        await Promise.all(config.accounts.map(acc => syncAccountWithRetry(acc, accountStates[acc.accountId])));
+        // Use retry wrapper for account syncs (but less frequent)
+        if (Date.now() - (global.lastFullSync || 0) > 500) {
+            await Promise.all(config.accounts.map(acc => syncAccountWithRetry(acc, accountStates[acc.accountId])));
+            global.lastFullSync = Date.now();
+        }
         
         const s1 = accountStates[1];
         const s2 = accountStates[2];
@@ -536,19 +635,24 @@ async function backgroundLoop() {
 
 // ==================== ENDPOINTS ====================
 app.get('/api/status', (req, res) => {
-    // Prepare latency summary for response
     const latencySummary = {};
     Object.keys(accountStates).forEach(accId => {
         const state = accountStates[accId];
         const avgLatency = state.roiLatencyHistory.length > 0 
             ? state.roiLatencyHistory.reduce((sum, record) => sum + record.latencyMs, 0) / state.roiLatencyHistory.length 
             : 0;
+        const wsUpdates = state.roiLatencyHistory.filter(h => h.source === 'websocket').length;
+        const restUpdates = state.roiLatencyHistory.filter(h => h.source === 'rest').length;
+        
         latencySummary[`account_${accId}_${state.direction}`] = {
             currentLatencyMs: state.roiLatencyMs,
             avgLatencyMs: Math.round(avgLatency),
             lastUpdateTime: new Date(state.lastRoiUpdateTime).toLocaleTimeString(),
             history: state.roiLatencyHistory.slice(0, 5),
-            consecutiveErrors: state.consecutiveErrors
+            consecutiveErrors: state.consecutiveErrors,
+            wsUpdatesCount: wsUpdates,
+            restUpdatesCount: restUpdates,
+            lastWsUpdate: state.lastWsUpdate ? new Date(state.lastWsUpdate).toLocaleTimeString() : 'never'
         };
     });
     
@@ -583,7 +687,6 @@ app.post('/api/close', async (req, res) => {
     res.json({ status: 'ok' });
 });
 
-// Debug endpoint to verify ROI
 app.get('/api/verify', async (req, res) => {
     const verification = [];
     
@@ -596,6 +699,7 @@ app.get('/api/verify', async (req, res) => {
         if (posRes?.status === 'ok' && posRes.data) {
             const pos = posRes.data.find(p => p.direction === state.direction);
             if (pos) {
+                const wsUpdates = state.roiLatencyHistory.filter(h => h.source === 'websocket').length;
                 verification.push({
                     account: acc.accountId,
                     direction: state.direction,
@@ -607,7 +711,9 @@ app.get('/api/verify', async (req, res) => {
                     avg_latency_ms: state.roiLatencyHistory.length > 0 
                         ? Math.round(state.roiLatencyHistory.reduce((sum, r) => sum + r.latencyMs, 0) / state.roiLatencyHistory.length)
                         : 0,
-                    websocket_connected: wsInstance && wsInstance.readyState === WebSocket.OPEN
+                    websocket_connected: wsInstance && wsInstance.readyState === WebSocket.OPEN,
+                    websocket_updates_received: wsUpdates,
+                    last_websocket_update: state.lastWsUpdate ? new Date(state.lastWsUpdate).toLocaleTimeString() : 'never'
                 });
             }
         }
@@ -615,10 +721,8 @@ app.get('/api/verify', async (req, res) => {
     
     res.json({
         verified: verification,
-        message: "Bot ROI matches Exchange ROI (profit_rate × 100) - WebSocket provides REAL-TIME updates",
-        latency_tracking: "WebSocket updates have <50ms latency vs polling delays",
-        polling_interval_ms: config.pollInterval,
-        websocket_status: wsInstance ? WebSocket.OPEN : 'disconnected'
+        message: "WebSocket position updates should provide sub-100ms latency",
+        websocket_status: wsInstance ? (wsInstance.readyState === WebSocket.OPEN ? 'CONNECTED' : 'DISCONNECTED') : 'NOT_INITIALIZED'
     });
 });
 
@@ -628,7 +732,7 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Martingale Pro - Real-Time WebSocket Edition</title>
+    <title>Martingale Pro - Fixed WebSocket Edition</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
     <style>
@@ -656,7 +760,7 @@ app.get('/', (req, res) => {
     <div class="max-w-7xl mx-auto">
         <div class="flex justify-between items-center mb-8">
             <div>
-                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO</span> <span class="text-xs bg-indigo-500/20 px-2 py-1 rounded">REAL-TIME</span></h1>
+                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">WEBSOCKET FIXED</span></h1>
                 <div class="flex items-center gap-3 mt-2">
                     <div class="flex items-center gap-1.5">
                         <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
@@ -695,6 +799,7 @@ app.get('/', (req, res) => {
                 <p id="lStep" class="text-[10px] text-slate-500 mt-2">STEP 0 | VOL 0</p>
                 <p id="lAction" class="text-[9px] text-indigo-400 mt-1"></p>
                 <p id="lLatency" class="text-[9px] mt-1"><span class="latency-badge">⏱️ Sync delay: -- ms</span></p>
+                <p id="lWsCount" class="text-[8px] text-slate-500 mt-1"></p>
             </div>
             <div class="exchange-card p-5">
                 <p class="stat-label mb-2">SHORT ACCOUNT</p>
@@ -703,13 +808,15 @@ app.get('/', (req, res) => {
                 <p id="sStep" class="text-[10px] text-slate-500 mt-2">STEP 0 | VOL 0</p>
                 <p id="sAction" class="text-[9px] text-indigo-400 mt-1"></p>
                 <p id="sLatency" class="text-[9px] mt-1"><span class="latency-badge">⏱️ Sync delay: -- ms</span></p>
+                <p id="sWsCount" class="text-[8px] text-slate-500 mt-1"></p>
             </div>
         </div>
 
         <div class="exchange-card overflow-hidden mb-8">
-            <div class="px-6 py-4 border-b border-[#1F2A3E]">
-                <p class="font-bold text-sm">⚡ REAL-TIME LATENCY MONITORING (WebSocket Mode)</p>
-                <p class="text-[9px] text-slate-500">WebSocket provides instant ROI updates - typical latency: 10-50ms</p>
+            <div class="px-6 py-4 border-b border-[#1F2A3E] bg-indigo-500/5">
+                <p class="font-bold text-sm">⚡ REAL-TIME WEBSOCKET LATENCY</p>
+                <p class="text-[9px] text-green-400">✅ WebSocket updates should show 🔌 icon with latency < 100ms</p>
+                <p class="text-[9px] text-yellow-400">⚠️ If you see 📡 icon, WebSocket position subscription is not working</p>
             </div>
             <div class="p-6">
                 <div class="grid grid-cols-2 gap-6">
@@ -731,7 +838,7 @@ app.get('/', (req, res) => {
 
         <div class="exchange-card overflow-hidden">
             <div class="px-6 py-4 border-b border-[#1F2A3E]">
-                <p class="font-bold text-sm">📋 EXCHANGE STYLE HISTORY</p>
+                <p class="font-bold text-sm">📋 TRADE HISTORY</p>
                 <p class="text-[9px] text-slate-500">Direct from HTX API - Real P&L including fees</p>
             </div>
             <div class="overflow-x-auto">
@@ -771,15 +878,12 @@ app.get('/', (req, res) => {
                 document.getElementById('bidPrice').innerHTML = d.market.bid.toFixed(8);
                 document.getElementById('askPrice').innerHTML = d.market.ask.toFixed(8);
                 
-                // WebSocket status
                 const wsConnected = d.config && d.config.wsConnected;
                 const wsStatusElem = document.getElementById('wsStatus');
                 if (wsConnected) {
                     wsStatusElem.innerHTML = '🔌 WebSocket: <span class="websocket-online">ONLINE</span>';
-                    wsStatusElem.className = 'text-[10px] font-bold';
                 } else {
                     wsStatusElem.innerHTML = '🔌 WebSocket: <span class="websocket-offline">OFFLINE</span>';
-                    wsStatusElem.className = 'text-[10px] font-bold';
                 }
                 
                 if (d.accounts && d.accounts.length >= 2) {
@@ -804,7 +908,6 @@ app.get('/', (req, res) => {
                     document.getElementById('sAction').innerHTML = short.lastAction;
                 }
                 
-                // Update latency displays
                 if (d.latency) {
                     const longLatencyKey = Object.keys(d.latency).find(k => k.includes('buy'));
                     const shortLatencyKey = Object.keys(d.latency).find(k => k.includes('sell'));
@@ -814,13 +917,15 @@ app.get('/', (req, res) => {
                         const latencyMs = lat.currentLatencyMs;
                         const latencyColor = getLatencyColor(latencyMs);
                         document.getElementById('lLatency').innerHTML = '<span class="latency-badge ' + latencyColor + '">⏱️ Sync delay: ' + latencyMs + ' ms (avg: ' + lat.avgLatencyMs + 'ms)</span>';
+                        document.getElementById('lWsCount').innerHTML = '🔌 WS updates: ' + (lat.wsUpdatesCount || 0) + ' | 📡 REST: ' + (lat.restUpdatesCount || 0);
                         
                         if (lat.history && lat.history.length > 0) {
                             let html = '';
                             lat.history.forEach(h => {
                                 const color = getLatencyColor(h.latencyMs);
                                 const sourceIcon = h.source === 'websocket' ? '🔌' : '📡';
-                                html += '<div class="text-xs bg-[#1A212E] p-2 rounded">' + sourceIcon + ' <span class="text-slate-400">' + new Date(h.timestamp).toLocaleTimeString() + '</span> — Exchange ROI: <span class="font-bold">' + h.exchangeRoi.toFixed(2) + '%</span> | Bot: ' + h.botRoi.toFixed(2) + '% | <span class="' + color + '">Delay: ' + h.latencyMs + 'ms</span></div>';
+                                const latencyDisplay = h.source === 'websocket' ? '<span class="text-green-400">' + h.latencyMs + 'ms (REAL-TIME)</span>' : h.latencyMs + 'ms';
+                                html += '<div class="text-xs bg-[#1A212E] p-2 rounded">' + sourceIcon + ' <span class="text-slate-400">' + new Date(h.timestamp).toLocaleTimeString() + '</span> — ROI: <span class="font-bold">' + h.exchangeRoi.toFixed(2) + '%</span> | Delay: ' + latencyDisplay + '</div>';
                             });
                             document.getElementById('longLatencyHistory').innerHTML = html;
                         }
@@ -831,13 +936,15 @@ app.get('/', (req, res) => {
                         const latencyMs = lat.currentLatencyMs;
                         const latencyColor = getLatencyColor(latencyMs);
                         document.getElementById('sLatency').innerHTML = '<span class="latency-badge ' + latencyColor + '">⏱️ Sync delay: ' + latencyMs + ' ms (avg: ' + lat.avgLatencyMs + 'ms)</span>';
+                        document.getElementById('sWsCount').innerHTML = '🔌 WS updates: ' + (lat.wsUpdatesCount || 0) + ' | 📡 REST: ' + (lat.restUpdatesCount || 0);
                         
                         if (lat.history && lat.history.length > 0) {
                             let html = '';
                             lat.history.forEach(h => {
                                 const color = getLatencyColor(h.latencyMs);
                                 const sourceIcon = h.source === 'websocket' ? '🔌' : '📡';
-                                html += '<div class="text-xs bg-[#1A212E] p-2 rounded">' + sourceIcon + ' <span class="text-slate-400">' + new Date(h.timestamp).toLocaleTimeString() + '</span> — Exchange ROI: <span class="font-bold">' + h.exchangeRoi.toFixed(2) + '%</span> | Bot: ' + h.botRoi.toFixed(2) + '% | <span class="' + color + '">Delay: ' + h.latencyMs + 'ms</span></div>';
+                                const latencyDisplay = h.source === 'websocket' ? '<span class="text-green-400">' + h.latencyMs + 'ms (REAL-TIME)</span>' : h.latencyMs + 'ms';
+                                html += '<div class="text-xs bg-[#1A212E] p-2 rounded">' + sourceIcon + ' <span class="text-slate-400">' + new Date(h.timestamp).toLocaleTimeString() + '</span> — ROI: <span class="font-bold">' + h.exchangeRoi.toFixed(2) + '%</span> | Delay: ' + latencyDisplay + '</div>';
                             });
                             document.getElementById('shortLatencyHistory').innerHTML = html;
                         }
@@ -865,7 +972,7 @@ app.get('/', (req, res) => {
                 }
                 document.getElementById('historyBody').innerHTML = html;
             } catch(e) { console.error(e); }
-        }, 500); // Update UI every 500ms
+        }, 500);
     </script>
 </body>
 </html>`);
@@ -875,14 +982,15 @@ app.get('/', (req, res) => {
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
 app.listen(config.port, '0.0.0.0', () => {
-    console.log(`\n✅ Martingale Pro Engine Started (REAL-TIME EDITION)`);
+    console.log(`\n✅ Martingale Pro Engine Started (WEBSOCKET FIXED)`);
     console.log(`📊 Symbol: ${config.symbol}`);
     console.log(`🎯 Take Profit: ${config.takeProfitPct}%`);
     console.log(`📈 Step Distance: ${config.stepDistancePct}%`);
     console.log(`🔧 Leverage: ${config.leverage}x`);
-    console.log(`⚡ Polling Interval: ${config.pollInterval}ms (reduced for faster updates)`);
-    console.log(`🔌 WebSocket: Enabled with real-time position updates`);
+    console.log(`⚡ Polling Interval: ${config.pollInterval}ms (backup only)`);
+    console.log(`🔌 WebSocket: Enabled with AUTH + position subscriptions`);
     console.log(`🌐 Dashboard: http://localhost:${config.port}`);
     console.log(`🔍 Verify ROI: http://localhost:${config.port}/api/verify`);
-    console.log(`\n📡 WebSocket provides INSTANT ROI updates - typical latency: 10-50ms\n`);
+    console.log(`\n📡 IMPORTANT: WebSocket should provide sub-100ms latency`);
+    console.log(`   Look for 🔌 icon in dashboard - if you see 📡, check WebSocket auth\n`);
 });
