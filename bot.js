@@ -200,16 +200,49 @@ class PerformanceMetrics {
     updateMaxMargin(margin) { if (margin > this.maxMarginUsed) this.maxMarginUsed = margin; }
     
     // FIXED: Calculate Daily Growth Rate based on net PnL over time
-    calculateDGR() {
-        if (this.trades.length === 0 || this.startTimestamp === 0) return "0.00%";
-        const daysElapsed = (Date.now() - this.startTimestamp) / (1000 * 60 * 60 * 24);
-        if (daysElapsed <= 0) return "0.00%";
-        const totalNetPnl = this.totalNetPnl;
-        const initialCapital = 100; // Assume $100 starting capital for DGR calculation
-        const totalReturn = totalNetPnl / initialCapital;
-        const dgr = (Math.pow(1 + totalReturn, 1 / daysElapsed) - 1) * 100;
-        return dgr.toFixed(2) + "%";
+    // In the PerformanceMetrics class, replace the calculateDGR method with this:
+calculateDGR() {
+    if (this.trades.length === 0) return "0.00%";
+    
+    // Get trades sorted by timestamp
+    const sortedTrades = [...this.trades].sort((a, b) => a.timestamp - b.timestamp);
+    
+    // Calculate cumulative net PnL from trade history
+    let cumulativePnl = 0;
+    let firstTradeTime = null;
+    let lastTradeTime = null;
+    
+    for (const trade of sortedTrades) {
+        cumulativePnl += trade.netPnl || 0;
+        if (!firstTradeTime) firstTradeTime = trade.timestamp;
+        lastTradeTime = trade.timestamp;
     }
+    
+    // If no trades or only one trade with no time difference
+    if (!firstTradeTime || !lastTradeTime || firstTradeTime === lastTradeTime) {
+        return "0.00%";
+    }
+    
+    // Calculate days between first and last trade
+    const daysElapsed = (lastTradeTime - firstTradeTime) / (1000 * 60 * 60 * 24);
+    if (daysElapsed <= 0.001) return "0.00%";
+    
+    // Initial capital assumption (can be modified)
+    const initialCapital = 100; // $100 starting capital
+    
+    // Total return = cumulative net PnL / initial capital
+    const totalReturn = cumulativePnl / initialCapital;
+    
+    // Calculate Daily Growth Rate: (1 + totalReturn)^(1/days) - 1
+    let dgr = 0;
+    if (totalReturn > -1) { // Avoid negative base for fractional exponent
+        dgr = (Math.pow(1 + totalReturn, 1 / daysElapsed) - 1) * 100;
+    } else {
+        dgr = -100; // Complete loss case
+    }
+    
+    return dgr.toFixed(2) + "%";
+}
 }
 
 // ==================== BACKTEST SIMULATION ENGINE ====================
@@ -1804,11 +1837,44 @@ app.get('/', (req, res) => { res.send(`<!DOCTYPE html>
             const data = await doAPI('/api/data', 'GET'); if(data.error) return;
 
             // Update DGR Display
-            if (data.dailyGrowthRate) {
-                document.getElementById('dgrDisplay').innerHTML = '📈 DGR: ' + data.dailyGrowthRate;
-                const isPositive = parseFloat(data.dailyGrowthRate) >= 0;
-                document.getElementById('dgrDisplay').className = "text-xs font-mono font-bold " + (isPositive ? "text-green-600 bg-green-50" : "text-red-600 bg-red-50") + " px-3 py-1 rounded-full";
+            // In fetchMetrics() function, replace the DGR display section with:
+
+// Calculate DGR directly from trade history
+if (data.metrics && data.metrics.trades && data.metrics.trades.length > 0) {
+    const trades = data.metrics.trades;
+    let cumulativePnl = 0;
+    let firstTradeTime = null;
+    let lastTradeTime = null;
+    
+    trades.forEach(trade => {
+        cumulativePnl += trade.netPnl || 0;
+        if (!firstTradeTime || trade.timestamp < firstTradeTime) firstTradeTime = trade.timestamp;
+        if (!lastTradeTime || trade.timestamp > lastTradeTime) lastTradeTime = trade.timestamp;
+    });
+    
+    if (firstTradeTime && lastTradeTime && firstTradeTime !== lastTradeTime) {
+        const daysElapsed = (lastTradeTime - firstTradeTime) / (1000 * 60 * 60 * 24);
+        if (daysElapsed > 0) {
+            const initialCapital = 100; // $100 starting capital
+            const totalReturn = cumulativePnl / initialCapital;
+            let dgr = 0;
+            if (totalReturn > -1) {
+                dgr = (Math.pow(1 + totalReturn, 1 / daysElapsed) - 1) * 100;
+            } else {
+                dgr = -100;
             }
+            document.getElementById('dgrDisplay').innerHTML = '📈 DGR: ' + dgr.toFixed(2) + '%';
+            const isPositive = dgr >= 0;
+            document.getElementById('dgrDisplay').className = "text-xs font-mono font-bold " + (isPositive ? "text-green-600 bg-green-50" : "text-red-600 bg-red-50") + " px-3 py-1 rounded-full";
+        } else {
+            document.getElementById('dgrDisplay').innerHTML = '📈 DGR: 0.00%';
+        }
+    } else {
+        document.getElementById('dgrDisplay').innerHTML = '📈 DGR: 0.00%';
+    }
+} else {
+    document.getElementById('dgrDisplay').innerHTML = '📈 DGR: 0.00%';
+}
 
             if (document.getElementById('view-step-history').classList.contains('active-view')) {
                 const tbody = document.getElementById("stepHistoryBody");
