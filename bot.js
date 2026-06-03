@@ -30,7 +30,7 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
     multiplier: 1.2,
-    stepDistancePct: -10, // Now represents 10% ROI trigger
+    stepDistancePct: 10, // Triggers at -10% ROI
     takeProfitPct: 15,
     maxStartSpread: parseFloat(process.env.MAX_START_SPREAD) || 0.1,
     takerFeeRate: 0.0005,
@@ -547,10 +547,10 @@ async function processMartingale() {
             continue;
         }
 
-        let roiMove = Math.abs(state.roi); // Use absolute ROI value for step trigger
         const currentStep = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
         
-        if (roiMove >= 10 && state.volume > 0) { // Trigger at -10% ROI
+        // Trigger martingale step when ROI reaches -10% or lower (negative)
+        if (state.roi <= -10 && state.volume > 0) {
             const nextStepNumber = currentStep + 1;
             let nextVol;
             
@@ -560,7 +560,7 @@ async function processMartingale() {
                 nextVol = Math.ceil(market.currentBaseVolume * Math.pow(config.multiplier, nextStepNumber));
             }
             
-            console.log(`📈 Martingale step ${nextStepNumber} for ${state.direction} - ROI: -${roiMove.toFixed(2)}% | Current Vol: ${state.volume} | Adding: ${nextVol}`);
+            console.log(`📈 MARTINGALE STEP ${nextStepNumber} for ${state.direction} - ROI: ${state.roi.toFixed(2)}% (LOSS) | Current Vol: ${state.volume} | Adding: ${nextVol} contracts`);
             state.isLocked = true;
             
             const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
@@ -576,7 +576,7 @@ async function processMartingale() {
                 state.pendingOrderId = res.data.order_id_str;
                 state.lastStepPrice = currentPrice;
                 state.lastAddedVolume = nextVol;
-                state.lastAction = `Martingale Step ${nextStepNumber} (Vol: ${state.volume + nextVol})`;
+                state.lastAction = `Martingale Step ${nextStepNumber} (-${Math.abs(state.roi).toFixed(1)}% loss, Added: ${nextVol})`;
             } else {
                 state.isLocked = false;
                 state.lastAction = "Step Failed";
@@ -950,7 +950,7 @@ app.get('/', (req, res) => {
                 <p class="stat-label mb-2">CONFIG</p>
                 <p class="text-sm">Base Vol: <span id="configBaseVol">${config.baseVolume}</span></p>
                 <p class="text-sm">Multiplier: ${config.multiplier}x</p>
-                <p class="text-sm">Step Dist: ${config.stepDistancePct}%</p>
+                <p class="text-sm">Step Trigger: <span class="text-red-400">-${config.stepDistancePct}% ROI</span></p>
             </div>
             <div class="card">
                 <p class="stat-label mb-2">MARKET</p>
@@ -1187,7 +1187,7 @@ app.get('/', (req, res) => {
                     data.tradeHistory.slice(0, 20).forEach(t => {
                         const roiVal = parseFloat(t.roi);
                         tradesHtml += '<tr class="border-b border-[#1A212E]">' +
-                            '<td class="p-3"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + ' font-bold">' + t.side + '</span></td>' +
+                            '<td class="p-3"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + ' font-bold">' + t.side + '</span><tr>' +
                             '<td class="p-3 text-xs">' + (t.openTime || '--') + '</td>' +
                             '<td class="p-3 text-xs">' + (t.closeTime || '--') + '</td>' +
                             '<td class="p-3 text-right">' + (t.step || 0) + '</td>' +
@@ -1223,7 +1223,7 @@ app.listen(config.port, '0.0.0.0', () => {
     console.log(`🎯 Take Profit: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price movement`);
     console.log(`💰 Auto-Compounding: ${config.riskPercent}% of wallet`);
     console.log(`📐 Formula: $${config.walletPerContract.toFixed(8)} wallet = 1 contract`);
-    console.log(`📈 Step Distance: ${config.stepDistancePct}% ROI trigger`);
+    console.log(`📈 Step Trigger: -${config.stepDistancePct}% ROI (adds martingale when losing)`);
     console.log(`🌐 Dashboard: http://localhost:${config.port}`);
     console.log(`\n📊 AUTO-COMPOUNDING EXAMPLES:`);
     console.log(`   Wallet $${config.walletPerContract.toFixed(8)} → 1 contract → Risk $${(config.walletPerContract * 0.02).toFixed(8)}`);
