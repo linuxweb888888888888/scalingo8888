@@ -29,8 +29,8 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
     multiplier: 1.2,
-    stepDistancePct: 0.2,
-    takeProfitPct: 15.0,
+    stepDistancePct: 0.2,  // Changed to 0.2% as shown in your UI
+    takeProfitPct: 15,      // Changed to 15% as shown in your UI
     maxStartSpread: 0.1,
     takerFeeRate: 0.0005,
     pollInterval: 1000,
@@ -55,8 +55,7 @@ config.accounts.forEach((account, idx) => {
         isLocked: false,
         pendingOrderId: null,
         lastAction: 'Idle',
-        step: 0, lastStepPrice: 0, lastAddedVolume: 0, startTime: null,
-        lastRawProfitRate: 0
+        step: 0, lastStepPrice: 0, lastAddedVolume: 0, startTime: null
     };
 });
 
@@ -154,26 +153,16 @@ async function syncAccount(acc, state) {
                 state.volume = parseFloat(pos.volume);
                 state.entryPrice = parseFloat(pos.cost_open);
                 
-                // CRITICAL FIX: Handle profit_rate correctly
-                // HTX returns profit_rate as a percentage already (e.g., 0.0992 = 9.92%)
-                // But sometimes it returns as raw decimal, so we need to ensure it's displayed correctly
+                // CRITICAL FIX: Multiply profit_rate by 100 to match exchange display
+                // Exchange API returns 0.20 for 20%, so multiply by 100 to show 20%
                 let rawProfitRate = parseFloat(pos.profit_rate);
-                state.lastRawProfitRate = rawProfitRate;
-                
-                // If profit_rate > 100, it's likely in basis points or multiplied by 100
-                if (Math.abs(rawProfitRate) > 100) {
-                    state.roi = rawProfitRate / 100; // Convert to percentage
-                } else {
-                    state.roi = rawProfitRate; // Already correct percentage
-                }
-                
+                state.roi = rawProfitRate * 100;  // Convert to percentage that matches exchange UI
                 state.unrealizedUsdt = parseFloat(pos.profit);
                 
                 if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
                 if (!state.startTime) state.startTime = new Date().toLocaleString();
                 
-                // Debug log to see what exchange returns
-                console.log(`${state.direction.toUpperCase()} - Raw profit_rate: ${rawProfitRate}, Display ROI: ${state.roi.toFixed(4)}%, PnL: ${state.unrealizedUsdt.toFixed(8)} USDT, Vol: ${state.volume}`);
+                console.log(`${state.direction.toUpperCase()} - Raw: ${rawProfitRate}, Display: ${state.roi.toFixed(2)}%, PnL: ${state.unrealizedUsdt.toFixed(8)} USDT`);
             } else {
                 state.volume = 0;
                 state.roi = 0;
@@ -294,9 +283,9 @@ async function processMartingale() {
             continue;
         }
 
-        // Take profit - Use correctly formatted ROI
+        // Take profit - Now using multiplied ROI (matches exchange display)
         if (state.roi >= config.takeProfitPct) {
-            console.log(`Take profit triggered for ${state.direction} - ROI: ${state.roi.toFixed(4)}%`);
+            console.log(`Take profit triggered for ${state.direction} - ROI: ${state.roi.toFixed(2)}%`);
             const v = state.volume;
             const finalRoi = state.roi;
             const finalPnl = state.unrealizedUsdt;
@@ -317,6 +306,13 @@ async function processMartingale() {
                 state.pendingOrderId = res.data.order_id_str;
                 state.lastAction = "Take Profit Close";
                 logTradeExchangeStyle(state, currentPrice, exitTime, finalRoi, finalPnl);
+                // Reset position data after close
+                state.volume = 0;
+                state.roi = 0;
+                state.unrealizedUsdt = 0;
+                state.step = 0;
+                state.lastStepPrice = 0;
+                state.startTime = null;
             } else {
                 state.isLocked = false;
                 state.lastAction = "TP Failed";
