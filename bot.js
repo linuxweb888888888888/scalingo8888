@@ -30,7 +30,7 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
     multiplier: 1.2,
-    stepDistancePct: 0.2,
+    stepDistancePct: 10, // Now represents 10% ROI trigger
     takeProfitPct: 15,
     maxStartSpread: parseFloat(process.env.MAX_START_SPREAD) || 0.1,
     takerFeeRate: 0.0005,
@@ -547,16 +547,10 @@ async function processMartingale() {
             continue;
         }
 
-        let priceMove = 0;
-        if (state.direction === 'buy') {
-            priceMove = ((state.lastStepPrice - currentPrice) / state.lastStepPrice) * 100;
-        } else {
-            priceMove = ((currentPrice - state.lastStepPrice) / state.lastStepPrice) * 100;
-        }
-        
+        let roiMove = Math.abs(state.roi); // Use absolute ROI value for step trigger
         const currentStep = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
         
-        if (priceMove >= config.stepDistancePct && state.lastStepPrice > 0) {
+        if (roiMove >= 10 && state.volume > 0) { // Trigger at -10% ROI
             const nextStepNumber = currentStep + 1;
             let nextVol;
             
@@ -566,7 +560,7 @@ async function processMartingale() {
                 nextVol = Math.ceil(market.currentBaseVolume * Math.pow(config.multiplier, nextStepNumber));
             }
             
-            console.log(`📈 Martingale step ${nextStepNumber} for ${state.direction} - Move: ${priceMove.toFixed(2)}% | Current Vol: ${state.volume} | Adding: ${nextVol}`);
+            console.log(`📈 Martingale step ${nextStepNumber} for ${state.direction} - ROI: -${roiMove.toFixed(2)}% | Current Vol: ${state.volume} | Adding: ${nextVol}`);
             state.isLocked = true;
             
             const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
@@ -1229,7 +1223,7 @@ app.listen(config.port, '0.0.0.0', () => {
     console.log(`🎯 Take Profit: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price movement`);
     console.log(`💰 Auto-Compounding: ${config.riskPercent}% of wallet`);
     console.log(`📐 Formula: $${config.walletPerContract.toFixed(8)} wallet = 1 contract`);
-    console.log(`📈 Step Distance: ${config.stepDistancePct}%`);
+    console.log(`📈 Step Distance: ${config.stepDistancePct}% ROI trigger`);
     console.log(`🌐 Dashboard: http://localhost:${config.port}`);
     console.log(`\n📊 AUTO-COMPOUNDING EXAMPLES:`);
     console.log(`   Wallet $${config.walletPerContract.toFixed(8)} → 1 contract → Risk $${(config.walletPerContract * 0.02).toFixed(8)}`);
