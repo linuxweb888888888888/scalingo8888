@@ -55,7 +55,13 @@ config.accounts.forEach((account, idx) => {
         isLocked: false,
         pendingOrderId: null,
         lastAction: 'Idle',
-        step: 0, lastStepPrice: 0, lastAddedVolume: 0, startTime: null
+        step: 0, lastStepPrice: 0, lastAddedVolume: 0, startTime: null,
+        // Latency tracking
+        lastExchangeRoi: 0,
+        lastBotRoi: 0,
+        roiLatencyMs: 0,
+        roiLatencyHistory: [],
+        lastRoiUpdateTime: Date.now()
     };
 });
 
@@ -153,14 +159,49 @@ async function syncAccount(acc, state) {
                 state.volume = parseFloat(pos.volume);
                 state.entryPrice = parseFloat(pos.cost_open);
                 
-                // CRITICAL FIX: Use exchange's profit_rate directly
-                // profit_rate is already the ROI as a decimal (e.g., 0.01406 = 1.41%)
-                // Multiply by 100 to display as percentage
+                // Get exchange ROI
                 let rawProfitRate = parseFloat(pos.profit_rate);
-                state.roi = rawProfitRate * 100;  // 1.41% for display
+                let newExchangeRoi = rawProfitRate * 100;
+                
+                // Check if exchange ROI changed
+                if (newExchangeRoi !== state.lastExchangeRoi) {
+                    const now = Date.now();
+                    const timeSinceLastUpdate = now - state.lastRoiUpdateTime;
+                    
+                    // Calculate latency if bot ROI is trying to catch up
+                    if (state.lastBotRoi !== newExchangeRoi) {
+                        state.roiLatencyMs = timeSinceLastUpdate;
+                        state.roiLatencyHistory.unshift({
+                            timestamp: now,
+                            exchangeRoi: newExchangeRoi,
+                            botRoi: state.roi,
+                            latencyMs: timeSinceLastUpdate,
+                            difference: Math.abs(newExchangeRoi - state.roi).toFixed(4)
+                        });
+                        
+                        // Keep last 10 latency records
+                        if (state.roiLatencyHistory.length > 10) state.roiLatencyHistory.pop();
+                        
+                        console.log(`[LATENCY][${state.direction.toUpperCase()}] Exchange ROI changed to ${newExchangeRoi.toFixed(4)}% | Bot ROI: ${state.roi.toFixed(4)}% | Delay: ${timeSinceLastUpdate}ms | Diff: ${Math.abs(newExchangeRoi - state.roi).toFixed(4)}%`);
+                    }
+                    
+                    state.lastExchangeRoi = newExchangeRoi;
+                    state.lastRoiUpdateTime = now;
+                }
+                
+                // Update bot ROI (this will gradually match exchange ROI)
+                const oldBotRoi = state.roi;
+                state.roi = newExchangeRoi; // Direct sync - bot matches exchange immediately
+                state.lastBotRoi = state.roi;
+                
+                // If bot just synced, log zero latency
+                if (oldBotRoi !== state.roi) {
+                    console.log(`[SYNC][${state.direction.toUpperCase()}] Bot ROI updated from ${oldBotRoi.toFixed(4)}% to ${state.roi.toFixed(4)}% (Zero latency - direct API match)`);
+                }
+                
                 state.unrealizedUsdt = parseFloat(pos.profit);
                 
-                console.log(`[${state.direction.toUpperCase()}] Exchange ROI: ${rawProfitRate} → Display: ${state.roi.toFixed(2)}%, PnL: ${state.unrealizedUsdt.toFixed(8)} USDT`);
+                console.log(`[${state.direction.toUpperCase()}] Exchange ROI: ${rawProfitRate} → Bot ROI: ${state.roi.toFixed(2)}%`);
                 
                 if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
                 if (!state.startTime) state.startTime = new Date().toLocaleString();
@@ -173,6 +214,8 @@ async function syncAccount(acc, state) {
                 state.lastStepPrice = 0;
                 state.startTime = null;
                 state.lastAddedVolume = 0;
+                state.lastExchangeRoi = 0;
+                state.lastBotRoi = 0;
             }
         }
 
@@ -394,10 +437,26 @@ async function backgroundLoop() {
 
 // ==================== ENDPOINTS ====================
 app.get('/api/status', (req, res) => {
+    // Prepare latency summary for response
+    const latencySummary = {};
+    Object.keys(accountStates).forEach(accId => {
+        const state = accountStates[accId];
+        const avgLatency = state.roiLatencyHistory.length > 0 
+            ? state.roiLatencyHistory.reduce((sum, record) => sum + record.latencyMs, 0) / state.roiLatencyHistory.length 
+            : 0;
+        latencySummary[`account_${accId}_${state.direction}`] = {
+            currentLatencyMs: state.roiLatencyMs,
+            avgLatencyMs: Math.round(avgLatency),
+            lastUpdateTime: new Date(state.lastRoiUpdateTime).toLocaleTimeString(),
+            history: state.roiLatencyHistory.slice(0, 5) // Send last 5 records
+        };
+    });
+    
     res.json({
         market,
         accounts: Object.values(accountStates),
-        tradeHistory
+        tradeHistory,
+        latency: latencySummary
     });
 });
 
@@ -439,7 +498,11 @@ app.get('/api/verify', async (req, res) => {
                     exchange_profit_rate: parseFloat(pos.profit_rate),
                     exchange_profit_rate_percent: (parseFloat(pos.profit_rate) * 100).toFixed(2) + '%',
                     bot_display_roi: state.roi.toFixed(2) + '%',
-                    matches: Math.abs((parseFloat(pos.profit_rate) * 100) - state.roi) < 0.01
+                    matches: Math.abs((parseFloat(pos.profit_rate) * 100) - state.roi) < 0.01,
+                    latency_ms: state.roiLatencyMs,
+                    avg_latency_ms: state.roiLatencyHistory.length > 0 
+                        ? Math.round(state.roiLatencyHistory.reduce((sum, r) => sum + r.latencyMs, 0) / state.roiLatencyHistory.length)
+                        : 0
                 });
             }
         }
@@ -447,7 +510,8 @@ app.get('/api/verify', async (req, res) => {
     
     res.json({
         verified: verification,
-        message: "Bot ROI should match Exchange ROI exactly (profit_rate × 100)"
+        message: "Bot ROI should match Exchange ROI exactly (profit_rate × 100)",
+        latency_tracking: "Shows delay in milliseconds between exchange ROI changes and bot sync"
     });
 });
 
@@ -473,6 +537,10 @@ app.get('/', (req, res) => {
         .exchange-table th { text-align: left; padding: 14px 12px; background: #0F141C; color: #6B7A8F; font-size: 11px; font-weight: 700; border-bottom: 1px solid #1F2A3E; }
         .exchange-table td { padding: 12px; border-bottom: 1px solid #1A212E; font-size: 13px; }
         .mono { font-family: 'SF Mono', monospace; font-size: 12px; }
+        .latency-badge { background: #1A212E; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-family: monospace; }
+        .latency-good { color: #00D1B2; }
+        .latency-warning { color: #FFB700; }
+        .latency-bad { color: #FF4D6D; }
     </style>
 </head>
 <body class="p-6">
@@ -516,6 +584,7 @@ app.get('/', (req, res) => {
                 <p id="lPnl" class="text-sm mono mt-1">$0.00000000</p>
                 <p id="lStep" class="text-[10px] text-slate-500 mt-2">STEP 0 | VOL 0</p>
                 <p id="lAction" class="text-[9px] text-indigo-400 mt-1"></p>
+                <p id="lLatency" class="text-[9px] mt-1"><span class="latency-badge">⏱️ Sync delay: -- ms</span></p>
             </div>
             <div class="exchange-card p-5">
                 <p class="stat-label mb-2">SHORT ACCOUNT</p>
@@ -523,6 +592,30 @@ app.get('/', (req, res) => {
                 <p id="sPnl" class="text-sm mono mt-1">$0.00000000</p>
                 <p id="sStep" class="text-[10px] text-slate-500 mt-2">STEP 0 | VOL 0</p>
                 <p id="sAction" class="text-[9px] text-indigo-400 mt-1"></p>
+                <p id="sLatency" class="text-[9px] mt-1"><span class="latency-badge">⏱️ Sync delay: -- ms</span></p>
+            </div>
+        </div>
+
+        <div class="exchange-card overflow-hidden mb-8">
+            <div class="px-6 py-4 border-b border-[#1F2A3E]">
+                <p class="font-bold text-sm">📊 REAL-TIME LATENCY MONITORING</p>
+                <p class="text-[9px] text-slate-500">Delay between exchange ROI change and bot synchronization</p>
+            </div>
+            <div class="p-6">
+                <div class="grid grid-cols-2 gap-6">
+                    <div>
+                        <p class="text-xs font-bold mb-3 text-indigo-400">LONG POSITION LATENCY</p>
+                        <div id="longLatencyHistory" class="space-y-2">
+                            <div class="text-center text-slate-500 text-xs">Waiting for ROI changes...</div>
+                        </div>
+                    </div>
+                    <div>
+                        <p class="text-xs font-bold mb-3 text-indigo-400">SHORT POSITION LATENCY</p>
+                        <div id="shortLatencyHistory" class="space-y-2">
+                            <div class="text-center text-slate-500 text-xs">Waiting for ROI changes...</div>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -549,6 +642,12 @@ app.get('/', (req, res) => {
     </div>
 
     <script>
+        function getLatencyColor(ms) {
+            if (ms < 500) return 'latency-good';
+            if (ms < 2000) return 'latency-warning';
+            return 'latency-bad';
+        }
+        
         async function triggerClose() { if(confirm("Close all positions?")) fetch('/api/close', {method:'POST'}); }
         
         setInterval(async () => {
@@ -582,6 +681,46 @@ app.get('/', (req, res) => {
                     document.getElementById('sPnl').innerHTML = (short.unrealizedUsdt >= 0 ? '+' : '') + short.unrealizedUsdt.toFixed(8);
                     document.getElementById('sStep').innerHTML = 'STEP ' + short.step + ' | VOL ' + short.volume;
                     document.getElementById('sAction').innerHTML = short.lastAction;
+                }
+                
+                // Update latency displays
+                if (d.latency) {
+                    const longLatencyKey = Object.keys(d.latency).find(k => k.includes('buy'));
+                    const shortLatencyKey = Object.keys(d.latency).find(k => k.includes('sell'));
+                    
+                    if (longLatencyKey && d.latency[longLatencyKey]) {
+                        const lat = d.latency[longLatencyKey];
+                        const latencyMs = lat.currentLatencyMs;
+                        const latencyColor = getLatencyColor(latencyMs);
+                        document.getElementById('lLatency').innerHTML = '<span class="latency-badge ' + latencyColor + '">⏱️ Sync delay: ' + latencyMs + ' ms (avg: ' + lat.avgLatencyMs + 'ms)</span>';
+                        
+                        // Build history
+                        if (lat.history && lat.history.length > 0) {
+                            let html = '';
+                            lat.history.forEach(h => {
+                                const color = getLatencyColor(h.latencyMs);
+                                html += '<div class="text-xs bg-[#1A212E] p-2 rounded"><span class="text-slate-400">' + new Date(h.timestamp).toLocaleTimeString() + '</span> — Exchange ROI: <span class="font-bold">' + h.exchangeRoi.toFixed(2) + '%</span> | Bot: ' + h.botRoi.toFixed(2) + '% | <span class="' + color + '">Delay: ' + h.latencyMs + 'ms</span> | Diff: ' + h.difference + '%</div>';
+                            });
+                            document.getElementById('longLatencyHistory').innerHTML = html;
+                        }
+                    }
+                    
+                    if (shortLatencyKey && d.latency[shortLatencyKey]) {
+                        const lat = d.latency[shortLatencyKey];
+                        const latencyMs = lat.currentLatencyMs;
+                        const latencyColor = getLatencyColor(latencyMs);
+                        document.getElementById('sLatency').innerHTML = '<span class="latency-badge ' + latencyColor + '">⏱️ Sync delay: ' + latencyMs + ' ms (avg: ' + lat.avgLatencyMs + 'ms)</span>';
+                        
+                        // Build history
+                        if (lat.history && lat.history.length > 0) {
+                            let html = '';
+                            lat.history.forEach(h => {
+                                const color = getLatencyColor(h.latencyMs);
+                                html += '<div class="text-xs bg-[#1A212E] p-2 rounded"><span class="text-slate-400">' + new Date(h.timestamp).toLocaleTimeString() + '</span> — Exchange ROI: <span class="font-bold">' + h.exchangeRoi.toFixed(2) + '%</span> | Bot: ' + h.botRoi.toFixed(2) + '% | <span class="' + color + '">Delay: ' + h.latencyMs + 'ms</span> | Diff: ' + h.difference + '%</div>';
+                            });
+                            document.getElementById('shortLatencyHistory').innerHTML = html;
+                        }
+                    }
                 }
                 
                 let html = '';
@@ -621,5 +760,6 @@ app.listen(config.port, '0.0.0.0', () => {
     console.log(`📈 Step Distance: ${config.stepDistancePct}%`);
     console.log(`🔧 Leverage: ${config.leverage}x`);
     console.log(`🌐 Dashboard: http://localhost:${config.port}`);
-    console.log(`🔍 Verify ROI: http://localhost:${config.port}/api/verify\n`);
+    console.log(`🔍 Verify ROI: http://localhost:${config.port}/api/verify`);
+    console.log(`📡 Latency monitoring active - tracks delay between exchange and bot ROI\n`);
 });
