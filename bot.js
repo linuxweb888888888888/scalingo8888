@@ -28,14 +28,18 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
+    baseVolume: parseInt(process.env.BASE_VOLUME) || 1, // Will be auto-calculated from wallet
     multiplier: 1.2,
     stepDistancePct: 0.2,
     takeProfitPct: 15,
     maxStartSpread: parseFloat(process.env.MAX_START_SPREAD) || 0.1,
     takerFeeRate: 0.0005,
     pollInterval: 500,
-    contractMultiplier: 0.001
+    contractMultiplier: 0.001,
+    // New: Auto-compounding settings
+    autoCompound: true,
+    riskPercent: 2, // 2% of total wallet per trade
+    shibPerContract: 1000 // 1 contract = 1000 SHIB
 };
 
 let market = {
@@ -49,13 +53,54 @@ let market = {
     totalTrades: 0,
     winningTrades: 0,
     losingTrades: 0,
-    totalFeesPaid: 0
+    totalFeesPaid: 0,
+    // New: Auto-compounding tracking
+    currentBaseVolume: parseInt(process.env.BASE_VOLUME) || 1,
+    currentBaseShib: 0,
+    currentRiskAmount: 0,
+    lastBaseUpdate: Date.now()
 };
 
 let tradeHistory = [];
 let accountStates = {};
 let lastPositionFetch = {};
 let lastBalanceFetch = {};
+
+// Function to calculate base volume from wallet balance
+function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
+    if (!config.autoCompound || totalEquity <= 0 || currentPrice <= 0) {
+        return config.baseVolume;
+    }
+    
+    // Calculate 2% of total wallet (risk amount in USDT)
+    const riskAmount = totalEquity * (config.riskPercent / 100);
+    market.currentRiskAmount = riskAmount;
+    
+    // Calculate position size in USDT (with leverage)
+    // Position size = riskAmount × leverage (since 2% risk = 2% of wallet, at 75x = 150% position)
+    const positionUsdt = riskAmount;
+    
+    // Calculate contract volume
+    // Contract value = currentPrice × contractMultiplier × volume
+    // Volume = positionUsdt / (currentPrice × contractMultiplier)
+    const contractValue = currentPrice * config.contractMultiplier;
+    let volume = Math.max(1, Math.floor(positionUsdt / contractValue));
+    
+    // Calculate SHIB amount
+    const shibAmount = volume * config.shibPerContract;
+    market.currentBaseShib = shibAmount;
+    
+    console.log(`\n💰 AUTO-COMPOUNDING CALCULATION:`);
+    console.log(`   Total Wallet: $${totalEquity.toFixed(8)}`);
+    console.log(`   2% Risk Amount: $${riskAmount.toFixed(8)}`);
+    console.log(`   Current Price: $${currentPrice.toFixed(8)}`);
+    console.log(`   Contract Value: $${contractValue.toFixed(8)}`);
+    console.log(`   Calculated Volume: ${volume} contracts`);
+    console.log(`   SHIB Amount: ${shibAmount.toLocaleString()} SHIB`);
+    console.log(`   (1 contract = ${config.shibPerContract.toLocaleString()} SHIB)\n`);
+    
+    return Math.max(1, volume);
+}
 
 function calculateStepFromVolume(volume, baseVolume, multiplier) {
     if (volume === 0) return 0;
@@ -109,7 +154,10 @@ function updateWalletGrowth(totalEquity) {
             time: new Date().toLocaleString(),
             equity: totalEquity,
             pnl: totalEquity - market.initialTotalEquity,
-            pnlPercent: market.initialTotalEquity > 0 ? ((totalEquity - market.initialTotalEquity) / market.initialTotalEquity) * 100 : 0
+            pnlPercent: market.initialTotalEquity > 0 ? ((totalEquity - market.initialTotalEquity) / market.initialTotalEquity) * 100 : 0,
+            baseVolume: market.currentBaseVolume,
+            baseShib: market.currentBaseShib,
+            riskAmount: market.currentRiskAmount
         });
         
         if (market.walletHistory.length > 100) market.walletHistory.shift();
@@ -248,7 +296,7 @@ async function syncAccount(acc, state) {
             state.entryPrice = newEntryPrice;
             state.unrealizedUsdt = newUnrealizedUsdt;
             
-            const calculatedStep = calculateStepFromVolume(newVolume, config.baseVolume, config.multiplier);
+            const calculatedStep = calculateStepFromVolume(newVolume, market.currentBaseVolume, config.multiplier);
             
             if (Math.abs(newExchangeRoi - state.roi) > 0.01) {
                 const timeSinceLastUpdate = now - state.lastRoiUpdateTime;
@@ -321,7 +369,7 @@ async function syncAccount(acc, state) {
 }
 
 function logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl) {
-    const step = calculateStepFromVolume(state.volume, config.baseVolume, config.multiplier);
+    const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
     const estimatedFee = Math.abs(finalPnl) * config.takerFeeRate;
     
     market.totalTrades++;
@@ -411,7 +459,7 @@ async function processMartingale() {
             
             const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol,
-                volume: config.baseVolume,
+                volume: market.currentBaseVolume,
                 direction: state.direction,
                 offset: 'open',
                 lever_rate: config.leverage,
@@ -464,7 +512,7 @@ async function processMartingale() {
             const finalRoi = config.takeProfitPct;
             const finalPnl = state.unrealizedUsdt;
             const exitTime = new Date().toLocaleString();
-            const currentStep = calculateStepFromVolume(state.volume, config.baseVolume, config.multiplier);
+            const currentStep = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
             
             console.log(`✅ Taking ${state.direction} profit at ${exitPrice.toFixed(8)} (Target ROI: ${finalRoi}%, Step ${currentStep}, Vol: ${state.volume})`);
             state.isLocked = true;
@@ -507,16 +555,16 @@ async function processMartingale() {
             priceMove = ((currentPrice - state.lastStepPrice) / state.lastStepPrice) * 100;
         }
         
-        const currentStep = calculateStepFromVolume(state.volume, config.baseVolume, config.multiplier);
+        const currentStep = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
         
         if (priceMove >= config.stepDistancePct && state.lastStepPrice > 0) {
             const nextStepNumber = currentStep + 1;
             let nextVol;
             
             if (nextStepNumber === 1) {
-                nextVol = Math.ceil(config.baseVolume * config.multiplier);
+                nextVol = Math.ceil(market.currentBaseVolume * config.multiplier);
             } else {
-                nextVol = Math.ceil(config.baseVolume * Math.pow(config.multiplier, nextStepNumber));
+                nextVol = Math.ceil(market.currentBaseVolume * Math.pow(config.multiplier, nextStepNumber));
             }
             
             console.log(`📈 Martingale step ${nextStepNumber} for ${state.direction} - Move: ${priceMove.toFixed(2)}% | Current Vol: ${state.volume} | Adding: ${nextVol}`);
@@ -541,7 +589,7 @@ async function processMartingale() {
                 state.lastAction = "Step Failed";
             }
         } else {
-            const step = calculateStepFromVolume(state.volume, config.baseVolume, config.multiplier);
+            const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
             const requiredMove = (config.takeProfitPct / config.leverage).toFixed(3);
             state.lastAction = `Active - Step ${step} | Vol: ${state.volume} | ROI: ${state.roi.toFixed(2)}%`;
         }
@@ -578,11 +626,22 @@ async function backgroundLoop() {
                 const elapsedHours = (Date.now() - market.startTime) / (1000 * 60 * 60);
                 market.dgr = elapsedHours > 0 ? (market.growthPct / elapsedHours) : 0;
                 
+                // Auto-compounding: Update base volume based on current wallet
+                if (config.autoCompound && market.bid > 0) {
+                    const newBaseVolume = calculateBaseVolumeFromWallet(totalEquity, market.bid);
+                    if (newBaseVolume !== market.currentBaseVolume) {
+                        console.log(`📈 AUTO-COMPOUND: Base volume updated: ${market.currentBaseVolume} → ${newBaseVolume} contracts`);
+                        market.currentBaseVolume = newBaseVolume;
+                        market.lastBaseUpdate = Date.now();
+                    }
+                }
+                
                 updateWalletGrowth(totalEquity);
                 
                 const lastRecord = market.walletHistory[market.walletHistory.length - 2];
                 if (lastRecord && Math.abs(market.growthPct - lastRecord.pnlPercent) > 0.1) {
                     console.log(`💰 WALLET: $${totalEquity.toFixed(8)} | PnL: ${market.totalNetGain >= 0 ? '+' : ''}$${market.totalNetGain.toFixed(8)} (${market.growthPct >= 0 ? '+' : ''}${market.growthPct.toFixed(2)}%)`);
+                    console.log(`   Base Volume: ${market.currentBaseVolume} contracts (${market.currentBaseShib.toLocaleString()} SHIB) | Risk: ${config.riskPercent}% = $${market.currentRiskAmount.toFixed(8)}`);
                 }
             }
         }
@@ -603,8 +662,8 @@ app.get('/api/status', (req, res) => {
     const totalFees = (s1?.totalFees || 0) + (s2?.totalFees || 0);
     
     const accountsWithInfo = Object.values(accountStates).map(state => {
-        const step = calculateStepFromVolume(state.volume, config.baseVolume, config.multiplier);
-        const expectedVol = calculateVolumeForStep(step, config.baseVolume, config.multiplier);
+        const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
+        const expectedVol = calculateVolumeForStep(step, market.currentBaseVolume, config.multiplier);
         const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
         
         return {
@@ -642,7 +701,14 @@ app.get('/api/status', (req, res) => {
             winningTrades: market.winningTrades,
             losingTrades: market.losingTrades,
             winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0,
-            walletHistory: market.walletHistory.slice(-20)
+            walletHistory: market.walletHistory.slice(-20),
+            // Auto-compounding info
+            autoCompound: config.autoCompound,
+            riskPercent: config.riskPercent,
+            currentBaseVolume: market.currentBaseVolume,
+            currentBaseShib: market.currentBaseShib,
+            currentRiskAmount: market.currentRiskAmount,
+            shibPerContract: config.shibPerContract
         },
         accounts: accountsWithInfo,
         tradeHistory,
@@ -652,8 +718,10 @@ app.get('/api/status', (req, res) => {
             leverage: config.leverage,
             requiredPriceMovePct: (config.takeProfitPct / config.leverage).toFixed(3) + '%',
             pollInterval: config.pollInterval,
-            baseVolume: config.baseVolume,
-            multiplier: config.multiplier
+            baseVolume: market.currentBaseVolume,
+            multiplier: config.multiplier,
+            autoCompound: config.autoCompound,
+            riskPercent: config.riskPercent
         }
     });
 });
@@ -665,7 +733,7 @@ app.post('/api/close', async (req, res) => {
     for (const acc of config.accounts) {
         const s = accountStates[acc.accountId];
         if (s.volume > 0) {
-            const step = calculateStepFromVolume(s.volume, config.baseVolume, config.multiplier);
+            const step = calculateStepFromVolume(s.volume, market.currentBaseVolume, config.multiplier);
             console.log(`Closing ${s.direction} position (Step ${step}, Vol: ${s.volume})...`);
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol,
@@ -704,7 +772,15 @@ app.get('/api/wallet-history', (req, res) => {
             peakEquity: market.peakEquity,
             maxDrawdown: market.maxDrawdown,
             totalTrades: market.totalTrades,
-            winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0
+            winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0,
+            autoCompound: {
+                enabled: config.autoCompound,
+                riskPercent: config.riskPercent,
+                currentBaseVolume: market.currentBaseVolume,
+                currentBaseShib: market.currentBaseShib,
+                currentRiskAmount: market.currentRiskAmount,
+                shibPerContract: config.shibPerContract
+            }
         },
         history: market.walletHistory,
         trades: tradeHistory.slice(0, 20)
@@ -756,9 +832,17 @@ app.get('/api/verify', async (req, res) => {
             peakEquity: market.peakEquity,
             maxDrawdown: market.maxDrawdown,
             totalTrades: market.totalTrades,
-            winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0
+            winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0,
+            autoCompound: {
+                enabled: config.autoCompound,
+                riskPercent: config.riskPercent,
+                currentBaseVolume: market.currentBaseVolume,
+                currentBaseShib: market.currentBaseShib,
+                currentRiskAmount: market.currentRiskAmount,
+                shibPerContract: config.shibPerContract
+            }
         },
-        message: `At ${config.leverage}x leverage, ${config.takeProfitPct}% ROI = ${requiredPriceMovePct.toFixed(3)}% price movement`
+        message: `At ${config.leverage}x leverage, ${config.takeProfitPct}% ROI = ${requiredPriceMovePct.toFixed(3)}% price movement. Auto-compounding: ${config.riskPercent}% of wallet per trade.`
     });
 });
 
@@ -771,7 +855,7 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Martingale Pro - Wallet Tracker</title>
+    <title>Martingale Pro - Auto-Compounding</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
@@ -790,13 +874,14 @@ app.get('/', (req, res) => {
         .wallet-card { background: linear-gradient(135deg, #1A212E 0%, #131824 100%); border: 1px solid #00D1B240; }
         .stat-number { font-size: 28px; font-weight: 900; }
         .chart-container { position: relative; height: 280px; width: 100%; }
+        .compound-info { background: #00D1B210; border: 1px solid #00D1B230; border-radius: 8px; padding: 12px; margin-top: 10px; }
     </style>
 </head>
 <body class="p-6">
     <div class="max-w-7xl mx-auto">
         <div class="flex justify-between items-center mb-8">
             <div>
-                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">WALLET TRACKING</span></h1>
+                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">AUTO-COMPOUND</span></h1>
                 <div class="flex items-center gap-3 mt-2">
                     <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
                     <span class="text-[10px] font-bold text-emerald-400">LIVE</span>
@@ -840,11 +925,27 @@ app.get('/', (req, res) => {
                     <p id="winRate" class="text-sm text-green-400">Win Rate: 0%</p>
                 </div>
             </div>
+            
+            <!-- Auto-Compounding Information -->
+            <div class="compound-info mt-4">
+                <div class="flex justify-between items-center">
+                    <div>
+                        <p class="text-xs text-slate-400">📈 AUTO-COMPOUNDING (${config.riskPercent}% of Wallet)</p>
+                        <p class="text-sm font-bold text-green-400" id="baseVolumeDisplay">Base Volume: 0 contracts</p>
+                        <p class="text-xs text-slate-400" id="shibDisplay">0 SHIB per trade (1 contract = ${config.shibPerContract.toLocaleString()} SHIB)</p>
+                    </div>
+                    <div class="text-right">
+                        <p class="text-xs text-slate-400">Risk Amount</p>
+                        <p class="text-sm font-bold" id="riskAmount">$0.00</p>
+                        <p class="text-xs text-slate-400" id="compoundStatus">🟢 Active</p>
+                    </div>
+                </div>
+            </div>
         </div>
 
-        <!-- Wallet Growth Chart - Fixed size container -->
+        <!-- Wallet Growth Chart -->
         <div class="card mb-8">
-            <h3 class="font-bold mb-4">📈 WALLET GROWTH CHART</h3>
+            <h3 class="font-bold mb-4">📈 WALLET GROWTH CHART (Compounding Effect)</h3>
             <div class="chart-container">
                 <canvas id="walletChart" style="max-height: 280px; width: 100%;"></canvas>
             </div>
@@ -853,7 +954,7 @@ app.get('/', (req, res) => {
         <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
             <div class="card">
                 <p class="stat-label mb-2">CONFIG</p>
-                <p class="text-sm">Base Vol: ${config.baseVolume}</p>
+                <p class="text-sm">Base Vol: <span id="configBaseVol">${config.baseVolume}</span></p>
                 <p class="text-sm">Multiplier: ${config.multiplier}x</p>
                 <p class="text-sm">Step Dist: ${config.stepDistancePct}%</p>
             </div>
@@ -928,6 +1029,10 @@ app.get('/', (req, res) => {
         
         function formatNumber(num) {
             return parseFloat(num).toFixed(8);
+        }
+        
+        function formatShib(num) {
+            return parseFloat(num).toLocaleString();
         }
         
         function updateChart(walletHistory) {
@@ -1039,6 +1144,12 @@ app.get('/', (req, res) => {
                 document.getElementById('tradeStats').innerHTML = 'Trades: ' + (data.market.totalTrades || 0);
                 document.getElementById('winRate').innerHTML = 'Win Rate: ' + (data.market.winRate || 0) + '%';
                 
+                // Update auto-compounding display
+                document.getElementById('baseVolumeDisplay').innerHTML = 'Base Volume: ' + (data.market.currentBaseVolume || 0) + ' contracts';
+                document.getElementById('shibDisplay').innerHTML = (data.market.currentBaseShib || 0).toLocaleString() + ' SHIB per trade (1 contract = ' + (data.market.shibPerContract || 1000).toLocaleString() + ' SHIB)';
+                document.getElementById('riskAmount').innerHTML = '$' + formatNumber(data.market.currentRiskAmount || 0);
+                document.getElementById('configBaseVol').innerHTML = data.market.currentBaseVolume || 0;
+                
                 if (data.market.walletHistory && data.market.walletHistory.length > 0) {
                     updateChart(data.market.walletHistory);
                 }
@@ -1117,19 +1228,16 @@ setInterval(backgroundLoop, config.pollInterval);
 app.listen(config.port, '0.0.0.0', () => {
     const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
     
-    console.log(`\n✅ Martingale Pro Started (PRECISE WALLET TRACKING)`);
+    console.log(`\n✅ Martingale Pro Started (AUTO-COMPOUNDING MODE)`);
     console.log(`📊 Symbol: ${config.symbol}`);
     console.log(`🔧 Leverage: ${config.leverage}x`);
     console.log(`🎯 Take Profit: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price movement`);
+    console.log(`💰 Auto-Compounding: ${config.riskPercent}% of total wallet per trade`);
     console.log(`📈 Step Distance: ${config.stepDistancePct}%`);
-    console.log(`💰 Fee Adjustment: ${config.takerFeeRate * 100}% included`);
     console.log(`🌐 Dashboard: http://localhost:${config.port}`);
-    console.log(`\n💰 WALLET TRACKING FEATURES:`);
-    console.log(`   • Real-time wallet balance monitoring`);
-    console.log(`   • Total P&L (realized + unrealized)`);
-    console.log(`   • Realized P&L per account`);
-    console.log(`   • Fee tracking per trade`);
-    console.log(`   • Fixed-size wallet growth chart (no layout jumping)`);
-    console.log(`   • Peak equity & max drawdown`);
-    console.log(`   • Win rate & trade statistics\n`);
+    console.log(`\n📊 AUTO-COMPOUNDING FORMULA:`);
+    console.log(`   2% of Wallet = Risk Amount USDT`);
+    console.log(`   Risk Amount ÷ Contract Value = Base Volume (contracts)`);
+    console.log(`   1 contract = ${config.shibPerContract.toLocaleString()} SHIB`);
+    console.log(`   Base Volume updates automatically as wallet grows\n`);
 });
