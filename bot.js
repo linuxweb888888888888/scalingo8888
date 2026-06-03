@@ -113,7 +113,6 @@ async function fetchPriceRest() {
             market.ask = parseFloat(res.data.tick.ask[0]);
             market.spread = ((market.ask - market.bid) / market.bid) * 100;
             market.lastPriceUpdate = Date.now();
-            console.log(`Price updated - Bid: ${market.bid}, Ask: ${market.ask}, Spread: ${market.spread}%`);
         }
     } catch (e) {
         console.error('Price fetch error:', e.message);
@@ -128,10 +127,10 @@ async function syncAccount(acc, state) {
                 contract_code: config.symbol,
                 order_id: state.pendingOrderId
             });
-            if (orderRes?.data?.[0]?.status === 6 || orderRes?.data?.[0]?.status === 7) { // 6=closed, 7=cancelled
+            if (orderRes?.data?.[0]?.status === 6 || orderRes?.data?.[0]?.status === 7) {
                 state.pendingOrderId = null;
                 state.isLocked = false;
-            } else if (orderRes?.data?.[0]?.status === 4 || orderRes?.data?.[0]?.status === 5) { // 4=partial, 5=filled
+            } else if (orderRes?.data?.[0]?.status === 4 || orderRes?.data?.[0]?.status === 5) {
                 state.pendingOrderId = null;
                 state.isLocked = false;
             } else {
@@ -141,7 +140,7 @@ async function syncAccount(acc, state) {
 
         if (state.isLocked) return;
 
-        // Get position info
+        // Get position info - THIS CONTAINS THE EXCHANGE'S ACTUAL ROI
         const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', {
             contract_code: config.symbol
         });
@@ -154,20 +153,14 @@ async function syncAccount(acc, state) {
                 state.volume = parseFloat(pos.volume);
                 state.entryPrice = parseFloat(pos.cost_open);
                 
-                // Calculate ROI using exchange method
-                const positionValue = state.volume * config.contractMultiplier * state.entryPrice;
-                const initialMargin = positionValue / config.leverage;
-                const unrealizedPnl = parseFloat(pos.profit);
-                
-                if (initialMargin > 0) {
-                    state.roi = (unrealizedPnl / initialMargin) * 100;
-                }
-                state.unrealizedUsdt = unrealizedPnl;
+                // USE EXCHANGE'S ACTUAL ROI AND PNL DIRECTLY FROM API
+                state.roi = parseFloat(pos.profit_rate); // This is the exchange's ROI percentage
+                state.unrealizedUsdt = parseFloat(pos.profit); // This is the exchange's PnL
                 
                 if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
                 if (!state.startTime) state.startTime = new Date().toLocaleString();
                 
-                console.log(`${state.direction.toUpperCase()} Account - ROI: ${state.roi.toFixed(4)}%, PnL: ${state.unrealizedUsdt.toFixed(8)} USDT`);
+                console.log(`${state.direction.toUpperCase()} - ROI: ${state.roi.toFixed(4)}%, PnL: ${state.unrealizedUsdt.toFixed(8)} USDT, Vol: ${state.volume}`);
             } else {
                 state.volume = 0;
                 state.roi = 0;
@@ -188,7 +181,6 @@ async function syncAccount(acc, state) {
             state.currentEquity = parseFloat(accRes.data[0].margin_balance);
             state.availableMargin = parseFloat(accRes.data[0].withdraw_available);
             if (state.initialEquity === null) state.initialEquity = state.currentEquity;
-            console.log(`Account ${acc.accountId} Equity: ${state.currentEquity.toFixed(4)} USDT`);
         }
     } catch (e) {
         console.error(`Sync error for account ${acc.accountId}:`, e.message);
@@ -196,23 +188,8 @@ async function syncAccount(acc, state) {
 }
 
 function logTradeExchangeStyle(state, exitPrice, exitTime) {
-    const faceValue = config.contractMultiplier;
-    const entryNotional = state.volume * state.entryPrice * faceValue;
-    const exitNotional = state.volume * exitPrice * faceValue;
-    const entryFee = entryNotional * config.takerFeeRate;
-    const exitFee = exitNotional * config.takerFeeRate;
-    const totalFees = entryFee + exitFee;
-    
-    let rawPnl = 0;
-    if (state.direction === 'buy') {
-        rawPnl = (exitPrice - state.entryPrice) * state.volume * faceValue;
-    } else {
-        rawPnl = (state.entryPrice - exitPrice) * state.volume * faceValue;
-    }
-    
-    const realizedPnl = rawPnl - totalFees;
-    const initialMargin = entryNotional / config.leverage;
-    const exchangeRoi = initialMargin > 0 ? (realizedPnl / initialMargin) * 100 : 0;
+    // Use the exchange's actual realized PnL from the close
+    const realizedPnl = state.unrealizedUsdt; // This is the PnL from the position that was closed
     
     tradeHistory.unshift({
         symbol: config.symbol.replace('-', '') + 'Perpetual',
@@ -222,7 +199,7 @@ function logTradeExchangeStyle(state, exitPrice, exitTime) {
         volume: state.volume,
         entryPrice: state.entryPrice.toFixed(8),
         exitPrice: exitPrice.toFixed(8),
-        roi: exchangeRoi.toFixed(4) + '%',
+        roi: state.roi.toFixed(4) + '%',
         netPnlUsdt: realizedPnl.toFixed(8)
     });
     
@@ -279,7 +256,7 @@ async function processMartingale() {
         // Open initial position
         if (state.volume === 0) {
             if (market.spread > config.maxStartSpread && market.spread > 0) {
-                state.lastAction = `Wait Spread (${market.spread.toFixed(2)}% > ${config.maxStartSpread}%)`;
+                state.lastAction = `Wait Spread (${market.spread.toFixed(2)}%)`;
                 continue;
             }
             
@@ -301,19 +278,18 @@ async function processMartingale() {
                 state.lastAction = "Position Opening";
             } else {
                 state.isLocked = false;
-                state.lastAction = "Open Failed: " + (res?.err_msg || 'Unknown');
+                state.lastAction = "Open Failed";
                 console.error(`Open order failed:`, res);
             }
             continue;
         }
 
-        // Take profit
+        // Take profit - Use exchange's ROI directly
         if (state.roi >= config.takeProfitPct) {
             console.log(`Take profit triggered for ${state.direction} - ROI: ${state.roi.toFixed(4)}%`);
             const v = state.volume;
             state.isLocked = true;
             const exitTime = new Date().toLocaleString();
-            logTradeExchangeStyle(state, currentPrice, exitTime);
             
             const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol,
@@ -327,6 +303,15 @@ async function processMartingale() {
             if (res?.status === 'ok' && res.data?.order_id_str) {
                 state.pendingOrderId = res.data.order_id_str;
                 state.lastAction = "Take Profit Close";
+                // Log the trade after confirming close
+                setTimeout(async () => {
+                    // Get final PnL before resetting
+                    const finalPos = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', {
+                        contract_code: config.symbol
+                    });
+                    const finalPnL = finalPos?.data?.find(p => p.direction === state.direction)?.profit || 0;
+                    logTradeExchangeStyle(state, currentPrice, exitTime);
+                }, 2000);
             } else {
                 state.isLocked = false;
                 state.lastAction = "TP Failed";
@@ -492,14 +477,14 @@ app.get('/', (req, res) => {
             </div>
             <div class="exchange-card p-5">
                 <p class="stat-label mb-2">LONG ACCOUNT</p>
-                <p id="lRoi" class="text-2xl font-black value-positive">0.0000%</p>
+                <p id="lRoi" class="text-2xl font-black">0.0000%</p>
                 <p id="lPnl" class="text-sm mono mt-1">$0.00000000</p>
                 <p id="lStep" class="text-[10px] text-slate-500 mt-2">STEP 0 | VOL 0</p>
                 <p id="lAction" class="text-[9px] text-indigo-400 mt-1"></p>
             </div>
             <div class="exchange-card p-5">
                 <p class="stat-label mb-2">SHORT ACCOUNT</p>
-                <p id="sRoi" class="text-2xl font-black value-negative">0.0000%</p>
+                <p id="sRoi" class="text-2xl font-black">0.0000%</p>
                 <p id="sPnl" class="text-sm mono mt-1">$0.00000000</p>
                 <p id="sStep" class="text-[10px] text-slate-500 mt-2">STEP 0 | VOL 0</p>
                 <p id="sAction" class="text-[9px] text-indigo-400 mt-1"></p>
@@ -543,16 +528,21 @@ app.get('/', (req, res) => {
                 
                 if (d.accounts && d.accounts.length >= 2) {
                     const long = d.accounts[0], short = d.accounts[1];
+                    
                     const lElem = document.getElementById('lRoi');
-                    lElem.innerHTML = (long.roi >= 0 ? '+' : '') + long.roi.toFixed(4) + '%';
-                    lElem.className = 'text-2xl font-black ' + (long.roi >= 0 ? 'value-positive' : 'value-negative');
+                    const longRoi = parseFloat(long.roi);
+                    lElem.innerHTML = (longRoi >= 0 ? '+' : '') + longRoi.toFixed(4) + '%';
+                    lElem.className = 'text-2xl font-black ' + (longRoi >= 0 ? 'value-positive' : 'value-negative');
+                    
                     document.getElementById('lPnl').innerHTML = (long.unrealizedUsdt >= 0 ? '+' : '') + long.unrealizedUsdt.toFixed(8);
                     document.getElementById('lStep').innerHTML = 'STEP ' + long.step + ' | VOL ' + long.volume;
                     document.getElementById('lAction').innerHTML = long.lastAction;
                     
                     const sElem = document.getElementById('sRoi');
-                    sElem.innerHTML = (short.roi >= 0 ? '+' : '') + short.roi.toFixed(4) + '%';
-                    sElem.className = 'text-2xl font-black ' + (short.roi >= 0 ? 'value-positive' : 'value-negative');
+                    const shortRoi = parseFloat(short.roi);
+                    sElem.innerHTML = (shortRoi >= 0 ? '+' : '') + shortRoi.toFixed(4) + '%';
+                    sElem.className = 'text-2xl font-black ' + (shortRoi >= 0 ? 'value-positive' : 'value-negative');
+                    
                     document.getElementById('sPnl').innerHTML = (short.unrealizedUsdt >= 0 ? '+' : '') + short.unrealizedUsdt.toFixed(8);
                     document.getElementById('sStep').innerHTML = 'STEP ' + short.step + ' | VOL ' + short.volume;
                     document.getElementById('sAction').innerHTML = short.lastAction;
@@ -562,14 +552,17 @@ app.get('/', (req, res) => {
                 if (d.tradeHistory && d.tradeHistory.length > 0) {
                     d.tradeHistory.forEach(h => {
                         const roiVal = parseFloat(h.roi);
-                        html += '<tr><td class="font-bold">' + h.symbol + '</td>';
+                        html += '<tr class="hover:bg-[#1A212E]">';
+                        html += '<td class="font-bold">' + h.symbol + '</td>';
                         html += '<td><span class="' + (h.side === 'LONG' ? 'badge-long' : 'badge-short') + '">' + h.side + '</span></td>';
                         html += '<td class="mono text-xs">' + (h.openTime || '--') + '</td>';
                         html += '<td class="mono text-xs">' + (h.closeTime || '--') + '</td>';
-                        html += '<td>' + h.volume + '</td><td class="mono">' + h.entryPrice + '</td>';
+                        html += '<td>' + h.volume + '</td>';
+                        html += '<td class="mono">' + h.entryPrice + '</td>';
                         html += '<td class="mono">' + h.exitPrice + '</td>';
                         html += '<td class="font-bold ' + (roiVal >= 0 ? 'value-positive' : 'value-negative') + '">' + (roiVal >= 0 ? '+' : '') + h.roi + '</td>';
-                        html += '<td class="mono font-bold ' + (parseFloat(h.netPnlUsdt) >= 0 ? 'value-positive' : 'value-negative') + '">' + (parseFloat(h.netPnlUsdt) >= 0 ? '+' : '') + h.netPnlUsdt + ' USDT</td></tr>';
+                        html += '<td class="mono font-bold ' + (parseFloat(h.netPnlUsdt) >= 0 ? 'value-positive' : 'value-negative') + '">' + (parseFloat(h.netPnlUsdt) >= 0 ? '+' : '') + h.netPnlUsdt + ' USDT</td>';
+                        html += '</tr>';
                     });
                 } else {
                     html = '<tr><td colspan="9" class="text-center text-slate-500 py-12">No trade history yet</td></tr>';
