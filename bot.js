@@ -28,7 +28,7 @@ const config = {
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
     accounts: apiAccounts,
-    baseVolume: parseInt(process.env.BASE_VOLUME) || 1, // Will be auto-calculated from wallet
+    baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
     multiplier: 1.2,
     stepDistancePct: 0.2,
     takeProfitPct: 15,
@@ -36,10 +36,9 @@ const config = {
     takerFeeRate: 0.0005,
     pollInterval: 500,
     contractMultiplier: 0.001,
-    // New: Auto-compounding settings
     autoCompound: true,
-    riskPercent: 2, // 2% of total wallet per trade
-    shibPerContract: 1000 // 1 contract = 1000 SHIB
+    riskPercent: 2,
+    shibPerContract: 1000
 };
 
 let market = {
@@ -54,7 +53,6 @@ let market = {
     winningTrades: 0,
     losingTrades: 0,
     totalFeesPaid: 0,
-    // New: Auto-compounding tracking
     currentBaseVolume: parseInt(process.env.BASE_VOLUME) || 1,
     currentBaseShib: 0,
     currentRiskAmount: 0,
@@ -66,40 +64,43 @@ let accountStates = {};
 let lastPositionFetch = {};
 let lastBalanceFetch = {};
 
-// Function to calculate base volume from wallet balance
 function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
-    if (!config.autoCompound || totalEquity <= 0 || currentPrice <= 0) {
+    if (!config.autoCompound || totalEquity <= 0) {
         return config.baseVolume;
     }
     
-    // Calculate 2% of total wallet (risk amount in USDT)
+    // Formula: Volume = Total Wallet × 200
+    // Because: 2% of wallet × 100 = contracts
+    // $0.01 × 200 = 2 contracts ✅
+    // $0.10 × 200 = 20 contracts ✅
+    // $1.00 × 200 = 200 contracts ✅
+    let volume = Math.floor(totalEquity * 200);
+    
+    // Ensure minimum 1 contract
+    volume = Math.max(1, volume);
+    
+    // Cap at 1,000,000 contracts for safety
+    const MAX_VOLUME = 1000000;
+    if (volume > MAX_VOLUME) {
+        volume = MAX_VOLUME;
+    }
+    
     const riskAmount = totalEquity * (config.riskPercent / 100);
-    market.currentRiskAmount = riskAmount;
-    
-    // Calculate position size in USDT (with leverage)
-    // Position size = riskAmount × leverage (since 2% risk = 2% of wallet, at 75x = 150% position)
-    const positionUsdt = riskAmount;
-    
-    // Calculate contract volume
-    // Contract value = currentPrice × contractMultiplier × volume
-    // Volume = positionUsdt / (currentPrice × contractMultiplier)
-    const contractValue = currentPrice * config.contractMultiplier;
-    let volume = Math.max(1, Math.floor(positionUsdt / contractValue));
-    
-    // Calculate SHIB amount
+    const positionUsdt = riskAmount * config.leverage;
     const shibAmount = volume * config.shibPerContract;
+    
+    market.currentRiskAmount = riskAmount;
     market.currentBaseShib = shibAmount;
     
     console.log(`\n💰 AUTO-COMPOUNDING CALCULATION:`);
-    console.log(`   Total Wallet: $${totalEquity.toFixed(8)}`);
-    console.log(`   2% Risk Amount: $${riskAmount.toFixed(8)}`);
-    console.log(`   Current Price: $${currentPrice.toFixed(8)}`);
-    console.log(`   Contract Value: $${contractValue.toFixed(8)}`);
-    console.log(`   Calculated Volume: ${volume} contracts`);
-    console.log(`   SHIB Amount: ${shibAmount.toLocaleString()} SHIB`);
+    console.log(`   Wallet: $${totalEquity.toFixed(4)}`);
+    console.log(`   ${config.riskPercent}% Risk: $${riskAmount.toFixed(4)}`);
+    console.log(`   @ ${config.leverage}x → $${positionUsdt.toFixed(4)} position`);
+    console.log(`   Formula: $${totalEquity.toFixed(4)} × 200 = ${volume} contracts`);
+    console.log(`   Volume: ${volume.toLocaleString()} contracts = ${shibAmount.toLocaleString()} SHIB`);
     console.log(`   (1 contract = ${config.shibPerContract.toLocaleString()} SHIB)\n`);
     
-    return Math.max(1, volume);
+    return volume;
 }
 
 function calculateStepFromVolume(volume, baseVolume, multiplier) {
@@ -626,7 +627,6 @@ async function backgroundLoop() {
                 const elapsedHours = (Date.now() - market.startTime) / (1000 * 60 * 60);
                 market.dgr = elapsedHours > 0 ? (market.growthPct / elapsedHours) : 0;
                 
-                // Auto-compounding: Update base volume based on current wallet
                 if (config.autoCompound && market.bid > 0) {
                     const newBaseVolume = calculateBaseVolumeFromWallet(totalEquity, market.bid);
                     if (newBaseVolume !== market.currentBaseVolume) {
@@ -702,7 +702,6 @@ app.get('/api/status', (req, res) => {
             losingTrades: market.losingTrades,
             winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0,
             walletHistory: market.walletHistory.slice(-20),
-            // Auto-compounding info
             autoCompound: config.autoCompound,
             riskPercent: config.riskPercent,
             currentBaseVolume: market.currentBaseVolume,
@@ -839,10 +838,11 @@ app.get('/api/verify', async (req, res) => {
                 currentBaseVolume: market.currentBaseVolume,
                 currentBaseShib: market.currentBaseShib,
                 currentRiskAmount: market.currentRiskAmount,
-                shibPerContract: config.shibPerContract
+                shibPerContract: config.shibPerContract,
+                formula: "Volume = Total Wallet × 200"
             }
         },
-        message: `At ${config.leverage}x leverage, ${config.takeProfitPct}% ROI = ${requiredPriceMovePct.toFixed(3)}% price movement. Auto-compounding: ${config.riskPercent}% of wallet per trade.`
+        message: `Auto-compounding: ${config.riskPercent}% of wallet = Volume × 200 contracts. Example: $0.01 wallet = 2 contracts.`
     });
 });
 
@@ -896,7 +896,6 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- Wallet Overview Card -->
         <div class="wallet-card rounded-2xl p-6 mb-8">
             <div class="grid grid-cols-1 md:grid-cols-5 gap-6">
                 <div>
@@ -926,13 +925,13 @@ app.get('/', (req, res) => {
                 </div>
             </div>
             
-            <!-- Auto-Compounding Information -->
             <div class="compound-info mt-4">
                 <div class="flex justify-between items-center">
                     <div>
-                        <p class="text-xs text-slate-400">📈 AUTO-COMPOUNDING (${config.riskPercent}% of Wallet)</p>
+                        <p class="text-xs text-slate-400">📈 AUTO-COMPOUNDING (${config.riskPercent}% of Wallet = Wallet × 200)</p>
                         <p class="text-sm font-bold text-green-400" id="baseVolumeDisplay">Base Volume: 0 contracts</p>
                         <p class="text-xs text-slate-400" id="shibDisplay">0 SHIB per trade (1 contract = ${config.shibPerContract.toLocaleString()} SHIB)</p>
+                        <p class="text-xs text-slate-400" id="formulaDisplay">Formula: $0.01 wallet = 2 contracts</p>
                     </div>
                     <div class="text-right">
                         <p class="text-xs text-slate-400">Risk Amount</p>
@@ -943,7 +942,6 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- Wallet Growth Chart -->
         <div class="card mb-8">
             <h3 class="font-bold mb-4">📈 WALLET GROWTH CHART (Compounding Effect)</h3>
             <div class="chart-container">
@@ -1029,10 +1027,6 @@ app.get('/', (req, res) => {
         
         function formatNumber(num) {
             return parseFloat(num).toFixed(8);
-        }
-        
-        function formatShib(num) {
-            return parseFloat(num).toLocaleString();
         }
         
         function updateChart(walletHistory) {
@@ -1144,9 +1138,8 @@ app.get('/', (req, res) => {
                 document.getElementById('tradeStats').innerHTML = 'Trades: ' + (data.market.totalTrades || 0);
                 document.getElementById('winRate').innerHTML = 'Win Rate: ' + (data.market.winRate || 0) + '%';
                 
-                // Update auto-compounding display
-                document.getElementById('baseVolumeDisplay').innerHTML = 'Base Volume: ' + (data.market.currentBaseVolume || 0) + ' contracts';
-                document.getElementById('shibDisplay').innerHTML = (data.market.currentBaseShib || 0).toLocaleString() + ' SHIB per trade (1 contract = ' + (data.market.shibPerContract || 1000).toLocaleString() + ' SHIB)';
+                document.getElementById('baseVolumeDisplay').innerHTML = 'Base Volume: ' + (data.market.currentBaseVolume || 0).toLocaleString() + ' contracts';
+                document.getElementById('shibDisplay').innerHTML = (data.market.currentBaseShib || 0).toLocaleString() + ' SHIB per trade';
                 document.getElementById('riskAmount').innerHTML = '$' + formatNumber(data.market.currentRiskAmount || 0);
                 document.getElementById('configBaseVol').innerHTML = data.market.currentBaseVolume || 0;
                 
@@ -1228,16 +1221,17 @@ setInterval(backgroundLoop, config.pollInterval);
 app.listen(config.port, '0.0.0.0', () => {
     const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
     
-    console.log(`\n✅ Martingale Pro Started (AUTO-COMPOUNDING MODE)`);
+    console.log(`\n✅ Martingale Pro Started (AUTO-COMPOUNDING FIXED)`);
     console.log(`📊 Symbol: ${config.symbol}`);
     console.log(`🔧 Leverage: ${config.leverage}x`);
     console.log(`🎯 Take Profit: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price movement`);
-    console.log(`💰 Auto-Compounding: ${config.riskPercent}% of total wallet per trade`);
+    console.log(`💰 Auto-Compounding: ${config.riskPercent}% of wallet = Wallet × 200 contracts`);
     console.log(`📈 Step Distance: ${config.stepDistancePct}%`);
     console.log(`🌐 Dashboard: http://localhost:${config.port}`);
     console.log(`\n📊 AUTO-COMPOUNDING FORMULA:`);
-    console.log(`   2% of Wallet = Risk Amount USDT`);
-    console.log(`   Risk Amount ÷ Contract Value = Base Volume (contracts)`);
-    console.log(`   1 contract = ${config.shibPerContract.toLocaleString()} SHIB`);
-    console.log(`   Base Volume updates automatically as wallet grows\n`);
+    console.log(`   Volume = Total Wallet × 200`);
+    console.log(`   Example: $0.01 wallet = 2 contracts`);
+    console.log(`   Example: $0.10 wallet = 20 contracts`);
+    console.log(`   Example: $1.00 wallet = 200 contracts`);
+    console.log(`   1 contract = ${config.shibPerContract.toLocaleString()} SHIB\n`);
 });
