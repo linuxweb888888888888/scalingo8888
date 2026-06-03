@@ -42,7 +42,15 @@ let market = {
     status: 'Active', bid: 0, ask: 0, spread: 0,
     totalNetGain: 0, growthPct: 0, dgr: 0,
     initialTotalEquity: 0, startTime: Date.now(),
-    lastPriceUpdate: 0
+    lastPriceUpdate: 0,
+    // Wallet growth tracking
+    walletHistory: [],
+    peakEquity: 0,
+    maxDrawdown: 0,
+    totalTrades: 0,
+    winningTrades: 0,
+    losingTrades: 0,
+    totalFeesPaid: 0
 };
 
 let tradeHistory = [];
@@ -80,29 +88,51 @@ function calculateVolumeForStep(step, baseVolume, multiplier) {
     return totalVolume;
 }
 
-// FIXED: Calculate target price based on leverage
-// At 75x leverage, 15% ROI = 0.2% price movement
+// Calculate target price based on leverage
 function calculateTargetPrice(state) {
-    // Required price movement percentage for target ROI
-    // Example: 15% ROI at 75x leverage = 0.2% price movement
     const requiredPriceMovePct = config.takeProfitPct / config.leverage;
     
     if (state.direction === 'buy') {
-        // LONG: Need price to go UP by requiredPriceMovePct
         const targetPrice = state.entryPrice * (1 + (requiredPriceMovePct / 100));
-        // Add fee (you pay taker fee when selling to close)
         const feeAdjustedTarget = targetPrice * (1 + config.takerFeeRate);
-        
-        console.log(`[LONG TP Calc] Entry: ${state.entryPrice.toFixed(8)}, Required Move: ${requiredPriceMovePct}%, Target Price: ${targetPrice.toFixed(8)}, +Fee: ${feeAdjustedTarget.toFixed(8)}`);
         return feeAdjustedTarget;
     } else {
-        // SHORT: Need price to go DOWN by requiredPriceMovePct
         const targetPrice = state.entryPrice * (1 - (requiredPriceMovePct / 100));
-        // Subtract fee (you pay taker fee when buying to close)
         const feeAdjustedTarget = targetPrice * (1 - config.takerFeeRate);
-        
-        console.log(`[SHORT TP Calc] Entry: ${state.entryPrice.toFixed(8)}, Required Move: ${requiredPriceMovePct}%, Target Price: ${targetPrice.toFixed(8)}, -Fee: ${feeAdjustedTarget.toFixed(8)}`);
         return feeAdjustedTarget;
+    }
+}
+
+// Update wallet growth metrics
+function updateWalletGrowth(totalEquity) {
+    const now = Date.now();
+    
+    // Record wallet history every minute (only if changed)
+    const lastRecord = market.walletHistory[market.walletHistory.length - 1];
+    if (!lastRecord || (now - lastRecord.timestamp) > 60000 || Math.abs(lastRecord.equity - totalEquity) > 0.000001) {
+        market.walletHistory.push({
+            timestamp: now,
+            time: new Date().toLocaleString(),
+            equity: totalEquity,
+            pnl: totalEquity - market.initialTotalEquity,
+            pnlPercent: market.initialTotalEquity > 0 ? ((totalEquity - market.initialTotalEquity) / market.initialTotalEquity) * 100 : 0
+        });
+        
+        // Keep last 100 records
+        if (market.walletHistory.length > 100) market.walletHistory.shift();
+    }
+    
+    // Update peak equity
+    if (totalEquity > market.peakEquity) {
+        market.peakEquity = totalEquity;
+    }
+    
+    // Update max drawdown
+    if (market.peakEquity > 0) {
+        const currentDrawdown = ((market.peakEquity - totalEquity) / market.peakEquity) * 100;
+        if (currentDrawdown > market.maxDrawdown) {
+            market.maxDrawdown = currentDrawdown;
+        }
     }
 }
 
@@ -119,7 +149,10 @@ config.accounts.forEach((account, idx) => {
         roiLatencyMs: 0,
         roiLatencyHistory: [],
         lastRoiUpdateTime: Date.now(),
-        targetPrice: 0
+        targetPrice: 0,
+        // Account specific tracking
+        realizedPnl: 0,
+        totalFees: 0
     };
 });
 
@@ -228,7 +261,6 @@ async function syncAccount(acc, state) {
             state.entryPrice = newEntryPrice;
             state.unrealizedUsdt = newUnrealizedUsdt;
             
-            // Calculate step based on volume
             const calculatedStep = calculateStepFromVolume(newVolume, config.baseVolume, config.multiplier);
             
             if (Math.abs(newExchangeRoi - state.roi) > 0.01) {
@@ -254,7 +286,6 @@ async function syncAccount(acc, state) {
                 state.lastRoiUpdateTime = now;
             }
             
-            // Update target price whenever entry price changes
             state.targetPrice = calculateTargetPrice(state);
             
             if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
@@ -285,14 +316,36 @@ async function syncAccount(acc, state) {
     });
 
     if (accRes?.status === 'ok' && accRes.data?.[0]) {
+        const oldEquity = state.currentEquity;
         state.currentEquity = parseFloat(accRes.data[0].margin_balance);
         state.availableMargin = parseFloat(accRes.data[0].withdraw_available);
-        if (state.initialEquity === null) state.initialEquity = state.currentEquity;
+        
+        if (state.initialEquity === null) {
+            state.initialEquity = state.currentEquity;
+        }
+        
+        // Track realized PnL changes
+        if (oldEquity > 0 && Math.abs(state.currentEquity - oldEquity) > 0.000001) {
+            const change = state.currentEquity - oldEquity;
+            if (Math.abs(change) > 0.0001) { // Ignore tiny fluctuations
+                console.log(`[${state.direction.toUpperCase()}] Equity: $${oldEquity.toFixed(8)} → $${state.currentEquity.toFixed(8)} (${change >= 0 ? '+' : ''}$${change.toFixed(8)})`);
+            }
+        }
     }
 }
 
 function logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl) {
     const step = calculateStepFromVolume(state.volume, config.baseVolume, config.multiplier);
+    const estimatedFee = Math.abs(finalPnl) * config.takerFeeRate;
+    
+    // Update trade statistics
+    market.totalTrades++;
+    if (finalPnl >= 0) {
+        market.winningTrades++;
+    } else {
+        market.losingTrades++;
+    }
+    market.totalFeesPaid += estimatedFee;
     
     tradeHistory.unshift({
         symbol: config.symbol.replace('-', '') + 'Perpetual',
@@ -304,10 +357,18 @@ function logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl) {
         entryPrice: state.entryPrice.toFixed(8),
         exitPrice: exitPrice.toFixed(8),
         roi: finalRoi.toFixed(2) + '%',
-        netPnlUsdt: finalPnl.toFixed(8)
+        netPnlUsdt: finalPnl.toFixed(8),
+        estimatedFee: estimatedFee.toFixed(8)
     });
     
     if (tradeHistory.length > 20) tradeHistory.pop();
+    
+    // Update account realized PnL
+    state.realizedPnl += finalPnl;
+    state.totalFees += estimatedFee;
+    
+    console.log(`📊 TRADE CLOSED: ${state.direction.toUpperCase()} | ROI: ${finalRoi.toFixed(2)}% | PnL: ${finalPnl >= 0 ? '+' : ''}$${finalPnl.toFixed(8)} | Fee: $${estimatedFee.toFixed(8)}`);
+    console.log(`📈 Account ${state.direction.toUpperCase()} Total: $${state.realizedPnl.toFixed(8)} PnL | $${state.totalFees.toFixed(8)} Fees`);
 }
 
 function startWS() {
@@ -465,10 +526,8 @@ async function processMartingale() {
             priceMove = ((currentPrice - state.lastStepPrice) / state.lastStepPrice) * 100;
         }
         
-        // Calculate current step from volume
         const currentStep = calculateStepFromVolume(state.volume, config.baseVolume, config.multiplier);
         
-        // Check if we need to add more (price moved against us by stepDistancePct)
         if (priceMove >= config.stepDistancePct && state.lastStepPrice > 0) {
             const nextStepNumber = currentStep + 1;
             let nextVol;
@@ -524,14 +583,29 @@ async function backgroundLoop() {
         if (s1 && s2) {
             if (market.initialTotalEquity === 0 && s1.initialEquity !== null && s2.initialEquity !== null) {
                 market.initialTotalEquity = s1.initialEquity + s2.initialEquity;
-                console.log(`Initial Total Equity: ${market.initialTotalEquity.toFixed(8)} USDT`);
+                market.peakEquity = market.initialTotalEquity;
+                console.log(`\n💰 INITIAL TOTAL EQUITY: $${market.initialTotalEquity.toFixed(8)} USDT`);
+                console.log(`📊 Starting wallet tracking...\n`);
             }
             
             if (market.initialTotalEquity > 0) {
-                market.totalNetGain = (s1.currentEquity + s2.currentEquity) - market.initialTotalEquity;
+                const totalEquity = s1.currentEquity + s2.currentEquity;
+                const totalRealizedPnl = s1.realizedPnl + s2.realizedPnl;
+                const totalFees = s1.totalFees + s2.totalFees;
+                
+                market.totalNetGain = totalEquity - market.initialTotalEquity;
                 market.growthPct = (market.totalNetGain / market.initialTotalEquity) * 100;
-                const elapsedDays = (Date.now() - market.startTime) / (1000 * 60 * 60 * 24);
-                market.dgr = elapsedDays > 0 ? (market.growthPct / elapsedDays) : 0;
+                const elapsedHours = (Date.now() - market.startTime) / (1000 * 60 * 60);
+                market.dgr = elapsedHours > 0 ? (market.growthPct / elapsedHours) : 0;
+                
+                // Update wallet growth history
+                updateWalletGrowth(totalEquity);
+                
+                // Log significant changes (>0.1% change)
+                const lastRecord = market.walletHistory[market.walletHistory.length - 2];
+                if (lastRecord && Math.abs(market.growthPct - lastRecord.pnlPercent) > 0.1) {
+                    console.log(`💰 WALLET: $${totalEquity.toFixed(8)} | PnL: ${market.totalNetGain >= 0 ? '+' : ''}$${market.totalNetGain.toFixed(8)} (${market.growthPct >= 0 ? '+' : ''}${market.growthPct.toFixed(2)}%) | Realized: $${totalRealizedPnl.toFixed(8)} | Fees: $${totalFees.toFixed(8)}`);
+                }
             }
         }
         
@@ -544,6 +618,12 @@ async function backgroundLoop() {
 }
 
 app.get('/api/status', (req, res) => {
+    const s1 = accountStates[1];
+    const s2 = accountStates[2];
+    const totalEquity = (s1?.currentEquity || 0) + (s2?.currentEquity || 0);
+    const totalRealizedPnl = (s1?.realizedPnl || 0) + (s2?.realizedPnl || 0);
+    const totalFees = (s1?.totalFees || 0) + (s2?.totalFees || 0);
+    
     const accountsWithInfo = Object.values(accountStates).map(state => {
         const step = calculateStepFromVolume(state.volume, config.baseVolume, config.multiplier);
         const expectedVol = calculateVolumeForStep(step, config.baseVolume, config.multiplier);
@@ -561,12 +641,31 @@ app.get('/api/status', (req, res) => {
             startTime: state.startTime,
             targetPrice: state.targetPrice,
             requiredPriceMoveForTP: `${requiredPriceMovePct}%`,
+            currentEquity: state.currentEquity,
+            initialEquity: state.initialEquity,
+            realizedPnl: state.realizedPnl,
+            totalFees: state.totalFees,
             roiLatencyHistory: state.roiLatencyHistory.slice(0, 5)
         };
     });
     
     res.json({
-        market,
+        market: {
+            ...market,
+            totalEquity: totalEquity,
+            totalRealizedPnl: totalRealizedPnl,
+            totalFeesPaid: totalFees,
+            totalNetGain: market.totalNetGain,
+            growthPct: market.growthPct,
+            dgr: market.dgr,
+            peakEquity: market.peakEquity,
+            maxDrawdown: market.maxDrawdown,
+            totalTrades: market.totalTrades,
+            winningTrades: market.winningTrades,
+            losingTrades: market.losingTrades,
+            winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0,
+            walletHistory: market.walletHistory.slice(-20) // Last 20 records
+        },
         accounts: accountsWithInfo,
         tradeHistory,
         config: {
@@ -614,6 +713,26 @@ app.post('/api/force-sync', async (req, res) => {
     res.json({ status: 'ok', message: 'Force sync completed' });
 });
 
+app.get('/api/wallet-history', (req, res) => {
+    const s1 = accountStates[1];
+    const s2 = accountStates[2];
+    
+    res.json({
+        currentWallet: {
+            totalEquity: (s1?.currentEquity || 0) + (s2?.currentEquity || 0),
+            totalRealizedPnl: (s1?.realizedPnl || 0) + (s2?.realizedPnl || 0),
+            totalFees: (s1?.totalFees || 0) + (s2?.totalFees || 0),
+            growthPct: market.growthPct,
+            peakEquity: market.peakEquity,
+            maxDrawdown: market.maxDrawdown,
+            totalTrades: market.totalTrades,
+            winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0
+        },
+        history: market.walletHistory,
+        trades: tradeHistory.slice(0, 20)
+    });
+});
+
 app.get('/api/verify', async (req, res) => {
     const requiredPriceMovePct = config.takeProfitPct / config.leverage;
     
@@ -639,7 +758,9 @@ app.get('/api/verify', async (req, res) => {
                     current_ask: market.ask,
                     current_bid: market.bid,
                     required_price_move_for_tp: requiredPriceMovePct.toFixed(3) + '%',
-                    leverage: config.leverage
+                    leverage: config.leverage,
+                    realized_pnl: state.realizedPnl,
+                    total_fees: state.totalFees
                 });
             }
         }
@@ -647,8 +768,19 @@ app.get('/api/verify', async (req, res) => {
     
     res.json({
         verified: verification,
-        message: `At ${config.leverage}x leverage, ${config.takeProfitPct}% ROI = ${requiredPriceMovePct.toFixed(3)}% price movement`,
-        take_profit_logic: `LONG: market.ask >= targetPrice (entry × ${(1 + requiredPriceMovePct/100).toFixed(6)}) | SHORT: market.bid <= targetPrice (entry × ${(1 - requiredPriceMovePct/100).toFixed(6)})`
+        wallet: {
+            initialEquity: market.initialTotalEquity,
+            currentEquity: (accountStates[1]?.currentEquity || 0) + (accountStates[2]?.currentEquity || 0),
+            totalPnL: market.totalNetGain,
+            totalPnLPercent: market.growthPct,
+            totalRealizedPnL: (accountStates[1]?.realizedPnl || 0) + (accountStates[2]?.realizedPnl || 0),
+            totalFees: (accountStates[1]?.totalFees || 0) + (accountStates[2]?.totalFees || 0),
+            peakEquity: market.peakEquity,
+            maxDrawdown: market.maxDrawdown,
+            totalTrades: market.totalTrades,
+            winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0
+        },
+        message: `At ${config.leverage}x leverage, ${config.takeProfitPct}% ROI = ${requiredPriceMovePct.toFixed(3)}% price movement`
     });
 });
 
@@ -661,8 +793,9 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Martingale Pro - Fixed TP Calculation</title>
+    <title>Martingale Pro - Wallet Growth Tracker</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         * { font-family: system-ui, -apple-system, sans-serif; }
         body { background: #0A0E17; color: #E8EDF2; }
@@ -677,13 +810,15 @@ app.get('/', (req, res) => {
         .sync-btn { background: #00D1B220; border-color: #00D1B2; color: #00D1B2; margin-left: 10px; }
         .step-badge { background: #6366F120; color: #6366F1; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }
         .info-box { background: #1A212E; padding: 10px; border-radius: 8px; margin-top: 10px; }
+        .wallet-card { background: linear-gradient(135deg, #1A212E 0%, #131824 100%); border: 1px solid #00D1B240; }
+        .stat-number { font-size: 28px; font-weight: 900; }
     </style>
 </head>
 <body class="p-6">
     <div class="max-w-7xl mx-auto">
         <div class="flex justify-between items-center mb-8">
             <div>
-                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">FIXED TP</span></h1>
+                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">WALLET TRACKING</span></h1>
                 <div class="flex items-center gap-3 mt-2">
                     <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
                     <span class="text-[10px] font-bold text-emerald-400">LIVE</span>
@@ -698,10 +833,41 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <div class="info-box mb-4">
-            <p class="text-xs text-green-400">✅ FIXED: Target price now correctly calculated for leverage</p>
-            <p class="text-xs text-slate-400">At ${config.leverage}x leverage, ${config.takeProfitPct}% ROI requires only ${requiredPriceMovePct}% price movement</p>
-            <p class="text-xs text-slate-400">Example: Entry $100 → Target $${(100 * (1 + requiredPriceMovePct/100)).toFixed(2)} (${requiredPriceMovePct}% move)</p>
+        <!-- Wallet Overview Card -->
+        <div class="wallet-card rounded-2xl p-6 mb-8">
+            <div class="grid grid-cols-1 md:grid-cols-5 gap-6">
+                <div>
+                    <p class="stat-label">TOTAL WALLET</p>
+                    <p id="totalWallet" class="stat-number value-positive">$0.00000000</p>
+                    <p id="walletChange" class="text-xs"></p>
+                </div>
+                <div>
+                    <p class="stat-label">TOTAL P&L</p>
+                    <p id="totalPnl" class="stat-number">$0.00000000</p>
+                    <p id="pnlPercent" class="text-xs"></p>
+                </div>
+                <div>
+                    <p class="stat-label">REALIZED P&L</p>
+                    <p id="realizedPnl" class="stat-number">$0.00000000</p>
+                    <p id="feesPaid" class="text-xs text-slate-500">Fees: $0.00</p>
+                </div>
+                <div>
+                    <p class="stat-label">PERFORMANCE</p>
+                    <p id="peakEquity" class="text-sm">Peak: $0.00</p>
+                    <p id="maxDrawdown" class="text-sm text-red-400">DD: 0%</p>
+                </div>
+                <div>
+                    <p class="stat-label">STATISTICS</p>
+                    <p id="tradeStats" class="text-sm">Trades: 0</p>
+                    <p id="winRate" class="text-sm text-green-400">Win Rate: 0%</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Wallet Growth Chart -->
+        <div class="card mb-8">
+            <h3 class="font-bold mb-4">📈 WALLET GROWTH CHART</h3>
+            <canvas id="walletChart" height="80" style="max-height: 300px;"></canvas>
         </div>
 
         <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
@@ -724,6 +890,7 @@ app.get('/', (req, res) => {
                 <p id="lStep" class="text-[10px] text-slate-500 mt-2"></p>
                 <p id="lAction" class="text-[9px] text-indigo-400 mt-1"></p>
                 <p id="lTarget" class="text-[9px] text-green-400 mt-1"></p>
+                <p id="lRealized" class="text-[8px] text-slate-500 mt-1">Realized: $0.00</p>
             </div>
             <div class="card">
                 <p class="stat-label mb-2">SHORT</p>
@@ -732,14 +899,15 @@ app.get('/', (req, res) => {
                 <p id="sStep" class="text-[10px] text-slate-500 mt-2"></p>
                 <p id="sAction" class="text-[9px] text-indigo-400 mt-1"></p>
                 <p id="sTarget" class="text-[9px] text-green-400 mt-1"></p>
+                <p id="sRealized" class="text-[8px] text-slate-500 mt-1">Realized: $0.00</p>
             </div>
         </div>
 
         <div class="card">
             <h3 class="font-bold mb-4">📋 CLOSED TRADES</h3>
-            <div class="overflow-x-auto">
+            <div class="overflow-x-auto max-h-96 overflow-y-auto">
                 <table class="w-full border-collapse">
-                    <thead class="bg-[#0F141C]">
+                    <thead class="bg-[#0F141C] sticky top-0">
                         <tr>
                             <th class="text-left p-3 text-xs text-slate-500">SIDE</th>
                             <th class="text-left p-3 text-xs text-slate-500">OPEN</th>
@@ -750,10 +918,11 @@ app.get('/', (req, res) => {
                             <th class="text-right p-3 text-xs text-slate-500">EXIT</th>
                             <th class="text-right p-3 text-xs text-slate-500">ROI</th>
                             <th class="text-right p-3 text-xs text-slate-500">PNL</th>
+                            <th class="text-right p-3 text-xs text-slate-500">FEE</th>
                         </tr>
                     </thead>
                     <tbody id="tradesBody">
-                        <tr><td colspan="9" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>
+                        <tr><td colspan="10" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -761,6 +930,8 @@ app.get('/', (req, res) => {
     </div>
 
     <script>
+        let walletChart = null;
+        
         async function forceSync() {
             const btn = event.target;
             btn.textContent = '🔄 SYNCING...';
@@ -775,10 +946,100 @@ app.get('/', (req, res) => {
             }
         }
         
+        function formatNumber(num) {
+            return parseFloat(num).toFixed(8);
+        }
+        
+        function updateChart(walletHistory) {
+            if (!walletHistory || walletHistory.length === 0) return;
+            
+            const labels = walletHistory.map(h => {
+                const date = new Date(h.timestamp);
+                return date.toLocaleTimeString();
+            });
+            const equity = walletHistory.map(h => h.equity);
+            const pnlPercent = walletHistory.map(h => h.pnlPercent);
+            
+            if (walletChart) {
+                walletChart.destroy();
+            }
+            
+            const ctx = document.getElementById('walletChart').getContext('2d');
+            walletChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [
+                        {
+                            label: 'Wallet Equity (USDT)',
+                            data: equity,
+                            borderColor: '#00D1B2',
+                            backgroundColor: 'rgba(0, 209, 178, 0.1)',
+                            fill: true,
+                            tension: 0.4,
+                            yAxisID: 'y'
+                        },
+                        {
+                            label: 'PnL %',
+                            data: pnlPercent,
+                            borderColor: '#6366F1',
+                            backgroundColor: 'rgba(99, 102, 241, 0.1)',
+                            fill: true,
+                            tension: 0.4,
+                            yAxisID: 'y1'
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    interaction: { mode: 'index', intersect: false },
+                    plugins: {
+                        legend: { position: 'top', labels: { color: '#E8EDF2' } },
+                        tooltip: { callbacks: { label: function(context) { return context.dataset.label + ': ' + context.raw.toFixed(8); } } }
+                    },
+                    scales: {
+                        y: { title: { display: true, text: 'USDT', color: '#00D1B2' }, grid: { color: '#1F2A3E' }, ticks: { color: '#E8EDF2' } },
+                        y1: { position: 'right', title: { display: true, text: 'PnL %', color: '#6366F1' }, grid: { drawOnChartArea: false }, ticks: { color: '#E8EDF2', callback: function(v) { return v.toFixed(1) + '%'; } } },
+                        x: { ticks: { color: '#E8EDF2', maxRotation: 45, minRotation: 45 } }
+                    }
+                }
+            });
+        }
+        
         setInterval(async () => {
             try {
                 const res = await fetch('/api/status');
                 const data = await res.json();
+                
+                // Update wallet overview
+                const totalEquity = data.market.totalEquity || 0;
+                const totalPnl = data.market.totalNetGain || 0;
+                const pnlPercent = data.market.growthPct || 0;
+                
+                document.getElementById('totalWallet').textContent = '$' + formatNumber(totalEquity);
+                document.getElementById('totalWallet').className = 'stat-number ' + (totalPnl >= 0 ? 'value-positive' : 'value-negative');
+                document.getElementById('walletChange').innerHTML = (totalPnl >= 0 ? '↑' : '↓') + ' $' + formatNumber(Math.abs(totalPnl)) + ' (' + (pnlPercent >= 0 ? '+' : '') + pnlPercent.toFixed(2) + '%)';
+                document.getElementById('walletChange').className = 'text-xs ' + (totalPnl >= 0 ? 'value-positive' : 'value-negative');
+                
+                document.getElementById('totalPnl').textContent = (totalPnl >= 0 ? '+' : '') + '$' + formatNumber(totalPnl);
+                document.getElementById('totalPnl').className = 'stat-number ' + (totalPnl >= 0 ? 'value-positive' : 'value-negative');
+                document.getElementById('pnlPercent').innerHTML = (pnlPercent >= 0 ? '+' : '') + pnlPercent.toFixed(2) + '%';
+                document.getElementById('pnlPercent').className = 'text-xs ' + (pnlPercent >= 0 ? 'value-positive' : 'value-negative');
+                
+                document.getElementById('realizedPnl').textContent = (data.market.totalRealizedPnl >= 0 ? '+' : '') + '$' + formatNumber(data.market.totalRealizedPnl || 0);
+                document.getElementById('realizedPnl').className = 'stat-number ' + (data.market.totalRealizedPnl >= 0 ? 'value-positive' : 'value-negative');
+                document.getElementById('feesPaid').innerHTML = 'Fees: $' + formatNumber(data.market.totalFeesPaid || 0);
+                
+                document.getElementById('peakEquity').innerHTML = 'Peak: $' + formatNumber(data.market.peakEquity || 0);
+                document.getElementById('maxDrawdown').innerHTML = 'DD: ' + (data.market.maxDrawdown || 0).toFixed(2) + '%';
+                document.getElementById('tradeStats').innerHTML = 'Trades: ' + (data.market.totalTrades || 0);
+                document.getElementById('winRate').innerHTML = 'Win Rate: ' + (data.market.winRate || 0) + '%';
+                
+                // Update chart
+                if (data.market.walletHistory && data.market.walletHistory.length > 0) {
+                    updateChart(data.market.walletHistory);
+                }
                 
                 document.getElementById('spread').textContent = (data.market.spread || 0).toFixed(3) + '%';
                 document.getElementById('bidPrice').textContent = (data.market.bid || 0).toFixed(8);
@@ -796,11 +1057,10 @@ app.get('/', (req, res) => {
                     document.getElementById('lPnl').textContent = (long.unrealizedUsdt >= 0 ? '+' : '') + (long.unrealizedUsdt || 0).toFixed(8);
                     document.getElementById('lStep').innerHTML = '<span class="step-badge">STEP ' + (long.step || 0) + '</span> | VOL ' + (long.volume || 0);
                     document.getElementById('lAction').textContent = long.lastAction || 'Idle';
+                    document.getElementById('lRealized').innerHTML = 'Realized: ' + (long.realizedPnl >= 0 ? '+' : '') + '$' + (long.realizedPnl || 0).toFixed(8);
                     
                     if (long.targetPrice > 0) {
                         document.getElementById('lTarget').innerHTML = '🎯 TP: ' + long.targetPrice.toFixed(8) + ' (need ' + long.requiredPriceMoveForTP + ' move)';
-                    } else {
-                        document.getElementById('lTarget').innerHTML = '';
                     }
                 }
                 
@@ -813,17 +1073,16 @@ app.get('/', (req, res) => {
                     document.getElementById('sPnl').textContent = (short.unrealizedUsdt >= 0 ? '+' : '') + (short.unrealizedUsdt || 0).toFixed(8);
                     document.getElementById('sStep').innerHTML = '<span class="step-badge">STEP ' + (short.step || 0) + '</span> | VOL ' + (short.volume || 0);
                     document.getElementById('sAction').textContent = short.lastAction || 'Idle';
+                    document.getElementById('sRealized').innerHTML = 'Realized: ' + (short.realizedPnl >= 0 ? '+' : '') + '$' + (short.realizedPnl || 0).toFixed(8);
                     
                     if (short.targetPrice > 0) {
                         document.getElementById('sTarget').innerHTML = '🎯 TP: ' + short.targetPrice.toFixed(8) + ' (need ' + short.requiredPriceMoveForTP + ' move)';
-                    } else {
-                        document.getElementById('sTarget').innerHTML = '';
                     }
                 }
                 
                 let tradesHtml = '';
                 if (data.tradeHistory && data.tradeHistory.length > 0) {
-                    data.tradeHistory.slice(0, 10).forEach(t => {
+                    data.tradeHistory.slice(0, 20).forEach(t => {
                         const roiVal = parseFloat(t.roi);
                         tradesHtml += '<tr class="border-b border-[#1A212E]">' +
                             '<td class="p-3"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + ' font-bold">' + t.side + '</span></td>' +
@@ -834,11 +1093,12 @@ app.get('/', (req, res) => {
                             '<td class="p-3 text-right mono">' + t.entryPrice + '</td>' +
                             '<td class="p-3 text-right mono">' + t.exitPrice + '</td>' +
                             '<td class="p-3 text-right ' + (roiVal >= 0 ? 'value-positive' : 'value-negative') + '">' + (roiVal >= 0 ? '+' : '') + t.roi + '</td>' +
-                            '<td class="p-3 text-right mono">' + t.netPnlUsdt + ' USDT</td>' +
+                            '<td class="p-3 text-right mono ' + (parseFloat(t.netPnlUsdt) >= 0 ? 'value-positive' : 'value-negative') + '">' + (parseFloat(t.netPnlUsdt) >= 0 ? '+' : '') + t.netPnlUsdt + '</td>' +
+                            '<td class="p-3 text-right mono text-slate-500">' + t.estimatedFee + '</td>' +
                         '</tr>';
                     });
                 } else {
-                    tradesHtml = '<tr><td colspan="9" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>';
+                    tradesHtml = '<tr><td colspan="10" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>';
                 }
                 document.getElementById('tradesBody').innerHTML = tradesHtml;
                 
@@ -855,16 +1115,19 @@ setInterval(backgroundLoop, config.pollInterval);
 app.listen(config.port, '0.0.0.0', () => {
     const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
     
-    console.log(`\n✅ Martingale Pro Started (FIXED TP CALCULATION)`);
+    console.log(`\n✅ Martingale Pro Started (PRECISE WALLET TRACKING)`);
     console.log(`📊 Symbol: ${config.symbol}`);
     console.log(`🔧 Leverage: ${config.leverage}x`);
     console.log(`🎯 Take Profit: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price movement`);
     console.log(`📈 Step Distance: ${config.stepDistancePct}%`);
     console.log(`💰 Fee Adjustment: ${config.takerFeeRate * 100}% included`);
     console.log(`🌐 Dashboard: http://localhost:${config.port}`);
-    console.log(`\n🔴 HOW TP WORKS NOW (CORRECTED):`);
-    console.log(`   ${config.takeProfitPct}% ROI at ${config.leverage}x leverage = ${requiredPriceMovePct}% price move`);
-    console.log(`   LONG: Target = Entry × ${(1 + requiredPriceMovePct/100).toFixed(6)} (ASK price)`);
-    console.log(`   SHORT: Target = Entry × ${(1 - requiredPriceMovePct/100).toFixed(6)} (BID price)`);
-    console.log(`   Example: Entry $100 → Target $${(100 * (1 + requiredPriceMovePct/100)).toFixed(4)}\n`);
+    console.log(`\n💰 WALLET TRACKING FEATURES:`);
+    console.log(`   • Real-time wallet balance monitoring`);
+    console.log(`   • Total P&L (realized + unrealized)`);
+    console.log(`   • Realized P&L per account`);
+    console.log(`   • Fee tracking per trade`);
+    console.log(`   • Wallet growth chart`);
+    console.log(`   • Peak equity & max drawdown`);
+    console.log(`   • Win rate & trade statistics\n`);
 });
