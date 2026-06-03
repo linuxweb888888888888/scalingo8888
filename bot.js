@@ -43,7 +43,6 @@ let market = {
     totalNetGain: 0, growthPct: 0, dgr: 0,
     initialTotalEquity: 0, startTime: Date.now(),
     lastPriceUpdate: 0,
-    // Wallet growth tracking
     walletHistory: [],
     peakEquity: 0,
     maxDrawdown: 0,
@@ -58,7 +57,6 @@ let accountStates = {};
 let lastPositionFetch = {};
 let lastBalanceFetch = {};
 
-// Function to calculate step number from volume
 function calculateStepFromVolume(volume, baseVolume, multiplier) {
     if (volume === 0) return 0;
     
@@ -78,7 +76,6 @@ function calculateStepFromVolume(volume, baseVolume, multiplier) {
     return step;
 }
 
-// Function to calculate expected volume for a given step
 function calculateVolumeForStep(step, baseVolume, multiplier) {
     let totalVolume = 0;
     for (let i = 0; i <= step; i++) {
@@ -88,7 +85,6 @@ function calculateVolumeForStep(step, baseVolume, multiplier) {
     return totalVolume;
 }
 
-// Calculate target price based on leverage
 function calculateTargetPrice(state) {
     const requiredPriceMovePct = config.takeProfitPct / config.leverage;
     
@@ -103,11 +99,9 @@ function calculateTargetPrice(state) {
     }
 }
 
-// Update wallet growth metrics
 function updateWalletGrowth(totalEquity) {
     const now = Date.now();
     
-    // Record wallet history every minute (only if changed)
     const lastRecord = market.walletHistory[market.walletHistory.length - 1];
     if (!lastRecord || (now - lastRecord.timestamp) > 60000 || Math.abs(lastRecord.equity - totalEquity) > 0.000001) {
         market.walletHistory.push({
@@ -118,16 +112,13 @@ function updateWalletGrowth(totalEquity) {
             pnlPercent: market.initialTotalEquity > 0 ? ((totalEquity - market.initialTotalEquity) / market.initialTotalEquity) * 100 : 0
         });
         
-        // Keep last 100 records
         if (market.walletHistory.length > 100) market.walletHistory.shift();
     }
     
-    // Update peak equity
     if (totalEquity > market.peakEquity) {
         market.peakEquity = totalEquity;
     }
     
-    // Update max drawdown
     if (market.peakEquity > 0) {
         const currentDrawdown = ((market.peakEquity - totalEquity) / market.peakEquity) * 100;
         if (currentDrawdown > market.maxDrawdown) {
@@ -150,13 +141,11 @@ config.accounts.forEach((account, idx) => {
         roiLatencyHistory: [],
         lastRoiUpdateTime: Date.now(),
         targetPrice: 0,
-        // Account specific tracking
         realizedPnl: 0,
         totalFees: 0
     };
 });
 
-// ==================== HTX API CORE ====================
 function getSignature(account, method, path, params = {}) {
     const timestamp = new Date().toISOString().split('.')[0];
     const allParams = {
@@ -211,9 +200,7 @@ async function fetchPriceRest() {
             market.spread = ((market.ask - market.bid) / market.bid) * 100;
             market.lastPriceUpdate = Date.now();
         }
-    } catch (e) {
-        // Silent fail
-    }
+    } catch (e) {}
 }
 
 async function syncAccount(acc, state) {
@@ -324,10 +311,9 @@ async function syncAccount(acc, state) {
             state.initialEquity = state.currentEquity;
         }
         
-        // Track realized PnL changes
         if (oldEquity > 0 && Math.abs(state.currentEquity - oldEquity) > 0.000001) {
             const change = state.currentEquity - oldEquity;
-            if (Math.abs(change) > 0.0001) { // Ignore tiny fluctuations
+            if (Math.abs(change) > 0.0001) {
                 console.log(`[${state.direction.toUpperCase()}] Equity: $${oldEquity.toFixed(8)} → $${state.currentEquity.toFixed(8)} (${change >= 0 ? '+' : ''}$${change.toFixed(8)})`);
             }
         }
@@ -338,7 +324,6 @@ function logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl) {
     const step = calculateStepFromVolume(state.volume, config.baseVolume, config.multiplier);
     const estimatedFee = Math.abs(finalPnl) * config.takerFeeRate;
     
-    // Update trade statistics
     market.totalTrades++;
     if (finalPnl >= 0) {
         market.winningTrades++;
@@ -363,12 +348,10 @@ function logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl) {
     
     if (tradeHistory.length > 20) tradeHistory.pop();
     
-    // Update account realized PnL
     state.realizedPnl += finalPnl;
     state.totalFees += estimatedFee;
     
     console.log(`📊 TRADE CLOSED: ${state.direction.toUpperCase()} | ROI: ${finalRoi.toFixed(2)}% | PnL: ${finalPnl >= 0 ? '+' : ''}$${finalPnl.toFixed(8)} | Fee: $${estimatedFee.toFixed(8)}`);
-    console.log(`📈 Account ${state.direction.toUpperCase()} Total: $${state.realizedPnl.toFixed(8)} PnL | $${state.totalFees.toFixed(8)} Fees`);
 }
 
 function startWS() {
@@ -448,7 +431,7 @@ async function processMartingale() {
                     if (orderInfo?.data?.[0]?.status === 6) {
                         state.entryPrice = parseFloat(orderInfo.data[0].price_avg);
                         state.targetPrice = calculateTargetPrice(state);
-                        console.log(`✅ Position opened at ${state.entryPrice.toFixed(8)}, TP target: ${state.targetPrice.toFixed(8)} (${config.takeProfitPct}% ROI = ${config.takeProfitPct/config.leverage}% price move)`);
+                        console.log(`✅ Position opened at ${state.entryPrice.toFixed(8)}, TP target: ${state.targetPrice.toFixed(8)}`);
                         state.isLocked = false;
                     }
                 }, 2000);
@@ -460,7 +443,6 @@ async function processMartingale() {
             continue;
         }
 
-        // TAKE PROFIT CHECK using order book prices
         let shouldTakeProfit = false;
         let exitPrice = 0;
         
@@ -484,7 +466,7 @@ async function processMartingale() {
             const exitTime = new Date().toLocaleString();
             const currentStep = calculateStepFromVolume(state.volume, config.baseVolume, config.multiplier);
             
-            console.log(`✅ Taking ${state.direction} profit at ${exitPrice.toFixed(8)} (Target ROI: ${finalRoi}% = ${finalRoi/config.leverage}% price move, Step ${currentStep}, Vol: ${state.volume})`);
+            console.log(`✅ Taking ${state.direction} profit at ${exitPrice.toFixed(8)} (Target ROI: ${finalRoi}%, Step ${currentStep}, Vol: ${state.volume})`);
             state.isLocked = true;
             state.lastAction = "Taking Profit...";
             
@@ -518,7 +500,6 @@ async function processMartingale() {
             continue;
         }
 
-        // Calculate price move since last step
         let priceMove = 0;
         if (state.direction === 'buy') {
             priceMove = ((state.lastStepPrice - currentPrice) / state.lastStepPrice) * 100;
@@ -562,7 +543,7 @@ async function processMartingale() {
         } else {
             const step = calculateStepFromVolume(state.volume, config.baseVolume, config.multiplier);
             const requiredMove = (config.takeProfitPct / config.leverage).toFixed(3);
-            state.lastAction = `Active - Step ${step} | Vol: ${state.volume} | ROI: ${state.roi.toFixed(2)}% | Need ${requiredMove}% price move for ${config.takeProfitPct}% ROI`;
+            state.lastAction = `Active - Step ${step} | Vol: ${state.volume} | ROI: ${state.roi.toFixed(2)}%`;
         }
     }
 }
@@ -584,8 +565,7 @@ async function backgroundLoop() {
             if (market.initialTotalEquity === 0 && s1.initialEquity !== null && s2.initialEquity !== null) {
                 market.initialTotalEquity = s1.initialEquity + s2.initialEquity;
                 market.peakEquity = market.initialTotalEquity;
-                console.log(`\n💰 INITIAL TOTAL EQUITY: $${market.initialTotalEquity.toFixed(8)} USDT`);
-                console.log(`📊 Starting wallet tracking...\n`);
+                console.log(`\n💰 INITIAL TOTAL EQUITY: $${market.initialTotalEquity.toFixed(8)} USDT\n`);
             }
             
             if (market.initialTotalEquity > 0) {
@@ -598,13 +578,11 @@ async function backgroundLoop() {
                 const elapsedHours = (Date.now() - market.startTime) / (1000 * 60 * 60);
                 market.dgr = elapsedHours > 0 ? (market.growthPct / elapsedHours) : 0;
                 
-                // Update wallet growth history
                 updateWalletGrowth(totalEquity);
                 
-                // Log significant changes (>0.1% change)
                 const lastRecord = market.walletHistory[market.walletHistory.length - 2];
                 if (lastRecord && Math.abs(market.growthPct - lastRecord.pnlPercent) > 0.1) {
-                    console.log(`💰 WALLET: $${totalEquity.toFixed(8)} | PnL: ${market.totalNetGain >= 0 ? '+' : ''}$${market.totalNetGain.toFixed(8)} (${market.growthPct >= 0 ? '+' : ''}${market.growthPct.toFixed(2)}%) | Realized: $${totalRealizedPnl.toFixed(8)} | Fees: $${totalFees.toFixed(8)}`);
+                    console.log(`💰 WALLET: $${totalEquity.toFixed(8)} | PnL: ${market.totalNetGain >= 0 ? '+' : ''}$${market.totalNetGain.toFixed(8)} (${market.growthPct >= 0 ? '+' : ''}${market.growthPct.toFixed(2)}%)`);
                 }
             }
         }
@@ -664,7 +642,7 @@ app.get('/api/status', (req, res) => {
             winningTrades: market.winningTrades,
             losingTrades: market.losingTrades,
             winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0,
-            walletHistory: market.walletHistory.slice(-20) // Last 20 records
+            walletHistory: market.walletHistory.slice(-20)
         },
         accounts: accountsWithInfo,
         tradeHistory,
@@ -793,7 +771,7 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Martingale Pro - Wallet Growth Tracker</title>
+    <title>Martingale Pro - Wallet Tracker</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
@@ -809,9 +787,9 @@ app.get('/', (req, res) => {
         button:hover { background: #FF4D6D40; }
         .sync-btn { background: #00D1B220; border-color: #00D1B2; color: #00D1B2; margin-left: 10px; }
         .step-badge { background: #6366F120; color: #6366F1; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }
-        .info-box { background: #1A212E; padding: 10px; border-radius: 8px; margin-top: 10px; }
         .wallet-card { background: linear-gradient(135deg, #1A212E 0%, #131824 100%); border: 1px solid #00D1B240; }
         .stat-number { font-size: 28px; font-weight: 900; }
+        .chart-container { position: relative; height: 280px; width: 100%; }
     </style>
 </head>
 <body class="p-6">
@@ -864,10 +842,12 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- Wallet Growth Chart -->
+        <!-- Wallet Growth Chart - Fixed size container -->
         <div class="card mb-8">
             <h3 class="font-bold mb-4">📈 WALLET GROWTH CHART</h3>
-            <canvas id="walletChart" height="80" style="max-height: 300px;"></canvas>
+            <div class="chart-container">
+                <canvas id="walletChart" style="max-height: 280px; width: 100%;"></canvas>
+            </div>
         </div>
 
         <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
@@ -977,7 +957,9 @@ app.get('/', (req, res) => {
                             backgroundColor: 'rgba(0, 209, 178, 0.1)',
                             fill: true,
                             tension: 0.4,
-                            yAxisID: 'y'
+                            yAxisID: 'y',
+                            pointRadius: 2,
+                            pointHoverRadius: 5
                         },
                         {
                             label: 'PnL %',
@@ -986,7 +968,9 @@ app.get('/', (req, res) => {
                             backgroundColor: 'rgba(99, 102, 241, 0.1)',
                             fill: true,
                             tension: 0.4,
-                            yAxisID: 'y1'
+                            yAxisID: 'y1',
+                            pointRadius: 2,
+                            pointHoverRadius: 5
                         }
                     ]
                 },
@@ -995,13 +979,33 @@ app.get('/', (req, res) => {
                     maintainAspectRatio: true,
                     interaction: { mode: 'index', intersect: false },
                     plugins: {
-                        legend: { position: 'top', labels: { color: '#E8EDF2' } },
-                        tooltip: { callbacks: { label: function(context) { return context.dataset.label + ': ' + context.raw.toFixed(8); } } }
+                        legend: { position: 'top', labels: { color: '#E8EDF2', font: { size: 10 } } },
+                        tooltip: { 
+                            callbacks: { 
+                                label: function(context) { 
+                                    return context.dataset.label + ': ' + context.raw.toFixed(8); 
+                                } 
+                            },
+                            bodyColor: '#E8EDF2',
+                            backgroundColor: '#131824'
+                        }
                     },
                     scales: {
-                        y: { title: { display: true, text: 'USDT', color: '#00D1B2' }, grid: { color: '#1F2A3E' }, ticks: { color: '#E8EDF2' } },
-                        y1: { position: 'right', title: { display: true, text: 'PnL %', color: '#6366F1' }, grid: { drawOnChartArea: false }, ticks: { color: '#E8EDF2', callback: function(v) { return v.toFixed(1) + '%'; } } },
-                        x: { ticks: { color: '#E8EDF2', maxRotation: 45, minRotation: 45 } }
+                        y: { 
+                            title: { display: true, text: 'USDT', color: '#00D1B2', font: { size: 10 } }, 
+                            grid: { color: '#1F2A3E' }, 
+                            ticks: { color: '#E8EDF2', font: { size: 9 } }
+                        },
+                        y1: { 
+                            position: 'right', 
+                            title: { display: true, text: 'PnL %', color: '#6366F1', font: { size: 10 } }, 
+                            grid: { drawOnChartArea: false }, 
+                            ticks: { color: '#E8EDF2', font: { size: 9 }, callback: function(v) { return v.toFixed(1) + '%'; } }
+                        },
+                        x: { 
+                            ticks: { color: '#E8EDF2', font: { size: 8 }, maxRotation: 45, minRotation: 45 },
+                            grid: { color: '#1F2A3E' }
+                        }
                     }
                 }
             });
@@ -1012,7 +1016,6 @@ app.get('/', (req, res) => {
                 const res = await fetch('/api/status');
                 const data = await res.json();
                 
-                // Update wallet overview
                 const totalEquity = data.market.totalEquity || 0;
                 const totalPnl = data.market.totalNetGain || 0;
                 const pnlPercent = data.market.growthPct || 0;
@@ -1036,7 +1039,6 @@ app.get('/', (req, res) => {
                 document.getElementById('tradeStats').innerHTML = 'Trades: ' + (data.market.totalTrades || 0);
                 document.getElementById('winRate').innerHTML = 'Win Rate: ' + (data.market.winRate || 0) + '%';
                 
-                // Update chart
                 if (data.market.walletHistory && data.market.walletHistory.length > 0) {
                     updateChart(data.market.walletHistory);
                 }
@@ -1060,7 +1062,7 @@ app.get('/', (req, res) => {
                     document.getElementById('lRealized').innerHTML = 'Realized: ' + (long.realizedPnl >= 0 ? '+' : '') + '$' + (long.realizedPnl || 0).toFixed(8);
                     
                     if (long.targetPrice > 0) {
-                        document.getElementById('lTarget').innerHTML = '🎯 TP: ' + long.targetPrice.toFixed(8) + ' (need ' + long.requiredPriceMoveForTP + ' move)';
+                        document.getElementById('lTarget').innerHTML = '🎯 TP: ' + long.targetPrice.toFixed(8);
                     }
                 }
                 
@@ -1076,7 +1078,7 @@ app.get('/', (req, res) => {
                     document.getElementById('sRealized').innerHTML = 'Realized: ' + (short.realizedPnl >= 0 ? '+' : '') + '$' + (short.realizedPnl || 0).toFixed(8);
                     
                     if (short.targetPrice > 0) {
-                        document.getElementById('sTarget').innerHTML = '🎯 TP: ' + short.targetPrice.toFixed(8) + ' (need ' + short.requiredPriceMoveForTP + ' move)';
+                        document.getElementById('sTarget').innerHTML = '🎯 TP: ' + short.targetPrice.toFixed(8);
                     }
                 }
                 
@@ -1127,7 +1129,7 @@ app.listen(config.port, '0.0.0.0', () => {
     console.log(`   • Total P&L (realized + unrealized)`);
     console.log(`   • Realized P&L per account`);
     console.log(`   • Fee tracking per trade`);
-    console.log(`   • Wallet growth chart`);
+    console.log(`   • Fixed-size wallet growth chart (no layout jumping)`);
     console.log(`   • Peak equity & max drawdown`);
     console.log(`   • Win rate & trade statistics\n`);
 });
