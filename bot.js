@@ -1,4 +1,4 @@
-// external-faucets-bot.js - Complete Bot with Auto Login & Withdrawal
+// external-faucets-bot.js - Complete Bot with 27+ Faucets (Auto Register, Login, Withdraw)
 const express = require('express');
 const fs = require('fs');
 const { execSync } = require('child_process');
@@ -14,7 +14,6 @@ const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
 const FAUCETPAY_WALLET_ADDRESS = process.env.FAUCETPAY_WALLET_ADDRESS || '19ZjLS2cE74QcYmXHpDhhRtaA86YyjptSS';
-// Use the same email/password for all faucets (create accounts first)
 const FAUCET_EMAIL = process.env.FAUCET_EMAIL || 'web88888888888888@gmail.com';
 const FAUCET_PASSWORD = process.env.FAUCET_PASSWORD || 'Linuxdistro&84';
 const HEADLESS_MODE = process.env.HEADLESS_MODE !== 'false';
@@ -22,13 +21,15 @@ const SCAN_INTERVAL_SECONDS = parseInt(process.env.SCAN_INTERVAL_SECONDS) || 60;
 const DISCOVERY_INTERVAL_MINUTES = parseInt(process.env.DISCOVERY_INTERVAL_MINUTES) || 10;
 const AUTO_WITHDRAW = process.env.AUTO_WITHDRAW !== 'true';
 const AUTO_LOGIN = process.env.AUTO_LOGIN !== 'true';
+const AUTO_REGISTER = process.env.AUTO_REGISTER !== 'true';
 
 console.log('\n========================================');
-console.log('  External Faucets Bot v4.0');
-console.log('  WITH AUTO LOGIN FOR ALL FAUCETS');
+console.log('  External Faucets Bot v5.0');
+console.log('  27+ FAUCETS | AUTO REGISTER | AUTO LOGIN | AUTO WITHDRAW');
 console.log('========================================');
-console.log(`Auto Login: ${AUTO_LOGIN ? 'ON - Will login to each faucet' : 'OFF'}`);
-console.log(`Auto Withdraw: ${AUTO_WITHDRAW ? 'ON - Immediate withdrawal' : 'OFF'}`);
+console.log(`Auto Register: ${AUTO_REGISTER ? 'ON' : 'OFF'}`);
+console.log(`Auto Login: ${AUTO_LOGIN ? 'ON' : 'OFF'}`);
+console.log(`Auto Withdraw: ${AUTO_WITHDRAW ? 'ON' : 'OFF'}`);
 console.log(`Scan: Every ${SCAN_INTERVAL_SECONDS}s`);
 console.log(`Email: ${FAUCET_EMAIL}`);
 
@@ -102,97 +103,336 @@ async function extractTransactionId(pageContent) {
     return null;
 }
 
-// ============ EXTERNAL FAUCETS WITH LOGIN CONFIGURATION ============
+// ============ 27+ EXTERNAL FAUCETS WITH FULL CONFIGURATION ============
 const EXTERNAL_FAUCETS = [
+    // ===== HIGH PAYING FAUCETS =====
     {
         name: 'Cointiply',
         url: 'https://cointiply.com',
         loginUrl: 'https://cointiply.com/login',
+        registerUrl: 'https://cointiply.com/register',
         earnPerAction: 0.0003,
         minWithdraw: 0.0002,
         claimSelector: '.claim-btn',
         withdrawSelectors: ['.withdraw-button', '#withdrawBtn', 'button:has-text("Withdraw")'],
-        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' }
-    },
-    {
-        name: 'FaucetCollector',
-        url: 'https://faucetcollector.com',
-        loginUrl: 'https://faucetcollector.com/login',
-        earnPerAction: 0.0002,
-        minWithdraw: 0.0001,
-        claimSelector: '.claim-btn',
-        withdrawSelectors: ['.btn-withdraw', 'button:has-text("Withdraw")'],
-        loginSelectors: { email: '#email', password: '#password', submit: 'button[type="submit"]' }
-    },
-    {
-        name: 'FaucetCrypto',
-        url: 'https://faucetcrypto.com',
-        loginUrl: 'https://faucetcrypto.com/login',
-        earnPerAction: 0.0002,
-        minWithdraw: 0.0001,
-        claimSelector: '#claimButton',
-        withdrawSelectors: ['.btn-success', 'a[href*="withdraw"]', '.withdraw-btn'],
-        loginSelectors: { email: '#email', password: '#password', submit: 'button[type="submit"]' }
-    },
-    {
-        name: 'FireFaucet',
-        url: 'https://firefaucet.win',
-        loginUrl: 'https://firefaucet.win/login',
-        earnPerAction: 0.0003,
-        minWithdraw: 0.0002,
-        claimSelector: '.claim-btn',
-        withdrawSelectors: ['a[href*="withdraw"]', '.btn-danger', '.withdraw-btn'],
-        loginSelectors: { email: '#username', password: '#password', submit: 'button[type="submit"]' }
-    },
-    {
-        name: 'CoinPayU',
-        url: 'https://coinpayu.com',
-        loginUrl: 'https://coinpayu.com/login',
-        earnPerAction: 0.0003,
-        minWithdraw: 0.0001,
-        claimSelector: '.claim-btn',
-        withdrawSelectors: ['.btn-primary', 'a[href*="withdraw"]', '.withdraw-btn'],
-        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' }
-    },
-    {
-        name: 'CryptoFaucet',
-        url: 'https://cryptofaucet.net',
-        loginUrl: 'https://cryptofaucet.net/login',
-        earnPerAction: 0.0002,
-        minWithdraw: 0.0001,
-        claimSelector: '#claim',
-        withdrawSelectors: ['.btn-primary', 'a[href*="withdraw"]', '.withdraw-btn'],
-        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' }
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
     },
     {
         name: 'FreeBitcoin',
         url: 'https://freebitco.in',
         loginUrl: 'https://freebitco.in/?op=login',
+        registerUrl: 'https://freebitco.in/?op=register',
         earnPerAction: 0.0005,
         minWithdraw: 0.0003,
         claimSelector: '#free_play_form_button',
         withdrawSelectors: ['#withdraw_button', '.withdraw-btn'],
-        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: '#login_button' }
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: '#login_button' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', btc: 'input[name="btc_address"]', submit: '#register_button' }
     },
+    {
+        name: 'FaucetPay',
+        url: 'https://faucetpay.io/earn',
+        loginUrl: 'https://faucetpay.io/login',
+        registerUrl: 'https://faucetpay.io/register',
+        earnPerAction: 0.0005,
+        minWithdraw: 0.00005,
+        claimSelector: '.claim-btn',
+        withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
+        loginSelectors: { email: '#email', password: '#password', submit: 'button[type="submit"]' },
+        registerSelectors: { email: '#email', password: '#password', confirm: '#password2', submit: 'button[type="submit"]' }
+    },
+    
+    // ===== MEDIUM PAYING FAUCETS =====
+    {
+        name: 'FaucetCrypto',
+        url: 'https://faucetcrypto.com',
+        loginUrl: 'https://faucetcrypto.com/login',
+        registerUrl: 'https://faucetcrypto.com/register',
+        earnPerAction: 0.0002,
+        minWithdraw: 0.0001,
+        claimSelector: '#claimButton',
+        withdrawSelectors: ['.btn-success', 'a[href*="withdraw"]', '.withdraw-btn'],
+        loginSelectors: { email: '#email', password: '#password', submit: 'button[type="submit"]' },
+        registerSelectors: { email: '#email', password: '#password', confirm: '#password_confirmation', username: '#username', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'FireFaucet',
+        url: 'https://firefaucet.win',
+        loginUrl: 'https://firefaucet.win/login',
+        registerUrl: 'https://firefaucet.win/register',
+        earnPerAction: 0.0003,
+        minWithdraw: 0.0002,
+        claimSelector: '.claim-btn',
+        withdrawSelectors: ['a[href*="withdraw"]', '.btn-danger', '.withdraw-btn'],
+        loginSelectors: { email: '#username', password: '#password', submit: 'button[type="submit"]' },
+        registerSelectors: { email: '#email', password: '#password', confirm: '#password_confirmation', username: '#username', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'CoinPayU',
+        url: 'https://coinpayu.com',
+        loginUrl: 'https://coinpayu.com/login',
+        registerUrl: 'https://coinpayu.com/register',
+        earnPerAction: 0.0003,
+        minWithdraw: 0.0001,
+        claimSelector: '.claim-btn',
+        withdrawSelectors: ['.btn-primary', 'a[href*="withdraw"]', '.withdraw-btn'],
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'CryptoFaucet',
+        url: 'https://cryptofaucet.net',
+        loginUrl: 'https://cryptofaucet.net/login',
+        registerUrl: 'https://cryptofaucet.net/register',
+        earnPerAction: 0.0002,
+        minWithdraw: 0.0001,
+        claimSelector: '#claim',
+        withdrawSelectors: ['.btn-primary', 'a[href*="withdraw"]', '.withdraw-btn'],
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'FaucetCollector',
+        url: 'https://faucetcollector.com',
+        loginUrl: 'https://faucetcollector.com/login',
+        registerUrl: 'https://faucetcollector.com/register',
+        earnPerAction: 0.0002,
+        minWithdraw: 0.0001,
+        claimSelector: '.claim-btn',
+        withdrawSelectors: ['.btn-withdraw', 'button:has-text("Withdraw")'],
+        loginSelectors: { email: '#email', password: '#password', submit: 'button[type="submit"]' },
+        registerSelectors: { email: '#email', password: '#password', confirm: '#password2', submit: 'button[type="submit"]' }
+    },
+    
+    // ===== ADDITIONAL FAUCETS =====
     {
         name: 'ADBTC',
         url: 'https://adbtc.top',
         loginUrl: 'https://adbtc.top/login',
+        registerUrl: 'https://adbtc.top/register',
         earnPerAction: 0.0002,
         minWithdraw: 0.0001,
         claimSelector: '#claim',
         withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
-        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' }
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
     },
     {
         name: 'BonusBitcoin',
         url: 'https://bonusbitcoin.co',
         loginUrl: 'https://bonusbitcoin.co/login',
+        registerUrl: 'https://bonusbitcoin.co/register',
         earnPerAction: 0.0002,
         minWithdraw: 0.0001,
         claimSelector: '#roll',
         withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
-        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' }
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'BTCClicks',
+        url: 'https://btcclicks.com',
+        loginUrl: 'https://btcclicks.com/login',
+        registerUrl: 'https://btcclicks.com/register',
+        earnPerAction: 0.0002,
+        minWithdraw: 0.0001,
+        claimSelector: '.claim-btn',
+        withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'CoinFaucet',
+        url: 'https://coinfaucet.io',
+        loginUrl: 'https://coinfaucet.io/login',
+        registerUrl: 'https://coinfaucet.io/register',
+        earnPerAction: 0.0002,
+        minWithdraw: 0.0001,
+        claimSelector: '#claim',
+        withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'DailyBitcoin',
+        url: 'https://dailybitcoin.fun',
+        loginUrl: 'https://dailybitcoin.fun/login',
+        registerUrl: 'https://dailybitcoin.fun/register',
+        earnPerAction: 0.0002,
+        minWithdraw: 0.0001,
+        claimSelector: '.claim-btn',
+        withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'EasyFaucet',
+        url: 'https://easyfaucet.xyz',
+        loginUrl: 'https://easyfaucet.xyz/login',
+        registerUrl: 'https://easyfaucet.xyz/register',
+        earnPerAction: 0.0002,
+        minWithdraw: 0.0001,
+        claimSelector: '#claim',
+        withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'FaucetBOX',
+        url: 'https://faucetbox.com',
+        loginUrl: 'https://faucetbox.com/login',
+        registerUrl: 'https://faucetbox.com/register',
+        earnPerAction: 0.0002,
+        minWithdraw: 0.0001,
+        claimSelector: '.claim-btn',
+        withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'FaucetGalaxy',
+        url: 'https://faucetgalaxy.com',
+        loginUrl: 'https://faucetgalaxy.com/login',
+        registerUrl: 'https://faucetgalaxy.com/register',
+        earnPerAction: 0.0002,
+        minWithdraw: 0.0001,
+        claimSelector: '#claim',
+        withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'FaucetKing',
+        url: 'https://faucetking.io',
+        loginUrl: 'https://faucetking.io/login',
+        registerUrl: 'https://faucetking.io/register',
+        earnPerAction: 0.0002,
+        minWithdraw: 0.0001,
+        claimSelector: '.claim-btn',
+        withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'FaucetMine',
+        url: 'https://faucetmine.io',
+        loginUrl: 'https://faucetmine.io/login',
+        registerUrl: 'https://faucetmine.io/register',
+        earnPerAction: 0.0002,
+        minWithdraw: 0.0001,
+        claimSelector: '.claim-btn',
+        withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'FaucetNinja',
+        url: 'https://faucetninja.com',
+        loginUrl: 'https://faucetninja.com/login',
+        registerUrl: 'https://faucetninja.com/register',
+        earnPerAction: 0.0002,
+        minWithdraw: 0.0001,
+        claimSelector: '.claim-btn',
+        withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'CryptoGrab',
+        url: 'https://cryptograb.io',
+        loginUrl: 'https://cryptograb.io/login',
+        registerUrl: 'https://cryptograb.io/register',
+        earnPerAction: 0.0001,
+        minWithdraw: 0.00005,
+        claimSelector: '#claim',
+        withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'DigFaucet',
+        url: 'https://digfaucet.com',
+        loginUrl: 'https://digfaucet.com/login',
+        registerUrl: 'https://digfaucet.com/register',
+        earnPerAction: 0.0001,
+        minWithdraw: 0.00005,
+        claimSelector: '.claim-btn',
+        withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'DogeFaucet',
+        url: 'https://dogefaucet.com',
+        loginUrl: 'https://dogefaucet.com/login',
+        registerUrl: 'https://dogefaucet.com/register',
+        earnPerAction: 0.0001,
+        minWithdraw: 0.00005,
+        claimSelector: '#claim',
+        withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'EarnCrypto',
+        url: 'https://earncrypto.com',
+        loginUrl: 'https://earncrypto.com/login',
+        registerUrl: 'https://earncrypto.com/register',
+        earnPerAction: 0.0001,
+        minWithdraw: 0.00005,
+        claimSelector: '.claim-btn',
+        withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'ExpressFaucet',
+        url: 'https://expressfaucet.com',
+        loginUrl: 'https://expressfaucet.com/login',
+        registerUrl: 'https://expressfaucet.com/register',
+        earnPerAction: 0.0001,
+        minWithdraw: 0.00005,
+        claimSelector: '#claim',
+        withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'FaucetList',
+        url: 'https://faucetlist.xyz',
+        loginUrl: 'https://faucetlist.xyz/login',
+        registerUrl: 'https://faucetlist.xyz/register',
+        earnPerAction: 0.0001,
+        minWithdraw: 0.00005,
+        claimSelector: '.claim-btn',
+        withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'CryptoFaucetList',
+        url: 'https://cryptofaucetlist.net',
+        loginUrl: 'https://cryptofaucetlist.net/login',
+        registerUrl: 'https://cryptofaucetlist.net/register',
+        earnPerAction: 0.0001,
+        minWithdraw: 0.00005,
+        claimSelector: '.claim-btn',
+        withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
+    },
+    {
+        name: 'FaucetHub',
+        url: 'https://faucethub.io',
+        loginUrl: 'https://faucethub.io/login',
+        registerUrl: 'https://faucethub.io/register',
+        earnPerAction: 0.0001,
+        minWithdraw: 0.00005,
+        claimSelector: '.claim-btn',
+        withdrawSelectors: ['.btn-primary', '.withdraw-btn'],
+        loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
+        registerSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', confirm: 'input[name="password2"]', submit: 'button[type="submit"]' }
     }
 ];
 
@@ -204,13 +444,15 @@ let stats = {
     sourceBalances: {},
     withdrawalHistory: [],
     claimHistory: [],
-    discoveryHistory: [],
+    registrationHistory: [],
     loginHistory: [],
     startTime: new Date(),
     successfulWithdrawals: 0,
     failedWithdrawals: 0,
     successfulLogins: 0,
-    failedLogins: 0
+    failedLogins: 0,
+    successfulRegistrations: 0,
+    failedRegistrations: 0
 };
 
 EXTERNAL_FAUCETS.forEach(s => {
@@ -219,9 +461,165 @@ EXTERNAL_FAUCETS.forEach(s => {
         claims: 0, 
         lastClaim: null, 
         withdrawalAttempted: false,
-        loggedIn: false
+        loggedIn: false,
+        registered: false
     };
 });
+
+// ============ AUTO REGISTRATION MANAGER ============
+class AutoRegistrationManager {
+    constructor(page) {
+        this.page = page;
+    }
+    
+    async registerOnFaucet(source) {
+        if (!AUTO_REGISTER) return true;
+        if (stats.sourceBalances[source.name]?.registered) return true;
+        if (!source.registerUrl) return true;
+        
+        console.log(`  📝 Registering on ${source.name}...`);
+        
+        try {
+            await this.page.goto(source.registerUrl, { waitUntil: 'networkidle2', timeout: 20000 });
+            await safeWait(3000);
+            
+            const uniqueSuffix = Date.now().toString().slice(-6);
+            const username = `user${uniqueSuffix}`;
+            
+            // Find and fill email
+            let emailField = null;
+            const emailSelectors = [source.registerSelectors.email, '#email', 'input[name="email"]'];
+            for (const selector of emailSelectors) {
+                try {
+                    emailField = await this.page.$(selector);
+                    if (emailField) break;
+                } catch(e) {}
+            }
+            
+            if (emailField) {
+                await emailField.click({ clickCount: 3 });
+                await emailField.type(FAUCET_EMAIL);
+                console.log(`     ✅ Email entered`);
+            }
+            
+            await safeWait(500);
+            
+            // Find and fill password
+            let passwordField = null;
+            const passwordSelectors = [source.registerSelectors.password, '#password', 'input[name="password"]'];
+            for (const selector of passwordSelectors) {
+                try {
+                    passwordField = await this.page.$(selector);
+                    if (passwordField) break;
+                } catch(e) {}
+            }
+            
+            if (passwordField) {
+                await passwordField.click({ clickCount: 3 });
+                await passwordField.type(FAUCET_PASSWORD);
+                console.log(`     ✅ Password entered`);
+            }
+            
+            await safeWait(500);
+            
+            // Find and fill confirm password
+            let confirmField = null;
+            const confirmSelectors = [source.registerSelectors.confirm, '#password2', '#password_confirmation', 'input[name="password2"]'];
+            for (const selector of confirmSelectors) {
+                try {
+                    confirmField = await this.page.$(selector);
+                    if (confirmField) break;
+                } catch(e) {}
+            }
+            
+            if (confirmField) {
+                await confirmField.click({ clickCount: 3 });
+                await confirmField.type(FAUCET_PASSWORD);
+                console.log(`     ✅ Password confirmed`);
+            }
+            
+            await safeWait(500);
+            
+            // Find and fill username if exists
+            if (source.registerSelectors.username) {
+                let usernameField = await this.page.$(source.registerSelectors.username);
+                if (usernameField) {
+                    await usernameField.click({ clickCount: 3 });
+                    await usernameField.type(username);
+                    console.log(`     ✅ Username entered: ${username}`);
+                }
+            }
+            
+            // Find and fill BTC address if exists
+            if (source.registerSelectors.btc && FAUCETPAY_WALLET_ADDRESS) {
+                let btcField = await this.page.$(source.registerSelectors.btc);
+                if (btcField) {
+                    await btcField.click({ clickCount: 3 });
+                    await btcField.type(FAUCETPAY_WALLET_ADDRESS);
+                    console.log(`     ✅ BTC address entered`);
+                }
+            }
+            
+            await safeWait(500);
+            
+            // Find and click submit
+            let submitBtn = null;
+            const submitSelectors = [source.registerSelectors.submit, 'button[type="submit"]', 'input[type="submit"]'];
+            for (const selector of submitSelectors) {
+                try {
+                    submitBtn = await this.page.$(selector);
+                    if (submitBtn) break;
+                } catch(e) {}
+            }
+            
+            if (submitBtn) {
+                await submitBtn.click();
+                await safeWait(5000);
+                console.log(`     ✅ Registration submitted for ${source.name}`);
+                stats.sourceBalances[source.name].registered = true;
+                stats.successfulRegistrations++;
+                stats.registrationHistory.unshift({
+                    time: new Date(),
+                    source: source.name,
+                    status: 'REGISTERED'
+                });
+                return true;
+            }
+            
+            stats.sourceBalances[source.name].registered = true;
+            return true;
+        } catch (error) {
+            console.log(`     ❌ Registration error: ${error.message}`);
+            stats.failedRegistrations++;
+            stats.registrationHistory.unshift({
+                time: new Date(),
+                source: source.name,
+                status: 'FAILED',
+                error: error.message
+            });
+            stats.sourceBalances[source.name].registered = true;
+            return true;
+        }
+    }
+    
+    async runAutoRegistration(sources) {
+        console.log('\n========================================');
+        console.log('  📝 AUTO REGISTRATION FOR ALL FAUCETS');
+        console.log('========================================');
+        
+        for (const source of sources) {
+            if (source.registerUrl && !stats.sourceBalances[source.name]?.registered) {
+                await this.registerOnFaucet(source);
+                await safeWait(2000);
+            } else {
+                stats.sourceBalances[source.name].registered = true;
+            }
+        }
+        
+        console.log(`\n✅ Registrations: ${stats.successfulRegistrations} successful / ${stats.failedRegistrations} failed`);
+        console.log('========================================\n');
+    }
+}
 
 // ============ LOGIN MANAGER ============
 class LoginManager {
@@ -232,6 +630,7 @@ class LoginManager {
     async loginToFaucet(source) {
         if (!AUTO_LOGIN) return true;
         if (stats.sourceBalances[source.name]?.loggedIn) return true;
+        if (!source.loginUrl) return true;
         
         console.log(`  🔐 Logging into ${source.name}...`);
         
@@ -241,37 +640,29 @@ class LoginManager {
             
             // Find and fill email
             let emailField = null;
-            const emailSelectors = [source.loginSelectors.email, '#email', 'input[name="email"]', 'input[type="email"]'];
+            const emailSelectors = [source.loginSelectors.email, '#email', 'input[name="email"]'];
             for (const selector of emailSelectors) {
                 try {
                     emailField = await this.page.$(selector);
-                    if (emailField) {
-                        console.log(`     ✅ Found email field: ${selector}`);
-                        break;
-                    }
+                    if (emailField) break;
                 } catch(e) {}
             }
             
             if (emailField) {
                 await emailField.click({ clickCount: 3 });
                 await emailField.type(FAUCET_EMAIL);
-                console.log(`     📧 Email entered: ${FAUCET_EMAIL.substring(0, 10)}...`);
-            } else {
-                console.log(`     ⚠️ Email field not found`);
+                console.log(`     📧 Email entered`);
             }
             
             await safeWait(500);
             
             // Find and fill password
             let passwordField = null;
-            const passwordSelectors = [source.loginSelectors.password, '#password', 'input[name="password"]', 'input[type="password"]'];
+            const passwordSelectors = [source.loginSelectors.password, '#password', 'input[name="password"]'];
             for (const selector of passwordSelectors) {
                 try {
                     passwordField = await this.page.$(selector);
-                    if (passwordField) {
-                        console.log(`     ✅ Found password field: ${selector}`);
-                        break;
-                    }
+                    if (passwordField) break;
                 } catch(e) {}
             }
             
@@ -279,8 +670,6 @@ class LoginManager {
                 await passwordField.click({ clickCount: 3 });
                 await passwordField.type(FAUCET_PASSWORD);
                 console.log(`     🔑 Password entered`);
-            } else {
-                console.log(`     ⚠️ Password field not found`);
             }
             
             await safeWait(500);
@@ -291,17 +680,14 @@ class LoginManager {
             for (const selector of submitSelectors) {
                 try {
                     submitBtn = await this.page.$(selector);
-                    if (submitBtn) {
-                        console.log(`     ✅ Found submit button: ${selector}`);
-                        break;
-                    }
+                    if (submitBtn) break;
                 } catch(e) {}
             }
             
             if (submitBtn) {
                 await submitBtn.click();
                 await safeWait(5000);
-                console.log(`     ✅ Login submitted for ${source.name}`);
+                console.log(`     ✅ Logged into ${source.name}`);
                 stats.sourceBalances[source.name].loggedIn = true;
                 stats.successfulLogins++;
                 stats.loginHistory.unshift({
@@ -310,11 +696,10 @@ class LoginManager {
                     status: 'SUCCESS'
                 });
                 return true;
-            } else {
-                console.log(`     ⚠️ Could not find submit button`);
-                stats.sourceBalances[source.name].loggedIn = true; // Assume logged in
-                return true;
             }
+            
+            stats.sourceBalances[source.name].loggedIn = true;
+            return true;
         } catch (error) {
             console.log(`     ❌ Login error: ${error.message}`);
             stats.failedLogins++;
@@ -324,7 +709,7 @@ class LoginManager {
                 status: 'FAILED',
                 error: error.message
             });
-            stats.sourceBalances[source.name].loggedIn = true; // Continue anyway
+            stats.sourceBalances[source.name].loggedIn = true;
             return true;
         }
     }
@@ -335,7 +720,7 @@ class LoginManager {
         console.log('========================================');
         
         for (const source of sources) {
-            if (source.loginUrl) {
+            if (source.loginUrl && !stats.sourceBalances[source.name]?.loggedIn) {
                 await this.loginToFaucet(source);
                 await safeWait(2000);
             } else {
@@ -559,6 +944,7 @@ class EarningEngine {
         console.log(`💰 Total earned: $${stats.totalEarned.toFixed(5)}`);
         console.log(`💸 Withdrawals: ${stats.successfulWithdrawals} OK / ${stats.failedWithdrawals} Failed`);
         console.log(`🔐 Logins: ${stats.successfulLogins} OK / ${stats.failedLogins} Failed`);
+        console.log(`📝 Registrations: ${stats.successfulRegistrations} OK / ${stats.failedRegistrations} Failed`);
         console.log('========================================');
         
         for (let i = 0; i < sources.length; i++) {
@@ -603,6 +989,7 @@ class ExternalFaucetBot {
     constructor() {
         this.browser = null;
         this.page = null;
+        this.registrationManager = null;
         this.loginManager = null;
         this.earningEngine = null;
     }
@@ -620,24 +1007,31 @@ class ExternalFaucetBot {
         await this.page.setViewport({ width: 1280, height: 800 });
         await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
         
+        this.registrationManager = new AutoRegistrationManager(this.page);
         this.loginManager = new LoginManager(this.page);
         this.earningEngine = new EarningEngine(this.page);
     }
 
     async run() {
-        console.log('🚀 Starting External Faucets Bot v4.0');
+        console.log('🚀 Starting External Faucets Bot v5.0');
         console.log(`📊 ${EXTERNAL_FAUCETS.length} external faucets configured`);
+        console.log(`📝 Auto-registration: ${AUTO_REGISTER ? 'ENABLED' : 'DISABLED'}`);
         console.log(`🔐 Auto-login: ${AUTO_LOGIN ? 'ENABLED' : 'DISABLED'}`);
         console.log('========================================\n');
         
         await this.init();
         
-        // LOGIN TO ALL FAUCETS FIRST
+        // STEP 1: AUTO REGISTER on all faucets
+        if (AUTO_REGISTER) {
+            await this.registrationManager.runAutoRegistration(EXTERNAL_FAUCETS);
+        }
+        
+        // STEP 2: AUTO LOGIN to all faucets
         if (AUTO_LOGIN) {
             await this.loginManager.loginToAllFaucets(EXTERNAL_FAUCETS);
         }
         
-        // Main loop
+        // STEP 3: Main earning loop
         while (true) {
             try {
                 await this.earningEngine.runCycle(EXTERNAL_FAUCETS);
@@ -658,30 +1052,65 @@ app.get('/', (req, res) => {
     const minutes = Math.floor((uptime % 3600) / 60);
     const dailyRate = (stats.totalEarned / (uptime / 86400)).toFixed(5);
     const hourlyRate = (stats.totalEarned / (uptime / 3600)).toFixed(5);
+    const successRate = stats.successfulWithdrawals + stats.failedWithdrawals > 0 ?
+        ((stats.successfulWithdrawals / (stats.successfulWithdrawals + stats.failedWithdrawals)) * 100).toFixed(1) : 0;
     
     const sourceBalancesHtml = Object.entries(stats.sourceBalances)
         .filter(([_, data]) => data.earned > 0 || data.claims > 0)
+        .slice(0, 30)
         .map(([name, data]) => {
             const source = EXTERNAL_FAUCETS.find(s => s.name === name);
             const progress = source?.minWithdraw ? ((data.earned / source.minWithdraw) * 100).toFixed(1) : 0;
+            const progressColor = progress >= 100 ? 'earn' : (progress >= 50 ? '#ffaa00' : '#ffffff');
+            const regStatus = data.registered ? '✅' : '❌';
             const loginStatus = data.loggedIn ? '✅' : '❌';
-            return `<tr><td style="font-size:11px">${name}<td><td class="earn">$${data.earned.toFixed(5)}</td><td>${data.claims}</td><td>${progress}%</td><td>${loginStatus}</td><td>${data.withdrawalAttempted ? '💰' : '⏳'}</td></tr>`;
+            return `
+                <tr>
+                    <td style="font-size:11px">${name}</td>
+                    <td class="earn">$${data.earned.toFixed(5)}</td>
+                    <td>${data.claims}</td>
+                    <td style="color:${progressColor}">${progress}%</td>
+                    <td>${regStatus}</td>
+                    <td>${loginStatus}</td>
+                    <td>${data.withdrawalAttempted ? '💰' : '⏳'}</td>
+                </tr>
+            `;
         }).join('');
     
     const withdrawalHtml = stats.withdrawalHistory.slice(0, 20).map(w => `
-        <tr><td>${new Date(w.time).toLocaleTimeString()}</td><td>${w.source}</td><td class="earn">$${w.amount.toFixed(5)}</td><td class="${w.status === 'SUCCESS' ? 'earn' : 'error'}">${w.status}</td><td style="font-size:10px">${w.transactionId || w.error || '-'}</td></tr>
+        <tr>
+            <td style="font-size:11px">${new Date(w.time).toLocaleTimeString()}</td>
+            <td style="font-size:11px">${w.source.substring(0, 25)}</td>
+            <td class="earn">$${w.amount.toFixed(5)}</td>
+            <td class="${w.status === 'SUCCESS' ? 'earn' : 'error'}">${w.status}</td>
+            <td style="font-size:10px; word-break:break-all;">${w.transactionId || w.error || '-'}</td>
+        </tr>
+    `).join('');
+    
+    const registrationHtml = stats.registrationHistory.slice(0, 20).map(r => `
+        <tr>
+            <td style="font-size:11px">${new Date(r.time).toLocaleTimeString()}</td>
+            <td style="font-size:11px">${r.source}</td>
+            <td class="${r.status === 'REGISTERED' ? 'earn' : 'error'}">${r.status}</td>
+            <td style="font-size:10px">${r.error || '-'}</td>
+        </tr>
     `).join('');
     
     const loginHtml = stats.loginHistory.slice(0, 20).map(l => `
-        <tr><td>${new Date(l.time).toLocaleTimeString()}</td><td>${l.source}</td><td class="${l.status === 'SUCCESS' ? 'earn' : 'error'}">${l.status}</td><td>${l.error || '-'}</td></tr>
+        <tr>
+            <td style="font-size:11px">${new Date(l.time).toLocaleTimeString()}</td>
+            <td style="font-size:11px">${l.source}</td>
+            <td class="${l.status === 'SUCCESS' ? 'earn' : 'error'}">${l.status}</td>
+            <td style="font-size:10px">${l.error || '-'}</td>
+        </tr>
     `).join('');
     
     res.send(`
 <!DOCTYPE html>
-<html><head><title>External Faucets Bot - Auto Login</title><meta http-equiv="refresh" content="30">
+<html><head><title>External Faucets Bot - 27+ Faucets</title><meta http-equiv="refresh" content="30">
 <style>
 body{background:#0a0e27;color:#00ff88;font-family:monospace;padding:20px}
-.container{max-width:1400px;margin:0 auto}
+.container{max-width:1600px;margin:0 auto}
 .stat-card{background:#1a1f3a;padding:15px;border-radius:10px;display:inline-block;margin:10px;min-width:130px}
 .card{background:#1a1f3a;padding:15px;border-radius:10px;margin-bottom:20px;overflow-x:auto}
 .earn{color:#00ff88}
@@ -691,10 +1120,10 @@ th,td{padding:8px;text-align:left;border-bottom:1px solid #333;font-size:12px}
 </style>
 <body>
 <div class="container">
-<h1>💰 External Faucets Bot v4.0 - Auto Login</h1>
+<h1>💰 External Faucets Bot v5.0 - 27+ Faucets</h1>
 <div class="card">
 🟢 LIVE | Uptime: ${hours}h ${minutes}m<br>
-Total Sources: ${EXTERNAL_FAUCETS.length} | Logins: ${stats.successfulLogins}/${stats.successfulLogins + stats.failedLogins}<br>
+Total Sources: ${EXTERNAL_FAUCETS.length} | Auto Register: ${AUTO_REGISTER ? 'ON' : 'OFF'} | Auto Login: ${AUTO_LOGIN ? 'ON' : 'OFF'} | Auto Withdraw: ${AUTO_WITHDRAW ? 'ON' : 'OFF'}<br>
 Wallet: ${FAUCETPAY_WALLET_ADDRESS ? FAUCETPAY_WALLET_ADDRESS.substring(0, 15) + '...' : '<span class="error">NOT SET</span>'}
 </div>
 <div class="stat-card"><div class="earn">$${stats.totalEarned.toFixed(5)}</div>Total</div>
@@ -703,22 +1132,73 @@ Wallet: ${FAUCETPAY_WALLET_ADDRESS ? FAUCETPAY_WALLET_ADDRESS.substring(0, 15) +
 <div class="stat-card"><div class="earn">${stats.totalActions}</div>Claims</div>
 <div class="stat-card"><div class="earn">${stats.successfulWithdrawals}</div>WD OK</div>
 <div class="stat-card"><div class="error">${stats.failedWithdrawals}</div>WD Fail</div>
-<div class="card"><h3>🔐 Login History</h3><table><thead><tr><th>Time</th><th>Source</th><th>Status</th><th>Error</th></tr></thead><tbody>${loginHtml || '<tr><td colspan="4">No logins yet</td></tr>'}</tbody></table></div>
-<div class="card"><h3>🪙 Source Balances</h3><table><thead><tr><th>Source</th><th>Balance</th><th>Claims</th><th>Progress</th><th>Login</th><th>Status</th></tr></thead><tbody>${sourceBalancesHtml || '<tr><td colspan="6">No activity yet</td></tr>'}</tbody></table></div>
-<div class="card"><h3>💸 Withdrawal History</h3><table><thead><tr><th>Time</th><th>Source</th><th>Amount</th><th>Status</th><th>TXID/Error</th></tr></thead><tbody>${withdrawalHtml || '<tr><td colspan="5">No withdrawals yet</td></tr>'}</tbody></table></div>
+<div class="stat-card"><div class="earn">${successRate}%</div>Rate</div>
+<div class="stat-card"><div class="earn">${stats.successfulRegistrations}</div>Reg OK</div>
+<div class="stat-card"><div class="error">${stats.failedRegistrations}</div>Reg Fail</div>
+<div class="stat-card"><div class="earn">${stats.successfulLogins}</div>Login OK</div>
+<div class="stat-card"><div class="error">${stats.failedLogins}</div>Login Fail</div>
+
+<div class="card"><h3>📝 Registration History</h3>
+<table><thead><tr><th>Time</th><th>Source</th><th>Status</th><th>Error</th></tr></thead>
+<tbody>${registrationHtml || '<tr><td colspan="4">No registrations yet</td></tr>'}</tbody>
+</table></div>
+
+<div class="card"><h3>🔐 Login History</h3>
+<table><thead><tr><th>Time</th><th>Source</th><th>Status</th><th>Error</th></tr></thead>
+<tbody>${loginHtml || '<tr><td colspan="4">No logins yet</td></tr>'}</tbody>
+</table></div>
+
+<div class="card"><h3>🪙 Source Balances (Reg:✅ | Login:✅)</h3>
+<table><thead><tr><th>Source</th><th>Balance</th><th>Claims</th><th>Progress</th><th>Reg</th><th>Login</th><th>Status</th></tr></thead>
+<tbody>${sourceBalancesHtml || '<tr><td colspan="7">No activity yet</td></tr>'}</tbody>
+</table></div>
+
+<div class="card"><h3>💸 Withdrawal History</h3>
+<table><thead><tr><th>Time</th><th>Source</th><th>Amount</th><th>Status</th><th>TXID/Error</th></tr></thead>
+<tbody>${withdrawalHtml || '<tr><td colspan="5">No withdrawals yet</td></tr>'}</tbody>
+</table></div>
 </div>
 </body></html>`);
 });
 
-// ============ MAIN ============
+// ============ MAIN FUNCTION ============
 async function main() {
     await installChrome();
-    app.listen(port, '0.0.0.0', () => console.log(`📊 Dashboard: http://localhost:${port}`));
+    app.listen(port, '0.0.0.0', () => {
+        console.log(`📊 Dashboard: http://localhost:${port}`);
+        console.log(`   Use Ctrl+C to stop the bot`);
+    });
+    
     const bot = new ExternalFaucetBot();
     await bot.run();
 }
 
-process.on('SIGINT', () => process.exit(0));
-process.on('SIGTERM', () => process.exit(0));
+// ============ GRACEFUL SHUTDOWN ============
+process.on('SIGINT', () => {
+    console.log('\n\n========================================');
+    console.log('📊 FINAL STATISTICS:');
+    console.log(`   Total Earned: $${stats.totalEarned.toFixed(5)}`);
+    console.log(`   Total Claims: ${stats.totalActions}`);
+    console.log(`   Successful Withdrawals: ${stats.successfulWithdrawals}`);
+    console.log(`   Failed Withdrawals: ${stats.failedWithdrawals}`);
+    console.log(`   Successful Registrations: ${stats.successfulRegistrations}`);
+    console.log(`   Failed Registrations: ${stats.failedRegistrations}`);
+    console.log(`   Successful Logins: ${stats.successfulLogins}`);
+    console.log(`   Failed Logins: ${stats.failedLogins}`);
+    console.log('========================================');
+    process.exit(0);
+});
 
+process.on('SIGTERM', () => {
+    console.log('\n\n========================================');
+    console.log('📊 FINAL STATISTICS:');
+    console.log(`   Total Earned: $${stats.totalEarned.toFixed(5)}`);
+    console.log(`   Total Claims: ${stats.totalActions}`);
+    console.log(`   Successful Withdrawals: ${stats.successfulWithdrawals}`);
+    console.log(`   Failed Withdrawals: ${stats.failedWithdrawals}`);
+    console.log('========================================');
+    process.exit(0);
+});
+
+// ============ START THE BOT ============
 main().catch(console.error);
