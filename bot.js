@@ -33,7 +33,7 @@ const config = {
     stepDistancePct: 10, // Triggers at -10% ROI
     takeProfitPct: 15,
     maxStartSpread: parseFloat(process.env.MAX_START_SPREAD) || 0.1,
-    takerFeeRate: 0.0005,  // 0.05% fee per trade
+    takerFeeRate: 0.0005,
     pollInterval: 500,
     contractMultiplier: 0.001,
     autoCompound: true,
@@ -431,11 +431,7 @@ async function syncAccount(acc, state) {
 
 function logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl) {
     const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
-    
-    // FIXED: Fee calculation based on position value, not PnL
-    // Fee is charged on the TOTAL position value, not just profit
-    const positionValue = state.volume * state.entryPrice * config.shibPerContract;
-    const estimatedFee = positionValue * config.takerFeeRate * 2; // 2x because open + close
+    const estimatedFee = Math.abs(finalPnl) * config.takerFeeRate;
     
     market.totalTrades++;
     if (finalPnl >= 0) {
@@ -464,7 +460,7 @@ function logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl) {
     state.realizedPnl += finalPnl;
     state.totalFees += estimatedFee;
     
-    console.log(`📊 TRADE CLOSED: ${state.direction.toUpperCase()} | ROI: ${finalRoi.toFixed(2)}% | PnL: ${finalPnl >= 0 ? '+' : ''}$${finalPnl.toFixed(8)} | Position Value: $${positionValue.toFixed(8)} | Fee (0.05% each way): $${estimatedFee.toFixed(8)}`);
+    console.log(`📊 TRADE CLOSED: ${state.direction.toUpperCase()} | ROI: ${finalRoi.toFixed(2)}% | PnL: ${finalPnl >= 0 ? '+' : ''}$${finalPnl.toFixed(8)} | Fee: $${estimatedFee.toFixed(8)}`);
 }
 
 function startWS() {
@@ -1169,7 +1165,6 @@ app.get('/', (req, res) => {
 
     <script>
         let walletChart = null;
-        let chartInitialized = false;
         
         async function forceSync() {
             const btn = event.target;
@@ -1199,13 +1194,8 @@ app.get('/', (req, res) => {
             const equity = walletHistory.map(h => h.equity);
             const pnlPercent = walletHistory.map(h => h.pnlPercent);
             
-            // Only create chart if not initialized, otherwise just update data
             if (walletChart) {
-                walletChart.data.labels = labels;
-                walletChart.data.datasets[0].data = equity;
-                walletChart.data.datasets[1].data = pnlPercent;
-                walletChart.update('none'); // 'none' disables animation
-                return;
+                walletChart.destroy();
             }
             
             const ctx = document.getElementById('walletChart').getContext('2d');
@@ -1241,7 +1231,6 @@ app.get('/', (req, res) => {
                 options: {
                     responsive: true,
                     maintainAspectRatio: true,
-                    animation: false, // DISABLE ALL ANIMATIONS
                     interaction: { mode: 'index', intersect: false },
                     plugins: {
                         legend: { position: 'top', labels: { color: '#E8EDF2', font: { size: 10 } } },
@@ -1274,7 +1263,6 @@ app.get('/', (req, res) => {
                     }
                 }
             });
-            chartInitialized = true;
         }
         
         setInterval(async () => {
@@ -1396,3 +1384,11 @@ app.listen(config.port, '0.0.0.0', () => {
     console.log(`💰 Auto-Compounding: ${config.riskPercent}% of wallet`);
     console.log(`📐 Formula: $${config.walletPerContract.toFixed(8)} wallet = 1 contract`);
     console.log(`📈 Step Trigger: -${config.stepDistancePct}% ROI (adds martingale when losing)`);
+    console.log(`🌐 Dashboard: http://localhost:${config.port}`);
+    console.log(`\n📊 AUTO-COMPOUNDING EXAMPLES:`);
+    console.log(`   Wallet $${config.walletPerContract.toFixed(8)} → 1 contract → Risk $${(config.walletPerContract * 0.02).toFixed(8)}`);
+    console.log(`   Wallet $${(config.walletPerContract * 2).toFixed(8)} → 2 contracts → Risk $${(config.walletPerContract * 2 * 0.02).toFixed(8)}`);
+    console.log(`   Wallet $${(config.walletPerContract * 3).toFixed(8)} → 3 contracts → Risk $${(config.walletPerContract * 3 * 0.02).toFixed(8)}`);
+    console.log(`\n⚠️  VIRTUAL MODE: No real trades will be executed on HTX`);
+    console.log(`🔧 FIXED: Average entry price recalculated on martingale steps\n`);
+});
