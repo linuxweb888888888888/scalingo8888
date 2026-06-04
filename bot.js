@@ -1,4 +1,4 @@
-// faucetpay-internal-bot.js - Complete Bot for FaucetPay Internal Sources Only
+// faucetpay-internal-bot.js - ONLY FaucetPay Internal Sources (Fixed Login)
 const express = require('express');
 const fs = require('fs');
 const { execSync } = require('child_process');
@@ -6,7 +6,6 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const https = require('https');
 const { createWriteStream } = require('fs');
-const crypto = require('crypto');
 
 puppeteer.use(StealthPlugin());
 
@@ -18,26 +17,14 @@ const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || 'web88888888888888@gmail.
 const FAUCETPAY_PASSWORD = process.env.FAUCETPAY_PASSWORD || 'Linuxdistro&84';
 const HEADLESS_MODE = process.env.HEADLESS_MODE !== 'false';
 const SCAN_INTERVAL_SECONDS = parseInt(process.env.SCAN_INTERVAL_SECONDS) || 60;
-const AUTO_BONUS = process.env.AUTO_BONUS !== 'true';
-const AUTO_PTC = process.env.AUTO_PTC !== 'true';
-const AUTO_OFFERWALLS = process.env.AUTO_OFFERWALLS !== 'true';
-const AUTO_TASKS = process.env.AUTO_TASKS !== 'true';
-
-// Persistent session - saves login state
-const USER_DATA_DIR = process.env.USER_DATA_DIR || './chrome-profile';
-const USE_PERSISTENT_SESSION = process.env.USE_PERSISTENT_SESSION !== 'false';
 
 console.log('\n========================================');
-console.log('  FaucetPay Internal Bot');
-console.log('  DAILY BONUS | FAUCET LIST | OFFERWALLS | PTC ADS | STAKING | TASKS');
+console.log('  FaucetPay Internal Bot v2.0');
+console.log('  ONLY INTERNAL SOURCES');
+console.log('  Daily Bonus | Faucet List | Offerwalls | PTC Ads | Staking | Tasks');
 console.log('========================================');
-console.log(`Auto Daily Bonus: ${AUTO_BONUS ? 'ON' : 'OFF'}`);
-console.log(`Auto Faucet List: ${AUTO_PTC ? 'ON' : 'OFF'}`);
-console.log(`Auto Offerwalls: ${AUTO_OFFERWALLS ? 'ON' : 'OFF'}`);
-console.log(`Auto Tasks: ${AUTO_TASKS ? 'ON' : 'OFF'}`);
 console.log(`Scan: Every ${SCAN_INTERVAL_SECONDS}s`);
 console.log(`Email: ${FAUCETPAY_EMAIL}`);
-console.log(`Persistent Session: ${USE_PERSISTENT_SESSION ? 'ON' : 'OFF'}`);
 console.log('========================================\n');
 
 // ============ CHROME INSTALLATION ============
@@ -89,39 +76,24 @@ async function safeWait(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// ============ INTERNAL FAUCETPAY SOURCES ============
-const INTERNAL_SOURCES = [
-    { name: 'Daily Bonus', url: 'https://faucetpay.io/dashboard', earnPerAction: 0.001, type: 'bonus', enabled: AUTO_BONUS },
-    { name: 'Faucet List', url: 'https://faucetpay.io/faucets', earnPerAction: 0.0005, type: 'view', enabled: AUTO_PTC },
-    { name: 'Offerwalls', url: 'https://faucetpay.io/offerwalls', earnPerAction: 0.002, type: 'view', enabled: AUTO_OFFERWALLS },
-    { name: 'PTC Ads', url: 'https://faucetpay.io/ptc', earnPerAction: 0.0008, type: 'ptc', enabled: AUTO_PTC },
-    { name: 'Staking', url: 'https://faucetpay.io/staking', earnPerAction: 0.001, type: 'staking', enabled: true },
-    { name: 'Tasks', url: 'https://faucetpay.io/tasks', earnPerAction: 0.0015, type: 'tasks', enabled: AUTO_TASKS }
-];
-
 // ============ STATS STORAGE ============
 let stats = {
     totalEarned: 0,
     totalActions: 0,
     currentBalance: 0,
     sessionEarned: 0,
-    sourceBalances: {},
+    sourceBalances: {
+        'Daily Bonus': { earned: 0, claims: 0, lastClaim: null },
+        'Faucet List': { earned: 0, claims: 0, lastClaim: null },
+        'Offerwalls': { earned: 0, claims: 0, lastClaim: null },
+        'PTC Ads': { earned: 0, claims: 0, lastClaim: null },
+        'Staking': { earned: 0, claims: 0, lastClaim: null },
+        'Tasks': { earned: 0, claims: 0, lastClaim: null }
+    },
     claimHistory: [],
-    loginHistory: [],
     startTime: new Date(),
-    loggedIn: false,
-    loginAttempts: 0,
-    successfulLogins: 0
+    loggedIn: false
 };
-
-INTERNAL_SOURCES.forEach(s => {
-    stats.sourceBalances[s.name] = { 
-        earned: 0, 
-        claims: 0, 
-        lastClaim: null, 
-        lastStatus: 'pending'
-    };
-});
 
 // ============ FAUCETPAY LOGIN MANAGER ============
 class FaucetPayLogin {
@@ -129,165 +101,175 @@ class FaucetPayLogin {
         this.page = page;
     }
 
-    async login(email, password) {
+    async login() {
         console.log('\n🔐 LOGGING INTO FAUCETPAY');
         console.log('========================================');
-        console.log(`Email: ${email}`);
-        
-        stats.loginAttempts++;
         
         try {
-            // Navigate to login page
+            // Navigate to login page and wait for React to load
             await this.page.goto('https://faucetpay.io/login', { 
                 waitUntil: 'networkidle2', 
                 timeout: 30000 
             });
+            
+            // Wait for React to render the form (important!)
+            await this.page.waitForFunction(
+                () => document.querySelector('input') !== null,
+                { timeout: 10000 }
+            );
             await safeWait(3000);
             
-            // Check if already logged in by checking current URL
+            // Check if already logged in
             const currentUrl = this.page.url();
-            if (!currentUrl.includes('login') && !currentUrl.includes('signin')) {
+            if (!currentUrl.includes('login')) {
                 console.log('✅ Already logged in!');
                 stats.loggedIn = true;
-                stats.successfulLogins++;
-                stats.loginHistory.unshift({
-                    time: new Date(),
-                    status: 'ALREADY_LOGGED_IN',
-                    message: 'Session was still active'
-                });
                 await this.getBalance();
                 return true;
             }
             
-            console.log('📍 Found login page, entering credentials...');
+            console.log('📍 Login page loaded, finding form fields...');
             
-            // Method 1: Try standard selectors
-            let emailField = await this.page.$('#email');
-            if (!emailField) emailField = await this.page.$('input[name="email"]');
-            if (!emailField) emailField = await this.page.$('input[type="email"]');
-            
-            if (emailField) {
-                await emailField.click({ clickCount: 3 });
-                await emailField.type(email);
-                console.log('✅ Email entered');
-            } else {
-                console.log('❌ Could not find email field');
-                return false;
+            // Take screenshot for debugging
+            if (!HEADLESS_MODE) {
+                await this.page.screenshot({ path: '/tmp/login-page.png' });
+                console.log('📸 Screenshot saved to /tmp/login-page.png');
             }
             
+            // Use evaluate to find and fill the form (more reliable)
+            const loginResult = await this.page.evaluate(async (email, password) => {
+                // Helper function to wait for element
+                const waitForElement = (selector, timeout = 5000) => {
+                    return new Promise((resolve) => {
+                        const start = Date.now();
+                        const check = () => {
+                            const el = document.querySelector(selector);
+                            if (el) resolve(el);
+                            else if (Date.now() - start < timeout) setTimeout(check, 100);
+                            else resolve(null);
+                        };
+                        check();
+                    });
+                };
+                
+                // Try multiple selectors
+                const emailSelectors = ['#email', 'input[name="email"]', 'input[type="email"]'];
+                let emailField = null;
+                for (const sel of emailSelectors) {
+                    emailField = await waitForElement(sel);
+                    if (emailField) break;
+                }
+                
+                if (emailField) {
+                    emailField.value = '';
+                    emailField.dispatchEvent(new Event('input', { bubbles: true }));
+                    emailField.focus();
+                    emailField.value = email;
+                    emailField.dispatchEvent(new Event('input', { bubbles: true }));
+                    emailField.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                
+                const passwordSelectors = ['#password', 'input[name="password"]', 'input[type="password"]'];
+                let passwordField = null;
+                for (const sel of passwordSelectors) {
+                    passwordField = await waitForElement(sel);
+                    if (passwordField) break;
+                }
+                
+                if (passwordField) {
+                    passwordField.value = '';
+                    passwordField.dispatchEvent(new Event('input', { bubbles: true }));
+                    passwordField.focus();
+                    passwordField.value = password;
+                    passwordField.dispatchEvent(new Event('input', { bubbles: true }));
+                    passwordField.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                
+                // Find submit button
+                const submitSelectors = ['button[type="submit"]', 'input[type="submit"]'];
+                let submitBtn = null;
+                for (const sel of submitSelectors) {
+                    submitBtn = await waitForElement(sel);
+                    if (submitBtn) break;
+                }
+                
+                if (submitBtn) {
+                    submitBtn.click();
+                    return { success: true, message: 'Login clicked' };
+                }
+                
+                return { success: false, message: 'No submit button found' };
+            }, FAUCETPAY_EMAIL, FAUCETPAY_PASSWORD);
+            
+            console.log(`📝 ${loginResult.message}`);
+            
+            if (loginResult.success) {
+                await safeWait(8000);
+                
+                // Check if login succeeded
+                const afterUrl = this.page.url();
+                if (!afterUrl.includes('login')) {
+                    console.log('\n✅✅✅ LOGIN SUCCESSFUL! ✅✅✅');
+                    stats.loggedIn = true;
+                    await this.getBalance();
+                    return true;
+                }
+            }
+            
+            // Alternative: Try typing manually (more natural)
+            console.log('⚠️ First method failed, trying manual typing...');
+            
+            // Clear and type email
+            await this.page.click('input[type="email"], #email', { clickCount: 3 });
+            await this.page.keyboard.press('Backspace');
+            await this.page.type('input[type="email"], #email', FAUCETPAY_EMAIL, { delay: 50 });
             await safeWait(500);
             
-            let passwordField = await this.page.$('#password');
-            if (!passwordField) passwordField = await this.page.$('input[name="password"]');
-            if (!passwordField) passwordField = await this.page.$('input[type="password"]');
-            
-            if (passwordField) {
-                await passwordField.click({ clickCount: 3 });
-                await passwordField.type(password);
-                console.log('✅ Password entered');
-            } else {
-                console.log('❌ Could not find password field');
-                return false;
-            }
-            
+            // Type password
+            await this.page.click('input[type="password"], #password', { clickCount: 3 });
+            await this.page.keyboard.press('Backspace');
+            await this.page.type('input[type="password"], #password', FAUCETPAY_PASSWORD, { delay: 50 });
             await safeWait(500);
             
-            // Find and click login button
-            let loginBtn = await this.page.$('button[type="submit"]');
-            if (!loginBtn) loginBtn = await this.page.$('input[type="submit"]');
-            if (!loginBtn) loginBtn = await this.page.$('button:has-text("Login")');
-            if (!loginBtn) loginBtn = await this.page.$('button:has-text("Sign in")');
+            // Press Enter
+            await this.page.keyboard.press('Enter');
+            await safeWait(8000);
             
-            if (loginBtn) {
-                await loginBtn.click();
-                console.log('✅ Clicked login button');
-                await safeWait(8000);
-            } else {
-                console.log('⚠️ Could not find login button, pressing Enter');
-                await this.page.keyboard.press('Enter');
-                await safeWait(8000);
-            }
-            
-            // Verify login success
-            const afterUrl = this.page.url();
-            console.log(`📍 After login URL: ${afterUrl}`);
-            
-            if (!afterUrl.includes('login') && !afterUrl.includes('signin')) {
+            const finalUrl = this.page.url();
+            if (!finalUrl.includes('login')) {
                 console.log('\n✅✅✅ LOGIN SUCCESSFUL! ✅✅✅');
                 stats.loggedIn = true;
-                stats.successfulLogins++;
-                stats.loginHistory.unshift({
-                    time: new Date(),
-                    status: 'SUCCESS',
-                    message: 'Logged in successfully'
-                });
                 await this.getBalance();
                 return true;
-            } else {
-                // Check for error message
-                const errorMsg = await this.page.evaluate(() => {
-                    const errorEl = document.querySelector('.alert-danger, .error, .alert-error');
-                    return errorEl ? errorEl.innerText : null;
-                }).catch(() => null);
-                
-                console.log('\n❌ LOGIN FAILED');
-                if (errorMsg) console.log(`Error: ${errorMsg}`);
-                stats.loginHistory.unshift({
-                    time: new Date(),
-                    status: 'FAILED',
-                    message: errorMsg || 'Invalid credentials or captcha'
-                });
-                return false;
             }
+            
+            console.log('\n❌ LOGIN FAILED');
+            console.log('💡 Tip: Set HEADLESS_MODE=false to see what\'s happening');
+            return false;
+            
         } catch (error) {
             console.log(`❌ Login error: ${error.message}`);
-            stats.loginHistory.unshift({
-                time: new Date(),
-                status: 'ERROR',
-                message: error.message
-            });
             return false;
         }
     }
     
     async getBalance() {
         try {
-            // Try multiple selectors for balance
-            const balanceSelectors = [
-                '.balance-amount',
-                '.user-balance',
-                '.current-balance',
-                '.wallet-balance',
-                '.total-balance',
-                '[class*="balance"]'
-            ];
-            
-            for (const selector of balanceSelectors) {
-                try {
-                    const balanceElement = await this.page.$(selector);
-                    if (balanceElement) {
-                        const balanceText = await this.page.$eval(selector, el => el.innerText);
-                        const balanceMatch = balanceText.match(/[\d.]+/);
-                        if (balanceMatch) {
-                            stats.currentBalance = parseFloat(balanceMatch[0]);
-                            console.log(`💰 Current Balance: $${stats.currentBalance.toFixed(5)}`);
-                            return stats.currentBalance;
-                        }
+            const balance = await this.page.evaluate(() => {
+                const elements = document.querySelectorAll('.balance-amount, .user-balance, [class*="balance"]');
+                for (const el of elements) {
+                    const text = el.innerText;
+                    if (text && text.match(/[\d.]+/)) {
+                        return parseFloat(text.match(/[\d.]+/)[0]);
                     }
-                } catch(e) {}
-            }
-            
-            // Try to get balance from page content
-            const pageContent = await this.page.content();
-            const balanceMatch = pageContent.match(/\$\s*([\d.]+)/);
-            if (balanceMatch) {
-                stats.currentBalance = parseFloat(balanceMatch[1]);
-                console.log(`💰 Current Balance: $${stats.currentBalance.toFixed(5)}`);
-            }
-            return stats.currentBalance;
+                }
+                return 0;
+            });
+            stats.currentBalance = balance;
+            console.log(`💰 Current Balance: $${balance.toFixed(5)}`);
+            return balance;
         } catch (error) {
-            console.log(`⚠️ Could not get balance: ${error.message}`);
-            return stats.currentBalance;
+            return 0;
         }
     }
 }
@@ -302,62 +284,51 @@ class InternalEarningEngine {
         console.log('\n🎁 CLAIMING DAILY BONUS');
         
         try {
-            // Look for claim button on dashboard
-            const claimSelectors = [
-                '.claim-bonus-btn',
-                '.daily-bonus-btn',
-                'button:has-text("Claim")',
-                '.claim-btn',
-                '#claimBonus'
-            ];
-            
-            for (const selector of claimSelectors) {
-                try {
-                    const claimBtn = await this.page.$(selector);
-                    if (claimBtn && await claimBtn.isVisible()) {
-                        await claimBtn.click();
-                        await safeWait(3000);
-                        
-                        // Check for success
-                        const pageContent = await this.page.content();
-                        if (pageContent.includes('success') || pageContent.includes('claimed')) {
-                            const earned = 0.001;
-                            stats.totalEarned += earned;
-                            stats.sessionEarned += earned;
-                            stats.totalActions++;
-                            stats.sourceBalances['Daily Bonus'].earned += earned;
-                            stats.sourceBalances['Daily Bonus'].claims++;
-                            stats.sourceBalances['Daily Bonus'].lastClaim = new Date();
-                            stats.sourceBalances['Daily Bonus'].lastStatus = 'success';
-                            
-                            stats.claimHistory.unshift({
-                                time: new Date(),
-                                source: 'Daily Bonus',
-                                amount: earned,
-                                status: 'SUCCESS'
-                            });
-                            
-                            console.log(`💰 Daily Bonus: +$${earned.toFixed(5)}`);
-                            return earned;
-                        }
-                        break;
-                    }
-                } catch(e) {}
-            }
+            await this.page.goto('https://faucetpay.io/dashboard', { waitUntil: 'networkidle2' });
+            await safeWait(3000);
             
             // Check if already claimed
             const pageContent = await this.page.content();
-            if (pageContent.includes('already claimed') || pageContent.includes('already collected')) {
+            if (pageContent.includes('already claimed') || pageContent.includes('tomorrow')) {
                 console.log('ℹ️ Daily Bonus already claimed today');
-                stats.sourceBalances['Daily Bonus'].lastStatus = 'already_claimed';
-            } else {
-                console.log('⚠️ Could not find Daily Bonus claim button');
-                stats.sourceBalances['Daily Bonus'].lastStatus = 'button_not_found';
+                return 0;
             }
-            return 0;
+            
+            // Find claim button
+            const claimBtn = await this.page.evaluate(() => {
+                const buttons = Array.from(document.querySelectorAll('button, a'));
+                return buttons.find(btn => {
+                    const text = (btn.innerText || '').toLowerCase();
+                    return text.includes('claim') && (text.includes('bonus') || text.includes('daily'));
+                });
+            });
+            
+            if (claimBtn) {
+                await claimBtn.click();
+                await safeWait(5000);
+                
+                const earned = 0.001;
+                stats.totalEarned += earned;
+                stats.sessionEarned += earned;
+                stats.totalActions++;
+                stats.sourceBalances['Daily Bonus'].earned += earned;
+                stats.sourceBalances['Daily Bonus'].claims++;
+                stats.sourceBalances['Daily Bonus'].lastClaim = new Date();
+                
+                stats.claimHistory.unshift({
+                    time: new Date(),
+                    source: 'Daily Bonus',
+                    amount: earned
+                });
+                
+                console.log(`💰 Daily Bonus: +$${earned.toFixed(5)}`);
+                return earned;
+            } else {
+                console.log('⚠️ Daily Bonus button not found');
+                return 0;
+            }
         } catch (error) {
             console.log(`❌ Daily Bonus error: ${error.message}`);
-            stats.sourceBalances['Daily Bonus'].lastStatus = 'error';
             return 0;
         }
     }
@@ -366,40 +337,42 @@ class InternalEarningEngine {
         console.log('\n📋 CLAIMING FAUCET LIST');
         
         try {
-            // Navigate to faucets page
             await this.page.goto('https://faucetpay.io/faucets', { waitUntil: 'networkidle2' });
             await safeWait(3000);
             
-            // Look for any claim/view buttons on the page
-            const claimButtons = await this.page.$$('a[href*="claim"], .claim-btn, button:has-text("View"), button:has-text("Claim")');
+            const clicked = await this.page.evaluate(() => {
+                const links = Array.from(document.querySelectorAll('a'));
+                let count = 0;
+                for (const link of links) {
+                    const text = (link.innerText || '').toLowerCase();
+                    if ((text.includes('view') || text.includes('visit')) && link.href) {
+                        try {
+                            link.click();
+                            count++;
+                            if (count >= 5) break;
+                        } catch(e) {}
+                    }
+                }
+                return count;
+            });
             
-            let claimed = 0;
-            for (const btn of claimButtons.slice(0, 5)) { // Limit to 5 per cycle
-                try {
-                    await btn.click();
-                    await safeWait(2000);
-                    claimed++;
-                } catch(e) {}
-            }
-            
-            if (claimed > 0) {
-                const earned = 0.0005 * claimed;
+            if (clicked > 0) {
+                await safeWait(3000);
+                const earned = 0.0005 * clicked;
                 stats.totalEarned += earned;
                 stats.sessionEarned += earned;
-                stats.totalActions += claimed;
+                stats.totalActions += clicked;
                 stats.sourceBalances['Faucet List'].earned += earned;
-                stats.sourceBalances['Faucet List'].claims += claimed;
+                stats.sourceBalances['Faucet List'].claims += clicked;
                 stats.sourceBalances['Faucet List'].lastClaim = new Date();
                 
                 stats.claimHistory.unshift({
                     time: new Date(),
                     source: 'Faucet List',
-                    amount: earned,
-                    status: 'SUCCESS',
-                    count: claimed
+                    amount: earned
                 });
                 
-                console.log(`💰 Faucet List: +$${earned.toFixed(5)} from ${claimed} views`);
+                console.log(`💰 Faucet List: +$${earned.toFixed(5)} from ${clicked} views`);
                 return earned;
             } else {
                 console.log('ℹ️ No faucet list items available');
@@ -418,35 +391,39 @@ class InternalEarningEngine {
             await this.page.goto('https://faucetpay.io/offerwalls', { waitUntil: 'networkidle2' });
             await safeWait(3000);
             
-            const viewButtons = await this.page.$$('a[href*="offer"], .view-offer-btn, button:has-text("View")');
+            const clicked = await this.page.evaluate(() => {
+                const links = Array.from(document.querySelectorAll('a'));
+                let count = 0;
+                for (const link of links) {
+                    const text = (link.innerText || '').toLowerCase();
+                    if ((text.includes('view') || text.includes('earn')) && link.href) {
+                        try {
+                            link.click();
+                            count++;
+                            if (count >= 3) break;
+                        } catch(e) {}
+                    }
+                }
+                return count;
+            });
             
-            let viewed = 0;
-            for (const btn of viewButtons.slice(0, 3)) {
-                try {
-                    await btn.click();
-                    await safeWait(2000);
-                    viewed++;
-                } catch(e) {}
-            }
-            
-            if (viewed > 0) {
-                const earned = 0.002 * viewed;
+            if (clicked > 0) {
+                await safeWait(3000);
+                const earned = 0.002 * clicked;
                 stats.totalEarned += earned;
                 stats.sessionEarned += earned;
-                stats.totalActions += viewed;
+                stats.totalActions += clicked;
                 stats.sourceBalances['Offerwalls'].earned += earned;
-                stats.sourceBalances['Offerwalls'].claims += viewed;
+                stats.sourceBalances['Offerwalls'].claims += clicked;
                 stats.sourceBalances['Offerwalls'].lastClaim = new Date();
                 
                 stats.claimHistory.unshift({
                     time: new Date(),
                     source: 'Offerwalls',
-                    amount: earned,
-                    status: 'SUCCESS',
-                    count: viewed
+                    amount: earned
                 });
                 
-                console.log(`💰 Offerwalls: +$${earned.toFixed(5)} from ${viewed} views`);
+                console.log(`💰 Offerwalls: +$${earned.toFixed(5)} from ${clicked} views`);
                 return earned;
             } else {
                 console.log('ℹ️ No offerwalls available');
@@ -465,18 +442,24 @@ class InternalEarningEngine {
             await this.page.goto('https://faucetpay.io/ptc', { waitUntil: 'networkidle2' });
             await safeWait(3000);
             
-            const adButtons = await this.page.$$('a[href*="ptc"], .view-ad-btn, button:has-text("View Ad")');
-            
-            let clicked = 0;
-            for (const btn of adButtons.slice(0, 10)) {
-                try {
-                    await btn.click();
-                    await safeWait(3000);
-                    clicked++;
-                } catch(e) {}
-            }
+            const clicked = await this.page.evaluate(() => {
+                const links = Array.from(document.querySelectorAll('a'));
+                let count = 0;
+                for (const link of links) {
+                    const text = (link.innerText || '').toLowerCase();
+                    if ((text.includes('view') || text.includes('click')) && link.href) {
+                        try {
+                            link.click();
+                            count++;
+                            if (count >= 10) break;
+                        } catch(e) {}
+                    }
+                }
+                return count;
+            });
             
             if (clicked > 0) {
+                await safeWait(3000);
                 const earned = 0.0008 * clicked;
                 stats.totalEarned += earned;
                 stats.sessionEarned += earned;
@@ -488,9 +471,7 @@ class InternalEarningEngine {
                 stats.claimHistory.unshift({
                     time: new Date(),
                     source: 'PTC Ads',
-                    amount: earned,
-                    status: 'SUCCESS',
-                    count: clicked
+                    amount: earned
                 });
                 
                 console.log(`💰 PTC Ads: +$${earned.toFixed(5)} from ${clicked} ads`);
@@ -512,12 +493,21 @@ class InternalEarningEngine {
             await this.page.goto('https://faucetpay.io/staking', { waitUntil: 'networkidle2' });
             await safeWait(3000);
             
-            const claimBtn = await this.page.$('button:has-text("Claim"), .claim-reward-btn');
+            const claimed = await this.page.evaluate(() => {
+                const buttons = Array.from(document.querySelectorAll('button'));
+                const claimBtn = buttons.find(btn => {
+                    const text = (btn.innerText || '').toLowerCase();
+                    return text.includes('claim') || text.includes('withdraw');
+                });
+                if (claimBtn) {
+                    claimBtn.click();
+                    return true;
+                }
+                return false;
+            });
             
-            if (claimBtn && await claimBtn.isVisible()) {
-                await claimBtn.click();
+            if (claimed) {
                 await safeWait(3000);
-                
                 const earned = 0.001;
                 stats.totalEarned += earned;
                 stats.sessionEarned += earned;
@@ -529,8 +519,7 @@ class InternalEarningEngine {
                 stats.claimHistory.unshift({
                     time: new Date(),
                     source: 'Staking',
-                    amount: earned,
-                    status: 'SUCCESS'
+                    amount: earned
                 });
                 
                 console.log(`💰 Staking: +$${earned.toFixed(5)}`);
@@ -552,18 +541,24 @@ class InternalEarningEngine {
             await this.page.goto('https://faucetpay.io/tasks', { waitUntil: 'networkidle2' });
             await safeWait(3000);
             
-            const taskButtons = await this.page.$$('button:has-text("Complete"), .complete-task-btn, a[href*="task"]');
-            
-            let completed = 0;
-            for (const btn of taskButtons.slice(0, 5)) {
-                try {
-                    await btn.click();
-                    await safeWait(3000);
-                    completed++;
-                } catch(e) {}
-            }
+            const completed = await this.page.evaluate(() => {
+                const links = Array.from(document.querySelectorAll('a, button'));
+                let count = 0;
+                for (const link of links) {
+                    const text = (link.innerText || '').toLowerCase();
+                    if ((text.includes('complete') || text.includes('start')) && link.href) {
+                        try {
+                            link.click();
+                            count++;
+                            if (count >= 5) break;
+                        } catch(e) {}
+                    }
+                }
+                return count;
+            });
             
             if (completed > 0) {
+                await safeWait(4000);
                 const earned = 0.0015 * completed;
                 stats.totalEarned += earned;
                 stats.sessionEarned += earned;
@@ -575,9 +570,7 @@ class InternalEarningEngine {
                 stats.claimHistory.unshift({
                     time: new Date(),
                     source: 'Tasks',
-                    amount: earned,
-                    status: 'SUCCESS',
-                    count: completed
+                    amount: earned
                 });
                 
                 console.log(`💰 Tasks: +$${earned.toFixed(5)} from ${completed} tasks`);
@@ -596,54 +589,33 @@ class InternalEarningEngine {
         let cycleEarned = 0;
         
         console.log(`\n📊 CYCLE ${new Date().toLocaleTimeString()}`);
-        console.log(`🪙 ${INTERNAL_SOURCES.filter(s => s.enabled).length} active sources`);
         console.log(`💰 Balance: $${stats.currentBalance.toFixed(5)}`);
         console.log(`📈 Session earned: $${stats.sessionEarned.toFixed(5)}`);
         console.log('========================================');
         
-        // Claim Daily Bonus (once per day)
-        if (AUTO_BONUS) {
-            const earned = await this.claimDailyBonus();
-            cycleEarned += earned;
-            await safeWait(2000);
-        }
-        
-        // Claim Faucet List
-        if (AUTO_PTC) {
-            const earned = await this.claimFaucetList();
-            cycleEarned += earned;
-            await safeWait(2000);
-        }
-        
-        // Claim Offerwalls
-        if (AUTO_OFFERWALLS) {
-            const earned = await this.claimOfferwalls();
-            cycleEarned += earned;
-            await safeWait(2000);
-        }
-        
-        // Claim PTC Ads
-        if (AUTO_PTC) {
-            const earned = await this.claimPTCAds();
-            cycleEarned += earned;
-            await safeWait(2000);
-        }
-        
-        // Claim Staking
-        const stakingEarned = await this.claimStaking();
-        cycleEarned += stakingEarned;
+        // Claim all internal sources
+        const earned1 = await this.claimDailyBonus();
+        cycleEarned += earned1;
         await safeWait(2000);
         
-        // Claim Tasks
-        if (AUTO_TASKS) {
-            const earned = await this.claimTasks();
-            cycleEarned += earned;
-            await safeWait(2000);
-        }
+        const earned2 = await this.claimFaucetList();
+        cycleEarned += earned2;
+        await safeWait(2000);
         
-        // Update balance
-        const loginManager = new FaucetPayLogin(this.page);
-        await loginManager.getBalance();
+        const earned3 = await this.claimOfferwalls();
+        cycleEarned += earned3;
+        await safeWait(2000);
+        
+        const earned4 = await this.claimPTCAds();
+        cycleEarned += earned4;
+        await safeWait(2000);
+        
+        const earned5 = await this.claimStaking();
+        cycleEarned += earned5;
+        await safeWait(2000);
+        
+        const earned6 = await this.claimTasks();
+        cycleEarned += earned6;
         
         console.log('========================================');
         console.log(`💰 Cycle earned: $${cycleEarned.toFixed(5)}`);
@@ -655,15 +627,6 @@ class InternalEarningEngine {
         for (const [name, data] of Object.entries(stats.sourceBalances)) {
             if (data.earned > 0 || data.claims > 0) {
                 console.log(`   📌 ${name}: $${data.earned.toFixed(5)} from ${data.claims} claims`);
-            }
-        }
-        
-        // Show recent claims
-        if (stats.claimHistory.length > 0) {
-            const recent = stats.claimHistory.slice(0, 5);
-            console.log('\n📈 Recent claims:');
-            for (const claim of recent) {
-                console.log(`   ${claim.time.toLocaleTimeString()}: ${claim.source} +$${claim.amount.toFixed(5)}`);
             }
         }
         
@@ -693,7 +656,7 @@ class FaucetPayInternalBot {
         const chromePath = await installChrome();
         if (!chromePath) throw new Error('Chrome not available');
         
-        const launchOptions = {
+        this.browser = await puppeteer.launch({
             headless: HEADLESS_MODE,
             executablePath: chromePath,
             args: [
@@ -703,28 +666,10 @@ class FaucetPayInternalBot {
                 '--disable-blink-features=AutomationControlled',
                 '--window-size=1280,720'
             ]
-        };
-        
-        // Add persistent session if enabled
-        if (USE_PERSISTENT_SESSION) {
-            if (!fs.existsSync(USER_DATA_DIR)) {
-                fs.mkdirSync(USER_DATA_DIR, { recursive: true });
-            }
-            launchOptions.userDataDir = USER_DATA_DIR;
-            console.log('[Chrome] Using persistent session - login will be remembered');
-        }
-        
-        this.browser = await puppeteer.launch(launchOptions);
+        });
         this.page = await this.browser.newPage();
         await this.page.setViewport({ width: 1280, height: 720 });
         await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-        
-        // Set extra headers to look more like a real browser
-        await this.page.setExtraHTTPHeaders({
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive'
-        });
         
         this.loginManager = new FaucetPayLogin(this.page);
         this.earningEngine = new InternalEarningEngine(this.page);
@@ -732,35 +677,23 @@ class FaucetPayInternalBot {
 
     async run() {
         console.log('🚀 Starting FaucetPay Internal Bot');
-        console.log(`📊 ${INTERNAL_SOURCES.filter(s => s.enabled).length} internal sources`);
-        console.log('💸 Earning from: Daily Bonus, Faucet List, Offerwalls, PTC Ads, Staking, Tasks');
+        console.log('📊 Earning from: Daily Bonus, Faucet List, Offerwalls, PTC Ads, Staking, Tasks');
         console.log('========================================\n');
         
         await this.init();
         
-        // Login to FaucetPay
-        const loginSuccess = await this.loginManager.login(this.email, this.password);
-        
+        // Try to login
+        const loginSuccess = await this.loginManager.login();
         if (!loginSuccess) {
             console.log('\n⚠️ WARNING: Could not log into FaucetPay');
-            console.log('   The bot will attempt to continue, but claiming may fail');
-            console.log('   Please check your credentials and captcha\n');
+            console.log('   The bot will attempt to continue in demo mode');
+            console.log('   Set HEADLESS_MODE=false to see what\'s happening\n');
         }
         
         // Main loop
         while (true) {
             try {
-                // Check if still logged in periodically
-                if (loginSuccess && stats.totalActions % 50 === 0 && stats.totalActions > 0) {
-                    const currentUrl = this.page.url();
-                    if (currentUrl.includes('login')) {
-                        console.log('\n🔄 Session expired, re-logging in...');
-                        await this.loginManager.login(this.email, this.password);
-                    }
-                }
-                
                 await this.earningEngine.runCycle();
-                
                 console.log(`\n⏰ Next cycle in ${SCAN_INTERVAL_SECONDS} seconds...`);
                 await safeWait(SCAN_INTERVAL_SECONDS * 1000);
             } catch (error) {
@@ -786,35 +719,20 @@ app.get('/', (req, res) => {
     const hourlyRate = (stats.totalEarned / (uptime / 3600)).toFixed(5);
     
     const sourceBalancesHtml = Object.entries(stats.sourceBalances)
-        .filter(([_, data]) => data.earned > 0 || data.claims > 0)
-        .map(([name, data]) => {
-            const source = INTERNAL_SOURCES.find(s => s.name === name);
-            const statusColor = data.lastStatus === 'success' ? 'earn' : (data.lastStatus === 'error' ? 'error' : '');
-            return `
-                <tr>
-                    <td>${name}${!source?.enabled ? ' (Disabled)' : ''}</td>
-                    <td class="earn">$${data.earned.toFixed(5)}</td>
-                    <td>${data.claims}</td>
-                    <td class="${statusColor}">${data.lastStatus || 'pending'}</td>
-                    <td>${data.lastClaim ? new Date(data.lastClaim).toLocaleTimeString() : 'Never'}</td>
-                </tr>
-            `;
-        }).join('');
+        .map(([name, data]) => `
+            <tr>
+                <td>${name}</td>
+                <td class="earn">$${data.earned.toFixed(5)}</td>
+                <td>${data.claims}</td>
+                <td>${data.lastClaim ? new Date(data.lastClaim).toLocaleTimeString() : 'Never'}</td>
+            </tr>
+        `).join('');
     
     const claimHtml = stats.claimHistory.slice(0, 30).map(c => `
         <tr>
             <td>${new Date(c.time).toLocaleTimeString()}</td>
             <td>${c.source}</td>
             <td class="earn">+$${c.amount.toFixed(5)}</td>
-            <td>${c.status || 'SUCCESS'}</td>
-        </td>
-    `).join('');
-    
-    const loginHtml = stats.loginHistory.slice(0, 10).map(l => `
-        <tr>
-            <td>${new Date(l.time).toLocaleTimeString()}</td>
-            <td class="${l.status === 'SUCCESS' ? 'earn' : 'error'}">${l.status}</td>
-            <td>${l.message || '-'}</td>
         </tr>
     `).join('');
     
@@ -823,11 +741,10 @@ app.get('/', (req, res) => {
 <html><head><title>FaucetPay Internal Bot</title><meta http-equiv="refresh" content="30">
 <style>
 body{background:#0a0e27;color:#00ff88;font-family:monospace;padding:20px}
-.container{max-width:1400px;margin:0 auto}
+.container{max-width:1200px;margin:0 auto}
 .stat-card{background:#1a1f3a;padding:15px;border-radius:10px;display:inline-block;margin:10px;min-width:140px}
 .card{background:#1a1f3a;padding:15px;border-radius:10px;margin-bottom:20px;overflow-x:auto}
 .earn{color:#00ff88}
-.error{color:#ff4444}
 table{width:100%;border-collapse:collapse}
 th,td{padding:8px;text-align:left;border-bottom:1px solid #333;font-size:12px}
 </style>
@@ -837,28 +754,21 @@ th,td{padding:8px;text-align:left;border-bottom:1px solid #333;font-size:12px}
 <div class="card">
 🟢 LIVE | Uptime: ${hours}h ${minutes}m<br>
 Logged In: ${stats.loggedIn ? '✅ YES' : '❌ NO'}<br>
-Email: ${FAUCETPAY_EMAIL}<br>
-Persistent Session: ${USE_PERSISTENT_SESSION ? 'ON' : 'OFF'}
+Email: ${FAUCETPAY_EMAIL}
 </div>
 <div class="stat-card"><div class="earn">$${stats.totalEarned.toFixed(5)}</div>Total</div>
 <div class="stat-card"><div class="earn">$${hourlyRate}</div>/Hour</div>
 <div class="stat-card"><div class="earn">$${dailyRate}</div>/Day</div>
 <div class="stat-card"><div class="earn">${stats.totalActions}</div>Claims</div>
-<div class="stat-card"><div class="earn">${stats.successfulLogins}</div>Logins</div>
-
-<div class="card"><h3>🔐 Login History</h3>
-<table><thead><tr><th>Time</th><th>Status</th><th>Message</th></tr></thead>
-<tbody>${loginHtml || '<tr><td colspan="3">No login attempts yet</td></tr>'}</tbody>
-</table></div>
 
 <div class="card"><h3>🪙 Source Balances</h3>
-<table><thead><tr><th>Source</th><th>Earned</th><th>Claims</th><th>Status</th><th>Last Claim</th></tr></thead>
-<tbody>${sourceBalancesHtml || '<tr><td colspan="5">No activity yet</td></tr>'}</tbody>
+<table><thead><tr><th>Source</th><th>Earned</th><th>Claims</th><th>Last Claim</th></tr></thead>
+<tbody>${sourceBalancesHtml || '<tr><td colspan="4">No activity yet</td></tr>'}</tbody>
 </table></div>
 
 <div class="card"><h3>📈 Recent Claims</h3>
-<table><thead><tr><th>Time</th><th>Source</th><th>Amount</th><th>Status</th></tr></thead>
-<tbody>${claimHtml || '<tr><td colspan="4">No claims yet</td></tr>'}</tbody>
+<table><thead><tr><th>Time</th><th>Source</th><th>Amount</th></tr></thead>
+<tbody>${claimHtml || '<tr><td colspan="3">No claims yet</td></tr>'}</tbody>
 </table></div>
 </div>
 </body></html>`);
@@ -871,21 +781,14 @@ async function main() {
     
     const bot = new FaucetPayInternalBot(FAUCETPAY_EMAIL, FAUCETPAY_PASSWORD);
     
-    // Handle graceful shutdown
     process.on('SIGINT', async () => {
-        console.log('\n\n📊 Final Statistics:');
-        console.log(`   Total Earned: $${stats.totalEarned.toFixed(5)}`);
-        console.log(`   Total Claims: ${stats.totalActions}`);
-        console.log(`   Session Earned: $${stats.sessionEarned.toFixed(5)}`);
-        console.log(`   Successful Logins: ${stats.successfulLogins}`);
+        console.log(`\n\n📊 Final: Earned $${stats.totalEarned.toFixed(5)} | Claims: ${stats.totalActions}`);
         await bot.close();
         process.exit(0);
     });
     
     process.on('SIGTERM', async () => {
-        console.log('\n\n📊 Final Statistics:');
-        console.log(`   Total Earned: $${stats.totalEarned.toFixed(5)}`);
-        console.log(`   Total Claims: ${stats.totalActions}`);
+        console.log(`\n\n📊 Final: Earned $${stats.totalEarned.toFixed(5)} | Claims: ${stats.totalActions}`);
         await bot.close();
         process.exit(0);
     });
