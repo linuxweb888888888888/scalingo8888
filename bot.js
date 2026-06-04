@@ -40,17 +40,17 @@ const config = {
     riskPercent: 2,
     shibPerContract: 1000,
     walletPerContract: 0.0066135,  // $0.0066135 wallet = 1 contract at 75x leverage
-    virtualMode: true  // NEW: Virtual trading mode
+    virtualMode: true  // Virtual trading mode
 };
 
 let market = {
     status: 'Active', bid: 0, ask: 0, spread: 0,
     totalNetGain: 0, growthPct: 0, dgr: 0,
-    initialTotalEquity: 1000.00,  // CHANGED: Start with $1000
+    initialTotalEquity: 1000.00,  // Start with $1000
     startTime: Date.now(),
     lastPriceUpdate: 0,
     walletHistory: [],
-    peakEquity: 1000.00,  // CHANGED: Match initial equity
+    peakEquity: 1000.00,  // Match initial equity
     maxDrawdown: 0,
     totalTrades: 0,
     winningTrades: 0,
@@ -180,9 +180,9 @@ config.accounts.forEach((account, idx) => {
     accountStates[account.accountId] = {
         direction: idx === 0 ? 'buy' : 'sell',
         roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
-        currentEquity: 500.00,  // CHANGED: $500 each for $1000 total
-        availableMargin: 500.00,  // CHANGED: Match equity
-        initialEquity: 500.00,  // CHANGED: $500 each
+        currentEquity: 500.00,  // $500 each for $1000 total
+        availableMargin: 500.00,  // Match equity
+        initialEquity: 500.00,  // $500 each
         isLocked: false,
         pendingOrderId: null,
         lastAction: 'Idle',
@@ -248,7 +248,7 @@ async function htxRequest(account, method, path, data = {}) {
 }
 
 async function fetchPriceRest() {
-    // VIRTUAL MODE: Still fetch real prices for simulation
+    // Still fetch real prices for simulation
     try {
         const url = `https://${config.restHost}/linear-swap-ex/market/detail/merged?contract_code=${config.symbol}`;
         const res = await axios.get(url, { timeout: 3000 });
@@ -269,13 +269,32 @@ async function syncAccount(acc, state) {
         
         if (state.volume > 0 && market.bid > 0 && market.ask > 0) {
             const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
-            const priceChangePct = ((currentPrice - state.entryPrice) / state.entryPrice) * 100;
-            const leveragedRoi = priceChangePct * config.leverage;
             
-            // Calculate position value and unrealized PnL
+            // FIXED: Correct ROI calculation for LONG and SHORT positions
+            let priceChangePct, leveragedRoi;
+            
+            if (state.direction === 'buy') {
+                // LONG: profit when price goes up (based on AVERAGE entry price)
+                priceChangePct = ((currentPrice - state.entryPrice) / state.entryPrice) * 100;
+                leveragedRoi = priceChangePct * config.leverage;
+            } else {
+                // SHORT: profit when price goes down (based on AVERAGE entry price)
+                priceChangePct = ((state.entryPrice - currentPrice) / state.entryPrice) * 100;
+                leveragedRoi = priceChangePct * config.leverage;
+            }
+            
+            // Calculate position value and unrealized PnL using AVERAGE entry price
             const positionValue = state.volume * state.entryPrice * config.shibPerContract;
             const currentValue = state.volume * currentPrice * config.shibPerContract;
-            const newUnrealizedUsdt = (state.direction === 'buy' ? currentValue - positionValue : positionValue - currentValue);
+            let newUnrealizedUsdt;
+            
+            if (state.direction === 'buy') {
+                // LONG: profit when current > average entry
+                newUnrealizedUsdt = currentValue - positionValue;
+            } else {
+                // SHORT: profit when average entry > current
+                newUnrealizedUsdt = positionValue - currentValue;
+            }
             
             // Update ROI and unrealized PnL
             const timeSinceLastUpdate = now - state.lastRoiUpdateTime;
@@ -285,7 +304,7 @@ async function syncAccount(acc, state) {
             state.targetPrice = calculateTargetPrice(state);
             
             if (Math.abs(leveragedRoi - state.lastExchangeRoi) > 0.01) {
-                console.log(`[VIRTUAL ${state.direction.toUpperCase()}] ROI: ${leveragedRoi.toFixed(2)}% | Vol: ${state.volume} | PnL: $${newUnrealizedUsdt.toFixed(8)}`);
+                console.log(`[VIRTUAL ${state.direction.toUpperCase()}] ROI: ${leveragedRoi.toFixed(2)}% | PnL: $${newUnrealizedUsdt.toFixed(2)} | Avg Entry: ${state.entryPrice.toFixed(8)} | Current: ${currentPrice.toFixed(8)}`);
                 state.lastExchangeRoi = leveragedRoi;
             }
         }
@@ -644,15 +663,25 @@ async function processMartingale() {
                 nextVol = Math.ceil(market.currentBaseVolume * Math.pow(config.multiplier, nextStepNumber));
             }
             
-            console.log(`📈 [VIRTUAL] MARTINGALE STEP ${nextStepNumber} for ${state.direction} - ROI: ${state.roi.toFixed(2)}% (LOSS) | Current Vol: ${state.volume} | Adding: ${nextVol} contracts`);
+            console.log(`📈 [VIRTUAL] MARTINGALE STEP ${nextStepNumber} for ${state.direction} - ROI: ${state.roi.toFixed(2)}% (LOSS) | Current Vol: ${state.volume} | Adding: ${nextVol} contracts at ${currentPrice.toFixed(8)}`);
             state.isLocked = true;
             
-            // VIRTUAL MARTINGALE STEP
+            // VIRTUAL MARTINGALE STEP - FIXED with average price recalculation
             if (config.virtualMode) {
-                state.volume += nextVol;
+                // Calculate new average entry price
+                const oldTotalValue = state.volume * state.entryPrice;
+                const newTotalValue = nextVol * currentPrice;
+                const newTotalVolume = state.volume + nextVol;
+                const newAvgPrice = (oldTotalValue + newTotalValue) / newTotalVolume;
+                
+                console.log(`   Old Avg Entry: ${state.entryPrice.toFixed(8)} | New Avg Entry: ${newAvgPrice.toFixed(8)}`);
+                
+                // Update state with new averages
+                state.entryPrice = newAvgPrice;
+                state.volume = newTotalVolume;
                 state.lastStepPrice = currentPrice;
                 state.lastAddedVolume = nextVol;
-                state.lastAction = `Martingale Step ${nextStepNumber} (-${Math.abs(state.roi).toFixed(1)}% loss, Added: ${nextVol})`;
+                state.lastAction = `Martingale Step ${nextStepNumber} (-${Math.abs(state.roi).toFixed(1)}% loss, Added: ${nextVol}, New Avg: ${newAvgPrice.toFixed(8)})`;
                 state.isLocked = false;
                 continue;
             }
@@ -678,7 +707,7 @@ async function processMartingale() {
         } else {
             const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
             const requiredMove = (config.takeProfitPct / config.leverage).toFixed(3);
-            state.lastAction = `Active - Step ${step} | Vol: ${state.volume} | ROI: ${state.roi.toFixed(2)}%`;
+            state.lastAction = `Active - Step ${step} | Vol: ${state.volume} | ROI: ${state.roi.toFixed(2)}% | Avg Entry: ${state.entryPrice.toFixed(8)}`;
         }
     }
 }
@@ -809,7 +838,7 @@ app.get('/api/status', (req, res) => {
             autoCompound: config.autoCompound,
             riskPercent: config.riskPercent,
             walletPerContract: config.walletPerContract,
-            virtualMode: config.virtualMode  // ADDED: Show virtual mode status
+            virtualMode: config.virtualMode
         }
     });
 });
@@ -1287,7 +1316,7 @@ app.get('/', (req, res) => {
                     roiElem.className = 'text-2xl font-black ' + (roi >= 0 ? 'value-positive' : 'value-negative');
                     
                     document.getElementById('lPnl').textContent = (long.unrealizedUsdt >= 0 ? '+' : '') + (long.unrealizedUsdt || 0).toFixed(8);
-                    document.getElementById('lStep').innerHTML = '<span class="step-badge">STEP ' + (long.step || 0) + '</span> | VOL ' + (long.volume || 0);
+                    document.getElementById('lStep').innerHTML = '<span class="step-badge">STEP ' + (long.step || 0) + '</span> | VOL ' + (long.volume || 0) + ' | AVG ' + (long.entryPrice || 0).toFixed(8);
                     document.getElementById('lAction').textContent = long.lastAction || 'Idle';
                     document.getElementById('lRealized').innerHTML = 'Realized: ' + (long.realizedPnl >= 0 ? '+' : '') + '$' + (long.realizedPnl || 0).toFixed(8);
                     
@@ -1303,7 +1332,7 @@ app.get('/', (req, res) => {
                     roiElem.className = 'text-2xl font-black ' + (roi >= 0 ? 'value-positive' : 'value-negative');
                     
                     document.getElementById('sPnl').textContent = (short.unrealizedUsdt >= 0 ? '+' : '') + (short.unrealizedUsdt || 0).toFixed(8);
-                    document.getElementById('sStep').innerHTML = '<span class="step-badge">STEP ' + (short.step || 0) + '</span> | VOL ' + (short.volume || 0);
+                    document.getElementById('sStep').innerHTML = '<span class="step-badge">STEP ' + (short.step || 0) + '</span> | VOL ' + (short.volume || 0) + ' | AVG ' + (short.entryPrice || 0).toFixed(8);
                     document.getElementById('sAction').textContent = short.lastAction || 'Idle';
                     document.getElementById('sRealized').innerHTML = 'Realized: ' + (short.realizedPnl >= 0 ? '+' : '') + '$' + (short.realizedPnl || 0).toFixed(8);
                     
@@ -1360,5 +1389,6 @@ app.listen(config.port, '0.0.0.0', () => {
     console.log(`   Wallet $${config.walletPerContract.toFixed(8)} → 1 contract → Risk $${(config.walletPerContract * 0.02).toFixed(8)}`);
     console.log(`   Wallet $${(config.walletPerContract * 2).toFixed(8)} → 2 contracts → Risk $${(config.walletPerContract * 2 * 0.02).toFixed(8)}`);
     console.log(`   Wallet $${(config.walletPerContract * 3).toFixed(8)} → 3 contracts → Risk $${(config.walletPerContract * 3 * 0.02).toFixed(8)}`);
-    console.log(`\n⚠️  VIRTUAL MODE: No real trades will be executed on HTX\n`);
+    console.log(`\n⚠️  VIRTUAL MODE: No real trades will be executed on HTX`);
+    console.log(`🔧 FIXED: Average entry price recalculated on martingale steps\n`);
 });
