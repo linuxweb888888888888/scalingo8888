@@ -101,20 +101,7 @@ const generateFaucetList = () => {
             loginSelectors: { email: '#email', password: '#password', submit: 'button[type="submit"]' },
             walletSelectors: ['#faucetpay_address', 'input[name="faucetpay"]'],
             saveSelectors: ['#save_address', 'button[type="submit"]'],
-            withdrawSelectors: ['.withdraw-btn', '#withdrawButton', 'button:has-text("Withdraw")', '.btn-withdraw']
-        },
-        {
-            name: 'FreeBitcoin',
-            url: 'https://freebitco.in',
-            loginUrl: 'https://freebitco.in/?op=login',
-            accountUrl: 'https://freebitco.in/?op=profile',
-            earnPerAction: 0.0005,
-            minWithdraw: 0.0003,
-            claimSelector: '#free_play_form_button',
-            loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: '#login_button' },
-            walletSelectors: ['input[name="btc_address"]'],
-            saveSelectors: ['#save_address'],
-            withdrawSelectors: ['#withdraw_button', '.withdraw-btn']
+            withdrawSelectors: ['.withdraw-btn', '#withdrawButton', 'button:has-text("Withdraw")', '.btn-withdraw', 'a[href*="withdraw"]', '.btn-success']
         },
         {
             name: 'FireFaucet',
@@ -127,7 +114,20 @@ const generateFaucetList = () => {
             loginSelectors: { email: '#username', password: '#password', submit: 'button[type="submit"]' },
             walletSelectors: ['input[name="faucetpay"]'],
             saveSelectors: ['button[type="submit"]'],
-            withdrawSelectors: ['.withdraw-btn', '#withdraw']
+            withdrawSelectors: ['.withdraw-btn', '#withdraw', 'a[href*="withdraw"]', '.btn-withdraw', 'button:has-text("Withdraw")']
+        },
+        {
+            name: 'FreeBitcoin',
+            url: 'https://freebitco.in',
+            loginUrl: 'https://freebitco.in/?op=login',
+            accountUrl: 'https://freebitco.in/?op=profile',
+            earnPerAction: 0.0005,
+            minWithdraw: 0.0003,
+            claimSelector: '#free_play_form_button',
+            loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: '#login_button' },
+            walletSelectors: ['input[name="btc_address"]'],
+            saveSelectors: ['#save_address'],
+            withdrawSelectors: ['#withdraw_button', '.withdraw-btn', 'a[href*="withdraw"]']
         },
         {
             name: 'Cointiply',
@@ -140,7 +140,7 @@ const generateFaucetList = () => {
             loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
             walletSelectors: ['#btc_address'],
             saveSelectors: ['#save_btc'],
-            withdrawSelectors: ['.withdraw-button', '#withdrawBtn']
+            withdrawSelectors: ['.withdraw-button', '#withdrawBtn', 'a[href*="withdraw"]']
         },
         {
             name: 'CoinPayU',
@@ -148,7 +148,7 @@ const generateFaucetList = () => {
             earnPerAction: 0.0003,
             minWithdraw: 0.0001,
             claimSelector: '.claim-btn',
-            withdrawSelectors: ['.withdraw-btn', '#withdraw']
+            withdrawSelectors: ['.withdraw-btn', '#withdraw', 'a[href*="withdraw"]', 'button:has-text("Withdraw")']
         },
         {
             name: 'CryptoFaucet',
@@ -156,63 +156,7 @@ const generateFaucetList = () => {
             earnPerAction: 0.0002,
             minWithdraw: 0.0001,
             claimSelector: '#claim',
-            withdrawSelectors: ['.withdraw-btn', '#withdraw']
-        },
-        {
-            name: 'ADBTC',
-            url: 'https://adbtc.top',
-            earnPerAction: 0.0002,
-            minWithdraw: 0.0001,
-            claimSelector: '#claim',
-            withdrawSelectors: ['.withdraw-btn']
-        },
-        {
-            name: 'BonusBitcoin',
-            url: 'https://bonusbitcoin.co',
-            earnPerAction: 0.0002,
-            minWithdraw: 0.0001,
-            claimSelector: '#roll',
-            withdrawSelectors: ['.withdraw-btn']
-        },
-        {
-            name: 'BTCClicks',
-            url: 'https://btcclicks.com',
-            earnPerAction: 0.0002,
-            minWithdraw: 0.0001,
-            claimSelector: '.claim-btn',
-            withdrawSelectors: ['.withdraw-btn']
-        },
-        {
-            name: 'CoinFaucet',
-            url: 'https://coinfaucet.io',
-            earnPerAction: 0.0002,
-            minWithdraw: 0.0001,
-            claimSelector: '#claim',
-            withdrawSelectors: ['.withdraw-btn']
-        },
-        {
-            name: 'DailyBitcoin',
-            url: 'https://dailybitcoin.fun',
-            earnPerAction: 0.0002,
-            minWithdraw: 0.0001,
-            claimSelector: '.claim-btn',
-            withdrawSelectors: ['.withdraw-btn']
-        },
-        {
-            name: 'EasyFaucet',
-            url: 'https://easyfaucet.xyz',
-            earnPerAction: 0.0002,
-            minWithdraw: 0.0001,
-            claimSelector: '#claim',
-            withdrawSelectors: ['.withdraw-btn']
-        },
-        {
-            name: 'FaucetBOX',
-            url: 'https://faucetbox.com',
-            earnPerAction: 0.0002,
-            minWithdraw: 0.0001,
-            claimSelector: '.claim-btn',
-            withdrawSelectors: ['.withdraw-btn']
+            withdrawSelectors: ['.withdraw-btn', '#withdraw', 'a[href*="withdraw"]']
         },
         {
             name: 'FaucetCollector',
@@ -220,7 +164,63 @@ const generateFaucetList = () => {
             earnPerAction: 0.0002,
             minWithdraw: 0.0001,
             claimSelector: '.claim-btn',
-            withdrawSelectors: ['.withdraw-btn']
+            withdrawSelectors: ['.withdraw-btn', '#withdraw', 'button:has-text("Withdraw")']
+        },
+        {
+            name: 'ADBTC',
+            url: 'https://adbtc.top',
+            earnPerAction: 0.0002,
+            minWithdraw: 0.0001,
+            claimSelector: '#claim',
+            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]']
+        },
+        {
+            name: 'BonusBitcoin',
+            url: 'https://bonusbitcoin.co',
+            earnPerAction: 0.0002,
+            minWithdraw: 0.0001,
+            claimSelector: '#roll',
+            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]']
+        },
+        {
+            name: 'BTCClicks',
+            url: 'https://btcclicks.com',
+            earnPerAction: 0.0002,
+            minWithdraw: 0.0001,
+            claimSelector: '.claim-btn',
+            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]']
+        },
+        {
+            name: 'CoinFaucet',
+            url: 'https://coinfaucet.io',
+            earnPerAction: 0.0002,
+            minWithdraw: 0.0001,
+            claimSelector: '#claim',
+            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]']
+        },
+        {
+            name: 'DailyBitcoin',
+            url: 'https://dailybitcoin.fun',
+            earnPerAction: 0.0002,
+            minWithdraw: 0.0001,
+            claimSelector: '.claim-btn',
+            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]']
+        },
+        {
+            name: 'EasyFaucet',
+            url: 'https://easyfaucet.xyz',
+            earnPerAction: 0.0002,
+            minWithdraw: 0.0001,
+            claimSelector: '#claim',
+            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]']
+        },
+        {
+            name: 'FaucetBOX',
+            url: 'https://faucetbox.com',
+            earnPerAction: 0.0002,
+            minWithdraw: 0.0001,
+            claimSelector: '.claim-btn',
+            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]']
         },
         {
             name: 'FaucetGalaxy',
@@ -228,7 +228,15 @@ const generateFaucetList = () => {
             earnPerAction: 0.0002,
             minWithdraw: 0.0001,
             claimSelector: '#claim',
-            withdrawSelectors: ['.withdraw-btn']
+            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]']
+        },
+        {
+            name: 'FaucetKing',
+            url: 'https://faucetking.io',
+            earnPerAction: 0.0002,
+            minWithdraw: 0.0001,
+            claimSelector: '.claim-btn',
+            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]']
         }
     ];
     
@@ -342,7 +350,7 @@ class DiscoveryEngine {
                             earnPerAction: 0.0001,
                             minWithdraw: 0.0001,
                             claimSelector: '#claim',
-                            withdrawSelectors: ['.withdraw-btn'],
+                            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]', 'button:has-text("Withdraw")'],
                             discoveredFrom: site.name
                         };
                         newFaucets.push(newFaucet);
@@ -503,7 +511,7 @@ class EarningEngine {
             await safeWait(3000);
             
             let withdrawClicked = false;
-            const withdrawSelectors = source.withdrawSelectors || ['.withdraw-btn', '#withdrawButton', 'button:has-text("Withdraw")', '#withdraw'];
+            const withdrawSelectors = source.withdrawSelectors || ['.withdraw-btn', '#withdrawButton', 'button:has-text("Withdraw")', '#withdraw', 'a[href*="withdraw"]', '.btn-withdraw', '.btn-success'];
             
             // Method 1: Try each selector with proper click
             for (const selector of withdrawSelectors) {
@@ -535,7 +543,7 @@ class EarningEngine {
                     const buttons = Array.from(document.querySelectorAll('button, a'));
                     const withdrawBtn = buttons.find(btn => {
                         const text = (btn.innerText || '').toLowerCase();
-                        return text.includes('withdraw') || text.includes('cash out') || text.includes('send');
+                        return text.includes('withdraw') || text.includes('cash out') || text.includes('send') || text.includes('withdrawal');
                     });
                     if (withdrawBtn) {
                         withdrawBtn.click();
@@ -551,11 +559,23 @@ class EarningEngine {
             // Method 3: Try XPath
             if (!withdrawClicked) {
                 try {
-                    const [withdrawBtn] = await this.page.$x("//button[contains(text(), 'Withdraw')] | //a[contains(text(), 'Withdraw')]");
+                    const [withdrawBtn] = await this.page.$x("//button[contains(text(), 'Withdraw')] | //a[contains(text(), 'Withdraw')] | //button[contains(text(), 'withdraw')] | //a[contains(text(), 'withdraw')]");
                     if (withdrawBtn) {
                         await withdrawBtn.click();
                         withdrawClicked = true;
                         console.log(`   ✅ Clicked withdraw button via XPath`);
+                    }
+                } catch(e) {}
+            }
+            
+            // Method 4: Try to find any link with withdraw in href
+            if (!withdrawClicked) {
+                try {
+                    const withdrawLink = await this.page.$('a[href*="withdraw"], a[href*="withdrawal"]');
+                    if (withdrawLink) {
+                        await withdrawLink.click();
+                        withdrawClicked = true;
+                        console.log(`   ✅ Clicked withdraw link via href`);
                     }
                 } catch(e) {}
             }
@@ -568,7 +588,8 @@ class EarningEngine {
                 const success = pageContent.toLowerCase().includes('success') || 
                                pageContent.toLowerCase().includes('sent') ||
                                pageContent.toLowerCase().includes('completed') ||
-                               pageContent.toLowerCase().includes('withdrawn');
+                               pageContent.toLowerCase().includes('withdrawn') ||
+                               pageContent.toLowerCase().includes('transaction');
                 
                 if (success) {
                     console.log(`   ✅✅✅ WITHDRAWAL SUCCESSFUL! ✅✅✅`);
