@@ -1,106 +1,28 @@
-// faucetpay-internal-bot.js - FaucetPay Internal Bot with Dashboard Login
+// bot.js - FaucetPay Bot with iFrame Dashboard & Session Capture
 const express = require('express');
+const puppeteer = require('puppeteer-core');
+const chromium = require('chrome-aws-lambda');
 const fs = require('fs');
-const { execSync } = require('child_process');
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const https = require('https');
-const { createWriteStream } = require('path');
-
-// Use the stealth plugin
-puppeteer.use(StealthPlugin());
+const path = require('path');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ============ CONFIGURATION ============
-const FAUCETPAY_WALLET_ADDRESS = process.env.FAUCETPAY_WALLET_ADDRESS || 'web88888888888888@gmail.com';
-const HEADLESS_MODE = process.env.HEADLESS_MODE !== 'false';
-const SCAN_INTERVAL_SECONDS = parseInt(process.env.SCAN_INTERVAL_SECONDS) || 60;
 const USER_DATA_DIR = process.env.USER_DATA_DIR || './chrome-profile';
+const SESSION_FILE = path.join(__dirname, 'session.json');
 
-console.log('\n========================================');
-console.log('  FaucetPay Internal Bot v5.0');
-console.log('  DASHBOARD LOGIN - PERSISTENT SESSION');
-console.log('========================================');
-console.log(`Scan: Every ${SCAN_INTERVAL_SECONDS}s`);
-console.log(`Persistent Session: ON`);
-console.log('========================================\n');
-
-// ============ CHROME INSTALLATION ============
-async function downloadFile(url, destPath) {
-    return new Promise((resolve, reject) => {
-        const file = createWriteStream(destPath);
-        https.get(url, (response) => {
-            if (response.statusCode !== 200) {
-                reject(new Error(`Failed: ${response.statusCode}`));
-                return;
-            }
-            response.pipe(file);
-            file.on('finish', () => {
-                file.close();
-                resolve();
-            });
-        }).on('error', reject);
-    });
-}
-
-async function installChrome() {
-    const CHROME_PATH = '/app/chrome-linux64/chrome';
-    const CHROME_URL = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
-    
-    if (fs.existsSync(CHROME_PATH)) {
-        const stats = fs.statSync(CHROME_PATH);
-        if (stats.size > 50000000) return CHROME_PATH;
-    }
-    
-    console.log('[Chrome] Installing...');
-    try {
-        execSync('apt-get update -qq 2>/dev/null || true', { stdio: 'inherit' });
-        execSync(`apt-get install -y -qq ca-certificates wget unzip libnss3 libxss1 libasound2 2>/dev/null || true`, { stdio: 'inherit' });
-        
-        const zipPath = '/tmp/chromium.zip';
-        await downloadFile(CHROME_URL, zipPath);
-        execSync(`unzip -q ${zipPath} -d /app/`, { stdio: 'inherit' });
-        fs.chmodSync(CHROME_PATH, 0o755);
-        fs.unlinkSync(zipPath);
-        console.log('[Chrome] ✅ Installed');
-        return CHROME_PATH;
-    } catch (error) {
-        console.error('[Chrome] Failed:', error.message);
-        return null;
-    }
-}
-
-async function safeWait(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// Ensure chrome-profile directory exists
-if (!fs.existsSync(USER_DATA_DIR)) {
-    fs.mkdirSync(USER_DATA_DIR, { recursive: true });
-}
-
-// ============ GLOBAL VARIABLES ============
-let browserInstance = null;
-let pageInstance = null;
-let botRunning = false;
-let loginStatus = {
-    isLoggedIn: false,
-    email: '',
-    lastLoginTime: null,
-    balance: 0
-};
-
+// ============ STATS ============
 let stats = {
     totalEarned: 0,
     totalActions: 0,
     currentBalance: 0,
     sessionEarned: 0,
+    startTime: new Date(),
+    loggedIn: false,
     sourceBalances: {
         'Daily Bonus': { earned: 0, claims: 0, lastClaim: null },
         'Faucet List': { earned: 0, claims: 0, lastClaim: null },
@@ -109,729 +31,442 @@ let stats = {
         'Staking': { earned: 0, claims: 0, lastClaim: null },
         'Tasks': { earned: 0, claims: 0, lastClaim: null }
     },
-    claimHistory: [],
-    startTime: new Date()
+    claimHistory: []
 };
 
-// ============ BROWSER MANAGER ============
-class BrowserManager {
-    constructor() {
-        this.browser = null;
-        this.page = null;
-    }
-    
-    async init() {
-        const chromePath = await installChrome();
-        if (!chromePath) throw new Error('Chrome not available');
-        
-        this.browser = await puppeteer.launch({
-            headless: HEADLESS_MODE,
-            executablePath: chromePath,
-            userDataDir: USER_DATA_DIR,
-            args: [
-                '--no-sandbox', 
-                '--disable-setuid-sandbox', 
-                '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled',
-                '--window-size=1280,720'
-            ]
-        });
-        
-        this.page = await this.browser.newPage();
-        await this.page.setViewport({ width: 1280, height: 720 });
-        await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-        
-        browserInstance = this.browser;
-        pageInstance = this.page;
-        
-        return this.page;
-    }
-    
-    async close() {
-        if (this.browser) {
-            await this.browser.close();
-        }
-    }
-    
-    async getBalance() {
-        if (!this.page) return 0;
-        try {
-            const balance = await this.page.evaluate(() => {
-                const elements = document.querySelectorAll('.balance-amount, .user-balance, [class*="balance"]');
-                for (const el of elements) {
-                    const text = el.innerText;
-                    if (text && text.match(/[\d.]+/)) {
-                        return parseFloat(text.match(/[\d.]+/)[0]);
-                    }
-                }
-                return 0;
-            });
-            loginStatus.balance = balance;
-            stats.currentBalance = balance;
-            return balance;
-        } catch (error) {
-            return 0;
-        }
+let browser = null;
+let page = null;
+let botRunning = false;
+let loginEmail = '';
+
+// ============ SESSION MANAGEMENT ============
+function saveSession(cookies) {
+    try {
+        fs.writeFileSync(SESSION_FILE, JSON.stringify(cookies, null, 2));
+        console.log(`✅ Session saved to ${SESSION_FILE}`);
+        return true;
+    } catch (error) {
+        console.error(`Failed to save session: ${error.message}`);
+        return false;
     }
 }
 
-let browserManager = new BrowserManager();
-
-// ============ LOGIN VIA DASHBOARD ============
-async function performLogin(email, password) {
-    console.log(`\n🔐 Manual login triggered for: ${email}`);
-    
+function loadSession() {
     try {
-        const page = await browserManager.init();
-        
-        await page.goto('https://faucetpay.io/login', { waitUntil: 'networkidle2', timeout: 30000 });
-        await safeWait(3000);
-        
-        const currentUrl = page.url();
-        if (!currentUrl.includes('login')) {
-            console.log('✅ Already logged in from persistent session!');
-            loginStatus.isLoggedIn = true;
-            loginStatus.email = email;
-            loginStatus.lastLoginTime = new Date();
-            await browserManager.getBalance();
-            return { success: true, message: 'Already logged in from saved session' };
-        }
-        
-        await page.type('#email, input[name="email"]', email);
-        await safeWait(500);
-        await page.type('#password, input[name="password"]', password);
-        await safeWait(500);
-        
-        const hasCaptcha = await page.evaluate(() => {
-            return !!document.querySelector('.g-recaptcha, iframe[src*="recaptcha"], .captcha');
-        });
-        
-        if (hasCaptcha) {
-            console.log('⚠️ CAPTCHA detected - please solve it in the browser window');
-            console.log('   You have 60 seconds to solve the captcha...');
-            
-            await page.waitForFunction(() => {
-                const recaptchaResponse = document.querySelector('#g-recaptcha-response');
-                return recaptchaResponse && recaptchaResponse.value.length > 0;
-            }, { timeout: 60000 }).catch(() => {
-                console.log('⚠️ Captcha not solved, trying to proceed anyway...');
-            });
-            
-            await safeWait(2000);
-        }
-        
-        await page.click('button[type="submit"], input[type="submit"]');
-        await safeWait(8000);
-        
-        const afterUrl = page.url();
-        if (!afterUrl.includes('login')) {
-            console.log('✅ Login successful! Session saved to persistent storage.');
-            loginStatus.isLoggedIn = true;
-            loginStatus.email = email;
-            loginStatus.lastLoginTime = new Date();
-            await browserManager.getBalance();
-            return { success: true, message: 'Login successful! Session saved.' };
-        } else {
-            console.log('❌ Login failed');
-            return { success: false, message: 'Login failed. Please check credentials.' };
+        if (fs.existsSync(SESSION_FILE)) {
+            const cookies = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
+            console.log(`✅ Loaded ${cookies.length} cookies from session`);
+            return cookies;
         }
     } catch (error) {
-        console.error(`Login error: ${error.message}`);
-        return { success: false, message: error.message };
+        console.error(`Failed to load session: ${error.message}`);
     }
+    return null;
 }
 
-// ============ EARNING ENGINE ============
-class InternalEarningEngine {
-    constructor(page) {
-        this.page = page;
-    }
+// ============ BROWSER LAUNCH ============
+async function launchBrowser() {
+    console.log('🚀 Launching browser...');
     
-    async claimDailyBonus() {
-        if (!this.page) return 0;
-        try {
-            await this.page.goto('https://faucetpay.io/dashboard', { waitUntil: 'networkidle2' });
-            await safeWait(3000);
-            
-            const result = await this.page.evaluate(() => {
-                const buttons = Array.from(document.querySelectorAll('button, a'));
-                const claimBtn = buttons.find(btn => {
-                    const text = (btn.innerText || '').toLowerCase();
-                    return text.includes('claim') && (text.includes('bonus') || text.includes('daily'));
-                });
-                if (claimBtn) {
-                    claimBtn.click();
-                    return true;
-                }
-                return false;
-            });
-            
-            if (result) {
-                await safeWait(5000);
-                const earned = 0.001;
-                stats.totalEarned += earned;
-                stats.sessionEarned += earned;
-                stats.totalActions++;
-                stats.sourceBalances['Daily Bonus'].earned += earned;
-                stats.sourceBalances['Daily Bonus'].claims++;
-                stats.sourceBalances['Daily Bonus'].lastClaim = new Date();
-                return earned;
-            }
-            return 0;
-        } catch (error) {
-            return 0;
-        }
-    }
+    const executablePath = await chromium.executablePath;
+    console.log(`📁 Chrome path: ${executablePath}`);
     
-    async claimFaucetList() {
-        if (!this.page) return 0;
-        try {
-            await this.page.goto('https://faucetpay.io/faucets', { waitUntil: 'networkidle2' });
-            await safeWait(3000);
-            
-            const result = await this.page.evaluate(() => {
-                const links = Array.from(document.querySelectorAll('a'));
-                let count = 0;
-                for (const link of links) {
-                    const text = (link.innerText || '').toLowerCase();
-                    if ((text.includes('view') || text.includes('visit')) && link.href && !link.href.includes('faucetpay.io')) {
-                        link.click();
-                        count++;
-                        if (count >= 5) break;
-                    }
-                }
-                return count;
-            });
-            
-            if (result > 0) {
-                await safeWait(3000);
-                const earned = 0.0005 * result;
-                stats.totalEarned += earned;
-                stats.sessionEarned += earned;
-                stats.totalActions += result;
-                stats.sourceBalances['Faucet List'].earned += earned;
-                stats.sourceBalances['Faucet List'].claims += result;
-                stats.sourceBalances['Faucet List'].lastClaim = new Date();
-                return earned;
-            }
-            return 0;
-        } catch (error) {
-            return 0;
-        }
-    }
+    browser = await puppeteer.launch({
+        args: [
+            ...chromium.args,
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-web-security',
+            '--disable-features=IsolateOrigins,site-per-process'
+        ],
+        defaultViewport: chromium.defaultViewport,
+        executablePath: executablePath,
+        headless: true,
+        ignoreHTTPSErrors: true,
+    });
     
-    async claimOfferwalls() {
-        if (!this.page) return 0;
-        try {
-            await this.page.goto('https://faucetpay.io/offerwalls', { waitUntil: 'networkidle2' });
-            await safeWait(3000);
-            
-            const result = await this.page.evaluate(() => {
-                const links = Array.from(document.querySelectorAll('a'));
-                let count = 0;
-                for (const link of links) {
-                    const text = (link.innerText || '').toLowerCase();
-                    if ((text.includes('view') || text.includes('earn') || text.includes('offer')) && link.href) {
-                        link.click();
-                        count++;
-                        if (count >= 3) break;
-                    }
-                }
-                return count;
-            });
-            
-            if (result > 0) {
-                await safeWait(3000);
-                const earned = 0.002 * result;
-                stats.totalEarned += earned;
-                stats.sessionEarned += earned;
-                stats.totalActions += result;
-                stats.sourceBalances['Offerwalls'].earned += earned;
-                stats.sourceBalances['Offerwalls'].claims += result;
-                stats.sourceBalances['Offerwalls'].lastClaim = new Date();
-                return earned;
-            }
-            return 0;
-        } catch (error) {
-            return 0;
-        }
-    }
+    page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 800 });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     
-    async claimPTCAds() {
-        if (!this.page) return 0;
-        try {
-            await this.page.goto('https://faucetpay.io/ptc', { waitUntil: 'networkidle2' });
-            await safeWait(3000);
-            
-            const result = await this.page.evaluate(() => {
-                const links = Array.from(document.querySelectorAll('a'));
-                let count = 0;
-                for (const link of links) {
-                    const text = (link.innerText || '').toLowerCase();
-                    if ((text.includes('view') || text.includes('click') || text.includes('ad')) && link.href) {
-                        link.click();
-                        count++;
-                        if (count >= 10) break;
-                    }
-                }
-                return count;
-            });
-            
-            if (result > 0) {
-                await safeWait(3000);
-                const earned = 0.0008 * result;
-                stats.totalEarned += earned;
-                stats.sessionEarned += earned;
-                stats.totalActions += result;
-                stats.sourceBalances['PTC Ads'].earned += earned;
-                stats.sourceBalances['PTC Ads'].claims += result;
-                stats.sourceBalances['PTC Ads'].lastClaim = new Date();
-                return earned;
-            }
-            return 0;
-        } catch (error) {
-            return 0;
-        }
-    }
-    
-    async claimStaking() {
-        if (!this.page) return 0;
-        try {
-            await this.page.goto('https://faucetpay.io/staking', { waitUntil: 'networkidle2' });
-            await safeWait(3000);
-            
-            const result = await this.page.evaluate(() => {
-                const buttons = Array.from(document.querySelectorAll('button'));
-                const claimBtn = buttons.find(btn => {
-                    const text = (btn.innerText || '').toLowerCase();
-                    return text.includes('claim') || text.includes('withdraw');
-                });
-                if (claimBtn) {
-                    claimBtn.click();
-                    return true;
-                }
-                return false;
-            });
-            
-            if (result) {
-                await safeWait(3000);
-                const earned = 0.001;
-                stats.totalEarned += earned;
-                stats.sessionEarned += earned;
-                stats.totalActions++;
-                stats.sourceBalances['Staking'].earned += earned;
-                stats.sourceBalances['Staking'].claims++;
-                stats.sourceBalances['Staking'].lastClaim = new Date();
-                return earned;
-            }
-            return 0;
-        } catch (error) {
-            return 0;
-        }
-    }
-    
-    async claimTasks() {
-        if (!this.page) return 0;
-        try {
-            await this.page.goto('https://faucetpay.io/tasks', { waitUntil: 'networkidle2' });
-            await safeWait(3000);
-            
-            const result = await this.page.evaluate(() => {
-                const links = Array.from(document.querySelectorAll('a, button'));
-                let count = 0;
-                for (const link of links) {
-                    const text = (link.innerText || '').toLowerCase();
-                    if ((text.includes('complete') || text.includes('start') || text.includes('earn')) && link.href) {
-                        link.click();
-                        count++;
-                        if (count >= 5) break;
-                    }
-                }
-                return count;
-            });
-            
-            if (result > 0) {
-                await safeWait(4000);
-                const earned = 0.0015 * result;
-                stats.totalEarned += earned;
-                stats.sessionEarned += earned;
-                stats.totalActions += result;
-                stats.sourceBalances['Tasks'].earned += earned;
-                stats.sourceBalances['Tasks'].claims += result;
-                stats.sourceBalances['Tasks'].lastClaim = new Date();
-                return earned;
-            }
-            return 0;
-        } catch (error) {
-            return 0;
-        }
-    }
-    
-    async runCycle() {
-        if (!this.page) {
-            console.log('⚠️ Browser not initialized. Please login first.');
-            return 0;
-        }
-        
-        let cycleEarned = 0;
-        
-        console.log(`\n📊 CYCLE ${new Date().toLocaleTimeString()}`);
-        console.log(`💰 Balance: $${stats.currentBalance.toFixed(5)}`);
-        console.log(`📈 Session earned: $${stats.sessionEarned.toFixed(5)}`);
-        console.log('========================================');
-        
-        cycleEarned += await this.claimDailyBonus();
-        await safeWait(2000);
-        
-        cycleEarned += await this.claimFaucetList();
-        await safeWait(2000);
-        
-        cycleEarned += await this.claimOfferwalls();
-        await safeWait(2000);
-        
-        cycleEarned += await this.claimPTCAds();
-        await safeWait(2000);
-        
-        cycleEarned += await this.claimStaking();
-        await safeWait(2000);
-        
-        cycleEarned += await this.claimTasks();
-        
-        await browserManager.getBalance();
-        
-        console.log('========================================');
-        console.log(`💰 Cycle earned: $${cycleEarned.toFixed(5)}`);
-        console.log(`📊 Total earned: $${stats.totalEarned.toFixed(5)}`);
-        console.log(`💳 Balance: $${stats.currentBalance.toFixed(5)}`);
-        
-        const uptimeHours = (Date.now() - stats.startTime) / 3600000;
-        const hourlyRate = uptimeHours > 0 ? (stats.totalEarned / uptimeHours).toFixed(5) : 0;
-        const dailyProjection = (hourlyRate * 24).toFixed(5);
-        console.log(`\n📈 Hourly rate: $${hourlyRate} | Projected daily: $${dailyProjection}`);
-        
-        return cycleEarned;
-    }
+    return page;
 }
 
-let earningEngine = null;
-
-// ============ API ROUTES ============
-
-app.post('/api/login', async (req, res) => {
-    const { email, password } = req.body;
-    
-    if (!email || !password) {
-        return res.json({ success: false, message: 'Email and password required' });
-    }
-    
-    const result = await performLogin(email, password);
-    res.json(result);
-});
-
-app.post('/api/logout', async (req, res) => {
+// ============ COOKIE SYNC ============
+async function syncCookiesToBrowser(cookies) {
+    if (!cookies || !page) return false;
     try {
-        if (browserInstance) {
-            await browserInstance.close();
-            browserInstance = null;
-            pageInstance = null;
-        }
-        loginStatus.isLoggedIn = false;
-        loginStatus.email = '';
-        loginStatus.lastLoginTime = null;
-        res.json({ success: true, message: 'Logged out successfully' });
+        await page.setCookie(...cookies);
+        console.log(`✅ Synced ${cookies.length} cookies to browser`);
+        return true;
     } catch (error) {
-        res.json({ success: false, message: error.message });
+        console.error(`Failed to sync cookies: ${error.message}`);
+        return false;
     }
-});
+}
 
-app.get('/api/status', async (req, res) => {
-    if (pageInstance && loginStatus.isLoggedIn) {
-        await browserManager.getBalance();
-    }
-    res.json({
-        loggedIn: loginStatus.isLoggedIn,
-        email: loginStatus.email,
-        lastLoginTime: loginStatus.lastLoginTime,
-        balance: loginStatus.balance,
-        botRunning: botRunning,
-        stats: {
-            totalEarned: stats.totalEarned,
-            totalActions: stats.totalActions,
-            sessionEarned: stats.sessionEarned,
-            currentBalance: stats.currentBalance
-        }
-    });
-});
-
-app.post('/api/start', async (req, res) => {
-    if (!loginStatus.isLoggedIn || !pageInstance) {
-        return res.json({ success: false, message: 'Please login first' });
-    }
-    
-    if (botRunning) {
-        return res.json({ success: false, message: 'Bot is already running' });
-    }
-    
-    botRunning = true;
-    earningEngine = new InternalEarningEngine(pageInstance);
-    
-    const runLoop = async () => {
-        while (botRunning && loginStatus.isLoggedIn) {
-            try {
-                await earningEngine.runCycle();
-                await safeWait(SCAN_INTERVAL_SECONDS * 1000);
-            } catch (error) {
-                console.error(`Cycle error: ${error.message}`);
-                await safeWait(10000);
-            }
-        }
-    };
-    
-    runLoop();
-    res.json({ success: true, message: 'Bot started' });
-});
-
-app.post('/api/stop', async (req, res) => {
-    botRunning = false;
-    res.json({ success: true, message: 'Bot stopped' });
-});
-
-app.get('/api/stats', (req, res) => {
-    const uptime = Math.floor((Date.now() - stats.startTime) / 1000);
-    const hourlyRate = uptime > 0 ? (stats.totalEarned / (uptime / 3600)).toFixed(5) : 0;
-    const dailyRate = uptime > 0 ? (stats.totalEarned / (uptime / 86400)).toFixed(5) : 0;
-    
-    res.json({
-        totalEarned: stats.totalEarned,
-        totalActions: stats.totalActions,
-        sessionEarned: stats.sessionEarned,
-        currentBalance: stats.currentBalance,
-        hourlyRate: hourlyRate,
-        dailyRate: dailyRate,
-        uptime: uptime,
-        sourceBalances: stats.sourceBalances,
-        claimHistory: stats.claimHistory.slice(0, 50)
-    });
-});
-
-// ============ DASHBOARD HTML ============
-app.get('/', (req, res) => {
-    res.send(`
+// ============ DASHBOARD HTML WITH IFRAME ============
+const dashboardHTML = `
 <!DOCTYPE html>
 <html>
 <head>
-    <title>FaucetPay Bot - Dashboard Login</title>
+    <title>FaucetPay Bot - iFrame Dashboard</title>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { background: linear-gradient(135deg, #0a0e27 0%, #1a1f3a 100%); font-family: 'Segoe UI', monospace; min-height: 100vh; color: #00ff88; }
-        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
-        h1 { text-align: center; margin-bottom: 20px; font-size: 28px; }
+        body { 
+            background: linear-gradient(135deg, #0a0e27 0%, #1a1f3a 100%); 
+            font-family: 'Segoe UI', monospace; 
+            min-height: 100vh; 
+            color: #00ff88; 
+            padding: 20px;
+        }
+        .container { max-width: 1600px; margin: 0 auto; }
         
-        .login-panel { background: rgba(26,31,58,0.95); border-radius: 15px; padding: 30px; margin-bottom: 20px; border: 1px solid #00ff88; }
-        .login-panel h2 { margin-bottom: 20px; font-size: 20px; }
-        .login-form { display: flex; gap: 15px; flex-wrap: wrap; align-items: flex-end; }
-        .form-group { flex: 1; min-width: 200px; }
-        .form-group label { display: block; margin-bottom: 5px; font-size: 12px; opacity: 0.8; }
-        .form-group input { width: 100%; padding: 12px; background: #0a0e27; border: 1px solid #00ff88; border-radius: 8px; color: #00ff88; font-family: monospace; }
-        .form-group input:focus { outline: none; border-color: #00ff88; box-shadow: 0 0 10px rgba(0,255,136,0.3); }
-        button { padding: 12px 24px; background: #00ff88; color: #0a0e27; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; font-family: monospace; transition: all 0.3s; }
+        h1 { text-align: center; margin-bottom: 20px; font-size: 28px; }
+        h1 span { background: #00ff88; color: #0a0e27; padding: 5px 15px; border-radius: 20px; font-size: 14px; margin-left: 10px; }
+        
+        .dashboard-layout { display: flex; gap: 20px; flex-wrap: wrap; }
+        .iframe-panel { flex: 2; min-width: 600px; }
+        .stats-panel { flex: 1; min-width: 300px; }
+        
+        .card { 
+            background: rgba(26,31,58,0.95); 
+            border-radius: 15px; 
+            padding: 20px; 
+            margin-bottom: 20px; 
+            border: 1px solid #00ff88;
+            backdrop-filter: blur(10px);
+        }
+        .card h2 { 
+            margin-bottom: 15px; 
+            font-size: 18px; 
+            border-bottom: 1px solid #00ff88; 
+            padding-bottom: 8px; 
+            display: flex; 
+            align-items: center; 
+            gap: 10px; 
+        }
+        
+        .faucet-iframe {
+            width: 100%;
+            height: 600px;
+            border: 2px solid #00ff88;
+            border-radius: 10px;
+            background: white;
+        }
+        
+        .stats-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 20px; }
+        .stat-card { 
+            background: #0a0e27; 
+            padding: 15px; 
+            border-radius: 10px; 
+            text-align: center; 
+            border: 1px solid #00ff88;
+        }
+        .stat-value { font-size: 24px; font-weight: bold; color: #00ff88; }
+        .stat-label { font-size: 10px; opacity: 0.7; margin-top: 5px; }
+        
+        .btn-group { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
+        button { 
+            padding: 10px 20px; 
+            background: #00ff88; 
+            color: #0a0e27; 
+            border: none; 
+            border-radius: 8px; 
+            cursor: pointer; 
+            font-weight: bold; 
+            font-family: monospace;
+            transition: all 0.3s;
+            flex: 1;
+        }
         button:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(0,255,136,0.4); }
         button.danger { background: #ff4444; color: white; }
         button.warning { background: #ffaa00; color: #0a0e27; }
-        button.success { background: #00ff88; color: #0a0e27; }
+        button.secondary { background: #1a1f3a; color: #00ff88; border: 1px solid #00ff88; }
         button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
         
-        .status-panel { background: rgba(26,31,58,0.95); border-radius: 15px; padding: 20px; margin-bottom: 20px; border: 1px solid #00ff88; }
-        .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-top: 15px; }
-        .status-item { background: #0a0e27; padding: 15px; border-radius: 10px; text-align: center; }
-        .status-label { font-size: 12px; opacity: 0.7; margin-bottom: 5px; }
-        .status-value { font-size: 24px; font-weight: bold; }
+        .status-item { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid rgba(0,255,136,0.2); }
+        .status-label { opacity: 0.7; }
+        .status-value { font-weight: bold; }
         
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 20px; }
-        .stat-card { background: rgba(26,31,58,0.95); padding: 20px; border-radius: 10px; text-align: center; border: 1px solid #00ff88; }
-        .stat-value { font-size: 28px; font-weight: bold; color: #00ff88; }
-        .stat-label { font-size: 12px; opacity: 0.7; margin-top: 5px; }
-        
-        .card { background: rgba(26,31,58,0.95); border-radius: 10px; padding: 20px; margin-bottom: 20px; overflow-x: auto; }
-        .card h3 { margin-bottom: 15px; border-bottom: 1px solid #00ff88; padding-bottom: 5px; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 10px; text-align: left; border-bottom: 1px solid rgba(0,255,136,0.2); font-size: 12px; }
+        .table-container { max-height: 300px; overflow-y: auto; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { padding: 8px; text-align: left; border-bottom: 1px solid rgba(0,255,136,0.2); font-size: 11px; }
         th { color: #00ff88; }
         .earn { color: #00ff88; }
         .error { color: #ff4444; }
         
-        .control-buttons { display: flex; gap: 15px; margin-bottom: 20px; flex-wrap: wrap; }
-        
-        .loading { display: inline-block; width: 20px; height: 20px; border: 2px solid #00ff88; border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; vertical-align: middle; margin-right: 5px; }
+        .loading { 
+            display: inline-block; 
+            width: 16px; 
+            height: 16px; 
+            border: 2px solid #00ff88; 
+            border-top-color: transparent; 
+            border-radius: 50%; 
+            animation: spin 1s linear infinite; 
+        }
         @keyframes spin { to { transform: rotate(360deg); } }
         
-        @media (max-width: 768px) {
-            .login-form { flex-direction: column; }
-            .form-group { width: 100%; }
-            button { width: 100%; }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 10px; }
+        .badge-success { background: #00ff88; color: #0a0e27; }
+        .badge-warning { background: #ffaa00; color: #0a0e27; }
+        
+        .log-area {
+            background: #0a0e27;
+            border-radius: 8px;
+            padding: 10px;
+            font-size: 11px;
+            font-family: monospace;
+            max-height: 200px;
+            overflow-y: auto;
+            color: #00ff88;
+        }
+        
+        @media (max-width: 1024px) {
+            .dashboard-layout { flex-direction: column; }
+            .iframe-panel { min-width: auto; }
         }
     </style>
 </head>
 <body>
 <div class="container">
-    <h1>💰 FaucetPay Internal Bot</h1>
+    <h1>💰 FaucetPay Bot <span>iFrame Dashboard</span></h1>
     
-    <div class="login-panel" id="loginPanel">
-        <h2>🔐 Login to FaucetPay</h2>
-        <div class="login-form">
-            <div class="form-group">
-                <label>Email Address</label>
-                <input type="email" id="email" placeholder="your@email.com">
-            </div>
-            <div class="form-group">
-                <label>Password</label>
-                <input type="password" id="password" placeholder="••••••••">
-            </div>
-            <button onclick="login()">🔓 Login & Save Session</button>
-        </div>
-        <div id="loginMessage" style="margin-top: 15px; font-size: 12px;"></div>
-    </div>
-    
-    <div class="status-panel" id="statusPanel" style="display: none;">
-        <h2>📊 Login Status</h2>
-        <div class="status-grid">
-            <div class="status-item">
-                <div class="status-label">Status</div>
-                <div class="status-value" id="loginStatus">-</div>
-            </div>
-            <div class="status-item">
-                <div class="status-label">Email</div>
-                <div class="status-value" id="loginEmail" style="font-size: 14px;">-</div>
-            </div>
-            <div class="status-item">
-                <div class="status-label">Balance</div>
-                <div class="status-value" id="balance">$0.00000</div>
-            </div>
-            <div class="status-item">
-                <div class="status-label">Session Saved To</div>
-                <div class="status-value" style="font-size: 12px;">./chrome-profile</div>
+    <div class="dashboard-layout">
+        <!-- Left Panel: iFrame -->
+        <div class="iframe-panel">
+            <div class="card">
+                <h2>
+                    <span>🌐</span> Login to FaucetPay
+                    <button onclick="refreshIframe()" class="secondary" style="margin-left: auto; padding: 5px 10px; font-size: 12px;">🔄 Refresh</button>
+                </h2>
+                <iframe id="faucetIframe" class="faucet-iframe" src="https://faucetpay.io/login"></iframe>
+                <div style="margin-top: 15px; display: flex; gap: 10px; flex-wrap: wrap;">
+                    <button onclick="detectLogin()" style="flex: 1;">🔍 Detect Login Status</button>
+                    <button onclick="captureSession()" style="flex: 1;">💾 Capture & Save Session</button>
+                </div>
+                <div id="iframeMsg" style="margin-top: 10px; font-size: 12px; text-align: center;"></div>
             </div>
         </div>
-    </div>
-    
-    <div class="control-buttons" id="controlButtons" style="display: none;">
-        <button id="startBtn" onclick="startBot()" class="success">▶️ Start Bot</button>
-        <button id="stopBtn" onclick="stopBot()" class="danger" disabled>⏹️ Stop Bot</button>
-        <button onclick="logout()" class="warning">🚪 Logout</button>
-    </div>
-    
-    <div class="stats-grid" id="statsGrid" style="display: none;">
-        <div class="stat-card"><div class="stat-value" id="totalEarned">$0.00000</div><div class="stat-label">Total Earned</div></div>
-        <div class="stat-card"><div class="stat-value" id="hourlyRate">$0.00000</div><div class="stat-label">Per Hour</div></div>
-        <div class="stat-card"><div class="stat-value" id="dailyRate">$0.00000</div><div class="stat-label">Per Day</div></div>
-        <div class="stat-card"><div class="stat-value" id="totalClaims">0</div><div class="stat-label">Total Claims</div></div>
-    </div>
-    
-    <div class="card" id="balancesCard" style="display: none;">
-        <h3>🪙 Source Balances</h3>
-        <table id="balancesTable">
-            <thead><tr><th>Source</th><th>Earned</th><th>Claims</th><th>Last Claim</th></tr></thead>
-            <tbody id="balancesBody"><tr><td colspan="4">Loading...</td></tr></tbody>
-        </table>
-    </div>
-    
-    <div class="card" id="claimsCard" style="display: none;">
-        <h3>📈 Recent Claims</h3>
-        <table id="claimsTable">
-            <thead><tr><th>Time</th><th>Source</th><th>Amount</th></tr></thead>
-            <tbody id="claimsBody"><tr><td colspan="3">Loading...</td></tr></tbody>
-        </table>
+        
+        <!-- Right Panel: Stats & Controls -->
+        <div class="stats-panel">
+            <div class="card">
+                <h2>📊 Bot Status</h2>
+                <div class="status-item">
+                    <span class="status-label">Bot Status:</span>
+                    <span class="status-value" id="botStatus">⭕ Stopped</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Login Status:</span>
+                    <span class="status-value" id="loginStatus">❌ Not logged in</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Session Saved:</span>
+                    <span class="status-value" id="sessionStatus">❌ No</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Balance:</span>
+                    <span class="status-value earn" id="balance">$0.00000</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Total Earned:</span>
+                    <span class="status-value earn" id="totalEarned">$0.00000</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Total Claims:</span>
+                    <span class="status-value" id="totalClaims">0</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>🎮 Controls</h2>
+                <div class="btn-group">
+                    <button id="startBtn" onclick="startBot()" class="success">▶️ Start Bot</button>
+                    <button id="stopBtn" onclick="stopBot()" class="danger" disabled>⏹️ Stop Bot</button>
+                </div>
+                <div class="btn-group">
+                    <button onclick="syncSessionToBot()" class="secondary">🔄 Sync Session to Bot</button>
+                    <button onclick="clearSession()" class="warning">🗑️ Clear Session</button>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>📈 Quick Stats</h2>
+                <div class="stats-grid">
+                    <div class="stat-card"><div class="stat-value" id="hourlyRate">$0</div><div class="stat-label">/Hour</div></div>
+                    <div class="stat-card"><div class="stat-value" id="dailyRate">$0</div><div class="stat-label">/Day</div></div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>🪙 Source Balances</h2>
+                <div class="table-container">
+                    <table id="balancesTable">
+                        <thead><tr><th>Source</th><th>Earned</th><th>Claims</th></tr></thead>
+                        <tbody id="balancesBody"><tr><td colspan="3">No data...</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>📝 Recent Activity</h2>
+                <div class="log-area" id="logArea">
+                    [INFO] Bot ready. Login via iFrame above.<br>
+                </div>
+            </div>
+        </div>
     </div>
 </div>
 
 <script>
     let refreshInterval = null;
     
-    async function login() {
-        const email = document.getElementById('email').value;
-        const password = document.getElementById('password').value;
-        
-        if (!email || !password) {
-            document.getElementById('loginMessage').innerHTML = '<span class="error">❌ Please enter email and password</span>';
-            return;
+    function addLog(message) {
+        const logArea = document.getElementById('logArea');
+        const time = new Date().toLocaleTimeString();
+        logArea.innerHTML += `[${time}] ${message}<br>`;
+        logArea.scrollTop = logArea.scrollHeight;
+        // Keep only last 50 lines
+        const lines = logArea.innerHTML.split('<br>');
+        if (lines.length > 50) {
+            logArea.innerHTML = lines.slice(-50).join('<br>');
         }
+    }
+    
+    function refreshIframe() {
+        const iframe = document.getElementById('faucetIframe');
+        iframe.src = iframe.src;
+        addLog('🔄 iFrame refreshed');
+    }
+    
+    async function detectLogin() {
+        const iframe = document.getElementById('faucetIframe');
+        const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
         
-        document.getElementById('loginMessage').innerHTML = '<span class="loading"></span> Logging in...';
+        const url = iframeDoc.location.href;
+        addLog(`🔍 Detecting login status: ${url}`);
+        
+        if (!url.includes('login')) {
+            document.getElementById('loginStatus').innerHTML = '✅ Logged in!';
+            document.getElementById('sessionStatus').innerHTML = '⚠️ Capture to save';
+            addLog('✅ Detected logged in status! Click "Capture & Save Session" to save.');
+            
+            // Get cookies from iframe
+            const cookies = iframeDoc.cookie;
+            if (cookies) {
+                addLog(`📝 Found cookies: ${cookies.substring(0, 100)}...`);
+            }
+        } else {
+            document.getElementById('loginStatus').innerHTML = '❌ Not logged in';
+            addLog('❌ Not logged in. Please login in the iFrame.');
+        }
+    }
+    
+    async function captureSession() {
+        addLog('📸 Capturing session from iFrame...');
+        
+        const iframe = document.getElementById('faucetIframe');
+        const iframeWin = iframe.contentWindow;
         
         try {
-            const response = await fetch('/api/login', {
+            // Get all cookies from the iframe
+            const cookies = iframeWin.document.cookie;
+            
+            // Get localStorage
+            const localStorage = iframeWin.localStorage;
+            const storageData = {};
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                storageData[key] = localStorage.getItem(key);
+            }
+            
+            const sessionData = {
+                cookies: cookies,
+                localStorage: storageData,
+                url: iframeWin.location.href,
+                timestamp: new Date().toISOString()
+            };
+            
+            const response = await fetch('/api/capture-session', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ email, password })
+                body: JSON.stringify(sessionData)
             });
-            const data = await response.json();
             
-            if (data.success) {
-                document.getElementById('loginMessage').innerHTML = '<span class="earn">✅ ' + data.message + '</span>';
-                document.getElementById('loginPanel').style.display = 'none';
-                document.getElementById('statusPanel').style.display = 'block';
-                document.getElementById('controlButtons').style.display = 'flex';
-                document.getElementById('statsGrid').style.display = 'grid';
-                document.getElementById('balancesCard').style.display = 'block';
-                document.getElementById('claimsCard').style.display = 'block';
-                
-                if (refreshInterval) clearInterval(refreshInterval);
-                refreshInterval = setInterval(updateStats, 5000);
-                updateStats();
+            const result = await response.json();
+            
+            if (result.success) {
+                addLog('✅ Session captured and saved successfully!');
+                document.getElementById('sessionStatus').innerHTML = '✅ Saved';
+                document.getElementById('loginStatus').innerHTML = '✅ Session saved';
             } else {
-                document.getElementById('loginMessage').innerHTML = '<span class="error">❌ ' + data.message + '</span>';
+                addLog('❌ Failed to save session: ' + result.message);
             }
         } catch (error) {
-            document.getElementById('loginMessage').innerHTML = '<span class="error">❌ Error: ' + error.message + '</span>';
+            addLog('❌ Error capturing session: ' + error.message);
+            addLog('⚠️ Due to CORS, manual cookie entry may be needed');
+        }
+    }
+    
+    async function syncSessionToBot() {
+        addLog('🔄 Syncing saved session to bot...');
+        
+        const response = await fetch('/api/sync-session', { method: 'POST' });
+        const result = await response.json();
+        
+        if (result.success) {
+            addLog('✅ Session synced to bot successfully!');
+            document.getElementById('loginStatus').innerHTML = '✅ Bot logged in';
+            updateStats();
+        } else {
+            addLog('❌ Failed to sync session: ' + result.message);
+        }
+    }
+    
+    async function clearSession() {
+        addLog('🗑️ Clearing saved session...');
+        
+        const response = await fetch('/api/clear-session', { method: 'POST' });
+        const result = await response.json();
+        
+        if (result.success) {
+            addLog('✅ Session cleared');
+            document.getElementById('sessionStatus').innerHTML = '❌ No';
+            document.getElementById('loginStatus').innerHTML = '❌ Not logged in';
         }
     }
     
     async function updateStats() {
         try {
-            const response = await fetch('/api/status');
-            const data = await response.json();
+            const res = await fetch('/api/status');
+            const data = await res.json();
             
-            if (data.loggedIn) {
-                document.getElementById('loginStatus').innerHTML = '✅ Logged In';
-                document.getElementById('loginEmail').innerHTML = data.email;
-                document.getElementById('balance').innerHTML = '$' + (data.balance || 0).toFixed(5);
-                document.getElementById('totalEarned').innerHTML = '$' + (data.stats.totalEarned || 0).toFixed(5);
-                document.getElementById('totalClaims').innerHTML = data.stats.totalActions || 0;
-            }
+            document.getElementById('loginStatus').innerHTML = data.loggedIn ? '✅ Logged in' : '❌ Not logged in';
+            document.getElementById('balance').innerHTML = '$' + (data.balance || 0).toFixed(5);
+            document.getElementById('totalEarned').innerHTML = '$' + (data.stats?.totalEarned || 0).toFixed(5);
+            document.getElementById('totalClaims').innerHTML = data.stats?.totalActions || 0;
+            document.getElementById('botStatus').innerHTML = data.botRunning ? '🟢 Running' : '⭕ Stopped';
             
-            const statsResponse = await fetch('/api/stats');
-            const stats = await statsResponse.json();
+            const statsRes = await fetch('/api/stats');
+            const statsData = await statsRes.json();
+            document.getElementById('hourlyRate').innerHTML = '$' + (statsData.hourlyRate || 0);
+            document.getElementById('dailyRate').innerHTML = '$' + (statsData.dailyRate || 0);
             
-            document.getElementById('hourlyRate').innerHTML = '$' + (stats.hourlyRate || 0);
-            document.getElementById('dailyRate').innerHTML = '$' + (stats.dailyRate || 0);
-            
-            if (stats.sourceBalances) {
+            // Update source balances
+            if (statsData.sourceBalances) {
                 const balancesBody = document.getElementById('balancesBody');
                 balancesBody.innerHTML = '';
-                for (const [name, data] of Object.entries(stats.sourceBalances)) {
+                for (const [name, data] of Object.entries(statsData.sourceBalances)) {
                     if (data.earned > 0 || data.claims > 0) {
                         const row = balancesBody.insertRow();
                         row.insertCell(0).innerHTML = name;
                         row.insertCell(1).innerHTML = '<span class="earn">$' + data.earned.toFixed(5) + '</span>';
                         row.insertCell(2).innerHTML = data.claims;
-                        row.insertCell(3).innerHTML = data.lastClaim ? new Date(data.lastClaim).toLocaleTimeString() : 'Never';
                     }
-                }
-                if (balancesBody.children.length === 0) {
-                    balancesBody.innerHTML = '<tr><td colspan="4">No activity yet...</td></tr>';
-                }
-            }
-            
-            if (stats.claimHistory && stats.claimHistory.length > 0) {
-                const claimsBody = document.getElementById('claimsBody');
-                claimsBody.innerHTML = '';
-                for (const claim of stats.claimHistory.slice(0, 30)) {
-                    const row = claimsBody.insertRow();
-                    row.insertCell(0).innerHTML = new Date(claim.time).toLocaleTimeString();
-                    row.insertCell(1).innerHTML = claim.source;
-                    row.insertCell(2).innerHTML = '<span class="earn">+$' + claim.amount.toFixed(5) + '</span>';
                 }
             }
         } catch (error) {
@@ -841,122 +476,299 @@ app.get('/', (req, res) => {
     
     async function startBot() {
         const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        
         startBtn.disabled = true;
         startBtn.innerHTML = '<span class="loading"></span> Starting...';
         
-        try {
-            const response = await fetch('/api/start', { method: 'POST' });
-            const data = await response.json();
-            
-            if (data.success) {
-                startBtn.innerHTML = '▶️ Bot Running';
-                startBtn.disabled = true;
-                document.getElementById('stopBtn').disabled = false;
-                alert('Bot started! Check console for logs.');
-            } else {
-                startBtn.innerHTML = '▶️ Start Bot';
-                startBtn.disabled = false;
-                alert('Error: ' + data.message);
-            }
-        } catch (error) {
+        const response = await fetch('/api/start', { method: 'POST' });
+        const data = await response.json();
+        
+        if (data.success) {
+            startBtn.innerHTML = '▶️ Running';
+            stopBtn.disabled = false;
+            addLog('🚀 Bot started!');
+            if (refreshInterval) clearInterval(refreshInterval);
+            refreshInterval = setInterval(updateStats, 5000);
+        } else {
             startBtn.innerHTML = '▶️ Start Bot';
             startBtn.disabled = false;
-            alert('Error: ' + error.message);
+            addLog('❌ Failed to start bot: ' + data.message);
         }
     }
     
     async function stopBot() {
-        const stopBtn = document.getElementById('stopBtn');
-        stopBtn.disabled = true;
-        stopBtn.innerHTML = '<span class="loading"></span> Stopping...';
+        const response = await fetch('/api/stop', { method: 'POST' });
+        const data = await response.json();
         
-        try {
-            const response = await fetch('/api/stop', { method: 'POST' });
-            const data = await response.json();
-            
-            if (data.success) {
-                stopBtn.innerHTML = '⏹️ Stop Bot';
-                stopBtn.disabled = false;
-                document.getElementById('startBtn').disabled = false;
-                document.getElementById('startBtn').innerHTML = '▶️ Start Bot';
-                alert('Bot stopped.');
-            } else {
-                stopBtn.innerHTML = '⏹️ Stop Bot';
-                stopBtn.disabled = false;
-            }
-        } catch (error) {
-            stopBtn.innerHTML = '⏹️ Stop Bot';
-            stopBtn.disabled = false;
+        if (data.success) {
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('startBtn').innerHTML = '▶️ Start Bot';
+            document.getElementById('stopBtn').disabled = true;
+            addLog('⏹️ Bot stopped');
         }
     }
     
-    async function logout() {
-        if (refreshInterval) clearInterval(refreshInterval);
-        
-        try {
-            await fetch('/api/logout', { method: 'POST' });
-        } catch(e) {}
-        
-        location.reload();
-    }
-    
-    async function checkStatus() {
-        try {
-            const response = await fetch('/api/status');
-            const data = await response.json();
-            
-            if (data.loggedIn) {
-                document.getElementById('loginPanel').style.display = 'none';
-                document.getElementById('statusPanel').style.display = 'block';
-                document.getElementById('controlButtons').style.display = 'flex';
-                document.getElementById('statsGrid').style.display = 'grid';
-                document.getElementById('balancesCard').style.display = 'block';
-                document.getElementById('claimsCard').style.display = 'block';
-                
-                refreshInterval = setInterval(updateStats, 5000);
-                updateStats();
-            }
-        } catch(e) {}
-    }
-    
-    checkStatus();
+    // Initial update
+    updateStats();
+    setInterval(updateStats, 10000);
 </script>
 </body>
 </html>
-    `);
+`;
+
+// ============ API ROUTES ============
+
+// Serve dashboard
+app.get('/', (req, res) => {
+    res.send(dashboardHTML);
 });
 
-// ============ MAIN ============
-async function main() {
-    await installChrome();
-    app.listen(port, '0.0.0.0', () => {
-        console.log(`\n========================================`);
-        console.log(`📊 DASHBOARD: http://localhost:${port}`);
-        console.log(`========================================`);
-        console.log(`\n💡 INSTRUCTIONS:`);
-        console.log(`   1. Open the dashboard in your browser`);
-        console.log(`   2. Enter your FaucetPay email and password`);
-        console.log(`   3. Click "Login & Save Session"`);
-        console.log(`   4. If captcha appears, solve it in the popup window`);
-        console.log(`   5. Session will be saved to ${USER_DATA_DIR}`);
-        console.log(`   6. Click "Start Bot" to begin earning!\n`);
-    });
+// Capture session from iFrame
+app.post('/api/capture-session', async (req, res) => {
+    const { cookies, localStorage, url } = req.body;
     
-    console.log('✅ Bot ready. Waiting for dashboard login...\n');
-}
-
-process.on('SIGINT', async () => {
-    if (browserInstance) {
-        await browserInstance.close();
+    try {
+        // Parse cookies string into array
+        const cookieArray = [];
+        if (cookies) {
+            cookies.split(';').forEach(cookie => {
+                const [name, value] = cookie.trim().split('=');
+                if (name && value) {
+                    cookieArray.push({
+                        name: name.trim(),
+                        value: value.trim(),
+                        domain: '.faucetpay.io',
+                        path: '/',
+                        secure: true,
+                        httpOnly: false
+                    });
+                }
+            });
+        }
+        
+        // Save session
+        const sessionData = {
+            cookies: cookieArray,
+            localStorage: localStorage,
+            url: url,
+            timestamp: new Date().toISOString()
+        };
+        
+        fs.writeFileSync('session.json', JSON.stringify(sessionData, null, 2));
+        
+        // Also sync to running browser if exists
+        if (page) {
+            await page.setCookie(...cookieArray);
+            console.log('✅ Cookies synced to running browser');
+        }
+        
+        stats.loggedIn = true;
+        
+        res.json({ success: true, message: `Saved ${cookieArray.length} cookies` });
+    } catch (error) {
+        res.json({ success: false, message: error.message });
     }
+});
+
+// Sync saved session to bot
+app.post('/api/sync-session', async (req, res) => {
+    try {
+        if (!fs.existsSync('session.json')) {
+            return res.json({ success: false, message: 'No saved session found' });
+        }
+        
+        const sessionData = JSON.parse(fs.readFileSync('session.json', 'utf8'));
+        
+        if (!page) {
+            await launchBrowser();
+        }
+        
+        if (sessionData.cookies && sessionData.cookies.length > 0) {
+            await page.setCookie(...sessionData.cookies);
+            console.log(`✅ Synced ${sessionData.cookies.length} cookies to browser`);
+        }
+        
+        stats.loggedIn = true;
+        loginEmail = 'from_session';
+        
+        res.json({ success: true, message: `Synced ${sessionData.cookies?.length || 0} cookies` });
+    } catch (error) {
+        res.json({ success: false, message: error.message });
+    }
+});
+
+// Clear session
+app.post('/api/clear-session', async (req, res) => {
+    try {
+        if (fs.existsSync('session.json')) {
+            fs.unlinkSync('session.json');
+        }
+        stats.loggedIn = false;
+        loginEmail = '';
+        res.json({ success: true });
+    } catch (error) {
+        res.json({ success: false, message: error.message });
+    }
+});
+
+// Get status
+app.get('/api/status', (req, res) => {
+    res.json({
+        loggedIn: stats.loggedIn,
+        email: loginEmail,
+        balance: stats.currentBalance,
+        botRunning: botRunning,
+        stats: {
+            totalEarned: stats.totalEarned,
+            totalActions: stats.totalActions,
+            sessionEarned: stats.sessionEarned
+        }
+    });
+});
+
+// Get detailed stats
+app.get('/api/stats', (req, res) => {
+    const uptime = (Date.now() - stats.startTime) / 1000;
+    const hourlyRate = uptime > 0 ? (stats.totalEarned / (uptime / 3600)).toFixed(5) : 0;
+    const dailyRate = uptime > 0 ? (stats.totalEarned / (uptime / 86400)).toFixed(5) : 0;
+    
+    res.json({
+        totalEarned: stats.totalEarned,
+        totalActions: stats.totalActions,
+        hourlyRate: hourlyRate,
+        dailyRate: dailyRate,
+        sourceBalances: stats.sourceBalances,
+        claimHistory: stats.claimHistory.slice(0, 50)
+    });
+});
+
+// Start bot
+app.post('/api/start', async (req, res) => {
+    if (!page) {
+        try {
+            await launchBrowser();
+        } catch (error) {
+            return res.json({ success: false, message: `Failed to launch browser: ${error.message}` });
+        }
+    }
+    
+    if (botRunning) {
+        return res.json({ success: false, message: 'Bot already running' });
+    }
+    
+    // Try to sync session if exists
+    if (fs.existsSync('session.json')) {
+        const sessionData = JSON.parse(fs.readFileSync('session.json', 'utf8'));
+        if (sessionData.cookies && sessionData.cookies.length > 0) {
+            await page.setCookie(...sessionData.cookies);
+            stats.loggedIn = true;
+            console.log('✅ Session loaded on start');
+        }
+    }
+    
+    botRunning = true;
+    console.log('🚀 Bot started!');
+    
+    const runLoop = async () => {
+        while (botRunning && page) {
+            try {
+                console.log(`\n📊 Cycle ${new Date().toLocaleTimeString()}`);
+                
+                await page.goto('https://faucetpay.io/dashboard', { waitUntil: 'networkidle2', timeout: 30000 });
+                await new Promise(r => setTimeout(r, 5000));
+                
+                // Check if we need to login
+                const url = page.url();
+                if (url.includes('login')) {
+                    console.log('❌ Not logged in! Please capture session from iFrame first.');
+                    botRunning = false;
+                    break;
+                }
+                
+                // Claim Daily Bonus
+                const claimed = await page.evaluate(() => {
+                    const buttons = Array.from(document.querySelectorAll('button, a'));
+                    const claimBtn = buttons.find(btn => {
+                        const text = (btn.innerText || '').toLowerCase();
+                        return text.includes('claim') && (text.includes('bonus') || text.includes('daily'));
+                    });
+                    if (claimBtn) {
+                        claimBtn.click();
+                        return true;
+                    }
+                    return false;
+                });
+                
+                if (claimed) {
+                    await new Promise(r => setTimeout(r, 5000));
+                    const earned = 0.001;
+                    stats.totalEarned += earned;
+                    stats.sessionEarned += earned;
+                    stats.totalActions++;
+                    stats.sourceBalances['Daily Bonus'].earned += earned;
+                    stats.sourceBalances['Daily Bonus'].claims++;
+                    stats.sourceBalances['Daily Bonus'].lastClaim = new Date();
+                    
+                    stats.claimHistory.unshift({
+                        time: new Date(),
+                        source: 'Daily Bonus',
+                        amount: earned
+                    });
+                    
+                    console.log(`💰 Daily Bonus: +$${earned.toFixed(5)}`);
+                } else {
+                    console.log('ℹ️ Daily Bonus not available');
+                }
+                
+                // Get balance
+                const balanceText = await page.evaluate(() => {
+                    const el = document.querySelector('.balance-amount, .user-balance, [class*="balance"]');
+                    return el ? el.innerText : '0';
+                });
+                const balance = parseFloat(balanceText) || 0;
+                stats.currentBalance = balance;
+                
+                await new Promise(r => setTimeout(r, 60000));
+            } catch (error) {
+                console.error(`Cycle error: ${error.message}`);
+                await new Promise(r => setTimeout(r, 10000));
+            }
+        }
+    };
+    
+    runLoop();
+    res.json({ success: true });
+});
+
+// Stop bot
+app.post('/api/stop', (req, res) => {
+    botRunning = false;
+    console.log('⏹️ Bot stopped');
+    res.json({ success: true });
+});
+
+// ============ START SERVER ============
+app.listen(port, '0.0.0.0', () => {
+    console.log(`\n========================================`);
+    console.log(`📊 DASHBOARD: http://localhost:${port}`);
+    console.log(`========================================`);
+    console.log(`\n💡 INSTRUCTIONS:`);
+    console.log(`   1. Open the dashboard in your browser`);
+    console.log(`   2. Login to FaucetPay in the iFrame on the left`);
+    console.log(`   3. Click "Detect Login Status" to verify`);
+    console.log(`   4. Click "Capture & Save Session" to save cookies`);
+    console.log(`   5. Click "Sync Session to Bot" to load into bot`);
+    console.log(`   6. Click "Start Bot" to begin earning!\n`);
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+    if (browser) await browser.close();
     process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
-    if (browserInstance) {
-        await browserInstance.close();
-    }
+    if (browser) await browser.close();
     process.exit(0);
 });
-
-main().catch(console.error);
