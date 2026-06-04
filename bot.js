@@ -15,10 +15,11 @@ const port = process.env.PORT || 3000;
 // ============ CONFIGURATION ============
 const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || 'web88888888888888@gmail.com';
 const FAUCETPAY_PASSWORD = process.env.FAUCETPAY_PASSWORD || 'Linuxdistro&84';
+const FAUCETPAY_WALLET_ADDRESS = process.env.FAUCETPAY_WALLET_ADDRESS || 'ltc1q0k6uqmjgp32uplwyfx9kqmd4j26js9w3x6as9d';  // ADDED: Wallet address from env
 const HEADLESS_MODE = process.env.HEADLESS_MODE !== 'false';
 const SCAN_INTERVAL_SECONDS = parseInt(process.env.SCAN_INTERVAL_SECONDS) || 60;
-const AUTO_WITHDRAW = process.env.AUTO_WITHDRAW !== 'false';
-const AUTO_SETUP = process.env.AUTO_SETUP !== 'false';
+const AUTO_WITHDRAW = process.env.AUTO_WITHDRAW !== 'true';
+const AUTO_SETUP = process.env.AUTO_SETUP !== 'true';
 
 console.log('\n========================================');
 console.log('  FaucetPay Complete Bot v3.0');
@@ -26,6 +27,15 @@ console.log('========================================');
 console.log(`Auto Setup: ${AUTO_SETUP ? 'ON - Will auto-configure all faucets' : 'OFF'}`);
 console.log(`Auto Withdraw: ${AUTO_WITHDRAW ? 'ON' : 'OFF'}`);
 console.log(`Scan: Every ${SCAN_INTERVAL_SECONDS}s`);
+
+// Check if wallet address is configured
+if (FAUCETPAY_WALLET_ADDRESS) {
+    console.log(`✅ Wallet configured: ${FAUCETPAY_WALLET_ADDRESS.substring(0, 15)}...`);
+} else {
+    console.log(`⚠️ WARNING: FAUCETPAY_WALLET_ADDRESS not set!`);
+    console.log(`   Withdrawals will fail. Set your BTC wallet address:`);
+    console.log(`   export FAUCETPAY_WALLET_ADDRESS="your_btc_address_here"`);
+}
 console.log('========================================\n');
 
 // ============ CHROME INSTALLATION ============
@@ -128,6 +138,15 @@ class AutoWalletSetup {
     
     async getFaucetPayWallet() {
         console.log('\n🔍 Getting FaucetPay wallet address...');
+        
+        // FIRST: Check environment variable
+        if (FAUCETPAY_WALLET_ADDRESS && FAUCETPAY_WALLET_ADDRESS.length > 25) {
+            console.log(`✅ Using wallet from environment variable: ${FAUCETPAY_WALLET_ADDRESS.substring(0, 15)}...`);
+            return FAUCETPAY_WALLET_ADDRESS;
+        }
+        
+        // SECOND: Try to scrape from FaucetPay account page
+        console.log('   Attempting to scrape from FaucetPay account page...');
         try {
             const walletPage = await this.browser.newPage();
             await walletPage.goto('https://faucetpay.io/account', { waitUntil: 'networkidle2' });
@@ -155,9 +174,12 @@ class AutoWalletSetup {
             await walletPage.close();
             
             if (walletAddress) {
-                console.log(`✅ Found wallet: ${walletAddress.substring(0, 15)}...`);
+                console.log(`✅ Found wallet from FaucetPay: ${walletAddress.substring(0, 15)}...`);
                 return walletAddress;
             }
+            
+            console.log('❌ Could not find wallet address!');
+            console.log('Please set FAUCETPAY_WALLET_ADDRESS environment variable');
             return null;
         } catch (error) {
             console.log(`❌ Error getting wallet: ${error.message}`);
@@ -185,7 +207,12 @@ class AutoWalletSetup {
             if (currentValue && currentValue.length > 25) {
                 console.log(`   ✅ Wallet already configured: ${currentValue.substring(0, 15)}...`);
                 stats.sourceBalances[source.name].walletConfigured = true;
-                stats.setupHistory.unshift({ time: new Date(), source: source.name, status: 'ALREADY_CONFIGURED', wallet: currentValue.substring(0, 15) });
+                stats.setupHistory.unshift({ 
+                    time: new Date(), 
+                    source: source.name, 
+                    status: 'ALREADY_CONFIGURED', 
+                    wallet: currentValue.substring(0, 15) 
+                });
                 return true;
             }
             
@@ -194,6 +221,13 @@ class AutoWalletSetup {
             await walletField.type(walletAddress);
             await this.page.waitForTimeout(1000);
             
+            // Verify entry
+            const enteredValue = await this.page.$eval(source.walletFieldSelector, el => el.value);
+            if (enteredValue !== walletAddress) {
+                console.log(`   ⚠️ Wallet entry may have failed`);
+                return false;
+            }
+            
             // Save
             let saveBtn = await this.page.$(source.saveButtonSelector);
             if (saveBtn) {
@@ -201,10 +235,16 @@ class AutoWalletSetup {
                 await this.page.waitForTimeout(3000);
                 console.log(`   ✅ Wallet configured and SAVED for ${source.name}!`);
                 stats.sourceBalances[source.name].walletConfigured = true;
-                stats.setupHistory.unshift({ time: new Date(), source: source.name, status: 'CONFIGURED', wallet: walletAddress.substring(0, 15) });
+                stats.setupHistory.unshift({ 
+                    time: new Date(), 
+                    source: source.name, 
+                    status: 'CONFIGURED', 
+                    wallet: walletAddress.substring(0, 15) 
+                });
                 return true;
             }
             
+            console.log(`   ⚠️ Could not find save button for ${source.name}`);
             return false;
         } catch (error) {
             console.log(`   ❌ Failed to configure ${source.name}: ${error.message}`);
@@ -219,9 +259,8 @@ class AutoWalletSetup {
         
         const walletAddress = await this.getFaucetPayWallet();
         if (!walletAddress) {
-            console.log('\n❌ Could not find FaucetPay wallet address!');
-            console.log('Please manually add your wallet address to .env:');
-            console.log('FAUCETPAY_WALLET_ADDRESS=your_btc_address_here\n');
+            console.log('\n❌ Cannot proceed with auto-setup - no wallet address!');
+            console.log('Please set FAUCETPAY_WALLET_ADDRESS environment variable and restart.\n');
             return false;
         }
         
@@ -611,25 +650,48 @@ app.get('/', (req, res) => {
             const source = EARNING_SOURCES.find(s => s.name === name);
             const minText = source?.minWithdraw ? ` / Min: $${source.minWithdraw}` : '';
             const walletStatus = data.walletConfigured ? '✅ Configured' : (source?.minWithdraw ? '❌ Not Set' : 'N/A');
-            return `<tr><td>${name}</td><td class="earn">$${data.earned.toFixed(5)}${minText}</td><td>${data.claims}</td><td>${walletStatus}</td><td>${data.pendingWithdraw ? '⏳' : 'Active'}</td></tr>`;
+            const progress = source?.minWithdraw ? ((data.earned / source.minWithdraw) * 100).toFixed(1) : 0;
+            return `<tr><td>${name}</td><td class="earn">$${data.earned.toFixed(5)}${minText}</td><td>${data.claims}</td><td>${progress}%</td><td>${walletStatus}</td><td>${data.pendingWithdraw ? '⏳' : 'Active'}</td></tr>`;
         }).join('');
     
     const withdrawalHtml = stats.withdrawalHistory.slice(0, 20).map(w => `
         <tr><td>${new Date(w.time).toLocaleTimeString()}</td><td>${w.source}</td><td class="earn">$${w.amount.toFixed(5)}</td><td class="${w.status === 'SUCCESS' ? 'earn' : 'error'}">${w.status}</td><td>${w.error || '-'}</td></tr>
     `).join('');
     
+    const setupHtml = stats.setupHistory.slice(0, 20).map(s => `
+        <tr><td>${new Date(s.time).toLocaleTimeString()}</td><td>${s.source}</td><td class="${s.status === 'CONFIGURED' ? 'earn' : ''}">${s.status}</td><td>${s.wallet || s.error || '-'}</td></tr>
+    `).join('');
+    
     res.send(`
 <!DOCTYPE html>
 <html><head><title>FaucetPay Bot</title><meta http-equiv="refresh" content="10">
-<style>body{background:#0a0e27;color:#00ff88;font-family:monospace;padding:20px}.container{max-width:1400px;margin:0 auto}.stat-card{background:#1a1f3a;padding:15px;border-radius:10px;display:inline-block;margin:10px}.card{background:#1a1f3a;padding:15px;border-radius:10px;margin-bottom:20px}.earn{color:#00ff88}.error{color:#ff4444}table{width:100%;border-collapse:collapse}th,td{padding:8px;text-align:left;border-bottom:1px solid #333}</style>
-<body><div class="container"><h1>💰 FaucetPay Bot</h1>
-<div class="card">🟢 LIVE | Uptime: ${hours}h ${minutes}m | Auto Setup: ${AUTO_SETUP ? 'ON' : 'OFF'} | Auto Withdraw: ${AUTO_WITHDRAW ? 'ON' : 'OFF'}<br>Session: $${stats.sessionEarned.toFixed(5)} | Balance: $${stats.currentBalance.toFixed(5)} | Withdrawals: ${stats.successfulWithdrawals}/${stats.withdrawalAttempts}</div>
+<style>
+body{background:#0a0e27;color:#00ff88;font-family:monospace;padding:20px}
+.container{max-width:1400px;margin:0 auto}
+.stat-card{background:#1a1f3a;padding:15px;border-radius:10px;display:inline-block;margin:10px}
+.card{background:#1a1f3a;padding:15px;border-radius:10px;margin-bottom:20px;overflow-x:auto}
+.earn{color:#00ff88}
+.error{color:#ff4444}
+table{width:100%;border-collapse:collapse}
+th,td{padding:8px;text-align:left;border-bottom:1px solid #333}
+.warning{color:#ffaa00}
+</style>
+<body>
+<div class="container">
+<h1>💰 FaucetPay Bot v3.0</h1>
+<div class="card">
+🟢 LIVE | Uptime: ${hours}h ${minutes}m | Auto Setup: ${AUTO_SETUP ? 'ON' : 'OFF'} | Auto Withdraw: ${AUTO_WITHDRAW ? 'ON' : 'OFF'}<br>
+Wallet: ${FAUCETPAY_WALLET_ADDRESS ? FAUCETPAY_WALLET_ADDRESS.substring(0, 15) + '...' : '<span class="error">NOT SET</span>'}<br>
+Session: $${stats.sessionEarned.toFixed(5)} | Balance: $${stats.currentBalance.toFixed(5)} | Withdrawals: ${stats.successfulWithdrawals}/${stats.withdrawalAttempts} (${stats.withdrawalAttempts > 0 ? ((stats.successfulWithdrawals/stats.withdrawalAttempts)*100).toFixed(1) : 0}%)
+</div>
 <div class="stat-card"><div class="earn">$${stats.totalEarned.toFixed(5)}</div>Total</div>
 <div class="stat-card"><div class="earn">$${hourlyRate}</div>/Hour</div>
 <div class="stat-card"><div class="earn">$${dailyRate}</div>/Day</div>
-<div class="card"><h3>🪙 Source Balances</h3><table><tr><th>Source</th><th>Balance</th><th>Claims</th><th>Wallet</th><th>Status</th></tr>${sourceBalancesHtml || '<tr><td colspan="5">No data</td></tr>'}</table></div>
-<div class="card"><h3>💸 Withdrawals</h3><table><tr><th>Time</th><th>Source</th><th>Amount</th><th>Status</th><th>Error</th></tr>${withdrawalHtml || '<tr><td colspan="5">No withdrawals</td></tr>'}</table></div>
-</div></body></html>`);
+<div class="card"><h3>🪙 Source Balances & Wallet Status</h3><table><tr><th>Source</th><th>Balance</th><th>Claims</th><th>Progress</th><th>Wallet</th><th>Status</th></tr>${sourceBalancesHtml || '<tr><td colspan="6">No data</td></tr>'}</table></div>
+<div class="card"><h3>🔧 Wallet Setup History</h3><table><tr><th>Time</th><th>Source</th><th>Status</th><th>Details</th></tr>${setupHtml || '<tr><td colspan="4">No setup attempts</td></tr>'}</table></div>
+<div class="card"><h3>💸 Withdrawal History</h3><table><tr><th>Time</th><th>Source</th><th>Amount</th><th>Status</th><th>Error</th></tr>${withdrawalHtml || '<tr><td colspan="5">No withdrawals</td></tr>'}</table></div>
+</div>
+</body></html>`);
 });
 
 // ============ MAIN ============
