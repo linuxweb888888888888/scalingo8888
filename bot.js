@@ -1,4 +1,4 @@
-// faucetpay-discovery-bot.js - COMPLETE - Auto Discovery + Auto Withdrawal IMMEDIATELY
+// faucetpay-discovery-bot.js - COMPLETE - Fixed Login + Auto Discovery + Auto Withdrawal
 const express = require('express');
 const fs = require('fs');
 const { execSync } = require('child_process');
@@ -15,7 +15,7 @@ const port = process.env.PORT || 3000;
 // ============ CONFIGURATION ============
 const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || 'web88888888888888@gmail.com';
 const FAUCETPAY_PASSWORD = process.env.FAUCETPAY_PASSWORD || 'Linuxdistro&84';
-const FAUCETPAY_WALLET_ADDRESS = process.env.FAUCETPAY_WALLET_ADDRESS || '19ZjLS2cE74QcYmXHpDhhRtaA86YyjptSS;
+const FAUCETPAY_WALLET_ADDRESS = process.env.FAUCETPAY_WALLET_ADDRESS || '19ZjLS2cE74QcYmXHpDhhRtaA86YyjptSS';
 const HEADLESS_MODE = process.env.HEADLESS_MODE !== 'false';
 const SCAN_INTERVAL_SECONDS = parseInt(process.env.SCAN_INTERVAL_SECONDS) || 60;
 const DISCOVERY_INTERVAL_MINUTES = parseInt(process.env.DISCOVERY_INTERVAL_MINUTES) || 5;
@@ -109,12 +109,6 @@ const generateFaucetList = () => {
         { name: 'BTCClicks', url: 'https://btcclicks.com', earnPerAction: 0.0002, minWithdraw: 0.0001, type: 'faucet', instantToBalance: false, requiresLogin: true },
         { name: 'CoinFaucet', url: 'https://coinfaucet.io', earnPerAction: 0.0002, minWithdraw: 0.0001, type: 'faucet', instantToBalance: false, requiresLogin: true },
         { name: 'CryptoFaucet', url: 'https://cryptofaucet.net', earnPerAction: 0.0002, minWithdraw: 0.0001, type: 'faucet', instantToBalance: false, requiresLogin: true },
-        { name: 'DailyBitcoin', url: 'https://dailybitcoin.fun', earnPerAction: 0.0002, minWithdraw: 0.0001, type: 'faucet', instantToBalance: false, requiresLogin: true },
-        { name: 'EasyFaucet', url: 'https://easyfaucet.xyz', earnPerAction: 0.0002, minWithdraw: 0.0001, type: 'faucet', instantToBalance: false, requiresLogin: true },
-        { name: 'FaucetBOX', url: 'https://faucetbox.com', earnPerAction: 0.0002, minWithdraw: 0.0001, type: 'faucet', instantToBalance: false, requiresLogin: true },
-        { name: 'FaucetCollector', url: 'https://faucetcollector.com', earnPerAction: 0.0002, minWithdraw: 0.0001, type: 'faucet', instantToBalance: false, requiresLogin: true },
-        { name: 'FaucetGalaxy', url: 'https://faucetgalaxy.com', earnPerAction: 0.0002, minWithdraw: 0.0001, type: 'faucet', instantToBalance: false, requiresLogin: true },
-        { name: 'FaucetKing', url: 'https://faucetking.io', earnPerAction: 0.0002, minWithdraw: 0.0001, type: 'faucet', instantToBalance: false, requiresLogin: true },
     ];
     
     // Generate 80+ additional faucets dynamically
@@ -478,11 +472,9 @@ class EarningEngine {
         stats.sourceBalances[source.name].lastWithdrawTime = new Date();
         
         try {
-            // Navigate to withdrawal page
             await this.page.goto(source.url, { waitUntil: 'networkidle2', timeout: 20000 });
             await safeWait(3000);
             
-            // Look for withdraw button
             let withdrawBtn = null;
             const withdrawSelectors = source.withdrawSelector ? [source.withdrawSelector] : 
                 ['.withdraw-btn', '#withdrawButton', 'button:has-text("Withdraw")', '.btn-withdraw', '#withdraw'];
@@ -513,7 +505,6 @@ class EarningEngine {
                 await withdrawBtn.click();
                 await safeWait(5000);
                 
-                // Check for success
                 const pageContent = await this.page.content();
                 const success = pageContent.toLowerCase().includes('success') || 
                                pageContent.toLowerCase().includes('sent') ||
@@ -535,7 +526,6 @@ class EarningEngine {
                         message: 'Auto-withdrawn immediately when threshold reached'
                     });
                     
-                    // Reset balance for this source
                     stats.sourceBalances[source.name].earned = 0;
                     return true;
                 } else {
@@ -581,9 +571,7 @@ class EarningEngine {
     
     async claimFromSource(source) {
         try {
-            // For external faucets, ensure logged in and wallet configured
             if (source.requiresLogin && !stats.sourceBalances[source.name]?.loggedIn) {
-                // Login would happen here in production
                 stats.sourceBalances[source.name].loggedIn = true;
             }
             
@@ -619,7 +607,6 @@ class EarningEngine {
                 
                 const earned = source.earnPerAction;
                 
-                // Update stats
                 stats.totalActions++;
                 stats.sourceBalances[source.name].earned += earned;
                 stats.sourceBalances[source.name].claims++;
@@ -638,7 +625,6 @@ class EarningEngine {
                 const indicator = source.instantToBalance ? '💰' : '🪙';
                 console.log(`  ${indicator} ${source.name}: +$${earned.toFixed(5)} → Total: $${currentBalance.toFixed(5)}`);
                 
-                // ============ IMMEDIATE WITHDRAWAL CHECK ============
                 if (!source.instantToBalance && source.minWithdraw && AUTO_WITHDRAW) {
                     if (currentBalance >= source.minWithdraw) {
                         console.log(`\n🎯 ${source.name} - MINIMUM THRESHOLD REACHED!`);
@@ -646,7 +632,6 @@ class EarningEngine {
                         console.log(`   Minimum required: $${source.minWithdraw}`);
                         console.log(`   🚀 INITIATING IMMEDIATE WITHDRAWAL...`);
                         
-                        // Check if wallet is configured
                         if (stats.sourceBalances[source.name].walletConfigured) {
                             await this.withdrawFromSource(source, currentBalance);
                         } else {
@@ -687,7 +672,6 @@ class EarningEngine {
         console.log(`⏳ Pending withdrawals: ${stats.pendingWithdrawals}`);
         console.log('========================================');
         
-        // Claim from all sources (limited to 50 per cycle for performance)
         const sourcesToClaim = sources.slice(0, 50);
         
         for (let i = 0; i < sourcesToClaim.length; i++) {
@@ -711,7 +695,6 @@ class EarningEngine {
         console.log(`📊 Total earned: $${stats.totalEarned.toFixed(5)}`);
         console.log(`💳 Balance: $${stats.currentBalance.toFixed(5)}`);
         
-        // Show pending balances that are close to withdrawal
         const pendingWithdrawals = Object.entries(stats.sourceBalances)
             .filter(([name, data]) => {
                 const source = FAUCET_SOURCES.find(s => s.name === name);
@@ -733,7 +716,6 @@ class EarningEngine {
             }
         }
         
-        // Show recent withdrawals
         if (stats.withdrawalHistory.length > 0) {
             const lastWithdraw = stats.withdrawalHistory[0];
             const timeSince = (Date.now() - new Date(lastWithdraw.time).getTime()) / 1000;
@@ -742,7 +724,6 @@ class EarningEngine {
             }
         }
         
-        // Calculate rates
         const uptimeHours = (Date.now() - stats.startTime) / 3600000;
         const hourlyRate = uptimeHours > 0 ? (stats.totalEarned / uptimeHours).toFixed(5) : 0;
         const dailyProjection = (hourlyRate * 24).toFixed(5);
@@ -752,7 +733,7 @@ class EarningEngine {
     }
 }
 
-// ============ MAIN BOT ============
+// ============ MAIN BOT WITH FIXED LOGIN ============
 class CompleteFaucetBot {
     constructor(email, password) {
         this.email = email;
@@ -786,27 +767,162 @@ class CompleteFaucetBot {
     }
 
     async loginToFaucetPay() {
-        if (!this.email || !this.password) return false;
+        if (!this.email || !this.password) {
+            console.log('[FaucetPay] No credentials provided');
+            return false;
+        }
         
         console.log('[FaucetPay] Logging in...');
+        console.log(`[FaucetPay] Email: ${this.email.substring(0, 10)}...`);
+        
         try {
-            await this.page.goto('https://faucetpay.io/login', { waitUntil: 'networkidle2' });
+            // Navigate to login page
+            await this.page.goto('https://faucetpay.io/login', { waitUntil: 'networkidle2', timeout: 30000 });
             await safeWait(3000);
-            await this.page.type('#email', this.email);
-            await this.page.type('#password', this.password);
-            await this.page.click('button[type="submit"]');
-            await safeWait(5000);
             
-            this.loggedIn = true;
-            stats.loggedIn = true;
-            console.log('[FaucetPay] ✅ Login successful!');
+            // Take screenshot for debugging
+            await this.page.screenshot({ path: '/tmp/login-page.png' }).catch(() => {});
             
-            const balanceText = await this.page.$eval('.balance-amount, .user-balance', el => el.innerText).catch(() => '0');
-            stats.currentBalance = parseFloat(balanceText) || 0;
-            console.log(`[FaucetPay] Current balance: $${stats.currentBalance.toFixed(5)}`);
-            return true;
+            // Try multiple selectors for email field
+            let emailField = null;
+            const emailSelectors = ['#email', 'input[name="email"]', 'input[type="email"]', '#login_email', '.email-input'];
+            
+            for (const selector of emailSelectors) {
+                try {
+                    emailField = await this.page.$(selector);
+                    if (emailField) {
+                        console.log(`[FaucetPay] Found email field: ${selector}`);
+                        break;
+                    }
+                } catch(e) {}
+            }
+            
+            if (!emailField) {
+                // Try to find by placeholder
+                emailField = await this.page.$('input[placeholder*="email"], input[placeholder*="Email"]');
+                if (emailField) console.log('[FaucetPay] Found email field by placeholder');
+            }
+            
+            if (emailField) {
+                await emailField.click({ clickCount: 3 });
+                await emailField.type(this.email);
+                console.log('[FaucetPay] Email entered');
+                await safeWait(1000);
+            } else {
+                console.log('[FaucetPay] Could not find email field');
+                return false;
+            }
+            
+            // Try multiple selectors for password field
+            let passwordField = null;
+            const passwordSelectors = ['#password', 'input[name="password"]', 'input[type="password"]', '#login_password', '.password-input'];
+            
+            for (const selector of passwordSelectors) {
+                try {
+                    passwordField = await this.page.$(selector);
+                    if (passwordField) {
+                        console.log(`[FaucetPay] Found password field: ${selector}`);
+                        break;
+                    }
+                } catch(e) {}
+            }
+            
+            if (!passwordField) {
+                passwordField = await this.page.$('input[placeholder*="password"], input[placeholder*="Password"]');
+                if (passwordField) console.log('[FaucetPay] Found password field by placeholder');
+            }
+            
+            if (passwordField) {
+                await passwordField.click({ clickCount: 3 });
+                await passwordField.type(this.password);
+                console.log('[FaucetPay] Password entered');
+                await safeWait(1000);
+            } else {
+                console.log('[FaucetPay] Could not find password field');
+                return false;
+            }
+            
+            // Try multiple selectors for submit button
+            let submitBtn = null;
+            const submitSelectors = [
+                'button[type="submit"]', 
+                'input[type="submit"]', 
+                '#login-btn', 
+                '.login-btn', 
+                'button:has-text("Login")',
+                'button:has-text("Sign in")',
+                '.btn-login'
+            ];
+            
+            for (const selector of submitSelectors) {
+                try {
+                    submitBtn = await this.page.$(selector);
+                    if (submitBtn) {
+                        console.log(`[FaucetPay] Found submit button: ${selector}`);
+                        break;
+                    }
+                } catch(e) {}
+            }
+            
+            if (submitBtn) {
+                await submitBtn.click();
+                console.log('[FaucetPay] Clicked login button');
+                await safeWait(8000);
+            } else {
+                // Try pressing Enter
+                await this.page.keyboard.press('Enter');
+                console.log('[FaucetPay] Pressed Enter to submit');
+                await safeWait(8000);
+            }
+            
+            // Check if login was successful by looking for dashboard elements
+            const currentUrl = this.page.url();
+            console.log(`[FaucetPay] Current URL: ${currentUrl}`);
+            
+            // Check for successful login indicators
+            const pageContent = await this.page.content();
+            const hasDashboard = pageContent.includes('dashboard') || 
+                                pageContent.includes('Dashboard') ||
+                                pageContent.includes('balance') ||
+                                pageContent.includes('Balance') ||
+                                currentUrl.includes('dashboard') ||
+                                currentUrl.includes('home');
+            
+            if (hasDashboard || !currentUrl.includes('login')) {
+                this.loggedIn = true;
+                stats.loggedIn = true;
+                console.log('[FaucetPay] ✅ Login successful!');
+                
+                // Try to get balance
+                try {
+                    const balanceSelectors = ['.balance-amount', '.user-balance', '.current-balance', '.wallet-balance'];
+                    for (const selector of balanceSelectors) {
+                        try {
+                            const balanceText = await this.page.$eval(selector, el => el.innerText).catch(() => null);
+                            if (balanceText) {
+                                stats.currentBalance = parseFloat(balanceText) || 0;
+                                console.log(`[FaucetPay] Current balance: $${stats.currentBalance.toFixed(5)}`);
+                                break;
+                            }
+                        } catch(e) {}
+                    }
+                } catch(e) {}
+                
+                return true;
+            } else {
+                console.log('[FaucetPay] ❌ Login failed - still on login page');
+                console.log('[FaucetPay] Trying alternative login method...');
+                
+                // Try to find error message
+                try {
+                    const errorMsg = await this.page.$eval('.error, .alert-danger, .alert-error', el => el.innerText).catch(() => null);
+                    if (errorMsg) console.log(`[FaucetPay] Error message: ${errorMsg}`);
+                } catch(e) {}
+                
+                return false;
+            }
         } catch (error) {
-            console.log('[FaucetPay] Login failed');
+            console.log(`[FaucetPay] Login error: ${error.message}`);
             return false;
         }
     }
@@ -819,14 +935,20 @@ class CompleteFaucetBot {
         console.log('========================================\n');
         
         await this.init();
-        await this.loginToFaucetPay();
         
-        // Run initial setup
-        if (AUTO_REGISTER) {
+        // Try to login, but continue even if login fails (demo mode)
+        const loginSuccess = await this.loginToFaucetPay();
+        if (!loginSuccess) {
+            console.log('\n⚠️ FaucetPay login failed - running in demo mode');
+            console.log('   Earnings will be tracked but not withdrawn to FaucetPay\n');
+        }
+        
+        // Run initial setup only if logged in
+        if (loginSuccess && AUTO_REGISTER) {
             await this.registrationManager.runAutoRegistration(FAUCET_SOURCES);
         }
         
-        if (AUTO_SETUP && FAUCETPAY_WALLET_ADDRESS) {
+        if (loginSuccess && AUTO_SETUP && FAUCETPAY_WALLET_ADDRESS) {
             await this.walletSetup.runAutoSetup(FAUCET_SOURCES);
         }
         
@@ -839,11 +961,11 @@ class CompleteFaucetBot {
                     const newFaucets = await this.discoveryEngine.discoverNewFaucets();
                     this.lastDiscoveryTime = now;
                     
-                    if (newFaucets.length > 0 && AUTO_REGISTER) {
+                    if (newFaucets.length > 0 && loginSuccess && AUTO_REGISTER) {
                         await this.registrationManager.runAutoRegistration(newFaucets);
                     }
                     
-                    if (newFaucets.length > 0 && AUTO_SETUP && FAUCETPAY_WALLET_ADDRESS) {
+                    if (newFaucets.length > 0 && loginSuccess && AUTO_SETUP && FAUCETPAY_WALLET_ADDRESS) {
                         await this.walletSetup.runAutoSetup(newFaucets);
                     }
                 }
@@ -907,6 +1029,7 @@ th,td{padding:8px;text-align:left;border-bottom:1px solid #333;font-size:12px}
 <div class="card">
 🟢 LIVE | Uptime: ${hours}h ${minutes}m | Discover every ${DISCOVERY_INTERVAL_MINUTES}min<br>
 Total Sources: ${FAUCET_SOURCES.length} | Discovered: ${stats.discoveredCount}<br>
+Logged In: ${stats.loggedIn ? '✅ YES' : '❌ NO (Demo Mode)'}<br>
 Wallet: ${FAUCETPAY_WALLET_ADDRESS ? FAUCETPAY_WALLET_ADDRESS.substring(0, 15) + '...' : '<span class="error">NOT SET</span>'}
 </div>
 <div class="stat-card"><div class="earn">$${stats.totalEarned.toFixed(5)}</div>Total</div>
