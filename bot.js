@@ -1,14 +1,13 @@
 // faucetpay-internal-bot.js - FaucetPay Internal Bot with Dashboard Login
 const express = require('express');
 const fs = require('fs');
-const path = require('path');
 const { execSync } = require('child_process');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const https = require('https');
-const { createWriteStream } = require('fs');
-const session = require('express-session');
+const { createWriteStream } = require('path');
 
+// Use the stealth plugin
 puppeteer.use(StealthPlugin());
 
 const app = express();
@@ -17,15 +16,6 @@ const port = process.env.PORT || 3000;
 // Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(express.static('public'));
-
-// Session storage for login status
-app.use(session({
-    secret: 'faucetpay-bot-secret-key',
-    resave: false,
-    saveUninitialized: true,
-    cookie: { maxAge: 24 * 60 * 60 * 1000 } // 24 hours
-}));
 
 // ============ CONFIGURATION ============
 const FAUCETPAY_WALLET_ADDRESS = process.env.FAUCETPAY_WALLET_ADDRESS || 'web88888888888888@gmail.com';
@@ -137,7 +127,7 @@ class BrowserManager {
         this.browser = await puppeteer.launch({
             headless: HEADLESS_MODE,
             executablePath: chromePath,
-            userDataDir: USER_DATA_DIR, // Persistent session!
+            userDataDir: USER_DATA_DIR,
             args: [
                 '--no-sandbox', 
                 '--disable-setuid-sandbox', 
@@ -194,11 +184,9 @@ async function performLogin(email, password) {
     try {
         const page = await browserManager.init();
         
-        // Navigate to login page
         await page.goto('https://faucetpay.io/login', { waitUntil: 'networkidle2', timeout: 30000 });
         await safeWait(3000);
         
-        // Check if already logged in via persistent session
         const currentUrl = page.url();
         if (!currentUrl.includes('login')) {
             console.log('✅ Already logged in from persistent session!');
@@ -209,13 +197,11 @@ async function performLogin(email, password) {
             return { success: true, message: 'Already logged in from saved session' };
         }
         
-        // Enter credentials
         await page.type('#email, input[name="email"]', email);
         await safeWait(500);
         await page.type('#password, input[name="password"]', password);
         await safeWait(500);
         
-        // Check for captcha
         const hasCaptcha = await page.evaluate(() => {
             return !!document.querySelector('.g-recaptcha, iframe[src*="recaptcha"], .captcha');
         });
@@ -224,7 +210,6 @@ async function performLogin(email, password) {
             console.log('⚠️ CAPTCHA detected - please solve it in the browser window');
             console.log('   You have 60 seconds to solve the captcha...');
             
-            // Wait for captcha to be solved
             await page.waitForFunction(() => {
                 const recaptchaResponse = document.querySelector('#g-recaptcha-response');
                 return recaptchaResponse && recaptchaResponse.value.length > 0;
@@ -235,11 +220,9 @@ async function performLogin(email, password) {
             await safeWait(2000);
         }
         
-        // Click login
         await page.click('button[type="submit"], input[type="submit"]');
         await safeWait(8000);
         
-        // Verify login success
         const afterUrl = page.url();
         if (!afterUrl.includes('login')) {
             console.log('✅ Login successful! Session saved to persistent storage.');
@@ -534,7 +517,6 @@ let earningEngine = null;
 
 // ============ API ROUTES ============
 
-// Login endpoint
 app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
     
@@ -546,7 +528,6 @@ app.post('/api/login', async (req, res) => {
     res.json(result);
 });
 
-// Logout endpoint
 app.post('/api/logout', async (req, res) => {
     try {
         if (browserInstance) {
@@ -563,7 +544,6 @@ app.post('/api/logout', async (req, res) => {
     }
 });
 
-// Get status endpoint
 app.get('/api/status', async (req, res) => {
     if (pageInstance && loginStatus.isLoggedIn) {
         await browserManager.getBalance();
@@ -583,7 +563,6 @@ app.get('/api/status', async (req, res) => {
     });
 });
 
-// Start bot endpoint
 app.post('/api/start', async (req, res) => {
     if (!loginStatus.isLoggedIn || !pageInstance) {
         return res.json({ success: false, message: 'Please login first' });
@@ -596,7 +575,6 @@ app.post('/api/start', async (req, res) => {
     botRunning = true;
     earningEngine = new InternalEarningEngine(pageInstance);
     
-    // Start bot loop
     const runLoop = async () => {
         while (botRunning && loginStatus.isLoggedIn) {
             try {
@@ -613,13 +591,11 @@ app.post('/api/start', async (req, res) => {
     res.json({ success: true, message: 'Bot started' });
 });
 
-// Stop bot endpoint
 app.post('/api/stop', async (req, res) => {
     botRunning = false;
     res.json({ success: true, message: 'Bot stopped' });
 });
 
-// Get stats endpoint
 app.get('/api/stats', (req, res) => {
     const uptime = Math.floor((Date.now() - stats.startTime) / 1000);
     const hourlyRate = uptime > 0 ? (stats.totalEarned / (uptime / 3600)).toFixed(5) : 0;
@@ -646,13 +622,13 @@ app.get('/', (req, res) => {
 <head>
     <title>FaucetPay Bot - Dashboard Login</title>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { background: linear-gradient(135deg, #0a0e27 0%, #1a1f3a 100%); font-family: 'Segoe UI', monospace; min-height: 100vh; color: #00ff88; }
         .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
         h1 { text-align: center; margin-bottom: 20px; font-size: 28px; }
         
-        /* Login Panel */
         .login-panel { background: rgba(26,31,58,0.95); border-radius: 15px; padding: 30px; margin-bottom: 20px; border: 1px solid #00ff88; }
         .login-panel h2 { margin-bottom: 20px; font-size: 20px; }
         .login-form { display: flex; gap: 15px; flex-wrap: wrap; align-items: flex-end; }
@@ -665,21 +641,19 @@ app.get('/', (req, res) => {
         button.danger { background: #ff4444; color: white; }
         button.warning { background: #ffaa00; color: #0a0e27; }
         button.success { background: #00ff88; color: #0a0e27; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
         
-        /* Status Panel */
         .status-panel { background: rgba(26,31,58,0.95); border-radius: 15px; padding: 20px; margin-bottom: 20px; border: 1px solid #00ff88; }
         .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-top: 15px; }
         .status-item { background: #0a0e27; padding: 15px; border-radius: 10px; text-align: center; }
         .status-label { font-size: 12px; opacity: 0.7; margin-bottom: 5px; }
         .status-value { font-size: 24px; font-weight: bold; }
         
-        /* Stats Grid */
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 20px; }
         .stat-card { background: rgba(26,31,58,0.95); padding: 20px; border-radius: 10px; text-align: center; border: 1px solid #00ff88; }
         .stat-value { font-size: 28px; font-weight: bold; color: #00ff88; }
         .stat-label { font-size: 12px; opacity: 0.7; margin-top: 5px; }
         
-        /* Tables */
         .card { background: rgba(26,31,58,0.95); border-radius: 10px; padding: 20px; margin-bottom: 20px; overflow-x: auto; }
         .card h3 { margin-bottom: 15px; border-bottom: 1px solid #00ff88; padding-bottom: 5px; }
         table { width: 100%; border-collapse: collapse; }
@@ -688,14 +662,11 @@ app.get('/', (req, res) => {
         .earn { color: #00ff88; }
         .error { color: #ff4444; }
         
-        /* Control Buttons */
         .control-buttons { display: flex; gap: 15px; margin-bottom: 20px; flex-wrap: wrap; }
         
-        /* Loading */
-        .loading { display: inline-block; width: 20px; height: 20px; border: 2px solid #00ff88; border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; }
+        .loading { display: inline-block; width: 20px; height: 20px; border: 2px solid #00ff88; border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; vertical-align: middle; margin-right: 5px; }
         @keyframes spin { to { transform: rotate(360deg); } }
         
-        /* Responsive */
         @media (max-width: 768px) {
             .login-form { flex-direction: column; }
             .form-group { width: 100%; }
@@ -707,7 +678,6 @@ app.get('/', (req, res) => {
 <div class="container">
     <h1>💰 FaucetPay Internal Bot</h1>
     
-    <!-- Login Panel -->
     <div class="login-panel" id="loginPanel">
         <h2>🔐 Login to FaucetPay</h2>
         <div class="login-form">
@@ -724,7 +694,6 @@ app.get('/', (req, res) => {
         <div id="loginMessage" style="margin-top: 15px; font-size: 12px;"></div>
     </div>
     
-    <!-- Status Panel -->
     <div class="status-panel" id="statusPanel" style="display: none;">
         <h2>📊 Login Status</h2>
         <div class="status-grid">
@@ -747,14 +716,12 @@ app.get('/', (req, res) => {
         </div>
     </div>
     
-    <!-- Control Buttons -->
     <div class="control-buttons" id="controlButtons" style="display: none;">
         <button id="startBtn" onclick="startBot()" class="success">▶️ Start Bot</button>
-        <button id="stopBtn" onclick="stopBot()" class="danger">⏹️ Stop Bot</button>
-        <button id="logoutBtn" onclick="logout()" class="warning">🚪 Logout</button>
+        <button id="stopBtn" onclick="stopBot()" class="danger" disabled>⏹️ Stop Bot</button>
+        <button onclick="logout()" class="warning">🚪 Logout</button>
     </div>
     
-    <!-- Stats Cards -->
     <div class="stats-grid" id="statsGrid" style="display: none;">
         <div class="stat-card"><div class="stat-value" id="totalEarned">$0.00000</div><div class="stat-label">Total Earned</div></div>
         <div class="stat-card"><div class="stat-value" id="hourlyRate">$0.00000</div><div class="stat-label">Per Hour</div></div>
@@ -762,7 +729,6 @@ app.get('/', (req, res) => {
         <div class="stat-card"><div class="stat-value" id="totalClaims">0</div><div class="stat-label">Total Claims</div></div>
     </div>
     
-    <!-- Source Balances -->
     <div class="card" id="balancesCard" style="display: none;">
         <h3>🪙 Source Balances</h3>
         <table id="balancesTable">
@@ -771,7 +737,6 @@ app.get('/', (req, res) => {
         </table>
     </div>
     
-    <!-- Recent Claims -->
     <div class="card" id="claimsCard" style="display: none;">
         <h3>📈 Recent Claims</h3>
         <table id="claimsTable">
@@ -784,7 +749,6 @@ app.get('/', (req, res) => {
 <script>
     let refreshInterval = null;
     
-    // Login function
     async function login() {
         const email = document.getElementById('email').value;
         const password = document.getElementById('password').value;
@@ -813,7 +777,6 @@ app.get('/', (req, res) => {
                 document.getElementById('balancesCard').style.display = 'block';
                 document.getElementById('claimsCard').style.display = 'block';
                 
-                // Start refreshing stats
                 if (refreshInterval) clearInterval(refreshInterval);
                 refreshInterval = setInterval(updateStats, 5000);
                 updateStats();
@@ -825,7 +788,6 @@ app.get('/', (req, res) => {
         }
     }
     
-    // Update stats
     async function updateStats() {
         try {
             const response = await fetch('/api/status');
@@ -835,19 +797,16 @@ app.get('/', (req, res) => {
                 document.getElementById('loginStatus').innerHTML = '✅ Logged In';
                 document.getElementById('loginEmail').innerHTML = data.email;
                 document.getElementById('balance').innerHTML = '$' + (data.balance || 0).toFixed(5);
-                
                 document.getElementById('totalEarned').innerHTML = '$' + (data.stats.totalEarned || 0).toFixed(5);
                 document.getElementById('totalClaims').innerHTML = data.stats.totalActions || 0;
             }
             
-            // Get detailed stats
             const statsResponse = await fetch('/api/stats');
             const stats = await statsResponse.json();
             
             document.getElementById('hourlyRate').innerHTML = '$' + (stats.hourlyRate || 0);
             document.getElementById('dailyRate').innerHTML = '$' + (stats.dailyRate || 0);
             
-            // Update source balances
             if (stats.sourceBalances) {
                 const balancesBody = document.getElementById('balancesBody');
                 balancesBody.innerHTML = '';
@@ -865,7 +824,6 @@ app.get('/', (req, res) => {
                 }
             }
             
-            // Update claim history
             if (stats.claimHistory && stats.claimHistory.length > 0) {
                 const claimsBody = document.getElementById('claimsBody');
                 claimsBody.innerHTML = '';
@@ -881,7 +839,6 @@ app.get('/', (req, res) => {
         }
     }
     
-    // Start bot
     async function startBot() {
         const startBtn = document.getElementById('startBtn');
         startBtn.disabled = true;
@@ -908,7 +865,6 @@ app.get('/', (req, res) => {
         }
     }
     
-    // Stop bot
     async function stopBot() {
         const stopBtn = document.getElementById('stopBtn');
         stopBtn.disabled = true;
@@ -934,7 +890,6 @@ app.get('/', (req, res) => {
         }
     }
     
-    // Logout
     async function logout() {
         if (refreshInterval) clearInterval(refreshInterval);
         
@@ -945,7 +900,6 @@ app.get('/', (req, res) => {
         location.reload();
     }
     
-    // Check initial status
     async function checkStatus() {
         try {
             const response = await fetch('/api/status');
@@ -988,7 +942,6 @@ async function main() {
         console.log(`   6. Click "Start Bot" to begin earning!\n`);
     });
     
-    // Don't auto-start browser - wait for dashboard login
     console.log('✅ Bot ready. Waiting for dashboard login...\n');
 }
 
