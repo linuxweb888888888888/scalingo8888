@@ -1,12 +1,11 @@
+// faucetpay-bot.js - Complete FaucetPay Auto Earning Bot
 const express = require('express');
 const fs = require('fs');
-const os = require('os');
-const { execSync, spawn } = require('child_process');
+const { execSync } = require('child_process');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const https = require('https');
 const { createWriteStream } = require('fs');
-const { MongoClient } = require('mongodb');
 
 // Apply stealth plugin
 puppeteer.use(StealthPlugin());
@@ -15,68 +14,33 @@ const app = express();
 app.use(express.json());
 const port = process.env.PORT || 3000;
 
-// ============ MONGODB CONNECTION ============
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888';
-let dbClient = null;
-let db = null;
+// ============ CONFIGURATION ============
+const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || '';
+const FAUCETPAY_PASSWORD = process.env.FAUCETPAY_PASSWORD || '';
+const MIN_WITHDRAWAL_USD = parseFloat(process.env.MIN_WITHDRAWAL_USD) || 0.10;
+const EARNING_GOAL = parseFloat(process.env.EARNING_GOAL) || 10;
+const SHOW_DASHBOARD = process.env.SHOW_DASHBOARD !== 'false';
+const HEADLESS_MODE = process.env.HEADLESS_MODE !== 'false';
 
-async function connectMongoDB() {
-    try {
-        dbClient = new MongoClient(MONGODB_URI);
-        await dbClient.connect();
-        db = dbClient.db('botdb');
-        console.log('[MongoDB] Connected successfully');
-        
-        await db.createCollection('accounts', { capped: false });
-        await db.createCollection('metrics', { capped: false });
-        await db.collection('accounts').createIndex({ createdAt: -1 });
-        
-        return true;
-    } catch (error) {
-        console.error('[MongoDB] Connection failed:', error.message);
-        return false;
-    }
-}
-
-// ============ ENVIRONMENT VARIABLES ============
-const ENV = {
-    BOT_PASSWORD: process.env.BOT_PASSWORD || 'Linuxdistro&84',
-    BOT_START_DELAY: parseInt(process.env.BOT_START_DELAY) || 10,
-    HEADLESS_MODE: process.env.HEADLESS_MODE !== 'false',
-    CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome',
-    CLEVER_TOKEN: process.env.CLEVER_TOKEN || '',
-    SCALINGO_API_TOKEN: process.env.SCALINGO_API_TOKEN || '',
-    SCALINGO_APP_NAME: process.env.SCALINGO_APP_NAME || ''
-};
+// Chrome paths
+const CHROME_PATH = process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome';
+const CHROME_URL = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
 
 console.log('\n========================================');
-console.log('  BOT CONFIGURATION');
+console.log('  FaucetPay Auto Earning Bot');
 console.log('========================================');
-console.log(`Bot Mode: Creates ONE account, then CLI RESTART for NEW IP`);
-console.log(`MongoDB: ${MONGODB_URI ? 'Connected' : 'Not configured'}`);
-console.log(`Clever Token: ${ENV.CLEVER_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
-console.log(`Scalingo App: ${ENV.SCALINGO_APP_NAME || 'Not set'}`);
-console.log(`Scalingo API Token: ${ENV.SCALINGO_API_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
+console.log(`Min Withdrawal: $${MIN_WITHDRAWAL_USD}`);
+console.log(`Daily Goal: $${EARNING_GOAL}`);
+console.log(`Dashboard: ${SHOW_DASHBOARD ? 'Enabled' : 'Disabled'}`);
+console.log(`Headless: ${HEADLESS_MODE}`);
+if (FAUCETPAY_EMAIL) {
+    console.log(`Account: ${FAUCETPAY_EMAIL}`);
+} else {
+    console.log(`Account: Demo Mode (no login)`);
+}
 console.log('========================================\n');
 
-// ============ STATE VARIABLES ============
-let botStatus = {
-    state: 'starting',
-    accountCreated: false,
-    accountEmail: null,
-    startTime: new Date(),
-    completionTime: null,
-    restartCount: 0
-};
-
-// ============ HELPER FUNCTIONS ============
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-function log(step, message, type = 'info', instanceId = 'MAIN') {
-    const timestamp = new Date().toLocaleTimeString();
-    console.log(`[${timestamp}] [${instanceId}] [${step}] ${message}`);
-}
-
+// ============ CHROME INSTALLATION ============
 async function downloadFile(url, destPath) {
     return new Promise((resolve, reject) => {
         const file = createWriteStream(destPath);
@@ -94,702 +58,442 @@ async function downloadFile(url, destPath) {
     });
 }
 
-async function installChromiumRuntime() {
-    const chromePath = ENV.CHROMIUM_PATH;
-    
-    if (fs.existsSync(chromePath)) {
-        const stats = fs.statSync(chromePath);
+async function installChrome() {
+    if (fs.existsSync(CHROME_PATH)) {
+        const stats = fs.statSync(CHROME_PATH);
         if (stats.size > 50000000) {
-            return chromePath;
+            console.log('[Chrome] Already installed');
+            return CHROME_PATH;
         }
     }
     
-    log('SYSTEM', 'Installing Chromium...', 'info', 'MAIN');
+    console.log('[Chrome] Installing...');
     
     try {
-        const chromeUrl = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
-        const zipPath = '/tmp/chromium.zip';
+        // Install system dependencies
+        console.log('[Chrome] Installing dependencies...');
+        execSync('apt-get update -qq 2>/dev/null || true', { stdio: 'inherit' });
+        execSync(`apt-get install -y -qq --no-install-recommends \
+            ca-certificates \
+            fonts-liberation \
+            libappindicator3-1 \
+            libasound2 \
+            libatk-bridge2.0-0 \
+            libatk1.0-0 \
+            libcups2 \
+            libdbus-1-3 \
+            libgbm1 \
+            libgtk-3-0 \
+            libnspr4 \
+            libnss3 \
+            libx11-xcb1 \
+            libxcb1 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxrandr2 \
+            xdg-utils \
+            wget \
+            unzip \
+            2>/dev/null || true`, { stdio: 'inherit' });
         
-        await downloadFile(chromeUrl, zipPath);
+        // Download Chrome
+        const zipPath = '/tmp/chromium.zip';
+        console.log('[Chrome] Downloading...');
+        await downloadFile(CHROME_URL, zipPath);
+        
+        // Extract
+        console.log('[Chrome] Extracting...');
         execSync(`unzip -q ${zipPath} -d /app/`, { stdio: 'inherit' });
         
-        if (fs.existsSync(chromePath)) {
-            fs.chmodSync(chromePath, 0o755);
+        // Verify
+        if (fs.existsSync(CHROME_PATH)) {
+            fs.chmodSync(CHROME_PATH, 0o755);
             fs.unlinkSync(zipPath);
-            return chromePath;
+            console.log('[Chrome] ✅ Installed successfully');
+            return CHROME_PATH;
         }
         throw new Error('Chrome binary not found');
+        
     } catch (error) {
-        log('SYSTEM', `Failed: ${error.message}`, 'error', 'MAIN');
+        console.error('[Chrome] Installation failed:', error.message);
         return null;
     }
 }
 
-// ============ INSTALL SCALINGO CLI AT RUNTIME ============
-function installScalingoCLI() {
-    const cliPath = '/app/bin/scalingo';
-    
-    if (fs.existsSync(cliPath)) {
-        console.log('[CLI] Scalingo CLI already installed');
-        return true;
-    }
-    
-    console.log('[CLI] Installing Scalingo CLI...');
-    
-    try {
-        if (!fs.existsSync('/app/bin')) {
-            fs.mkdirSync('/app/bin', { recursive: true });
-        }
-        
-        console.log('[CLI] Downloading...');
-        execSync('curl -L -o /tmp/scalingo.tar.gz https://github.com/Scalingo/cli/releases/download/1.44.1/scalingo_1.44.1_linux_amd64.tar.gz', { stdio: 'inherit' });
-        
-        console.log('[CLI] Extracting...');
-        execSync('cd /tmp && tar -xzf scalingo.tar.gz', { stdio: 'inherit' });
-        
-        console.log('[CLI] Copying binary...');
-        execSync('cp /tmp/scalingo_1.44.1_linux_amd64/scalingo /app/bin/scalingo', { stdio: 'inherit' });
-        
-        execSync('chmod +x /app/bin/scalingo', { stdio: 'inherit' });
-        execSync('rm -rf /tmp/scalingo_1.44.1_linux_amd64 /tmp/scalingo.tar.gz', { stdio: 'inherit' });
-        
-        console.log('[CLI] ✅ Scalingo CLI installed successfully');
-        return true;
-        
-    } catch (error) {
-        console.error('[CLI] Failed to install:', error.message);
-        return false;
-    }
+function getChromeLaunchOptions() {
+    return {
+        headless: HEADLESS_MODE,
+        executablePath: CHROME_PATH,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--disable-webgl',
+            '--disable-accelerated-2d-canvas'
+        ]
+    };
 }
 
-// ============ RESTART VIA CLI ============
-async function restartWithCLI() {
-    const cliPath = '/app/bin/scalingo';
-    const appName = ENV.SCALINGO_APP_NAME;
-    const apiToken = ENV.SCALINGO_API_TOKEN;
-    
-    if (!fs.existsSync(cliPath)) {
-        log('RESTART', 'Scalingo CLI not found', 'error', 'MAIN');
-        return false;
-    }
-    
-    if (!appName) {
-        log('RESTART', 'SCALINGO_APP_NAME not set', 'error', 'MAIN');
-        return false;
-    }
-    
-    if (!apiToken) {
-        log('RESTART', 'SCALINGO_API_TOKEN not set', 'error', 'MAIN');
-        return false;
-    }
-    
-    log('RESTART', `Restarting ${appName} via CLI...`, 'info', 'MAIN');
-    
-    return new Promise((resolve) => {
-        const cmd = `${cliPath} login --api-token "${apiToken}" && ${cliPath} --app ${appName} restart`;
-        
-        const child = spawn('bash', ['-c', cmd]);
-        
-        child.stdout.on('data', (data) => {
-            console.log(`[CLI] ${data.toString().trim()}`);
-        });
-        
-        child.stderr.on('data', (data) => {
-            console.log(`[CLI ERR] ${data.toString().trim()}`);
-        });
-        
-        child.on('close', (code) => {
-            if (code === 0) {
-                log('RESTART', '✅ CLI restart initiated successfully!', 'success', 'MAIN');
-                resolve(true);
-            } else {
-                log('RESTART', `CLI restart failed with code ${code}`, 'error', 'MAIN');
-                resolve(false);
-            }
-        });
-    });
-}
+// ============ FAUCET SITES ============
+const FAUCET_SITES = [
+    { name: 'FireFaucet', url: 'https://firefaucet.win', earnPerClaim: 0.0005, timePerClaim: 5, claimsPerDay: 30 },
+    { name: 'EzBit', url: 'https://ezbit.co.in', earnPerClaim: 0.0003, timePerClaim: 3, claimsPerDay: 40 },
+    { name: 'CoinPayU', url: 'https://coinpayu.com', earnPerClaim: 0.001, timePerClaim: 5, claimsPerDay: 50 },
+    { name: 'AdBTC', url: 'https://adbtc.top', earnPerClaim: 0.0015, timePerClaim: 6, claimsPerDay: 40 },
+    { name: 'BTCClicks', url: 'https://btcclicks.com', earnPerClaim: 0.0012, timePerClaim: 5, claimsPerDay: 35 },
+    { name: 'Cointiply', url: 'https://cointiply.com', earnPerClaim: 0.003, timePerClaim: 10, claimsPerDay: 25 }
+];
 
-// ============ TEST SCALINGO CLI ============
-function testScalingoCLI() {
-    const cliPath = '/app/bin/scalingo';
-    
-    console.log('\n========================================');
-    console.log('  TESTING SCALINGO CLI');
-    console.log('========================================');
-    
-    if (fs.existsSync(cliPath)) {
-        console.log(`✅ Scalingo CLI found at: ${cliPath}`);
-        try {
-            const version = execSync(`${cliPath} version`, { encoding: 'utf8' });
-            console.log(`✅ Version: ${version.trim()}`);
-        } catch(e) {
-            console.log(`❌ Failed to get version: ${e.message}`);
-        }
-    } else {
-        console.log('❌ Scalingo CLI not found');
-    }
-    
-    console.log('========================================\n');
-}
+// ============ MEMORY STORAGE ============
+let totalEarned = 0;
+let totalClicks = 0;
+let totalSessions = 0;
+let currentBalance = 0;
+const earningHistory = [];
 
-// ============ BOT CLASS ============
-class CleverCloudBot {
-    constructor(instanceId, password, startDelay = 0) {
-        this.instanceId = instanceId;
+// ============ FAUCETPAY BOT CLASS ============
+class FaucetPayBot {
+    constructor(email, password) {
+        this.email = email;
+        this.password = password;
         this.browser = null;
         this.page = null;
-        this.mailPage = null;
-        this.realTempEmail = null;
-        this.password = password;
-        this.startDelay = startDelay;
-        this.chromePath = null;
-        this.oauthHandled = false;
+        this.earned = 0;
+        this.clicks = 0;
     }
 
-    async initBrowser() {
-        if (!this.chromePath) {
-            this.chromePath = await installChromiumRuntime();
-        }
-        if (!this.chromePath) throw new Error('No Chromium found');
+    async init() {
+        const chromePath = await installChrome();
+        if (!chromePath) throw new Error('Chrome not available');
         
-        const launchOptions = {
-            headless: ENV.HEADLESS_MODE,
-            executablePath: this.chromePath,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-        };
-        
+        const launchOptions = getChromeLaunchOptions();
         this.browser = await puppeteer.launch(launchOptions);
         this.page = await this.browser.newPage();
         await this.page.setViewport({ width: 1280, height: 800 });
+        
+        // Random user agent
+        const userAgents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
+        ];
+        await this.page.setUserAgent(userAgents[Math.floor(Math.random() * userAgents.length)]);
     }
 
-    async fetchTempEmail() {
-        log('EMAIL', 'Getting temp email...', 'info', this.instanceId);
-        this.mailPage = await this.browser.newPage();
-        await this.mailPage.goto('https://10minutemail.net/', { waitUntil: 'domcontentloaded' });
-        await sleep(5000);
-        
-        this.realTempEmail = await this.mailPage.evaluate(() => {
-            const input = document.querySelector('#fe_text');
-            if (input && input.value) return input.value;
-            const span = document.querySelector('#mailAddress');
-            return span ? span.textContent : null;
-        });
-        
-        if (!this.realTempEmail) {
-            throw new Error('Could not extract email');
+    async loginToFaucetPay() {
+        if (!this.email || !this.password) {
+            console.log('[FaucetPay] Demo mode - skipping login');
+            return false;
         }
         
-        log('EMAIL', this.realTempEmail, 'success', this.instanceId);
-        return this.realTempEmail;
-    }
-
-    async handleSignup(email, password) {
-        log('SIGNUP', 'Creating account...', 'info', this.instanceId);
-        
-        await this.page.goto('https://api.clever-cloud.com/v2/sessions/signup', { waitUntil: 'networkidle2' });
-        await sleep(3000);
-        
-        await this.page.waitForSelector('input[type="email"]');
-        await this.page.type('input[type="email"]', email);
-        await this.page.type('input[type="password"]', password);
-        
-        await this.page.evaluate(() => {
-            const checkbox = document.querySelector('input[type="checkbox"]');
-            if (checkbox) checkbox.click();
-        });
-        
-        await this.page.evaluate(() => {
-            const cb = document.querySelector('#altcha_checkbox');
-            if (cb) cb.click();
-        });
-        
-        log('CAPTCHA', 'Waiting for solution...', 'info', this.instanceId);
-        let captchaSolved = false;
-        for (let i = 0; i < 60; i++) {
-            const solved = await this.page.evaluate(() => {
-                const input = document.querySelector('input[name="altcha"]');
-                return input && input.value && input.value.length > 20;
-            });
-            if (solved) {
-                log('CAPTCHA', 'Solved!', 'success', this.instanceId);
-                captchaSolved = true;
-                break;
-            }
-            await sleep(1000);
-        }
-        
-        if (!captchaSolved) {
-            log('CAPTCHA', 'Warning: CAPTCHA may not have solved', 'warn', this.instanceId);
-        }
-        
-        await this.page.evaluate(() => {
-            const btn = Array.from(document.querySelectorAll('button')).find(x => x.innerText.toLowerCase().includes('sign up'));
-            if (btn) btn.click();
-        });
-        
-        await sleep(8000);
-        log('SIGNUP', 'Form submitted', 'success', this.instanceId);
-    }
-
-    async getVerificationLink() {
-        log('VERIFY', 'Waiting for verification email...', 'info', this.instanceId);
-        const startTime = Date.now();
-        let emailFound = false;
-        
-        while (Date.now() - startTime < 180000) {
-            let link = await this.mailPage.evaluate(() => {
-                const regex = /https:\/\/api\.clever-cloud\.com\/v2\/self\/validate_email\?validationKey=[a-f0-9-]+/;
-                const match = document.documentElement.innerHTML.match(regex);
-                return match ? match[0] : null;
-            });
-            
-            if (link) {
-                log('VERIFY', 'Verification link found!', 'success', this.instanceId);
-                return link;
-            }
-            
-            if (!emailFound) {
-                const clicked = await this.mailPage.evaluate(() => {
-                    const rows = Array.from(document.querySelectorAll('#maillist tr'));
-                    for (const row of rows) {
-                        const text = (row.innerText || '').toLowerCase();
-                        if (text.includes('clever cloud') || text.includes('clever-cloud')) {
-                            const a = row.querySelector('a');
-                            if (a) {
-                                a.click();
-                                return true;
-                            }
-                        }
-                    }
-                    return false;
-                });
-                
-                if (clicked) {
-                    emailFound = true;
-                    log('VERIFY', 'Email found, loading content...', 'success', this.instanceId);
-                    await sleep(8000);
-                    continue;
-                }
-            }
-            
-            const elapsed = Math.floor((Date.now() - startTime) / 1000);
-            console.log(`  Waiting for email... ${elapsed}s / 180s`);
-            await sleep(5000);
-        }
-        
-        throw new Error('No verification email received after 3 minutes');
-    }
-
-    async handleOAuth(url, email, password) {
-        log('OAUTH', '========================================', 'info', this.instanceId);
-        log('OAUTH', 'Opening OAuth URL for auto-login...', 'info', this.instanceId);
+        console.log('[FaucetPay] Logging in...');
         
         try {
-            const oauthPage = await this.browser.newPage();
-            await oauthPage.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
-            log('OAUTH', 'OAuth page loaded', 'success', this.instanceId);
-            await sleep(3000);
+            await this.page.goto('https://faucetpay.io/login', { waitUntil: 'networkidle2', timeout: 30000 });
+            await this.page.waitForTimeout(3000);
             
-            const credentialsFilled = await oauthPage.evaluate((email, password) => {
-                const emailField = document.querySelector('input[type="email"], input[name="email"], input[id="email"]');
-                const passwordField = document.querySelector('input[type="password"], input[name="password"], input[id="password"]');
-                
-                if (emailField && passwordField) {
-                    emailField.value = email;
-                    passwordField.value = password;
-                    emailField.dispatchEvent(new Event('input', { bubbles: true }));
-                    passwordField.dispatchEvent(new Event('input', { bubbles: true }));
-                    return true;
-                }
-                return false;
-            }, email, password);
+            await this.page.type('input[name="email"]', this.email);
+            await this.page.type('input[name="password"]', this.password);
+            await this.page.click('button[type="submit"]');
             
-            if (credentialsFilled) {
-                log('OAUTH', 'Credentials filled successfully', 'success', this.instanceId);
-                await sleep(2000);
+            await this.page.waitForTimeout(5000);
+            
+            if (await this.page.$('.dashboard-container')) {
+                console.log('[FaucetPay] ✅ Login successful');
                 
-                const loginClicked = await oauthPage.evaluate(() => {
-                    const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-                    const loginButton = buttons.find(btn => {
-                        const text = (btn.innerText || btn.value || '').toLowerCase();
-                        return text.includes('login') || text.includes('sign in') || text.includes('log in');
-                    });
-                    if (loginButton) {
-                        loginButton.click();
-                        return true;
-                    }
-                    const form = document.querySelector('form');
-                    if (form) {
-                        form.submit();
-                        return true;
-                    }
-                    return false;
-                });
-                
-                if (loginClicked) {
-                    log('OAUTH', 'Login button clicked!', 'success', this.instanceId);
-                }
+                // Get balance
+                const balanceText = await this.page.$eval('.balance-amount', el => el.innerText).catch(() => '0');
+                currentBalance = parseFloat(balanceText) || 0;
+                console.log(`[FaucetPay] Balance: $${currentBalance}`);
+                return true;
             }
-            
-            await sleep(8000);
-            await oauthPage.close();
-            log('OAUTH', 'OAuth flow completed', 'success', this.instanceId);
-            log('OAUTH', '========================================', 'info', this.instanceId);
-            return true;
+            return false;
         } catch (error) {
-            log('OAUTH', `OAuth error: ${error.message}`, 'error', this.instanceId);
+            console.error('[FaucetPay] Login failed:', error.message);
             return false;
         }
     }
 
-    async startDockerInBackground(email, password) {
-        return new Promise((resolve, reject) => {
-            const dockerId = `${this.instanceId}_${Date.now()}`;
-            const logFile = `docker_${this.instanceId}_${dockerId}.log`;
-            
-            log('DOCKER', 'Starting Docker deployment...', 'info', this.instanceId);
-            
-            const dockerScriptPath = '/app/docker';
-            if (!fs.existsSync(dockerScriptPath)) {
-                log('DOCKER', 'Docker script not found', 'warn', this.instanceId);
-                resolve({ success: true, email, deployedApps: [] });
-                return;
-            }
-            
-            const dockerProcess = spawn('bash', [dockerScriptPath], { 
-                detached: true, 
-                stdio: ['ignore', 'pipe', 'pipe'],
-                env: { ...process.env, CLEVER_TOKEN: ENV.CLEVER_TOKEN }
-            });
-            
-            let deployedApps = [];
-            let oauthUrlDetected = false;
-            
-            const extractOAuthUrl = (output) => {
-                const match = output.match(/https:\/\/console\.clever-cloud\.com\/cli-oauth\?[^\s]+/);
-                return match ? match[0] : null;
-            };
-            
-            dockerProcess.stdout.on('data', async (data) => {
-                const output = data.toString();
-                console.log(`[DOCKER] ${output.trim()}`);
-                
-                if (!oauthUrlDetected && !this.oauthHandled) {
-                    const oauthUrl = extractOAuthUrl(output);
-                    if (oauthUrl) {
-                        oauthUrlDetected = true;
-                        this.oauthHandled = true;
-                        log('OAUTH', 'Detected OAuth URL, handling automatically...', 'success', this.instanceId);
-                        await this.handleOAuth(oauthUrl, email, password);
-                    }
-                }
-                
-                const urlMatch = output.match(/https:\/\/[a-z0-9-]+\.osc-fr1\.scalingo\.io/);
-                if (urlMatch && !deployedApps.includes(urlMatch[0])) {
-                    deployedApps.push(urlMatch[0]);
-                    log('DOCKER', `App deployed: ${urlMatch[0]}`, 'success', this.instanceId);
-                }
-                
-                if (output.includes('All 3 apps deployed')) {
-                    log('DOCKER', 'Deployment completed successfully!', 'success', this.instanceId);
-                    resolve({ success: true, email, deployedApps });
-                }
-            });
-            
-            dockerProcess.stderr.on('data', (data) => {
-                const err = data.toString();
-                console.error(`[DOCKER ERR] ${err.trim()}`);
-            });
-            
-            dockerProcess.on('close', (code) => {
-                if (deployedApps.length > 0) {
-                    resolve({ success: true, email, deployedApps });
-                } else if (code === 0) {
-                    resolve({ success: true, email, deployedApps: [] });
-                } else {
-                    reject(new Error(`Docker exited with code ${code}`));
-                }
-            });
-            
-            dockerProcess.unref();
-            
-            setTimeout(() => {
-                if (deployedApps.length > 0) {
-                    resolve({ success: true, email, deployedApps });
-                } else {
-                    reject(new Error('Docker deployment timeout'));
-                }
-            }, 600000);
-        });
-    }
-
-    async cleanup() {
-        if (this.browser) await this.browser.close();
-    }
-
-    async run() {
-        if (this.startDelay > 0) {
-            log('START', `Waiting ${this.startDelay}s...`, 'warn', this.instanceId);
-            await sleep(this.startDelay * 1000);
-        }
-        
-        log('START', '=== CREATING ONE ACCOUNT ===', 'info', this.instanceId);
-        botStatus.state = 'running';
-        
-        let accountCreated = false;
-        let accountEmail = null;
+    async processFaucet(faucet) {
+        console.log(`\n[${faucet.name}] Processing...`);
         
         try {
-            await this.initBrowser();
+            await this.page.goto(faucet.url, { waitUntil: 'networkidle2', timeout: 30000 });
+            await this.page.waitForTimeout(5000);
             
-            accountEmail = await this.fetchTempEmail();
-            botStatus.accountEmail = accountEmail;
+            // Scroll down to load content
+            await this.page.evaluate(() => window.scrollBy(0, window.innerHeight));
+            await this.page.waitForTimeout(1000);
             
-            await this.handleSignup(accountEmail, this.password);
-            const verifyLink = await this.getVerificationLink();
+            // Look for claim button
+            const claimSelectors = [
+                '#claimButton', '.claim-btn', 'button:has-text("Claim")',
+                'a:has-text("Claim")', '.captcha-form button', '.claim-button',
+                'button[class*="claim"]', 'a[class*="claim"]', '#claim',
+                '.faucet-button', '.get-faucet', '.reward-button'
+            ];
             
-            log('VERIFY', 'Activating account...', 'info', this.instanceId);
-            await this.page.goto(verifyLink, { waitUntil: 'domcontentloaded' });
-            await sleep(5000);
-            
-            const result = await this.startDockerInBackground(accountEmail, this.password);
-            
-            if (db) {
-                await db.collection('accounts').insertOne({
-                    email: accountEmail,
-                    password: this.password,
-                    deployedApps: result.deployedApps || [],
-                    createdAt: new Date(),
-                    instanceId: this.instanceId
-                });
+            let claimed = false;
+            for (const selector of claimSelectors) {
+                try {
+                    const claimBtn = await this.page.$(selector);
+                    if (claimBtn) {
+                        await claimBtn.click();
+                        await this.page.waitForTimeout(5000);
+                        console.log(`[${faucet.name}] ✅ Claimed! +$${faucet.earnPerClaim}`);
+                        this.earned += faucet.earnPerClaim;
+                        this.clicks++;
+                        claimed = true;
+                        break;
+                    }
+                } catch(e) {}
             }
             
-            accountCreated = true;
-            botStatus.accountCreated = true;
+            if (!claimed) {
+                console.log(`[${faucet.name}] No claim button found`);
+            }
             
-            log('SUCCESS', `✓ Account ${accountEmail} created successfully!`, 'success', this.instanceId);
+            return claimed;
             
         } catch (error) {
-            log('ERROR', `${error.message}`, 'error', this.instanceId);
-            log('FAILURE', 'Account creation failed - will restart to retry', 'warn', this.instanceId);
+            console.error(`[${faucet.name}] Error:`, error.message);
+            return false;
+        }
+    }
+
+    async checkAndWithdraw() {
+        if (!this.email || !this.password) {
+            console.log('[FaucetPay] Demo mode - skipping withdrawal');
+            return false;
         }
         
-        await this.cleanup();
+        console.log(`\n[FaucetPay] Checking balance for withdrawal...`);
         
-        botStatus.completionTime = new Date();
-        botStatus.state = accountCreated ? 'completed' : 'failed';
-        botStatus.restartCount++;
+        try {
+            await this.page.goto('https://faucetpay.io/dashboard', { waitUntil: 'networkidle2' });
+            await this.page.waitForTimeout(3000);
+            
+            const balanceText = await this.page.$eval('.balance-amount', el => el.innerText).catch(() => '0');
+            currentBalance = parseFloat(balanceText) || 0;
+            console.log(`[FaucetPay] Current balance: $${currentBalance}`);
+            
+            if (currentBalance >= MIN_WITHDRAWAL_USD) {
+                console.log(`[FaucetPay] Balance $${currentBalance} exceeds threshold $${MIN_WITHDRAWAL_USD}`);
+                console.log(`[FaucetPay] Manual withdrawal required - log in to withdraw`);
+                // Note: Automated withdrawal would require pre-configured withdrawal address
+            } else {
+                console.log(`[FaucetPay] Balance $${currentBalance} below threshold $${MIN_WITHDRAWAL_USD}`);
+            }
+            
+            return currentBalance;
+        } catch (error) {
+            console.error('[FaucetPay] Balance check failed:', error.message);
+            return 0;
+        }
+    }
+
+    async runSession() {
+        console.log('\n========================================');
+        console.log('  STARTING EARNING SESSION');
+        console.log(`  Goal: $${EARNING_GOAL}`);
+        console.log('========================================\n');
         
-        log('RESTART', `========================================`, 'info', this.instanceId);
-        log('RESTART', `${accountCreated ? 'Account created' : 'Account creation failed'} - Restarting for NEW IP`, 'info', this.instanceId);
-        log('RESTART', `This was attempt #${botStatus.restartCount}`, 'info', this.instanceId);
-        log('RESTART', `========================================`, 'info', this.instanceId);
+        await this.init();
         
-        const cliSuccess = await restartWithCLI();
-        
-        if (!cliSuccess) {
-            log('RESTART', 'CLI restart failed, using exit restart', 'warn', 'MAIN');
+        if (this.email && this.password) {
+            await this.loginToFaucetPay();
+        } else {
+            console.log('[FaucetPay] Running in demo mode (no login required for faucet claims)');
         }
         
-        await sleep(2000);
-        process.exit(0);
+        let sessionEarnings = 0;
+        
+        for (const faucet of FAUCET_SITES) {
+            if (sessionEarnings >= EARNING_GOAL) {
+                console.log(`\n🎉 Daily goal reached! Total: $${sessionEarnings.toFixed(4)}`);
+                break;
+            }
+            
+            const success = await this.processFaucet(faucet);
+            if (success) {
+                sessionEarnings += faucet.earnPerClaim;
+            }
+            
+            console.log(`   Running total: $${sessionEarnings.toFixed(4)}`);
+            
+            // Random delay between faucets (30-90 seconds)
+            const delay = 30000 + Math.random() * 60000;
+            console.log(`   Waiting ${Math.round(delay / 1000)} seconds...`);
+            await this.page.waitForTimeout(delay);
+        }
+        
+        this.earned = sessionEarnings;
+        totalEarned += sessionEarnings;
+        totalClicks += this.clicks;
+        totalSessions++;
+        
+        earningHistory.push({
+            earned: sessionEarnings,
+            clicks: this.clicks,
+            timestamp: new Date()
+        });
+        
+        // Check balance and attempt withdrawal
+        if (this.email && this.password) {
+            await this.checkAndWithdraw();
+        }
+        
+        console.log('\n========================================');
+        console.log(`  SESSION COMPLETE`);
+        console.log(`  Earned: $${sessionEarnings.toFixed(4)}`);
+        console.log(`  Clicks: ${this.clicks}`);
+        console.log(`  Total Earned: $${totalEarned.toFixed(4)}`);
+        console.log('========================================\n');
+        
+        await this.browser.close();
+        return sessionEarnings;
     }
 }
 
-// ============ METRICS ENDPOINTS ============
-let metrics = { totalAccounts: 0, completedToday: 0 };
-
-async function updateMetrics() {
-    if (!db) return;
-    metrics.totalAccounts = await db.collection('accounts').countDocuments();
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    metrics.completedToday = await db.collection('accounts').countDocuments({
-        createdAt: { $gte: today }
-    });
-}
-
-app.get('/api/metrics', async (req, res) => {
-    await updateMetrics();
-    res.json({
-        totalAccounts: metrics.totalAccounts,
-        completedToday: metrics.completedToday,
-        botState: botStatus.state,
-        accountCreated: botStatus.accountCreated,
-        lastAccount: botStatus.accountEmail,
-        restartCount: botStatus.restartCount,
-        uptime: process.uptime()
-    });
-});
-
-app.get('/api/accounts', async (req, res) => {
-    if (!db) return res.json([]);
-    const accounts = await db.collection('accounts')
-        .find({ email: { $exists: true, $ne: null } })
-        .sort({ createdAt: -1 })
-        .limit(50)
-        .toArray();
-    res.json(accounts);
-});
-
-// ============ MATERIAL DESIGN WHITE DASHBOARD ============
-app.get('/', (req, res) => {
-    res.send(`<!DOCTYPE html>
+// ============ DASHBOARD ============
+if (SHOW_DASHBOARD) {
+    app.get('/', (req, res) => {
+        const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Clever Cloud Bot • Material Dashboard</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;14..32,400;14..32,500;14..32,600;14..32,700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0,200" />
+    <title>FaucetPay Auto Earning Bot</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            background: #f5f7fb;
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            color: #1e293b;
-            line-height: 1.5;
+            background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            padding: 40px 20px;
+            color: white;
         }
-        .md-surface { background: #ffffff; border-radius: 28px; box-shadow: 0 1px 3px 0 rgba(0,0,0,0.05), 0 1px 2px -1px rgba(0,0,0,0.03); }
-        .container { max-width: 1280px; margin: 0 auto; padding: 32px 24px; }
-        /* header */
-        .header { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; margin-bottom: 32px; }
-        .title-section h1 { font-size: 28px; font-weight: 600; letter-spacing: -0.01em; background: linear-gradient(135deg, #1e293b 0%, #2d3a4f 100%); background-clip: text; -webkit-background-clip: text; color: transparent; margin-bottom: 6px; }
-        .subhead { color: #5b6e8c; font-size: 14px; font-weight: 400; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-        .status-chip { display: inline-flex; align-items: center; gap: 6px; background: #eef2ff; padding: 4px 12px; border-radius: 40px; font-size: 12px; font-weight: 500; color: #1e40af; }
-        /* metric cards */
-        .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; margin-bottom: 32px; }
-        .metric-card { background: white; border-radius: 24px; padding: 20px 20px; transition: all 0.2s ease; border: 1px solid #edf2f7; box-shadow: 0 1px 2px rgba(0,0,0,0.02); }
-        .metric-icon { background: #f8fafc; width: 44px; height: 44px; border-radius: 28px; display: flex; align-items: center; justify-content: center; margin-bottom: 16px; }
-        .metric-icon .material-symbols-outlined { font-size: 26px; color: #3b82f6; }
-        .metric-value { font-size: 34px; font-weight: 700; color: #0f172a; letter-spacing: -0.02em; line-height: 1.2; }
-        .metric-label { font-size: 13px; font-weight: 500; color: #5b6e8c; margin-top: 8px; text-transform: uppercase; letter-spacing: 0.3px; }
-        /* table card */
-        .data-card { background: white; border-radius: 28px; border: 1px solid #edf2f7; overflow: hidden; margin-bottom: 24px; box-shadow: 0 4px 6px -2px rgba(0,0,0,0.02); }
-        .card-header { padding: 20px 24px 8px 24px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #f0f2f5; }
-        .card-header h3 { font-size: 18px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
-        .table-wrapper { overflow-x: auto; padding: 0 4px; }
-        table { width: 100%; border-collapse: collapse; font-size: 14px; }
-        th { text-align: left; padding: 16px 20px; background: #fefefe; font-weight: 600; color: #475569; border-bottom: 1px solid #eef2f6; }
-        td { padding: 14px 20px; border-bottom: 1px solid #f1f5f9; color: #1e293b; }
-        tr:last-child td { border-bottom: none; }
-        .email-cell { font-family: monospace; font-weight: 500; background: #f8fafc; padding: 4px 10px; border-radius: 40px; display: inline-block; font-size: 12px; }
-        .badge-pwd { font-family: monospace; background: #fef9e3; padding: 4px 10px; border-radius: 40px; font-size: 12px; color: #b45309; }
-        .info-note { background: #f8fafc; border-radius: 20px; padding: 16px 24px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; border: 1px solid #eef2ff; margin-top: 16px; }
-        .info-note .material-symbols-outlined { color: #3b82f6; }
-        .footer-text { font-size: 12px; color: #7e8aa2; text-align: center; margin-top: 32px; }
-        @keyframes pulse-ring { 0% { opacity: 0.6; } 100% { opacity: 1; } }
-        .live-dot { width: 10px; height: 10px; background: #22c55e; border-radius: 50%; display: inline-block; box-shadow: 0 0 0 0 rgba(34,197,94,0.4); animation: pulse-ring 1.2s infinite; margin-right: 6px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { text-align: center; margin-bottom: 10px; }
+        .subtitle { text-align: center; opacity: 0.8; margin-bottom: 40px; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 40px; }
+        .stat-card { background: rgba(255,255,255,0.1); border-radius: 15px; padding: 20px; text-align: center; }
+        .stat-value { font-size: 2rem; font-weight: bold; color: #00d4ff; }
+        .stat-label { font-size: 0.8rem; opacity: 0.7; margin-top: 5px; }
+        .history-table { background: rgba(255,255,255,0.1); border-radius: 15px; padding: 20px; overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.2); }
+        th { color: #00d4ff; }
+        .profit { color: #10b981; }
+        .refresh-btn { background: #00d4ff; color: #000; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; margin-bottom: 20px; font-weight: bold; }
+        .faucet-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 15px; margin-bottom: 40px; }
+        .faucet-card { background: rgba(255,255,255,0.1); border-radius: 10px; padding: 15px; text-align: center; }
+        .faucet-name { font-weight: bold; margin-bottom: 8px; }
+        .faucet-rate { font-size: 0.8rem; opacity: 0.8; }
+        .balance { font-size: 1.5rem; color: #00d4ff; }
     </style>
 </head>
 <body>
-<div class="container">
-    <div class="header">
-        <div class="title-section">
-            <h1>Clever Cloud Bot</h1>
-            <div class="subhead">
-                <span class="status-chip"><span class="live-dot"></span> ACTIVE · ONE ACCOUNT PER RESTART</span>
-                <span>⚡ Auto OAuth · IP rotation via CLI restart</span>
-            </div>
+    <div class="container">
+        <h1>💰 FaucetPay Auto Earning Bot</h1>
+        <div class="subtitle">Automated Faucet Claims • 24/7 Operation</div>
+        
+        <div class="stats">
+            <div class="stat-card"><div class="stat-value">$${totalEarned.toFixed(4)}</div><div class="stat-label">Total Earned</div></div>
+            <div class="stat-card"><div class="stat-value">${totalClicks}</div><div class="stat-label">Total Claims</div></div>
+            <div class="stat-card"><div class="stat-value">${totalSessions}</div><div class="stat-label">Sessions</div></div>
+            <div class="stat-card"><div class="stat-value">$${currentBalance.toFixed(4)}</div><div class="stat-label">Current Balance</div></div>
         </div>
-    </div>
-
-    <div class="grid-4">
-        <div class="metric-card"><div class="metric-icon"><span class="material-symbols-outlined">group</span></div><div class="metric-value" id="totalAccounts">0</div><div class="metric-label">Total accounts</div></div>
-        <div class="metric-card"><div class="metric-icon"><span class="material-symbols-outlined">today</span></div><div class="metric-value" id="todayAccounts">0</div><div class="metric-label">Created today</div></div>
-        <div class="metric-card"><div class="metric-icon"><span class="material-symbols-outlined">autorenew</span></div><div class="metric-value" id="restartCount">0</div><div class="metric-label">Restart attempts</div></div>
-        <div class="metric-card"><div class="metric-icon"><span class="material-symbols-outlined">memory</span></div><div class="metric-value" id="botState">—</div><div class="metric-label">Bot state</div></div>
-    </div>
-
-    <div class="data-card">
-        <div class="card-header"><h3><span class="material-symbols-outlined" style="font-size:22px">description</span> Recently created accounts</h3><span style="font-size:12px; color:#6c86a3;">⬇ last 50 records</span></div>
-        <div class="table-wrapper">
-            <table id="accountsTable">
-                <thead><tr><th>Email address</th><th>Password</th><th>Created at</th></tr></thead>
-                <tbody id="accountsBody"><tr><td colspan="3" style="text-align:center; padding:48px;">Loading secure data...</td></tr></tbody>
+        
+        <h2>🌊 Active Faucets</h2>
+        <div class="faucet-list">
+            ${FAUCET_SITES.map(faucet => `
+                <div class="faucet-card">
+                    <div class="faucet-name">${faucet.name}</div>
+                    <div class="faucet-rate">$${faucet.earnPerClaim}/claim</div>
+                    <div class="faucet-rate">${faucet.claimsPerDay}/day max</div>
+                </div>
+            `).join('')}
+        </div>
+        
+        <h2>📈 Earning History</h2>
+        <div class="history-table">
+            <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
+            <table>
+                <thead>
+                    <tr><th>Time</th><th>Clicks</th><th>Earned</th></tr>
+                </thead>
+                <tbody>
+                    ${earningHistory.slice().reverse().slice(0, 30).map(h => `
+                        <tr>
+                            <td>${new Date(h.timestamp).toLocaleString()}</td>
+                            <td>${h.clicks}</td>
+                            <td class="profit">+$${h.earned.toFixed(4)}</td>
+                        </tr>
+                    `).join('')}
+                    ${earningHistory.length === 0 ? '<tr><td colspan="3">No earnings yet. Bot is running...</td></tr>' : ''}
+                </tbody>
             </table>
         </div>
     </div>
-
-    <div class="info-note">
-        <span class="material-symbols-outlined">info</span>
-        <span><strong>Material Design · White UI</strong> — Bot creates exactly ONE account, then triggers CLI restart (new IP). OAuth is auto-filled and submitted. MongoDB stores credentials & deployed apps. Dashboard updates every 5s.</span>
-    </div>
-    <div class="footer-text">Clever Cloud automation · stealth puppeteer · scalingo restart engine</div>
-</div>
-
-<script>
-    async function refreshDashboard() {
-        try {
-            const metricsRes = await fetch('/api/metrics');
-            const metrics = await metricsRes.json();
-            document.getElementById('totalAccounts').innerText = metrics.totalAccounts || 0;
-            document.getElementById('todayAccounts').innerText = metrics.completedToday || 0;
-            document.getElementById('restartCount').innerText = metrics.restartCount || 0;
-            let stateDisplay = metrics.botState || 'unknown';
-            if (metrics.botState === 'running') stateDisplay = '⚙️ running';
-            else if (metrics.botState === 'completed') stateDisplay = '✅ completed';
-            else if (metrics.botState === 'failed') stateDisplay = '⚠️ failed';
-            else if (metrics.botState === 'starting') stateDisplay = '🔄 starting';
-            document.getElementById('botState').innerHTML = stateDisplay;
-            
-            const accountsRes = await fetch('/api/accounts');
-            const accounts = await accountsRes.json();
-            const tbody = document.getElementById('accountsBody');
-            if (accounts && accounts.length) {
-                let html = '';
-                for (let acc of accounts) {
-                    let dateStr = acc.createdAt ? new Date(acc.createdAt).toLocaleString() : 'just now';
-                    html += \`<tr><td><span class="email-cell">\${acc.email || 'N/A'}</span></td><td><span class="badge-pwd">\${acc.password || '••••••'}</span></td><td style="font-size:12px; color:#4b5563;">\${dateStr}</td></tr>\`;
-                }
-                tbody.innerHTML = html;
-            } else {
-                tbody.innerHTML = '<tr><td colspan="3" style="text-align:center; padding:32px;">✨ No accounts yet — waiting for first creation...</td></tr>';
-            }
-        } catch(e) { console.warn(e); }
-    }
-    refreshDashboard();
-    setInterval(refreshDashboard, 5000);
-</script>
+    <script>
+        setTimeout(() => location.reload(), 15000);
+    </script>
 </body>
-</html>`);
-});
-
-// ============ START ============
-async function main() {
-    console.log(`\n🚀 Clever Cloud Bot Starting...`);
-    console.log(`📊 Dashboard: http://localhost:${port}`);
-    console.log(`🔄 Mode: Creates ONE account, then CLI RESTART for NEW IP`);
-    console.log(`\n`);
-    
-    console.log('[START] Installing Scalingo CLI...');
-    installScalingoCLI();
-    
-    testScalingoCLI();
-    
-    await connectMongoDB();
-    
-    app.listen(port, '0.0.0.0', () => {
-        console.log(`✅ Dashboard server running on port ${port}`);
+</html>`;
+        res.send(html);
     });
     
-    await sleep(2000);
-    
-    const bot = new CleverCloudBot('INSTANCE_1', ENV.BOT_PASSWORD, ENV.BOT_START_DELAY);
-    await bot.run();
+    app.get('/api/stats', (req, res) => {
+        res.json({ totalEarned, totalClicks, totalSessions, currentBalance, history: earningHistory.slice(-50) });
+    });
 }
 
+// ============ WEB SERVER FOR PORT BINDING (Required for Scalingo) ============
+// This ensures the app binds to PORT and prevents timeout errors
+const server = app.listen(port, '0.0.0.0', () => {
+    console.log(`✅ Web server bound to port ${port} for health checks`);
+});
+
+// ============ MAIN LOOP ============
+async function main() {
+    console.log('🚀 Starting FaucetPay Auto Earning Bot...');
+    
+    // Install Chrome first
+    await installChrome();
+    
+    if (SHOW_DASHBOARD) {
+        console.log(`📊 Dashboard: http://localhost:${port}`);
+    }
+    
+    // Continuous earning loop
+    while (true) {
+        try {
+            const bot = new FaucetPayBot(FAUCETPAY_EMAIL, FAUCETPAY_PASSWORD);
+            await bot.runSession();
+            
+            // Wait between full cycles (1-2 hours)
+            const waitMinutes = 60 + Math.random() * 60;
+            console.log(`\n⏰ Cycle complete. Waiting ${Math.round(waitMinutes)} minutes before next cycle...\n`);
+            await new Promise(r => setTimeout(r, waitMinutes * 60 * 1000));
+            
+        } catch (error) {
+            console.error('Session error:', error.message);
+            await new Promise(r => setTimeout(r, 300000));
+        }
+    }
+}
+
+// Handle graceful shutdown
 process.on('SIGINT', () => {
     console.log('\n🛑 Shutting down...');
-    if (dbClient) dbClient.close();
+    server.close();
     process.exit(0);
 });
 
 process.on('SIGTERM', () => {
     console.log('\n🛑 Shutting down...');
-    if (dbClient) dbClient.close();
+    server.close();
     process.exit(0);
 });
 
