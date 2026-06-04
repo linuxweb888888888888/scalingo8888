@@ -6,8 +6,8 @@ const fs = require('fs');
 puppeteer.use(StealthPlugin());
 
 // ============ CONFIGURATION ============
-const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || 'your_email@example.com';
-const FAUCETPAY_PASSWORD = process.env.FAUCETPAY_PASSWORD || 'your_password';
+const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || 'web88888888888888@gmail.com';
+const FAUCETPAY_PASSWORD = process.env.FAUCETPAY_PASSWORD || 'Linuxdistro&84';
 const MIN_WITHDRAWAL_USD = parseFloat(process.env.MIN_WITHDRAWAL_USD) || 0.10;
 
 // Supported faucet URLs (add more)
