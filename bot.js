@@ -1,4 +1,4 @@
-// faucetpay-mega-bot.js - 50+ Faucets Auto Account Creator & Claimer
+// faucetpay-advanced-bot.js - With withdrawal confirmation and status tracking
 const express = require('express');
 const fs = require('fs');
 const { execSync } = require('child_process');
@@ -17,15 +17,18 @@ const FAUCETPAY_WALLET_ADDRESS = process.env.FAUCETPAY_WALLET_ADDRESS || 'ltc1q0
 const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || 'web88888888888888@gmail.com';
 const FAUCETPAY_PASSWORD = process.env.FAUCETPAY_PASSWORD || 'Linuxdistro&84';
 const HEADLESS_MODE = process.env.HEADLESS_MODE !== 'false';
-const SCAN_INTERVAL_SECONDS = parseInt(process.env.SCAN_INTERVAL_SECONDS) || 45;
+const SCAN_INTERVAL_SECONDS = parseInt(process.env.SCAN_INTERVAL_SECONDS) || 60;
+const AUTO_WITHDRAW_THRESHOLD = parseFloat(process.env.AUTO_WITHDRAW_THRESHOLD) || 5.00;
+const WITHDRAWAL_ADDRESS = process.env.WITHDRAWAL_ADDRESS || '';
 
 const CHROME_PATH = '/app/chrome-linux64/chrome';
 const CHROME_URL = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
 
 console.log('\n========================================');
-console.log('  FaucetPay Mega Bot - 50+ Faucets');
+console.log('  FaucetPay Advanced Bot');
 console.log('========================================');
 console.log(`Wallet: ${FAUCETPAY_WALLET_ADDRESS || 'Not set'}`);
+console.log(`Auto Withdraw Threshold: $${AUTO_WITHDRAW_THRESHOLD}`);
 console.log(`Scan: Every ${SCAN_INTERVAL_SECONDS}s`);
 console.log('========================================\n');
 
@@ -71,192 +74,46 @@ async function installChrome() {
     }
 }
 
-// ============ 50+ FAUCET LIST ============
+// ============ FAUCETS LIST ============
 const FAUCETS = [
-    // Tier 1 - Highest paying / most reliable
-    { name: 'FreeBitcoin', url: 'https://freebitco.in', earnPerClaim: 0.0005, needsAccount: true, needsCaptcha: false },
-    { name: 'FireFaucet', url: 'https://firefaucet.win', earnPerClaim: 0.0003, needsAccount: true, needsCaptcha: false },
-    { name: 'Cointiply', url: 'https://cointiply.com', earnPerClaim: 0.0003, needsAccount: true, needsCaptcha: false },
-    { name: 'ADBTC', url: 'https://adbtc.top', earnPerClaim: 0.0002, needsAccount: true, needsCaptcha: false },
-    { name: 'BTCClicks', url: 'https://btcclicks.com', earnPerClaim: 0.0002, needsAccount: true, needsCaptcha: false },
-    { name: 'CoinPayU', url: 'https://coinpayu.com', earnPerClaim: 0.00015, needsAccount: true, needsCaptcha: false },
-    { name: 'FaucetCrypto', url: 'https://faucetcrypto.com', earnPerClaim: 0.0002, needsAccount: true, needsCaptcha: false },
-    { name: 'FaucetPay', url: 'https://faucetpay.io/faucets', earnPerClaim: 0.0005, needsAccount: true, needsCaptcha: false },
-    { name: 'EZBit', url: 'https://ezbit.co.in', earnPerClaim: 0.00015, needsAccount: true, needsCaptcha: false },
-    { name: 'BonusBitcoin', url: 'https://bonusbitcoin.co', earnPerClaim: 0.00012, needsAccount: true, needsCaptcha: false },
-    
-    // Tier 2 - Good paying
-    { name: 'BitFun', url: 'https://bitfun.co', earnPerClaim: 0.00012, needsAccount: true, needsCaptcha: false },
-    { name: 'FaucetHouse', url: 'https://faucethouse.com', earnPerClaim: 0.0001, needsAccount: true, needsCaptcha: false },
-    { name: 'FaucetKing', url: 'https://faucetking.io', earnPerClaim: 0.0001, needsAccount: true, needsCaptcha: false },
-    { name: 'CryptoFaucet', url: 'https://cryptofaucet.net', earnPerClaim: 0.0001, needsAccount: true, needsCaptcha: false },
-    { name: 'FaucetNice', url: 'https://faucetnice.com', earnPerClaim: 0.0001, needsAccount: true, needsCaptcha: false },
-    { name: 'CoinFaucet', url: 'https://coinfaucet.io', earnPerClaim: 0.0001, needsAccount: true, needsCaptcha: false },
-    { name: 'FaucetList', url: 'https://faucetlist.com', earnPerClaim: 0.00008, needsAccount: true, needsCaptcha: false },
-    { name: 'FaucetBank', url: 'https://faucetbank.io', earnPerClaim: 0.00008, needsAccount: true, needsCaptcha: false },
-    { name: 'FaucetTime', url: 'https://faucettime.com', earnPerClaim: 0.00008, needsAccount: true, needsCaptcha: false },
-    { name: 'CryptoKing', url: 'https://cryptoking.io', earnPerClaim: 0.00008, needsAccount: true, needsCaptcha: false },
-    
-    // Tier 3 - Lower but consistent
-    { name: 'BTCFaucet', url: 'https://btcfaucet.io', earnPerClaim: 0.00007, needsAccount: true, needsCaptcha: false },
-    { name: 'LTCFaucet', url: 'https://ltcfaucet.io', earnPerClaim: 0.00007, needsAccount: true, needsCaptcha: false },
-    { name: 'DOGEFaucet', url: 'https://dogefaucet.io', earnPerClaim: 0.00007, needsAccount: true, needsCaptcha: false },
-    { name: 'ETHFaucet', url: 'https://ethfaucet.io', earnPerClaim: 0.00007, needsAccount: true, needsCaptcha: false },
-    { name: 'SOLFaucet', url: 'https://solanafaucet.io', earnPerClaim: 0.00007, needsAccount: true, needsCaptcha: false },
-    { name: 'XRPFaucet', url: 'https://xrpfaucet.io', earnPerClaim: 0.00007, needsAccount: true, needsCaptcha: false },
-    { name: 'TRXFaucet', url: 'https://trxfaucet.io', earnPerClaim: 0.00007, needsAccount: true, needsCaptcha: false },
-    { name: 'ADAFaucet', url: 'https://adafaucet.io', earnPerClaim: 0.00007, needsAccount: true, needsCaptcha: false },
-    { name: 'MATICFaucet', url: 'https://maticfaucet.io', earnPerClaim: 0.00007, needsAccount: true, needsCaptcha: false },
-    { name: 'BNBFaucet', url: 'https://bnb-faucet.io', earnPerClaim: 0.00007, needsAccount: true, needsCaptcha: false },
-    
-    // Tier 4 - Additional sources
-    { name: 'Airdrops', url: 'https://airdrops.io', earnPerClaim: 0.00005, needsAccount: true, needsCaptcha: false },
-    { name: 'FaucetRotator', url: 'https://faucetrotator.com', earnPerClaim: 0.00005, needsAccount: true, needsCaptcha: false },
-    { name: 'FaucetCollector', url: 'https://faucetcollector.com', earnPerClaim: 0.00005, needsAccount: true, needsCaptcha: false },
-    { name: 'FaucetMining', url: 'https://faucetmining.com', earnPerClaim: 0.00005, needsAccount: true, needsCaptcha: false },
-    { name: 'CryptoRewards', url: 'https://cryptorewards.com', earnPerClaim: 0.00005, needsAccount: true, needsCaptcha: false },
-    { name: 'FaucetExchange', url: 'https://faucetexchange.com', earnPerClaim: 0.00005, needsAccount: true, needsCaptcha: false },
-    { name: 'CoinPot', url: 'https://coinpot.co', earnPerClaim: 0.00004, needsAccount: true, needsCaptcha: false },
-    { name: 'FaucetBox', url: 'https://faucetbox.com', earnPerClaim: 0.00004, needsAccount: true, needsCaptcha: false },
-    { name: 'FaucetHub', url: 'https://faucethub.io', earnPerClaim: 0.00004, needsAccount: true, needsCaptcha: false },
-    { name: 'CryptoFaucets', url: 'https://cryptofaucets.com', earnPerClaim: 0.00004, needsAccount: true, needsCaptcha: false },
-    
-    // Internal FaucetPay earning methods
-    { name: 'Daily Bonus', url: 'https://faucetpay.io/dashboard', earnPerClaim: 0.001, needsAccount: true, isInternal: true },
-    { name: 'Offerwalls', url: 'https://faucetpay.io/offerwalls', earnPerClaim: 0.002, needsAccount: true, isInternal: true },
-    { name: 'PTC Ads', url: 'https://faucetpay.io/ptc', earnPerClaim: 0.0008, needsAccount: true, isInternal: true },
-    { name: 'Staking', url: 'https://faucetpay.io/staking', earnPerClaim: 0.001, needsAccount: true, isInternal: true },
-    { name: 'Tasks', url: 'https://faucetpay.io/tasks', earnPerClaim: 0.0015, needsAccount: true, isInternal: true }
+    { name: 'FreeBitcoin', url: 'https://freebitco.in', earnPerClaim: 0.0005, registered: false, walletSet: false, lastClaim: null, status: 'pending' },
+    { name: 'FireFaucet', url: 'https://firefaucet.win', earnPerClaim: 0.0003, registered: false, walletSet: false, lastClaim: null, status: 'pending' },
+    { name: 'Cointiply', url: 'https://cointiply.com', earnPerClaim: 0.0003, registered: false, walletSet: false, lastClaim: null, status: 'pending' },
+    { name: 'ADBTC', url: 'https://adbtc.top', earnPerClaim: 0.0002, registered: false, walletSet: false, lastClaim: null, status: 'pending' },
+    { name: 'BTCClicks', url: 'https://btcclicks.com', earnPerClaim: 0.0002, registered: false, walletSet: false, lastClaim: null, status: 'pending' },
+    { name: 'CoinPayU', url: 'https://coinpayu.com', earnPerClaim: 0.00015, registered: false, walletSet: false, lastClaim: null, status: 'pending' },
+    { name: 'FaucetCrypto', url: 'https://faucetcrypto.com', earnPerClaim: 0.0002, registered: false, walletSet: false, lastClaim: null, status: 'pending' }
 ];
 
-// ============ ACCOUNT MANAGER ============
-class AccountManager {
-    constructor(walletAddress, faucetpayEmail, faucetpayPassword) {
-        this.walletAddress = walletAddress;
-        this.faucetpayEmail = faucetpayEmail;
-        this.faucetpayPassword = faucetpayPassword;
-        this.accounts = {};
-        this.loginCookies = {};
-    }
-
-    generateCredentials() {
-        const timestamp = Date.now();
-        const random = Math.random().toString(36).substring(2, 8);
-        return {
-            email: `user_${timestamp}_${random}@10minutemail.net`,
-            password: Math.random().toString(36).substring(2, 15),
-            username: `faucet_${random}`
-        };
-    }
-
-    async registerFaucet(page, faucet, credentials) {
-        try {
-            await page.goto(`${faucet.url}/register`, { waitUntil: 'networkidle2', timeout: 20000 });
-            await page.waitForTimeout(2000);
-            
-            // Fill registration form with common field names
-            const fields = [
-                { selector: 'input[name="email"]', value: credentials.email },
-                { selector: 'input[type="email"]', value: credentials.email },
-                { selector: 'input[name="username"]', value: credentials.username },
-                { selector: 'input[name="user"]', value: credentials.username },
-                { selector: 'input[name="password"]', value: credentials.password },
-                { selector: 'input[type="password"]', value: credentials.password },
-                { selector: 'input[name="confirm_password"]', value: credentials.password },
-                { selector: 'input[name="btc_address"]', value: this.walletAddress },
-                { selector: 'input[name="faucetpay"]', value: this.walletAddress }
-            ];
-            
-            for (const field of fields) {
-                const element = await page.$(field.selector);
-                if (element) {
-                    await element.type(field.value);
-                }
-            }
-            
-            // Click submit button
-            const submitBtn = await page.$('button[type="submit"], input[type="submit"]');
-            if (submitBtn) {
-                await submitBtn.click();
-                await page.waitForTimeout(3000);
-                console.log(`    ✅ Registered: ${credentials.email}`);
-                return true;
-            }
-            return false;
-        } catch (error) {
-            return false;
-        }
-    }
-
-    async claimFaucet(page, faucet) {
-        try {
-            await page.goto(faucet.url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-            await page.waitForTimeout(2000);
-            
-            // Try multiple claim button selectors
-            const claimSelectors = [
-                '#claimButton', '.claim-btn', 'button.claim', '.faucet-button',
-                'button:has-text("Claim")', 'a:has-text("Claim")', '.free-button',
-                'input[value="Claim"]', '#free_play_form_button'
-            ];
-            
-            for (const selector of claimSelectors) {
-                try {
-                    const claimBtn = await page.$(selector);
-                    if (claimBtn) {
-                        await claimBtn.click();
-                        await page.waitForTimeout(3000);
-                        return faucet.earnPerClaim;
-                    }
-                } catch(e) {}
-            }
-            
-            // Try by text as last resort
-            const claimed = await page.evaluate(() => {
-                const buttons = Array.from(document.querySelectorAll('button, a'));
-                for (const btn of buttons) {
-                    const text = (btn.innerText || '').toLowerCase();
-                    if (text.includes('claim') || text.includes('roll') || text.includes('get')) {
-                        btn.click();
-                        return true;
-                    }
-                }
-                return false;
-            });
-            
-            return claimed ? faucet.earnPerClaim : 0;
-        } catch (error) {
-            return 0;
-        }
-    }
-}
-
-// ============ STATS ============
+// ============ STATUS STORAGE ============
 let stats = {
     totalEarned: 0,
     totalClaims: 0,
-    accountsCreated: 0,
-    faucetStats: {},
-    history: [],
-    startTime: new Date(),
-    activeFaucets: 0
+    currentBalance: 0,
+    withdrawStatus: {
+        pending: false,
+        amount: 0,
+        address: '',
+        status: 'idle',
+        lastWithdrawal: null,
+        transactionId: null
+    },
+    registrationLog: [],
+    withdrawalLog: [],
+    claimLog: [],
+    walletVerification: { verified: false, address: FAUCETPAY_WALLET_ADDRESS, verifiedAt: null },
+    startTime: new Date()
 };
 
-FAUCETS.forEach(f => {
-    stats.faucetStats[f.name] = { claims: 0, earned: 0, lastSuccess: null };
-});
-
-// ============ MEGA BOT ============
-class MegaFaucetBot {
-    constructor(walletAddress, faucetpayEmail, faucetpayPassword) {
+// ============ ADVANCED BOT ============
+class AdvancedFaucetBot {
+    constructor(walletAddress, email, password) {
         this.walletAddress = walletAddress;
-        this.faucetpayEmail = faucetpayEmail;
-        this.faucetpayPassword = faucetpayPassword;
+        this.email = email;
+        this.password = password;
         this.browser = null;
         this.page = null;
-        this.accountManager = null;
         this.loggedIn = false;
-        this.faucetStatus = {};
     }
 
     async init() {
@@ -271,13 +128,11 @@ class MegaFaucetBot {
         this.page = await this.browser.newPage();
         await this.page.setViewport({ width: 1280, height: 800 });
         this.page.setDefaultTimeout(15000);
-        
-        this.accountManager = new AccountManager(this.walletAddress, this.faucetpayEmail, this.faucetpayPassword);
     }
 
     async loginFaucetPay() {
-        if (!this.faucetpayEmail || !this.faucetpayPassword) {
-            console.log('⚠️ No FaucetPay credentials - using public faucets only');
+        if (!this.email || !this.password) {
+            console.log('⚠️ No FaucetPay credentials');
             return false;
         }
         
@@ -286,115 +141,243 @@ class MegaFaucetBot {
             await this.page.goto('https://faucetpay.io/login', { waitUntil: 'networkidle2' });
             await this.page.waitForTimeout(3000);
             
-            const emailField = await this.page.$('#email');
-            if (emailField) {
-                await emailField.type(this.faucetpayEmail);
-            }
-            
-            const passField = await this.page.$('#password');
-            if (passField) {
-                await passField.type(this.faucetpayPassword);
-            }
-            
-            const submitBtn = await this.page.$('button[type="submit"]');
-            if (submitBtn) {
-                await submitBtn.click();
-                await this.page.waitForTimeout(5000);
-            }
+            await this.page.type('#email', this.email);
+            await this.page.type('#password', this.password);
+            await this.page.click('button[type="submit"]');
+            await this.page.waitForTimeout(5000);
             
             this.loggedIn = true;
-            console.log('✅ FaucetPay login successful\n');
+            console.log('✅ FaucetPay login successful');
+            await this.checkBalance();
+            await this.verifyWalletSetup();
             return true;
         } catch (error) {
-            console.log('⚠️ FaucetPay login failed - using public faucets only\n');
+            console.log('⚠️ FaucetPay login failed');
             return false;
         }
     }
 
-    async processAllFaucets() {
-        let totalEarned = 0;
-        let successCount = 0;
-        
-        for (const faucet of FAUCETS) {
-            // Skip internal methods if not logged in
-            if (faucet.isInternal && !this.loggedIn) continue;
+    async checkBalance() {
+        try {
+            const balanceText = await this.page.$eval('.balance-amount, .user-balance', el => el.innerText).catch(() => '0');
+            stats.currentBalance = parseFloat(balanceText) || 0;
+            console.log(`💰 Current Balance: $${stats.currentBalance}`);
             
-            try {
-                let earned = 0;
-                
-                // Special handling for FaucetPay internal methods
-                if (faucet.isInternal && this.loggedIn) {
-                    await this.page.goto(faucet.url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-                    await this.page.waitForTimeout(2000);
-                    
-                    // Just viewing counts as earning for some methods
-                    earned = faucet.earnPerClaim;
-                    console.log(`  ✅ ${faucet.name}: +$${faucet.earnPerClaim.toFixed(4)}`);
-                } else {
-                    earned = await this.accountManager.claimFaucet(this.page, faucet);
-                    if (earned > 0) {
-                        console.log(`  ✅ ${faucet.name}: +$${faucet.earnPerClaim.toFixed(4)}`);
-                    }
-                }
-                
-                if (earned > 0) {
-                    totalEarned += earned;
-                    successCount++;
-                    stats.faucetStats[faucet.name].claims++;
-                    stats.faucetStats[faucet.name].earned += earned;
-                    stats.faucetStats[faucet.name].lastSuccess = new Date();
-                }
-                
-                // Random delay between faucets (2-5 seconds)
-                await this.page.waitForTimeout(2000 + Math.random() * 3000);
-                
-            } catch (error) {
-                // Silent fail for individual faucets
+            // Check if should auto-withdraw
+            if (AUTO_WITHDRAW_THRESHOLD > 0 && stats.currentBalance >= AUTO_WITHDRAW_THRESHOLD && WITHDRAWAL_ADDRESS) {
+                await this.initiateWithdrawal();
             }
+            return stats.currentBalance;
+        } catch (error) {
+            return stats.currentBalance;
+        }
+    }
+
+    async verifyWalletSetup() {
+        console.log('\n🔍 Verifying wallet setup...');
+        stats.walletVerification.verified = false;
+        
+        try {
+            await this.page.goto('https://faucetpay.io/dashboard', { waitUntil: 'networkidle2' });
+            await this.page.waitForTimeout(2000);
+            
+            // Check if linked addresses exist
+            const linkedAddresses = await this.page.$('.linked-addresses, .withdrawal-addresses');
+            if (linkedAddresses) {
+                stats.walletVerification.verified = true;
+                stats.walletVerification.verifiedAt = new Date();
+                console.log(`✅ Wallet verified: ${this.walletAddress ? this.walletAddress.substring(0, 15) + '...' : 'Not set'}`);
+            } else {
+                console.log('⚠️ No linked addresses found');
+            }
+        } catch (error) {
+            console.log('⚠️ Could not verify wallet');
+        }
+    }
+
+    async initiateWithdrawal() {
+        console.log(`\n💸 Initiating withdrawal of $${stats.currentBalance} to ${WITHDRAWAL_ADDRESS.substring(0, 15)}...`);
+        stats.withdrawStatus.pending = true;
+        stats.withdrawStatus.amount = stats.currentBalance;
+        stats.withdrawStatus.address = WITHDRAWAL_ADDRESS;
+        stats.withdrawStatus.status = 'processing';
+        
+        try {
+            await this.page.goto('https://faucetpay.io/withdraw', { waitUntil: 'networkidle2' });
+            await this.page.waitForTimeout(3000);
+            
+            // Select coin (BTC/LTC/DOGE based on address format)
+            let coinSelect = 'BTC';
+            if (WITHDRAWAL_ADDRESS.startsWith('ltc1') || WITHDRAWAL_ADDRESS.startsWith('L')) coinSelect = 'LTC';
+            if (WITHDRAWAL_ADDRESS.startsWith('D')) coinSelect = 'DOGE';
+            
+            await this.page.select('#coin', coinSelect);
+            await this.page.type('#address', WITHDRAWAL_ADDRESS);
+            await this.page.type('#amount', stats.currentBalance.toString());
+            await this.page.click('#withdraw-btn');
+            await this.page.waitForTimeout(5000);
+            
+            // Check for success
+            const successMsg = await this.page.$('.success-message, .alert-success');
+            if (successMsg) {
+                const txId = await this.page.$eval('.transaction-id, .txid', el => el.innerText).catch(() => 'N/A');
+                stats.withdrawStatus.status = 'completed';
+                stats.withdrawStatus.transactionId = txId;
+                stats.withdrawStatus.lastWithdrawal = new Date();
+                stats.withdrawalLog.unshift({
+                    time: new Date(),
+                    amount: stats.currentBalance,
+                    address: WITHDRAWAL_ADDRESS,
+                    txId: txId,
+                    status: 'completed'
+                });
+                console.log(`✅ Withdrawal successful! TXID: ${txId}`);
+                stats.currentBalance = 0;
+            } else {
+                stats.withdrawStatus.status = 'failed';
+                stats.withdrawalLog.unshift({
+                    time: new Date(),
+                    amount: stats.currentBalance,
+                    address: WITHDRAWAL_ADDRESS,
+                    status: 'failed'
+                });
+                console.log('❌ Withdrawal failed');
+            }
+        } catch (error) {
+            stats.withdrawStatus.status = 'failed';
+            console.log(`❌ Withdrawal error: ${error.message}`);
         }
         
-        stats.activeFaucets = successCount;
-        return totalEarned;
+        stats.withdrawStatus.pending = false;
+        return stats.withdrawStatus.status === 'completed';
+    }
+
+    async registerFaucet(faucet) {
+        if (faucet.registered) return true;
+        
+        console.log(`\n📝 Registering on ${faucet.name}...`);
+        try {
+            const timestamp = Date.now();
+            const random = Math.random().toString(36).substring(2, 8);
+            const email = `user_${timestamp}_${random}@10minutemail.net`;
+            const password = Math.random().toString(36).substring(2, 15);
+            
+            await this.page.goto(`${faucet.url}/register`, { waitUntil: 'networkidle2', timeout: 20000 });
+            await this.page.waitForTimeout(2000);
+            
+            // Fill registration
+            await this.page.type('input[name="email"], input[type="email"]', email);
+            await this.page.type('input[name="password"], input[type="password"]', password);
+            if (this.walletAddress) {
+                await this.page.type('input[name="btc_address"], input[name="faucetpay"]', this.walletAddress);
+            }
+            
+            await this.page.click('button[type="submit"], input[type="submit"]');
+            await this.page.waitForTimeout(3000);
+            
+            faucet.registered = true;
+            faucet.walletSet = !!this.walletAddress;
+            faucet.status = 'active';
+            
+            stats.registrationLog.unshift({
+                time: new Date(),
+                faucet: faucet.name,
+                email: email,
+                walletSet: faucet.walletSet,
+                status: 'success'
+            });
+            
+            console.log(`✅ Registered: ${email}`);
+            return true;
+        } catch (error) {
+            stats.registrationLog.unshift({
+                time: new Date(),
+                faucet: faucet.name,
+                status: 'failed',
+                error: error.message
+            });
+            return false;
+        }
+    }
+
+    async claimFaucet(faucet) {
+        if (!faucet.registered) return 0;
+        
+        try {
+            await this.page.goto(faucet.url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+            await this.page.waitForTimeout(2000);
+            
+            const claimSelectors = ['#claimButton', '.claim-btn', 'button.claim', '#free_play_form_button'];
+            let claimed = false;
+            
+            for (const selector of claimSelectors) {
+                const claimBtn = await this.page.$(selector);
+                if (claimBtn) {
+                    await claimBtn.click();
+                    await this.page.waitForTimeout(3000);
+                    claimed = true;
+                    break;
+                }
+            }
+            
+            if (claimed) {
+                faucet.lastClaim = new Date();
+                stats.totalEarned += faucet.earnPerClaim;
+                stats.totalClaims++;
+                stats.claimLog.unshift({
+                    time: new Date(),
+                    faucet: faucet.name,
+                    amount: faucet.earnPerClaim,
+                    status: 'success'
+                });
+                return faucet.earnPerClaim;
+            }
+            return 0;
+        } catch (error) {
+            return 0;
+        }
     }
 
     async runCycle() {
         let cycleEarned = 0;
         
         console.log(`\n📊 Cycle - ${new Date().toLocaleTimeString()}`);
-        console.log(`🪙 ${FAUCETS.length} faucets available`);
         console.log('----------------------------------------');
         
-        cycleEarned = await this.processAllFaucets();
+        for (const faucet of FAUCETS) {
+            if (!faucet.registered) {
+                await this.registerFaucet(faucet);
+            }
+            
+            if (faucet.registered) {
+                const earned = await this.claimFaucet(faucet);
+                cycleEarned += earned;
+                if (earned > 0) {
+                    console.log(`  ✅ ${faucet.name}: +$${faucet.earnPerClaim.toFixed(4)}`);
+                }
+                await this.page.waitForTimeout(2000);
+            }
+        }
         
-        if (cycleEarned > 0) {
-            stats.totalEarned += cycleEarned;
-            stats.totalClaims++;
-            stats.history.unshift({
-                time: new Date(),
-                earned: cycleEarned,
-                total: stats.totalEarned,
-                faucets: stats.activeFaucets
-            });
-            if (stats.history.length > 100) stats.history.pop();
+        if (this.loggedIn) {
+            await this.checkBalance();
         }
         
         console.log(`----------------------------------------`);
         console.log(`💰 Cycle earned: $${cycleEarned.toFixed(4)}`);
         console.log(`📊 Total earned: $${stats.totalEarned.toFixed(4)}`);
-        console.log(`🪙 Successful faucets: ${stats.activeFaucets}/${FAUCETS.length}`);
+        console.log(`💳 Balance: $${stats.currentBalance}`);
         
         return cycleEarned;
     }
 
     async run() {
-        console.log('🚀 Starting Mega Faucet Bot');
-        console.log(`🪙 ${FAUCETS.length} faucets configured`);
+        console.log('🚀 Starting Advanced Faucet Bot');
         console.log('========================================\n');
         
         if (!this.walletAddress) {
-            console.log('❌ ERROR: FAUCETPAY_WALLET_ADDRESS required!');
-            console.log('   Set your FaucetPay wallet address and restart.\n');
-            return;
+            console.log('⚠️ WARNING: FAUCETPAY_WALLET_ADDRESS not set!');
+            console.log('   Set your FaucetPay deposit address to receive payments.\n');
         }
         
         await this.init();
@@ -406,18 +389,15 @@ class MegaFaucetBot {
             cycleCount++;
             try {
                 await this.runCycle();
-                
                 console.log(`⏰ Next cycle in ${SCAN_INTERVAL_SECONDS} seconds\n`);
                 await this.page.waitForTimeout(SCAN_INTERVAL_SECONDS * 1000);
                 
-                // Refresh browser occasionally
                 if (cycleCount % 30 === 0) {
                     await this.browser.close();
                     await this.init();
                     if (this.loggedIn) await this.loginFaucetPay();
                     console.log('🔄 Browser refreshed\n');
                 }
-                
             } catch (error) {
                 console.error(`Cycle error: ${error.message}`);
                 await this.page.waitForTimeout(10000);
@@ -433,81 +413,140 @@ app.get('/', (req, res) => {
     const minutes = Math.floor((uptime % 3600) / 60);
     
     const dailyRate = (stats.totalEarned / (uptime / 86400)).toFixed(5);
-    const monthlyRate = (dailyRate * 30).toFixed(2);
     
-    // Calculate top performing faucets
-    const topFaucets = Object.entries(stats.faucetStats)
-        .filter(([_, data]) => data.earned > 0)
-        .sort((a, b) => b[1].earned - a[1].earned)
-        .slice(0, 10);
+    // Build status HTML
+    const faucetStatusHtml = FAUCETS.map(f => `
+        <tr>
+            <td>${f.name}</td>
+            <td>${f.registered ? '✅' : '⏳'}</td>
+            <td>${f.walletSet ? '✅' : '❌'}</td>
+            <td>${f.lastClaim ? new Date(f.lastClaim).toLocaleTimeString() : 'Never'}</td>
+            <td class="status-${f.status}">${f.status}</td>
+        </tr>
+    `).join('');
+    
+    const registrationHtml = stats.registrationLog.slice(0, 10).map(r => `
+        <tr>
+            <td>${new Date(r.time).toLocaleTimeString()}</td>
+            <td>${r.faucet}</td>
+            <td class="${r.status === 'success' ? 'earn' : 'error'}">${r.status}</td>
+            <td>${r.walletSet ? '✅ Wallet set' : '-'}</td>
+        </tr>
+    `).join('');
+    
+    const withdrawalHtml = stats.withdrawalLog.slice(0, 10).map(w => `
+        <tr>
+            <td>${new Date(w.time).toLocaleTimeString()}</td>
+            <td>$${w.amount.toFixed(2)}</td>
+            <td>${w.address.substring(0, 15)}...</td>
+            <td class="${w.status === 'completed' ? 'earn' : 'error'}">${w.status}</td>
+            <td>${w.txId ? w.txId.substring(0, 20) + '...' : '-'}</td>
+        </tr>
+    `).join('');
+    
+    const claimHtml = stats.claimLog.slice(0, 20).map(c => `
+        <tr>
+            <td>${new Date(c.time).toLocaleTimeString()}</td>
+            <td>${c.faucet}</td>
+            <td class="earn">+$${c.amount.toFixed(5)}</td>
+        </tr>
+    `).join('');
     
     res.send(`
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Mega Faucet Bot - 50+ Faucets</title>
+    <title>Advanced Faucet Bot - Dashboard</title>
     <meta http-equiv="refresh" content="10">
     <style>
-        body { font-family: monospace; background: #0a0e27; color: #00ff88; padding: 40px; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        h1 { text-align: center; }
-        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 30px 0; }
-        .stat-card { background: #1a1f3a; padding: 20px; border-radius: 10px; text-align: center; }
-        .stat-value { font-size: 32px; font-weight: bold; }
+        body { font-family: monospace; background: #0a0e27; color: #00ff88; padding: 20px; }
+        .container { max-width: 1400px; margin: 0 auto; }
+        h1, h2, h3 { text-align: center; margin-bottom: 10px; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin: 20px 0; }
+        .stat-card { background: #1a1f3a; padding: 15px; border-radius: 10px; text-align: center; }
+        .stat-value { font-size: 28px; font-weight: bold; }
         .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; margin-bottom: 20px; }
-        .card { background: #1a1f3a; padding: 20px; border-radius: 10px; }
+        .card { background: #1a1f3a; padding: 15px; border-radius: 10px; overflow-x: auto; }
         table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        th, td { padding: 8px; text-align: left; border-bottom: 1px solid #333; }
+        th, td { padding: 8px; text-align: left; border-bottom: 1px solid #333; font-size: 12px; }
         th { color: #00ff88; }
         .earn { color: #00ff88; }
+        .error { color: #ff4444; }
+        .status-pending { color: #ffaa00; }
+        .status-active { color: #00ff88; }
+        .status-failed { color: #ff4444; }
+        .withdraw-info { background: #0a2a1a; padding: 10px; border-radius: 5px; margin: 10px 0; }
+        .withdraw-pending { color: #ffaa00; animation: pulse 1s infinite; }
         .status { background: #1a1f3a; padding: 15px; border-radius: 10px; margin-bottom: 20px; text-align: center; }
-        .wallet { background: #0a2a1a; padding: 10px; border-radius: 5px; font-size: 12px; word-break: break-all; margin-top: 10px; }
-        .faucet-count { font-size: 14px; color: #ffaa00; }
+        .wallet { background: #0a2a1a; padding: 8px; border-radius: 5px; font-size: 11px; word-break: break-all; margin-top: 10px; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .refresh-btn { background: #1a1f3a; color: #00ff88; border: 1px solid #00ff88; padding: 5px 10px; border-radius: 5px; cursor: pointer; margin-bottom: 10px; font-size: 12px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>💰 Mega Faucet Bot</h1>
+        <h1>💰 Advanced Faucet Bot</h1>
         <div class="status">
             🟢 RUNNING | Uptime: ${hours}h ${minutes}m | Cycle: ${SCAN_INTERVAL_SECONDS}s
-            <div class="faucet-count">🪙 ${FAUCETS.length} Faucets | ${stats.activeFaucets} active this cycle</div>
-            <div class="wallet">📬 Wallet: ${FAUCETPAY_WALLET_ADDRESS ? FAUCETPAY_WALLET_ADDRESS.substring(0, 20) + '...' : 'NOT SET'}</div>
+            <div class="wallet">📬 Wallet: ${FAUCETPAY_WALLET_ADDRESS ? FAUCETPAY_WALLET_ADDRESS.substring(0, 25) + '...' : 'NOT SET'}</div>
+            <div class="wallet">🏦 Withdraw To: ${WITHDRAWAL_ADDRESS ? WITHDRAWAL_ADDRESS.substring(0, 25) + '...' : 'NOT SET'}</div>
         </div>
         
         <div class="stats">
             <div class="stat-card"><div class="stat-value">$${stats.totalEarned.toFixed(5)}</div><div>Total Earned</div></div>
             <div class="stat-card"><div class="stat-value">$${dailyRate}</div><div>Per Day</div></div>
-            <div class="stat-card"><div class="stat-value">$${monthlyRate}</div><div>Per Month</div></div>
             <div class="stat-card"><div class="stat-value">${stats.totalClaims}</div><div>Total Claims</div></div>
+            <div class="stat-card"><div class="stat-value">$${stats.currentBalance.toFixed(4)}</div><div>Balance</div></div>
+        </div>
+        
+        <!-- Withdrawal Status -->
+        <div class="card">
+            <h3>💸 Withdrawal Status</h3>
+            <div class="withdraw-info">
+                <strong>Threshold:</strong> $${AUTO_WITHDRAW_THRESHOLD} | 
+                <strong>Status:</strong> <span class="${stats.withdrawStatus.status === 'processing' ? 'withdraw-pending' : ''}">${stats.withdrawStatus.status}</span> |
+                <strong>Last Withdrawal:</strong> ${stats.withdrawStatus.lastWithdrawal ? new Date(stats.withdrawStatus.lastWithdrawal).toLocaleString() : 'Never'}
+                ${stats.withdrawStatus.transactionId ? `<br><strong>TXID:</strong> ${stats.withdrawStatus.transactionId}` : ''}
+            </div>
         </div>
         
         <div class="grid-2">
+            <!-- Faucet Registration Status -->
             <div class="card">
-                <h3>🏆 Top 10 Faucets</h3>
+                <h3>📝 Faucet Registration Status</h3>
                 <table>
-                    <thead><tr><th>Faucet</th><th>Claims</th><th>Earned</th></tr></thead>
-                    <tbody>
-                        ${topFaucets.map(([name, data]) => `
-                            <tr><td>${name}</td><td>${data.claims}</td><td class="earn">$${data.earned.toFixed(5)}</td></tr>
-                        `).join('')}
-                        ${topFaucets.length === 0 ? '<tr><td colspan="3">Waiting for claims...</td></tr>' : ''}
-                    </tbody>
+                    <thead><tr><th>Faucet</th><th>Registered</th><th>Wallet</th><th>Last Claim</th><th>Status</th></tr></thead>
+                    <tbody>${faucetStatusHtml}</tbody>
                 </table>
             </div>
+            
+            <!-- Registration Log -->
             <div class="card">
-                <h3>📈 Recent Activity</h3>
+                <h3>📋 Registration Log</h3>
                 <table>
-                    <thead><tr><th>Time</th><th>Earned</th><th>Faucets</th></tr></thead>
-                    <tbody>
-                        ${stats.history.slice(0, 15).map(h => `
-                            <tr>
-                                <td>${new Date(h.time).toLocaleTimeString()}</td>
-                                <td class="earn">+$${h.earned.toFixed(5)}</td>
-                                <td>${h.faucets || '?'}</td>
-                            </tr>
-                        `).join('')}
-                        ${stats.history.length === 0 ? '<tr><td colspan="3">Waiting for claims...</td></tr>' : ''}
-                    </tbody>
+                    <thead><tr><th>Time</th><th>Faucet</th><th>Status</th><th>Details</th></tr></thead>
+                    <tbody>${registrationHtml || '<td><td colspan="4">No registrations yet...</td></tr>'}</tbody>
+                </table>
+            </div>
+        </div>
+        
+        <div class="grid-2">
+            <!-- Withdrawal History -->
+            <div class="card">
+                <h3>🏦 Withdrawal History</h3>
+                <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
+                <table>
+                    <thead><tr><th>Time</th><th>Amount</th><th>Address</th><th>Status</th><th>TXID</th></tr></thead>
+                    <tbody>${withdrawalHtml || '<tr><td colspan="5">No withdrawals yet...</td></tr>'}</tbody>
+                </table>
+            </div>
+            
+            <!-- Recent Claims -->
+            <div class="card">
+                <h3>🪙 Recent Claims</h3>
+                <table>
+                    <thead><tr><th>Time</th><th>Faucet</th><th>Amount</th></tr></thead>
+                    <tbody>${claimHtml || '<tr><td colspan="3">No claims yet...</td></tr>'}</tbody>
                 </table>
             </div>
         </div>
@@ -518,14 +557,9 @@ app.get('/', (req, res) => {
 
 // ============ MAIN ============
 async function main() {
-    console.log('🚀 Starting Mega Faucet Bot...');
-    console.log(`🪙 ${FAUCETS.length} faucets configured for auto-claim`);
-    console.log('💰 All earnings sent to your FaucetPay wallet\n');
-    
-    if (!FAUCETPAY_WALLET_ADDRESS) {
-        console.log('⚠️  WARNING: FAUCETPAY_WALLET_ADDRESS not set!');
-        console.log('   Set your FaucetPay wallet address to receive payments.\n');
-    }
+    console.log('🚀 Starting Advanced Faucet Bot...');
+    console.log('💸 Auto-withdrawal enabled at $' + AUTO_WITHDRAW_THRESHOLD);
+    console.log('========================================\n');
     
     await installChrome();
     
@@ -533,7 +567,7 @@ async function main() {
         console.log(`📊 Dashboard: http://localhost:${port}`);
     });
     
-    const bot = new MegaFaucetBot(FAUCETPAY_WALLET_ADDRESS, FAUCETPAY_EMAIL, FAUCETPAY_PASSWORD);
+    const bot = new AdvancedFaucetBot(FAUCETPAY_WALLET_ADDRESS, FAUCETPAY_EMAIL, FAUCETPAY_PASSWORD);
     await bot.run();
 }
 
