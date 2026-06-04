@@ -28,7 +28,7 @@ app.use(session({
 }));
 
 // ============ CONFIGURATION ============
-const FAUCETPAY_WALLET_ADDRESS = process.env.FAUCETPAY_WALLET_ADDRESS || '';
+const FAUCETPAY_WALLET_ADDRESS = process.env.FAUCETPAY_WALLET_ADDRESS || 'web88888888888888@gmail.com';
 const HEADLESS_MODE = process.env.HEADLESS_MODE !== 'false';
 const SCAN_INTERVAL_SECONDS = parseInt(process.env.SCAN_INTERVAL_SECONDS) || 60;
 const USER_DATA_DIR = process.env.USER_DATA_DIR || './chrome-profile';
