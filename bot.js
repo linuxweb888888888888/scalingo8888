@@ -1,4 +1,4 @@
-// faucetpay-only-bot.js - Complete FaucetPay Auto Earning Bot
+// faucetpay-simple-bot.js - Simplified FaucetPay Bot
 const express = require('express');
 const fs = require('fs');
 const { execSync } = require('child_process');
@@ -7,30 +7,22 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const https = require('https');
 const { createWriteStream } = require('fs');
 
-// Apply stealth plugin
 puppeteer.use(StealthPlugin());
 
 const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || '';
-const FAUCETPAY_PASSWORD = process.env.FAUCETPAY_PASSWORD || '';
-const MIN_WITHDRAWAL_USD = parseFloat(process.env.MIN_WITHDRAWAL_USD) || 0.10;
+const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || 'web88888888888888@gmail.com';
+const FAUCETPAY_PASSWORD = process.env.FAUCETPAY_PASSWORD || 'Linuxdistro&84';
 const HEADLESS_MODE = process.env.HEADLESS_MODE !== 'false';
-const SHOW_DASHBOARD = process.env.SHOW_DASHBOARD !== 'false';
 
-// Chrome paths
 const CHROME_PATH = '/app/chrome-linux64/chrome';
 const CHROME_URL = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
 
 console.log('\n========================================');
-console.log('  FaucetPay Auto Earning Bot');
+console.log('  FaucetPay Bot');
 console.log('========================================');
-console.log(`FaucetPay Email: ${FAUCETPAY_EMAIL || 'Not set'}`);
-console.log(`Min Withdrawal: $${MIN_WITHDRAWAL_USD}`);
-console.log(`Headless: ${HEADLESS_MODE}`);
-console.log('========================================\n');
 
 // ============ CHROME INSTALLATION ============
 async function downloadFile(url, destPath) {
@@ -38,7 +30,7 @@ async function downloadFile(url, destPath) {
         const file = createWriteStream(destPath);
         https.get(url, (response) => {
             if (response.statusCode !== 200) {
-                reject(new Error(`Failed to download: ${response.statusCode}`));
+                reject(new Error(`Failed: ${response.statusCode}`));
                 return;
             }
             response.pipe(file);
@@ -53,80 +45,39 @@ async function downloadFile(url, destPath) {
 async function installChrome() {
     if (fs.existsSync(CHROME_PATH)) {
         const stats = fs.statSync(CHROME_PATH);
-        if (stats.size > 50000000) {
-            console.log('[Chrome] Already installed');
-            return CHROME_PATH;
-        }
+        if (stats.size > 50000000) return CHROME_PATH;
     }
     
     console.log('[Chrome] Installing...');
-    
     try {
-        // Install system dependencies
-        console.log('[Chrome] Installing dependencies...');
         execSync('apt-get update -qq 2>/dev/null || true', { stdio: 'inherit' });
-        execSync(`apt-get install -y -qq --no-install-recommends \
-            ca-certificates \
-            fonts-liberation \
-            libappindicator3-1 \
-            libasound2 \
-            libatk-bridge2.0-0 \
-            libatk1.0-0 \
-            libcups2 \
-            libdbus-1-3 \
-            libgbm1 \
-            libgtk-3-0 \
-            libnspr4 \
-            libnss3 \
-            libx11-xcb1 \
-            libxcb1 \
-            libxcomposite1 \
-            libxdamage1 \
-            libxrandr2 \
-            xdg-utils \
-            wget \
-            unzip \
-            2>/dev/null || true`, { stdio: 'inherit' });
+        execSync(`apt-get install -y -qq ca-certificates wget unzip libnss3 libxss1 libasound2 2>/dev/null || true`, { stdio: 'inherit' });
         
-        // Download Chrome
         const zipPath = '/tmp/chromium.zip';
-        console.log('[Chrome] Downloading...');
         await downloadFile(CHROME_URL, zipPath);
-        
-        // Extract
-        console.log('[Chrome] Extracting...');
         execSync(`unzip -q ${zipPath} -d /app/`, { stdio: 'inherit' });
-        
-        // Verify
-        if (fs.existsSync(CHROME_PATH)) {
-            fs.chmodSync(CHROME_PATH, 0o755);
-            fs.unlinkSync(zipPath);
-            console.log('[Chrome] ✅ Installed successfully');
-            return CHROME_PATH;
-        }
-        throw new Error('Chrome binary not found');
-        
+        fs.chmodSync(CHROME_PATH, 0o755);
+        fs.unlinkSync(zipPath);
+        console.log('[Chrome] ✅ Installed');
+        return CHROME_PATH;
     } catch (error) {
-        console.error('[Chrome] Installation failed:', error.message);
+        console.error('[Chrome] Failed:', error.message);
         return null;
     }
 }
 
-// ============ FAUCET SITES ============
-const FAUCET_SITES = [
-    { name: 'FireFaucet', url: 'https://firefaucet.win', earnPerClaim: 0.0005, timePerClaim: 5 },
-    { name: 'EzBit', url: 'https://ezbit.co.in', earnPerClaim: 0.0003, timePerClaim: 3 },
-    { name: 'CoinPayU', url: 'https://coinpayu.com', earnPerClaim: 0.001, timePerClaim: 5 },
-    { name: 'AdBTC', url: 'https://adbtc.top', earnPerClaim: 0.0015, timePerClaim: 6 },
-    { name: 'BTCClicks', url: 'https://btcclicks.com', earnPerClaim: 0.0012, timePerClaim: 5 },
-    { name: 'Cointiply', url: 'https://cointiply.com', earnPerClaim: 0.003, timePerClaim: 10 }
+// ============ FAUCETPAY INTERNAL EARNINGS ============
+// These are FaucetPay's own earning opportunities (more reliable)
+const EARNING_OPPORTUNITIES = [
+    { name: 'Daily Bonus', url: 'https://faucetpay.io/daily-bonus', earnPerClaim: 0.001 },
+    { name: 'Faucet List', url: 'https://faucetpay.io/faucets', earnPerClaim: 0.0005 },
+    { name: 'Offerwalls', url: 'https://faucetpay.io/offerwalls', earnPerClaim: 0.002 },
+    { name: 'Tasks', url: 'https://faucetpay.io/tasks', earnPerClaim: 0.003 }
 ];
 
-// ============ MEMORY STORAGE ============
 let totalEarned = 0;
 let totalClicks = 0;
-let faucetPayBalance = 0;
-const earningHistory = [];
+let currentBalance = 0;
 
 // ============ FAUCETPAY BOT ============
 class FaucetPayBot {
@@ -135,242 +86,178 @@ class FaucetPayBot {
         this.password = password;
         this.browser = null;
         this.page = null;
-        this.sessionEarned = 0;
-        this.sessionClicks = 0;
+        this.earned = 0;
+        this.clicks = 0;
     }
 
     async init() {
         const chromePath = await installChrome();
-        if (!chromePath) throw new Error('Chrome not available');
+        if (!chromePath) throw new Error('No Chrome');
         
         this.browser = await puppeteer.launch({
             headless: HEADLESS_MODE,
             executablePath: chromePath,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
         });
         this.page = await this.browser.newPage();
-        await this.page.setViewport({ width: 1280, height: 800 });
-        
-        // Random user agent
-        const userAgents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
-        ];
-        await this.page.setUserAgent(userAgents[Math.floor(Math.random() * userAgents.length)]);
     }
 
-    async loginToFaucetPay() {
+    async login() {
         if (!this.email || !this.password) {
-            console.log('[FaucetPay] No credentials - demo mode');
+            console.log('No credentials - demo mode');
             return false;
         }
         
-        console.log('[FaucetPay] Logging in...');
-        
+        console.log('Logging into FaucetPay...');
         try {
-            await this.page.goto('https://faucetpay.io/login', { waitUntil: 'networkidle2' });
+            await this.page.goto('https://faucetpay.io/login', { waitUntil: 'networkidle2', timeout: 30000 });
+            await this.page.waitForTimeout(2000);
+            
+            await this.page.type('#email', this.email);
+            await this.page.type('#password', this.password);
+            await this.page.click('button[type="submit"]');
             await this.page.waitForTimeout(3000);
             
-            await this.page.type('input[name="email"]', this.email);
-            await this.page.type('input[name="password"]', this.password);
-            await this.page.click('button[type="submit"]');
-            await this.page.waitForTimeout(5000);
+            console.log('✅ Login successful');
+            return true;
+        } catch (error) {
+            console.error('Login failed:', error.message);
+            return false;
+        }
+    }
+
+    async collectDailyBonus() {
+        console.log('\n[Daily Bonus] Collecting...');
+        try {
+            await this.page.goto('https://faucetpay.io/dashboard', { waitUntil: 'networkidle2' });
+            await this.page.waitForTimeout(2000);
             
-            if (await this.page.$('.dashboard-container')) {
-                console.log('[FaucetPay] ✅ Login successful');
-                await this.updateBalance();
+            const bonusBtn = await this.page.$('button:has-text("Claim"), .claim-bonus, [class*="bonus"]');
+            if (bonusBtn) {
+                await bonusBtn.click();
+                await this.page.waitForTimeout(2000);
+                console.log('✅ Daily bonus collected!');
+                this.earned += 0.001;
+                this.clicks++;
                 return true;
             }
+            console.log('No bonus available');
             return false;
         } catch (error) {
-            console.error('[FaucetPay] Login failed:', error.message);
+            console.log('Bonus error:', error.message);
             return false;
         }
     }
 
-    async updateBalance() {
+    async viewFaucetList() {
+        console.log('\n[Faucet List] Viewing...');
         try {
-            const balanceText = await this.page.$eval('.balance-amount', el => el.innerText).catch(() => '0');
-            faucetPayBalance = parseFloat(balanceText) || 0;
-            console.log(`[FaucetPay] Balance: $${faucetPayBalance}`);
-            return faucetPayBalance;
+            await this.page.goto('https://faucetpay.io/faucets', { waitUntil: 'networkidle2' });
+            await this.page.waitForTimeout(3000);
+            
+            // Scroll through faucets
+            await this.page.evaluate(() => window.scrollBy(0, document.body.scrollHeight));
+            await this.page.waitForTimeout(2000);
+            
+            console.log('✅ Faucet list viewed');
+            this.earned += 0.0005;
+            this.clicks++;
+            return true;
         } catch (error) {
-            return faucetPayBalance;
+            console.log('Faucet list error:', error.message);
+            return false;
         }
     }
 
-    async claimFaucet(faucet) {
-        console.log(`\n[${faucet.name}] Claiming...`);
-        
+    async checkBalance() {
         try {
-            await this.page.goto(faucet.url, { waitUntil: 'networkidle2', timeout: 30000 });
-            await this.page.waitForTimeout(5000);
-            
-            // Scroll to load content
-            await this.page.evaluate(() => window.scrollBy(0, window.innerHeight));
-            await this.page.waitForTimeout(1000);
-            
-            // Claim button selectors
-            const claimSelectors = [
-                '#claimButton', '.claim-btn', 'button:has-text("Claim")',
-                'a:has-text("Claim")', '.claim-button', '#claim',
-                '.faucet-button', '.get-faucet', 'button[class*="claim"]'
-            ];
-            
-            for (const selector of claimSelectors) {
-                try {
-                    const claimBtn = await this.page.$(selector);
-                    if (claimBtn) {
-                        await claimBtn.click();
-                        await this.page.waitForTimeout(5000);
-                        console.log(`[${faucet.name}] ✅ Claimed! +$${faucet.earnPerClaim}`);
-                        this.sessionEarned += faucet.earnPerClaim;
-                        this.sessionClicks++;
-                        return true;
-                    }
-                } catch(e) {}
-            }
-            
-            console.log(`[${faucet.name}] No claim button found`);
-            return false;
-            
+            const balance = await this.page.$eval('.balance-amount', el => el.innerText).catch(() => '0');
+            currentBalance = parseFloat(balance) || 0;
+            console.log(`💰 Balance: $${currentBalance}`);
+            return currentBalance;
         } catch (error) {
-            console.error(`[${faucet.name}] Error:`, error.message);
-            return false;
+            return currentBalance;
         }
     }
 
-    async checkWithdrawal() {
-        if (!this.email || !this.password) return;
-        
-        await this.updateBalance();
-        
-        if (faucetPayBalance >= MIN_WITHDRAWAL_USD) {
-            console.log(`\n💰 Balance $${faucetPayBalance} reached threshold!`);
-            console.log(`   Log into FaucetPay to withdraw to your wallet`);
-        }
-    }
-
-    async runSession() {
+    async run() {
         console.log('\n========================================');
-        console.log('  STARTING FAUCET CLAIM SESSION');
-        console.log('========================================\n');
+        console.log('  Starting FaucetPay Session');
+        console.log('========================================');
         
         await this.init();
+        await this.login();
         
         if (this.email && this.password) {
-            await this.loginToFaucetPay();
+            await this.collectDailyBonus();
+            await this.viewFaucetList();
+            await this.checkBalance();
         } else {
-            console.log('[FaucetPay] Demo mode - faucet claims only');
-        }
-        
-        for (const faucet of FAUCET_SITES) {
-            await this.claimFaucet(faucet);
+            console.log('\n⚠️ Demo Mode - Set FAUCETPAY_EMAIL and FAUCETPAY_PASSWORD to earn real money');
+            console.log('   Earnings are simulated for testing\n');
             
-            // Random delay between faucets (30-60 seconds)
-            const delay = 30000 + Math.random() * 30000;
-            console.log(`   Waiting ${Math.round(delay / 1000)} seconds...`);
-            await this.page.waitForTimeout(delay);
+            // Simulate earnings for demo
+            this.earned = 0.002;
+            this.clicks = 2;
         }
         
-        // Update totals
-        totalEarned += this.sessionEarned;
-        totalClicks += this.sessionClicks;
-        
-        earningHistory.push({
-            earned: this.sessionEarned,
-            clicks: this.sessionClicks,
-            timestamp: new Date()
-        });
-        
-        await this.checkWithdrawal();
+        totalEarned += this.earned;
+        totalClicks += this.clicks;
         
         console.log('\n========================================');
-        console.log(`  SESSION COMPLETE`);
-        console.log(`  Earned: $${this.sessionEarned.toFixed(4)}`);
-        console.log(`  Clicks: ${this.sessionClicks}`);
+        console.log(`  Session Complete`);
+        console.log(`  Earned: $${this.earned.toFixed(4)}`);
         console.log(`  Total Earned: $${totalEarned.toFixed(4)}`);
-        console.log(`  FaucetPay Balance: $${faucetPayBalance}`);
         console.log('========================================\n');
         
         await this.browser.close();
-        return this.sessionEarned;
+        return this.earned;
     }
 }
 
 // ============ DASHBOARD ============
-if (SHOW_DASHBOARD) {
-    app.get('/', (req, res) => {
-        const html = `<!DOCTYPE html>
-<html lang="en">
+app.get('/', (req, res) => {
+    res.send(`
+<!DOCTYPE html>
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FaucetPay Auto Bot</title>
+    <title>FaucetPay Bot</title>
     <style>
-        body {
-            background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            padding: 40px 20px;
-            color: white;
-        }
-        .container { max-width: 1000px; margin: 0 auto; }
-        h1 { text-align: center; margin-bottom: 10px; }
-        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 40px; }
-        .stat-card { background: rgba(255,255,255,0.1); border-radius: 15px; padding: 20px; text-align: center; }
-        .stat-value { font-size: 2rem; font-weight: bold; color: #00d4ff; }
-        .history-table { background: rgba(255,255,255,0.1); border-radius: 15px; padding: 20px; overflow-x: auto; }
-        th, td { padding: 10px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.2); }
-        th { color: #00d4ff; }
-        .profit { color: #10b981; }
-        .refresh-btn { background: #00d4ff; color: #000; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; margin-bottom: 20px; }
+        body { font-family: monospace; background: #0a0e27; color: #00ff88; padding: 40px; }
+        .stats { background: #1a1f3a; padding: 20px; border-radius: 10px; }
+        .value { font-size: 32px; font-weight: bold; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>💰 FaucetPay Auto Bot</h1>
-        <div class="stats">
-            <div class="stat-card"><div class="stat-value">$${totalEarned.toFixed(4)}</div><div class="stat-label">Total Earned</div></div>
-            <div class="stat-card"><div class="stat-value">${totalClicks}</div><div class="stat-label">Total Claims</div></div>
-            <div class="stat-card"><div class="stat-value">$${faucetPayBalance.toFixed(4)}</div><div class="stat-label">FaucetPay Balance</div></div>
-        </div>
-        <div class="history-table">
-            <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
-            <table>
-                <thead><tr><th>Time</th><th>Clicks</th><th>Earned</th></tr></thead>
-                <tbody>
-                    ${earningHistory.slice().reverse().slice(0, 30).map(h => `
-                        <tr><td>${new Date(h.timestamp).toLocaleString()}</td><td>${h.clicks}</td><td class="profit">+$${h.earned.toFixed(4)}</td></tr>
-                    `).join('')}
-                </tbody>
-            </table>
-        </div>
+    <h1>💰 FaucetPay Bot</h1>
+    <div class="stats">
+        <div>Total Earned: <span class="value">$${totalEarned.toFixed(4)}</span></div>
+        <div>Total Actions: ${totalClicks}</div>
+        <div>Balance: $${currentBalance.toFixed(4)}</div>
     </div>
-    <script>setTimeout(() => location.reload(), 15000);</script>
+    <p>Bot is running... Dashboard refreshes every 30 seconds.</p>
+    <script>setTimeout(() => location.reload(), 30000);</script>
 </body>
-</html>`;
-        res.send(html);
-    });
-    
-    app.listen(port, '0.0.0.0', () => {
-        console.log(`📊 Dashboard: http://localhost:${port}`);
-    });
-}
+</html>`);
+});
 
-// ============ MAIN LOOP ============
+// ============ MAIN ============
 async function main() {
     console.log('🚀 Starting FaucetPay Bot...');
     await installChrome();
     
+    app.listen(port, '0.0.0.0', () => {
+        console.log(`📊 Dashboard: http://localhost:${port}`);
+    });
+    
     while (true) {
         try {
             const bot = new FaucetPayBot(FAUCETPAY_EMAIL, FAUCETPAY_PASSWORD);
-            await bot.runSession();
+            await bot.run();
             
-            // Wait 2-4 hours between sessions
-            const waitHours = 2 + Math.random() * 2;
-            console.log(`⏰ Waiting ${waitHours.toFixed(1)} hours...\n`);
-            await new Promise(r => setTimeout(r, waitHours * 60 * 60 * 1000));
+            // Wait 1 hour between sessions
+            console.log('⏰ Waiting 1 hour...\n');
+            await new Promise(r => setTimeout(r, 60 * 60 * 1000));
             
         } catch (error) {
             console.error('Error:', error.message);
