@@ -1,4 +1,4 @@
-// ptc-company-bot.js - Automated PTC Earning Bot
+// ptc-company-bot.js - Fixed with Chrome installation
 const express = require('express');
 const fs = require('fs');
 const os = require('os');
@@ -113,6 +113,57 @@ const ENV = {
     MONGODB_URI: process.env.MONGODB_URI || null
 };
 
+// ============ CHROME INSTALLATION (FIXED) ============
+async function downloadFile(url, destPath) {
+    return new Promise((resolve, reject) => {
+        const file = createWriteStream(destPath);
+        https.get(url, (response) => {
+            if (response.statusCode !== 200) {
+                reject(new Error(`Failed to download: ${response.statusCode}`));
+                return;
+            }
+            response.pipe(file);
+            file.on('finish', () => {
+                file.close();
+                resolve();
+            });
+        }).on('error', reject);
+    });
+}
+
+async function installChromiumRuntime() {
+    const chromePath = ENV.CHROMIUM_PATH;
+    
+    if (fs.existsSync(chromePath)) {
+        const stats = fs.statSync(chromePath);
+        if (stats.size > 50000000) {
+            console.log('[CHROME] Using existing Chrome at:', chromePath);
+            return chromePath;
+        }
+    }
+    
+    console.log('[CHROME] Installing Chromium...');
+    
+    try {
+        const chromeUrl = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
+        const zipPath = '/tmp/chromium.zip';
+        
+        await downloadFile(chromeUrl, zipPath);
+        execSync(`unzip -q ${zipPath} -d /app/`, { stdio: 'inherit' });
+        
+        if (fs.existsSync(chromePath)) {
+            fs.chmodSync(chromePath, 0o755);
+            fs.unlinkSync(zipPath);
+            console.log('[CHROME] Chrome installed successfully');
+            return chromePath;
+        }
+        throw new Error('Chrome binary not found');
+    } catch (error) {
+        console.log('[CHROME] Failed:', error.message);
+        return null;
+    }
+}
+
 // ============ DATABASE SETUP ============
 let dbClient = null;
 let db = null;
@@ -130,7 +181,6 @@ const memoryStore = {
 function initDemoData() {
     console.log('[Storage] Initializing earning data...');
     
-    // Initialize PTC sites
     for (const site of PTC_SITES) {
         memoryStore.sites.set(site.name, {
             ...site,
@@ -178,24 +228,25 @@ class PTCBot {
         this.clicksToday = 0;
         this.email = null;
         this.password = null;
+        this.chromePath = null;
     }
 
     async initBrowser() {
-        const chromePath = ENV.CHROMIUM_PATH;
+        if (!this.chromePath) {
+            this.chromePath = await installChromiumRuntime();
+        }
+        if (!this.chromePath) throw new Error('No Chromium found');
         
         const launchOptions = {
             headless: ENV.HEADLESS_MODE,
-            executablePath: chromePath,
+            executablePath: this.chromePath,
             args: [
-                '--no-sandbox', 
-                '--disable-setuid-sandbox', 
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-gpu',
                 '--disable-webgl',
-                '--disable-accelerated-2d-canvas',
-                '--disable-accelerated-jpeg-decoding',
-                '--disable-accelerated-mjpeg-decode',
-                '--disable-accelerated-video-decode'
+                '--disable-accelerated-2d-canvas'
             ]
         };
         
@@ -203,7 +254,7 @@ class PTCBot {
         this.page = await this.browser.newPage();
         await this.page.setViewport({ width: 1280, height: 800 });
         
-        // Set random user agent
+        // Random user agent
         const userAgents = [
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
@@ -213,7 +264,6 @@ class PTCBot {
     }
 
     async generateTempEmail() {
-        // Generate random email for account creation
         const randomStr = Math.random().toString(36).substring(2, 15);
         this.email = `${randomStr}@10minutemail.net`;
         this.password = Math.random().toString(36).substring(2, 15);
@@ -225,17 +275,49 @@ class PTCBot {
         
         try {
             await this.page.goto(this.site.signupUrl, { waitUntil: 'networkidle2', timeout: 30000 });
-            await this.page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 10000 });
+            await this.page.waitForTimeout(3000);
             
-            // Fill registration form
-            await this.page.type('input[type="email"], input[name="email"]', this.email);
-            await this.page.type('input[type="password"], input[name="password"]', this.password);
-            await this.page.type('input[name="username"], input[id="username"]', `user_${Math.random().toString(36).substring(2, 10)}`);
+            // Look for email field
+            const emailSelectors = ['input[type="email"]', 'input[name="email"]', 'input[id="email"]'];
+            for (const selector of emailSelectors) {
+                const field = await this.page.$(selector);
+                if (field) {
+                    await field.type(this.email);
+                    break;
+                }
+            }
+            
+            // Look for password field
+            const passwordSelectors = ['input[type="password"]', 'input[name="password"]', 'input[id="password"]'];
+            for (const selector of passwordSelectors) {
+                const field = await this.page.$(selector);
+                if (field) {
+                    await field.type(this.password);
+                    break;
+                }
+            }
+            
+            // Look for username field
+            const usernameSelectors = ['input[name="username"]', 'input[id="username"]'];
+            for (const selector of usernameSelectors) {
+                const field = await this.page.$(selector);
+                if (field) {
+                    await field.type(`user_${Math.random().toString(36).substring(2, 10)}`);
+                    break;
+                }
+            }
             
             // Submit form
-            await this.page.click('button[type="submit"], input[type="submit"]');
-            await this.page.waitForTimeout(5000);
+            const submitSelectors = ['button[type="submit"]', 'input[type="submit"]', 'button:has-text("Sign Up")', 'button:has-text("Register")'];
+            for (const selector of submitSelectors) {
+                const btn = await this.page.$(selector);
+                if (btn) {
+                    await btn.click();
+                    break;
+                }
+            }
             
+            await this.page.waitForTimeout(5000);
             console.log(`[${this.site.name}] Account created: ${this.email}`);
             return true;
         } catch (error) {
@@ -249,13 +331,21 @@ class PTCBot {
         
         try {
             await this.page.goto(this.site.loginUrl, { waitUntil: 'networkidle2', timeout: 30000 });
-            await this.page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 10000 });
+            await this.page.waitForTimeout(3000);
             
-            await this.page.type('input[type="email"], input[name="email"]', this.email);
-            await this.page.type('input[type="password"], input[name="password"]', this.password);
-            await this.page.click('button[type="submit"], input[type="submit"]');
+            // Fill email
+            const emailField = await this.page.$('input[type="email"], input[name="email"]');
+            if (emailField) await emailField.type(this.email);
+            
+            // Fill password
+            const passwordField = await this.page.$('input[type="password"], input[name="password"]');
+            if (passwordField) await passwordField.type(this.password);
+            
+            // Submit
+            const submitBtn = await this.page.$('button[type="submit"], input[type="submit"]');
+            if (submitBtn) await submitBtn.click();
+            
             await this.page.waitForTimeout(5000);
-            
             console.log(`[${this.site.name}] Login successful`);
             return true;
         } catch (error) {
@@ -268,47 +358,44 @@ class PTCBot {
         console.log(`[${this.site.name}] Searching for ads...`);
         
         try {
-            // Look for ad links/buttons
-            const adSelectors = [
+            // Scroll down to load more content
+            await this.page.evaluate(() => window.scrollBy(0, window.innerHeight));
+            await this.page.waitForTimeout(2000);
+            
+            // Look for clickable elements
+            const clickSelectors = [
                 'a[href*="click"]',
                 'a[href*="ad"]',
                 'a[class*="ad"]',
                 'button[class*="earn"]',
                 'a[class*="earn"]',
                 '.offer-link',
-                '.ad-link',
-                'a[target="_blank"]'
+                '.ad-link'
             ];
             
-            let adsFound = 0;
-            
-            for (const selector of adSelectors) {
-                const ads = await this.page.$$(selector);
-                adsFound += ads.length;
-            }
-            
-            console.log(`[${this.site.name}] Found ${adsFound} potential ads`);
-            
-            // Click on ads
             let clicks = 0;
-            const maxClicks = this.site.adsPerDay || 20;
+            const maxClicks = this.site.adsPerDay || 10;
             
-            for (let i = 0; i < Math.min(adsFound, maxClicks); i++) {
-                try {
-                    // Random click position
-                    const ads = await this.page.$$('a[href*="click"], a[class*="ad"], .offer-link');
-                    if (ads[i]) {
-                        await ads[i].click();
-                        await this.page.waitForTimeout(this.site.timePerAd * 1000);
-                        clicks++;
-                        this.clicksToday++;
-                        this.totalEarned += this.site.earnPerClick;
-                        
-                        console.log(`[${this.site.name}] Clicked ad ${clicks}/${maxClicks} | Earned: $${(this.site.earnPerClick).toFixed(4)}`);
-                    }
-                } catch (clickError) {
-                    console.error(`[${this.site.name}] Error clicking ad:`, clickError.message);
+            for (let i = 0; i < maxClicks; i++) {
+                let clicked = false;
+                
+                for (const selector of clickSelectors) {
+                    try {
+                        const elements = await this.page.$$(selector);
+                        if (elements.length > i && elements[i]) {
+                            await elements[i].click();
+                            await this.page.waitForTimeout(this.site.timePerAd * 1000);
+                            clicks++;
+                            this.clicksToday++;
+                            this.totalEarned += this.site.earnPerClick;
+                            console.log(`[${this.site.name}] Clicked ad ${clicks}/${maxClicks} | Earned: $${(this.site.earnPerClick).toFixed(4)}`);
+                            clicked = true;
+                            break;
+                        }
+                    } catch(e) {}
                 }
+                
+                if (!clicked) break;
             }
             
             return clicks;
@@ -327,19 +414,22 @@ class PTCBot {
         
         while (sessionEarnings < targetEarnings) {
             try {
+                // Refresh page occasionally
+                if (Math.random() > 0.8) {
+                    await this.page.reload({ waitUntil: 'networkidle2' });
+                    await this.page.waitForTimeout(5000);
+                }
+                
                 const clicks = await this.findAndClickAds();
                 sessionEarnings = clicks * this.site.earnPerClick;
                 
                 console.log(`[${this.site.name}] Session progress: $${sessionEarnings.toFixed(4)} / $${targetEarnings.toFixed(4)}`);
                 
+                if (sessionEarnings >= targetEarnings) break;
+                
                 // Random delay between cycles (30-90 seconds)
                 const delay = 30000 + Math.random() * 60000;
                 await this.page.waitForTimeout(delay);
-                
-                // Refresh page occasionally
-                if (Math.random() > 0.7) {
-                    await this.page.reload({ waitUntil: 'networkidle2' });
-                }
                 
             } catch (error) {
                 console.error(`[${this.site.name}] Error in earning loop:`, error.message);
@@ -347,7 +437,7 @@ class PTCBot {
             }
         }
         
-        console.log(`[${this.site.name}] Daily target reached! Earned: $${sessionEarnings.toFixed(4)}`);
+        console.log(`[${this.site.name}] Session complete! Earned: $${sessionEarnings.toFixed(4)}`);
         return sessionEarnings;
     }
 
@@ -422,10 +512,14 @@ class EarningWorker {
             console.log(`\n--- Processing ${site.name} ---`);
             
             const bot = new PTCBot(site, this.instanceId);
-            const earned = await bot.run().catch(err => {
+            let earned = 0;
+            
+            try {
+                earned = await bot.run();
+            } catch (err) {
                 console.error(`Error on ${site.name}:`, err.message);
-                return 0;
-            });
+                earned = 0;
+            }
             
             totalEarnings += earned;
             this.sitesRun++;
@@ -487,7 +581,7 @@ app.get('/', async (req, res) => {
         .profit { color: #10b981; }
         .refresh-btn { background: linear-gradient(135deg, #667eea, #764ba2); color: white; border: none; padding: 12px 24px; border-radius: 12px; cursor: pointer; margin-bottom: 20px; font-weight: 600; }
         h2 { color: white; margin-bottom: 20px; font-weight: 600; }
-        .goal-progress { background: rgba(255,255,255,0.2); border-radius: 10px; height: 20px; overflow: hidden; margin-top: 10px; }
+        .goal-progress { background: rgba(255,255,255,0.2); border-radius: 10px; height: 20px; overflow: hidden; margin-bottom: 30px; }
         .goal-fill { background: linear-gradient(90deg, #00d4ff, #667eea); height: 100%; width: ${Math.min(100, (totalEarned / EARNING_GOAL) * 100)}%; transition: width 0.5s; }
     </style>
 </head>
@@ -498,15 +592,15 @@ app.get('/', async (req, res) => {
             <p>Automated PTC Earnings • Multi-Site Support • 24/7 Operation</p>
         </div>
         
-        <div class="stats-grid">
-            <div class="stat-card"><div class="stat-value">$${totalEarned.toFixed(2)}</div><div class="stat-label">Total Earned (All Time)</div></div>
-            <div class="stat-card"><div class="stat-value">$${(totalEarned / 30).toFixed(2)}</div><div class="stat-label">Monthly Average</div></div>
-            <div class="stat-card"><div class="stat-value">$${(totalEarned / 7).toFixed(2)}</div><div class="stat-label">Weekly Average</div></div>
-            <div class="stat-card"><div class="stat-value">${totalClicks}</div><div class="stat-label">Total Clicks</div></div>
+        <div class="goal-progress">
+            <div class="goal-fill"></div>
         </div>
         
-        <div class="goal-progress" style="margin-bottom: 30px;">
-            <div class="goal-fill"></div>
+        <div class="stats-grid">
+            <div class="stat-card"><div class="stat-value">$${totalEarned.toFixed(4)}</div><div class="stat-label">Total Earned (All Time)</div></div>
+            <div class="stat-card"><div class="stat-value">$${totalClicks}</div><div class="stat-label">Total Clicks</div></div>
+            <div class="stat-card"><div class="stat-value">${memoryStore.earnings.length}</div><div class="stat-label">Total Sessions</div></div>
+            <div class="stat-card"><div class="stat-value">${memoryStore.sites.size}</div><div class="stat-label">Active Sites</div></div>
         </div>
         
         <h2>🌐 PTC Sites Active</h2>
@@ -565,6 +659,9 @@ app.get('/api/earnings', (req, res) => {
 async function main() {
     console.log(`\n🚀 ${COMPANY_NAME} Starting...`);
     console.log(`📊 Dashboard: http://localhost:${port}`);
+    
+    // Install Chrome first
+    await installChromiumRuntime();
     
     await connectMongoDB();
     
