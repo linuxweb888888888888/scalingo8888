@@ -1,24 +1,17 @@
 {
   "name": "faucetpay-bot",
   "version": "6.0.0",
-  "description": "FaucetPay Internal Bot with Dashboard Login",
+  "description": "FaucetPay Bot with iFrame Dashboard",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js",
-    "postinstall": "npx puppeteer browsers install chrome"
+    "start": "node bot.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "puppeteer": "^22.15.0",
-    "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "express-rate-limit": "^7.4.0"
+    "express": "^4.18.2",
+    "puppeteer-core": "^21.11.0",
+    "chrome-aws-lambda": "^10.1.0"
   },
   "engines": {
-    "node": "20.x",
-    "npm": "10.x"
-  },
-  "keywords": ["faucetpay", "bot", "automation", "crypto"],
-  "author": "FaucetPay Bot",
-  "license": "MIT"
+    "node": "18.x"
+  }
 }
