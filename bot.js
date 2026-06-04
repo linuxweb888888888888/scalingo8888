@@ -13,13 +13,13 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const FAUCETPAY_WALLET_ADDRESS = process.env.FAUCETPAY_WALLET_ADDRESS || '';
+const FAUCETPAY_WALLET_ADDRESS = process.env.FAUCETPAY_WALLET_ADDRESS || '19ZjLS2cE74QcYmXHpDhhRtaA86YyjptSS';
 const HEADLESS_MODE = process.env.HEADLESS_MODE !== 'false';
 const SCAN_INTERVAL_SECONDS = parseInt(process.env.SCAN_INTERVAL_SECONDS) || 60;
 const DISCOVERY_INTERVAL_MINUTES = parseInt(process.env.DISCOVERY_INTERVAL_MINUTES) || 5;
-const AUTO_WITHDRAW = process.env.AUTO_WITHDRAW !== 'false';
-const AUTO_SETUP = process.env.AUTO_SETUP !== 'false';
-const AUTO_REGISTER = process.env.AUTO_REGISTER !== 'false';
+const AUTO_WITHDRAW = process.env.AUTO_WITHDRAW !== 'true';
+const AUTO_SETUP = process.env.AUTO_SETUP !== 'true';
+const AUTO_REGISTER = process.env.AUTO_REGISTER !== 'true';
 
 console.log('\n========================================');
 console.log('  External Faucets Bot v3.0');
