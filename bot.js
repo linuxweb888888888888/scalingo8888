@@ -1,4 +1,4 @@
-// external-faucets-bot.js - Complete Bot with Fixed Withdrawal
+// external-faucets-bot.js - Complete Bot with Transaction ID Tracking
 const express = require('express');
 const fs = require('fs');
 const { execSync } = require('child_process');
@@ -23,7 +23,7 @@ const AUTO_REGISTER = process.env.AUTO_REGISTER !== 'true';
 
 console.log('\n========================================');
 console.log('  External Faucets Bot v2.1');
-console.log('  FIXED WITHDRAWAL HANDLER');
+console.log('  WITH TRANSACTION ID TRACKING');
 console.log('========================================');
 console.log(`Auto Discover: Every ${DISCOVERY_INTERVAL_MINUTES} minutes`);
 console.log(`Auto Register: ${AUTO_REGISTER ? 'ON' : 'OFF'}`);
@@ -85,6 +85,30 @@ async function installChrome() {
 
 async function safeWait(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Function to extract transaction ID from page content
+async function extractTransactionId(pageContent) {
+    // Common transaction ID patterns
+    const patterns = [
+        /transaction[_\s]id[:\s]+([a-zA-Z0-9]{20,})/i,
+        /tx[_\s]id[:\s]+([a-zA-Z0-9]{20,})/i,
+        /txn[_\s]id[:\s]+([a-zA-Z0-9]{20,})/i,
+        /transaction[:\s]+([a-zA-Z0-9]{20,})/i,
+        /tx[:\s]+([a-zA-Z0-9]{20,})/i,
+        /hash[:\s]+([a-zA-Z0-9]{20,})/i,
+        /[A-Fa-f0-9]{64}/,
+        /[a-f0-9]{64}/,
+        /txid[=:\s]+([a-f0-9]{64})/i
+    ];
+    
+    for (const pattern of patterns) {
+        const match = pageContent.match(pattern);
+        if (match) {
+            return match[1] || match[0];
+        }
+    }
+    return null;
 }
 
 // ============ 100+ PRE-CONFIGURED EXTERNAL FAUCETS ============
@@ -165,78 +189,6 @@ const generateFaucetList = () => {
             minWithdraw: 0.0001,
             claimSelector: '.claim-btn',
             withdrawSelectors: ['.withdraw-btn', '#withdraw', 'button:has-text("Withdraw")']
-        },
-        {
-            name: 'ADBTC',
-            url: 'https://adbtc.top',
-            earnPerAction: 0.0002,
-            minWithdraw: 0.0001,
-            claimSelector: '#claim',
-            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]']
-        },
-        {
-            name: 'BonusBitcoin',
-            url: 'https://bonusbitcoin.co',
-            earnPerAction: 0.0002,
-            minWithdraw: 0.0001,
-            claimSelector: '#roll',
-            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]']
-        },
-        {
-            name: 'BTCClicks',
-            url: 'https://btcclicks.com',
-            earnPerAction: 0.0002,
-            minWithdraw: 0.0001,
-            claimSelector: '.claim-btn',
-            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]']
-        },
-        {
-            name: 'CoinFaucet',
-            url: 'https://coinfaucet.io',
-            earnPerAction: 0.0002,
-            minWithdraw: 0.0001,
-            claimSelector: '#claim',
-            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]']
-        },
-        {
-            name: 'DailyBitcoin',
-            url: 'https://dailybitcoin.fun',
-            earnPerAction: 0.0002,
-            minWithdraw: 0.0001,
-            claimSelector: '.claim-btn',
-            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]']
-        },
-        {
-            name: 'EasyFaucet',
-            url: 'https://easyfaucet.xyz',
-            earnPerAction: 0.0002,
-            minWithdraw: 0.0001,
-            claimSelector: '#claim',
-            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]']
-        },
-        {
-            name: 'FaucetBOX',
-            url: 'https://faucetbox.com',
-            earnPerAction: 0.0002,
-            minWithdraw: 0.0001,
-            claimSelector: '.claim-btn',
-            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]']
-        },
-        {
-            name: 'FaucetGalaxy',
-            url: 'https://faucetgalaxy.com',
-            earnPerAction: 0.0002,
-            minWithdraw: 0.0001,
-            claimSelector: '#claim',
-            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]']
-        },
-        {
-            name: 'FaucetKing',
-            url: 'https://faucetking.io',
-            earnPerAction: 0.0002,
-            minWithdraw: 0.0001,
-            claimSelector: '.claim-btn',
-            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]']
         }
     ];
     
@@ -491,7 +443,7 @@ class WalletSetupManager {
     }
 }
 
-// ============ EARNING ENGINE WITH FIXED WITHDRAWAL ============
+// ============ EARNING ENGINE WITH TRANSACTION ID TRACKING ============
 class EarningEngine {
     constructor(page) {
         this.page = page;
@@ -524,7 +476,6 @@ class EarningEngine {
                         break;
                     }
                 } catch(e) {
-                    // Try alternative click method
                     try {
                         await this.page.evaluate((sel) => {
                             const btn = document.querySelector(sel);
@@ -537,7 +488,7 @@ class EarningEngine {
                 }
             }
             
-            // Method 2: Find by text content using evaluate
+            // Method 2: Find by text content
             if (!withdrawClicked) {
                 withdrawClicked = await this.page.evaluate(() => {
                     const buttons = Array.from(document.querySelectorAll('button, a'));
@@ -556,7 +507,7 @@ class EarningEngine {
                 }
             }
             
-            // Method 3: Try XPath
+            // Method 3: XPath
             if (!withdrawClicked) {
                 try {
                     const [withdrawBtn] = await this.page.$x("//button[contains(text(), 'Withdraw')] | //a[contains(text(), 'Withdraw')] | //button[contains(text(), 'withdraw')] | //a[contains(text(), 'withdraw')]");
@@ -568,7 +519,7 @@ class EarningEngine {
                 } catch(e) {}
             }
             
-            // Method 4: Try to find any link with withdraw in href
+            // Method 4: Link with withdraw in href
             if (!withdrawClicked) {
                 try {
                     const withdrawLink = await this.page.$('a[href*="withdraw"], a[href*="withdrawal"]');
@@ -583,8 +534,13 @@ class EarningEngine {
             if (withdrawClicked) {
                 await safeWait(5000);
                 
-                // Check for success
+                // Get page content to extract transaction ID
                 const pageContent = await this.page.content();
+                
+                // Extract transaction ID
+                const transactionId = await extractTransactionId(pageContent);
+                
+                // Check for success
                 const success = pageContent.toLowerCase().includes('success') || 
                                pageContent.toLowerCase().includes('sent') ||
                                pageContent.toLowerCase().includes('completed') ||
@@ -594,13 +550,20 @@ class EarningEngine {
                 if (success) {
                     console.log(`   ✅✅✅ WITHDRAWAL SUCCESSFUL! ✅✅✅`);
                     console.log(`   💰 $${balance.toFixed(5)} sent to wallet`);
+                    if (transactionId) {
+                        console.log(`   🆔 Transaction ID: ${transactionId}`);
+                    } else {
+                        console.log(`   🆔 Transaction ID: Pending (may appear later)`);
+                    }
                     
                     stats.successfulWithdrawals++;
                     stats.withdrawalHistory.unshift({
                         time: new Date(),
                         source: source.name,
                         amount: balance,
-                        status: 'SUCCESS'
+                        status: 'SUCCESS',
+                        transactionId: transactionId || 'Pending',
+                        details: `Successfully withdrew $${balance.toFixed(5)} from ${source.name}`
                     });
                     
                     stats.sourceBalances[source.name].earned = 0;
@@ -613,7 +576,9 @@ class EarningEngine {
                         source: source.name,
                         amount: balance,
                         status: 'FAILED',
-                        error: 'Not confirmed'
+                        transactionId: null,
+                        error: 'Not confirmed',
+                        details: 'Withdrawal not confirmed by the site'
                     });
                     return false;
                 }
@@ -626,7 +591,9 @@ class EarningEngine {
                     source: source.name,
                     amount: balance,
                     status: 'FAILED',
-                    error: 'Button not found'
+                    transactionId: null,
+                    error: 'Button not found',
+                    details: 'Could not locate withdraw button on the page'
                 });
                 return false;
             }
@@ -638,7 +605,9 @@ class EarningEngine {
                 source: source.name,
                 amount: balance,
                 status: 'FAILED',
-                error: error.message
+                transactionId: null,
+                error: error.message,
+                details: `Exception during withdrawal: ${error.message}`
             });
             return false;
         }
@@ -774,6 +743,9 @@ class EarningEngine {
             const timeSince = (Date.now() - new Date(last.time).getTime()) / 1000;
             if (timeSince < 120) {
                 console.log(`\n💸 Last withdrawal: $${last.amount.toFixed(5)} from ${last.source} - ${last.status}`);
+                if (last.transactionId) {
+                    console.log(`   🆔 TXID: ${last.transactionId}`);
+                }
             }
         }
         
@@ -852,7 +824,7 @@ class ExternalFaucetBot {
     }
 }
 
-// ============ DASHBOARD ============
+// ============ DASHBOARD WITH TRANSACTION ID DISPLAY ============
 app.get('/', (req, res) => {
     const uptime = Math.floor((Date.now() - stats.startTime) / 1000);
     const hours = Math.floor(uptime / 3600);
@@ -868,16 +840,23 @@ app.get('/', (req, res) => {
         .map(([name, data]) => {
             const source = EXTERNAL_FAUCETS.find(s => s.name === name);
             const progress = source?.minWithdraw ? ((data.earned / source.minWithdraw) * 100).toFixed(1) : 0;
-            return `<tr><td style="font-size:11px">${name.substring(0, 25)}</td><td class="earn">$${data.earned.toFixed(5)}</td><td>${data.claims}</td><td>${progress}%</td><td>${data.walletConfigured ? '✅' : '❌'}</td><td>${data.withdrawalAttempted ? '💰' : '⏳'}</td></tr>`;
+            return `<tr><td style="font-size:11px">${name.substring(0, 25)}</td><td class="earn">$${data.earned.toFixed(5)}</td><td>${data.claims}</td><td>${progress}%</td><td>${data.walletConfigured ? '✅' : '❌'}</td><td>${data.withdrawalAttempted ? '💰' : '⏳'}</td></table>`;
         }).join('');
     
     const withdrawalHtml = stats.withdrawalHistory.slice(0, 20).map(w => `
-        <tr><td>${new Date(w.time).toLocaleTimeString()}</td><td style="font-size:11px">${w.source.substring(0, 25)}</td><td class="earn">$${w.amount.toFixed(5)}</td><td class="${w.status === 'SUCCESS' ? 'earn' : 'error'}">${w.status}</td><td>${w.error || '-'}</td></tr>
+        <tr>
+            <td style="font-size:11px">${new Date(w.time).toLocaleTimeString()}</td>
+            <td style="font-size:11px">${w.source.substring(0, 25)}</td>
+            <td class="earn">$${w.amount.toFixed(5)}</td>
+            <td class="${w.status === 'SUCCESS' ? 'earn' : 'error'}">${w.status}</td>
+            <td style="font-size:10px; word-break:break-all;">${w.transactionId ? w.transactionId.substring(0, 20) + '...' : '-'}</td>
+            <td style="font-size:10px">${w.error || w.details || '-'}</td>
+        </tr>
     `).join('');
     
     res.send(`
 <!DOCTYPE html>
-<html><head><title>External Faucets Bot</title><meta http-equiv="refresh" content="30">
+<html><head><title>External Faucets Bot - With TXID</title><meta http-equiv="refresh" content="30">
 <style>
 body{background:#0a0e27;color:#00ff88;font-family:monospace;padding:20px}
 .container{max-width:1600px;margin:0 auto}
@@ -887,10 +866,11 @@ body{background:#0a0e27;color:#00ff88;font-family:monospace;padding:20px}
 .error{color:#ff4444}
 table{width:100%;border-collapse:collapse}
 th,td{padding:8px;text-align:left;border-bottom:1px solid #333;font-size:12px}
+.txid{font-family:monospace;font-size:10px;color:#ffaa00}
 </style>
 <body>
 <div class="container">
-<h1>💰 External Faucets Bot v2.1 - Fixed Withdrawal</h1>
+<h1>💰 External Faucets Bot - With Transaction IDs</h1>
 <div class="card">
 🟢 LIVE | Uptime: ${hours}h ${minutes}m<br>
 Total Sources: ${EXTERNAL_FAUCETS.length} | Discovered: ${stats.discoveredCount}<br>
@@ -907,9 +887,9 @@ Wallet: ${FAUCETPAY_WALLET_ADDRESS ? FAUCETPAY_WALLET_ADDRESS.substring(0, 15) +
 <div class="card"><h3>🪙 Active Sources</h3>
 <table><thead><tr><th>Source</th><th>Balance</th><th>Claims</th><th>Progress</th><th>Wallet</th><th>Status</th></tr></thead>
 <tbody>${sourceBalancesHtml || '<tr><td colspan="6">No activity yet</td></tr>'}</tbody></table></div>
-<div class="card"><h3>💸 Withdrawal History</h3>
-<table><thead><tr><th>Time</th><th>Source</th><th>Amount</th><th>Status</th><th>Details</th></tr></thead>
-<tbody>${withdrawalHtml || '<tr><td colspan="5">No withdrawals yet</td></tr>'}</tbody></table></div>
+<div class="card"><h3>💸 Withdrawal History (With Transaction IDs)</h3>
+<table><thead><tr><th>Time</th><th>Source</th><th>Amount</th><th>Status</th><th>TXID</th><th>Details</th></tr></thead>
+<tbody>${withdrawalHtml || '<tr><td colspan="6">No withdrawals yet</td></tr>'}</tbody></table></div>
 </div>
 </body></html>`);
 });
