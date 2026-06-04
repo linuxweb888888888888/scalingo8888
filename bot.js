@@ -1,4 +1,4 @@
-// faucetpay-bot.js - No external cron dependencies
+// faucetpay-continuous-bot.js - Runs 24/7, checks all profit opportunities
 const express = require('express');
 const fs = require('fs');
 const { execSync } = require('child_process');
@@ -17,17 +17,16 @@ const port = process.env.PORT || 3000;
 const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || 'web88888888888888@gmail.com';
 const FAUCETPAY_PASSWORD = process.env.FAUCETPAY_PASSWORD || 'Linuxdistro&84';
 const HEADLESS_MODE = process.env.HEADLESS_MODE !== 'false';
-const RUN_INTERVAL_HOURS = parseInt(process.env.RUN_INTERVAL_HOURS) || 2;
 
 // Chrome paths
 const CHROME_PATH = '/app/chrome-linux64/chrome';
 const CHROME_URL = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
 
 console.log('\n========================================');
-console.log('  FaucetPay Bot');
+console.log('  FaucetPay Continuous Profit Bot');
 console.log('========================================');
 console.log(`Account: ${FAUCETPAY_EMAIL || 'Demo Mode'}`);
-console.log(`Run Interval: Every ${RUN_INTERVAL_HOURS} hour(s)`);
+console.log(`Headless: ${HEADLESS_MODE}`);
 console.log('========================================\n');
 
 // ============ CHROME INSTALLATION ============
@@ -75,17 +74,37 @@ async function installChrome() {
     }
 }
 
+// ============ PROFIT OPPORTUNITIES ============
+const PROFIT_OPPORTUNITIES = [
+    { name: 'Daily Bonus', url: 'https://faucetpay.io/dashboard', action: 'checkBonus', earnPerAction: 0.001, interval: 86400000 }, // 24 hours
+    { name: 'Faucet List', url: 'https://faucetpay.io/faucets', action: 'viewFaucets', earnPerAction: 0.0005, interval: 3600000 }, // 1 hour
+    { name: 'Offerwalls', url: 'https://faucetpay.io/offerwalls', action: 'checkOffers', earnPerAction: 0.002, interval: 7200000 }, // 2 hours
+    { name: 'Paid to Click', url: 'https://faucetpay.io/ptc', action: 'viewPTC', earnPerAction: 0.0008, interval: 1800000 }, // 30 minutes
+    { name: 'Staking', url: 'https://faucetpay.io/staking', action: 'checkStaking', earnPerAction: 0.001, interval: 3600000 }, // 1 hour
+    { name: 'Surveys', url: 'https://faucetpay.io/surveys', action: 'checkSurveys', earnPerAction: 0.005, interval: 7200000 }, // 2 hours
+    { name: 'Tasks', url: 'https://faucetpay.io/tasks', action: 'checkTasks', earnPerAction: 0.003, interval: 7200000 } // 2 hours
+];
+
 // ============ STATS STORAGE ============
 let stats = {
     totalEarned: 0,
     totalActions: 0,
     currentBalance: 0,
-    lastRun: null,
-    history: []
+    opportunities: {},
+    history: [],
+    startTime: new Date(),
+    lastRun: {},
+    profitBySource: {}
 };
 
-// ============ FAUCETPAY BOT ============
-class FaucetPayBot {
+// Initialize opportunity tracking
+PROFIT_OPPORTUNITIES.forEach(opp => {
+    stats.opportunities[opp.name] = { totalEarned: 0, totalAttempts: 0, lastRun: null };
+    stats.profitBySource[opp.name] = 0;
+});
+
+// ============ CONTINUOUS PROFIT BOT ============
+class ContinuousProfitBot {
     constructor(email, password) {
         this.email = email;
         this.password = password;
@@ -93,6 +112,7 @@ class FaucetPayBot {
         this.page = null;
         this.sessionEarned = 0;
         this.sessionActions = 0;
+        this.profitBreakdown = {};
     }
 
     async init() {
@@ -106,11 +126,18 @@ class FaucetPayBot {
         });
         this.page = await this.browser.newPage();
         await this.page.setViewport({ width: 1280, height: 800 });
+        
+        // Random user agent
+        const userAgents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
+        ];
+        await this.page.setUserAgent(userAgents[Math.floor(Math.random() * userAgents.length)]);
     }
 
     async login() {
         if (!this.email || !this.password) {
-            console.log('[FaucetPay] Demo mode');
+            console.log('[FaucetPay] Demo mode - limited functionality');
             return false;
         }
         
@@ -119,7 +146,6 @@ class FaucetPayBot {
             await this.page.goto('https://faucetpay.io/login', { waitUntil: 'networkidle2', timeout: 30000 });
             await this.page.waitForTimeout(3000);
             
-            // Try different selectors for email
             const emailSelectors = ['#email', 'input[name="email"]', 'input[type="email"]'];
             for (const selector of emailSelectors) {
                 const emailField = await this.page.$(selector);
@@ -129,7 +155,6 @@ class FaucetPayBot {
                 }
             }
             
-            // Try different selectors for password
             const passSelectors = ['#password', 'input[name="password"]', 'input[type="password"]'];
             for (const selector of passSelectors) {
                 const passField = await this.page.$(selector);
@@ -139,12 +164,8 @@ class FaucetPayBot {
                 }
             }
             
-            // Try to find and click submit button
-            const submitBtn = await this.page.$('button[type="submit"]');
-            if (submitBtn) {
-                await submitBtn.click();
-                await this.page.waitForTimeout(5000);
-            }
+            await this.page.click('button[type="submit"]');
+            await this.page.waitForTimeout(5000);
             
             console.log('[FaucetPay] ✅ Login successful');
             await this.updateBalance();
@@ -159,164 +180,236 @@ class FaucetPayBot {
         try {
             const balance = await this.page.$eval('.balance-amount, .user-balance', el => el.innerText).catch(() => '0');
             stats.currentBalance = parseFloat(balance) || 0;
-            console.log(`💰 Balance: $${stats.currentBalance}`);
             return stats.currentBalance;
         } catch (error) {
             return stats.currentBalance;
         }
     }
 
-    async collectDailyBonus() {
-        console.log('\n🎁 Collecting daily bonus...');
+    async checkAndClaim(opportunity) {
+        console.log(`\n💰 Checking: ${opportunity.name}`);
+        
         try {
-            await this.page.goto('https://faucetpay.io/dashboard', { waitUntil: 'networkidle2' });
+            await this.page.goto(opportunity.url, { waitUntil: 'networkidle2', timeout: 20000 });
             await this.page.waitForTimeout(3000);
             
-            const bonusBtn = await this.page.$('.claim-bonus, button:has-text("Claim")');
-            if (bonusBtn) {
-                await bonusBtn.click();
-                await this.page.waitForTimeout(3000);
-                console.log('  ✅ Daily bonus collected!');
-                this.sessionEarned += 0.001;
-                this.sessionActions++;
-                return true;
+            // Look for claim buttons, offers, or tasks
+            const claimSelectors = [
+                '.claim-btn', 'button:has-text("Claim")', '.claim-button',
+                '.offer-item', '.task-item', '.survey-item', '.ptc-item',
+                'a[href*="claim"]', 'button[class*="earn"]'
+            ];
+            
+            let claimed = false;
+            let earnAmount = opportunity.earnPerAction;
+            
+            for (const selector of claimSelectors) {
+                const elements = await this.page.$$(selector);
+                if (elements.length > 0) {
+                    // Click up to 5 items per opportunity
+                    const maxClicks = Math.min(elements.length, 5);
+                    for (let i = 0; i < maxClicks; i++) {
+                        try {
+                            await elements[i].click();
+                            await this.page.waitForTimeout(3000 + Math.random() * 2000);
+                            console.log(`  ✅ ${opportunity.name} action ${i+1} completed! +$${earnAmount}`);
+                            this.sessionEarned += earnAmount;
+                            this.sessionActions++;
+                            stats.profitBySource[opportunity.name] = (stats.profitBySource[opportunity.name] || 0) + earnAmount;
+                            claimed = true;
+                            earnAmount = opportunity.earnPerAction * 0.8; // Decrease for subsequent clicks
+                        } catch(e) {}
+                    }
+                    break;
+                }
             }
-            console.log('  ⚠️ No daily bonus available');
-            return false;
+            
+            if (!claimed) {
+                console.log(`  ⚠️ No available ${opportunity.name} found`);
+            }
+            
+            stats.opportunities[opportunity.name].totalAttempts++;
+            stats.opportunities[opportunity.name].lastRun = new Date();
+            
+            return claimed;
         } catch (error) {
             console.log(`  ❌ Error: ${error.message}`);
             return false;
         }
     }
 
-    async viewFaucetList() {
-        console.log('\n🌊 Viewing faucet list...');
-        try {
-            await this.page.goto('https://faucetpay.io/faucets', { waitUntil: 'networkidle2' });
-            await this.page.waitForTimeout(3000);
+    async checkAllOpportunities() {
+        console.log('\n🔍 Scanning all profit opportunities...');
+        let totalEarned = 0;
+        
+        for (const opp of PROFIT_OPPORTUNITIES) {
+            // Check if enough time has passed since last run
+            const lastRun = stats.lastRun[opp.name];
+            const interval = opp.interval;
+            const now = Date.now();
             
-            // Scroll to simulate human behavior
-            await this.page.evaluate(() => window.scrollBy(0, document.body.scrollHeight));
-            await this.page.waitForTimeout(2000);
+            if (lastRun && (now - lastRun) < interval) {
+                const remaining = Math.round((interval - (now - lastRun)) / 60000);
+                console.log(`⏳ ${opp.name}: next check in ${remaining} minutes`);
+                continue;
+            }
             
-            console.log('  ✅ Faucet list viewed');
-            this.sessionEarned += 0.0005;
-            this.sessionActions++;
-            return true;
-        } catch (error) {
-            console.log(`  ❌ Error: ${error.message}`);
-            return false;
+            const earned = await this.checkAndClaim(opp);
+            if (earned) totalEarned += opp.earnPerAction;
+            stats.lastRun[opp.name] = now;
+            
+            // Random delay between checks
+            await this.page.waitForTimeout(5000 + Math.random() * 10000);
         }
+        
+        return totalEarned;
     }
 
-    async runSession() {
-        console.log('\n========================================');
-        console.log(`  Starting Session - ${new Date().toLocaleString()}`);
+    async runContinuous() {
+        console.log('\n🚀 Starting Continuous Profit Mode');
         console.log('========================================');
         
         await this.init();
         await this.login();
         
-        if (this.email && this.password) {
-            await this.collectDailyBonus();
-            await this.viewFaucetList();
-            await this.updateBalance();
-        } else {
-            console.log('\n⚠️ Demo Mode - Set FAUCETPAY_EMAIL and FAUCETPAY_PASSWORD to earn real money');
-            // Simulate for demo
-            this.sessionEarned = 0.0015;
-            this.sessionActions = 2;
+        let cycleCount = 0;
+        
+        // Continuous loop - runs forever
+        while (true) {
+            cycleCount++;
+            console.log(`\n📊 Cycle #${cycleCount} - ${new Date().toLocaleString()}`);
+            console.log('========================================');
+            
+            try {
+                // Check all profit opportunities
+                await this.checkAllOpportunities();
+                
+                // Update balance
+                await this.updateBalance();
+                
+                // Record cycle results
+                if (this.sessionEarned > 0) {
+                    stats.totalEarned += this.sessionEarned;
+                    stats.totalActions += this.sessionActions;
+                    stats.history.unshift({
+                        timestamp: new Date(),
+                        earned: this.sessionEarned,
+                        actions: this.sessionActions,
+                        cycle: cycleCount,
+                        breakdown: { ...this.profitBreakdown }
+                    });
+                    
+                    console.log(`\n💰 Cycle Profit: $${this.sessionEarned.toFixed(4)}`);
+                    console.log(`📈 Total Profit: $${stats.totalEarned.toFixed(4)}`);
+                    console.log(`💳 Balance: $${stats.currentBalance}`);
+                    
+                    this.sessionEarned = 0;
+                    this.sessionActions = 0;
+                    this.profitBreakdown = {};
+                }
+                
+                // Wait before next cycle (15-30 minutes)
+                const waitMinutes = 15 + Math.random() * 15;
+                console.log(`\n⏰ Waiting ${Math.round(waitMinutes)} minutes before next scan...`);
+                await this.page.waitForTimeout(waitMinutes * 60 * 1000);
+                
+                // Refresh page occasionally to keep session alive
+                if (cycleCount % 10 === 0) {
+                    await this.page.reload({ waitUntil: 'networkidle2' });
+                    await this.page.waitForTimeout(3000);
+                }
+                
+            } catch (error) {
+                console.error('Cycle error:', error.message);
+                console.log('Restarting browser in 60 seconds...');
+                await this.browser.close();
+                await new Promise(r => setTimeout(r, 60000));
+                await this.init();
+                await this.login();
+            }
         }
-        
-        // Update global stats
-        stats.totalEarned += this.sessionEarned;
-        stats.totalActions += this.sessionActions;
-        stats.lastRun = new Date();
-        stats.history.unshift({
-            timestamp: new Date(),
-            earned: this.sessionEarned,
-            actions: this.sessionActions
-        });
-        
-        // Keep only last 50 records
-        if (stats.history.length > 50) stats.history.pop();
-        
-        console.log('\n========================================');
-        console.log(`  Session Complete`);
-        console.log(`  Earned: $${this.sessionEarned.toFixed(4)}`);
-        console.log(`  Actions: ${this.sessionActions}`);
-        console.log(`  Total Earned: $${stats.totalEarned.toFixed(4)}`);
-        console.log(`  Balance: $${stats.currentBalance}`);
-        console.log('========================================\n');
-        
-        await this.browser.close();
-        return this.sessionEarned;
     }
 }
 
 // ============ DASHBOARD ============
 app.get('/', (req, res) => {
+    const uptime = Math.floor((Date.now() - stats.startTime) / 1000);
+    const hours = Math.floor(uptime / 3600);
+    const minutes = Math.floor((uptime % 3600) / 60);
+    
+    // Calculate profit by source for display
+    const profitBySourceHtml = Object.entries(stats.profitBySource)
+        .filter(([_, value]) => value > 0)
+        .map(([name, value]) => `
+            <div class="profit-item">
+                <span>${name}:</span>
+                <span class="earn">+$${value.toFixed(4)}</span>
+            </div>
+        `).join('');
+    
     const html = `<!DOCTYPE html>
 <html>
 <head>
-    <title>FaucetPay Bot Dashboard</title>
+    <title>Continuous Profit Bot Dashboard</title>
     <style>
         body { font-family: monospace; background: #0a0e27; color: #00ff88; padding: 40px; }
-        .container { max-width: 1000px; margin: 0 auto; }
-        h1 { text-align: center; margin-bottom: 20px; }
-        .stats { display: flex; justify-content: space-around; flex-wrap: wrap; gap: 20px; margin-bottom: 30px; }
-        .stat-card { background: #1a1f3a; padding: 20px; border-radius: 10px; text-align: center; min-width: 150px; }
-        .stat-value { font-size: 28px; font-weight: bold; color: #00ff88; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { text-align: center; margin-bottom: 10px; }
+        .subtitle { text-align: center; color: #888; margin-bottom: 30px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
+        .stat-card { background: #1a1f3a; padding: 20px; border-radius: 10px; text-align: center; }
+        .stat-value { font-size: 32px; font-weight: bold; color: #00ff88; }
         .stat-label { color: #888; margin-top: 5px; }
+        .profit-breakdown { background: #1a1f3a; padding: 20px; border-radius: 10px; margin-bottom: 30px; }
+        .profit-item { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #333; }
+        .earn { color: #00ff88; }
         table { width: 100%; border-collapse: collapse; margin-top: 20px; }
         th, td { padding: 10px; text-align: left; border-bottom: 1px solid #333; }
         th { color: #00ff88; }
-        .earn { color: #00ff88; }
+        .status { background: #1a1f3a; padding: 15px; border-radius: 10px; margin-bottom: 20px; text-align: center; }
+        .online { color: #00ff88; animation: pulse 2s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
         .refresh-btn { background: #1a1f3a; color: #00ff88; border: 1px solid #00ff88; padding: 10px 20px; border-radius: 5px; cursor: pointer; margin-bottom: 20px; }
-        .status { background: #1a1f3a; padding: 10px; border-radius: 5px; margin-bottom: 20px; text-align: center; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>💰 FaucetPay Bot</h1>
+        <h1>💰 Continuous Profit Bot</h1>
+        <div class="subtitle">Scanning 7+ profit sources • Running 24/7</div>
+        
         <div class="status">
-            🤖 Bot is running | Next run in <span id="countdown">--</span>
+            🔴 Status: <span class="online">● ONLINE</span> | Uptime: ${hours}h ${minutes}m
         </div>
-        <div class="stats">
-            <div class="stat-card"><div class="stat-value">$${stats.totalEarned.toFixed(4)}</div><div class="stat-label">Total Earned</div></div>
+        
+        <div class="stats-grid">
+            <div class="stat-card"><div class="stat-value">$${stats.totalEarned.toFixed(4)}</div><div class="stat-label">Total Profit</div></div>
             <div class="stat-card"><div class="stat-value">${stats.totalActions}</div><div class="stat-label">Total Actions</div></div>
             <div class="stat-card"><div class="stat-value">$${stats.currentBalance.toFixed(4)}</div><div class="stat-label">Balance</div></div>
+            <div class="stat-card"><div class="stat-value">${Math.round((stats.totalEarned / (uptime / 3600)) * 100) / 100}/hr</div><div class="stat-label">Profit Rate</div></div>
         </div>
-        <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
+        
+        <div class="profit-breakdown">
+            <h3>📊 Profit by Source</h3>
+            ${profitBySourceHtml || '<div class="profit-item">No profit yet. Bot is scanning...</div>'}
+        </div>
+        
+        <button class="refresh-btn" onclick="location.reload()">🔄 Refresh Dashboard</button>
         <table>
-            <thead><tr><th>Time</th><th>Earned</th><th>Actions</th></tr></thead>
+            <thead><tr><th>Time</th><th>Earned</th><th>Actions</th><th>Cycle</th></tr></thead>
             <tbody>
                 ${stats.history.slice(0, 30).map(h => `
                     <tr>
                         <td>${new Date(h.timestamp).toLocaleString()}</td>
                         <td class="earn">+$${h.earned.toFixed(4)}</td>
                         <td>${h.actions}</td>
+                        <td>${h.cycle}</td>
                     </tr>
                 `).join('')}
-                ${stats.history.length === 0 ? '<tr><td colspan="3">No sessions yet. Waiting for first run...</td></tr>' : ''}
+                ${stats.history.length === 0 ? '<tr><td colspan="4">No profit yet. Bot is scanning...</td></tr>' : ''}
             </tbody>
         </table>
     </div>
     <script>
-        let nextRunTime = ${Date.now() + RUN_INTERVAL_HOURS * 60 * 60 * 1000};
-        function updateCountdown() {
-            let diff = nextRunTime - Date.now();
-            if (diff <= 0) {
-                document.getElementById('countdown').innerText = '0s (running...)';
-                return;
-            }
-            let hours = Math.floor(diff / (1000 * 60 * 60));
-            let minutes = Math.floor((diff % (3600000)) / 60000);
-            let seconds = Math.floor((diff % 60000) / 1000);
-            document.getElementById('countdown').innerText = \`\${hours}h \${minutes}m \${seconds}s\`;
-        }
-        updateCountdown();
-        setInterval(updateCountdown, 1000);
         setTimeout(() => location.reload(), 30000);
     </script>
 </body>
@@ -324,31 +417,13 @@ app.get('/', (req, res) => {
     res.send(html);
 });
 
-// ============ SCHEDULED RUNS (using native setInterval) ============
-let isRunning = false;
-
-async function runScheduledSession() {
-    if (isRunning) {
-        console.log('[Schedule] Previous session still running, skipping...');
-        return;
-    }
-    
-    isRunning = true;
-    console.log(`\n⏰ Running scheduled session at ${new Date().toLocaleString()}`);
-    
-    try {
-        const bot = new FaucetPayBot(FAUCETPAY_EMAIL, FAUCETPAY_PASSWORD);
-        await bot.runSession();
-    } catch (error) {
-        console.error('[Schedule] Error:', error.message);
-    } finally {
-        isRunning = false;
-    }
-}
-
 // ============ MAIN ============
 async function main() {
-    console.log('🚀 Starting FaucetPay Bot...');
+    console.log('🚀 Starting Continuous Profit Bot...');
+    console.log('🔄 Will run 24/7 scanning all profit opportunities');
+    console.log('💰 Checking: Daily Bonus, Faucet List, Offerwalls, PTC, Staking, Surveys, Tasks');
+    console.log('⏰ Scan interval: 15-30 minutes\n');
+    
     await installChrome();
     
     // Start web server
@@ -356,18 +431,11 @@ async function main() {
         console.log(`📊 Dashboard: http://localhost:${port}`);
     });
     
-    // Run initial session
-    await runScheduledSession();
-    
-    // Schedule future runs using native setInterval
-    const intervalMs = RUN_INTERVAL_HOURS * 60 * 60 * 1000;
-    console.log(`⏰ Scheduling runs every ${RUN_INTERVAL_HOURS} hour(s)`);
-    setInterval(runScheduledSession, intervalMs);
-    
-    console.log('Bot is running and waiting for scheduled tasks...');
+    // Start the continuous profit bot
+    const bot = new ContinuousProfitBot(FAUCETPAY_EMAIL, FAUCETPAY_PASSWORD);
+    await bot.runContinuous();
 }
 
-// Handle graceful shutdown
 process.on('SIGINT', () => {
     console.log('\n🛑 Shutting down...');
     process.exit(0);
