@@ -14,8 +14,8 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || '';
-const FAUCETPAY_PASSWORD = process.env.FAUCETPAY_PASSWORD || '';
+const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || 'web88888888888888@gmail.com';
+const FAUCETPAY_PASSWORD = process.env.FAUCETPAY_PASSWORD || 'Linuxdistro&84';
 const HEADLESS_MODE = process.env.HEADLESS_MODE !== 'false';
 const RUN_INTERVAL_HOURS = parseInt(process.env.RUN_INTERVAL_HOURS) || 2;
 
