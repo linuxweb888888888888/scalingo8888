@@ -1,17 +1,24 @@
 {
-  "name": "faucetpay-bot",
-  "version": "6.0.0",
-  "description": "FaucetPay Bot with iFrame Dashboard",
-  "main": "bot.js",
+  "name": "faucetpay-internal-bot",
+  "version": "1.0.0",
+  "description": "FaucetPay Internal Bot - Daily Bonus, Faucet List, Offerwalls, PTC Ads, Staking, Tasks",
+  "main": "faucetpay-internal-bot.js",
+  "type": "commonjs",
   "scripts": {
-    "start": "node bot.js"
-  },
-  "dependencies": {
-    "express": "^4.18.2",
-    "puppeteer-core": "^21.11.0",
-    "chrome-aws-lambda": "^10.1.0"
+    "start": "node faucetpay-internal-bot.js",
+    "dev": "cross-env HEADLESS_MODE=false node faucetpay-internal-bot.js"
   },
   "engines": {
-    "node": "18.x"
+    "node": "20.x",
+    "npm": "10.x"
+  },
+  "dependencies": {
+    "express": "4.18.2",
+    "puppeteer": "21.6.1",
+    "puppeteer-extra": "3.3.6",
+    "puppeteer-extra-plugin-stealth": "2.11.2"
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3"
   }
 }
