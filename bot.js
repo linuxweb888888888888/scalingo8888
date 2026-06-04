@@ -1,4 +1,4 @@
-// faucetpay-internal-bot.js - ONLY FaucetPay Internal Sources (Fixed Login)
+// faucetpay-internal-bot.js - ONLY FaucetPay Internal Sources (FIXED SELECTORS)
 const express = require('express');
 const fs = require('fs');
 const { execSync } = require('child_process');
@@ -19,8 +19,8 @@ const HEADLESS_MODE = process.env.HEADLESS_MODE !== 'false';
 const SCAN_INTERVAL_SECONDS = parseInt(process.env.SCAN_INTERVAL_SECONDS) || 60;
 
 console.log('\n========================================');
-console.log('  FaucetPay Internal Bot v2.0');
-console.log('  ONLY INTERNAL SOURCES');
+console.log('  FaucetPay Internal Bot v3.0');
+console.log('  ONLY INTERNAL SOURCES - FIXED SELECTORS');
 console.log('  Daily Bonus | Faucet List | Offerwalls | PTC Ads | Staking | Tasks');
 console.log('========================================');
 console.log(`Scan: Every ${SCAN_INTERVAL_SECONDS}s`);
@@ -106,18 +106,13 @@ class FaucetPayLogin {
         console.log('========================================');
         
         try {
-            // Navigate to login page and wait for React to load
             await this.page.goto('https://faucetpay.io/login', { 
                 waitUntil: 'networkidle2', 
                 timeout: 30000 
             });
             
-            // Wait for React to render the form (important!)
-            await this.page.waitForFunction(
-                () => document.querySelector('input') !== null,
-                { timeout: 10000 }
-            );
-            await safeWait(3000);
+            // Wait for page to load
+            await safeWait(4000);
             
             // Check if already logged in
             const currentUrl = this.page.url();
@@ -128,125 +123,57 @@ class FaucetPayLogin {
                 return true;
             }
             
-            console.log('📍 Login page loaded, finding form fields...');
+            console.log('📍 Login page loaded, entering credentials...');
             
-            // Take screenshot for debugging
-            if (!HEADLESS_MODE) {
-                await this.page.screenshot({ path: '/tmp/login-page.png' });
-                console.log('📸 Screenshot saved to /tmp/login-page.png');
+            // Find and fill email using standard selectors
+            const emailField = await this.page.$('#email, input[name="email"], input[type="email"]');
+            if (emailField) {
+                await emailField.click({ clickCount: 3 });
+                await emailField.type(FAUCETPAY_EMAIL);
+                console.log('✅ Email entered');
+            } else {
+                console.log('❌ Could not find email field');
+                return false;
             }
             
-            // Use evaluate to find and fill the form (more reliable)
-            const loginResult = await this.page.evaluate(async (email, password) => {
-                // Helper function to wait for element
-                const waitForElement = (selector, timeout = 5000) => {
-                    return new Promise((resolve) => {
-                        const start = Date.now();
-                        const check = () => {
-                            const el = document.querySelector(selector);
-                            if (el) resolve(el);
-                            else if (Date.now() - start < timeout) setTimeout(check, 100);
-                            else resolve(null);
-                        };
-                        check();
-                    });
-                };
-                
-                // Try multiple selectors
-                const emailSelectors = ['#email', 'input[name="email"]', 'input[type="email"]'];
-                let emailField = null;
-                for (const sel of emailSelectors) {
-                    emailField = await waitForElement(sel);
-                    if (emailField) break;
-                }
-                
-                if (emailField) {
-                    emailField.value = '';
-                    emailField.dispatchEvent(new Event('input', { bubbles: true }));
-                    emailField.focus();
-                    emailField.value = email;
-                    emailField.dispatchEvent(new Event('input', { bubbles: true }));
-                    emailField.dispatchEvent(new Event('change', { bubbles: true }));
-                }
-                
-                const passwordSelectors = ['#password', 'input[name="password"]', 'input[type="password"]'];
-                let passwordField = null;
-                for (const sel of passwordSelectors) {
-                    passwordField = await waitForElement(sel);
-                    if (passwordField) break;
-                }
-                
-                if (passwordField) {
-                    passwordField.value = '';
-                    passwordField.dispatchEvent(new Event('input', { bubbles: true }));
-                    passwordField.focus();
-                    passwordField.value = password;
-                    passwordField.dispatchEvent(new Event('input', { bubbles: true }));
-                    passwordField.dispatchEvent(new Event('change', { bubbles: true }));
-                }
-                
-                // Find submit button
-                const submitSelectors = ['button[type="submit"]', 'input[type="submit"]'];
-                let submitBtn = null;
-                for (const sel of submitSelectors) {
-                    submitBtn = await waitForElement(sel);
-                    if (submitBtn) break;
-                }
-                
-                if (submitBtn) {
-                    submitBtn.click();
-                    return { success: true, message: 'Login clicked' };
-                }
-                
-                return { success: false, message: 'No submit button found' };
-            }, FAUCETPAY_EMAIL, FAUCETPAY_PASSWORD);
+            await safeWait(500);
             
-            console.log(`📝 ${loginResult.message}`);
+            // Find and fill password
+            const passwordField = await this.page.$('#password, input[name="password"], input[type="password"]');
+            if (passwordField) {
+                await passwordField.click({ clickCount: 3 });
+                await passwordField.type(FAUCETPAY_PASSWORD);
+                console.log('✅ Password entered');
+            } else {
+                console.log('❌ Could not find password field');
+                return false;
+            }
             
-            if (loginResult.success) {
+            await safeWait(500);
+            
+            // Click login button
+            const loginBtn = await this.page.$('button[type="submit"], input[type="submit"]');
+            if (loginBtn) {
+                await loginBtn.click();
+                console.log('✅ Clicked login button');
                 await safeWait(8000);
-                
-                // Check if login succeeded
-                const afterUrl = this.page.url();
-                if (!afterUrl.includes('login')) {
-                    console.log('\n✅✅✅ LOGIN SUCCESSFUL! ✅✅✅');
-                    stats.loggedIn = true;
-                    await this.getBalance();
-                    return true;
-                }
+            } else {
+                await this.page.keyboard.press('Enter');
+                console.log('✅ Pressed Enter');
+                await safeWait(8000);
             }
             
-            // Alternative: Try typing manually (more natural)
-            console.log('⚠️ First method failed, trying manual typing...');
-            
-            // Clear and type email
-            await this.page.click('input[type="email"], #email', { clickCount: 3 });
-            await this.page.keyboard.press('Backspace');
-            await this.page.type('input[type="email"], #email', FAUCETPAY_EMAIL, { delay: 50 });
-            await safeWait(500);
-            
-            // Type password
-            await this.page.click('input[type="password"], #password', { clickCount: 3 });
-            await this.page.keyboard.press('Backspace');
-            await this.page.type('input[type="password"], #password', FAUCETPAY_PASSWORD, { delay: 50 });
-            await safeWait(500);
-            
-            // Press Enter
-            await this.page.keyboard.press('Enter');
-            await safeWait(8000);
-            
-            const finalUrl = this.page.url();
-            if (!finalUrl.includes('login')) {
+            // Check login success
+            const afterUrl = this.page.url();
+            if (!afterUrl.includes('login')) {
                 console.log('\n✅✅✅ LOGIN SUCCESSFUL! ✅✅✅');
                 stats.loggedIn = true;
                 await this.getBalance();
                 return true;
+            } else {
+                console.log('\n❌ LOGIN FAILED');
+                return false;
             }
-            
-            console.log('\n❌ LOGIN FAILED');
-            console.log('💡 Tip: Set HEADLESS_MODE=false to see what\'s happening');
-            return false;
-            
         } catch (error) {
             console.log(`❌ Login error: ${error.message}`);
             return false;
@@ -287,25 +214,31 @@ class InternalEarningEngine {
             await this.page.goto('https://faucetpay.io/dashboard', { waitUntil: 'networkidle2' });
             await safeWait(3000);
             
-            // Check if already claimed
-            const pageContent = await this.page.content();
-            if (pageContent.includes('already claimed') || pageContent.includes('tomorrow')) {
-                console.log('ℹ️ Daily Bonus already claimed today');
-                return 0;
-            }
-            
-            // Find claim button
-            const claimBtn = await this.page.evaluate(() => {
+            // Use evaluate to find and click claim button
+            const result = await this.page.evaluate(() => {
+                // Look for any claim button
                 const buttons = Array.from(document.querySelectorAll('button, a'));
-                return buttons.find(btn => {
+                const claimBtn = buttons.find(btn => {
                     const text = (btn.innerText || '').toLowerCase();
                     return text.includes('claim') && (text.includes('bonus') || text.includes('daily'));
                 });
+                
+                if (claimBtn) {
+                    claimBtn.click();
+                    return { success: true, message: 'Clicked claim button' };
+                }
+                return { success: false, message: 'No claim button found' };
             });
             
-            if (claimBtn) {
-                await claimBtn.click();
+            if (result.success) {
                 await safeWait(5000);
+                
+                // Check if already claimed
+                const pageContent = await this.page.content();
+                if (pageContent.includes('already claimed') || pageContent.includes('tomorrow')) {
+                    console.log('ℹ️ Daily Bonus already claimed today');
+                    return 0;
+                }
                 
                 const earned = 0.001;
                 stats.totalEarned += earned;
@@ -324,7 +257,7 @@ class InternalEarningEngine {
                 console.log(`💰 Daily Bonus: +$${earned.toFixed(5)}`);
                 return earned;
             } else {
-                console.log('⚠️ Daily Bonus button not found');
+                console.log('ℹ️ Daily Bonus button not found or already claimed');
                 return 0;
             }
         } catch (error) {
@@ -340,12 +273,12 @@ class InternalEarningEngine {
             await this.page.goto('https://faucetpay.io/faucets', { waitUntil: 'networkidle2' });
             await safeWait(3000);
             
-            const clicked = await this.page.evaluate(() => {
+            const result = await this.page.evaluate(() => {
                 const links = Array.from(document.querySelectorAll('a'));
                 let count = 0;
                 for (const link of links) {
                     const text = (link.innerText || '').toLowerCase();
-                    if ((text.includes('view') || text.includes('visit')) && link.href) {
+                    if ((text.includes('view') || text.includes('visit')) && link.href && !link.href.includes('faucetpay.io')) {
                         try {
                             link.click();
                             count++;
@@ -356,14 +289,14 @@ class InternalEarningEngine {
                 return count;
             });
             
-            if (clicked > 0) {
+            if (result > 0) {
                 await safeWait(3000);
-                const earned = 0.0005 * clicked;
+                const earned = 0.0005 * result;
                 stats.totalEarned += earned;
                 stats.sessionEarned += earned;
-                stats.totalActions += clicked;
+                stats.totalActions += result;
                 stats.sourceBalances['Faucet List'].earned += earned;
-                stats.sourceBalances['Faucet List'].claims += clicked;
+                stats.sourceBalances['Faucet List'].claims += result;
                 stats.sourceBalances['Faucet List'].lastClaim = new Date();
                 
                 stats.claimHistory.unshift({
@@ -372,7 +305,7 @@ class InternalEarningEngine {
                     amount: earned
                 });
                 
-                console.log(`💰 Faucet List: +$${earned.toFixed(5)} from ${clicked} views`);
+                console.log(`💰 Faucet List: +$${earned.toFixed(5)} from ${result} views`);
                 return earned;
             } else {
                 console.log('ℹ️ No faucet list items available');
@@ -391,12 +324,12 @@ class InternalEarningEngine {
             await this.page.goto('https://faucetpay.io/offerwalls', { waitUntil: 'networkidle2' });
             await safeWait(3000);
             
-            const clicked = await this.page.evaluate(() => {
+            const result = await this.page.evaluate(() => {
                 const links = Array.from(document.querySelectorAll('a'));
                 let count = 0;
                 for (const link of links) {
                     const text = (link.innerText || '').toLowerCase();
-                    if ((text.includes('view') || text.includes('earn')) && link.href) {
+                    if ((text.includes('view') || text.includes('earn') || text.includes('offer')) && link.href) {
                         try {
                             link.click();
                             count++;
@@ -407,14 +340,14 @@ class InternalEarningEngine {
                 return count;
             });
             
-            if (clicked > 0) {
+            if (result > 0) {
                 await safeWait(3000);
-                const earned = 0.002 * clicked;
+                const earned = 0.002 * result;
                 stats.totalEarned += earned;
                 stats.sessionEarned += earned;
-                stats.totalActions += clicked;
+                stats.totalActions += result;
                 stats.sourceBalances['Offerwalls'].earned += earned;
-                stats.sourceBalances['Offerwalls'].claims += clicked;
+                stats.sourceBalances['Offerwalls'].claims += result;
                 stats.sourceBalances['Offerwalls'].lastClaim = new Date();
                 
                 stats.claimHistory.unshift({
@@ -423,7 +356,7 @@ class InternalEarningEngine {
                     amount: earned
                 });
                 
-                console.log(`💰 Offerwalls: +$${earned.toFixed(5)} from ${clicked} views`);
+                console.log(`💰 Offerwalls: +$${earned.toFixed(5)} from ${result} views`);
                 return earned;
             } else {
                 console.log('ℹ️ No offerwalls available');
@@ -442,12 +375,12 @@ class InternalEarningEngine {
             await this.page.goto('https://faucetpay.io/ptc', { waitUntil: 'networkidle2' });
             await safeWait(3000);
             
-            const clicked = await this.page.evaluate(() => {
+            const result = await this.page.evaluate(() => {
                 const links = Array.from(document.querySelectorAll('a'));
                 let count = 0;
                 for (const link of links) {
                     const text = (link.innerText || '').toLowerCase();
-                    if ((text.includes('view') || text.includes('click')) && link.href) {
+                    if ((text.includes('view') || text.includes('click') || text.includes('ad')) && link.href) {
                         try {
                             link.click();
                             count++;
@@ -458,14 +391,14 @@ class InternalEarningEngine {
                 return count;
             });
             
-            if (clicked > 0) {
+            if (result > 0) {
                 await safeWait(3000);
-                const earned = 0.0008 * clicked;
+                const earned = 0.0008 * result;
                 stats.totalEarned += earned;
                 stats.sessionEarned += earned;
-                stats.totalActions += clicked;
+                stats.totalActions += result;
                 stats.sourceBalances['PTC Ads'].earned += earned;
-                stats.sourceBalances['PTC Ads'].claims += clicked;
+                stats.sourceBalances['PTC Ads'].claims += result;
                 stats.sourceBalances['PTC Ads'].lastClaim = new Date();
                 
                 stats.claimHistory.unshift({
@@ -474,7 +407,7 @@ class InternalEarningEngine {
                     amount: earned
                 });
                 
-                console.log(`💰 PTC Ads: +$${earned.toFixed(5)} from ${clicked} ads`);
+                console.log(`💰 PTC Ads: +$${earned.toFixed(5)} from ${result} ads`);
                 return earned;
             } else {
                 console.log('ℹ️ No PTC ads available');
@@ -493,7 +426,7 @@ class InternalEarningEngine {
             await this.page.goto('https://faucetpay.io/staking', { waitUntil: 'networkidle2' });
             await safeWait(3000);
             
-            const claimed = await this.page.evaluate(() => {
+            const result = await this.page.evaluate(() => {
                 const buttons = Array.from(document.querySelectorAll('button'));
                 const claimBtn = buttons.find(btn => {
                     const text = (btn.innerText || '').toLowerCase();
@@ -506,7 +439,7 @@ class InternalEarningEngine {
                 return false;
             });
             
-            if (claimed) {
+            if (result) {
                 await safeWait(3000);
                 const earned = 0.001;
                 stats.totalEarned += earned;
@@ -541,12 +474,12 @@ class InternalEarningEngine {
             await this.page.goto('https://faucetpay.io/tasks', { waitUntil: 'networkidle2' });
             await safeWait(3000);
             
-            const completed = await this.page.evaluate(() => {
+            const result = await this.page.evaluate(() => {
                 const links = Array.from(document.querySelectorAll('a, button'));
                 let count = 0;
                 for (const link of links) {
                     const text = (link.innerText || '').toLowerCase();
-                    if ((text.includes('complete') || text.includes('start')) && link.href) {
+                    if ((text.includes('complete') || text.includes('start') || text.includes('earn')) && link.href) {
                         try {
                             link.click();
                             count++;
@@ -557,14 +490,14 @@ class InternalEarningEngine {
                 return count;
             });
             
-            if (completed > 0) {
+            if (result > 0) {
                 await safeWait(4000);
-                const earned = 0.0015 * completed;
+                const earned = 0.0015 * result;
                 stats.totalEarned += earned;
                 stats.sessionEarned += earned;
-                stats.totalActions += completed;
+                stats.totalActions += result;
                 stats.sourceBalances['Tasks'].earned += earned;
-                stats.sourceBalances['Tasks'].claims += completed;
+                stats.sourceBalances['Tasks'].claims += result;
                 stats.sourceBalances['Tasks'].lastClaim = new Date();
                 
                 stats.claimHistory.unshift({
@@ -573,7 +506,7 @@ class InternalEarningEngine {
                     amount: earned
                 });
                 
-                console.log(`💰 Tasks: +$${earned.toFixed(5)} from ${completed} tasks`);
+                console.log(`💰 Tasks: +$${earned.toFixed(5)} from ${result} tasks`);
                 return earned;
             } else {
                 console.log('ℹ️ No tasks available');
@@ -722,7 +655,7 @@ app.get('/', (req, res) => {
         .map(([name, data]) => `
             <tr>
                 <td>${name}</td>
-                <td class="earn">$${data.earned.toFixed(5)}</td>
+                <td class="earn">$${data.earned.toFixed(5)}</td
                 <td>${data.claims}</td>
                 <td>${data.lastClaim ? new Date(data.lastClaim).toLocaleTimeString() : 'Never'}</td>
             </tr>
@@ -732,7 +665,7 @@ app.get('/', (req, res) => {
         <tr>
             <td>${new Date(c.time).toLocaleTimeString()}</td>
             <td>${c.source}</td>
-            <td class="earn">+$${c.amount.toFixed(5)}</td>
+            <td class="earn">+$${c.amount.toFixed(5)}</td
         </tr>
     `).join('');
     
@@ -750,7 +683,7 @@ th,td{padding:8px;text-align:left;border-bottom:1px solid #333;font-size:12px}
 </style>
 <body>
 <div class="container">
-<h1>💰 FaucetPay Internal Bot</h1>
+<h1>💰 FaucetPay Internal Bot v3.0</h1>
 <div class="card">
 🟢 LIVE | Uptime: ${hours}h ${minutes}m<br>
 Logged In: ${stats.loggedIn ? '✅ YES' : '❌ NO'}<br>
@@ -762,14 +695,18 @@ Email: ${FAUCETPAY_EMAIL}
 <div class="stat-card"><div class="earn">${stats.totalActions}</div>Claims</div>
 
 <div class="card"><h3>🪙 Source Balances</h3>
-<table><thead><tr><th>Source</th><th>Earned</th><th>Claims</th><th>Last Claim</th></tr></thead>
+<table>
+<thead><tr><th>Source</th><th>Earned</th><th>Claims</th><th>Last Claim</th></tr></thead>
 <tbody>${sourceBalancesHtml || '<tr><td colspan="4">No activity yet</td></tr>'}</tbody>
-</table></div>
+</table>
+</div>
 
 <div class="card"><h3>📈 Recent Claims</h3>
-<table><thead><tr><th>Time</th><th>Source</th><th>Amount</th></tr></thead>
+<table>
+<thead><tr><th>Time</th><th>Source</th><th>Amount</th></tr></thead>
 <tbody>${claimHtml || '<tr><td colspan="3">No claims yet</td></tr>'}</tbody>
-</table></div>
+</table>
+</div>
 </div>
 </body></html>`);
 });
