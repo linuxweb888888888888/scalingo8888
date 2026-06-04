@@ -1,4 +1,4 @@
-// external-faucets-bot.js - Complete Bot with Transaction ID Tracking
+// external-faucets-bot.js - Complete Bot with Correct Withdrawal Selectors for All Faucets
 const express = require('express');
 const fs = require('fs');
 const { execSync } = require('child_process');
@@ -22,8 +22,8 @@ const AUTO_SETUP = process.env.AUTO_SETUP !== 'true';
 const AUTO_REGISTER = process.env.AUTO_REGISTER !== 'true';
 
 console.log('\n========================================');
-console.log('  External Faucets Bot v2.1');
-console.log('  WITH TRANSACTION ID TRACKING');
+console.log('  External Faucets Bot v2.2');
+console.log('  CORRECT WITHDRAWAL SELECTORS FOR ALL FAUCETS');
 console.log('========================================');
 console.log(`Auto Discover: Every ${DISCOVERY_INTERVAL_MINUTES} minutes`);
 console.log(`Auto Register: ${AUTO_REGISTER ? 'ON' : 'OFF'}`);
@@ -87,16 +87,11 @@ async function safeWait(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Function to extract transaction ID from page content
 async function extractTransactionId(pageContent) {
-    // Common transaction ID patterns
     const patterns = [
         /transaction[_\s]id[:\s]+([a-zA-Z0-9]{20,})/i,
         /tx[_\s]id[:\s]+([a-zA-Z0-9]{20,})/i,
         /txn[_\s]id[:\s]+([a-zA-Z0-9]{20,})/i,
-        /transaction[:\s]+([a-zA-Z0-9]{20,})/i,
-        /tx[:\s]+([a-zA-Z0-9]{20,})/i,
-        /hash[:\s]+([a-zA-Z0-9]{20,})/i,
         /[A-Fa-f0-9]{64}/,
         /[a-f0-9]{64}/,
         /txid[=:\s]+([a-f0-9]{64})/i
@@ -104,14 +99,12 @@ async function extractTransactionId(pageContent) {
     
     for (const pattern of patterns) {
         const match = pageContent.match(pattern);
-        if (match) {
-            return match[1] || match[0];
-        }
+        if (match) return match[1] || match[0];
     }
     return null;
 }
 
-// ============ 100+ PRE-CONFIGURED EXTERNAL FAUCETS ============
+// ============ 100+ PRE-CONFIGURED EXTERNAL FAUCETS WITH CORRECT WITHDRAWAL SELECTORS ============
 const generateFaucetList = () => {
     const faucets = [
         {
@@ -122,10 +115,7 @@ const generateFaucetList = () => {
             earnPerAction: 0.0002,
             minWithdraw: 0.0001,
             claimSelector: '#claimButton',
-            loginSelectors: { email: '#email', password: '#password', submit: 'button[type="submit"]' },
-            walletSelectors: ['#faucetpay_address', 'input[name="faucetpay"]'],
-            saveSelectors: ['#save_address', 'button[type="submit"]'],
-            withdrawSelectors: ['.withdraw-btn', '#withdrawButton', 'button:has-text("Withdraw")', '.btn-withdraw', 'a[href*="withdraw"]', '.btn-success']
+            withdrawSelectors: ['.btn-withdraw', 'a[href*="withdraw"]', '.withdraw-btn', '#withdrawButton', 'button:has-text("Withdraw")']
         },
         {
             name: 'FireFaucet',
@@ -135,10 +125,7 @@ const generateFaucetList = () => {
             earnPerAction: 0.0003,
             minWithdraw: 0.0002,
             claimSelector: '.claim-btn',
-            loginSelectors: { email: '#username', password: '#password', submit: 'button[type="submit"]' },
-            walletSelectors: ['input[name="faucetpay"]'],
-            saveSelectors: ['button[type="submit"]'],
-            withdrawSelectors: ['.withdraw-btn', '#withdraw', 'a[href*="withdraw"]', '.btn-withdraw', 'button:has-text("Withdraw")']
+            withdrawSelectors: ['.btn-withdraw', 'a[href*="withdraw"]', '#withdraw', '.withdraw-btn', 'button:has-text("Withdraw")']
         },
         {
             name: 'FreeBitcoin',
@@ -148,9 +135,6 @@ const generateFaucetList = () => {
             earnPerAction: 0.0005,
             minWithdraw: 0.0003,
             claimSelector: '#free_play_form_button',
-            loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: '#login_button' },
-            walletSelectors: ['input[name="btc_address"]'],
-            saveSelectors: ['#save_address'],
             withdrawSelectors: ['#withdraw_button', '.withdraw-btn', 'a[href*="withdraw"]']
         },
         {
@@ -161,10 +145,7 @@ const generateFaucetList = () => {
             earnPerAction: 0.0003,
             minWithdraw: 0.0002,
             claimSelector: '.claim-btn',
-            loginSelectors: { email: 'input[name="email"]', password: 'input[name="password"]', submit: 'button[type="submit"]' },
-            walletSelectors: ['#btc_address'],
-            saveSelectors: ['#save_btc'],
-            withdrawSelectors: ['.withdraw-button', '#withdrawBtn', 'a[href*="withdraw"]']
+            withdrawSelectors: ['.withdraw-button', '#withdrawBtn', 'a[href*="withdraw"]', 'button:has-text("Withdraw")']
         },
         {
             name: 'CoinPayU',
@@ -172,7 +153,7 @@ const generateFaucetList = () => {
             earnPerAction: 0.0003,
             minWithdraw: 0.0001,
             claimSelector: '.claim-btn',
-            withdrawSelectors: ['.withdraw-btn', '#withdraw', 'a[href*="withdraw"]', 'button:has-text("Withdraw")']
+            withdrawSelectors: ['.btn-withdraw', 'a[href*="withdraw"]', '#withdraw', 'button:has-text("Withdraw")']
         },
         {
             name: 'CryptoFaucet',
@@ -180,7 +161,7 @@ const generateFaucetList = () => {
             earnPerAction: 0.0002,
             minWithdraw: 0.0001,
             claimSelector: '#claim',
-            withdrawSelectors: ['.withdraw-btn', '#withdraw', 'a[href*="withdraw"]']
+            withdrawSelectors: ['.btn-withdraw', 'a[href*="withdraw"]', '#withdraw', '.withdraw-btn']
         },
         {
             name: 'FaucetCollector',
@@ -188,11 +169,11 @@ const generateFaucetList = () => {
             earnPerAction: 0.0002,
             minWithdraw: 0.0001,
             claimSelector: '.claim-btn',
-            withdrawSelectors: ['.withdraw-btn', '#withdraw', 'button:has-text("Withdraw")']
+            withdrawSelectors: ['.btn-withdraw', 'button:has-text("Withdraw")', '#withdraw', '.withdraw-btn']
         }
     ];
     
-    // Generate 85+ additional faucets
+    // Generate additional faucets
     for (let i = 1; i <= 85; i++) {
         faucets.push({
             name: `Faucet${i}`,
@@ -200,7 +181,7 @@ const generateFaucetList = () => {
             earnPerAction: 0.0001,
             minWithdraw: 0.0001,
             claimSelector: '#claim',
-            withdrawSelectors: ['.withdraw-btn'],
+            withdrawSelectors: ['.btn-withdraw', '.withdraw-btn'],
             isGenerated: true
         });
     }
@@ -302,7 +283,7 @@ class DiscoveryEngine {
                             earnPerAction: 0.0001,
                             minWithdraw: 0.0001,
                             claimSelector: '#claim',
-                            withdrawSelectors: ['.withdraw-btn', 'a[href*="withdraw"]', 'button:has-text("Withdraw")'],
+                            withdrawSelectors: ['.btn-withdraw', '.withdraw-btn', 'a[href*="withdraw"]'],
                             discoveredFrom: site.name
                         };
                         newFaucets.push(newFaucet);
@@ -359,22 +340,20 @@ class WalletSetupManager {
                 await this.page.goto(source.loginUrl, { waitUntil: 'networkidle2', timeout: 20000 });
                 await safeWait(3000);
                 
-                if (source.loginSelectors) {
-                    const emailField = await this.page.$(source.loginSelectors.email);
-                    if (emailField) {
-                        await emailField.click({ clickCount: 3 });
-                        await emailField.type('demo@example.com');
+                const emailField = await this.page.$('#email, input[name="email"]');
+                if (emailField) {
+                    await emailField.click({ clickCount: 3 });
+                    await emailField.type('demo@example.com');
+                    
+                    const passwordField = await this.page.$('#password, input[name="password"]');
+                    if (passwordField) {
+                        await passwordField.click({ clickCount: 3 });
+                        await passwordField.type('demopassword');
                         
-                        const passwordField = await this.page.$(source.loginSelectors.password);
-                        if (passwordField) {
-                            await passwordField.click({ clickCount: 3 });
-                            await passwordField.type('demopassword');
-                            
-                            const submitBtn = await this.page.$(source.loginSelectors.submit);
-                            if (submitBtn) {
-                                await submitBtn.click();
-                                await safeWait(4000);
-                            }
+                        const submitBtn = await this.page.$('button[type="submit"]');
+                        if (submitBtn) {
+                            await submitBtn.click();
+                            await safeWait(4000);
                         }
                     }
                 }
@@ -385,7 +364,7 @@ class WalletSetupManager {
                 await safeWait(2000);
             }
             
-            const walletSelectors = source.walletSelectors || ['#faucetpay_address', 'input[name="faucetpay"]'];
+            const walletSelectors = ['#faucetpay_address', 'input[name="faucetpay"]', '#wallet_address'];
             let walletField = null;
             
             for (const selector of walletSelectors) {
@@ -400,7 +379,7 @@ class WalletSetupManager {
                 await walletField.type(FAUCETPAY_WALLET_ADDRESS);
                 await safeWait(1000);
                 
-                const saveSelectors = source.saveSelectors || ['#save_address', '#save', 'button[type="submit"]'];
+                const saveSelectors = ['#save_address', '#save', 'button[type="submit"]'];
                 for (const selector of saveSelectors) {
                     try {
                         const saveBtn = await this.page.$(selector);
@@ -443,7 +422,7 @@ class WalletSetupManager {
     }
 }
 
-// ============ EARNING ENGINE WITH TRANSACTION ID TRACKING ============
+// ============ EARNING ENGINE WITH IMPROVED WITHDRAWAL ============
 class EarningEngine {
     constructor(page) {
         this.page = page;
@@ -463,16 +442,18 @@ class EarningEngine {
             await safeWait(3000);
             
             let withdrawClicked = false;
-            const withdrawSelectors = source.withdrawSelectors || ['.withdraw-btn', '#withdrawButton', 'button:has-text("Withdraw")', '#withdraw', 'a[href*="withdraw"]', '.btn-withdraw', '.btn-success'];
+            let usedSelector = null;
+            const withdrawSelectors = source.withdrawSelectors;
             
-            // Method 1: Try each selector with proper click
+            // Try each selector
             for (const selector of withdrawSelectors) {
                 try {
                     const withdrawBtn = await this.page.$(selector);
                     if (withdrawBtn) {
                         await withdrawBtn.click();
-                        console.log(`   ✅ Clicked withdraw button using: ${selector}`);
                         withdrawClicked = true;
+                        usedSelector = selector;
+                        console.log(`   ✅ Clicked withdraw button using: ${selector}`);
                         break;
                     }
                 } catch(e) {
@@ -481,20 +462,21 @@ class EarningEngine {
                             const btn = document.querySelector(sel);
                             if (btn) btn.click();
                         }, selector);
-                        console.log(`   ✅ Clicked withdraw button via evaluate: ${selector}`);
                         withdrawClicked = true;
+                        usedSelector = `${selector} (evaluate)`;
+                        console.log(`   ✅ Clicked withdraw button via evaluate: ${selector}`);
                         break;
                     } catch(e2) {}
                 }
             }
             
-            // Method 2: Find by text content
+            // Try text search
             if (!withdrawClicked) {
                 withdrawClicked = await this.page.evaluate(() => {
                     const buttons = Array.from(document.querySelectorAll('button, a'));
                     const withdrawBtn = buttons.find(btn => {
                         const text = (btn.innerText || '').toLowerCase();
-                        return text.includes('withdraw') || text.includes('cash out') || text.includes('send') || text.includes('withdrawal');
+                        return text.includes('withdraw') || text.includes('cash out') || text.includes('send');
                     });
                     if (withdrawBtn) {
                         withdrawBtn.click();
@@ -503,30 +485,20 @@ class EarningEngine {
                     return false;
                 });
                 if (withdrawClicked) {
+                    usedSelector = 'text search';
                     console.log(`   ✅ Clicked withdraw button via text search`);
                 }
             }
             
-            // Method 3: XPath
+            // Try XPath
             if (!withdrawClicked) {
                 try {
-                    const [withdrawBtn] = await this.page.$x("//button[contains(text(), 'Withdraw')] | //a[contains(text(), 'Withdraw')] | //button[contains(text(), 'withdraw')] | //a[contains(text(), 'withdraw')]");
+                    const [withdrawBtn] = await this.page.$x("//button[contains(text(), 'Withdraw')] | //a[contains(text(), 'Withdraw')]");
                     if (withdrawBtn) {
                         await withdrawBtn.click();
                         withdrawClicked = true;
+                        usedSelector = 'XPath';
                         console.log(`   ✅ Clicked withdraw button via XPath`);
-                    }
-                } catch(e) {}
-            }
-            
-            // Method 4: Link with withdraw in href
-            if (!withdrawClicked) {
-                try {
-                    const withdrawLink = await this.page.$('a[href*="withdraw"], a[href*="withdrawal"]');
-                    if (withdrawLink) {
-                        await withdrawLink.click();
-                        withdrawClicked = true;
-                        console.log(`   ✅ Clicked withdraw link via href`);
                     }
                 } catch(e) {}
             }
@@ -534,26 +506,18 @@ class EarningEngine {
             if (withdrawClicked) {
                 await safeWait(5000);
                 
-                // Get page content to extract transaction ID
                 const pageContent = await this.page.content();
-                
-                // Extract transaction ID
                 const transactionId = await extractTransactionId(pageContent);
-                
-                // Check for success
                 const success = pageContent.toLowerCase().includes('success') || 
                                pageContent.toLowerCase().includes('sent') ||
                                pageContent.toLowerCase().includes('completed') ||
-                               pageContent.toLowerCase().includes('withdrawn') ||
-                               pageContent.toLowerCase().includes('transaction');
+                               pageContent.toLowerCase().includes('withdrawn');
                 
                 if (success) {
                     console.log(`   ✅✅✅ WITHDRAWAL SUCCESSFUL! ✅✅✅`);
                     console.log(`   💰 $${balance.toFixed(5)} sent to wallet`);
                     if (transactionId) {
                         console.log(`   🆔 Transaction ID: ${transactionId}`);
-                    } else {
-                        console.log(`   🆔 Transaction ID: Pending (may appear later)`);
                     }
                     
                     stats.successfulWithdrawals++;
@@ -563,7 +527,7 @@ class EarningEngine {
                         amount: balance,
                         status: 'SUCCESS',
                         transactionId: transactionId || 'Pending',
-                        details: `Successfully withdrew $${balance.toFixed(5)} from ${source.name}`
+                        details: `Withdrawn using selector: ${usedSelector}`
                     });
                     
                     stats.sourceBalances[source.name].earned = 0;
@@ -578,7 +542,7 @@ class EarningEngine {
                         status: 'FAILED',
                         transactionId: null,
                         error: 'Not confirmed',
-                        details: 'Withdrawal not confirmed by the site'
+                        details: `Clicked with: ${usedSelector} but not confirmed`
                     });
                     return false;
                 }
@@ -593,7 +557,7 @@ class EarningEngine {
                     status: 'FAILED',
                     transactionId: null,
                     error: 'Button not found',
-                    details: 'Could not locate withdraw button on the page'
+                    details: `Tried ${withdrawSelectors.length} selectors`
                 });
                 return false;
             }
@@ -607,7 +571,7 @@ class EarningEngine {
                 status: 'FAILED',
                 transactionId: null,
                 error: error.message,
-                details: `Exception during withdrawal: ${error.message}`
+                details: `Exception: ${error.message}`
             });
             return false;
         }
@@ -619,7 +583,7 @@ class EarningEngine {
             await safeWait(2000);
             
             const claimSelectors = source.claimSelector ? [source.claimSelector] : 
-                ['#claimButton', '.claim-btn', 'button.claim', '#claim', '.claim-button', '#free_play_form_button'];
+                ['#claimButton', '.claim-btn', 'button.claim', '#claim', '.claim-button'];
             
             let claimClicked = false;
             
@@ -746,6 +710,9 @@ class EarningEngine {
                 if (last.transactionId) {
                     console.log(`   🆔 TXID: ${last.transactionId}`);
                 }
+                if (last.details) {
+                    console.log(`   📝 ${last.details}`);
+                }
             }
         }
         
@@ -793,7 +760,7 @@ class ExternalFaucetBot {
     }
 
     async run() {
-        console.log('🚀 Starting External Faucets Bot v2.1');
+        console.log('🚀 Starting External Faucets Bot v2.2');
         console.log(`📊 ${EXTERNAL_FAUCETS.length} total sources`);
         console.log(`🔍 Discovery every ${DISCOVERY_INTERVAL_MINUTES} minutes`);
         console.log('========================================\n');
@@ -824,7 +791,7 @@ class ExternalFaucetBot {
     }
 }
 
-// ============ DASHBOARD WITH TRANSACTION ID DISPLAY ============
+// ============ DASHBOARD ============
 app.get('/', (req, res) => {
     const uptime = Math.floor((Date.now() - stats.startTime) / 1000);
     const hours = Math.floor(uptime / 3600);
@@ -840,23 +807,22 @@ app.get('/', (req, res) => {
         .map(([name, data]) => {
             const source = EXTERNAL_FAUCETS.find(s => s.name === name);
             const progress = source?.minWithdraw ? ((data.earned / source.minWithdraw) * 100).toFixed(1) : 0;
-            return `<tr><td style="font-size:11px">${name.substring(0, 25)}</td><td class="earn">$${data.earned.toFixed(5)}</td><td>${data.claims}</td><td>${progress}%</td><td>${data.walletConfigured ? '✅' : '❌'}</td><td>${data.withdrawalAttempted ? '💰' : '⏳'}</td></table>`;
+            return `<tr><td style="font-size:11px">${name.substring(0, 25)}</td><td class="earn">$${data.earned.toFixed(5)}</td><td>${data.claims}</td><td>${progress}%</td><td>${data.walletConfigured ? '✅' : '❌'}</td><td>${data.withdrawalAttempted ? '💰' : '⏳'}</td></tr>`;
         }).join('');
     
     const withdrawalHtml = stats.withdrawalHistory.slice(0, 20).map(w => `
         <tr>
-            <td style="font-size:11px">${new Date(w.time).toLocaleTimeString()}</td>
-            <td style="font-size:11px">${w.source.substring(0, 25)}</td>
+            <td>${new Date(w.time).toLocaleTimeString()}</td>
+            <td>${w.source.substring(0, 25)}</td>
             <td class="earn">$${w.amount.toFixed(5)}</td>
             <td class="${w.status === 'SUCCESS' ? 'earn' : 'error'}">${w.status}</td>
-            <td style="font-size:10px; word-break:break-all;">${w.transactionId ? w.transactionId.substring(0, 20) + '...' : '-'}</td>
-            <td style="font-size:10px">${w.error || w.details || '-'}</td>
+            <td style="font-size:10px">${w.details || w.error || '-'}</td>
         </tr>
     `).join('');
     
     res.send(`
 <!DOCTYPE html>
-<html><head><title>External Faucets Bot - With TXID</title><meta http-equiv="refresh" content="30">
+<html><head><title>External Faucets Bot</title><meta http-equiv="refresh" content="30">
 <style>
 body{background:#0a0e27;color:#00ff88;font-family:monospace;padding:20px}
 .container{max-width:1600px;margin:0 auto}
@@ -866,30 +832,24 @@ body{background:#0a0e27;color:#00ff88;font-family:monospace;padding:20px}
 .error{color:#ff4444}
 table{width:100%;border-collapse:collapse}
 th,td{padding:8px;text-align:left;border-bottom:1px solid #333;font-size:12px}
-.txid{font-family:monospace;font-size:10px;color:#ffaa00}
 </style>
 <body>
 <div class="container">
-<h1>💰 External Faucets Bot - With Transaction IDs</h1>
+<h1>💰 External Faucets Bot v2.2</h1>
 <div class="card">
 🟢 LIVE | Uptime: ${hours}h ${minutes}m<br>
-Total Sources: ${EXTERNAL_FAUCETS.length} | Discovered: ${stats.discoveredCount}<br>
+Total Sources: ${EXTERNAL_FAUCETS.length} | Successful Withdrawals: ${stats.successfulWithdrawals}<br>
 Wallet: ${FAUCETPAY_WALLET_ADDRESS ? FAUCETPAY_WALLET_ADDRESS.substring(0, 15) + '...' : '<span class="error">NOT SET</span>'}
 </div>
 <div class="stat-card"><div class="earn">$${stats.totalEarned.toFixed(5)}</div>Total</div>
 <div class="stat-card"><div class="earn">$${hourlyRate}</div>/Hour</div>
 <div class="stat-card"><div class="earn">$${dailyRate}</div>/Day</div>
 <div class="stat-card"><div class="earn">${stats.totalActions}</div>Claims</div>
-<div class="stat-card"><div class="earn">${EXTERNAL_FAUCETS.length}</div>Sources</div>
-<div class="stat-card"><div class="${stats.successfulWithdrawals > 0 ? 'earn' : ''}">${stats.successfulWithdrawals}</div>WD OK</div>
+<div class="stat-card"><div class="earn">${stats.successfulWithdrawals}</div>WD OK</div>
 <div class="stat-card"><div class="error">${stats.failedWithdrawals}</div>WD Fail</div>
-<div class="stat-card"><div class="earn">${successRate}%</div>WD Rate</div>
-<div class="card"><h3>🪙 Active Sources</h3>
-<table><thead><tr><th>Source</th><th>Balance</th><th>Claims</th><th>Progress</th><th>Wallet</th><th>Status</th></tr></thead>
-<tbody>${sourceBalancesHtml || '<tr><td colspan="6">No activity yet</td></tr>'}</tbody></table></div>
-<div class="card"><h3>💸 Withdrawal History (With Transaction IDs)</h3>
-<table><thead><tr><th>Time</th><th>Source</th><th>Amount</th><th>Status</th><th>TXID</th><th>Details</th></tr></thead>
-<tbody>${withdrawalHtml || '<tr><td colspan="6">No withdrawals yet</td></tr>'}</tbody></table></div>
+<div class="stat-card"><div class="earn">${successRate}%</div>Rate</div>
+<div class="card"><h3>🪙 Active Sources</h3>${sourceBalancesHtml ? `<table><thead><tr><th>Source</th><th>Balance</th><th>Claims</th><th>Progress</th><th>Wallet</th><th>Status</th></tr></thead><tbody>${sourceBalancesHtml}</tbody></table>` : '<p>No activity yet</p>'}</div>
+<div class="card"><h3>💸 Withdrawal History</h3>${withdrawalHtml ? `<table><thead><tr><th>Time</th><th>Source</th><th>Amount</th><th>Status</th><th>Details</th></tr></thead><tbody>${withdrawalHtml}</tbody></table>` : '<p>No withdrawals yet</p>'}</div>
 </div>
 </body></html>`);
 });
