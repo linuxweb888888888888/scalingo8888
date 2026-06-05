@@ -1,6 +1,7 @@
-// faucetpay-full-bot.js - Complete bot with real-time earnings and withdrawal tracking
+// faucetpay-persistent-bot.js - Bot with manual login and persistent session
 const express = require('express');
 const fs = require('fs');
+const path = require('path');
 const { execSync } = require('child_process');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
@@ -13,35 +14,34 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || 'web88888888888888@gmail.com';
-const FAUCETPAY_PASSWORD = process.env.FAUCETPAY_PASSWORD || 'Linuxdistro&84';
 const HEADLESS_MODE = process.env.HEADLESS_MODE !== 'false';
 const SCAN_INTERVAL_SECONDS = parseInt(process.env.SCAN_INTERVAL_SECONDS) || 60;
-const AUTO_WITHDRAW = process.env.AUTO_WITHDRAW !== 'true';
+const AUTO_WITHDRAW = process.env.AUTO_WITHDRAW !== 'false';
+
+// Session storage paths
+const SESSION_DIR = path.join(__dirname, 'sessions');
+const SESSION_FILE = path.join(SESSION_DIR, 'faucetpay-session.json');
+const USER_DATA_DIR = path.join(__dirname, 'chrome-user-data');
 
 const CHROME_PATH = '/app/chrome-linux64/chrome';
 const CHROME_URL = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
 
+// Bot state
+let botInstance = null;
+let botRunning = false;
+let loginCompleted = false;
+let loginPromiseResolve = null;
+
 console.log('\n========================================');
-console.log('  FaucetPay Complete Bot');
+console.log('  FaucetPay Persistent Bot');
 console.log('========================================');
 console.log(`Auto Withdraw: ${AUTO_WITHDRAW ? 'ON' : 'OFF'}`);
 console.log(`Scan: Every ${SCAN_INTERVAL_SECONDS}s`);
 console.log('========================================\n');
 
-// Store HTML debug data
-let htmlDebug = {
-    loginPage: null,
-    loginPageTrimmed: null,
-    dashboardPage: null,
-    lastLoginAttempt: null,
-    loginError: null,
-    pageStructure: {},
-    loginFormFound: false,
-    emailFieldFound: false,
-    passwordFieldFound: false,
-    submitButtonFound: false
-};
+// Ensure directories exist
+if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
+if (!fs.existsSync(USER_DATA_DIR)) fs.mkdirSync(USER_DATA_DIR, { recursive: true });
 
 // ============ CHROME INSTALLATION ============
 async function downloadFile(url, destPath) {
@@ -114,389 +114,152 @@ let stats = {
     successHistory: [],
     startTime: new Date(),
     loggedIn: false,
-    lastWithdrawal: null
+    lastWithdrawal: null,
+    lastCycleTime: null
 };
 
 EARNING_SOURCES.forEach(s => {
     stats.sourceBalances[s.name] = { earned: 0, claims: 0, lastClaim: null, pendingWithdraw: false };
 });
 
-// ============ COMPLETE BOT ============
-class CompleteFaucetBot {
-    constructor(email, password) {
-        this.email = email;
-        this.password = password;
+// ============ PERSISTENT BOT ============
+class PersistentFaucetBot {
+    constructor() {
         this.browser = null;
         this.page = null;
         this.loggedIn = false;
         this.claimSelectors = ['#claimButton', '.claim-btn', 'button.claim', '#claim', '.claim-button', '#free_play_form_button'];
+        this.isRunning = false;
     }
 
     async init() {
         const chromePath = await installChrome();
         if (!chromePath) throw new Error('Chrome not available');
         
+        // Launch with persistent user data directory
         this.browser = await puppeteer.launch({
             headless: HEADLESS_MODE,
             executablePath: chromePath,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            userDataDir: USER_DATA_DIR, // This preserves cookies and sessions
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-web-security',
+                '--disable-features=IsolateOrigins,site-per-process'
+            ]
         });
+        
         this.page = await this.browser.newPage();
         await this.page.setViewport({ width: 1280, height: 800 });
+        
+        // Load saved session state if exists
+        await this.loadSessionState();
     }
 
-    async captureHTMLDebug(page, type) {
-        try {
-            const html = await page.content();
-            const trimmedHTML = html.substring(0, 5000); // First 5000 chars for preview
-            
-            if (type === 'login') {
-                htmlDebug.loginPage = html;
-                htmlDebug.loginPageTrimmed = trimmedHTML;
-                htmlDebug.lastLoginAttempt = new Date();
-                
-                // Analyze login page structure
-                const hasForm = await page.$('form').catch(() => null);
-                const emailField = await page.$('#email, input[name="email"], input[type="email"]').catch(() => null);
-                const passwordField = await page.$('#password, input[name="password"], input[type="password"]').catch(() => null);
-                const submitBtn = await page.$('button[type="submit"], input[type="submit"], button:has-text("Login")').catch(() => null);
-                
-                htmlDebug.loginFormFound = !!hasForm;
-                htmlDebug.emailFieldFound = !!emailField;
-                htmlDebug.passwordFieldFound = !!passwordField;
-                htmlDebug.submitButtonFound = !!submitBtn;
-                
-                // Get all input fields for debugging
-                const inputs = await page.$$eval('input', elements => 
-                    elements.map(el => ({ type: el.type, name: el.name, id: el.id, class: el.className }))
-                ).catch(() => []);
-                htmlDebug.pageStructure.loginInputs = inputs;
-                
-                console.log('\n📄 LOGIN PAGE DEBUG:');
-                console.log(`   Form found: ${htmlDebug.loginFormFound}`);
-                console.log(`   Email field: ${htmlDebug.emailFieldFound}`);
-                console.log(`   Password field: ${htmlDebug.passwordFieldFound}`);
-                console.log(`   Submit button: ${htmlDebug.submitButtonFound}`);
-                console.log(`   Available inputs:`, inputs.slice(0, 5));
-                
-                // Save HTML to file for inspection
-                fs.writeFileSync('/tmp/faucetpay-login-page.html', html);
-                console.log(`   💾 Login HTML saved to: /tmp/faucetpay-login-page.html`);
-                
-            } else if (type === 'dashboard') {
-                htmlDebug.dashboardPage = trimmedHTML;
-                console.log('\n📊 DASHBOARD PAGE DEBUG:');
-                console.log(`   HTML preview: ${trimmedHTML.substring(0, 500)}...`);
+    async loadSessionState() {
+        if (fs.existsSync(SESSION_FILE)) {
+            try {
+                const savedStats = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
+                if (savedStats.totalEarned) {
+                    stats.totalEarned = savedStats.totalEarned;
+                    stats.totalActions = savedStats.totalActions;
+                    stats.sourceBalances = savedStats.sourceBalances || stats.sourceBalances;
+                    stats.withdrawalHistory = savedStats.withdrawalHistory || [];
+                    stats.claimHistory = savedStats.claimHistory || [];
+                    console.log('[Session] ✅ Loaded previous session data');
+                    console.log(`[Session] Previous total earned: $${stats.totalEarned.toFixed(5)}`);
+                }
+            } catch (e) {
+                console.log('[Session] No saved session found');
             }
-            
-            return trimmedHTML;
-        } catch (error) {
-            console.error(`HTML capture error: ${error.message}`);
-            return null;
         }
     }
 
-    async login() {
-        if (!this.email || !this.password) {
-            console.log('[FaucetPay] Demo mode - limited features');
-            return false;
-        }
-        
-        console.log('\n🔐 [FaucetPay] Starting login process...');
-        console.log(`   Email: ${this.email}`);
-        console.log(`   Password: ${'*'.repeat(this.password.length)}`);
-        
+    async saveSessionState() {
+        const saveData = {
+            totalEarned: stats.totalEarned,
+            totalActions: stats.totalActions,
+            sourceBalances: stats.sourceBalances,
+            withdrawalHistory: stats.withdrawalHistory.slice(0, 100),
+            claimHistory: stats.claimHistory.slice(0, 500),
+            lastSaved: new Date()
+        };
+        fs.writeFileSync(SESSION_FILE, JSON.stringify(saveData, null, 2));
+    }
+
+    async checkLoginStatus() {
         try {
-            // Navigate to login page
-            console.log('   🌐 Navigating to login page...');
-            await this.page.goto('https://faucetpay.io/login', { 
-                waitUntil: 'networkidle2',
-                timeout: 30000 
-            });
+            await this.page.goto('https://faucetpay.io/dashboard', { waitUntil: 'domcontentloaded', timeout: 10000 });
+            await this.page.waitForTimeout(2000);
             
-            // IMPORTANT: Wait for React to render the login form
-            console.log('   ⏳ Waiting for React to render login form...');
-            await this.page.waitForTimeout(5000);
-            
-            // Wait for specific React-rendered elements
-            await this.page.waitForSelector('input[type="email"], input[name="email"], input[placeholder*="Email"], input[placeholder*="email"]', { 
-                timeout: 10000 
-            }).catch(() => console.log('   ⚠️ Email selector timeout - checking alternatives...'));
-            
-            // Capture login page HTML after React loads
-            console.log('   📸 Capturing login page HTML after React render...');
-            await this.captureHTMLDebug(this.page, 'login');
-            
-            // Check if we're already logged in
-            const currentUrl = this.page.url();
-            console.log(`   🔗 Current URL: ${currentUrl}`);
-            
-            if (currentUrl.includes('/dashboard') || currentUrl.includes('/home')) {
-                console.log('   ✅ Already logged in!');
-                this.loggedIn = true;
-                stats.loggedIn = true;
-                await this.updateBalance();
-                return true;
-            }
-            
-            // Method 1: Try to find email field by various selectors (React form)
-            console.log('   📝 Looking for email field...');
-            const emailSelectors = [
-                'input[type="email"]',
-                'input[name="email"]',
-                'input[placeholder*="Email"]',
-                'input[placeholder*="email"]',
-                'input[id*="email"]',
-                'input[class*="email"]',
-                '#email',
-                '.email-input',
-                'input[autocomplete="email"]'
-            ];
-            
-            let emailField = null;
-            for (const selector of emailSelectors) {
-                try {
-                    emailField = await this.page.$(selector);
-                    if (emailField && await emailField.isVisible()) {
-                        console.log(`   ✅ Found email field with selector: ${selector}`);
-                        break;
-                    }
-                } catch(e) {}
-            }
-            
-            if (!emailField) {
-                // Try to find any input that might be for email
-                const allInputs = await this.page.$$('input');
-                for (const input of allInputs) {
-                    const type = await input.evaluate(el => el.type).catch(() => '');
-                    const placeholder = await input.evaluate(el => el.placeholder || '').catch(() => '');
-                    const name = await input.evaluate(el => el.name || '').catch(() => '');
-                    const id = await input.evaluate(el => el.id || '').catch(() => '');
-                    
-                    if (type === 'email' || 
-                        placeholder.toLowerCase().includes('email') || 
-                        name.toLowerCase().includes('email') ||
-                        id.toLowerCase().includes('email')) {
-                        emailField = input;
-                        console.log(`   ✅ Found email field by scanning: type=${type}, placeholder=${placeholder}`);
-                        break;
-                    }
-                }
-            }
-            
-            if (!emailField) {
-                // Take screenshot to debug
-                await this.page.screenshot({ path: '/tmp/login-no-email.png' });
-                console.log('   ❌ Email field not found - screenshot saved to /tmp/login-no-email.png');
-                
-                // Log all input fields on page
-                const inputs = await this.page.$$eval('input', elements => 
-                    elements.map(el => ({
-                        type: el.type,
-                        name: el.name,
-                        id: el.id,
-                        className: el.className,
-                        placeholder: el.placeholder,
-                        autocomplete: el.autocomplete
-                    }))
-                );
-                console.log('   📋 Available input fields:', JSON.stringify(inputs, null, 2));
-                throw new Error('Email field not found on page');
-            }
-            
-            // Clear and fill email
-            await emailField.click();
-            await emailField.click({ clickCount: 3 });
-            await emailField.press('Backspace');
-            await emailField.type(this.email, { delay: 50 });
-            console.log('   ✅ Email entered');
-            
-            // Method 2: Find password field
-            console.log('   🔒 Looking for password field...');
-            const passwordSelectors = [
-                'input[type="password"]',
-                'input[name="password"]',
-                'input[placeholder*="Password"]',
-                'input[placeholder*="password"]',
-                'input[id*="password"]',
-                'input[class*="password"]',
-                '#password',
-                '.password-input'
-            ];
-            
-            let passwordField = null;
-            for (const selector of passwordSelectors) {
-                try {
-                    passwordField = await this.page.$(selector);
-                    if (passwordField && await passwordField.isVisible()) {
-                        console.log(`   ✅ Found password field with selector: ${selector}`);
-                        break;
-                    }
-                } catch(e) {}
-            }
-            
-            if (!passwordField) {
-                // Try to find password input by scanning
-                const allInputs = await this.page.$$('input');
-                for (const input of allInputs) {
-                    const type = await input.evaluate(el => el.type).catch(() => '');
-                    const placeholder = await input.evaluate(el => el.placeholder || '').catch(() => '');
-                    
-                    if (type === 'password' || placeholder.toLowerCase().includes('password')) {
-                        passwordField = input;
-                        console.log(`   ✅ Found password field by scanning: type=${type}`);
-                        break;
-                    }
-                }
-            }
-            
-            if (!passwordField) {
-                throw new Error('Password field not found on page');
-            }
-            
-            await passwordField.click();
-            await passwordField.type(this.password, { delay: 50 });
-            console.log('   ✅ Password entered');
-            
-            // Method 3: Find login/submit button
-            console.log('   🔘 Looking for submit button...');
-            const submitSelectors = [
-                'button[type="submit"]',
-                'input[type="submit"]',
-                'button:has-text("Login")',
-                'button:has-text("Sign in")',
-                'button:has-text("Sign In")',
-                'button:has-text("LOGIN")',
-                'button:has-text("SIGN IN")',
-                '[class*="login"] button',
-                '[class*="submit"] button',
-                '.login-button',
-                '.submit-button'
-            ];
-            
-            let submitBtn = null;
-            for (const selector of submitSelectors) {
-                try {
-                    if (selector.includes(':has-text')) {
-                        submitBtn = await this.page.$eval(selector, el => el).catch(() => null);
-                    } else {
-                        submitBtn = await this.page.$(selector);
-                    }
-                    if (submitBtn && await submitBtn.isVisible()) {
-                        console.log(`   ✅ Found submit button with selector: ${selector}`);
-                        break;
-                    }
-                } catch(e) {}
-            }
-            
-            if (!submitBtn) {
-                // Try to find button by text content
-                const buttons = await this.page.$$('button, input[type="submit"], a[role="button"]');
-                for (const btn of buttons) {
-                    const text = await btn.evaluate(el => (el.innerText || el.value || '').toLowerCase());
-                    if (text.includes('login') || text.includes('sign in') || text.includes('submit')) {
-                        submitBtn = btn;
-                        console.log(`   ✅ Found submit button by text: "${text}"`);
-                        break;
-                    }
-                }
-            }
-            
-            if (!submitBtn) {
-                // Try to submit by pressing Enter on password field
-                console.log('   ⚠️ No submit button found, trying Enter key...');
-                await passwordField.press('Enter');
-            } else {
-                console.log('   🚀 Clicking submit button...');
-                await submitBtn.click();
-            }
-            
-            // Wait for navigation/redirect
-            console.log('   ⏳ Waiting for login to complete...');
-            
-            // Wait for either navigation or dashboard content
-            await Promise.race([
-                this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }),
-                this.page.waitForSelector('.dashboard, .user-balance, .balance-amount', { timeout: 15000 }).catch(() => null)
-            ]).catch(() => console.log('   ⚠️ No navigation detected, checking current state...'));
-            
-            await this.page.waitForTimeout(3000);
-            
-            // Check login result
-            const finalUrl = this.page.url();
-            console.log(`   🔗 Final URL: ${finalUrl}`);
-            
-            // Check if login was successful
-            const hasDashboard = await this.page.$('.dashboard, .user-menu, .balance-amount, [class*="dashboard"]').catch(() => null);
-            const isLoggedIn = hasDashboard !== null || finalUrl.includes('/dashboard') || finalUrl !== 'https://faucetpay.io/login';
+            // Check if we're logged in by looking for user elements
+            const isLoggedIn = await this.page.evaluate(() => {
+                const hasBalance = document.querySelector('.balance-amount, .user-balance');
+                const hasLogout = document.querySelector('a[href*="logout"]');
+                const hasDashboard = window.location.href.includes('/dashboard');
+                return !!(hasBalance || hasLogout || hasDashboard);
+            }).catch(() => false);
             
             if (isLoggedIn) {
                 this.loggedIn = true;
                 stats.loggedIn = true;
-                console.log('\n✅✅✅ LOGIN SUCCESSFUL! ✅✅✅');
-                console.log(`   Redirected to: ${finalUrl}`);
-                
-                await this.captureHTMLDebug(this.page, 'dashboard');
+                console.log('[FaucetPay] ✅ Already logged in from saved session!');
                 await this.updateBalance();
                 return true;
-            } else {
-                // Check for error messages
-                const errorMsg = await this.page.$eval('.alert, .error, [class*="error"], [class*="alert"]', el => el.innerText).catch(() => null);
-                if (errorMsg) {
-                    htmlDebug.loginError = errorMsg;
-                    console.log(`   ❌ Login error message: ${errorMsg}`);
-                }
-                
-                // Check if captcha is present
-                const hasCaptcha = await this.page.$('.captcha, [class*="captcha"], iframe[src*="captcha"]').catch(() => null);
-                if (hasCaptcha) {
-                    console.log('   ⚠️ CAPTCHA detected! Manual intervention may be required.');
-                    htmlDebug.loginError = 'CAPTCHA detected - manual solving required';
-                }
-                
-                throw new Error('Login failed - incorrect credentials or site issue');
             }
-            
+            return false;
         } catch (error) {
-            console.log(`\n❌❌❌ LOGIN FAILED! ❌❌❌`);
-            console.log(`   Error: ${error.message}`);
-            htmlDebug.loginError = error.message;
-            
-            // Take screenshot for debugging
-            try {
-                await this.page.screenshot({ path: '/tmp/login-error.png', fullPage: true });
-                console.log(`   📸 Full page screenshot saved to: /tmp/login-error.png`);
-                
-                // Also save HTML for debugging
-                const html = await this.page.content();
-                fs.writeFileSync('/tmp/login-error.html', html);
-                console.log(`   📄 HTML saved to: /tmp/login-error.html`);
-            } catch (e) {}
-            
-            console.log('\n[FaucetPay] Running in limited mode without login');
             return false;
         }
     }
 
+    async waitForManualLogin() {
+        console.log('\n========================================');
+        console.log('  ⏳ MANUAL LOGIN REQUIRED');
+        console.log('========================================');
+        console.log('1. Open your browser and go to:');
+        console.log(`   http://localhost:${port}/faucetpaylogin`);
+        console.log('2. Login to your FaucetPay account');
+        console.log('3. Bot will automatically detect login');
+        console.log('========================================\n');
+        
+        // Navigate to login page and wait for manual login
+        await this.page.goto('https://faucetpay.io/login', { waitUntil: 'networkidle2' });
+        
+        // Wait for successful login (check every 2 seconds)
+        while (!this.loggedIn) {
+            await this.page.waitForTimeout(2000);
+            
+            const isLoggedIn = await this.page.evaluate(() => {
+                const url = window.location.href;
+                const hasDashboard = url.includes('/dashboard');
+                const hasBalance = document.querySelector('.balance-amount, .user-balance');
+                return hasDashboard || hasBalance;
+            }).catch(() => false);
+            
+            if (isLoggedIn) {
+                this.loggedIn = true;
+                stats.loggedIn = true;
+                console.log('\n[FaucetPay] ✅ Manual login detected!');
+                await this.updateBalance();
+                await this.saveSessionState();
+                
+                // Resolve the promise if someone is waiting
+                if (loginPromiseResolve) {
+                    loginPromiseResolve(true);
+                    loginPromiseResolve = null;
+                }
+                break;
+            }
+        }
+        
+        return true;
+    }
+
     async updateBalance() {
         try {
-            // Try multiple selectors for balance
-            const balanceSelectors = [
-                '.balance-amount',
-                '.user-balance',
-                '[class*="balance"]',
-                '.dashboard-balance',
-                '.wallet-balance'
-            ];
-            
-            let balanceText = '0';
-            for (const selector of balanceSelectors) {
-                try {
-                    balanceText = await this.page.$eval(selector, el => el.innerText).catch(() => null);
-                    if (balanceText) break;
-                } catch(e) {}
-            }
-            
+            const balanceText = await this.page.$eval('.balance-amount, .user-balance', el => el.innerText).catch(() => '0');
             const newBalance = parseFloat(balanceText) || 0;
             if (newBalance !== stats.currentBalance) {
                 console.log(`💰 Balance updated: $${stats.currentBalance.toFixed(5)} → $${newBalance.toFixed(5)}`);
@@ -552,9 +315,17 @@ class CompleteFaucetBot {
                     instantToBalance: source.instantToBalance
                 });
                 
+                // Trim history
+                if (stats.claimHistory.length > 500) stats.claimHistory.pop();
+                
                 // Log with appropriate indicator
                 const indicator = source.instantToBalance ? '💰' : '🪙';
                 console.log(`  ${indicator} ${source.name}: +$${earned.toFixed(5)} → ${source.instantToBalance ? 'To Balance' : `To ${source.name} Wallet`}`);
+                
+                // Save session periodically
+                if (stats.totalActions % 10 === 0) {
+                    await this.saveSessionState();
+                }
                 
                 // Check if external faucet reached withdrawal minimum
                 if (!source.instantToBalance && source.minWithdraw && stats.sourceBalances[source.name].earned >= source.minWithdraw) {
@@ -578,7 +349,6 @@ class CompleteFaucetBot {
         stats.sourceBalances[source.name].pendingWithdraw = true;
         
         try {
-            // Attempt to find and click withdraw button
             await this.page.goto(source.url, { waitUntil: 'networkidle2' });
             await this.page.waitForTimeout(3000);
             
@@ -593,7 +363,6 @@ class CompleteFaucetBot {
                 await withdrawBtn.click();
                 await this.page.waitForTimeout(3000);
                 
-                // Record successful withdrawal
                 stats.withdrawalHistory.unshift({
                     time: new Date(),
                     source: source.name,
@@ -602,11 +371,14 @@ class CompleteFaucetBot {
                     to: 'FaucetPay Balance'
                 });
                 
+                // Trim history
+                if (stats.withdrawalHistory.length > 100) stats.withdrawalHistory.pop();
+                
                 console.log(`     ✅ WITHDRAWAL SUCCESSFUL! $${balance.toFixed(5)} sent to FaucetPay balance`);
                 stats.sourceBalances[source.name].earned = 0;
                 stats.lastWithdrawal = new Date();
+                await this.saveSessionState();
                 
-                // Update balance
                 if (this.loggedIn) {
                     await this.updateBalance();
                 }
@@ -625,13 +397,20 @@ class CompleteFaucetBot {
         }
         
         stats.sourceBalances[source.name].pendingWithdraw = false;
+        await this.saveSessionState();
     }
 
     async runCycle() {
+        if (!this.loggedIn) {
+            console.log('[Bot] Waiting for login...');
+            return 0;
+        }
+        
         let cycleEarned = 0;
         
         console.log(`\n📊 CYCLE ${new Date().toLocaleTimeString()}`);
         console.log(`🪙 ${EARNING_SOURCES.length} sources | Balance: $${stats.currentBalance.toFixed(5)}`);
+        console.log(`📈 Total earned this session: $${stats.sessionEarned.toFixed(5)}`);
         console.log('========================================');
         
         // First claim external faucets (ones that need withdrawal)
@@ -655,6 +434,9 @@ class CompleteFaucetBot {
             await this.updateBalance();
         }
         
+        stats.lastCycleTime = new Date();
+        await this.saveSessionState();
+        
         // Show summary
         console.log('========================================');
         console.log(`💰 Cycle earned: $${cycleEarned.toFixed(5)}`);
@@ -675,7 +457,7 @@ class CompleteFaucetBot {
         }
         
         // Show recent withdrawals
-        if (stats.withdrawalHistory.length > 0 && stats.withdrawalHistory[0].time > new Date(Date.now() - 60000)) {
+        if (stats.withdrawalHistory.length > 0 && new Date(stats.withdrawalHistory[0].time) > new Date(Date.now() - 60000)) {
             const lastWithdraw = stats.withdrawalHistory[0];
             console.log(`\n💸 Last withdrawal: $${lastWithdraw.amount.toFixed(5)} from ${lastWithdraw.source} - ${lastWithdraw.status}`);
         }
@@ -683,37 +465,211 @@ class CompleteFaucetBot {
         return cycleEarned;
     }
 
-    async run() {
-        console.log('🚀 Starting Complete Faucet Bot');
-        console.log('💰 Will show real-time earnings and withdrawals');
+    async start() {
+        console.log('🚀 Starting Persistent Faucet Bot');
+        console.log('💰 Will save session data between restarts');
         console.log('========================================\n');
         
         await this.init();
-        await this.login();
         
-        while (true) {
+        // Check if already logged in from previous session
+        const wasLoggedIn = await this.checkLoginStatus();
+        
+        if (!wasLoggedIn) {
+            await this.waitForManualLogin();
+        }
+        
+        this.isRunning = true;
+        
+        // Start the main loop
+        while (this.isRunning) {
             try {
                 await this.runCycle();
                 console.log(`\n⏰ Next cycle in ${SCAN_INTERVAL_SECONDS} seconds...`);
                 await this.page.waitForTimeout(SCAN_INTERVAL_SECONDS * 1000);
             } catch (error) {
                 console.error(`Cycle error: ${error.message}`);
+                
+                // Check if we're still logged in
+                const stillLoggedIn = await this.checkLoginStatus();
+                if (!stillLoggedIn) {
+                    console.log('[Bot] Session expired. Waiting for re-login...');
+                    this.loggedIn = false;
+                    stats.loggedIn = false;
+                    await this.waitForManualLogin();
+                }
+                
                 await this.page.waitForTimeout(10000);
             }
         }
     }
+
+    async stop() {
+        this.isRunning = false;
+        await this.saveSessionState();
+        if (this.browser) {
+            await this.browser.close();
+        }
+    }
 }
 
-// ============ DASHBOARD ============
-app.get('/', (req, res) => {
+// ============ EXPRESS ROUTES ============
+
+// Login page for manual authentication
+app.get('/faucetpaylogin', (req, res) => {
+    res.send(`
+<!DOCTYPE html>
+<html>
+<head>
+    <title>FaucetPay Login - Bot Authentication</title>
+    <style>
+        body {
+            font-family: monospace;
+            background: linear-gradient(135deg, #0a0e27 0%, #1a1f3a 100%);
+            color: #00ff88;
+            padding: 20px;
+            min-height: 100vh;
+            margin: 0;
+        }
+        .container {
+            max-width: 800px;
+            margin: 50px auto;
+            text-align: center;
+        }
+        .card {
+            background: rgba(26, 31, 58, 0.95);
+            padding: 30px;
+            border-radius: 20px;
+            border: 1px solid #00ff88;
+            box-shadow: 0 0 30px rgba(0,255,136,0.2);
+        }
+        h1 {
+            margin-bottom: 10px;
+        }
+        .status {
+            display: inline-block;
+            padding: 10px 20px;
+            margin: 20px 0;
+            border-radius: 10px;
+            font-weight: bold;
+        }
+        .waiting {
+            background: #ffaa00;
+            color: #000;
+            animation: pulse 1s infinite;
+        }
+        .success {
+            background: #00ff88;
+            color: #000;
+        }
+        .instructions {
+            text-align: left;
+            background: rgba(0,0,0,0.3);
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+        }
+        .instructions li {
+            margin: 10px 0;
+        }
+        .iframe-container {
+            margin: 20px 0;
+            border: 2px solid #00ff88;
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        iframe {
+            width: 100%;
+            height: 600px;
+            border: none;
+        }
+        button {
+            background: #00ff88;
+            color: #000;
+            border: none;
+            padding: 10px 20px;
+            margin: 10px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        button:hover {
+            background: #00cc66;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+        .balance {
+            font-size: 24px;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <h1>🔐 FaucetPay Login</h1>
+            <p>Login to your FaucetPay account to start the bot</p>
+            
+            <div id="status" class="status waiting">⏳ WAITING FOR LOGIN...</div>
+            
+            <div class="instructions">
+                <h3>📋 Instructions:</h3>
+                <ol>
+                    <li>Login to your FaucetPay account in the frame below</li>
+                    <li>Complete any 2FA if enabled</li>
+                    <li>Wait for the success message</li>
+                    <li>Bot will automatically start claiming!</li>
+                </ol>
+                <p><strong>⚠️ Note:</strong> Your session will be saved. You won't need to login again unless cookies expire.</p>
+            </div>
+            
+            <div class="iframe-container">
+                <iframe src="https://faucetpay.io/login"></iframe>
+            </div>
+            
+            <button onclick="checkLoginStatus()">🔄 Check Login Status</button>
+            <button onclick="window.open('https://faucetpay.io/dashboard', '_blank')">📊 Open Dashboard</button>
+        </div>
+    </div>
+    
+    <script>
+        async function checkLoginStatus() {
+            try {
+                const response = await fetch('/api/login-status');
+                const data = await response.json();
+                if (data.loggedIn) {
+                    document.getElementById('status').className = 'status success';
+                    document.getElementById('status').innerHTML = '✅ LOGIN SUCCESSFUL! Bot is running...';
+                    setTimeout(() => {
+                        window.location.href = '/dashboard';
+                    }, 2000);
+                } else {
+                    document.getElementById('status').innerHTML = '⏳ Still waiting for login... Please login in the frame above';
+                }
+            } catch(e) {
+                console.error(e);
+            }
+        }
+        
+        setInterval(checkLoginStatus, 3000);
+        checkLoginStatus();
+    </script>
+</body>
+</html>
+    `);
+});
+
+// Dashboard
+app.get('/dashboard', (req, res) => {
     const uptime = Math.floor((Date.now() - stats.startTime) / 1000);
     const hours = Math.floor(uptime / 3600);
     const minutes = Math.floor((uptime % 3600) / 60);
     
-    const dailyRate = (stats.totalEarned / (uptime / 86400)).toFixed(5);
-    const hourlyRate = (stats.totalEarned / (uptime / 3600)).toFixed(5);
+    const dailyRate = uptime > 0 ? (stats.totalEarned / (uptime / 86400)).toFixed(5) : '0.00000';
+    const hourlyRate = uptime > 0 ? (stats.totalEarned / (uptime / 3600)).toFixed(5) : '0.00000';
     
-    // Source balances HTML
     const sourceBalancesHtml = Object.entries(stats.sourceBalances)
         .filter(([_, data]) => data.earned > 0 || data.claims > 0)
         .map(([name, data]) => {
@@ -729,7 +685,6 @@ app.get('/', (req, res) => {
             </tr>
         `}).join('');
     
-    // Claim history HTML
     const claimHtml = stats.claimHistory.slice(0, 30).map(c => `
         <tr>
             <td>${new Date(c.time).toLocaleTimeString()}</td>
@@ -739,7 +694,6 @@ app.get('/', (req, res) => {
         </tr>
     `).join('');
     
-    // Withdrawal history HTML
     const withdrawalHtml = stats.withdrawalHistory.slice(0, 20).map(w => `
         <tr>
             <td>${new Date(w.time).toLocaleTimeString()}</td>
@@ -749,44 +703,17 @@ app.get('/', (req, res) => {
         </tr>
     `).join('');
     
-    // HTML Debug info
-    const debugHtml = `
-        <div class="card" style="margin-top: 20px;">
-            <h3>🔍 Login Debug Information</h3>
-            <div style="font-size: 11px; font-family: monospace; background: #0a0e27; padding: 10px; border-radius: 5px;">
-                <div><strong>Last Login Attempt:</strong> ${htmlDebug.lastLoginAttempt ? new Date(htmlDebug.lastLoginAttempt).toLocaleString() : 'Never'}</div>
-                <div><strong>Login Successful:</strong> <span class="${stats.loggedIn ? 'earn' : 'error'}">${stats.loggedIn ? 'YES' : 'NO'}</span></div>
-                <div><strong>Login Error:</strong> ${htmlDebug.loginError || 'None'}</div>
-                <div><strong>Login Form Found:</strong> ${htmlDebug.loginFormFound ? '✅' : '❌'}</div>
-                <div><strong>Email Field Found:</strong> ${htmlDebug.emailFieldFound ? '✅' : '❌'}</div>
-                <div><strong>Password Field Found:</strong> ${htmlDebug.passwordFieldFound ? '✅' : '❌'}</div>
-                <div><strong>Submit Button Found:</strong> ${htmlDebug.submitButtonFound ? '✅' : '❌'}</div>
-                ${htmlDebug.loginPageTrimmed ? `
-                <details style="margin-top: 10px;">
-                    <summary>View Login Page HTML Preview (first 1000 chars)</summary>
-                    <pre style="overflow-x: auto; white-space: pre-wrap; word-wrap: break-word; font-size: 10px; margin-top: 10px;">${htmlDebug.loginPageTrimmed.substring(0, 1000)}</pre>
-                </details>
-                ` : ''}
-                ${htmlDebug.pageStructure.loginInputs ? `
-                <details style="margin-top: 10px;">
-                    <summary>View Available Input Fields</summary>
-                    <pre style="overflow-x: auto; white-space: pre-wrap; word-wrap: break-word; font-size: 10px; margin-top: 10px;">${JSON.stringify(htmlDebug.pageStructure.loginInputs, null, 2)}</pre>
-                </details>
-                ` : ''}
-            </div>
-        </div>
-    `;
-    
     res.send(`
 <!DOCTYPE html>
 <html>
 <head>
-    <title>FaucetPay Complete Bot - Live Earnings</title>
+    <title>FaucetPay Bot Dashboard - Live Earnings</title>
     <meta http-equiv="refresh" content="10">
     <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: monospace; background: #0a0e27; color: #00ff88; padding: 20px; }
         .container { max-width: 1400px; margin: 0 auto; }
-        h1 { text-align: center; }
+        h1 { text-align: center; margin-bottom: 20px; }
         .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin: 20px 0; }
         .stat-card { background: #1a1f3a; padding: 15px; border-radius: 10px; text-align: center; }
         .stat-value { font-size: 28px; font-weight: bold; }
@@ -799,19 +726,25 @@ app.get('/', (req, res) => {
         th { color: #00ff88; }
         .earn { color: #00ff88; }
         .error { color: #ff4444; }
-        .pending { color: #ffaa00; }
-        .refresh-btn { background: #1a1f3a; color: #00ff88; border: 1px solid #00ff88; padding: 5px 10px; border-radius: 5px; cursor: pointer; margin-bottom: 10px; }
-        .live { color: #00ff88; animation: pulse 1s infinite; }
+        .nav { text-align: center; margin-bottom: 20px; }
+        .nav a { color: #00ff88; margin: 0 10px; text-decoration: none; }
+        .nav a:hover { text-decoration: underline; }
+        .live { animation: pulse 1s infinite; }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        button { background: #1a1f3a; color: #00ff88; border: 1px solid #00ff88; padding: 5px 10px; border-radius: 5px; cursor: pointer; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>💰 FaucetPay Complete Bot</h1>
+        <h1>💰 FaucetPay Persistent Bot</h1>
+        <div class="nav">
+            <a href="/dashboard">📊 Dashboard</a>
+            <a href="/faucetpaylogin">🔐 Re-login</a>
+        </div>
         <div class="status">
-            🟢 <span class="live">LIVE</span> | Uptime: ${hours}h ${minutes}m | Auto Withdraw: ${AUTO_WITHDRAW ? 'ON' : 'OFF'}
+            🟢 <span class="live">${botRunning ? 'RUNNING' : 'STOPPED'}</span> | Uptime: ${hours}h ${minutes}m | Auto Withdraw: ${AUTO_WITHDRAW ? 'ON' : 'OFF'}
             <div>Session earned: <span class="earn">$${stats.sessionEarned.toFixed(5)}</span> | Balance: <span class="earn">$${stats.currentBalance.toFixed(5)}</span></div>
-            <div>Login Status: <span class="${stats.loggedIn ? 'earn' : 'error'}">${stats.loggedIn ? '✅ Logged In' : '❌ Not Logged In'}</span></div>
+            <div>Total earned all time: <span class="earn">$${stats.totalEarned.toFixed(5)}</span></div>
         </div>
         
         <div class="stats">
@@ -824,8 +757,8 @@ app.get('/', (req, res) => {
         <div class="grid-2">
             <div class="card">
                 <h3>🪙 Source Balances</h3>
-                <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
-                </table>
+                <button onclick="location.reload()">🔄 Refresh</button>
+                <table>
                     <thead><tr><th>Source</th><th>Balance</th><th>Claims</th><th>Last</th><th>Status</th></tr></thead>
                     <tbody>${sourceBalancesHtml || '<tr><td colspan="5">No activity yet...</td></tr>'}</tbody>
                 </table>
@@ -846,56 +779,63 @@ app.get('/', (req, res) => {
                 <tbody>${claimHtml || '<tr><td colspan="4">No claims yet...</td></tr>'}</tbody>
             </table>
         </div>
-        
-        ${debugHtml}
     </div>
 </body>
 </html>`);
 });
 
-app.get('/debug/html/login', (req, res) => {
-    res.setHeader('Content-Type', 'text/html');
-    if (htmlDebug.loginPage) {
-        res.send(htmlDebug.loginPage);
-    } else {
-        res.send('<html><body><h1>No login page captured yet</h1><p>Wait for the bot to attempt login.</p></body></html>');
-    }
+// API endpoint to check login status
+app.get('/api/login-status', (req, res) => {
+    res.json({ 
+        loggedIn: stats.loggedIn,
+        running: botRunning,
+        balance: stats.currentBalance,
+        totalEarned: stats.totalEarned
+    });
 });
 
-app.get('/debug/html/dashboard', (req, res) => {
-    res.setHeader('Content-Type', 'text/html');
-    if (htmlDebug.dashboardPage) {
-        res.send(`<html><body><pre>${htmlDebug.dashboardPage}</pre></body></html>`);
-    } else {
-        res.send('<html><body><h1>No dashboard page captured yet</h1></body></html>');
-    }
+// API to get stats
+app.get('/api/stats', (req, res) => {
+    res.json(stats);
 });
 
-app.get('/debug/info', (req, res) => {
-    res.json(htmlDebug);
+// Root redirect
+app.get('/', (req, res) => {
+    res.redirect('/dashboard');
 });
 
 // ============ MAIN ============
 async function main() {
-    console.log('🚀 Starting Complete Faucet Bot...');
-    console.log('💰 Real-time earnings and withdrawal tracking enabled');
-    console.log('🔍 Login debugging enabled - check /debug endpoints');
+    console.log('🚀 Starting Persistent Faucet Bot...');
+    console.log('💰 Manual login required at /faucetpaylogin');
     console.log('========================================\n');
     
     await installChrome();
     
     app.listen(port, '0.0.0.0', () => {
-        console.log(`📊 Dashboard: http://localhost:${port}`);
-        console.log(`🔍 Login HTML Debug: http://localhost:${port}/debug/html/login`);
-        console.log(`🔍 Dashboard HTML: http://localhost:${port}/debug/html/dashboard`);
-        console.log(`🔍 Debug Info (JSON): http://localhost:${port}/debug/info`);
+        console.log(`\n📊 Dashboard: http://localhost:${port}/dashboard`);
+        console.log(`🔐 Login Page: http://localhost:${port}/faucetpaylogin`);
+        console.log('\n⚠️  Open the login page and authenticate to start the bot\n');
     });
     
-    const bot = new CompleteFaucetBot(FAUCETPAY_EMAIL, FAUCETPAY_PASSWORD);
-    await bot.run();
+    botInstance = new PersistentFaucetBot();
+    botRunning = true;
+    await botInstance.start();
 }
 
-process.on('SIGINT', () => process.exit(0));
-process.on('SIGTERM', () => process.exit(0));
+process.on('SIGINT', async () => {
+    console.log('\n[Bot] Shutting down...');
+    if (botInstance) {
+        await botInstance.stop();
+    }
+    process.exit(0);
+});
+process.on('SIGTERM', async () => {
+    console.log('\n[Bot] Shutting down...');
+    if (botInstance) {
+        await botInstance.stop();
+    }
+    process.exit(0);
+});
 
 main().catch(console.error);
