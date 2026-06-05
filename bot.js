@@ -63,6 +63,24 @@ function calculateScaledBase(balance) {
     return Number(calculatedBase.toFixed(8));
 }
 
+// Reset function to "reboot" the bot session
+function resetSession() {
+    botState.statusMessage = "REBOOTING: Floor Hit. Restarting Session...";
+    botState.profitProtection.safeBalance = 0;
+    botState.stats = {
+        totalBets: 0,
+        wins: 0,
+        losses: 0,
+        netProfit: 0,
+        maxSessionProfit: 0,
+        pullbackPercent: 0,
+        currentBalance: botState.stats.currentBalance,
+        startTime: Date.now()
+    };
+    botState.betHistory = [];
+    botState.settings.currentBet = calculateScaledBase(botState.stats.currentBalance);
+}
+
 const STATE_PATH = './bot-state.json';
 function saveState() {
     try { fs.writeFileSync(STATE_PATH, JSON.stringify(botState, null, 2)); } catch (e) {}
@@ -98,10 +116,11 @@ async function runStrategy() {
     botState.statusMessage = "Active";
     
     while (true) {
+        // --- AUTO-REBOOT PROTECTION ---
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
-            botState.running = false;
-            botState.statusMessage = "STOPPED: Floor Limit Hit!";
-            break;
+            resetSession();
+            await new Promise(r => setTimeout(r, 3000)); // 3 second delay before restart
+            continue; 
         }
 
         const result = await placeBet();
@@ -129,7 +148,7 @@ async function runStrategy() {
                 botState.nextResumeTime = Date.now() + 60000;
                 botState.statusMessage = `PULLBACK GUARD: Pausing 60s (${botState.stats.pullbackPercent.toFixed(2)}% drop)`;
                 
-                botState.stats.maxSessionProfit = botState.stats.netProfit; // Reset peak
+                botState.stats.maxSessionProfit = botState.stats.netProfit; 
                 await new Promise(r => setTimeout(r, 60000));
                 
                 botState.isPaused = false;
@@ -185,7 +204,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro | Pro Dashboard</title>
+    <title>Dice Pro | Auto-Reboot Dash</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -214,7 +233,7 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <div class="header">
-            <h1>Dice Pro <span style="color:var(--primary)">v2.6</span></h1>
+            <h1>Dice Pro <span style="color:var(--primary)">v2.7</span></h1>
             <div style="text-align: right"><div class="label">Market BTC/USD</div><div id="price-tag" style="font-weight: 700;">$0.00</div></div>
         </div>
         
@@ -237,7 +256,7 @@ app.get('/', (req, res) => {
             <div class="mini-card"><div class="label">Uptime</div><div id="uptime" style="font-weight:700">0h</div></div>
         </div>
 
-        <div class="label">Revenue Projections</div>
+        <div class="label">Revenue Projections (Session)</div>
         <div class="proj-grid">
             <div class="proj-card"><div class="label">Hourly</div><span id="p-hr-btc" class="win" style="font-weight:700">0.00</span><br><span id="p-hr-usd" class="usd-val">$0.00</span></div>
             <div class="proj-card"><div class="label">Daily</div><span id="p-day-btc" class="win" style="font-weight:700">0.00</span><br><span id="p-day-usd" class="usd-val">$0.00</span></div>
@@ -278,7 +297,6 @@ app.get('/', (req, res) => {
                 document.getElementById('scaling-base').innerText = f(botState.settings.baseBet);
                 document.getElementById('uptime').innerText = hoursPassed + "h";
 
-                // Projections
                 const ph = botState.stats.netProfit / hoursPassed;
                 document.getElementById('p-hr-btc').innerText = f(ph); document.getElementById('p-hr-usd').innerText = u(ph);
                 document.getElementById('p-day-btc').innerText = f(ph*24); document.getElementById('p-day-usd').innerText = u(ph*24);
