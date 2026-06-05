@@ -14,13 +14,16 @@ const DEFAULTS = {
     multiplier: 1.1,          
     payout: 2.0,              
     balanceStep: 0.00000050,  
-    betIncrement: 0.00000001  
+    betIncrement: 0.00000001,
+    cycleDuration: 60000 // 60 seconds in ms
 };
 
 // ============ BOT STATE ============
 let btcPrice = 65000; 
 let botState = {
     running: false,
+    isCoolingDown: false, // Track if we are in the rest period
+    nextCycleTime: Date.now() + DEFAULTS.cycleDuration,
     statusMessage: "Initializing...",
     coin: DEFAULTS.coin,
     profitProtection: { safeBalance: 0 }, 
@@ -58,11 +61,9 @@ function calculateScaledBase(balance) {
 }
 
 const STATE_PATH = process.env.HOME ? `${process.env.HOME}/bot-state.json` : './bot-state.json';
-
 function saveState() {
     try { fs.writeFileSync(STATE_PATH, JSON.stringify(botState, null, 2)); } catch (e) {}
 }
-
 function loadState() {
     if (fs.existsSync(STATE_PATH)) {
         try {
@@ -75,7 +76,6 @@ function loadState() {
 // ============ API LOGIC ============
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
-    // alphanumeric only seed
     const randomSuffix = Math.random().toString(36).replace(/[^a-z0-9]/gi, '').substring(0, 10);
     const safeSeed = "node20" + randomSuffix; 
 
@@ -95,17 +95,40 @@ async function placeBet() {
     }
 }
 
-// ============ MAIN STRATEGY ============
-async function runStrategy() {
-    botState.running = true;
-    botState.statusMessage = "Running";
+// ============ CYCLE MANAGER ============
+async function startCycleController() {
+    while (true) {
+        // --- PHASE 1: RUNNING ---
+        botState.running = true;
+        botState.isCoolingDown = false;
+        botState.nextCycleTime = Date.now() + DEFAULTS.cycleDuration;
+        botState.statusMessage = "RUNNING (60s Active Window)";
+        
+        // Start the betting strategy loop
+        runStrategyLoop(); 
 
+        // Wait for 60 seconds
+        await new Promise(r => setTimeout(r, DEFAULTS.cycleDuration));
+
+        // --- PHASE 2: COOLDOWN ---
+        botState.running = false; // This breaks the runStrategyLoop while condition
+        botState.isCoolingDown = true;
+        botState.nextCycleTime = Date.now() + DEFAULTS.cycleDuration;
+        botState.statusMessage = "COOLDOWN (60s Rest Period)";
+        
+        // Wait for 60 seconds
+        await new Promise(r => setTimeout(r, DEFAULTS.cycleDuration));
+    }
+}
+
+// ============ MAIN STRATEGY ============
+async function runStrategyLoop() {
+    // This loop continues as long as botState.running is true
     while (botState.running) {
-        // --- HARD PROTECTION CHECK ---
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
             botState.running = false;
             botState.statusMessage = "STOPPED: Protected Profit Floor Hit!";
-            break;
+            return; // Hard stop, breaks cycle controller too if logic isn't careful
         }
 
         const result = await placeBet();
@@ -127,13 +150,12 @@ async function runStrategy() {
             botState.settings.currentBet = botState.settings.baseBet;
         } else {
             botState.stats.losses++;
-            // Math.ceil fix for low-amount martingale scaling
             let nextBet = botState.settings.currentBet * botState.settings.multiplier;
             botState.settings.currentBet = Math.ceil(nextBet * 100000000) / 100000000;
         }
 
         botState.betHistory.unshift({ 
-            id: botState.stats.totalBets, time: new Date(), bet: result.Bet, roll: result.Roll, 
+            id: botState.stats.totalBets, time: new Date().toLocaleTimeString(), bet: result.Bet, roll: result.Roll, 
             profit: profit, isWin: profit > 0, dynamicBase: botState.settings.baseBet
         });
         if (botState.betHistory.length > 50) botState.betHistory.pop();
@@ -147,12 +169,17 @@ async function runStrategy() {
 app.get('/api/stats', (req, res) => {
     const msPassed = Date.now() - botState.stats.startTime;
     const hoursPassed = Math.max(0.0001, msPassed / (1000 * 60 * 60));
+    
+    // Calculate seconds remaining in current phase
+    const timeLeft = Math.max(0, Math.round((botState.nextCycleTime - Date.now()) / 1000));
+
     res.json({
         botState,
         btcPrice,
         tradingBalance: Math.max(0, botState.stats.currentBalance - botState.profitProtection.safeBalance).toFixed(8),
         hoursPassed: hoursPassed.toFixed(2),
-        winRate: botState.stats.totalBets > 0 ? ((botState.stats.wins / botState.stats.totalBets) * 100).toFixed(1) : "0.0"
+        winRate: botState.stats.totalBets > 0 ? ((botState.stats.wins / botState.stats.totalBets) * 100).toFixed(1) : "0.0",
+        timeLeft: timeLeft
     });
 });
 
@@ -185,16 +212,22 @@ app.get('/', (req, res) => {
         th { background: #f8fafc; padding: 1rem; text-align: left; font-size: 0.75rem; color: var(--text-muted); border-bottom: 1px solid var(--border); }
         td { padding: 1rem; font-size: 0.875rem; border-bottom: 1px solid var(--border); font-family: monospace; }
         .win { color: var(--success); } .loss { color: var(--danger); }
-        .status-bar { padding: 10px; background: #1e293b; color: white; border-radius: 8px; margin-bottom: 20px; font-size: 0.8rem; font-weight: bold; }
+        .status-bar { display: flex; justify-content: space-between; padding: 12px; background: #1e293b; color: white; border-radius: 8px; margin-bottom: 20px; font-size: 0.85rem; font-weight: bold; }
+        .timer-badge { background: var(--primary); padding: 2px 8px; border-radius: 4px; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>Dice Pro <span style="color:var(--primary)">v2.0</span></h1>
+            <h1>Dice Pro <span style="color:var(--primary)">v2.1</span></h1>
             <div style="text-align: right"><div class="label">Market BTC/USD</div><div id="price-tag" style="font-weight: 700;">$0.00</div></div>
         </div>
-        <div id="status-msg" class="status-bar">Status: Initializing...</div>
+        
+        <div class="status-bar">
+            <div id="status-msg">Status: Initializing...</div>
+            <div>Phase Timer: <span id="cycle-timer" class="timer-badge">0s</span></div>
+        </div>
+
         <div class="grid">
             <div class="card accent"><div class="label">🔒 Protected Floor</div><div id="safe-balance" class="btc-val">0.00000000</div><div id="safe-usd" class="usd-val">$0.00</div></div>
             <div class="card danger"><div class="label">💳 Trading Balance</div><div id="trading-balance" class="btc-val" style="color:var(--danger)">0.00000000</div><div id="trading-usd" class="usd-val">$0.00</div></div>
@@ -224,10 +257,17 @@ app.get('/', (req, res) => {
             try {
                 const response = await fetch('/api/stats');
                 const data = await response.json();
-                const { botState, btcPrice, tradingBalance, hoursPassed, winRate } = data;
+                const { botState, btcPrice, tradingBalance, hoursPassed, winRate, timeLeft } = data;
+                
                 const f = (n) => parseFloat(n || 0).toFixed(8);
                 const u = (n) => "$" + (parseFloat(n || 0) * btcPrice).toLocaleString(undefined, {minimumFractionDigits: 2});
+                
                 document.getElementById('status-msg').innerText = "Status: " + botState.statusMessage;
+                document.getElementById('cycle-timer').innerText = timeLeft + "s";
+                
+                // Color the timer badge based on state
+                document.getElementById('cycle-timer').style.background = botState.running ? "#10b981" : "#ef4444";
+
                 document.getElementById('price-tag').innerText = "$" + btcPrice.toLocaleString();
                 document.getElementById('safe-balance').innerText = f(botState.profitProtection.safeBalance);
                 document.getElementById('safe-usd').innerText = u(botState.profitProtection.safeBalance);
@@ -235,29 +275,45 @@ app.get('/', (req, res) => {
                 document.getElementById('trading-usd').innerText = u(tradingBalance);
                 document.getElementById('balance').innerText = f(botState.stats.currentBalance);
                 document.getElementById('balance-usd').innerText = u(botState.stats.currentBalance);
-                const pr = document.getElementById('profit'); pr.innerText = f(botState.stats.netProfit);
+                
+                const pr = document.getElementById('profit'); 
+                pr.innerText = f(botState.stats.netProfit);
                 pr.className = 'btc-val ' + (botState.stats.netProfit >= 0 ? 'win' : 'loss');
                 document.getElementById('profit-usd').innerText = u(botState.stats.netProfit);
+                
                 document.getElementById('next-bet').innerText = f(botState.settings.currentBet);
                 document.getElementById('win-rate').innerText = winRate + "%";
                 document.getElementById('scaling-base').innerText = f(botState.settings.baseBet);
                 document.getElementById('uptime').innerText = hoursPassed + "h";
+                
                 const ph = botState.stats.netProfit / hoursPassed;
                 document.getElementById('p-hr-btc').innerText = f(ph); document.getElementById('p-hr-usd').innerText = u(ph);
                 document.getElementById('p-day-btc').innerText = f(ph*24); document.getElementById('p-day-usd').innerText = u(ph*24);
                 document.getElementById('p-month-btc').innerText = f(ph*24*30); document.getElementById('p-month-usd').innerText = u(ph*24*30);
                 document.getElementById('p-year-btc').innerText = f(ph*24*365); document.getElementById('p-year-usd').innerText = u(ph*24*365);
+                
                 document.getElementById('history-body').innerHTML = botState.betHistory.map(b => \`
-                    <tr><td>#\${b.id}</td><td style="color:var(--primary)">\${f(b.dynamicBase)}</td><td>\${f(b.bet)}</td><td>\${b.roll.toFixed(2)}</td><td class="\${b.isWin ? 'win' : 'loss'}">\${b.isWin ? '+' : ''}\${f(b.profit)}</td><td class="\${b.isWin ? 'win' : 'loss'}"><strong>\${b.isWin ? 'WIN' : 'LOSS'}</strong></td></tr>
+                    <tr>
+                        <td>#\${b.id}</td>
+                        <td style="color:var(--primary)">\${f(b.dynamicBase)}</td>
+                        <td>\${f(b.bet)}</td>
+                        <td>\${b.roll.toFixed(2)}</td>
+                        <td class="\${b.isWin ? 'win' : 'loss'}">\${b.isWin ? '+' : ''}\${f(b.profit)}</td>
+                        <td class="\${b.isWin ? 'win' : 'loss'}"><strong>\${b.isWin ? 'WIN' : 'LOSS'}</strong></td>
+                    </tr>
                 \`).join('');
             } catch (e) {}
         }
-        setInterval(updateStats, 2000);
+        setInterval(updateStats, 1000);
     </script>
 </body>
 </html>
     `);
 });
 
+// ============ BOOTSTRAP ============
 loadState();
-app.listen(port, '0.0.0.0', () => runStrategy());
+app.listen(port, '0.0.0.0', () => {
+    console.log(`Bot Dash Server running on port ${port}`);
+    startCycleController(); // This starts the loop logic
+});
