@@ -13,8 +13,7 @@ const DEFAULTS = {
     coin: "BTC",
     payout: 2.0,              
     balanceStep: 0.00000050,  
-    betIncrement: 0.00000001,
-    recoveryBuffer: 0.00000001 // Strictly incrementing by 1 unit
+    betIncrement: 0.00000001
 };
 
 // ============ BOT STATE ============
@@ -22,8 +21,7 @@ let btcPrice = 60964;
 let botState = {
     running: true,
     statusMessage: "Initializing...",
-    recoveryPot: 0, 
-    bufferRatio: 0, 
+    recoveryPot: 0, // Sum of all absolute losses in current streak
     coin: DEFAULTS.coin,
     profitProtection: { safeBalance: 0 }, 
     stats: {
@@ -31,6 +29,7 @@ let botState = {
         wins: 0,
         losses: 0,
         netProfit: 0,
+        maxSessionProfit: 0,
         currentBalance: 0,
         startTime: Date.now(),
     },
@@ -58,11 +57,11 @@ function calculateScaledBase(balance) {
 }
 
 function resetSession() {
-    botState.statusMessage = "REBOOTING: Floor Hit. Resetting Session...";
+    botState.statusMessage = "REBOOTING: Floor Hit. Starting Fresh...";
     botState.profitProtection.safeBalance = 0;
     botState.recoveryPot = 0;
     botState.stats = {
-        totalBets: 0, wins: 0, losses: 0, netProfit: 0,
+        totalBets: 0, wins: 0, losses: 0, netProfit: 0, maxSessionProfit: 0,
         currentBalance: botState.stats.currentBalance,
         startTime: Date.now()
     };
@@ -91,17 +90,17 @@ async function placeBet() {
         const response = await axios.post(url, payload);
         return response.data;
     } catch (error) { 
-        botState.statusMessage = error.response?.data?.Message || "API Connection Error";
+        botState.statusMessage = error.response?.data?.Message || "API Error";
         return null; 
     }
 }
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = "Continuous Mode Active";
+    botState.statusMessage = "Sum-Recovery Mode Active";
     
     while (true) {
-        // Floor Auto-Reboot Check
+        // --- FLOOR PROTECTION REBOOT ---
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
             resetSession();
             await new Promise(r => setTimeout(r, 2000));
@@ -119,26 +118,27 @@ async function runStrategy() {
         botState.stats.netProfit += profit;
         botState.stats.currentBalance = result.Balance || 0;
 
-        // --- UPDATED RECOVERY LOGIC (LINEAR INCREMENT) ---
+        // Track Peak
+        if (botState.stats.netProfit > botState.stats.maxSessionProfit) {
+            botState.stats.maxSessionProfit = botState.stats.netProfit;
+        }
+
+        // --- SUM-ALL RECOVERY LOGIC ---
         botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
 
         if (profit > 0) {
+            // WIN: We covered the "Sum all", so reset recoveryPot
             botState.stats.wins++;
             botState.recoveryPot = 0; 
-            botState.bufferRatio = 0;
             botState.profitProtection.safeBalance += (profit * 0.50); 
             botState.settings.currentBet = botState.settings.baseBet;
         } else {
+            // LOSS: Add to the sum and calculate recovery bet
             botState.stats.losses++;
-            // Sum total absolute losses for the "Pot Sum" metric
             botState.recoveryPot += Math.abs(profit);
             
-            // Calculate percentage of the 1 unit buffer vs total pot
-            botState.bufferRatio = (DEFAULTS.recoveryBuffer / botState.recoveryPot) * 100;
-            
-            // INCREMENT BY 1 UNIT ONLY (Prevents doubling 12->24->48)
-            // Logic: Next Bet = Current Bet + 0.00000001
-            botState.settings.currentBet += DEFAULTS.betIncrement;
+            // Next Bet = (All money lost so far) + (1 unit profit)
+            botState.settings.currentBet = botState.recoveryPot + DEFAULTS.betIncrement;
         }
 
         botState.betHistory.unshift({ 
@@ -148,13 +148,8 @@ async function runStrategy() {
         });
         if (botState.betHistory.length > 30) botState.betHistory.pop();
 
-        saveState();
         await new Promise(r => setTimeout(r, 1100)); 
     }
-}
-
-function saveState() {
-    try { fs.writeFileSync('./bot-state.json', JSON.stringify(botState, null, 2)); } catch (e) {}
 }
 
 // ============ AJAX API ============
@@ -170,7 +165,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.1 | Linear Recovery</title>
+    <title>Dice Pro v3.2 | Sum Recovery</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -195,28 +190,28 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <div class="header">
-            <h1>Dice Pro <span style="color:var(--primary)">v3.1</span></h1>
+            <h1>Dice Pro <span style="color:var(--primary)">v3.2</span></h1>
             <div style="text-align: right"><div class="label">Market BTC/USD</div><div id="price-tag" style="font-weight: 700;">$0.00</div></div>
         </div>
         <div class="status-bar" id="status-msg">Status: Initializing...</div>
         <div class="grid">
+            <div class="card"><div class="label">📈 Peak Profit</div><div id="peak-prof" class="btc-val">0.00</div><div class="usd-val">Sum + 1 Recovery</div></div>
             <div class="card"><div class="label">💳 Trading Balance</div><div id="t-bal" class="btc-val" style="color:var(--danger)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">⚖️ Pot Sum (Streak)</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div id="ratio-display" class="usd-val">Buffer: 1 Unit</div></div>
         </div>
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
             <div class="mini-card"><div class="label">Scaling Base</div><div id="s-base" style="font-weight:700; color:var(--primary)">0.00</div></div>
-            <div class="mini-card"><div class="label">Total Bets</div><div id="t-bets" style="font-weight:700">0</div></div>
+            <div class="mini-card"><div class="label">Total Losses (Streak)</div><div id="pot-display" style="font-weight:700; color:var(--danger)">0.00</div></div>
             <div class="mini-card"><div class="label">Uptime</div><div id="uptime" style="font-weight:700">0h</div></div>
         </div>
         <div class="label">Revenue Projections</div>
         <div class="proj-grid">
             <div class="proj-card"><div class="label">Hourly</div><span id="p-hr-b" class="win">0.00</span><br><span id="p-hr-u" class="usd-val">0.00</span></div>
             <div class="proj-card"><div class="label">Daily</div><span id="p-dy-b" class="win">0.00</span><br><span id="p-dy-u" class="usd-val">0.00</span></div>
-            <div class="proj-card"><div class="label">Monthly</div><span id="p-month-b" class="win">0.00</span><br><span id="p-month-u" class="usd-val">0.00</span></div>
-            <div class="proj-card"><div class="label">Yearly</div><span id="p-year-b" class="win">0.00</span><br><span id="p-year-u" class="usd-val">0.00</span></div>
+            <div class="proj-card"><div class="label">Monthly</div><span id="p-mo-b" class="win">0.00</span><br><span id="p-mo-u" class="usd-val">0.00</span></div>
+            <div class="proj-card"><div class="label">Yearly</div><span id="p-yr-b" class="win">0.00</span><br><span id="p-yr-u" class="usd-val">0.00</span></div>
         </div>
         <table>
             <thead><tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Sum</th></tr></thead>
@@ -233,6 +228,7 @@ app.get('/', (req, res) => {
                 
                 document.getElementById('status-msg').innerText = "Status: " + botState.statusMessage;
                 document.getElementById('price-tag').innerText = "$" + btcPrice.toLocaleString();
+                document.getElementById('peak-prof').innerText = f(botState.stats.maxSessionProfit);
                 document.getElementById('t-bal').innerText = f(botState.stats.currentBalance - botState.profitProtection.safeBalance);
                 document.getElementById('t-usd').innerText = u(botState.stats.currentBalance - botState.profitProtection.safeBalance);
                 document.getElementById('w-bal').innerText = f(botState.stats.currentBalance);
@@ -240,20 +236,18 @@ app.get('/', (req, res) => {
                 document.getElementById('n-prof').innerText = f(botState.stats.netProfit);
                 document.getElementById('n-usd').innerText = u(botState.stats.netProfit);
                 document.getElementById('pot-display').innerText = f(botState.recoveryPot);
-                document.getElementById('ratio-display').innerText = "Current Pullback %: " + botState.bufferRatio.toFixed(2) + "%";
                 document.getElementById('wr').innerText = ((botState.stats.wins/botState.stats.totalBets)*100 || 0).toFixed(1) + "%";
                 document.getElementById('s-base').innerText = f(botState.settings.baseBet);
-                document.getElementById('t-bets').innerText = botState.stats.totalBets;
                 document.getElementById('uptime').innerText = hoursPassed + "h";
 
                 const ph = botState.stats.netProfit / hoursPassed;
                 document.getElementById('p-hr-b').innerText = f(ph); document.getElementById('p-hr-u').innerText = u(ph);
                 document.getElementById('p-dy-b').innerText = f(ph*24); document.getElementById('p-dy-u').innerText = u(ph*24);
-                document.getElementById('p-month-b').innerText = f(ph*24*30); document.getElementById('p-month-u').innerText = u(ph*24*30);
-                document.getElementById('p-year-b').innerText = f(ph*24*365); document.getElementById('p-year-u').innerText = u(ph*24*365);
+                document.getElementById('p-mo-b').innerText = f(ph*24*30); document.getElementById('p-mo-u').innerText = u(ph*24*30);
+                document.getElementById('p-yr-b').innerText = f(ph*24*365); document.getElementById('p-yr-u').innerText = u(ph*24*365);
 
                 document.getElementById('h-body').innerHTML = botState.betHistory.map(b => \`
-                    <tr><td>#\${b.id}</td><td>\${f(b.dBase)}</td><td>\${f(b.bet)}</td><td>\${b.roll}</td><td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td><td>\${b.pot} Sat</td></tr>
+                    <tr><td>#\${b.id}</td><td>\${f(b.dBase)}</td><td>\${f(b.bet)}</td><td>\${b.roll}</td><td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td><td>\${b.pot} BTC</td></tr>
                 \`).join('');
             } catch(e) {}
         }
