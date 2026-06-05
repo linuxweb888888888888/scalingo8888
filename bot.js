@@ -21,8 +21,9 @@ const DEFAULTS = {
 let btcPrice = 65000; 
 let botState = {
     running: false,
+    statusMessage: "Initializing...",
     coin: DEFAULTS.coin,
-    profitProtection: { safeBalance: 0 },
+    profitProtection: { safeBalance: 0 }, // This is now a HARD FLOOR
     stats: {
         totalBets: 0,
         wins: 0,
@@ -88,7 +89,7 @@ async function placeBet() {
         const response = await axios.post(url, payload);
         return response.data;
     } catch (error) { 
-        console.error(`[!] API Error: ${error.response?.data?.Message || error.message}`);
+        botState.statusMessage = error.response?.data?.Message || "API Connection Error";
         return null; 
     }
 }
@@ -96,7 +97,18 @@ async function placeBet() {
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
     botState.running = true;
+    botState.statusMessage = "Running";
+
     while (botState.running) {
+        // --- REAL PROTECTION CHECK ---
+        // If current balance is less than or equal to protected profit, STOP.
+        if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
+            botState.running = false;
+            botState.statusMessage = "STOPPED: Protected Profit Floor Hit!";
+            console.log("!!! SAFETY STOP: Balance hit Protected Profit limit.");
+            break;
+        }
+
         const result = await placeBet();
         if (!result) { 
             await new Promise(r => setTimeout(r, 5000)); 
@@ -112,6 +124,7 @@ async function runStrategy() {
 
         if (profit > 0) {
             botState.stats.wins++;
+            // LOCK 50% of the win into the Safe Balance (The Floor)
             botState.profitProtection.safeBalance += (profit * 0.50); 
             botState.settings.currentBet = botState.settings.baseBet;
         } else {
@@ -132,13 +145,14 @@ async function runStrategy() {
     }
 }
 
-// ============ AJAX API ENDPOINT ============
+// ============ AJAX API ============
 app.get('/api/stats', (req, res) => {
     const msPassed = Date.now() - botState.stats.startTime;
     const hoursPassed = Math.max(0.0001, msPassed / (1000 * 60 * 60));
     res.json({
         botState,
         btcPrice,
+        tradingBalance: Math.max(0, botState.stats.currentBalance - botState.profitProtection.safeBalance).toFixed(8),
         hoursPassed: hoursPassed.toFixed(2),
         winRate: botState.stats.totalBets > 0 ? ((botState.stats.wins / botState.stats.totalBets) * 100).toFixed(1) : "0.0"
     });
@@ -151,16 +165,17 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro | AJAX SaaS Dashboard</title>
+    <title>Dice Pro | Real Protection</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Inter', sans-serif; background-color: var(--bg); color: var(--text-main); padding: 2rem; line-height: 1.5; }
+        body { font-family: 'Inter', sans-serif; background-color: var(--bg); color: var(--text-main); padding: 2rem; }
         .container { max-width: 1200px; margin: 0 auto; }
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; }
         .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1.5rem; margin-bottom: 2rem; }
-        .card { background: var(--card-bg); padding: 1.5rem; border-radius: 12px; border: 1px solid var(--border); box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+        .card { background: var(--card-bg); padding: 1.5rem; border-radius: 12px; border: 1px solid var(--border); box-shadow: 0 1px 3px rgba(0,0,0,0.05); position: relative; overflow: hidden;}
         .card.accent { border-top: 4px solid var(--accent); }
+        .card.danger { border-top: 4px solid var(--danger); }
         .label { font-size: 0.75rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; margin-bottom: 0.5rem; }
         .btc-val { font-size: 1.75rem; font-weight: 700; }
         .usd-val { font-size: 0.875rem; color: var(--accent); font-weight: 500; }
@@ -168,63 +183,46 @@ app.get('/', (req, res) => {
         .mini-card { background: var(--card-bg); padding: 1rem; border-radius: 8px; border: 1px solid var(--border); text-align: center; }
         .proj-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2rem; }
         .proj-card { background: #f1f5f9; padding: 1rem; border-radius: 8px; text-align: center; }
-        .proj-btc { display: block; font-weight: 700; font-size: 1rem; }
-        .proj-usd { display: block; font-size: 0.8rem; color: var(--accent); font-weight: 500; }
         table { width: 100%; border-collapse: collapse; background: var(--card-bg); border-radius: 12px; overflow: hidden; border: 1px solid var(--border); }
         th { background: #f8fafc; padding: 1rem; text-align: left; font-size: 0.75rem; color: var(--text-muted); border-bottom: 1px solid var(--border); }
         td { padding: 1rem; font-size: 0.875rem; border-bottom: 1px solid var(--border); font-family: monospace; }
         .win { color: var(--success); } .loss { color: var(--danger); }
-        .live-dot { height: 8px; width: 8px; background-color: var(--success); border-radius: 50%; display: inline-block; box-shadow: 0 0 8px var(--success); }
+        .status-bar { padding: 10px; background: #1e293b; color: white; border-radius: 8px; margin-bottom: 20px; font-size: 0.8rem; font-weight: bold; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1><span class="live-dot"></span> Dice Pro Alpha</h1>
+            <h1>Dice Pro <span style="color:var(--primary)">v2.0</span></h1>
             <div style="text-align: right"><div class="label">Market BTC/USD</div><div id="price-tag" style="font-weight: 700;">$0.00</div></div>
         </div>
 
+        <div id="status-msg" class="status-bar">Status: Initializing...</div>
+
         <div class="grid">
-            <div class="card accent"><div class="label">🔒 Protected Profit (50%)</div><div id="safe-balance" class="btc-val">0.00000000</div><div id="safe-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">💰 Wallet Balance</div><div id="balance" class="btc-val">0.00000000</div><div id="balance-usd" class="usd-val">$0.00</div></div>
+            <div class="card accent"><div class="label">🔒 Protected Profit (The Floor)</div><div id="safe-balance" class="btc-val">0.00000000</div><div id="safe-usd" class="usd-val">$0.00</div></div>
+            <div class="card danger"><div class="label">💳 Trading Balance (Available)</div><div id="trading-balance" class="btc-val" style="color:var(--danger)">0.00000000</div><div id="trading-usd" class="usd-val" style="color:var(--text-muted)">$0.00</div></div>
+            <div class="card"><div class="label">💰 Total Wallet Balance</div><div id="balance" class="btc-val">0.00000000</div><div id="balance-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Session Profit</div><div id="profit" class="btc-val">0.00000000</div><div id="profit-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">🎯 Next Wager</div><div id="next-bet" class="btc-val">0.00000000</div><div id="next-bet-usd" class="usd-val">$0.00</div></div>
         </div>
 
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div id="win-rate" style="font-weight:700">0%</div></div>
-            <div class="mini-card"><div class="label">Total Bets</div><div id="total-bets" style="font-weight:700">0</div></div>
+            <div class="mini-card"><div class="label">Next Bet</div><div id="next-bet" style="font-weight:700; color:var(--accent)">0.00000000</div></div>
             <div class="mini-card"><div class="label">Scaling Base</div><div id="scaling-base" style="font-weight:700; color:var(--primary)">0.00000000</div></div>
-            <div class="mini-card"><div class="label">Bot Uptime</div><div id="uptime" style="font-weight:700">0h</div></div>
+            <div class="mini-card"><div class="label">Uptime</div><div id="uptime" style="font-weight:700">0h</div></div>
         </div>
 
-        <div class="label" style="margin-bottom: 1rem;">Projected Revenue Projections (USD)</div>
+        <div class="label">Revenue Projections</div>
         <div class="proj-grid">
-            <div class="proj-card">
-                <div class="label">Hourly</div>
-                <span id="p-hr-btc" class="proj-btc win">0.00000000</span>
-                <span id="p-hr-usd" class="proj-usd">$0.00</span>
-            </div>
-            <div class="proj-card">
-                <div class="label">Daily</div>
-                <span id="p-day-btc" class="proj-btc win">0.00000000</span>
-                <span id="p-day-usd" class="proj-usd">$0.00</span>
-            </div>
-            <div class="proj-card">
-                <div class="label">Monthly</div>
-                <span id="p-month-btc" class="proj-btc win">0.00000000</span>
-                <span id="p-month-usd" class="proj-usd">$0.00</span>
-            </div>
-            <div class="proj-card">
-                <div class="label">Yearly</div>
-                <span id="p-year-btc" class="proj-btc win">0.00000000</span>
-                <span id="p-year-usd" class="proj-usd">$0.00</span>
-            </div>
+            <div class="proj-card"><div class="label">Hourly</div><span id="p-hr-btc" class="win" style="font-weight:700">0.00</span><br><span id="p-hr-usd" class="usd-val">$0.00</span></div>
+            <div class="proj-card"><div class="label">Daily</div><span id="p-day-btc" class="win" style="font-weight:700">0.00</span><br><span id="p-day-usd" class="usd-val">$0.00</span></div>
+            <div class="proj-card"><div class="label">Monthly</div><span id="p-month-btc" class="win" style="font-weight:700">0.00</span><br><span id="p-month-usd" class="usd-val">$0.00</span></div>
+            <div class="proj-card"><div class="label">Yearly</div><span id="p-year-btc" class="win" style="font-weight:700">0.00</span><br><span id="p-year-usd" class="usd-val">$0.00</span></div>
         </div>
 
-        <div class="label" style="margin-bottom: 1rem;">Live Transaction Log</div>
         <table>
-            <thead><tr><th>ID</th><th>Base Unit</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Status</th></tr></thead>
+            <thead><tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net</th><th>Status</th></tr></thead>
             <tbody id="history-body"></tbody>
         </table>
     </div>
@@ -234,49 +232,42 @@ app.get('/', (req, res) => {
             try {
                 const response = await fetch('/api/stats');
                 const data = await response.json();
-                const { botState, btcPrice, hoursPassed, winRate } = data;
+                const { botState, btcPrice, tradingBalance, hoursPassed, winRate } = data;
 
                 const fmt = (n) => parseFloat(n || 0).toFixed(8);
-                const usd = (n) => "$" + (parseFloat(n || 0) * btcPrice).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                const usd = (n) => "$" + (parseFloat(n || 0) * btcPrice).toLocaleString(undefined, {minimumFractionDigits: 2});
 
+                document.getElementById('status-msg').innerText = "Status: " + botState.statusMessage;
                 document.getElementById('price-tag').innerText = "$" + btcPrice.toLocaleString();
                 
-                // Top Cards
                 document.getElementById('safe-balance').innerText = fmt(botState.profitProtection.safeBalance);
                 document.getElementById('safe-usd').innerText = usd(botState.profitProtection.safeBalance);
+                
+                document.getElementById('trading-balance').innerText = tradingBalance;
+                document.getElementById('trading-usd').innerText = usd(tradingBalance);
+
                 document.getElementById('balance').innerText = fmt(botState.stats.currentBalance);
                 document.getElementById('balance-usd').innerText = usd(botState.stats.currentBalance);
                 
-                const profitEl = document.getElementById('profit');
-                profitEl.innerText = fmt(botState.stats.netProfit);
-                profitEl.className = 'btc-val ' + (botState.stats.netProfit >= 0 ? 'win' : 'loss');
+                document.getElementById('profit').innerText = fmt(botState.stats.netProfit);
+                document.getElementById('profit').className = 'btc-val ' + (botState.stats.netProfit >= 0 ? 'win' : 'loss');
                 document.getElementById('profit-usd').innerText = usd(botState.stats.netProfit);
                 
                 document.getElementById('next-bet').innerText = fmt(botState.settings.currentBet);
-                document.getElementById('next-bet-usd').innerText = usd(botState.settings.currentBet);
-                
-                // Stats Row
                 document.getElementById('win-rate').innerText = winRate + "%";
-                document.getElementById('total-bets').innerText = botState.stats.totalBets;
                 document.getElementById('scaling-base').innerText = fmt(botState.settings.baseBet);
                 document.getElementById('uptime').innerText = hoursPassed + "h";
 
-                // Projections
                 const pPerHour = botState.stats.netProfit / hoursPassed;
-                
-                // BTC Projections
                 document.getElementById('p-hr-btc').innerText = fmt(pPerHour);
-                document.getElementById('p-day-btc').innerText = fmt(pPerHour * 24);
-                document.getElementById('p-month-btc').innerText = fmt(pPerHour * 24 * 30);
-                document.getElementById('p-year-btc').innerText = fmt(pPerHour * 24 * 365);
-                
-                // USD Projections
                 document.getElementById('p-hr-usd').innerText = usd(pPerHour);
+                document.getElementById('p-day-btc').innerText = fmt(pPerHour * 24);
                 document.getElementById('p-day-usd').innerText = usd(pPerHour * 24);
+                document.getElementById('p-month-btc').innerText = fmt(pPerHour * 24 * 30);
                 document.getElementById('p-month-usd').innerText = usd(pPerHour * 24 * 30);
+                document.getElementById('p-year-btc').innerText = fmt(pPerHour * 24 * 365);
                 document.getElementById('p-year-usd').innerText = usd(pPerHour * 24 * 365);
 
-                // History
                 const historyHtml = botState.betHistory.map(b => \`
                     <tr>
                         <td>#\${b.id}</td>
@@ -289,9 +280,8 @@ app.get('/', (req, res) => {
                 \`).join('');
                 document.getElementById('history-body').innerHTML = historyHtml;
 
-            } catch (e) { console.error("Update failed", e); }
+            } catch (e) {}
         }
-
         setInterval(updateStats, 2000);
         updateStats();
     </script>
@@ -302,6 +292,6 @@ app.get('/', (req, res) => {
 
 loadState();
 app.listen(port, '0.0.0.0', () => {
-    console.log(`🚀 AJAX Neat Bot Online on port ${port}`);
+    console.log(`🚀 Safety Bot Online on port ${port}`);
     runStrategy();
 });
