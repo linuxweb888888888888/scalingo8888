@@ -14,7 +14,9 @@ const DEFAULTS = {
     multiplier: 1.1,          
     payout: 2.0,              
     balanceStep: 0.00000050,  
-    betIncrement: 0.00000001  
+    betIncrement: 0.00000001,
+    // (0.00000002 / 0.00000012) * 100 = 16.67%
+    pullbackTriggerPercent: 16.67 
 };
 
 // ============ BOT STATE ============
@@ -70,10 +72,10 @@ function saveState() {
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
     
-    // STRICT ALPHANUMERIC SEED GENERATION
+    // STRICT ALPHANUMERIC SEED
     const rawSuffix = Math.random().toString(36).substring(2); 
-    const alphanumericSuffix = rawSuffix.replace(/[^a-z0-9]/gi, '').substring(0, 10);
-    const safeSeed = "node" + alphanumericSuffix; 
+    const alphanumericSuffix = rawSuffix.replace(/[^a-z0-9]/gi, '').substring(0, 12);
+    const safeSeed = "seed" + alphanumericSuffix; 
 
     const payload = { 
         Bet: botState.settings.currentBet, 
@@ -93,12 +95,12 @@ async function placeBet() {
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = "Running Strategy...";
+    botState.statusMessage = "Active";
     
     while (true) {
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
             botState.running = false;
-            botState.statusMessage = "STOPPED: Protected Profit Floor Hit!";
+            botState.statusMessage = "STOPPED: Floor Limit Hit!";
             break;
         }
 
@@ -113,27 +115,25 @@ async function runStrategy() {
         botState.stats.netProfit += profit;
         botState.stats.currentBalance = result.Balance || 0;
 
-        // --- PULLBACK CALCULATION ---
+        // --- PULLBACK CALCULATIONS ---
         if (botState.stats.netProfit > botState.stats.maxSessionProfit) {
             botState.stats.maxSessionProfit = botState.stats.netProfit;
         }
 
-        if (botState.stats.maxSessionProfit > 0 && botState.stats.netProfit < botState.stats.maxSessionProfit) {
-            const drop = botState.stats.maxSessionProfit - botState.stats.netProfit;
-            botState.stats.pullbackPercent = (drop / botState.stats.maxSessionProfit) * 100;
+        if (botState.stats.maxSessionProfit > 0.00000001) {
+            const currentDrop = botState.stats.maxSessionProfit - botState.stats.netProfit;
+            botState.stats.pullbackPercent = (currentDrop / botState.stats.maxSessionProfit) * 100;
 
-            // Trigger 60s pause if drop is 20% or more
-            if (botState.stats.pullbackPercent >= 20) {
+            if (botState.stats.pullbackPercent >= DEFAULTS.pullbackTriggerPercent) {
                 botState.isPaused = true;
                 botState.nextResumeTime = Date.now() + 60000;
-                botState.statusMessage = `PULLBACK GUARD: Pausing 60s (${botState.stats.pullbackPercent.toFixed(1)}% Drop)`;
+                botState.statusMessage = `PULLBACK GUARD: Pausing 60s (${botState.stats.pullbackPercent.toFixed(2)}% drop)`;
                 
-                botState.stats.maxSessionProfit = botState.stats.netProfit;
-                
+                botState.stats.maxSessionProfit = botState.stats.netProfit; // Reset peak
                 await new Promise(r => setTimeout(r, 60000));
                 
                 botState.isPaused = false;
-                botState.statusMessage = "Resuming after Pullback...";
+                botState.statusMessage = "Resuming Activity...";
             }
         } else {
             botState.stats.pullbackPercent = 0;
@@ -153,9 +153,9 @@ async function runStrategy() {
 
         botState.betHistory.unshift({ 
             id: botState.stats.totalBets, time: new Date().toLocaleTimeString(), bet: result.Bet, roll: result.Roll, 
-            profit: profit, isWin: profit > 0, pb: botState.stats.pullbackPercent.toFixed(1)
+            profit: profit, isWin: profit > 0, pb: botState.stats.pullbackPercent.toFixed(2), dBase: botState.settings.baseBet
         });
-        if (botState.betHistory.length > 50) botState.betHistory.pop();
+        if (botState.betHistory.length > 30) botState.betHistory.pop();
 
         saveState();
         await new Promise(r => setTimeout(r, 1100)); 
@@ -164,7 +164,8 @@ async function runStrategy() {
 
 // ============ AJAX API ============
 app.get('/api/stats', (req, res) => {
-    const hoursPassed = Math.max(0.0001, (Date.now() - botState.stats.startTime) / (1000 * 60 * 60));
+    const msPassed = Date.now() - botState.stats.startTime;
+    const hoursPassed = Math.max(0.0001, msPassed / (1000 * 60 * 60));
     const pauseTimer = botState.isPaused ? Math.max(0, Math.round((botState.nextResumeTime - Date.now()) / 1000)) : 0;
 
     res.json({
@@ -184,7 +185,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro | Alphanumeric Seed</title>
+    <title>Dice Pro | Pro Dashboard</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -200,36 +201,50 @@ app.get('/', (req, res) => {
         .usd-val { font-size: 0.875rem; color: var(--accent); font-weight: 500; }
         .stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2rem; }
         .mini-card { background: var(--card-bg); padding: 1rem; border-radius: 8px; border: 1px solid var(--border); text-align: center; }
+        .proj-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2rem; }
+        .proj-card { background: #f1f5f9; padding: 1rem; border-radius: 8px; text-align: center; }
         table { width: 100%; border-collapse: collapse; background: var(--card-bg); border-radius: 12px; overflow: hidden; border: 1px solid var(--border); }
         th { background: #f8fafc; padding: 1rem; text-align: left; font-size: 0.75rem; color: var(--text-muted); border-bottom: 1px solid var(--border); }
         td { padding: 1rem; font-size: 0.875rem; border-bottom: 1px solid var(--border); font-family: monospace; }
         .win { color: var(--success); } .loss { color: var(--danger); }
         .status-bar { display: flex; justify-content: space-between; padding: 12px; background: #1e293b; color: white; border-radius: 8px; margin-bottom: 20px; font-size: 0.85rem; font-weight: bold; }
-        .timer-badge { background: var(--danger); padding: 2px 8px; border-radius: 4px; display: none; }
+        .timer-badge { background: var(--danger); padding: 2px 8px; border-radius: 4px; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>Dice Pro <span style="color:var(--primary)">v2.4</span></h1>
+            <h1>Dice Pro <span style="color:var(--primary)">v2.6</span></h1>
             <div style="text-align: right"><div class="label">Market BTC/USD</div><div id="price-tag" style="font-weight: 700;">$0.00</div></div>
         </div>
+        
         <div class="status-bar">
             <div id="status-msg">Status: Initializing...</div>
-            <div id="pause-container">Pause Timer: <span id="pause-timer" class="timer-badge">0s</span></div>
+            <div id="pause-container" style="display:none">Cooldown: <span id="pause-timer" class="timer-badge">0s</span></div>
         </div>
+
         <div class="grid">
-            <div class="card accent"><div class="label">📈 Peak Profit (Session)</div><div id="peak-profit" class="btc-val">0.00000000</div><div id="pullback-info" class="usd-val" style="color:var(--danger)">Pullback: 0%</div></div>
+            <div class="card accent"><div class="label">📈 Peak Profit</div><div id="peak-profit" class="btc-val">0.00000000</div><div id="pb-info" class="usd-val">Drop Trigger: 16.67%</div></div>
             <div class="card danger"><div class="label">💳 Trading Balance</div><div id="trading-balance" class="btc-val" style="color:var(--danger)">0.00000000</div><div id="trading-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">💰 Wallet Balance</div><div id="balance" class="btc-val">0.00000000</div><div id="balance-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Net Profit</div><div id="profit" class="btc-val">0.00000000</div><div id="profit-usd" class="usd-val">$0.00</div></div>
         </div>
+
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div id="win-rate" style="font-weight:700">0%</div></div>
-            <div class="mini-card"><div class="label">Next Bet</div><div id="next-bet" style="font-weight:700; color:var(--accent)">0.00000000</div></div>
+            <div class="mini-card"><div class="label">Current Pullback</div><div id="curr-pb" style="font-weight:700; color:var(--danger)">0.00%</div></div>
             <div class="mini-card"><div class="label">Scaling Base</div><div id="scaling-base" style="font-weight:700; color:var(--primary)">0.00000000</div></div>
             <div class="mini-card"><div class="label">Uptime</div><div id="uptime" style="font-weight:700">0h</div></div>
         </div>
+
+        <div class="label">Revenue Projections</div>
+        <div class="proj-grid">
+            <div class="proj-card"><div class="label">Hourly</div><span id="p-hr-btc" class="win" style="font-weight:700">0.00</span><br><span id="p-hr-usd" class="usd-val">$0.00</span></div>
+            <div class="proj-card"><div class="label">Daily</div><span id="p-day-btc" class="win" style="font-weight:700">0.00</span><br><span id="p-day-usd" class="usd-val">$0.00</span></div>
+            <div class="proj-card"><div class="label">Monthly</div><span id="p-month-btc" class="win" style="font-weight:700">0.00</span><br><span id="p-month-usd" class="usd-val">$0.00</span></div>
+            <div class="proj-card"><div class="label">Yearly</div><span id="p-year-btc" class="win" style="font-weight:700">0.00</span><br><span id="p-year-usd" class="usd-val">$0.00</span></div>
+        </div>
+
         <table>
             <thead><tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pullback</th></tr></thead>
             <tbody id="history-body"></tbody>
@@ -241,33 +256,37 @@ app.get('/', (req, res) => {
                 const response = await fetch('/api/stats');
                 const data = await response.json();
                 const { botState, btcPrice, tradingBalance, hoursPassed, winRate, pauseTimer } = data;
+                
                 const f = (n) => parseFloat(n || 0).toFixed(8);
                 const u = (n) => "$" + (parseFloat(n || 0) * btcPrice).toLocaleString(undefined, {minimumFractionDigits: 2});
-                document.getElementById('status-msg').innerText = botState.statusMessage;
                 
-                const timerEl = document.getElementById('pause-timer');
-                if(pauseTimer > 0) {
-                    timerEl.style.display = 'inline';
-                    timerEl.innerText = pauseTimer + "s";
-                } else {
-                    timerEl.style.display = 'none';
-                }
+                document.getElementById('status-msg').innerText = "Status: " + botState.statusMessage;
+                const pCont = document.getElementById('pause-container');
+                if(pauseTimer > 0) { pCont.style.display = 'block'; document.getElementById('pause-timer').innerText = pauseTimer + "s"; }
+                else { pCont.style.display = 'none'; }
 
                 document.getElementById('price-tag').innerText = "$" + btcPrice.toLocaleString();
                 document.getElementById('peak-profit').innerText = f(botState.stats.maxSessionProfit);
-                document.getElementById('pullback-info').innerText = "Current Pullback: " + botState.stats.pullbackPercent.toFixed(2) + "%";
+                document.getElementById('curr-pb').innerText = botState.stats.pullbackPercent.toFixed(2) + "%";
                 document.getElementById('trading-balance').innerText = tradingBalance;
                 document.getElementById('trading-usd').innerText = u(tradingBalance);
                 document.getElementById('balance').innerText = f(botState.stats.currentBalance);
                 document.getElementById('balance-usd').innerText = u(botState.stats.currentBalance);
                 document.getElementById('profit').innerText = f(botState.stats.netProfit);
                 document.getElementById('profit-usd').innerText = u(botState.stats.netProfit);
-                document.getElementById('next-bet').innerText = f(botState.settings.currentBet);
                 document.getElementById('win-rate').innerText = winRate + "%";
                 document.getElementById('scaling-base').innerText = f(botState.settings.baseBet);
                 document.getElementById('uptime').innerText = hoursPassed + "h";
+
+                // Projections
+                const ph = botState.stats.netProfit / hoursPassed;
+                document.getElementById('p-hr-btc').innerText = f(ph); document.getElementById('p-hr-usd').innerText = u(ph);
+                document.getElementById('p-day-btc').innerText = f(ph*24); document.getElementById('p-day-usd').innerText = u(ph*24);
+                document.getElementById('p-month-btc').innerText = f(ph*24*30); document.getElementById('p-month-usd').innerText = u(ph*24*30);
+                document.getElementById('p-year-btc').innerText = f(ph*24*365); document.getElementById('p-year-usd').innerText = u(ph*24*365);
+
                 document.getElementById('history-body').innerHTML = botState.betHistory.map(b => \`
-                    <tr><td>#\${b.id}</td><td>\${f(b.bet)}</td><td>\${f(b.bet)}</td><td>\${b.roll.toFixed(2)}</td><td class="\${b.isWin ? 'win' : 'loss'}">\${f(b.profit)}</td><td>\${b.pb}%</td></tr>
+                    <tr><td>#\${b.id}</td><td style="color:var(--primary)">\${f(b.dBase)}</td><td>\${f(b.bet)}</td><td>\${b.roll.toFixed(2)}</td><td class="\${b.isWin ? 'win' : 'loss'}">\${f(b.profit)}</td><td>\${b.pb}%</td></tr>
                 \`).join('');
             } catch (e) {}
         }
