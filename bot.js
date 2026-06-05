@@ -6,7 +6,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "uVGG7F3K9Lib69b8H7g216G932YUwCp4M1A7fJfWhNJ9VcMGwg";
+const API_KEY = process.env.API_KEY || "tj3oSiat8AG9yK4XW8g05h3UA7ziYqcr57hYXG2Iv3bBlOjSUB";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
@@ -14,7 +14,8 @@ const DEFAULTS = {
     payout: 2.0,              
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001,
-    recoveryDivisor: 10 // Changed to 10 to significantly lower the bet size
+    recoveryDivisor: 50,      // Spreads recovery over 50 wins (Much Slower)
+    maxRecoveryMult: 5        // Recovery part will never exceed 5x the base bet
 };
 
 // ============ BOT STATE ============
@@ -74,8 +75,6 @@ function resetSession() {
 // ============ API LOGIC ============
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
-    
-    // STRICT ALPHANUMERIC SEED
     const rawSuffix = Math.random().toString(36).substring(2); 
     const alphanumericSuffix = rawSuffix.replace(/[^a-z0-9]/gi, '').substring(0, 12);
     const safeSeed = "pro" + alphanumericSuffix; 
@@ -98,7 +97,7 @@ async function placeBet() {
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = "Ultra-Safe Recovery Active (10-Win Split)";
+    botState.statusMessage = "Ultra-Safe Recovery Active (50-Win Split)";
     
     while (true) {
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
@@ -122,29 +121,33 @@ async function runStrategy() {
             botState.stats.maxSessionProfit = botState.stats.netProfit;
         }
 
-        // --- ULTRA-SAFE FRACTIONAL RECOVERY ---
+        // --- CALIBRATE BASE ---
         botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
 
         if (profit > 0) {
             botState.stats.wins++;
             botState.recoveryPot -= profit;
+            if (botState.recoveryPot < 0) botState.recoveryPot = 0;
             
-            if (botState.recoveryPot <= 0) {
-                botState.recoveryPot = 0;
+            if (botState.recoveryPot === 0) {
                 botState.profitProtection.safeBalance += (profit * 0.50); 
                 botState.settings.currentBet = botState.settings.baseBet;
             } else {
-                // Stay on recovery bet but recalibrate based on new pot size
-                const recoveryPart = botState.recoveryPot / DEFAULTS.recoveryDivisor;
-                botState.settings.currentBet = botState.settings.baseBet + recoveryPart;
+                // Slower Recovery Calculation
+                let recoveryPart = botState.recoveryPot / DEFAULTS.recoveryDivisor;
+                // CAP: Don't let recovery part exceed 5x the base bet
+                let cappedRecovery = Math.min(recoveryPart, botState.settings.baseBet * DEFAULTS.maxRecoveryMult);
+                botState.settings.currentBet = botState.settings.baseBet + cappedRecovery;
             }
         } else {
             botState.stats.losses++;
-            botState.recoveryPot += Math.abs(profit);
+            // DAMPENING: Only add 70% of the loss to the pot to slow down escalation
+            botState.recoveryPot += (Math.abs(profit) * 0.7);
             
-            // Bet = Base + 10% of current losses
-            const recoveryPart = botState.recoveryPot / DEFAULTS.recoveryDivisor;
-            botState.settings.currentBet = botState.settings.baseBet + recoveryPart;
+            let recoveryPart = botState.recoveryPot / DEFAULTS.recoveryDivisor;
+            // CAP: Don't let recovery part exceed 5x the base bet
+            let cappedRecovery = Math.min(recoveryPart, botState.settings.baseBet * DEFAULTS.maxRecoveryMult);
+            botState.settings.currentBet = botState.settings.baseBet + cappedRecovery;
         }
 
         botState.betHistory.unshift({ 
@@ -171,7 +174,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.5 | Ultra Safe</title>
+    <title>Dice Pro v3.6 | Ultra Safe</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -196,7 +199,7 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <div class="header">
-            <h1>Dice Pro <span style="color:var(--primary)">v3.5</span></h1>
+            <h1>Dice Pro <span style="color:var(--primary)">v3.6</span></h1>
             <div style="text-align: right"><div class="label">Market BTC/USD</div><div id="price-tag" style="font-weight: 700;">$0.00</div></div>
         </div>
         <div class="status-bar" id="status-msg">Status: Initializing...</div>
@@ -204,7 +207,7 @@ app.get('/', (req, res) => {
             <div class="card"><div class="label">💳 Trading Balance</div><div id="t-bal" class="btc-val" style="color:var(--danger)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">⚖️ Recovery Pot (Remaining)</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div class="usd-val">Split: 10 Target Wins</div></div>
+            <div class="card"><div class="label">⚖️ Recovery Pot (Remaining)</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div class="usd-val">Split: 50 Target Wins</div></div>
         </div>
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
