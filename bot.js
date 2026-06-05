@@ -6,7 +6,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "PFC4REWEF5rfGBqthHIURvKZ1Q46ssIB5p4YR0JbRPomnV4U1h";
+const API_KEY = process.env.API_KEY || "nTx8Qmz7CABSM5Ccmtz2gsMax028MklDF7JvtgZtvTWY96Og1q";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
@@ -14,7 +14,7 @@ const DEFAULTS = {
     payout: 2.0,              
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001,
-    recoveryBuffer: 0.00000001 // Changed from 0.00000002 to 0.00000001 as requested
+    recoveryBuffer: 0.00000001 // Strictly incrementing by 1 unit
 };
 
 // ============ BOT STATE ============
@@ -58,7 +58,7 @@ function calculateScaledBase(balance) {
 }
 
 function resetSession() {
-    botState.statusMessage = "REBOOTING: Floor Hit. Resetting Stats...";
+    botState.statusMessage = "REBOOTING: Floor Hit. Resetting Session...";
     botState.profitProtection.safeBalance = 0;
     botState.recoveryPot = 0;
     botState.stats = {
@@ -75,7 +75,7 @@ function resetSession() {
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
     
-    // STRICT ALPHANUMERIC SEED Logic
+    // STRICT ALPHANUMERIC SEED
     const rawSuffix = Math.random().toString(36).substring(2); 
     const alphanumericSuffix = rawSuffix.replace(/[^a-z0-9]/gi, '').substring(0, 12);
     const safeSeed = "pro" + alphanumericSuffix; 
@@ -91,14 +91,14 @@ async function placeBet() {
         const response = await axios.post(url, payload);
         return response.data;
     } catch (error) { 
-        botState.statusMessage = error.response?.data?.Message || "API Error";
+        botState.statusMessage = error.response?.data?.Message || "API Connection Error";
         return null; 
     }
 }
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = "Continuous Recovery Active";
+    botState.statusMessage = "Continuous Mode Active";
     
     while (true) {
         // Floor Auto-Reboot Check
@@ -119,7 +119,7 @@ async function runStrategy() {
         botState.stats.netProfit += profit;
         botState.stats.currentBalance = result.Balance || 0;
 
-        // --- BETTING & RECOVERY LOGIC ---
+        // --- UPDATED RECOVERY LOGIC (LINEAR INCREMENT) ---
         botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
 
         if (profit > 0) {
@@ -130,14 +130,15 @@ async function runStrategy() {
             botState.settings.currentBet = botState.settings.baseBet;
         } else {
             botState.stats.losses++;
-            // Sum absolute values of losses (Pot Accumulation)
+            // Sum total absolute losses for the "Pot Sum" metric
             botState.recoveryPot += Math.abs(profit);
             
-            // Calculate buffer % vs current pot for the dashboard
+            // Calculate percentage of the 1 unit buffer vs total pot
             botState.bufferRatio = (DEFAULTS.recoveryBuffer / botState.recoveryPot) * 100;
             
-            // Bet = sum of all losses in streak + 0.00000001
-            botState.settings.currentBet = botState.recoveryPot + DEFAULTS.recoveryBuffer;
+            // INCREMENT BY 1 UNIT ONLY (Prevents doubling 12->24->48)
+            // Logic: Next Bet = Current Bet + 0.00000001
+            botState.settings.currentBet += DEFAULTS.betIncrement;
         }
 
         botState.betHistory.unshift({ 
@@ -147,8 +148,13 @@ async function runStrategy() {
         });
         if (botState.betHistory.length > 30) botState.betHistory.pop();
 
+        saveState();
         await new Promise(r => setTimeout(r, 1100)); 
     }
+}
+
+function saveState() {
+    try { fs.writeFileSync('./bot-state.json', JSON.stringify(botState, null, 2)); } catch (e) {}
 }
 
 // ============ AJAX API ============
@@ -164,7 +170,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.0 | Optimized Recovery</title>
+    <title>Dice Pro v3.1 | Linear Recovery</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -189,7 +195,7 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <div class="header">
-            <h1>Dice Pro <span style="color:var(--primary)">v3.0</span></h1>
+            <h1>Dice Pro <span style="color:var(--primary)">v3.1</span></h1>
             <div style="text-align: right"><div class="label">Market BTC/USD</div><div id="price-tag" style="font-weight: 700;">$0.00</div></div>
         </div>
         <div class="status-bar" id="status-msg">Status: Initializing...</div>
@@ -197,7 +203,7 @@ app.get('/', (req, res) => {
             <div class="card"><div class="label">💳 Trading Balance</div><div id="t-bal" class="btc-val" style="color:var(--danger)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">⚖️ Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div id="ratio-display" class="usd-val">Buffer: 1 Unit</div></div>
+            <div class="card"><div class="label">⚖️ Pot Sum (Streak)</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div id="ratio-display" class="usd-val">Buffer: 1 Unit</div></div>
         </div>
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
@@ -234,7 +240,7 @@ app.get('/', (req, res) => {
                 document.getElementById('n-prof').innerText = f(botState.stats.netProfit);
                 document.getElementById('n-usd').innerText = u(botState.stats.netProfit);
                 document.getElementById('pot-display').innerText = f(botState.recoveryPot);
-                document.getElementById('ratio-display').innerText = "Buffer/Pot Ratio: " + botState.bufferRatio.toFixed(2) + "%";
+                document.getElementById('ratio-display').innerText = "Current Pullback %: " + botState.bufferRatio.toFixed(2) + "%";
                 document.getElementById('wr').innerText = ((botState.stats.wins/botState.stats.totalBets)*100 || 0).toFixed(1) + "%";
                 document.getElementById('s-base').innerText = f(botState.settings.baseBet);
                 document.getElementById('t-bets').innerText = botState.stats.totalBets;
