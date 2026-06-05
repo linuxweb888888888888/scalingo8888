@@ -213,10 +213,18 @@ class CompleteFaucetBot {
                 waitUntil: 'networkidle2',
                 timeout: 30000 
             });
-            await this.page.waitForTimeout(3000);
             
-            // Capture login page HTML
-            console.log('   📸 Capturing login page HTML...');
+            // IMPORTANT: Wait for React to render the login form
+            console.log('   ⏳ Waiting for React to render login form...');
+            await this.page.waitForTimeout(5000);
+            
+            // Wait for specific React-rendered elements
+            await this.page.waitForSelector('input[type="email"], input[name="email"], input[placeholder*="Email"], input[placeholder*="email"]', { 
+                timeout: 10000 
+            }).catch(() => console.log('   ⚠️ Email selector timeout - checking alternatives...'));
+            
+            // Capture login page HTML after React loads
+            console.log('   📸 Capturing login page HTML after React render...');
             await this.captureHTMLDebug(this.page, 'login');
             
             // Check if we're already logged in
@@ -231,36 +239,114 @@ class CompleteFaucetBot {
                 return true;
             }
             
-            // Find and fill email field
+            // Method 1: Try to find email field by various selectors (React form)
             console.log('   📝 Looking for email field...');
-            const emailSelectors = ['#email', 'input[name="email"]', 'input[type="email"]', '#login_email'];
+            const emailSelectors = [
+                'input[type="email"]',
+                'input[name="email"]',
+                'input[placeholder*="Email"]',
+                'input[placeholder*="email"]',
+                'input[id*="email"]',
+                'input[class*="email"]',
+                '#email',
+                '.email-input',
+                'input[autocomplete="email"]'
+            ];
+            
             let emailField = null;
             for (const selector of emailSelectors) {
-                emailField = await this.page.$(selector);
-                if (emailField) {
-                    console.log(`   ✅ Found email field with selector: ${selector}`);
-                    break;
+                try {
+                    emailField = await this.page.$(selector);
+                    if (emailField && await emailField.isVisible()) {
+                        console.log(`   ✅ Found email field with selector: ${selector}`);
+                        break;
+                    }
+                } catch(e) {}
+            }
+            
+            if (!emailField) {
+                // Try to find any input that might be for email
+                const allInputs = await this.page.$$('input');
+                for (const input of allInputs) {
+                    const type = await input.evaluate(el => el.type).catch(() => '');
+                    const placeholder = await input.evaluate(el => el.placeholder || '').catch(() => '');
+                    const name = await input.evaluate(el => el.name || '').catch(() => '');
+                    const id = await input.evaluate(el => el.id || '').catch(() => '');
+                    
+                    if (type === 'email' || 
+                        placeholder.toLowerCase().includes('email') || 
+                        name.toLowerCase().includes('email') ||
+                        id.toLowerCase().includes('email')) {
+                        emailField = input;
+                        console.log(`   ✅ Found email field by scanning: type=${type}, placeholder=${placeholder}`);
+                        break;
+                    }
                 }
             }
             
             if (!emailField) {
+                // Take screenshot to debug
+                await this.page.screenshot({ path: '/tmp/login-no-email.png' });
+                console.log('   ❌ Email field not found - screenshot saved to /tmp/login-no-email.png');
+                
+                // Log all input fields on page
+                const inputs = await this.page.$$eval('input', elements => 
+                    elements.map(el => ({
+                        type: el.type,
+                        name: el.name,
+                        id: el.id,
+                        className: el.className,
+                        placeholder: el.placeholder,
+                        autocomplete: el.autocomplete
+                    }))
+                );
+                console.log('   📋 Available input fields:', JSON.stringify(inputs, null, 2));
                 throw new Error('Email field not found on page');
             }
             
+            // Clear and fill email
             await emailField.click();
-            await emailField.click({ clickCount: 3 }); // Select all text
+            await emailField.click({ clickCount: 3 });
+            await emailField.press('Backspace');
             await emailField.type(this.email, { delay: 50 });
             console.log('   ✅ Email entered');
             
-            // Find and fill password field
+            // Method 2: Find password field
             console.log('   🔒 Looking for password field...');
-            const passwordSelectors = ['#password', 'input[name="password"]', 'input[type="password"]', '#login_password'];
+            const passwordSelectors = [
+                'input[type="password"]',
+                'input[name="password"]',
+                'input[placeholder*="Password"]',
+                'input[placeholder*="password"]',
+                'input[id*="password"]',
+                'input[class*="password"]',
+                '#password',
+                '.password-input'
+            ];
+            
             let passwordField = null;
             for (const selector of passwordSelectors) {
-                passwordField = await this.page.$(selector);
-                if (passwordField) {
-                    console.log(`   ✅ Found password field with selector: ${selector}`);
-                    break;
+                try {
+                    passwordField = await this.page.$(selector);
+                    if (passwordField && await passwordField.isVisible()) {
+                        console.log(`   ✅ Found password field with selector: ${selector}`);
+                        break;
+                    }
+                } catch(e) {}
+            }
+            
+            if (!passwordField) {
+                // Try to find password input by scanning
+                const allInputs = await this.page.$$('input');
+                for (const input of allInputs) {
+                    const type = await input.evaluate(el => el.type).catch(() => '');
+                    const placeholder = await input.evaluate(el => el.placeholder || '').catch(() => '');
+                    
+                    if (type === 'password' || placeholder.toLowerCase().includes('password')) {
+                        passwordField = input;
+                        console.log(`   ✅ Found password field by scanning: type=${type}`);
+                        break;
+                    }
                 }
             }
             
@@ -272,33 +358,43 @@ class CompleteFaucetBot {
             await passwordField.type(this.password, { delay: 50 });
             console.log('   ✅ Password entered');
             
-            // Find and click submit button
+            // Method 3: Find login/submit button
             console.log('   🔘 Looking for submit button...');
             const submitSelectors = [
-                'button[type="submit"]', 
-                'input[type="submit"]', 
-                '#login-btn',
-                '.login-btn',
+                'button[type="submit"]',
+                'input[type="submit"]',
                 'button:has-text("Login")',
                 'button:has-text("Sign in")',
-                '.btn-primary'
+                'button:has-text("Sign In")',
+                'button:has-text("LOGIN")',
+                'button:has-text("SIGN IN")',
+                '[class*="login"] button',
+                '[class*="submit"] button',
+                '.login-button',
+                '.submit-button'
             ];
             
             let submitBtn = null;
             for (const selector of submitSelectors) {
-                submitBtn = await this.page.$(selector);
-                if (submitBtn) {
-                    console.log(`   ✅ Found submit button with selector: ${selector}`);
-                    break;
-                }
+                try {
+                    if (selector.includes(':has-text')) {
+                        submitBtn = await this.page.$eval(selector, el => el).catch(() => null);
+                    } else {
+                        submitBtn = await this.page.$(selector);
+                    }
+                    if (submitBtn && await submitBtn.isVisible()) {
+                        console.log(`   ✅ Found submit button with selector: ${selector}`);
+                        break;
+                    }
+                } catch(e) {}
             }
             
             if (!submitBtn) {
-                // Try to find by text content
-                const buttons = await this.page.$$('button');
+                // Try to find button by text content
+                const buttons = await this.page.$$('button, input[type="submit"], a[role="button"]');
                 for (const btn of buttons) {
-                    const text = await btn.evaluate(el => el.innerText.toLowerCase());
-                    if (text.includes('login') || text.includes('sign in')) {
+                    const text = await btn.evaluate(el => (el.innerText || el.value || '').toLowerCase());
+                    if (text.includes('login') || text.includes('sign in') || text.includes('submit')) {
                         submitBtn = btn;
                         console.log(`   ✅ Found submit button by text: "${text}"`);
                         break;
@@ -307,22 +403,34 @@ class CompleteFaucetBot {
             }
             
             if (!submitBtn) {
-                throw new Error('Submit button not found on page');
+                // Try to submit by pressing Enter on password field
+                console.log('   ⚠️ No submit button found, trying Enter key...');
+                await passwordField.press('Enter');
+            } else {
+                console.log('   🚀 Clicking submit button...');
+                await submitBtn.click();
             }
             
-            console.log('   🚀 Clicking submit button...');
-            await submitBtn.click();
-            
-            // Wait for navigation
+            // Wait for navigation/redirect
             console.log('   ⏳ Waiting for login to complete...');
-            await this.page.waitForTimeout(5000);
+            
+            // Wait for either navigation or dashboard content
+            await Promise.race([
+                this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }),
+                this.page.waitForSelector('.dashboard, .user-balance, .balance-amount', { timeout: 15000 }).catch(() => null)
+            ]).catch(() => console.log('   ⚠️ No navigation detected, checking current state...'));
+            
+            await this.page.waitForTimeout(3000);
             
             // Check login result
             const finalUrl = this.page.url();
             console.log(`   🔗 Final URL: ${finalUrl}`);
             
-            // Capture dashboard HTML if login successful
-            if (finalUrl.includes('/dashboard') || finalUrl.includes('/home') || finalUrl !== 'https://faucetpay.io/login') {
+            // Check if login was successful
+            const hasDashboard = await this.page.$('.dashboard, .user-menu, .balance-amount, [class*="dashboard"]').catch(() => null);
+            const isLoggedIn = hasDashboard !== null || finalUrl.includes('/dashboard') || finalUrl !== 'https://faucetpay.io/login';
+            
+            if (isLoggedIn) {
                 this.loggedIn = true;
                 stats.loggedIn = true;
                 console.log('\n✅✅✅ LOGIN SUCCESSFUL! ✅✅✅');
@@ -333,11 +441,19 @@ class CompleteFaucetBot {
                 return true;
             } else {
                 // Check for error messages
-                const errorMsg = await this.page.$eval('.alert-danger, .error, .alert', el => el.innerText).catch(() => null);
+                const errorMsg = await this.page.$eval('.alert, .error, [class*="error"], [class*="alert"]', el => el.innerText).catch(() => null);
                 if (errorMsg) {
                     htmlDebug.loginError = errorMsg;
                     console.log(`   ❌ Login error message: ${errorMsg}`);
                 }
+                
+                // Check if captcha is present
+                const hasCaptcha = await this.page.$('.captcha, [class*="captcha"], iframe[src*="captcha"]').catch(() => null);
+                if (hasCaptcha) {
+                    console.log('   ⚠️ CAPTCHA detected! Manual intervention may be required.');
+                    htmlDebug.loginError = 'CAPTCHA detected - manual solving required';
+                }
+                
                 throw new Error('Login failed - incorrect credentials or site issue');
             }
             
@@ -348,10 +464,13 @@ class CompleteFaucetBot {
             
             // Take screenshot for debugging
             try {
-                const screenshot = await this.page.screenshot({ encoding: 'base64' });
-                htmlDebug.loginScreenshot = screenshot.substring(0, 200) + '...'; // Store preview
-                await this.page.screenshot({ path: '/tmp/login-error.png' });
-                console.log(`   📸 Screenshot saved to: /tmp/login-error.png`);
+                await this.page.screenshot({ path: '/tmp/login-error.png', fullPage: true });
+                console.log(`   📸 Full page screenshot saved to: /tmp/login-error.png`);
+                
+                // Also save HTML for debugging
+                const html = await this.page.content();
+                fs.writeFileSync('/tmp/login-error.html', html);
+                console.log(`   📄 HTML saved to: /tmp/login-error.html`);
             } catch (e) {}
             
             console.log('\n[FaucetPay] Running in limited mode without login');
@@ -361,7 +480,23 @@ class CompleteFaucetBot {
 
     async updateBalance() {
         try {
-            const balanceText = await this.page.$eval('.balance-amount, .user-balance', el => el.innerText).catch(() => '0');
+            // Try multiple selectors for balance
+            const balanceSelectors = [
+                '.balance-amount',
+                '.user-balance',
+                '[class*="balance"]',
+                '.dashboard-balance',
+                '.wallet-balance'
+            ];
+            
+            let balanceText = '0';
+            for (const selector of balanceSelectors) {
+                try {
+                    balanceText = await this.page.$eval(selector, el => el.innerText).catch(() => null);
+                    if (balanceText) break;
+                } catch(e) {}
+            }
+            
             const newBalance = parseFloat(balanceText) || 0;
             if (newBalance !== stats.currentBalance) {
                 console.log(`💰 Balance updated: $${stats.currentBalance.toFixed(5)} → $${newBalance.toFixed(5)}`);
@@ -690,7 +825,7 @@ app.get('/', (req, res) => {
             <div class="card">
                 <h3>🪙 Source Balances</h3>
                 <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
-                <table>
+                </table>
                     <thead><tr><th>Source</th><th>Balance</th><th>Claims</th><th>Last</th><th>Status</th></tr></thead>
                     <tbody>${sourceBalancesHtml || '<tr><td colspan="5">No activity yet...</td></tr>'}</tbody>
                 </table>
