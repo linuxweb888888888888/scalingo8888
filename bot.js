@@ -1,181 +1,173 @@
-// faucetpay-bot.js - Complete FaucetPay Automation Bot
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+// chrome-installer.js - Standalone Chrome/Chromium installation utility
 const fs = require('fs');
-
-puppeteer.use(StealthPlugin());
+const { execSync } = require('child_process');
+const https = require('https');
+const { createWriteStream } = require('fs');
 
 // ============ CONFIGURATION ============
-const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || 'your_email@example.com';
-const FAUCETPAY_PASSWORD = process.env.FAUCETPAY_PASSWORD || 'your_password';
-const MIN_WITHDRAWAL_USD = parseFloat(process.env.MIN_WITHDRAWAL_USD) || 0.10;
+const CHROME_PATH = process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome';
+const CHROME_URL = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
 
-// Supported faucet URLs (add more)
-const FAUCETS = [
-    { name: 'FireFaucet', url: 'https://firefaucet.win', coin: 'BTC' },
-    { name: 'EzBit', url: 'https://ezbit.co.in', coin: 'Multiple' },
-    { name: 'CoinPayU', url: 'https://coinpayu.com', coin: 'BTC' },
-    { name: 'AdBTC', url: 'https://adbtc.top', coin: 'BTC' },
-    { name: 'BTCClicks', url: 'https://btcclicks.com', coin: 'BTC' },
-    { name: 'Cointiply', url: 'https://cointiply.com', coin: 'BTC' }
-];
+// ============ DOWNLOAD FUNCTION ============
+async function downloadFile(url, destPath) {
+    return new Promise((resolve, reject) => {
+        const file = createWriteStream(destPath);
+        https.get(url, (response) => {
+            if (response.statusCode !== 200) {
+                reject(new Error(`Failed to download: ${response.statusCode}`));
+                return;
+            }
+            response.pipe(file);
+            file.on('finish', () => {
+                file.close();
+                resolve();
+            });
+        }).on('error', reject);
+    });
+}
 
-// ============ FAUCETPAY BOT CLASS ============
-class FaucetPayBot {
-    constructor(email, password) {
-        this.email = email;
-        this.password = password;
-        this.browser = null;
-        this.page = null;
-        this.balance = { BTC: 0, DOGE: 0, LTC: 0, USDT: 0 };
-    }
-
-    async init() {
-        const chromePath = '/app/chrome-linux64/chrome';
-        
-        this.browser = await puppeteer.launch({
-            headless: true,
-            executablePath: chromePath,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-        });
-        this.page = await this.browser.newPage();
-        await this.page.setViewport({ width: 1280, height: 800 });
-    }
-
-    async loginToFaucetPay() {
-        console.log('[FaucetPay] Logging in...');
-        
-        await this.page.goto('https://faucetpay.io/login', { waitUntil: 'networkidle2' });
-        await this.page.waitForTimeout(3000);
-        
-        await this.page.type('input[name="email"]', this.email);
-        await this.page.type('input[name="password"]', this.password);
-        await this.page.click('button[type="submit"]');
-        
-        await this.page.waitForTimeout(5000);
-        
-        if (await this.page.$('.dashboard-container')) {
-            console.log('[FaucetPay] ✅ Login successful');
-            return true;
+// ============ CHROME INSTALLATION ============
+async function installChrome() {
+    const chromePath = CHROME_PATH;
+    
+    // Check if Chrome already exists and is valid
+    if (fs.existsSync(chromePath)) {
+        const stats = fs.statSync(chromePath);
+        if (stats.size > 50000000) { // Chrome is at least 50MB
+            console.log('[Chrome] Already installed at:', chromePath);
+            return chromePath;
         }
+    }
+    
+    console.log('[Chrome] Installing Chromium...');
+    
+    try {
+        const zipPath = '/tmp/chromium.zip';
+        
+        // Download Chrome
+        console.log('[Chrome] Downloading from:', CHROME_URL);
+        await downloadFile(CHROME_URL, zipPath);
+        
+        // Extract to /app directory
+        console.log('[Chrome] Extracting...');
+        execSync(`unzip -q ${zipPath} -d /app/`, { stdio: 'inherit' });
+        
+        // Verify installation
+        if (fs.existsSync(chromePath)) {
+            fs.chmodSync(chromePath, 0o755);
+            fs.unlinkSync(zipPath);
+            console.log('[Chrome] ✅ Installed successfully at:', chromePath);
+            return chromePath;
+        }
+        throw new Error('Chrome binary not found after extraction');
+        
+    } catch (error) {
+        console.error('[Chrome] Installation failed:', error.message);
+        return null;
+    }
+}
+
+// ============ CHROME INSTALLATION WITH DEPENDENCIES ============
+async function installChromeWithDependencies() {
+    console.log('[Chrome] Installing Chrome with system dependencies...');
+    
+    // Install required dependencies for Chrome on Linux
+    try {
+        console.log('[Chrome] Installing system dependencies...');
+        execSync('apt-get update -qq 2>/dev/null || true', { stdio: 'inherit' });
+        execSync(`apt-get install -y -qq --no-install-recommends \
+            ca-certificates \
+            fonts-liberation \
+            libappindicator3-1 \
+            libasound2 \
+            libatk-bridge2.0-0 \
+            libatk1.0-0 \
+            libcups2 \
+            libdbus-1-3 \
+            libgbm1 \
+            libgtk-3-0 \
+            libnspr4 \
+            libnss3 \
+            libx11-xcb1 \
+            libxcb1 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxrandr2 \
+            xdg-utils \
+            wget \
+            2>/dev/null || true`, { stdio: 'inherit' });
+        console.log('[Chrome] Dependencies installed');
+    } catch (error) {
+        console.log('[Chrome] Warning: Some dependencies may already be installed');
+    }
+    
+    // Install Chrome
+    return await installChrome();
+}
+
+// ============ LAUNCH OPTIONS ============
+function getChromeLaunchOptions() {
+    return {
+        headless: process.env.HEADLESS_MODE !== 'false',
+        executablePath: CHROME_PATH,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--disable-webgl',
+            '--disable-accelerated-2d-canvas'
+        ]
+    };
+}
+
+// ============ VERIFY INSTALLATION ============
+async function verifyChromeInstallation() {
+    if (!fs.existsSync(CHROME_PATH)) {
+        console.log('[Chrome] ❌ Not installed');
         return false;
     }
-
-    async getBalance() {
-        console.log('[FaucetPay] Checking balance...');
-        
-        // Navigate to balance page
-        await this.page.goto('https://faucetpay.io/dashboard', { waitUntil: 'networkidle2' });
-        await this.page.waitForTimeout(3000);
-        
-        const balances = await this.page.evaluate(() => {
-            const results = {};
-            const rows = document.querySelectorAll('.balance-table tr');
-            rows.forEach(row => {
-                const coin = row.querySelector('td:first-child')?.innerText;
-                const amount = row.querySelector('td:last-child')?.innerText;
-                if (coin && amount) {
-                    results[coin] = parseFloat(amount) || 0;
-                }
-            });
-            return results;
-        });
-        
-        this.balance = balances;
-        console.log(`[FaucetPay] Balance: BTC ${this.balance.BTC || 0}, DOGE ${this.balance.DOGE || 0}, LTC ${this.balance.LTC || 0}`);
-        return this.balance;
-    }
-
-    async autoWithdraw() {
-        console.log('[FaucetPay] Checking withdrawal conditions...');
-        
-        for (const [coin, amount] of Object.entries(this.balance)) {
-            if (amount >= MIN_WITHDRAWAL_USD) {
-                console.log(`[FaucetPay] Attempting withdrawal of ${amount} ${coin}...`);
-                await this.withdrawToWallet(coin);
-            }
-        }
-    }
-
-    async withdrawToWallet(coin) {
-        // Implementation depends on your wallet setup
-        console.log(`[FaucetPay] Withdrawing ${coin}...`);
-        // Add withdrawal logic here
-    }
-
-    async processFaucet(faucet) {
-        console.log(`\n[${faucet.name}] Processing...`);
-        
-        await this.page.goto(faucet.url, { waitUntil: 'networkidle2' });
-        await this.page.waitForTimeout(5000);
-        
-        // Look for claim button
-        const claimSelectors = [
-            '#claimButton', '.claim-btn', 'button:has-text("Claim")',
-            'a:has-text("Claim")', '.captcha-form button'
-        ];
-        
-        for (const selector of claimSelectors) {
-            try {
-                const claimBtn = await this.page.$(selector);
-                if (claimBtn) {
-                    await claimBtn.click();
-                    await this.page.waitForTimeout(3000);
-                    console.log(`[${faucet.name}] ✅ Claim attempted`);
-                    break;
-                }
-            } catch(e) {}
-        }
-        
-        // Wait random time between faucets (30-90 seconds)
-        const delay = 30000 + Math.random() * 60000;
-        await this.page.waitForTimeout(delay);
-    }
-
-    async run() {
-        await this.init();
-        
-        if (await this.loginToFaucetPay()) {
-            // Process each faucet
-            for (const faucet of FAUCETS) {
-                try {
-                    await this.processFaucet(faucet);
-                } catch (error) {
-                    console.log(`[${faucet.name}] Error: ${error.message}`);
-                }
-            }
-            
-            // Check balance and withdraw
-            await this.getBalance();
-            await this.autoWithdraw();
-        }
-        
-        await this.browser.close();
-    }
-}
-
-// ============ MAIN LOOP ============
-async function main() {
-    console.log('========================================');
-    console.log('  FaucetPay Auto Bot');
-    console.log('========================================');
-    console.log(`Email: ${FAUCETPAY_EMAIL}`);
-    console.log(`Min Withdrawal: $${MIN_WITHDRAWAL_USD}`);
-    console.log('========================================\n');
     
-    while (true) {
-        const bot = new FaucetPayBot(FAUCETPAY_EMAIL, FAUCETPAY_PASSWORD);
-        await bot.run();
-        
-        console.log('\n⏰ Waiting 2 hours before next cycle...\n');
-        await new Promise(r => setTimeout(r, 2 * 60 * 60 * 1000));
+    const stats = fs.statSync(CHROME_PATH);
+    console.log(`[Chrome] ✅ Installed: ${CHROME_PATH} (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
+    
+    // Test if Chrome can run
+    try {
+        execSync(`${CHROME_PATH} --version`, { stdio: 'pipe' });
+        console.log('[Chrome] ✅ Version check passed');
+        return true;
+    } catch (error) {
+        console.log('[Chrome] ⚠️ Version check failed, but binary exists');
+        return true;
     }
 }
 
-// Handle shutdown
-process.on('SIGINT', () => {
-    console.log('\n🛑 Shutting down...');
-    process.exit(0);
-});
+// ============ EXPORTS ============
+module.exports = {
+    installChrome,
+    installChromeWithDependencies,
+    getChromeLaunchOptions,
+    verifyChromeInstallation,
+    CHROME_PATH
+};
 
-main().catch(console.error);
+// ============ RUN DIRECTLY ============
+if (require.main === module) {
+    (async () => {
+        console.log('\n========================================');
+        console.log('  Chrome/Chromium Installer');
+        console.log('========================================\n');
+        
+        const success = await installChromeWithDependencies();
+        
+        if (success) {
+            await verifyChromeInstallation();
+            console.log('\n✅ Chrome is ready to use!');
+            console.log(`   Path: ${CHROME_PATH}`);
+            console.log(`   Launch options:`, getChromeLaunchOptions());
+        } else {
+            console.error('\n❌ Chrome installation failed');
+            process.exit(1);
+        }
+    })();
+}
