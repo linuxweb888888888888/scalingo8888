@@ -13,11 +13,11 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || '';
-const FAUCETPAY_PASSWORD = process.env.FAUCETPAY_PASSWORD || '';
+const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || 'web88888888888888@gmail.com';
+const FAUCETPAY_PASSWORD = process.env.FAUCETPAY_PASSWORD || 'Linuxdistro&84';
 const HEADLESS_MODE = process.env.HEADLESS_MODE !== 'false';
 const SCAN_INTERVAL_SECONDS = parseInt(process.env.SCAN_INTERVAL_SECONDS) || 60;
-const AUTO_WITHDRAW = process.env.AUTO_WITHDRAW !== 'false';
+const AUTO_WITHDRAW = process.env.AUTO_WITHDRAW !== 'true';
 
 const CHROME_PATH = '/app/chrome-linux64/chrome';
 const CHROME_URL = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
