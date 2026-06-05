@@ -6,7 +6,6 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-// IMPORTANT: Replace with your actual API Key
 const API_KEY = process.env.API_KEY || "v5ygZk5Inn0phFAWJwoYJZYZ8AqTFsV4wNFTMUZnxQogAZ5kPc";
 const BASE_URL = "https://api.crypto.games/v1";
 
@@ -15,11 +14,11 @@ const DEFAULTS = {
     payout: 2.0,              
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001,
-    recoveryDivisor: 5 // Splits recovery over 5 wins to prevent high bets
+    recoveryDivisor: 5 // Splits the recovery over 5 wins to keep wagers low
 };
 
 // ============ BOT STATE ============
-let btcPrice = 60964; 
+let btcPrice = 60826; 
 let botState = {
     running: true,
     statusMessage: "Initializing...",
@@ -59,7 +58,7 @@ function calculateScaledBase(balance) {
 }
 
 function resetSession() {
-    botState.statusMessage = "REBOOTING: Floor Hit. Starting Fresh...";
+    botState.statusMessage = "REBOOTING: Floor Hit. Resetting Stats...";
     botState.profitProtection.safeBalance = 0;
     botState.recoveryPot = 0;
     botState.stats = {
@@ -92,7 +91,7 @@ async function placeBet() {
         const response = await axios.post(url, payload);
         return response.data;
     } catch (error) { 
-        botState.statusMessage = error.response?.data?.Message || "API Connection Error";
+        botState.statusMessage = error.response?.data?.Message || "API Error";
         return null; 
     }
 }
@@ -120,38 +119,34 @@ async function runStrategy() {
         botState.stats.netProfit += profit;
         botState.stats.currentBalance = result.Balance || 0;
 
-        // Peak tracking for UI
         if (botState.stats.netProfit > botState.stats.maxSessionProfit) {
             botState.stats.maxSessionProfit = botState.stats.netProfit;
         }
 
-        // --- SAFETY-SPLIT RECOVERY LOGIC ---
+        // --- FRACTIONAL RECOVERY LOGIC ---
         botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
 
         if (profit > 0) {
             botState.stats.wins++;
-            // Deduct profit from the recovery pot
+            // Deduct the profit earned from the recovery pot
             botState.recoveryPot -= profit;
-            
-            if (botState.recoveryPot <= 0) {
-                // Pot cleared! Return to base and lock profit
+            if (botState.recoveryPot < 0) {
                 botState.recoveryPot = 0;
+                // Only lock safe profit when pot is cleared
                 botState.profitProtection.safeBalance += (profit * 0.50); 
-                botState.settings.currentBet = botState.settings.baseBet;
-            } else {
-                // Pot still exists, recalculate smaller recovery bet
-                const recoveryPart = botState.recoveryPot / DEFAULTS.recoveryDivisor;
-                botState.settings.currentBet = botState.settings.baseBet + recoveryPart;
             }
         } else {
             botState.stats.losses++;
-            // Add loss to the pot
+            // Add the absolute loss to the pot
             botState.recoveryPot += Math.abs(profit);
-            
-            // Increment bet: Base + 1/5th of the total losses
-            // This prevents doubling while still aiming for recovery
+        }
+
+        // CALCULATE NEXT BET: Base + 20% (1/5) of current Pot
+        if (botState.recoveryPot > 0) {
             const recoveryPart = botState.recoveryPot / DEFAULTS.recoveryDivisor;
             botState.settings.currentBet = botState.settings.baseBet + recoveryPart;
+        } else {
+            botState.settings.currentBet = botState.settings.baseBet;
         }
 
         botState.betHistory.unshift({ 
@@ -161,7 +156,7 @@ async function runStrategy() {
         });
         if (botState.betHistory.length > 30) botState.betHistory.pop();
 
-        await new Promise(r => setTimeout(r, 1100)); // Rate limiting
+        await new Promise(r => setTimeout(r, 1100)); 
     }
 }
 
@@ -211,7 +206,7 @@ app.get('/', (req, res) => {
             <div class="card"><div class="label">💳 Trading Balance</div><div id="t-bal" class="btc-val" style="color:var(--danger)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">⚖️ Recovery Pot (Remaining)</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div class="usd-val">Split: 5 Target Wins</div></div>
+            <div class="card"><div class="label">⚖️ Recovery Pot (Remaining)</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div class="usd-val">Safety Split Recovery</div></div>
         </div>
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
@@ -227,7 +222,7 @@ app.get('/', (req, res) => {
             <div class="proj-card"><div class="label">Yearly</div><span id="p-year-b" class="win">0.00</span><br><span id="p-year-u" class="usd-val">0.00</span></div>
         </div>
         <table>
-            <thead><tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Left</th></tr></thead>
+            <thead><tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Remaining</th></tr></thead>
             <tbody id="h-body"></tbody>
         </table>
     </div>
