@@ -1,24 +1,13 @@
 {
-  "name": "faucetpay-internal-bot",
+  "name": "dicebot-server",
   "version": "1.0.0",
-  "description": "FaucetPay Internal Bot - Daily Bonus, Faucet List, Offerwalls, PTC Ads, Staking, Tasks",
-  "main": "faucetpay-internal-bot.js",
-  "type": "commonjs",
+  "description": "Auto Dice Betting Bot for Scalingo",
+  "main": "bot.js",
   "scripts": {
-    "start": "node faucetpay-internal-bot.js",
-    "dev": "cross-env HEADLESS_MODE=false node faucetpay-internal-bot.js"
-  },
-  "engines": {
-    "node": "20.x",
-    "npm": "10.x"
+    "start": "node bot.js"
   },
   "dependencies": {
-    "express": "4.18.2",
-    "puppeteer": "21.6.1",
-    "puppeteer-extra": "3.3.6",
-    "puppeteer-extra-plugin-stealth": "2.11.2"
-  },
-  "devDependencies": {
-    "cross-env": "^7.0.3"
+    "express": "^4.18.2",
+    "axios": "^1.6.0"
   }
 }
