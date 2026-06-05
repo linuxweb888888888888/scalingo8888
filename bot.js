@@ -3,7 +3,6 @@ const express = require('express');
 const fs = require('fs');
 
 const app = express();
-// Scalingo dynamic port handling
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
@@ -57,15 +56,17 @@ function calculateScaledBase(balance) {
     return Number(calculatedBase.toFixed(8));
 }
 
-// State persistence (Ephemeral on Scalingo unless volume is attached)
+// Fixed for Scalingo /tmp or local storage
+const STATE_PATH = process.env.HOME ? `${process.env.HOME}/bot-state.json` : './bot-state.json';
+
 function saveState() {
-    try { fs.writeFileSync('/tmp/bot-state.json', JSON.stringify(botState, null, 2)); } catch (e) {}
+    try { fs.writeFileSync(STATE_PATH, JSON.stringify(botState, null, 2)); } catch (e) {}
 }
 
 function loadState() {
-    if (fs.existsSync('/tmp/bot-state.json')) {
+    if (fs.existsSync(STATE_PATH)) {
         try {
-            const data = JSON.parse(fs.readFileSync('/tmp/bot-state.json'));
+            const data = JSON.parse(fs.readFileSync(STATE_PATH));
             botState.profitProtection = data.profitProtection || { safeBalance: 0 };
         } catch(e) {}
     }
@@ -74,12 +75,17 @@ function loadState() {
 // ============ API LOGIC ============
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
-    const randomSuffix = Math.random().toString(36).replace(/[^a-z0-9]/gi, '').substring(0, 8);
+    
+    // FIX: Removed underscore. "node20" is alphanumeric. 
+    // randomSuffix is filtered to be alphanumeric only.
+    const randomSuffix = Math.random().toString(36).replace(/[^a-z0-9]/gi, '').substring(0, 10);
+    const safeSeed = "node20" + randomSuffix; 
+
     const payload = { 
         Bet: botState.settings.currentBet, 
         Payout: botState.settings.payout, 
         UnderOver: true, 
-        ClientSeed: "node20_" + randomSuffix 
+        ClientSeed: safeSeed 
     };
 
     try {
@@ -96,14 +102,16 @@ async function runStrategy() {
     botState.running = true;
     while (botState.running) {
         const result = await placeBet();
-        if (!result) { await new Promise(r => setTimeout(r, 5000)); continue; }
+        if (!result) { 
+            await new Promise(r => setTimeout(r, 5000)); 
+            continue; 
+        }
 
         botState.stats.totalBets++;
         const profit = result.Profit || 0;
         botState.stats.netProfit += profit;
         botState.stats.currentBalance = result.Balance || 0;
 
-        // Apply Absolute Scaling logic
         botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
 
         if (profit > 0) {
@@ -112,7 +120,6 @@ async function runStrategy() {
             botState.settings.currentBet = botState.settings.baseBet;
         } else {
             botState.stats.losses++;
-            // Martingale 1.2x
             botState.settings.currentBet = Number((botState.settings.currentBet * botState.settings.multiplier).toFixed(8));
         }
 
@@ -131,9 +138,8 @@ async function runStrategy() {
 app.get('/', (req, res) => {
     const fmt = (num) => (num || 0).toFixed(8);
     const usd = (num) => ((num || 0) * btcPrice).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
-    
     const msPassed = Date.now() - botState.stats.startTime;
-    const hoursPassed = msPassed / (1000 * 60 * 60) || 0.0001;
+    const hoursPassed = Math.max(0.0001, msPassed / (1000 * 60 * 60));
     const pPerHour = botState.stats.netProfit / hoursPassed;
     const winRate = botState.stats.totalBets > 0 ? ((botState.stats.wins / botState.stats.totalBets) * 100).toFixed(1) : 0;
 
@@ -141,7 +147,7 @@ app.get('/', (req, res) => {
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Dice Pro | Node 20</title>
+    <title>Dice Pro | Node 20 Fix</title>
     <meta http-equiv="refresh" content="5">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -170,8 +176,8 @@ app.get('/', (req, res) => {
         </div>
         <div class="grid">
             <div class="card safe-card"><div class="label">🔒 Protected Profit (50%)</div><span class="btc-val" style="color:#ffaa00">${fmt(botState.profitProtection.safeBalance)}</span><span class="usd-val">${usd(botState.profitProtection.safeBalance)}</span></div>
-            <div class="card"><div class="label">💰 Balance</div><span class="btc-val">${fmt(botState.stats.currentBalance)}</span><span class="usd-val">${usd(botState.stats.currentBalance)}</span></div>
-            <div class="card"><div class="label">📊 Net Profit</div><span class="btc-val ${botState.stats.netProfit >= 0 ? 'win' : 'loss'}">${fmt(botState.stats.netProfit)}</span><span class="usd-val">${usd(botState.stats.netProfit)}</span></div>
+            <div class="card"><div class="label">💰 Wallet Balance</div><span class="btc-val">${fmt(botState.stats.currentBalance)}</span><span class="usd-val">${usd(botState.stats.currentBalance)}</span></div>
+            <div class="card"><div class="label">📊 Session Net Profit</div><span class="btc-val ${botState.stats.netProfit >= 0 ? 'win' : 'loss'}">${fmt(botState.stats.netProfit)}</span><span class="usd-val">${usd(botState.stats.netProfit)}</span></div>
             <div class="card"><div class="label">🎯 Next Bet</div><span class="btc-val">${fmt(botState.settings.currentBet)}</span><span class="usd-val">${usd(botState.settings.currentBet)}</span></div>
         </div>
         <div class="grid">
