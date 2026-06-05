@@ -1,676 +1,702 @@
-// dicebot-server.js - Complete Dice Bot for Scalingo.com
+// bitsler-profit-bot.js - Dice Bot with 50% Profit Protection
+// NEVER hardcode API keys! Use .env file only.
+
+require('dotenv').config();
 const express = require('express');
+const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
-const axios = require('axios');
-const crypto = require('crypto');
 
-const app = express();
-app.use(express.json());
-app.use(express.static('public'));
+// ============ LOAD API KEY FROM ENVIRONMENT ============
+const API_KEY = process.env.BITSLER_API_KEY;
+const PROFIT_SAFE_PERCENT = parseFloat(process.env.PROFIT_SAFE_PERCENT) || 50;
+const BASE_BET = parseFloat(process.env.BASE_BET) || 1;
+const WIN_CHANCE = parseFloat(process.env.WIN_CHANCE) || 49.5;
+const STOP_ON_PROFIT = parseFloat(process.env.STOP_ON_PROFIT) || 100;
+const STOP_ON_LOSS = parseFloat(process.env.STOP_ON_LOSS) || 50;
+const MAX_BET = parseFloat(process.env.MAX_BET) || 500;
+const MARTINGALE_MULTIPLIER = 2;
 
-const port = process.env.PORT || 3000;
+// Validate API key
+if (!API_KEY) {
+    console.error('\n❌ ERROR: BITSLER_API_KEY not found!');
+    console.error('Please create a .env file with: BITSLER_API_KEY=your_key_here\n');
+    process.exit(1);
+}
 
-// ============ CONFIGURATION ============
-const SESSION_FILE = process.env.SESSION_FILE || './sessions/bot-state.json';
-const BETTING_ENABLED = process.env.BETTING_ENABLED !== 'false';
-const DEFAULT_BET_AMOUNT = parseFloat(process.env.DEFAULT_BET_AMOUNT) || 1;
-const DEFAULT_WIN_CHANCE = parseFloat(process.env.DEFAULT_WIN_CHANCE) || 49.5;
-const MARTINGALE_MULTIPLIER = parseFloat(process.env.MARTINGALE_MULTIPLIER) || 2.0;
-
-// Ensure sessions directory exists
-if (!fs.existsSync('./sessions')) fs.mkdirSync('./sessions', { recursive: true });
-
+// Mask API key for display
+const maskedKey = API_KEY.substring(0, 8) + '...' + API_KEY.substring(API_KEY.length - 4);
 console.log('\n========================================');
-console.log('  🎲 DiceBot Server - Node.js Edition');
-console.log('  Auto Betting + Martingale Strategy');
+console.log('  🎲 Bitsler Dice Bot - Profit Protection');
 console.log('========================================');
-console.log(`Betting Enabled: ${BETTING_ENABLED}`);
-console.log(`Base Bet: ${DEFAULT_BET_AMOUNT}`);
-console.log(`Win Chance: ${DEFAULT_WIN_CHANCE}%`);
-console.log(`Martingale: ${MARTINGALE_MULTIPLIER}x on loss`);
-console.log('========================================\n');
+console.log(`🔐 API Key: ${maskedKey}`);
+console.log(`💰 Profit Safe: ${PROFIT_SAFE_PERCENT}% of profits will be LOCKED`);
+console.log(`⚠️  Locked profits will NEVER be traded\n`);
 
-// ============ SIMULATED DICE SITES API ============
-// These are mock APIs - replace with real site endpoints
+// ============ API CONFIGURATION ============
+const BASE_URL = 'https://bitsler.com/api';
 
-const SUPPORTED_SITES = [
-    {
-        name: 'FreeBitco.in',
-        apiUrl: 'https://freebitco.in/api',
-        requiresApiKey: true,
-        betEndpoint: '/bet',
-        balanceEndpoint: '/balance'
+const api = axios.create({
+    baseURL: BASE_URL,
+    headers: {
+        'Authorization': `Bearer ${API_KEY}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
     },
-    {
-        name: 'PrimeDice',
-        apiUrl: 'https://api.primedice.com',
-        requiresApiKey: true,
-        betEndpoint: '/v2/bet',
-        balanceEndpoint: '/v2/user'
-    },
-    {
-        name: 'Stake',
-        apiUrl: 'https://stake.com/api',
-        requiresApiKey: true,
-        betEndpoint: '/v2/roll',
-        balanceEndpoint: '/v2/wallet'
-    },
-    {
-        name: 'Bitsler',
-        apiUrl: 'https://bitsler.com/api',
-        requiresApiKey: true,
-        betEndpoint: '/dice',
-        balanceEndpoint: '/user'
-    }
-];
+    timeout: 30000
+});
+
+// ============ PROFIT PROTECTION SYSTEM ============
+// This is the core feature - separates profit from trading balance
+
+let profitProtection = {
+    // SAFE BALANCE - This money is LOCKED and will never be traded
+    safeBalance: 0,
+    safeBalanceHistory: [],
+    
+    // TRADING BALANCE - Only this money is used for betting
+    tradingBalance: 0,
+    
+    // Original starting balance
+    startingBalance: 0,
+    
+    // Total profit ever made
+    totalProfitEver: 0,
+    
+    // Last time profit was locked
+    lastLockTime: null,
+    
+    // Lock events history
+    lockHistory: []
+};
 
 // ============ BOT STATE ============
 let botState = {
-    isRunning: false,
-    currentStrategy: 'martingale',
-    currentSite: 'FreeBitco.in',
+    running: false,
     stats: {
         totalBets: 0,
         wins: 0,
         losses: 0,
         netProfit: 0,
+        lockedProfit: 0,
+        availableProfit: 0,
         currentBalance: 0,
+        tradingBalance: 0,
+        safeBalance: 0,
         highestBalance: 0,
         lowestBalance: 0,
         longestWinStreak: 0,
         longestLossStreak: 0,
         currentStreak: 0,
         startTime: null,
-        lastBetTime: null
+        lastLockAmount: 0
     },
     settings: {
-        baseBet: DEFAULT_BET_AMOUNT,
-        currentBet: DEFAULT_BET_AMOUNT,
-        winChance: DEFAULT_WIN_CHANCE,
+        baseBet: BASE_BET,
+        currentBet: BASE_BET,
+        winChance: WIN_CHANCE,
         multiplier: MARTINGALE_MULTIPLIER,
-        stopOnProfit: parseFloat(process.env.STOP_ON_PROFIT) || 100,
-        stopOnLoss: parseFloat(process.env.STOP_ON_LOSS) || 50,
-        maxBet: parseFloat(process.env.MAX_BET) || 1000,
-        onWinAction: 'reset',
-        onLossAction: 'multiply',
-        hiLoChoice: 'high'
+        stopOnProfit: STOP_ON_PROFIT,
+        stopOnLoss: STOP_ON_LOSS,
+        maxBet: MAX_BET,
+        profitSafePercent: PROFIT_SAFE_PERCENT
     },
-    betHistory: [],
-    apiKeys: {}
+    betHistory: []
 };
 
-// ============ LOAD/SAVE STATE ============
-function loadState() {
-    try {
-        if (fs.existsSync(SESSION_FILE)) {
-            const data = fs.readFileSync(SESSION_FILE, 'utf8');
-            const saved = JSON.parse(data);
-            botState.stats = saved.stats || botState.stats;
-            botState.settings = saved.settings || botState.settings;
-            botState.betHistory = saved.betHistory || [];
-            console.log('[State] ✅ Loaded previous session');
-        }
-    } catch (e) {
-        console.log('[State] No saved session found');
+// ============ SAVE/LOAD STATE ============
+const STATE_FILE = './sessions/profit-bot-state.json';
+const SAFE_FILE = './sessions/safe-balance.json';
+
+function ensureDirectoryExists() {
+    if (!fs.existsSync('./sessions')) {
+        fs.mkdirSync('./sessions', { recursive: true });
     }
 }
 
 function saveState() {
+    ensureDirectoryExists();
     try {
-        fs.writeFileSync(SESSION_FILE, JSON.stringify({
+        fs.writeFileSync(STATE_FILE, JSON.stringify({
             stats: botState.stats,
             settings: botState.settings,
-            betHistory: botState.betHistory.slice(-100)
+            betHistory: botState.betHistory.slice(-200)
         }, null, 2));
+        
+        fs.writeFileSync(SAFE_FILE, JSON.stringify({
+            safeBalance: profitProtection.safeBalance,
+            safeBalanceHistory: profitProtection.safeBalanceHistory.slice(-50),
+            lockHistory: profitProtection.lockHistory.slice(-50),
+            totalProfitEver: profitProtection.totalProfitEver,
+            startingBalance: profitProtection.startingBalance
+        }, null, 2));
+        
     } catch (e) {
-        console.error('[State] Save failed:', e.message);
+        console.error('Save failed:', e.message);
     }
 }
 
-// ============ PROVABLY FAIR ROLL SIMULATION ============
-function generateRoll(winChance) {
-    // Simulate a provably fair dice roll
-    const randomValue = crypto.randomInt(0, 10000) / 100;
-    const isWin = randomValue <= winChance;
-    
-    // Calculate multiplier (standard 2x for 49.5%, scaled accordingly)
-    const multiplier = 100 / winChance;
-    
-    return {
-        roll: randomValue.toFixed(2),
-        isWin: isWin,
-        multiplier: multiplier,
-        payout: isWin ? multiplier : 0
-    };
-}
-
-// ============ PLACE BET (Simulated) ============
-async function placeBet() {
-    if (!botState.isRunning) {
-        console.log('[Bot] ⏸️ Bot is paused');
-        return null;
-    }
-    
-    const settings = botState.settings;
-    const betAmount = settings.currentBet;
-    
-    // Check stop conditions
-    if (botState.stats.netProfit >= settings.stopOnProfit) {
-        console.log(`[Bot] 🛑 Stop on profit reached: ${botState.stats.netProfit.toFixed(2)}`);
-        botState.isRunning = false;
-        return null;
-    }
-    
-    if (botState.stats.netProfit <= -settings.stopOnLoss) {
-        console.log(`[Bot] 🛑 Stop on loss reached: ${botState.stats.netProfit.toFixed(2)}`);
-        botState.isRunning = false;
-        return null;
-    }
-    
-    if (betAmount > settings.maxBet) {
-        console.log(`[Bot] 🛑 Max bet reached: ${betAmount}`);
-        botState.isRunning = false;
-        return null;
-    }
-    
-    // Generate the roll
-    const roll = generateRoll(settings.winChance);
-    
-    // Calculate profit/loss
-    let profit = 0;
-    if (roll.isWin) {
-        profit = betAmount * (roll.multiplier - 1);
-        botState.stats.wins++;
-        botState.stats.currentStreak = botState.stats.currentStreak > 0 ? botState.stats.currentStreak + 1 : 1;
-        if (botState.stats.currentStreak > botState.stats.longestWinStreak) {
-            botState.stats.longestWinStreak = botState.stats.currentStreak;
+function loadState() {
+    ensureDirectoryExists();
+    try {
+        if (fs.existsSync(STATE_FILE)) {
+            const data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+            botState.stats = data.stats || botState.stats;
+            botState.settings = data.settings || botState.settings;
+            botState.betHistory = data.betHistory || [];
+            console.log('📂 Loaded previous session data');
         }
         
-        // On win: reset bet or apply on-win strategy
-        if (settings.onWinAction === 'reset') {
-            settings.currentBet = settings.baseBet;
-        } else if (settings.onWinAction === 'multiply') {
-            settings.currentBet = Math.min(settings.currentBet * 1.5, settings.maxBet);
+        if (fs.existsSync(SAFE_FILE)) {
+            const safeData = JSON.parse(fs.readFileSync(SAFE_FILE, 'utf8'));
+            profitProtection.safeBalance = safeData.safeBalance || 0;
+            profitProtection.safeBalanceHistory = safeData.safeBalanceHistory || [];
+            profitProtection.lockHistory = safeData.lockHistory || [];
+            profitProtection.totalProfitEver = safeData.totalProfitEver || 0;
+            profitProtection.startingBalance = safeData.startingBalance || 0;
+            console.log(`🔒 Loaded SAFE balance: ${profitProtection.safeBalance.toFixed(2)} (LOCKED - never traded)`);
         }
-    } else {
-        profit = -betAmount;
-        botState.stats.losses++;
-        botState.stats.currentStreak = botState.stats.currentStreak < 0 ? botState.stats.currentStreak - 1 : -1;
-        if (Math.abs(botState.stats.currentStreak) > botState.stats.longestLossStreak) {
-            botState.stats.longestLossStreak = Math.abs(botState.stats.currentStreak);
-        }
-        
-        // On loss: multiply bet (Martingale)
-        if (settings.onLossAction === 'multiply') {
-            settings.currentBet = Math.min(settings.currentBet * settings.multiplier, settings.maxBet);
-        }
+    } catch (e) {
+        console.log('No previous session found');
     }
-    
-    // Update stats
-    botState.stats.totalBets++;
-    botState.stats.netProfit += profit;
-    botState.stats.currentBalance += profit;
-    botState.stats.lastBetTime = new Date();
-    
-    if (botState.stats.currentBalance > botState.stats.highestBalance) {
-        botState.stats.highestBalance = botState.stats.currentBalance;
-    }
-    if (botState.stats.currentBalance < botState.stats.lowestBalance) {
-        botState.stats.lowestBalance = botState.stats.currentBalance;
-    }
-    
-    // Record bet
-    const betRecord = {
-        id: botState.stats.totalBets,
-        time: new Date(),
-        amount: betAmount,
-        roll: roll.roll,
-        isWin: roll.isWin,
-        profit: profit,
-        balance: botState.stats.currentBalance,
-        multiplier: roll.multiplier
-    };
-    
-    botState.betHistory.unshift(betRecord);
-    if (botState.betHistory.length > 100) botState.betHistory.pop();
-    
-    // Log to console
-    const emoji = roll.isWin ? '✅' : '❌';
-    console.log(`[${betRecord.time.toLocaleTimeString()}] ${emoji} Bet: ${betAmount} | Roll: ${roll.roll} | Profit: ${profit.toFixed(2)} | Balance: ${botState.stats.currentBalance.toFixed(2)}`);
-    
-    saveState();
-    return betRecord;
 }
 
-// ============ BOT LOOP ============
-async function botLoop() {
-    if (!botState.isRunning) {
-        return;
+// ============ PROFIT PROTECTION CORE FUNCTION ============
+// This function locks a percentage of profit into SAFE balance
+function lockProfit(amount) {
+    const lockAmount = amount * (PROFIT_SAFE_PERCENT / 100);
+    
+    if (lockAmount > 0) {
+        profitProtection.safeBalance += lockAmount;
+        profitProtection.totalProfitEver += lockAmount;
+        profitProtection.lockHistory.unshift({
+            time: new Date(),
+            amount: lockAmount,
+            totalSafe: profitProtection.safeBalance,
+            reason: 'profit_lock'
+        });
+        
+        botState.stats.lockedProfit = profitProtection.safeBalance;
+        botState.stats.lastLockAmount = lockAmount;
+        profitProtection.lastLockTime = new Date();
+        
+        console.log(`\n🔒 PROFIT LOCKED: ${lockAmount.toFixed(2)} added to SAFE balance!`);
+        console.log(`   💰 Total SAFE (never traded): ${profitProtection.safeBalance.toFixed(2)}`);
+        console.log(`   📊 ${PROFIT_SAFE_PERCENT}% of profit is now PROTECTED\n`);
+        
+        // Record in history
+        profitProtection.safeBalanceHistory.unshift({
+            time: new Date(),
+            balance: profitProtection.safeBalance,
+            added: lockAmount
+        });
+        
+        saveState();
+    }
+    
+    return lockAmount;
+}
+
+// Check if we should lock profit based on net profit
+function checkAndLockProfit() {
+    const currentNetProfit = botState.stats.netProfit;
+    const previousLockedProfit = profitProtection.safeBalance;
+    
+    // Calculate how much profit is eligible for locking
+    const eligibleProfit = currentNetProfit - previousLockedProfit;
+    
+    if (eligibleProfit > 0) {
+        const lockAmount = lockProfit(eligibleProfit);
+        return lockAmount;
+    }
+    
+    return 0;
+}
+
+// Update trading balance (total - safe balance)
+function updateTradingBalance(totalBalance) {
+    const newTradingBalance = totalBalance - profitProtection.safeBalance;
+    profitProtection.tradingBalance = Math.max(0, newTradingBalance);
+    botState.stats.tradingBalance = profitProtection.tradingBalance;
+    botState.stats.safeBalance = profitProtection.safeBalance;
+    
+    return profitProtection.tradingBalance;
+}
+
+// ============ API FUNCTIONS ============
+async function getBalance() {
+    try {
+        const response = await api.get('/v2/user/balance');
+        const totalBalance = parseFloat(response.data.balance || response.data.balance_btc || 0);
+        
+        // Record starting balance if not set
+        if (profitProtection.startingBalance === 0) {
+            profitProtection.startingBalance = totalBalance;
+            console.log(`📊 Starting balance: ${totalBalance.toFixed(2)}`);
+        }
+        
+        // Update balances
+        botState.stats.currentBalance = totalBalance;
+        updateTradingBalance(totalBalance);
+        
+        // Track highest/lowest
+        if (totalBalance > botState.stats.highestBalance) {
+            botState.stats.highestBalance = totalBalance;
+        }
+        if (totalBalance < botState.stats.lowestBalance || botState.stats.lowestBalance === 0) {
+            botState.stats.lowestBalance = totalBalance;
+        }
+        
+        return totalBalance;
+    } catch (error) {
+        console.error('❌ Balance error:', error.response?.data?.message || error.message);
+        return 0;
+    }
+}
+
+async function placeBet(amount, winChance, choice = 'high') {
+    // Check if we have enough trading balance
+    if (amount > profitProtection.tradingBalance) {
+        console.log(`\n⚠️ INSUFFICIENT TRADING BALANCE!`);
+        console.log(`   Need: ${amount} | Available: ${profitProtection.tradingBalance.toFixed(2)}`);
+        console.log(`   SAFE balance: ${profitProtection.safeBalance.toFixed(2)} (PROTECTED - cannot use)`);
+        return { success: false, error: 'Insufficient trading balance' };
     }
     
     try {
-        await placeBet();
+        const betData = {
+            amount: parseFloat(amount),
+            win_chance: parseFloat(winChance),
+            choice: choice,
+            currency: 'BTC'
+        };
         
-        // Calculate delay based on strategy (simulate human-like timing)
-        const delay = Math.random() * 2000 + 1000; // 1-3 seconds
-        setTimeout(botLoop, delay);
+        const response = await api.post('/v2/dice/bet', betData);
+        const result = response.data;
+        
+        const isWin = result.win;
+        const multiplier = 100 / winChance;
+        const profit = isWin ? amount * (multiplier - 1) : -amount;
+        
+        return {
+            success: true,
+            isWin: isWin,
+            roll: result.roll,
+            profit: profit,
+            payout: result.payout,
+            multiplier: multiplier
+        };
+        
     } catch (error) {
-        console.error('[Bot] Error:', error.message);
-        setTimeout(botLoop, 5000);
+        const errorMsg = error.response?.data?.message || error.message;
+        console.error(`❌ Bet error: ${errorMsg}`);
+        return { success: false, error: errorMsg };
     }
 }
 
-function startBot() {
-    if (botState.isRunning) {
-        console.log('[Bot] Already running');
+async function getUserInfo() {
+    try {
+        const response = await api.get('/v2/user');
+        return response.data;
+    } catch (error) {
+        console.error('❌ Failed to get user info:', error.message);
+        return null;
+    }
+}
+
+// ============ BETTING WITH PROFIT PROTECTION ============
+async function executeSafeMartingale() {
+    const settings = botState.settings;
+    
+    while (botState.running) {
+        // Check stop conditions
+        if (botState.stats.netProfit >= settings.stopOnProfit) {
+            console.log(`\n🎯 Profit target reached: $${botState.stats.netProfit.toFixed(2)}`);
+            // Lock remaining profit before stopping
+            checkAndLockProfit();
+            break;
+        }
+        if (botState.stats.netProfit <= -settings.stopOnLoss) {
+            console.log(`\n🛑 Loss limit reached: $${botState.stats.netProfit.toFixed(2)}`);
+            break;
+        }
+        if (settings.currentBet > settings.maxBet) {
+            console.log(`\n⚠️ Max bet limit reached: ${settings.currentBet}`);
+            break;
+        }
+        
+        // Check if we have enough trading balance
+        if (settings.currentBet > profitProtection.tradingBalance) {
+            console.log(`\n⚠️ Cannot continue - insufficient trading balance`);
+            console.log(`   Trading balance: ${profitProtection.tradingBalance.toFixed(2)}`);
+            console.log(`   SAFE balance: ${profitProtection.safeBalance.toFixed(2)} (PROTECTED)`);
+            break;
+        }
+        
+        // Place bet
+        const result = await placeBet(settings.currentBet, settings.winChance);
+        
+        if (!result.success) {
+            console.log('⚠️ Bet failed, retrying in 5 seconds...');
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            continue;
+        }
+        
+        // Update stats
+        const previousProfit = botState.stats.netProfit;
+        botState.stats.totalBets++;
+        botState.stats.netProfit += result.profit;
+        botState.stats.currentBalance += result.profit;
+        
+        // Update trading balance
+        updateTradingBalance(botState.stats.currentBalance);
+        
+        if (result.isWin) {
+            botState.stats.wins++;
+            botState.stats.currentStreak = botState.stats.currentStreak > 0 ? botState.stats.currentStreak + 1 : 1;
+            if (botState.stats.currentStreak > botState.stats.longestWinStreak) {
+                botState.stats.longestWinStreak = botState.stats.currentStreak;
+            }
+            // Reset bet on win
+            settings.currentBet = settings.baseBet;
+        } else {
+            botState.stats.losses++;
+            botState.stats.currentStreak = botState.stats.currentStreak < 0 ? botState.stats.currentStreak - 1 : -1;
+            if (Math.abs(botState.stats.currentStreak) > botState.stats.longestLossStreak) {
+                botState.stats.longestLossStreak = Math.abs(botState.stats.currentStreak);
+            }
+            // Double bet on loss (Martingale) - but only up to max
+            settings.currentBet = Math.min(settings.currentBet * settings.multiplier, settings.maxBet);
+        }
+        
+        // LOCK PROFIT - This is the key feature!
+        // Every time we have net profit, lock 50% of it
+        const lockedThisBet = checkAndLockProfit();
+        if (lockedThisBet > 0) {
+            botState.stats.availableProfit = botState.stats.netProfit - profitProtection.safeBalance;
+        }
+        
+        // Record bet history
+        const betRecord = {
+            id: botState.stats.totalBets,
+            time: new Date(),
+            amount: settings.currentBet,
+            roll: result.roll,
+            isWin: result.isWin,
+            profit: result.profit,
+            balance: botState.stats.currentBalance,
+            tradingBalance: profitProtection.tradingBalance,
+            safeBalance: profitProtection.safeBalance,
+            lockedThisBet: lockedThisBet,
+            multiplier: result.multiplier
+        };
+        botState.betHistory.unshift(betRecord);
+        if (botState.betHistory.length > 200) botState.betHistory.pop();
+        
+        // Log result with profit protection info
+        const emoji = result.isWin ? '✅' : '❌';
+        console.log(`${emoji} #${botState.stats.totalBets} | Bet: ${settings.currentBet.toFixed(2)} | Profit: ${result.profit.toFixed(2)} | Net: ${botState.stats.netProfit.toFixed(2)} | Trading: ${profitProtection.tradingBalance.toFixed(2)} | 🔒 SAFE: ${profitProtection.safeBalance.toFixed(2)}`);
+        
+        if (lockedThisBet > 0) {
+            console.log(`   🔒 LOCKED ${lockedThisBet.toFixed(2)} into SAFE balance! (${PROFIT_SAFE_PERCENT}% of profit protected)`);
+        }
+        
+        // Save state periodically
+        if (botState.stats.totalBets % 10 === 0) {
+            saveState();
+        }
+        
+        // Wait between bets
+        await new Promise(resolve => setTimeout(resolve, Math.random() * 1000 + 1000));
+    }
+    
+    return true;
+}
+
+// ============ BOT CONTROL ============
+async function startBot() {
+    if (botState.running) {
+        console.log('Bot is already running');
         return;
     }
     
-    botState.isRunning = true;
+    botState.running = true;
     botState.stats.startTime = botState.stats.startTime || new Date();
     botState.settings.currentBet = botState.settings.baseBet;
     
-    console.log('[Bot] 🚀 Starting dice bot...');
-    console.log(`[Bot] Strategy: ${botState.currentStrategy}`);
-    console.log(`[Bot] Base bet: ${botState.settings.baseBet}`);
-    console.log(`[Bot] Win chance: ${botState.settings.winChance}%`);
+    console.log('\n🚀 Starting Bitsler Dice Bot with PROFIT PROTECTION');
+    console.log('========================================');
+    console.log(`📊 Strategy: Martingale (${botState.settings.multiplier}x on loss)`);
+    console.log(`💰 Base Bet: ${botState.settings.baseBet}`);
+    console.log(`🎯 Win Chance: ${botState.settings.winChance}%`);
+    console.log(`🔒 Profit Protection: ${PROFIT_SAFE_PERCENT}% of profits LOCKED`);
+    console.log(`🛑 Stop Profit: ${botState.settings.stopOnProfit} | Stop Loss: ${botState.settings.stopOnLoss}`);
+    console.log(`💎 SAFE Balance (never traded): ${profitProtection.safeBalance.toFixed(2)}`);
+    console.log(`💳 Trading Balance: ${profitProtection.tradingBalance.toFixed(2)}`);
+    console.log('========================================\n');
     
-    botLoop();
+    await executeSafeMartingale();
+    
+    console.log('\n========================================');
+    console.log('📊 FINAL STATS WITH PROFIT PROTECTION');
+    console.log('========================================');
+    console.log(`Total Bets: ${botState.stats.totalBets}`);
+    console.log(`Wins: ${botState.stats.wins} (${(botState.stats.wins/botState.stats.totalBets*100).toFixed(1)}%)`);
+    console.log(`Losses: ${botState.stats.losses}`);
+    console.log(`Net Profit: ${botState.stats.netProfit.toFixed(2)}`);
+    console.log(`🔒 LOCKED (SAFE): ${profitProtection.safeBalance.toFixed(2)}`);
+    console.log(`💳 Trading Balance: ${profitProtection.tradingBalance.toFixed(2)}`);
+    console.log(`💰 Total Balance: ${botState.stats.currentBalance.toFixed(2)}`);
+    console.log('========================================\n');
+    
+    saveState();
+    botState.running = false;
 }
 
 function stopBot() {
-    botState.isRunning = false;
-    console.log('[Bot] 🛑 Bot stopped');
+    botState.running = false;
+    console.log('\n⏹️ Bot stopping...');
+    checkAndLockProfit(); // Lock any remaining profit
     saveState();
 }
 
-function resetStats() {
-    botState.stats = {
-        totalBets: 0,
-        wins: 0,
-        losses: 0,
-        netProfit: 0,
-        currentBalance: 0,
-        highestBalance: 0,
-        lowestBalance: 0,
-        longestWinStreak: 0,
-        longestLossStreak: 0,
-        currentStreak: 0,
-        startTime: new Date(),
-        lastBetTime: null
-    };
-    botState.settings.currentBet = botState.settings.baseBet;
-    botState.betHistory = [];
-    saveState();
-    console.log('[Bot] Stats reset');
-}
+// ============ EXPRESS DASHBOARD ============
+const app = express();
+const port = process.env.PORT || 3000;
 
-// ============ EXPRESS API ROUTES ============
-
-// Get bot status
-app.get('/api/status', (req, res) => {
+app.get('/', (req, res) => {
     const uptime = botState.stats.startTime 
         ? Math.floor((Date.now() - new Date(botState.stats.startTime).getTime()) / 1000)
         : 0;
+    const hours = Math.floor(uptime / 3600);
+    const minutes = Math.floor((uptime % 3600) / 60);
     
-    res.json({
-        running: botState.isRunning,
-        stats: {
-            ...botState.stats,
-            uptime: uptime,
-            winRate: botState.stats.totalBets > 0 
-                ? (botState.stats.wins / botState.stats.totalBets * 100).toFixed(2)
-                : 0
-        },
-        settings: botState.settings,
-        currentSite: botState.currentSite,
-        supportedSites: SUPPORTED_SITES.map(s => s.name)
-    });
-});
-
-// Start/Stop bot
-app.post('/api/control', (req, res) => {
-    const { action } = req.body;
+    const winRate = botState.stats.totalBets > 0 
+        ? (botState.stats.wins / botState.stats.totalBets * 100).toFixed(1)
+        : 0;
     
-    if (action === 'start') {
-        startBot();
-        res.json({ success: true, message: 'Bot started' });
-    } else if (action === 'stop') {
-        stopBot();
-        res.json({ success: true, message: 'Bot stopped' });
-    } else if (action === 'reset') {
-        resetStats();
-        res.json({ success: true, message: 'Stats reset' });
-    } else {
-        res.status(400).json({ error: 'Invalid action' });
-    }
-});
-
-// Update settings
-app.post('/api/settings', (req, res) => {
-    const allowedSettings = ['baseBet', 'winChance', 'multiplier', 'stopOnProfit', 'stopOnLoss', 'maxBet', 'onWinAction', 'onLossAction', 'hiLoChoice'];
+    const profitProtectionRate = PROFIT_SAFE_PERCENT;
+    const totalLocked = profitProtection.safeBalance;
+    const profitLockedPercent = botState.stats.netProfit > 0 
+        ? (totalLocked / botState.stats.netProfit * 100).toFixed(1)
+        : 0;
     
-    for (const key of allowedSettings) {
-        if (req.body[key] !== undefined) {
-            if (key === 'baseBet') {
-                botState.settings.baseBet = parseFloat(req.body[key]);
-                if (!botState.isRunning) {
-                    botState.settings.currentBet = botState.settings.baseBet;
-                }
-            } else if (key === 'winChance') {
-                botState.settings.winChance = parseFloat(req.body[key]);
-            } else if (key === 'multiplier') {
-                botState.settings.multiplier = parseFloat(req.body[key]);
-            } else if (key === 'stopOnProfit') {
-                botState.settings.stopOnProfit = parseFloat(req.body[key]);
-            } else if (key === 'stopOnLoss') {
-                botState.settings.stopOnLoss = parseFloat(req.body[key]);
-            } else if (key === 'maxBet') {
-                botState.settings.maxBet = parseFloat(req.body[key]);
-            } else if (key === 'onWinAction') {
-                botState.settings.onWinAction = req.body[key];
-            } else if (key === 'onLossAction') {
-                botState.settings.onLossAction = req.body[key];
-            } else if (key === 'hiLoChoice') {
-                botState.settings.hiLoChoice = req.body[key];
-            }
-        }
-    }
-    
-    saveState();
-    res.json({ success: true, settings: botState.settings });
-});
-
-// Get bet history
-app.get('/api/history', (req, res) => {
-    const limit = parseInt(req.query.limit) || 50;
-    res.json(botState.betHistory.slice(0, limit));
-});
-
-// Get supported sites
-app.get('/api/sites', (req, res) => {
-    res.json(SUPPORTED_SITES);
-});
-
-// Set API key for a site
-app.post('/api/apikey', (req, res) => {
-    const { site, apiKey } = req.body;
-    botState.apiKeys[site] = apiKey;
-    saveState();
-    res.json({ success: true, message: `API key saved for ${site}` });
-});
-
-// Dashboard HTML
-app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
 <html>
 <head>
-    <title>🎲 DiceBot - Auto Betting Server</title>
-    <meta http-equiv="refresh" content="2">
+    <title>Bitsler Dice Bot - 50% Profit Protection</title>
+    <meta http-equiv="refresh" content="3">
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: monospace; background: #0a0e27; color: #00ff88; padding: 20px; }
         .container { max-width: 1400px; margin: 0 auto; }
-        h1 { text-align: center; margin-bottom: 20px; }
-        .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
         .card { background: #1a1f3a; padding: 20px; border-radius: 10px; margin-bottom: 20px; }
         .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-bottom: 20px; }
         .stat-card { background: #1a1f3a; padding: 15px; border-radius: 10px; text-align: center; }
         .stat-value { font-size: 28px; font-weight: bold; }
-        .stat-label { font-size: 12px; color: #888; margin-top: 5px; }
-        .live { animation: pulse 1s infinite; display: inline-block; width: 10px; height: 10px; background: #00ff88; border-radius: 50%; margin-right: 8px; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
-        button { background: #00ff88; color: #000; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-weight: bold; margin: 5px; }
-        button.danger { background: #ff4444; color: #fff; }
-        button.warning { background: #ffaa00; color: #000; }
-        input, select { background: #0a0e27; color: #00ff88; border: 1px solid #00ff88; padding: 8px; border-radius: 5px; margin: 5px; }
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        th, td { padding: 8px; text-align: left; border-bottom: 1px solid #333; font-size: 12px; }
+        .stat-value-large { font-size: 36px; font-weight: bold; }
         .win { color: #00ff88; }
         .loss { color: #ff4444; }
-        .settings-row { display: flex; flex-wrap: wrap; gap: 15px; align-items: center; }
-        hr { border-color: #333; margin: 15px 0; }
+        .safe { color: #ffaa00; }
+        .trading { color: #00ccff; }
+        button { background: #00ff88; color: #000; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; margin: 5px; font-weight: bold; }
+        button.danger { background: #ff4444; color: #fff; }
+        .live { display: inline-block; width: 10px; height: 10px; background: #00ff88; border-radius: 50%; animation: pulse 1s infinite; margin-right: 8px; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 8px; text-align: left; border-bottom: 1px solid #333; font-size: 12px; }
+        .profit-protection { background: #2a1f3a; border: 1px solid #ffaa00; }
+        .safe-badge { background: #ffaa00; color: #000; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: bold; }
+        .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🎲 DiceBot - Auto Betting Server</h1>
+        <h1>🎲 Bitsler Dice Bot <span class="safe-badge">🔒 ${PROFIT_SAFE_PERCENT}% PROFIT PROTECTION</span></h1>
         
         <div class="card">
-            <div id="status"></div>
+            <div><span class="live"></span> <strong>${botState.running ? 'RUNNING' : 'STOPPED'}</strong> | Uptime: ${hours}h ${minutes}m</div>
             <div style="margin-top: 15px;">
-                <button onclick="control('start')">▶️ START BOT</button>
-                <button onclick="control('stop')" class="danger">⏹️ STOP BOT</button>
-                <button onclick="control('reset')" class="warning">🔄 RESET STATS</button>
+                ${!botState.running ? '<button onclick="start()">▶️ START BOT</button>' : '<button onclick="stop()" class="danger">⏹️ STOP BOT</button>'}
             </div>
         </div>
         
+        <!-- Balance Overview with Profit Protection -->
         <div class="stats">
-            <div class="stat-card">
-                <div class="stat-value" id="totalBets">0</div>
-                <div class="stat-label">Total Bets</div>
+            <div class="stat-card profit-protection">
+                <div class="stat-value-large safe">${profitProtection.safeBalance.toFixed(2)}</div>
+                <div>🔒 SAFE BALANCE</div>
+                <div style="font-size: 10px;">NEVER TRADED - ${profitLockedPercent}% of profit locked</div>
             </div>
             <div class="stat-card">
-                <div class="stat-value" id="netProfit">0</div>
-                <div class="stat-label">Net Profit</div>
+                <div class="stat-value-large trading">${profitProtection.tradingBalance.toFixed(2)}</div>
+                <div>💳 TRADING BALANCE</div>
+                <div style="font-size: 10px;">Only this is used for bets</div>
             </div>
             <div class="stat-card">
-                <div class="stat-value" id="winRate">0%</div>
-                <div class="stat-label">Win Rate</div>
+                <div class="stat-value">${botState.stats.currentBalance.toFixed(2)}</div>
+                <div>💰 TOTAL BALANCE</div>
             </div>
             <div class="stat-card">
-                <div class="stat-value" id="currentBet">0</div>
-                <div class="stat-label">Current Bet</div>
+                <div class="stat-value ${botState.stats.netProfit >= 0 ? 'win' : 'loss'}">${botState.stats.netProfit.toFixed(2)}</div>
+                <div>📊 NET PROFIT</div>
             </div>
         </div>
         
-        <div class="grid">
+        <div class="grid-2">
             <div class="card">
-                <h3>⚙️ Betting Settings</h3>
-                <div class="settings-row">
-                    <div>
-                        <label>Base Bet</label>
-                        <input type="number" id="baseBet" step="1" value="1">
-                    </div>
-                    <div>
-                        <label>Win Chance (%)</label>
-                        <input type="number" id="winChance" step="0.1" value="49.5">
-                    </div>
-                    <div>
-                        <label>Martingale x</label>
-                        <input type="number" id="multiplier" step="0.1" value="2">
-                    </div>
+                <h3>📊 Betting Stats</h3>
+                <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;">
+                    <div>Total Bets: <strong>${botState.stats.totalBets}</strong></div>
+                    <div>Win Rate: <strong>${winRate}%</strong></div>
+                    <div>Wins: <span class="win">${botState.stats.wins}</span></div>
+                    <div>Losses: <span class="loss">${botState.stats.losses}</span></div>
+                    <div>Win Streak: <span class="win">${botState.stats.longestWinStreak}</span></div>
+                    <div>Loss Streak: <span class="loss">${botState.stats.longestLossStreak}</span></div>
+                    <div>Current Bet: <strong>${botState.settings.currentBet}</strong></div>
+                    <div>Current Streak: ${botState.stats.currentStreak}</div>
                 </div>
-                <div class="settings-row">
-                    <div>
-                        <label>Stop on Profit</label>
-                        <input type="number" id="stopOnProfit" value="100">
-                    </div>
-                    <div>
-                        <label>Stop on Loss</label>
-                        <input type="number" id="stopOnLoss" value="50">
-                    </div>
-                    <div>
-                        <label>Max Bet</label>
-                        <input type="number" id="maxBet" value="1000">
-                    </div>
-                </div>
-                <div class="settings-row">
-                    <div>
-                        <label>On Win</label>
-                        <select id="onWinAction">
-                            <option value="reset">Reset to base</option>
-                            <option value="multiply">Multiply by 1.5</option>
-                        </select>
-                    </div>
-                    <div>
-                        <label>On Loss</label>
-                        <select id="onLossAction">
-                            <option value="multiply">Multiply (Martingale)</option>
-                            <option value="reset">Reset to base</option>
-                        </select>
-                    </div>
-                    <div>
-                        <label>HI/LO Choice</label>
-                        <select id="hiLoChoice">
-                            <option value="high">HIGH (always)</option>
-                            <option value="low">LOW (always)</option>
-                            <option value="alternate">Alternate each bet</option>
-                        </select>
-                    </div>
-                </div>
-                <button onclick="updateSettings()">💾 Save Settings</button>
             </div>
             
             <div class="card">
-                <h3>📈 Performance Stats</h3>
-                <div class="settings-row">
-                    <div>🏆 Longest Win Streak: <strong id="longestWinStreak">0</strong></div>
-                    <div>💀 Longest Loss Streak: <strong id="longestLossStreak">0</strong></div>
-                </div>
-                <div class="settings-row">
-                    <div>📊 Highest Balance: <strong id="highestBalance">0</strong></div>
-                    <div>📉 Lowest Balance: <strong id="lowestBalance">0</strong></div>
-                </div>
-                <div class="settings-row">
-                    <div>✅ Wins: <strong id="wins">0</strong></div>
-                    <div>❌ Losses: <strong id="losses">0</strong></div>
-                </div>
-                <div class="settings-row">
-                    <div>🕐 Uptime: <strong id="uptime">0s</strong></div>
-                    <div>🎲 Current Streak: <strong id="currentStreak">0</strong></div>
+                <h3>🔒 Profit Protection History</h3>
+                <div style="max-height: 200px; overflow-y: auto;">
+                    ${profitProtection.lockHistory.slice(0, 10).map(l => `
+                        <div style="border-bottom: 1px solid #333; padding: 5px;">
+                            ${new Date(l.time).toLocaleTimeString()} - 🔒 Locked ${l.amount.toFixed(2)} (Total SAFE: ${l.totalSafe.toFixed(2)})
+                        </div>
+                    `).join('') || '<div>No locks yet...</div>'}
                 </div>
             </div>
         </div>
         
         <div class="card">
-            <h3>📜 Recent Bets</h3>
+            <h3>📜 Recent Bets (Profit protected on every win)</h3>
             <table>
-                <thead><tr><th>Time</th><th>Bet</th><th>Roll</th><th>Result</th><th>Profit</th><th>Balance</th></tr></thead>
-                <tbody id="betHistory"></tbody>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Bet</th>
+                        <th>Roll</th>
+                        <th>Result</th>
+                        <th>Profit</th>
+                        <th>Trading</th>
+                        <th>🔒 SAFE</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${botState.betHistory.slice(0, 30).map(b => `
+                        <tr>
+                            <td>${new Date(b.time).toLocaleTimeString()}</td>
+                            <td>${b.amount}</td>
+                            <td>${b.roll}</td>
+                            <td class="${b.isWin ? 'win' : 'loss'}">${b.isWin ? 'WIN' : 'LOSS'}</td>
+                            <td class="${b.profit >= 0 ? 'win' : 'loss'}">${b.profit >= 0 ? '+' : ''}${b.profit.toFixed(2)}</td>
+                            <td>${b.tradingBalance?.toFixed(2) || '-'}</td>
+                            <td class="safe">${b.safeBalance?.toFixed(2) || '-'}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
             </table>
         </div>
         
-        <div class="card">
-            <h3>📡 Supported Sites (Real API Integration)</h3>
-            <p>To connect to real dice sites, set these environment variables:</p>
-            <pre>
-FREE_BITCOIN_API_KEY=your_key_here
-PRIME_DICE_API_KEY=your_key_here
-STAKE_API_KEY=your_key_here
-BITSLLER_API_KEY=your_key_here
-            </pre>
-            <p>The bot currently runs in <strong>SIMULATION MODE</strong> for testing. Connect your API keys for real betting!</p>
+        <div class="card" style="background: #1a2a1f; border-color: #00ff88;">
+            <h3>💡 How Profit Protection Works</h3>
+            <ul style="margin-left: 20px; line-height: 1.8;">
+                <li>🔒 <strong>${PROFIT_SAFE_PERCENT}% of every profit is automatically LOCKED</strong> into SAFE balance</li>
+                <li>💰 <strong>SAFE balance is NEVER used for betting</strong> - it's permanently protected</li>
+                <li>💳 Only the <strong>remaining ${100 - PROFIT_SAFE_PERCENT}% stays in TRADING balance</strong></li>
+                <li>✅ This ensures you keep ${PROFIT_SAFE_PERCENT}% of ALL profits, no matter what happens</li>
+                <li>🎯 Even if you lose later, your SAFE profits remain untouched!</li>
+            </ul>
         </div>
     </div>
     
     <script>
-        async function fetchStatus() {
-            const res = await fetch('/api/status');
-            const data = await res.json();
-            
-            document.getElementById('totalBets').innerText = data.stats.totalBets;
-            document.getElementById('netProfit').innerText = data.stats.netProfit.toFixed(2);
-            document.getElementById('winRate').innerText = data.stats.winRate + '%';
-            document.getElementById('currentBet').innerText = data.settings.currentBet;
-            document.getElementById('longestWinStreak').innerText = data.stats.longestWinStreak;
-            document.getElementById('longestLossStreak').innerText = data.stats.longestLossStreak;
-            document.getElementById('highestBalance').innerText = data.stats.highestBalance.toFixed(2);
-            document.getElementById('lowestBalance').innerText = data.stats.lowestBalance.toFixed(2);
-            document.getElementById('wins').innerText = data.stats.wins;
-            document.getElementById('losses').innerText = data.stats.losses;
-            document.getElementById('currentStreak').innerText = data.stats.currentStreak;
-            
-            const uptime = data.stats.uptime;
-            const hours = Math.floor(uptime / 3600);
-            const minutes = Math.floor((uptime % 3600) / 60);
-            const seconds = uptime % 60;
-            document.getElementById('uptime').innerText = \`\${hours}h \${minutes}m \${seconds}s\`;
-            
-            const statusDiv = document.getElementById('status');
-            if (data.running) {
-                statusDiv.innerHTML = '<div><span class="live"></span> 🟢 BOT IS RUNNING</div>';
-            } else {
-                statusDiv.innerHTML = '<div>⏸️ BOT IS STOPPED</div>';
-            }
+        async function start() {
+            await fetch('/api/start', { method: 'POST' });
+            location.reload();
         }
-        
-        async function loadHistory() {
-            const res = await fetch('/api/history?limit=20');
-            const history = await res.json();
-            
-            const tbody = document.getElementById('betHistory');
-            tbody.innerHTML = history.map(b => \`
-                <tr>
-                    <td>\${new Date(b.time).toLocaleTimeString()}</td>
-                    <td>\${b.amount}</td>
-                    <td>\${b.roll}</td>
-                    <td class="\${b.isWin ? 'win' : 'loss'}">\${b.isWin ? '✅ WIN' : '❌ LOSS'}</td>
-                    <td class="\${b.profit >= 0 ? 'win' : 'loss'}">\${b.profit >= 0 ? '+' : ''}\${b.profit.toFixed(2)}</td>
-                    <td>\${b.balance.toFixed(2)}</td>
-                </tr>
-            \`).join('');
+        async function stop() {
+            await fetch('/api/stop', { method: 'POST' });
+            location.reload();
         }
-        
-        async function control(action) {
-            await fetch('/api/control', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ action })
-            });
-            fetchStatus();
-        }
-        
-        async function updateSettings() {
-            const settings = {
-                baseBet: parseFloat(document.getElementById('baseBet').value),
-                winChance: parseFloat(document.getElementById('winChance').value),
-                multiplier: parseFloat(document.getElementById('multiplier').value),
-                stopOnProfit: parseFloat(document.getElementById('stopOnProfit').value),
-                stopOnLoss: parseFloat(document.getElementById('stopOnLoss').value),
-                maxBet: parseFloat(document.getElementById('maxBet').value),
-                onWinAction: document.getElementById('onWinAction').value,
-                onLossAction: document.getElementById('onLossAction').value,
-                hiLoChoice: document.getElementById('hiLoChoice').value
-            };
-            
-            await fetch('/api/settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(settings)
-            });
-            
-            fetchStatus();
-        }
-        
-        setInterval(() => {
-            fetchStatus();
-            loadHistory();
-        }, 2000);
-        
-        fetchStatus();
-        loadHistory();
     </script>
 </body>
 </html>
     `);
 });
 
-// ============ START SERVER ============
-loadState();
-
-app.listen(port, '0.0.0.0', () => {
-    console.log(`\n📊 Dashboard: http://localhost:${port}`);
-    console.log(`\n⚠️  This bot runs in SIMULATION MODE`);
-    console.log(`   To bet with real crypto, add API keys to environment variables`);
-    console.log(`\n🎲 Ready! Open the dashboard to start the bot\n`);
+app.post('/api/start', async (req, res) => {
+    if (!botState.running) {
+        startBot().catch(console.error);
+    }
+    res.json({ success: true });
 });
 
-// Keep the bot alive on Scalingo
+app.post('/api/stop', (req, res) => {
+    stopBot();
+    res.json({ success: true });
+});
+
+app.get('/api/status', (req, res) => {
+    res.json({
+        running: botState.running,
+        stats: botState.stats,
+        settings: botState.settings,
+        profitProtection: {
+            safeBalance: profitProtection.safeBalance,
+            tradingBalance: profitProtection.tradingBalance,
+            totalProfitEver: profitProtection.totalProfitEver
+        }
+    });
+});
+
+// ============ MAIN ============
+async function main() {
+    console.log('🔐 Verifying API connection...');
+    
+    // Test API connection
+    const userInfo = await getUserInfo();
+    if (!userInfo) {
+        console.error('\n❌ Failed to connect to Bitsler API');
+        console.error('Please check your API key in the .env file\n');
+        process.exit(1);
+    }
+    
+    console.log(`👤 Account: ${userInfo.username || 'Connected'}`);
+    await getBalance();
+    
+    loadState();
+    
+    // Recalculate trading balance after loading
+    updateTradingBalance(botState.stats.currentBalance);
+    
+    console.log(`\n💰 Balance Breakdown:`);
+    console.log(`   🔒 SAFE (protected): ${profitProtection.safeBalance.toFixed(2)}`);
+    console.log(`   💳 Trading (can bet): ${profitProtection.tradingBalance.toFixed(2)}`);
+    console.log(`   📊 Total: ${botState.stats.currentBalance.toFixed(2)}`);
+    
+    app.listen(port, '0.0.0.0', () => {
+        console.log(`\n📊 Dashboard: http://localhost:${port}`);
+        console.log(`\n🔒 PROFIT PROTECTION ACTIVE:`);
+        console.log(`   ${PROFIT_SAFE_PERCENT}% of ALL profits will be LOCKED and NEVER traded`);
+        console.log(`   Your SAFE balance will grow with every win`);
+        console.log(`   Even if you lose later, SAFE profits remain yours!\n`);
+    });
+    
+    // Auto-start if configured
+    if (process.env.AUTO_START === 'true') {
+        console.log('🚀 Auto-start enabled...');
+        await startBot();
+    }
+}
+
 process.on('SIGINT', () => {
-    console.log('\n[Server] Shutting down...');
+    console.log('\n\n👋 Shutting down...');
+    checkAndLockProfit(); // Final profit lock
     saveState();
     process.exit(0);
 });
+
+main().catch(console.error);
