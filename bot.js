@@ -6,7 +6,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "f6WwuqPyqqvQdV55Y22ZbACPB9kau2vX9xyaFaAaduwZHfWJbu";
+const API_KEY = process.env.API_KEY || "uVGG7F3K9Lib69b8H7g216G932YUwCp4M1A7fJfWhNJ9VcMGwg";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
@@ -14,7 +14,7 @@ const DEFAULTS = {
     payout: 2.0,              
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001,
-    recoveryDivisor: 5 // Splits the recovery over 5 wins to keep wagers low
+    recoveryDivisor: 10 // Changed to 10 to significantly lower the bet size
 };
 
 // ============ BOT STATE ============
@@ -58,7 +58,7 @@ function calculateScaledBase(balance) {
 }
 
 function resetSession() {
-    botState.statusMessage = "REBOOTING: Floor Hit. Resetting Stats...";
+    botState.statusMessage = "REBOOTING: Floor Hit. Restarting...";
     botState.profitProtection.safeBalance = 0;
     botState.recoveryPot = 0;
     botState.stats = {
@@ -78,7 +78,7 @@ async function placeBet() {
     // STRICT ALPHANUMERIC SEED
     const rawSuffix = Math.random().toString(36).substring(2); 
     const alphanumericSuffix = rawSuffix.replace(/[^a-z0-9]/gi, '').substring(0, 12);
-    const safeSeed = "saf" + alphanumericSuffix; 
+    const safeSeed = "pro" + alphanumericSuffix; 
 
     const payload = { 
         Bet: Number(botState.settings.currentBet.toFixed(8)), 
@@ -98,10 +98,9 @@ async function placeBet() {
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = "Safety-Split Recovery Active";
+    botState.statusMessage = "Ultra-Safe Recovery Active (10-Win Split)";
     
     while (true) {
-        // Floor Auto-Reboot Check
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
             resetSession();
             await new Promise(r => setTimeout(r, 2000));
@@ -123,30 +122,29 @@ async function runStrategy() {
             botState.stats.maxSessionProfit = botState.stats.netProfit;
         }
 
-        // --- FRACTIONAL RECOVERY LOGIC ---
+        // --- ULTRA-SAFE FRACTIONAL RECOVERY ---
         botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
 
         if (profit > 0) {
             botState.stats.wins++;
-            // Deduct the profit earned from the recovery pot
             botState.recoveryPot -= profit;
-            if (botState.recoveryPot < 0) {
+            
+            if (botState.recoveryPot <= 0) {
                 botState.recoveryPot = 0;
-                // Only lock safe profit when pot is cleared
                 botState.profitProtection.safeBalance += (profit * 0.50); 
+                botState.settings.currentBet = botState.settings.baseBet;
+            } else {
+                // Stay on recovery bet but recalibrate based on new pot size
+                const recoveryPart = botState.recoveryPot / DEFAULTS.recoveryDivisor;
+                botState.settings.currentBet = botState.settings.baseBet + recoveryPart;
             }
         } else {
             botState.stats.losses++;
-            // Add the absolute loss to the pot
             botState.recoveryPot += Math.abs(profit);
-        }
-
-        // CALCULATE NEXT BET: Base + 20% (1/5) of current Pot
-        if (botState.recoveryPot > 0) {
+            
+            // Bet = Base + 10% of current losses
             const recoveryPart = botState.recoveryPot / DEFAULTS.recoveryDivisor;
             botState.settings.currentBet = botState.settings.baseBet + recoveryPart;
-        } else {
-            botState.settings.currentBet = botState.settings.baseBet;
         }
 
         botState.betHistory.unshift({ 
@@ -173,7 +171,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.4 | Safety Split</title>
+    <title>Dice Pro v3.5 | Ultra Safe</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -198,7 +196,7 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <div class="header">
-            <h1>Dice Pro <span style="color:var(--primary)">v3.4</span></h1>
+            <h1>Dice Pro <span style="color:var(--primary)">v3.5</span></h1>
             <div style="text-align: right"><div class="label">Market BTC/USD</div><div id="price-tag" style="font-weight: 700;">$0.00</div></div>
         </div>
         <div class="status-bar" id="status-msg">Status: Initializing...</div>
@@ -206,7 +204,7 @@ app.get('/', (req, res) => {
             <div class="card"><div class="label">💳 Trading Balance</div><div id="t-bal" class="btc-val" style="color:var(--danger)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">⚖️ Recovery Pot (Remaining)</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div class="usd-val">Safety Split Recovery</div></div>
+            <div class="card"><div class="label">⚖️ Recovery Pot (Remaining)</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div class="usd-val">Split: 10 Target Wins</div></div>
         </div>
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
@@ -222,7 +220,7 @@ app.get('/', (req, res) => {
             <div class="proj-card"><div class="label">Yearly</div><span id="p-year-b" class="win">0.00</span><br><span id="p-year-u" class="usd-val">0.00</span></div>
         </div>
         <table>
-            <thead><tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Remaining</th></tr></thead>
+            <thead><tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Left</th></tr></thead>
             <tbody id="h-body"></tbody>
         </table>
     </div>
