@@ -1,597 +1,676 @@
-// cointiply-bot.js - Complete Cointipy Automation Bot (Educational Purpose Only)
+// dicebot-server.js - Complete Dice Bot for Scalingo.com
 const express = require('express');
 const fs = require('fs');
-const { execSync } = require('child_process');
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const https = require('https');
-const { createWriteStream } = require('fs');
-
-puppeteer.use(StealthPlugin());
+const path = require('path');
+const axios = require('axios');
+const crypto = require('crypto');
 
 const app = express();
+app.use(express.json());
+app.use(express.static('public'));
+
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const COINTIPLY_EMAIL = process.env.COINTIPLY_EMAIL || 'web88888888888888@gmail.com';
-const COINTIPLY_PASSWORD = process.env.COINTIPLY_PASSWORD || 'Linuxdistro&84';
-const HEADLESS_MODE = process.env.HEADLESS_MODE !== 'false';
-const SCAN_INTERVAL_SECONDS = parseInt(process.env.SCAN_INTERVAL_SECONDS) || 60;
+const SESSION_FILE = process.env.SESSION_FILE || './sessions/bot-state.json';
+const BETTING_ENABLED = process.env.BETTING_ENABLED !== 'false';
+const DEFAULT_BET_AMOUNT = parseFloat(process.env.DEFAULT_BET_AMOUNT) || 1;
+const DEFAULT_WIN_CHANCE = parseFloat(process.env.DEFAULT_WIN_CHANCE) || 49.5;
+const MARTINGALE_MULTIPLIER = parseFloat(process.env.MARTINGALE_MULTIPLIER) || 2.0;
 
-const CHROME_PATH = '/app/chrome-linux64/chrome';
-const CHROME_URL = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
+// Ensure sessions directory exists
+if (!fs.existsSync('./sessions')) fs.mkdirSync('./sessions', { recursive: true });
 
 console.log('\n========================================');
-console.log('  Cointiply Automation Bot');
+console.log('  🎲 DiceBot Server - Node.js Edition');
+console.log('  Auto Betting + Martingale Strategy');
 console.log('========================================');
-console.log(`Account: ${COINTIPLY_EMAIL || 'Not set'}`);
-console.log(`Scan: Every ${SCAN_INTERVAL_SECONDS}s`);
+console.log(`Betting Enabled: ${BETTING_ENABLED}`);
+console.log(`Base Bet: ${DEFAULT_BET_AMOUNT}`);
+console.log(`Win Chance: ${DEFAULT_WIN_CHANCE}%`);
+console.log(`Martingale: ${MARTINGALE_MULTIPLIER}x on loss`);
 console.log('========================================\n');
 
-// ============ CHROME INSTALLATION ============
-async function downloadFile(url, destPath) {
-    return new Promise((resolve, reject) => {
-        const file = createWriteStream(destPath);
-        https.get(url, (response) => {
-            if (response.statusCode !== 200) {
-                reject(new Error(`Failed: ${response.statusCode}`));
-                return;
-            }
-            response.pipe(file);
-            file.on('finish', () => {
-                file.close();
-                resolve();
-            });
-        }).on('error', reject);
-    });
-}
+// ============ SIMULATED DICE SITES API ============
+// These are mock APIs - replace with real site endpoints
 
-async function installChrome() {
-    if (fs.existsSync(CHROME_PATH)) {
-        const stats = fs.statSync(CHROME_PATH);
-        if (stats.size > 50000000) return CHROME_PATH;
-    }
-    
-    console.log('[Chrome] Installing...');
-    try {
-        execSync('apt-get update -qq 2>/dev/null || true', { stdio: 'inherit' });
-        execSync(`apt-get install -y -qq ca-certificates wget unzip libnss3 libxss1 libasound2 2>/dev/null || true`, { stdio: 'inherit' });
-        
-        const zipPath = '/tmp/chromium.zip';
-        await downloadFile(CHROME_URL, zipPath);
-        execSync(`unzip -q ${zipPath} -d /app/`, { stdio: 'inherit' });
-        fs.chmodSync(CHROME_PATH, 0o755);
-        fs.unlinkSync(zipPath);
-        console.log('[Chrome] ✅ Installed');
-        return CHROME_PATH;
-    } catch (error) {
-        console.error('[Chrome] Failed:', error.message);
-        return null;
-    }
-}
-
-// ============ COINTIPLY EARNING METHODS ============
-// Based on official Cointiply documentation
-
-const EARNING_METHODS = [
-    // Daily Free Coins (Faucet) [citation:3]
-    { 
-        name: 'Daily Free Coins', 
-        url: 'https://cointiply.com/free-coins', 
-        earnPerAction: 0.001, 
-        type: 'faucet',
-        selector: '#captcha-input, .captcha-input, #claim-button',
-        requiresCaptcha: true
+const SUPPORTED_SITES = [
+    {
+        name: 'FreeBitco.in',
+        apiUrl: 'https://freebitco.in/api',
+        requiresApiKey: true,
+        betEndpoint: '/bet',
+        balanceEndpoint: '/balance'
     },
-    
-    // PTC Ads [citation:3][citation:7]
-    { 
-        name: 'PTC Ads', 
-        url: 'https://cointiply.com/ptc', 
-        earnPerAction: 0.0005, 
-        type: 'ptc',
-        selector: '.ptc-ad, .ad-item, .view-ad',
-        timerSeconds: 10
+    {
+        name: 'PrimeDice',
+        apiUrl: 'https://api.primedice.com',
+        requiresApiKey: true,
+        betEndpoint: '/v2/bet',
+        balanceEndpoint: '/v2/user'
     },
-    
-    // Missions - Features & Earning [citation:2][citation:5]
-    { 
-        name: 'Missions', 
-        url: 'https://cointiply.com/missions', 
-        earnPerAction: 0.002, 
-        type: 'mission',
-        selector: '.claim-mission, .claim-reward'
+    {
+        name: 'Stake',
+        apiUrl: 'https://stake.com/api',
+        requiresApiKey: true,
+        betEndpoint: '/v2/roll',
+        balanceEndpoint: '/v2/wallet'
     },
-    
-    // Offerwalls [citation:7]
-    { 
-        name: 'Offerwalls', 
-        url: 'https://cointiply.com/offers', 
-        earnPerAction: 0.005, 
-        type: 'offerwall',
-        requiresInteraction: true
-    },
-    
-    // Surveys [citation:7]
-    { 
-        name: 'Surveys', 
-        url: 'https://cointiply.com/surveys', 
-        earnPerAction: 0.01, 
-        type: 'survey',
-        requiresHuman: true
-    },
-    
-    // Chat Rain - Qualify for bonuses [citation:1][citation:3]
-    { 
-        name: 'Chat Rain', 
-        url: 'https://cointiply.com/chat', 
-        earnPerAction: 0.0005, 
-        type: 'rain',
-        selector: '.qualify-rain, .rain-pool-btn'
-    },
-    
-    // Games
-    { 
-        name: 'Games', 
-        url: 'https://cointiply.com/games', 
-        earnPerAction: 0.0003, 
-        type: 'game',
-        selector: '.play-game, .game-link'
-    },
-    
-    // Mystery Box / Free Spins
-    { 
-        name: 'Free Spins', 
-        url: 'https://cointiply.com/free-spins', 
-        earnPerAction: 0.0002, 
-        type: 'spin',
-        selector: '.spin-button, .free-spin'
-    },
-    
-    // Promo Codes [citation:3]
-    { 
-        name: 'Promo Codes', 
-        url: 'https://cointiply.com/redeem', 
-        earnPerAction: 0.001, 
-        type: 'promo',
-        requiresCode: true
-    },
-    
-    // Bonus Interest (5% APY) [citation:6]
-    { 
-        name: 'Interest', 
-        url: 'https://cointiply.com/settings', 
-        earnPerAction: 0, 
-        type: 'interest',
-        isPassive: true,
-        requirement: 'min 35,000 coins balance, weekly activity'
+    {
+        name: 'Bitsler',
+        apiUrl: 'https://bitsler.com/api',
+        requiresApiKey: true,
+        betEndpoint: '/dice',
+        balanceEndpoint: '/user'
     }
 ];
 
-// ============ STATS STORAGE ============
-let stats = {
-    totalEarned: 0,
-    totalActions: 0,
-    currentBalance: 0,
-    missionsCompleted: 0,
-    ptcCompleted: 0,
-    claimHistory: [],
-    startTime: new Date(),
-    loggedIn: false,
-    interestEnabled: false
+// ============ BOT STATE ============
+let botState = {
+    isRunning: false,
+    currentStrategy: 'martingale',
+    currentSite: 'FreeBitco.in',
+    stats: {
+        totalBets: 0,
+        wins: 0,
+        losses: 0,
+        netProfit: 0,
+        currentBalance: 0,
+        highestBalance: 0,
+        lowestBalance: 0,
+        longestWinStreak: 0,
+        longestLossStreak: 0,
+        currentStreak: 0,
+        startTime: null,
+        lastBetTime: null
+    },
+    settings: {
+        baseBet: DEFAULT_BET_AMOUNT,
+        currentBet: DEFAULT_BET_AMOUNT,
+        winChance: DEFAULT_WIN_CHANCE,
+        multiplier: MARTINGALE_MULTIPLIER,
+        stopOnProfit: parseFloat(process.env.STOP_ON_PROFIT) || 100,
+        stopOnLoss: parseFloat(process.env.STOP_ON_LOSS) || 50,
+        maxBet: parseFloat(process.env.MAX_BET) || 1000,
+        onWinAction: 'reset',
+        onLossAction: 'multiply',
+        hiLoChoice: 'high'
+    },
+    betHistory: [],
+    apiKeys: {}
 };
 
-// ============ COINTIPLY BOT ============
-class CointiplyBot {
-    constructor(email, password) {
-        this.email = email;
-        this.password = password;
-        this.browser = null;
-        this.page = null;
-        this.loggedIn = false;
-    }
-
-    async init() {
-        const chromePath = await installChrome();
-        if (!chromePath) throw new Error('Chrome not available');
-        
-        this.browser = await puppeteer.launch({
-            headless: HEADLESS_MODE,
-            executablePath: chromePath,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-        });
-        this.page = await this.browser.newPage();
-        await this.page.setViewport({ width: 1280, height: 800 });
-    }
-
-    async login() {
-        if (!this.email || !this.password) {
-            console.log('[Cointiply] No credentials - demo mode');
-            return false;
+// ============ LOAD/SAVE STATE ============
+function loadState() {
+    try {
+        if (fs.existsSync(SESSION_FILE)) {
+            const data = fs.readFileSync(SESSION_FILE, 'utf8');
+            const saved = JSON.parse(data);
+            botState.stats = saved.stats || botState.stats;
+            botState.settings = saved.settings || botState.settings;
+            botState.betHistory = saved.betHistory || [];
+            console.log('[State] ✅ Loaded previous session');
         }
-        
-        console.log('[Cointiply] Logging in...');
-        try {
-            await this.page.goto('https://cointiply.com/login', { waitUntil: 'networkidle2' });
-            await this.page.waitForTimeout(3000);
-            
-            await this.page.type('#login-email, input[type="email"]', this.email);
-            await this.page.type('#login-password, input[type="password"]', this.password);
-            await this.page.click('#login-submit, button[type="submit"]');
-            await this.page.waitForTimeout(5000);
-            
-            this.loggedIn = true;
-            stats.loggedIn = true;
-            await this.updateBalance();
-            await this.checkInterestSetting();
-            console.log(`[Cointiply] ✅ Login successful! Balance: ${stats.currentBalance} coins`);
-            return true;
-        } catch (error) {
-            console.log('[Cointiply] Login failed');
-            return false;
-        }
-    }
-
-    async updateBalance() {
-        try {
-            const balanceText = await this.page.$eval('.user-balance, .balance-amount, #user-balance', 
-                el => el.innerText).catch(() => '0');
-            stats.currentBalance = parseFloat(balanceText.replace(/[^0-9.-]/g, '')) || 0;
-            return stats.currentBalance;
-        } catch (error) {
-            return stats.currentBalance;
-        }
-    }
-
-    async checkInterestSetting() {
-        // Check if 5% interest is enabled [citation:6]
-        try {
-            await this.page.goto('https://cointiply.com/settings', { waitUntil: 'networkidle2' });
-            await this.page.waitForTimeout(2000);
-            
-            const interestToggle = await this.page.$('#interest-toggle, .interest-switch');
-            if (interestToggle) {
-                const isChecked = await interestToggle.evaluate(el => el.checked);
-                stats.interestEnabled = isChecked;
-                if (!isChecked) {
-                    console.log('  💡 Interest not enabled - enable in Settings to earn 5% APY');
-                }
-            }
-        } catch (error) {
-            // Silent fail
-        }
-    }
-
-    async claimDailyFreeCoins() {
-        // Automatic daily claim every 60 minutes [citation:3]
-        try {
-            await this.page.goto('https://cointiply.com/free-coins', { waitUntil: 'networkidle2' });
-            await this.page.waitForTimeout(2000);
-            
-            // Look for captcha input
-            const captchaInput = await this.page.$('#captcha-input, .captcha-input');
-            if (captchaInput) {
-                // Note: Captcha solving would require external service
-                console.log('  ⚠️ Daily Free Coins requires CAPTCHA - manual intervention needed');
-                return 0;
-            }
-            
-            const claimBtn = await this.page.$('#claim-button, .claim-btn');
-            if (claimBtn) {
-                await claimBtn.click();
-                await this.page.waitForTimeout(3000);
-                const earned = 0.001;
-                stats.totalEarned += earned;
-                stats.totalActions++;
-                this.recordClaim('Daily Free Coins', earned);
-                console.log(`  ✅ Daily Free Coins: +${earned} coins`);
-                return earned;
-            }
-            return 0;
-        } catch (error) {
-            return 0;
-        }
-    }
-
-    async viewPTCAds() {
-        // Automated PTC ad viewing [citation:3][citation:7]
-        try {
-            await this.page.goto('https://cointiply.com/ptc', { waitUntil: 'networkidle2' });
-            await this.page.waitForTimeout(2000);
-            
-            const ads = await this.page.$$('.ptc-ad, .ad-item, .view-ad');
-            let clicks = 0;
-            
-            for (let i = 0; i < Math.min(ads.length, 10); i++) {
-                try {
-                    await ads[i].click();
-                    await this.page.waitForTimeout(10000); // Wait for ad timer [citation:3]
-                    
-                    // Complete verification if present
-                    const verifyBtn = await this.page.$('#verify-btn, .verify-ad');
-                    if (verifyBtn) {
-                        await verifyBtn.click();
-                        await this.page.waitForTimeout(3000);
-                    }
-                    
-                    clicks++;
-                    const earned = 0.0005;
-                    stats.totalEarned += earned;
-                    stats.totalActions++;
-                    stats.ptcCompleted++;
-                    this.recordClaim('PTC Ad', earned);
-                    console.log(`  ✅ PTC Ad ${clicks}: +${earned} coins`);
-                    
-                    await this.page.waitForTimeout(2000);
-                } catch(e) {}
-            }
-            
-            return clicks * 0.0005;
-        } catch (error) {
-            return 0;
-        }
-    }
-
-    async checkMissions() {
-        // Auto-claim completed missions [citation:2][citation:5]
-        try {
-            await this.page.goto('https://cointiply.com/missions', { waitUntil: 'networkidle2' });
-            await this.page.waitForTimeout(2000);
-            
-            const claimButtons = await this.page.$$('.claim-mission, .claim-reward, .mission-claim');
-            let claims = 0;
-            
-            for (const btn of claimButtons) {
-                try {
-                    await btn.click();
-                    await this.page.waitForTimeout(2000);
-                    claims++;
-                    stats.missionsCompleted++;
-                    const earned = 0.002;
-                    stats.totalEarned += earned;
-                    stats.totalActions++;
-                    this.recordClaim('Mission', earned);
-                    console.log(`  ✅ Mission completed! +${earned} coins`);
-                } catch(e) {}
-            }
-            
-            return claims * 0.002;
-        } catch (error) {
-            return 0;
-        }
-    }
-
-    async qualifyForChatRain() {
-        // Qualify for rain pool to earn passive bonuses [citation:1][citation:3]
-        try {
-            await this.page.goto('https://cointiply.com/chat', { waitUntil: 'networkidle2' });
-            await this.page.waitForTimeout(2000);
-            
-            const qualifyBtn = await this.page.$('.qualify-rain, .rain-pool-btn, .qualify-for-rain');
-            if (qualifyBtn) {
-                await qualifyBtn.click();
-                await this.page.waitForTimeout(2000);
-                console.log('  ✅ Qualified for Chat Rain pool');
-                return true;
-            }
-            return false;
-        } catch (error) {
-            return false;
-        }
-    }
-
-    async freeSpins() {
-        // Claim free spins [citation:6]
-        try {
-            await this.page.goto('https://cointiply.com/free-spins', { waitUntil: 'networkidle2' });
-            await this.page.waitForTimeout(2000);
-            
-            const spinBtn = await this.page.$('.spin-button, .free-spin, .claim-spin');
-            if (spinBtn) {
-                await spinBtn.click();
-                await this.page.waitForTimeout(3000);
-                const earned = 0.0002;
-                stats.totalEarned += earned;
-                stats.totalActions++;
-                this.recordClaim('Free Spins', earned);
-                console.log(`  ✅ Free Spins: +${earned} coins`);
-                return earned;
-            }
-            return 0;
-        } catch (error) {
-            return 0;
-        }
-    }
-
-    recordClaim(source, amount) {
-        stats.claimHistory.unshift({
-            time: new Date(),
-            source: source,
-            amount: amount,
-            status: 'SUCCESS'
-        });
-        if (stats.claimHistory.length > 100) stats.claimHistory.pop();
-    }
-
-    async runCycle() {
-        let cycleEarned = 0;
-        
-        console.log(`\n📊 CYCLE ${new Date().toLocaleTimeString()}`);
-        console.log(`💰 Balance: ${stats.currentBalance.toFixed(2)} coins`);
-        console.log('========================================');
-        
-        // Daily Free Coins (once per hour)
-        const dailyEarned = await this.claimDailyFreeCoins();
-        cycleEarned += dailyEarned;
-        
-        await this.page.waitForTimeout(3000);
-        
-        // PTC Ads
-        const ptcEarned = await this.viewPTCAds();
-        cycleEarned += ptcEarned;
-        
-        await this.page.waitForTimeout(3000);
-        
-        // Missions
-        const missionEarned = await this.checkMissions();
-        cycleEarned += missionEarned;
-        
-        await this.page.waitForTimeout(3000);
-        
-        // Chat Rain qualification
-        await this.qualifyForChatRain();
-        
-        await this.page.waitTimeout(3000);
-        
-        // Free Spins
-        const spinsEarned = await this.freeSpins();
-        cycleEarned += spinsEarned;
-        
-        // Update balance
-        await this.updateBalance();
-        
-        // Show interest info [citation:6]
-        if (stats.currentBalance >= 35000 && !stats.interestEnabled) {
-            console.log('\n  💡 TIP: Enable 5% interest in Settings to earn passive income!');
-        }
-        
-        console.log('========================================');
-        console.log(`💰 Cycle earned: ${cycleEarned.toFixed(5)} coins`);
-        console.log(`📊 Total earned: ${stats.totalEarned.toFixed(5)} coins`);
-        console.log(`💳 Balance: ${stats.currentBalance.toFixed(2)} coins`);
-        
-        return cycleEarned;
-    }
-
-    async run() {
-        console.log('🚀 Starting Cointiply Automation Bot');
-        console.log('⚠️  WARNING: Automation may violate Cointiply ToS [citation:4]');
-        console.log('========================================\n');
-        
-        await this.init();
-        await this.login();
-        
-        while (true) {
-            try {
-                await this.runCycle();
-                console.log(`\n⏰ Next cycle in ${SCAN_INTERVAL_SECONDS} seconds...`);
-                await this.page.waitForTimeout(SCAN_INTERVAL_SECONDS * 1000);
-            } catch (error) {
-                console.error(`Cycle error: ${error.message}`);
-                await this.page.waitForTimeout(10000);
-            }
-        }
+    } catch (e) {
+        console.log('[State] No saved session found');
     }
 }
 
-// ============ DASHBOARD ============
+function saveState() {
+    try {
+        fs.writeFileSync(SESSION_FILE, JSON.stringify({
+            stats: botState.stats,
+            settings: botState.settings,
+            betHistory: botState.betHistory.slice(-100)
+        }, null, 2));
+    } catch (e) {
+        console.error('[State] Save failed:', e.message);
+    }
+}
+
+// ============ PROVABLY FAIR ROLL SIMULATION ============
+function generateRoll(winChance) {
+    // Simulate a provably fair dice roll
+    const randomValue = crypto.randomInt(0, 10000) / 100;
+    const isWin = randomValue <= winChance;
+    
+    // Calculate multiplier (standard 2x for 49.5%, scaled accordingly)
+    const multiplier = 100 / winChance;
+    
+    return {
+        roll: randomValue.toFixed(2),
+        isWin: isWin,
+        multiplier: multiplier,
+        payout: isWin ? multiplier : 0
+    };
+}
+
+// ============ PLACE BET (Simulated) ============
+async function placeBet() {
+    if (!botState.isRunning) {
+        console.log('[Bot] ⏸️ Bot is paused');
+        return null;
+    }
+    
+    const settings = botState.settings;
+    const betAmount = settings.currentBet;
+    
+    // Check stop conditions
+    if (botState.stats.netProfit >= settings.stopOnProfit) {
+        console.log(`[Bot] 🛑 Stop on profit reached: ${botState.stats.netProfit.toFixed(2)}`);
+        botState.isRunning = false;
+        return null;
+    }
+    
+    if (botState.stats.netProfit <= -settings.stopOnLoss) {
+        console.log(`[Bot] 🛑 Stop on loss reached: ${botState.stats.netProfit.toFixed(2)}`);
+        botState.isRunning = false;
+        return null;
+    }
+    
+    if (betAmount > settings.maxBet) {
+        console.log(`[Bot] 🛑 Max bet reached: ${betAmount}`);
+        botState.isRunning = false;
+        return null;
+    }
+    
+    // Generate the roll
+    const roll = generateRoll(settings.winChance);
+    
+    // Calculate profit/loss
+    let profit = 0;
+    if (roll.isWin) {
+        profit = betAmount * (roll.multiplier - 1);
+        botState.stats.wins++;
+        botState.stats.currentStreak = botState.stats.currentStreak > 0 ? botState.stats.currentStreak + 1 : 1;
+        if (botState.stats.currentStreak > botState.stats.longestWinStreak) {
+            botState.stats.longestWinStreak = botState.stats.currentStreak;
+        }
+        
+        // On win: reset bet or apply on-win strategy
+        if (settings.onWinAction === 'reset') {
+            settings.currentBet = settings.baseBet;
+        } else if (settings.onWinAction === 'multiply') {
+            settings.currentBet = Math.min(settings.currentBet * 1.5, settings.maxBet);
+        }
+    } else {
+        profit = -betAmount;
+        botState.stats.losses++;
+        botState.stats.currentStreak = botState.stats.currentStreak < 0 ? botState.stats.currentStreak - 1 : -1;
+        if (Math.abs(botState.stats.currentStreak) > botState.stats.longestLossStreak) {
+            botState.stats.longestLossStreak = Math.abs(botState.stats.currentStreak);
+        }
+        
+        // On loss: multiply bet (Martingale)
+        if (settings.onLossAction === 'multiply') {
+            settings.currentBet = Math.min(settings.currentBet * settings.multiplier, settings.maxBet);
+        }
+    }
+    
+    // Update stats
+    botState.stats.totalBets++;
+    botState.stats.netProfit += profit;
+    botState.stats.currentBalance += profit;
+    botState.stats.lastBetTime = new Date();
+    
+    if (botState.stats.currentBalance > botState.stats.highestBalance) {
+        botState.stats.highestBalance = botState.stats.currentBalance;
+    }
+    if (botState.stats.currentBalance < botState.stats.lowestBalance) {
+        botState.stats.lowestBalance = botState.stats.currentBalance;
+    }
+    
+    // Record bet
+    const betRecord = {
+        id: botState.stats.totalBets,
+        time: new Date(),
+        amount: betAmount,
+        roll: roll.roll,
+        isWin: roll.isWin,
+        profit: profit,
+        balance: botState.stats.currentBalance,
+        multiplier: roll.multiplier
+    };
+    
+    botState.betHistory.unshift(betRecord);
+    if (botState.betHistory.length > 100) botState.betHistory.pop();
+    
+    // Log to console
+    const emoji = roll.isWin ? '✅' : '❌';
+    console.log(`[${betRecord.time.toLocaleTimeString()}] ${emoji} Bet: ${betAmount} | Roll: ${roll.roll} | Profit: ${profit.toFixed(2)} | Balance: ${botState.stats.currentBalance.toFixed(2)}`);
+    
+    saveState();
+    return betRecord;
+}
+
+// ============ BOT LOOP ============
+async function botLoop() {
+    if (!botState.isRunning) {
+        return;
+    }
+    
+    try {
+        await placeBet();
+        
+        // Calculate delay based on strategy (simulate human-like timing)
+        const delay = Math.random() * 2000 + 1000; // 1-3 seconds
+        setTimeout(botLoop, delay);
+    } catch (error) {
+        console.error('[Bot] Error:', error.message);
+        setTimeout(botLoop, 5000);
+    }
+}
+
+function startBot() {
+    if (botState.isRunning) {
+        console.log('[Bot] Already running');
+        return;
+    }
+    
+    botState.isRunning = true;
+    botState.stats.startTime = botState.stats.startTime || new Date();
+    botState.settings.currentBet = botState.settings.baseBet;
+    
+    console.log('[Bot] 🚀 Starting dice bot...');
+    console.log(`[Bot] Strategy: ${botState.currentStrategy}`);
+    console.log(`[Bot] Base bet: ${botState.settings.baseBet}`);
+    console.log(`[Bot] Win chance: ${botState.settings.winChance}%`);
+    
+    botLoop();
+}
+
+function stopBot() {
+    botState.isRunning = false;
+    console.log('[Bot] 🛑 Bot stopped');
+    saveState();
+}
+
+function resetStats() {
+    botState.stats = {
+        totalBets: 0,
+        wins: 0,
+        losses: 0,
+        netProfit: 0,
+        currentBalance: 0,
+        highestBalance: 0,
+        lowestBalance: 0,
+        longestWinStreak: 0,
+        longestLossStreak: 0,
+        currentStreak: 0,
+        startTime: new Date(),
+        lastBetTime: null
+    };
+    botState.settings.currentBet = botState.settings.baseBet;
+    botState.betHistory = [];
+    saveState();
+    console.log('[Bot] Stats reset');
+}
+
+// ============ EXPRESS API ROUTES ============
+
+// Get bot status
+app.get('/api/status', (req, res) => {
+    const uptime = botState.stats.startTime 
+        ? Math.floor((Date.now() - new Date(botState.stats.startTime).getTime()) / 1000)
+        : 0;
+    
+    res.json({
+        running: botState.isRunning,
+        stats: {
+            ...botState.stats,
+            uptime: uptime,
+            winRate: botState.stats.totalBets > 0 
+                ? (botState.stats.wins / botState.stats.totalBets * 100).toFixed(2)
+                : 0
+        },
+        settings: botState.settings,
+        currentSite: botState.currentSite,
+        supportedSites: SUPPORTED_SITES.map(s => s.name)
+    });
+});
+
+// Start/Stop bot
+app.post('/api/control', (req, res) => {
+    const { action } = req.body;
+    
+    if (action === 'start') {
+        startBot();
+        res.json({ success: true, message: 'Bot started' });
+    } else if (action === 'stop') {
+        stopBot();
+        res.json({ success: true, message: 'Bot stopped' });
+    } else if (action === 'reset') {
+        resetStats();
+        res.json({ success: true, message: 'Stats reset' });
+    } else {
+        res.status(400).json({ error: 'Invalid action' });
+    }
+});
+
+// Update settings
+app.post('/api/settings', (req, res) => {
+    const allowedSettings = ['baseBet', 'winChance', 'multiplier', 'stopOnProfit', 'stopOnLoss', 'maxBet', 'onWinAction', 'onLossAction', 'hiLoChoice'];
+    
+    for (const key of allowedSettings) {
+        if (req.body[key] !== undefined) {
+            if (key === 'baseBet') {
+                botState.settings.baseBet = parseFloat(req.body[key]);
+                if (!botState.isRunning) {
+                    botState.settings.currentBet = botState.settings.baseBet;
+                }
+            } else if (key === 'winChance') {
+                botState.settings.winChance = parseFloat(req.body[key]);
+            } else if (key === 'multiplier') {
+                botState.settings.multiplier = parseFloat(req.body[key]);
+            } else if (key === 'stopOnProfit') {
+                botState.settings.stopOnProfit = parseFloat(req.body[key]);
+            } else if (key === 'stopOnLoss') {
+                botState.settings.stopOnLoss = parseFloat(req.body[key]);
+            } else if (key === 'maxBet') {
+                botState.settings.maxBet = parseFloat(req.body[key]);
+            } else if (key === 'onWinAction') {
+                botState.settings.onWinAction = req.body[key];
+            } else if (key === 'onLossAction') {
+                botState.settings.onLossAction = req.body[key];
+            } else if (key === 'hiLoChoice') {
+                botState.settings.hiLoChoice = req.body[key];
+            }
+        }
+    }
+    
+    saveState();
+    res.json({ success: true, settings: botState.settings });
+});
+
+// Get bet history
+app.get('/api/history', (req, res) => {
+    const limit = parseInt(req.query.limit) || 50;
+    res.json(botState.betHistory.slice(0, limit));
+});
+
+// Get supported sites
+app.get('/api/sites', (req, res) => {
+    res.json(SUPPORTED_SITES);
+});
+
+// Set API key for a site
+app.post('/api/apikey', (req, res) => {
+    const { site, apiKey } = req.body;
+    botState.apiKeys[site] = apiKey;
+    saveState();
+    res.json({ success: true, message: `API key saved for ${site}` });
+});
+
+// Dashboard HTML
 app.get('/', (req, res) => {
-    const uptime = Math.floor((Date.now() - stats.startTime) / 1000);
-    const hours = Math.floor(uptime / 3600);
-    const minutes = Math.floor((uptime % 3600) / 60);
-    
-    const dailyRate = (stats.totalEarned / (uptime / 86400)).toFixed(5);
-    const monthlyRate = (dailyRate * 30).toFixed(2);
-    
-    const claimHtml = stats.claimHistory.slice(0, 30).map(c => `
-        <tr>
-            <td>${new Date(c.time).toLocaleTimeString()}</td>
-            <td>${c.source}</td>
-            <td class="earn">+${c.amount.toFixed(5)} coins</td>
-            <td>${c.status}</td>
-        </tr>
-    `).join('');
-    
     res.send(`
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Cointiply Automation Bot</title>
-    <meta http-equiv="refresh" content="15">
+    <title>🎲 DiceBot - Auto Betting Server</title>
+    <meta http-equiv="refresh" content="2">
     <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: monospace; background: #0a0e27; color: #00ff88; padding: 20px; }
-        .container { max-width: 1000px; margin: 0 auto; }
-        h1 { text-align: center; }
-        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin: 20px 0; }
+        .container { max-width: 1400px; margin: 0 auto; }
+        h1 { text-align: center; margin-bottom: 20px; }
+        .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
+        .card { background: #1a1f3a; padding: 20px; border-radius: 10px; margin-bottom: 20px; }
+        .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-bottom: 20px; }
         .stat-card { background: #1a1f3a; padding: 15px; border-radius: 10px; text-align: center; }
         .stat-value { font-size: 28px; font-weight: bold; }
-        .stat-value-large { font-size: 36px; font-weight: bold; color: #00ff88; }
-        .card { background: #1a1f3a; padding: 15px; border-radius: 10px; margin-bottom: 20px; overflow-x: auto; max-height: 400px; overflow-y: auto; }
-        .status { background: #1a1f3a; padding: 15px; border-radius: 10px; margin-bottom: 20px; text-align: center; }
+        .stat-label { font-size: 12px; color: #888; margin-top: 5px; }
+        .live { animation: pulse 1s infinite; display: inline-block; width: 10px; height: 10px; background: #00ff88; border-radius: 50%; margin-right: 8px; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+        button { background: #00ff88; color: #000; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-weight: bold; margin: 5px; }
+        button.danger { background: #ff4444; color: #fff; }
+        button.warning { background: #ffaa00; color: #000; }
+        input, select { background: #0a0e27; color: #00ff88; border: 1px solid #00ff88; padding: 8px; border-radius: 5px; margin: 5px; }
         table { width: 100%; border-collapse: collapse; margin-top: 10px; }
         th, td { padding: 8px; text-align: left; border-bottom: 1px solid #333; font-size: 12px; }
-        th { color: #00ff88; }
-        .earn { color: #00ff88; }
-        .warning { color: #ffaa00; background: #2a1a0a; padding: 10px; border-radius: 5px; margin-top: 10px; font-size: 12px; }
-        .refresh-btn { background: #1a1f3a; color: #00ff88; border: 1px solid #00ff88; padding: 5px 10px; border-radius: 5px; cursor: pointer; margin-bottom: 10px; }
-        .live { color: #00ff88; animation: pulse 1s infinite; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .win { color: #00ff88; }
+        .loss { color: #ff4444; }
+        .settings-row { display: flex; flex-wrap: wrap; gap: 15px; align-items: center; }
+        hr { border-color: #333; margin: 15px 0; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>💰 Cointiply Automation Bot</h1>
-        <div class="status">
-            🟢 <span class="live">LIVE</span> | Uptime: ${hours}h ${minutes}m
-            <div class="stat-value-large">${stats.currentBalance.toFixed(2)}</div>
-            <div>Cointiply Coins</div>
-            <div class="warning">
-                ⚠️ WARNING: Automation may violate Cointiply Terms of Service<br>
-                Use at your own risk. One account per person. No bots allowed [citation:4]
+        <h1>🎲 DiceBot - Auto Betting Server</h1>
+        
+        <div class="card">
+            <div id="status"></div>
+            <div style="margin-top: 15px;">
+                <button onclick="control('start')">▶️ START BOT</button>
+                <button onclick="control('stop')" class="danger">⏹️ STOP BOT</button>
+                <button onclick="control('reset')" class="warning">🔄 RESET STATS</button>
             </div>
         </div>
         
         <div class="stats">
-            <div class="stat-card"><div class="stat-value">${stats.totalEarned.toFixed(5)}</div><div>Total Earned</div></div>
-            <div class="stat-card"><div class="stat-value">$${monthlyRate}</div><div>Monthly Value*</div></div>
-            <div class="stat-card"><div class="stat-value">${stats.ptcCompleted}</div><div>PTC Ads Watched</div></div>
-            <div class="stat-card"><div class="stat-value">${stats.missionsCompleted}</div><div>Missions Completed</div></div>
+            <div class="stat-card">
+                <div class="stat-value" id="totalBets">0</div>
+                <div class="stat-label">Total Bets</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="netProfit">0</div>
+                <div class="stat-label">Net Profit</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="winRate">0%</div>
+                <div class="stat-label">Win Rate</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="currentBet">0</div>
+                <div class="stat-label">Current Bet</div>
+            </div>
+        </div>
+        
+        <div class="grid">
+            <div class="card">
+                <h3>⚙️ Betting Settings</h3>
+                <div class="settings-row">
+                    <div>
+                        <label>Base Bet</label>
+                        <input type="number" id="baseBet" step="1" value="1">
+                    </div>
+                    <div>
+                        <label>Win Chance (%)</label>
+                        <input type="number" id="winChance" step="0.1" value="49.5">
+                    </div>
+                    <div>
+                        <label>Martingale x</label>
+                        <input type="number" id="multiplier" step="0.1" value="2">
+                    </div>
+                </div>
+                <div class="settings-row">
+                    <div>
+                        <label>Stop on Profit</label>
+                        <input type="number" id="stopOnProfit" value="100">
+                    </div>
+                    <div>
+                        <label>Stop on Loss</label>
+                        <input type="number" id="stopOnLoss" value="50">
+                    </div>
+                    <div>
+                        <label>Max Bet</label>
+                        <input type="number" id="maxBet" value="1000">
+                    </div>
+                </div>
+                <div class="settings-row">
+                    <div>
+                        <label>On Win</label>
+                        <select id="onWinAction">
+                            <option value="reset">Reset to base</option>
+                            <option value="multiply">Multiply by 1.5</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label>On Loss</label>
+                        <select id="onLossAction">
+                            <option value="multiply">Multiply (Martingale)</option>
+                            <option value="reset">Reset to base</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label>HI/LO Choice</label>
+                        <select id="hiLoChoice">
+                            <option value="high">HIGH (always)</option>
+                            <option value="low">LOW (always)</option>
+                            <option value="alternate">Alternate each bet</option>
+                        </select>
+                    </div>
+                </div>
+                <button onclick="updateSettings()">💾 Save Settings</button>
+            </div>
+            
+            <div class="card">
+                <h3>📈 Performance Stats</h3>
+                <div class="settings-row">
+                    <div>🏆 Longest Win Streak: <strong id="longestWinStreak">0</strong></div>
+                    <div>💀 Longest Loss Streak: <strong id="longestLossStreak">0</strong></div>
+                </div>
+                <div class="settings-row">
+                    <div>📊 Highest Balance: <strong id="highestBalance">0</strong></div>
+                    <div>📉 Lowest Balance: <strong id="lowestBalance">0</strong></div>
+                </div>
+                <div class="settings-row">
+                    <div>✅ Wins: <strong id="wins">0</strong></div>
+                    <div>❌ Losses: <strong id="losses">0</strong></div>
+                </div>
+                <div class="settings-row">
+                    <div>🕐 Uptime: <strong id="uptime">0s</strong></div>
+                    <div>🎲 Current Streak: <strong id="currentStreak">0</strong></div>
+                </div>
+            </div>
         </div>
         
         <div class="card">
-            <h3>📈 Recent Activity</h3>
-            <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
+            <h3>📜 Recent Bets</h3>
             <table>
-                <thead><tr><th>Time</th><th>Source</th><th>Amount</th><th>Status</th></tr></thead>
-                <tbody>${claimHtml || '<tr><td colspan="4">No activity yet...登录Cointiply to start earning!</td></tr>'}</tbody>
+                <thead><tr><th>Time</th><th>Bet</th><th>Roll</th><th>Result</th><th>Profit</th><th>Balance</th></tr></thead>
+                <tbody id="betHistory"></tbody>
             </table>
         </div>
         
         <div class="card">
-            <div class="warning">
-                <strong>💰 How to Earn More on Cointiply (Legitimately):</strong><br><br>
-                • <strong>Daily Free Coins</strong> - Claim every hour [citation:3]<br>
-                • <strong>PTC Ads</strong> - Watch ads daily for consistent earnings [citation:7]<br>
-                • <strong>Missions</strong> - Complete tasks for bonus coins [citation:2][citation:5]<br>
-                • <strong>5% Interest</strong> - Keep 35,000+ coins balance and stay active [citation:6]<br>
-                • <strong>Chat Rain</strong> - Qualify daily for bonus distributions [citation:1]<br>
-                • <strong>Offerwalls & Surveys</strong> - Higher payouts for active users [citation:7]<br><br>
-                <strong>Estimated monthly earnings: $5-$20</strong> [citation:7][citation:9]<br>
-                Minimum withdrawal: $3.50 [citation:9]
-            </div>
+            <h3>📡 Supported Sites (Real API Integration)</h3>
+            <p>To connect to real dice sites, set these environment variables:</p>
+            <pre>
+FREE_BITCOIN_API_KEY=your_key_here
+PRIME_DICE_API_KEY=your_key_here
+STAKE_API_KEY=your_key_here
+BITSLLER_API_KEY=your_key_here
+            </pre>
+            <p>The bot currently runs in <strong>SIMULATION MODE</strong> for testing. Connect your API keys for real betting!</p>
         </div>
     </div>
+    
+    <script>
+        async function fetchStatus() {
+            const res = await fetch('/api/status');
+            const data = await res.json();
+            
+            document.getElementById('totalBets').innerText = data.stats.totalBets;
+            document.getElementById('netProfit').innerText = data.stats.netProfit.toFixed(2);
+            document.getElementById('winRate').innerText = data.stats.winRate + '%';
+            document.getElementById('currentBet').innerText = data.settings.currentBet;
+            document.getElementById('longestWinStreak').innerText = data.stats.longestWinStreak;
+            document.getElementById('longestLossStreak').innerText = data.stats.longestLossStreak;
+            document.getElementById('highestBalance').innerText = data.stats.highestBalance.toFixed(2);
+            document.getElementById('lowestBalance').innerText = data.stats.lowestBalance.toFixed(2);
+            document.getElementById('wins').innerText = data.stats.wins;
+            document.getElementById('losses').innerText = data.stats.losses;
+            document.getElementById('currentStreak').innerText = data.stats.currentStreak;
+            
+            const uptime = data.stats.uptime;
+            const hours = Math.floor(uptime / 3600);
+            const minutes = Math.floor((uptime % 3600) / 60);
+            const seconds = uptime % 60;
+            document.getElementById('uptime').innerText = \`\${hours}h \${minutes}m \${seconds}s\`;
+            
+            const statusDiv = document.getElementById('status');
+            if (data.running) {
+                statusDiv.innerHTML = '<div><span class="live"></span> 🟢 BOT IS RUNNING</div>';
+            } else {
+                statusDiv.innerHTML = '<div>⏸️ BOT IS STOPPED</div>';
+            }
+        }
+        
+        async function loadHistory() {
+            const res = await fetch('/api/history?limit=20');
+            const history = await res.json();
+            
+            const tbody = document.getElementById('betHistory');
+            tbody.innerHTML = history.map(b => \`
+                <tr>
+                    <td>\${new Date(b.time).toLocaleTimeString()}</td>
+                    <td>\${b.amount}</td>
+                    <td>\${b.roll}</td>
+                    <td class="\${b.isWin ? 'win' : 'loss'}">\${b.isWin ? '✅ WIN' : '❌ LOSS'}</td>
+                    <td class="\${b.profit >= 0 ? 'win' : 'loss'}">\${b.profit >= 0 ? '+' : ''}\${b.profit.toFixed(2)}</td>
+                    <td>\${b.balance.toFixed(2)}</td>
+                </tr>
+            \`).join('');
+        }
+        
+        async function control(action) {
+            await fetch('/api/control', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action })
+            });
+            fetchStatus();
+        }
+        
+        async function updateSettings() {
+            const settings = {
+                baseBet: parseFloat(document.getElementById('baseBet').value),
+                winChance: parseFloat(document.getElementById('winChance').value),
+                multiplier: parseFloat(document.getElementById('multiplier').value),
+                stopOnProfit: parseFloat(document.getElementById('stopOnProfit').value),
+                stopOnLoss: parseFloat(document.getElementById('stopOnLoss').value),
+                maxBet: parseFloat(document.getElementById('maxBet').value),
+                onWinAction: document.getElementById('onWinAction').value,
+                onLossAction: document.getElementById('onLossAction').value,
+                hiLoChoice: document.getElementById('hiLoChoice').value
+            };
+            
+            await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(settings)
+            });
+            
+            fetchStatus();
+        }
+        
+        setInterval(() => {
+            fetchStatus();
+            loadHistory();
+        }, 2000);
+        
+        fetchStatus();
+        loadHistory();
+    </script>
 </body>
-</html>`);
+</html>
+    `);
 });
 
-// ============ MAIN ============
-async function main() {
-    console.log('🚀 Starting Cointiply Automation Bot...');
-    console.log('⚠️  DISCLAIMER: Automation may violate Cointiply Terms of Service [citation:4]');
-    console.log('========================================\n');
-    
-    await installChrome();
-    
-    app.listen(port, '0.0.0.0', () => {
-        console.log(`📊 Dashboard: http://localhost:${port}`);
-    });
-    
-    const bot = new CointiplyBot(COINTIPLY_EMAIL, COINTIPLY_PASSWORD);
-    await bot.run();
-}
+// ============ START SERVER ============
+loadState();
 
-process.on('SIGINT', () => process.exit(0));
-process.on('SIGTERM', () => process.exit(0));
+app.listen(port, '0.0.0.0', () => {
+    console.log(`\n📊 Dashboard: http://localhost:${port}`);
+    console.log(`\n⚠️  This bot runs in SIMULATION MODE`);
+    console.log(`   To bet with real crypto, add API keys to environment variables`);
+    console.log(`\n🎲 Ready! Open the dashboard to start the bot\n`);
+});
 
-main().catch(console.error);
+// Keep the bot alive on Scalingo
+process.on('SIGINT', () => {
+    console.log('\n[Server] Shutting down...');
+    saveState();
+    process.exit(0);
+});
