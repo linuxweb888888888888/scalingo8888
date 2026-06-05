@@ -6,7 +6,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "Nwx9YlcGttiHsXwXSzplk3A7z9LiJaijXpPr3cCNTBHAzAOuvM";
+const API_KEY = process.env.API_KEY || "YOUR_API_KEY_HERE";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
@@ -14,11 +14,11 @@ const DEFAULTS = {
     payout: 2.0,              
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001,
-    recoveryBuffer: 0.00000002 // The "room" added to the recovery sum
+    recoveryBuffer: 0.00000001 // Changed from 0.00000002 to 0.00000001 as requested
 };
 
 // ============ BOT STATE ============
-let btcPrice = 60000; 
+let btcPrice = 60964; 
 let botState = {
     running: true,
     statusMessage: "Initializing...",
@@ -74,7 +74,11 @@ function resetSession() {
 // ============ API LOGIC ============
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
-    const safeSeed = "seed" + Math.random().toString(36).replace(/[^a-z0-9]/gi, '').substring(0, 12); 
+    
+    // STRICT ALPHANUMERIC SEED Logic
+    const rawSuffix = Math.random().toString(36).substring(2); 
+    const alphanumericSuffix = rawSuffix.replace(/[^a-z0-9]/gi, '').substring(0, 12);
+    const safeSeed = "pro" + alphanumericSuffix; 
 
     const payload = { 
         Bet: Number(botState.settings.currentBet.toFixed(8)), 
@@ -94,10 +98,10 @@ async function placeBet() {
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = "Continuous Mode Active";
+    botState.statusMessage = "Continuous Recovery Active";
     
     while (true) {
-        // Floor Reboot Check
+        // Floor Auto-Reboot Check
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
             resetSession();
             await new Promise(r => setTimeout(r, 2000));
@@ -126,11 +130,13 @@ async function runStrategy() {
             botState.settings.currentBet = botState.settings.baseBet;
         } else {
             botState.stats.losses++;
-            // Sum absolute values of losses
+            // Sum absolute values of losses (Pot Accumulation)
             botState.recoveryPot += Math.abs(profit);
-            // Calculate buffer % vs current pot
+            
+            // Calculate buffer % vs current pot for the dashboard
             botState.bufferRatio = (DEFAULTS.recoveryBuffer / botState.recoveryPot) * 100;
-            // Bet = sum of losses + 0.00000002
+            
+            // Bet = sum of all losses in streak + 0.00000001
             botState.settings.currentBet = botState.recoveryPot + DEFAULTS.recoveryBuffer;
         }
 
@@ -158,7 +164,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v2.9 | High Speed</title>
+    <title>Dice Pro v3.0 | Optimized Recovery</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -183,7 +189,7 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <div class="header">
-            <h1>Dice Pro <span style="color:var(--primary)">v2.9</span></h1>
+            <h1>Dice Pro <span style="color:var(--primary)">v3.0</span></h1>
             <div style="text-align: right"><div class="label">Market BTC/USD</div><div id="price-tag" style="font-weight: 700;">$0.00</div></div>
         </div>
         <div class="status-bar" id="status-msg">Status: Initializing...</div>
@@ -191,7 +197,7 @@ app.get('/', (req, res) => {
             <div class="card"><div class="label">💳 Trading Balance</div><div id="t-bal" class="btc-val" style="color:var(--danger)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">⚖️ Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div id="ratio-display" class="usd-val">Buffer: 0%</div></div>
+            <div class="card"><div class="label">⚖️ Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div id="ratio-display" class="usd-val">Buffer: 1 Unit</div></div>
         </div>
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
@@ -203,8 +209,8 @@ app.get('/', (req, res) => {
         <div class="proj-grid">
             <div class="proj-card"><div class="label">Hourly</div><span id="p-hr-b" class="win">0.00</span><br><span id="p-hr-u" class="usd-val">0.00</span></div>
             <div class="proj-card"><div class="label">Daily</div><span id="p-dy-b" class="win">0.00</span><br><span id="p-dy-u" class="usd-val">0.00</span></div>
-            <div class="proj-card"><div class="label">Monthly</div><span id="p-mo-b" class="win">0.00</span><br><span id="p-mo-u" class="usd-val">0.00</span></div>
-            <div class="proj-card"><div class="label">Yearly</div><span id="p-yr-b" class="win">0.00</span><br><span id="p-yr-u" class="usd-val">0.00</span></div>
+            <div class="proj-card"><div class="label">Monthly</div><span id="p-month-b" class="win">0.00</span><br><span id="p-month-u" class="usd-val">0.00</span></div>
+            <div class="proj-card"><div class="label">Yearly</div><span id="p-year-b" class="win">0.00</span><br><span id="p-year-u" class="usd-val">0.00</span></div>
         </div>
         <table>
             <thead><tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Sum</th></tr></thead>
@@ -228,7 +234,7 @@ app.get('/', (req, res) => {
                 document.getElementById('n-prof').innerText = f(botState.stats.netProfit);
                 document.getElementById('n-usd').innerText = u(botState.stats.netProfit);
                 document.getElementById('pot-display').innerText = f(botState.recoveryPot);
-                document.getElementById('ratio-display').innerText = "Buffer Ratio: " + botState.bufferRatio.toFixed(2) + "%";
+                document.getElementById('ratio-display').innerText = "Buffer/Pot Ratio: " + botState.bufferRatio.toFixed(2) + "%";
                 document.getElementById('wr').innerText = ((botState.stats.wins/botState.stats.totalBets)*100 || 0).toFixed(1) + "%";
                 document.getElementById('s-base').innerText = f(botState.settings.baseBet);
                 document.getElementById('t-bets').innerText = botState.stats.totalBets;
@@ -237,11 +243,11 @@ app.get('/', (req, res) => {
                 const ph = botState.stats.netProfit / hoursPassed;
                 document.getElementById('p-hr-b').innerText = f(ph); document.getElementById('p-hr-u').innerText = u(ph);
                 document.getElementById('p-dy-b').innerText = f(ph*24); document.getElementById('p-dy-u').innerText = u(ph*24);
-                document.getElementById('p-mo-b').innerText = f(ph*24*30); document.getElementById('p-mo-u').innerText = u(ph*24*30);
-                document.getElementById('p-yr-b').innerText = f(ph*24*365); document.getElementById('p-yr-u').innerText = u(ph*24*365);
+                document.getElementById('p-month-b').innerText = f(ph*24*30); document.getElementById('p-month-u').innerText = u(ph*24*30);
+                document.getElementById('p-year-b').innerText = f(ph*24*365); document.getElementById('p-year-u').innerText = u(ph*24*365);
 
                 document.getElementById('h-body').innerHTML = botState.betHistory.map(b => \`
-                    <tr><td>#\${b.id}</td><td>\${f(b.dBase)}</td><td>\${f(b.bet)}</td><td>\${b.roll}</td><td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td><td>\${b.pot}</td></tr>
+                    <tr><td>#\${b.id}</td><td>\${f(b.dBase)}</td><td>\${f(b.bet)}</td><td>\${b.roll}</td><td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td><td>\${b.pot} Sat</td></tr>
                 \`).join('');
             } catch(e) {}
         }
