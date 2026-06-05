@@ -1,6 +1,11 @@
 git
 wget
 curl
+xvfb
+gtk+3.0
+libdbus-glib-1-2
+libxt6
+libxrender1
 gnupg
 apt-transport-https
 ca-certificates
