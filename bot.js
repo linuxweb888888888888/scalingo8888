@@ -17,7 +17,7 @@ const port = process.env.PORT || 3000;
 // ============ CONFIGURATION ============
 const HEADLESS_MODE = process.env.HEADLESS_MODE !== 'false';
 const SCAN_INTERVAL_SECONDS = parseInt(process.env.SCAN_INTERVAL_SECONDS) || 900; // 15 minutes default
-const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || '';
+const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || 'web88888888888888@gmail.com';
 
 // Session storage
 const SESSION_DIR = path.join(__dirname, 'sessions');
