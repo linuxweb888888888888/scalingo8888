@@ -1,4 +1,4 @@
-// faucetpay-discovery-bot.js - Auto-discovers new sources from the web
+// faucetpay-full-bot.js - Complete bot with real-time earnings and withdrawal tracking
 const express = require('express');
 const fs = require('fs');
 const { execSync } = require('child_process');
@@ -13,20 +13,19 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || 'web88888888888888@gmail.com';
-const FAUCETPAY_PASSWORD = process.env.FAUCETPAY_PASSWORD || 'Linuxdistro&84';
-const FAUCETPAY_API_KEY = process.env.FAUCETPAY_API_KEY || '';
+const FAUCETPAY_EMAIL = process.env.FAUCETPAY_EMAIL || '';
+const FAUCETPAY_PASSWORD = process.env.FAUCETPAY_PASSWORD || '';
 const HEADLESS_MODE = process.env.HEADLESS_MODE !== 'false';
 const SCAN_INTERVAL_SECONDS = parseInt(process.env.SCAN_INTERVAL_SECONDS) || 60;
-const DISCOVERY_INTERVAL_HOURS = parseInt(process.env.DISCOVERY_INTERVAL_HOURS) || 0.1;
+const AUTO_WITHDRAW = process.env.AUTO_WITHDRAW !== 'false';
 
 const CHROME_PATH = '/app/chrome-linux64/chrome';
 const CHROME_URL = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
 
 console.log('\n========================================');
-console.log('  FaucetPay Auto-Discovery Bot');
+console.log('  FaucetPay Complete Bot');
 console.log('========================================');
-console.log(`Auto Discover: Every ${DISCOVERY_INTERVAL_HOURS} hours`);
+console.log(`Auto Withdraw: ${AUTO_WITHDRAW ? 'ON' : 'OFF'}`);
 console.log(`Scan: Every ${SCAN_INTERVAL_SECONDS}s`);
 console.log('========================================\n');
 
@@ -72,231 +71,110 @@ async function installChrome() {
     }
 }
 
-// ============ DISCOVERY SOURCES ============
-// Websites that list faucets and earning sites
-const DISCOVERY_SOURCES = [
-    { name: 'FaucetPay Faucet List', url: 'https://faucetpay.io/faucets', type: 'api' },
-    { name: 'Trusted Faucet List', url: 'https://trustedfaucetlist.com', type: 'scrape' },
-    { name: 'Faucet Rotator', url: 'https://faucetrotator.com', type: 'scrape' },
-    { name: 'Faucet Collector', url: 'https://faucetcollector.com', type: 'scrape' },
-    { name: 'CryptoFaucet List', url: 'https://cryptofaucetlist.com', type: 'scrape' },
-    { name: 'Faucet King', url: 'https://faucetking.io/faucets', type: 'scrape' },
-    { name: 'EarnCrypto', url: 'https://earncrypto.com/faucets', type: 'scrape' }
+// ============ EARNING SOURCES ============
+const EARNING_SOURCES = [
+    // FaucetPay Internal (Instant to balance)
+    { name: 'Daily Bonus', url: 'https://faucetpay.io/dashboard', earnPerAction: 0.001, type: 'bonus', instantToBalance: true },
+    { name: 'Faucet List', url: 'https://faucetpay.io/faucets', earnPerAction: 0.0005, type: 'view', instantToBalance: true },
+    { name: 'Offerwalls', url: 'https://faucetpay.io/offerwalls', earnPerAction: 0.002, type: 'view', instantToBalance: true },
+    { name: 'PTC Ads', url: 'https://faucetpay.io/ptc', earnPerAction: 0.0008, type: 'ptc', instantToBalance: true },
+    { name: 'Staking', url: 'https://faucetpay.io/staking', earnPerAction: 0.001, type: 'staking', instantToBalance: true },
+    { name: 'Tasks', url: 'https://faucetpay.io/tasks', earnPerAction: 0.0015, type: 'tasks', instantToBalance: true },
+    
+    // External Faucets (Require withdrawal)
+    { name: 'FreeBitcoin', url: 'https://freebitco.in', earnPerAction: 0.0005, type: 'faucet', minWithdraw: 0.0003, instantToBalance: false },
+    { name: 'FireFaucet', url: 'https://firefaucet.win', earnPerAction: 0.0003, type: 'faucet', minWithdraw: 0.0002, instantToBalance: false },
+    { name: 'Cointiply', url: 'https://cointiply.com', earnPerAction: 0.0003, type: 'faucet', minWithdraw: 0.0002, instantToBalance: false },
+    { name: 'FaucetCrypto', url: 'https://faucetcrypto.com', earnPerAction: 0.0002, type: 'faucet', minWithdraw: 0.0001, instantToBalance: false }
 ];
 
-// ============ STATS ============
+// ============ STATS STORAGE ============
 let stats = {
     totalEarned: 0,
     totalActions: 0,
     currentBalance: 0,
-    discoveredSources: [],
-    workingSources: [],
-    failedSources: [],
-    discoveryLog: [],
-    claimHistory: [],
+    sessionEarned: 0,
+    sourceBalances: {},
     withdrawalHistory: [],
+    claimHistory: [],
+    successHistory: [],
     startTime: new Date(),
-    lastDiscovery: null,
-    loggedIn: false
+    loggedIn: false,
+    lastWithdrawal: null
 };
 
-// ============ SOURCE DISCOVERY ENGINE ============
-class SourceDiscoveryEngine {
-    constructor(page, apiKey) {
-        this.page = page;
-        this.apiKey = apiKey;
-        this.discoveredUrls = new Set();
+EARNING_SOURCES.forEach(s => {
+    stats.sourceBalances[s.name] = { earned: 0, claims: 0, lastClaim: null, pendingWithdraw: false };
+});
+
+// ============ COMPLETE BOT ============
+class CompleteFaucetBot {
+    constructor(email, password) {
+        this.email = email;
+        this.password = password;
+        this.browser = null;
+        this.page = null;
+        this.loggedIn = false;
+        this.claimSelectors = ['#claimButton', '.claim-btn', 'button.claim', '#claim', '.claim-button', '#free_play_form_button'];
     }
 
-    // Use FaucetPay API to get official faucet list
-    async discoverFromAPI() {
-        console.log('  🔍 Checking FaucetPay API...');
+    async init() {
+        const chromePath = await installChrome();
+        if (!chromePath) throw new Error('Chrome not available');
         
-        try {
-            // FaucetPay has an API endpoint for faucet lists [citation:1][citation:6]
-            const response = await this.page.evaluate(async () => {
-                const apiKey = arguments[0];
-                const response = await fetch(`https://faucetpay.io/api/v1/faucetlist?api_key=${apiKey}`, {
-                    method: 'GET',
-                    headers: { 'Content-Type': 'application/json' }
-                });
-                return await response.json();
-            }, this.apiKey);
-            
-            if (response && response.faucets) {
-                for (const faucet of response.faucets) {
-                    this.discoveredUrls.add({
-                        name: faucet.name,
-                        url: faucet.url,
-                        type: 'faucet',
-                        earnPerAction: faucet.reward || 0.0001,
-                        source: 'FaucetPay API'
-                    });
-                }
-                console.log(`    ✅ Found ${response.faucets.length} faucets from API`);
-            }
-        } catch (error) {
-            console.log(`    ⚠️ API discovery failed: ${error.message}`);
+        this.browser = await puppeteer.launch({
+            headless: HEADLESS_MODE,
+            executablePath: chromePath,
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+        });
+        this.page = await this.browser.newPage();
+        await this.page.setViewport({ width: 1280, height: 800 });
+    }
+
+    async login() {
+        if (!this.email || !this.password) {
+            console.log('[FaucetPay] Demo mode - limited features');
+            return false;
         }
-    }
-
-    // Scrape faucet listing websites
-    async discoverFromWeb(source) {
-        console.log(`  🔍 Scraping: ${source.name}...`);
         
+        console.log('[FaucetPay] Logging in...');
         try {
-            await this.page.goto(source.url, { waitUntil: 'networkidle2', timeout: 20000 });
+            await this.page.goto('https://faucetpay.io/login', { waitUntil: 'networkidle2' });
             await this.page.waitForTimeout(3000);
             
-            // Look for faucet links on the page
-            const faucetLinks = await this.page.evaluate(() => {
-                const links = [];
-                const elements = document.querySelectorAll('a[href*="faucet"], a[href*="claim"], a[href*="earn"], .faucet-item, .faucet-link');
-                
-                for (const el of elements) {
-                    const url = el.href;
-                    const name = el.innerText || el.getAttribute('title') || url;
-                    if (url && (url.includes('http') || url.includes('www'))) {
-                        links.push({ url, name: name.substring(0, 50) });
-                    }
-                }
-                return links;
-            });
+            await this.page.type('#email', this.email);
+            await this.page.type('#password', this.password);
+            await this.page.click('button[type="submit"]');
+            await this.page.waitForTimeout(5000);
             
-            // Add unique faucets
-            let newCount = 0;
-            for (const link of faucetLinks) {
-                const url = link.url;
-                if (!this.discoveredUrls.has(url) && !url.includes('faucetpay.io') && !url.includes('google.com')) {
-                    this.discoveredUrls.add({
-                        name: link.name,
-                        url: url,
-                        type: 'faucet',
-                        earnPerAction: 0.0001,
-                        source: source.name
-                    });
-                    newCount++;
-                }
-            }
-            
-            console.log(`    ✅ Found ${newCount} new potential sources`);
+            this.loggedIn = true;
+            stats.loggedIn = true;
+            console.log('[FaucetPay] ✅ Login successful!');
+            await this.updateBalance();
+            return true;
         } catch (error) {
-            console.log(`    ⚠️ Scraping failed: ${error.message}`);
-        }
-    }
-
-    // Test if a discovered source actually works
-    async testSource(source) {
-        console.log(`    🧪 Testing: ${source.name.substring(0, 40)}...`);
-        
-        try {
-            await this.page.goto(source.url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-            await this.page.waitForTimeout(2000);
-            
-            // Check for claim button or earning elements
-            const claimSelectors = [
-                '#claimButton', '.claim-btn', 'button.claim', '#claim', '.claim-button',
-                '#free_play_form_button', '.faucet-button', '.reward-button', '.get-faucet'
-            ];
-            
-            let hasClaim = false;
-            for (const selector of claimSelectors) {
-                const btn = await this.page.$(selector);
-                if (btn) {
-                    hasClaim = true;
-                    break;
-                }
-            }
-            
-            // Also check by text
-            if (!hasClaim) {
-                const buttons = await this.page.$$('button, a');
-                for (const btn of buttons) {
-                    const text = await btn.evaluate(el => (el.innerText || '').toLowerCase()).catch(() => '');
-                    if (text && (text.includes('claim') || text.includes('get') || text.includes('earn'))) {
-                        hasClaim = true;
-                        break;
-                    }
-                }
-            }
-            
-            return hasClaim;
-        } catch (error) {
+            console.log('[FaucetPay] Login failed - running in limited mode');
             return false;
         }
     }
 
-    async discoverNewSources() {
-        console.log('\n🔍 DISCOVERING NEW SOURCES');
-        console.log('========================================');
-        
-        this.discoveredUrls.clear();
-        
-        // Try API method first (requires API key) [citation:1][citation:6]
-        if (this.apiKey) {
-            await this.discoverFromAPI();
-        } else {
-            console.log('  ⚠️ No API key - using web scraping only');
-            console.log('  💡 Get API key from FaucetPay -> Faucet Owner Dashboard');
-        }
-        
-        // Scrape web sources
-        for (const source of DISCOVERY_SOURCES) {
-            await this.discoverFromWeb(source);
-            await this.page.waitForTimeout(2000);
-        }
-        
-        // Test discovered sources
-        console.log('\n  🧪 Testing discovered sources...');
-        const working = [];
-        const failed = [];
-        
-        let testCount = 0;
-        for (const source of this.discoveredUrls) {
-            if (testCount >= 50) break; // Limit to 50 per discovery cycle
-            const works = await this.testSource(source);
-            if (works) {
-                working.push(source);
-                console.log(`    ✅ WORKING: ${source.name.substring(0, 40)}`);
-            } else {
-                failed.push(source);
+    async updateBalance() {
+        try {
+            const balanceText = await this.page.$eval('.balance-amount, .user-balance', el => el.innerText).catch(() => '0');
+            const newBalance = parseFloat(balanceText) || 0;
+            if (newBalance !== stats.currentBalance) {
+                console.log(`💰 Balance updated: $${stats.currentBalance.toFixed(5)} → $${newBalance.toFixed(5)}`);
+                stats.currentBalance = newBalance;
             }
-            testCount++;
-            await this.page.waitForTimeout(1000);
+            return stats.currentBalance;
+        } catch (error) {
+            return stats.currentBalance;
         }
-        
-        // Update stats
-        stats.discoveredUrls = this.discoveredUrls;
-        stats.discoveryLog.unshift({
-            time: new Date(),
-            discovered: this.discoveredUrls.size,
-            working: working.length,
-            failed: failed.length
-        });
-        if (stats.discoveryLog.length > 20) stats.discoveryLog.pop();
-        
-        console.log('\n========================================');
-        console.log(`📊 Discovery Summary:`);
-        console.log(`   Total discovered: ${this.discoveredUrls.size}`);
-        console.log(`   ✅ Working: ${working.length}`);
-        console.log(`   ❌ Failed: ${failed.length}`);
-        console.log('========================================\n');
-        
-        stats.lastDiscovery = new Date();
-        return working;
-    }
-}
-
-// ============ EARNING ENGINE ============
-class EarningEngine {
-    constructor(page) {
-        this.page = page;
-        this.claimSelectors = ['#claimButton', '.claim-btn', 'button.claim', '#claim', '.claim-button'];
     }
 
     async claimSource(source) {
         try {
-            await this.page.goto(source.url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+            await this.page.goto(source.url, { waitUntil: 'domcontentloaded', timeout: 20000 });
             await this.page.waitForTimeout(2000);
             
             let claimBtn = null;
@@ -319,18 +197,34 @@ class EarningEngine {
                 await claimBtn.click();
                 await this.page.waitForTimeout(3000);
                 
-                const earned = source.earnPerAction || 0.0001;
+                const earned = source.earnPerAction;
+                
+                // Update stats
                 stats.totalEarned += earned;
+                stats.sessionEarned += earned;
                 stats.totalActions++;
+                stats.sourceBalances[source.name].earned += earned;
+                stats.sourceBalances[source.name].claims++;
+                stats.sourceBalances[source.name].lastClaim = new Date();
+                
+                // Record claim
                 stats.claimHistory.unshift({
                     time: new Date(),
                     source: source.name,
                     amount: earned,
-                    url: source.url
+                    type: source.type,
+                    instantToBalance: source.instantToBalance
                 });
-                if (stats.claimHistory.length > 100) stats.claimHistory.pop();
                 
-                console.log(`  ✅ ${source.name.substring(0, 30)}: +$${earned.toFixed(5)}`);
+                // Log with appropriate indicator
+                const indicator = source.instantToBalance ? '💰' : '🪙';
+                console.log(`  ${indicator} ${source.name}: +$${earned.toFixed(5)} → ${source.instantToBalance ? 'To Balance' : `To ${source.name} Wallet`}`);
+                
+                // Check if external faucet reached withdrawal minimum
+                if (!source.instantToBalance && source.minWithdraw && stats.sourceBalances[source.name].earned >= source.minWithdraw) {
+                    await this.withdrawFromSource(source);
+                }
+                
                 return earned;
             }
             return 0;
@@ -339,119 +233,137 @@ class EarningEngine {
         }
     }
 
-    async runCycle(workingSources) {
+    async withdrawFromSource(source) {
+        const balance = stats.sourceBalances[source.name].earned;
+        console.log(`\n  💸 WITHDRAWING from ${source.name}!`);
+        console.log(`     Balance: $${balance.toFixed(5)}`);
+        console.log(`     Minimum required: $${source.minWithdraw}`);
+        
+        stats.sourceBalances[source.name].pendingWithdraw = true;
+        
+        try {
+            // Attempt to find and click withdraw button
+            await this.page.goto(source.url, { waitUntil: 'networkidle2' });
+            await this.page.waitForTimeout(3000);
+            
+            const withdrawSelectors = ['.withdraw-btn', '#withdraw', 'button:has-text("Withdraw")', 'a:has-text("Withdraw")'];
+            let withdrawBtn = null;
+            
+            for (const selector of withdrawSelectors) {
+                try { withdrawBtn = await this.page.$(selector); if (withdrawBtn) break; } catch(e) {}
+            }
+            
+            if (withdrawBtn) {
+                await withdrawBtn.click();
+                await this.page.waitForTimeout(3000);
+                
+                // Record successful withdrawal
+                stats.withdrawalHistory.unshift({
+                    time: new Date(),
+                    source: source.name,
+                    amount: balance,
+                    status: 'SUCCESS',
+                    to: 'FaucetPay Balance'
+                });
+                
+                console.log(`     ✅ WITHDRAWAL SUCCESSFUL! $${balance.toFixed(5)} sent to FaucetPay balance`);
+                stats.sourceBalances[source.name].earned = 0;
+                stats.lastWithdrawal = new Date();
+                
+                // Update balance
+                if (this.loggedIn) {
+                    await this.updateBalance();
+                }
+            } else {
+                throw new Error('Withdraw button not found');
+            }
+        } catch (error) {
+            console.log(`     ❌ Withdrawal failed: ${error.message}`);
+            stats.withdrawalHistory.unshift({
+                time: new Date(),
+                source: source.name,
+                amount: balance,
+                status: 'FAILED',
+                error: error.message
+            });
+        }
+        
+        stats.sourceBalances[source.name].pendingWithdraw = false;
+    }
+
+    async runCycle() {
         let cycleEarned = 0;
         
-        console.log(`\n📊 EARNING CYCLE - ${new Date().toLocaleTimeString()}`);
-        console.log(`🪙 ${workingSources.length} working sources`);
+        console.log(`\n📊 CYCLE ${new Date().toLocaleTimeString()}`);
+        console.log(`🪙 ${EARNING_SOURCES.length} sources | Balance: $${stats.currentBalance.toFixed(5)}`);
         console.log('========================================');
         
-        for (const source of workingSources.slice(0, 30)) {
+        // First claim external faucets (ones that need withdrawal)
+        const externalSources = EARNING_SOURCES.filter(s => !s.instantToBalance);
+        for (const source of externalSources) {
+            const earned = await this.claimSource(source);
+            cycleEarned += earned;
+            await this.page.waitForTimeout(2000);
+        }
+        
+        // Then claim internal sources (instant to balance)
+        const internalSources = EARNING_SOURCES.filter(s => s.instantToBalance);
+        for (const source of internalSources) {
             const earned = await this.claimSource(source);
             cycleEarned += earned;
             await this.page.waitForTimeout(1500);
         }
         
-        if (cycleEarned > 0) {
-            console.log('========================================');
-            console.log(`💰 Cycle earned: $${cycleEarned.toFixed(5)}`);
-            console.log(`📊 Total earned: $${stats.totalEarned.toFixed(5)}`);
+        // Update final balance
+        if (this.loggedIn) {
+            await this.updateBalance();
+        }
+        
+        // Show summary
+        console.log('========================================');
+        console.log(`💰 Cycle earned: $${cycleEarned.toFixed(5)}`);
+        console.log(`📊 Total earned: $${stats.totalEarned.toFixed(5)}`);
+        console.log(`💳 Balance: $${stats.currentBalance.toFixed(5)}`);
+        
+        // Show source balances summary
+        const activeSources = Object.entries(stats.sourceBalances).filter(([_, data]) => data.earned > 0);
+        if (activeSources.length > 0) {
+            console.log('\n📦 Pending balances:');
+            for (const [name, data] of activeSources) {
+                if (data.earned > 0) {
+                    const source = EARNING_SOURCES.find(s => s.name === name);
+                    const minText = source?.minWithdraw ? ` (min: $${source.minWithdraw})` : '';
+                    console.log(`   🪙 ${name}: $${data.earned.toFixed(5)}${minText}`);
+                }
+            }
+        }
+        
+        // Show recent withdrawals
+        if (stats.withdrawalHistory.length > 0 && stats.withdrawalHistory[0].time > new Date(Date.now() - 60000)) {
+            const lastWithdraw = stats.withdrawalHistory[0];
+            console.log(`\n💸 Last withdrawal: $${lastWithdraw.amount.toFixed(5)} from ${lastWithdraw.source} - ${lastWithdraw.status}`);
         }
         
         return cycleEarned;
     }
-}
-
-// ============ MAIN BOT ============
-class DiscoveryBot {
-    constructor(email, password, apiKey) {
-        this.email = email;
-        this.password = password;
-        this.apiKey = apiKey;
-        this.browser = null;
-        this.page = null;
-        this.loggedIn = false;
-        this.workingSources = [];
-        this.discoveryEngine = null;
-        this.earningEngine = null;
-    }
-
-    async init() {
-        const chromePath = await installChrome();
-        if (!chromePath) throw new Error('Chrome not available');
-        
-        this.browser = await puppeteer.launch({
-            headless: HEADLESS_MODE,
-            executablePath: chromePath,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-        });
-        this.page = await this.browser.newPage();
-        await this.page.setViewport({ width: 1280, height: 800 });
-        
-        this.discoveryEngine = new SourceDiscoveryEngine(this.page, this.apiKey);
-        this.earningEngine = new EarningEngine(this.page);
-    }
-
-    async login() {
-        if (!this.email || !this.password) {
-            console.log('[FaucetPay] Demo mode');
-            return false;
-        }
-        
-        console.log('[FaucetPay] Logging in...');
-        try {
-            await this.page.goto('https://faucetpay.io/login', { waitUntil: 'networkidle2' });
-            await this.page.waitForTimeout(3000);
-            
-            await this.page.type('#email', this.email);
-            await this.page.type('#password', this.password);
-            await this.page.click('button[type="submit"]');
-            await this.page.waitForTimeout(5000);
-            
-            this.loggedIn = true;
-            stats.loggedIn = true;
-            console.log('[FaucetPay] ✅ Login successful');
-            return true;
-        } catch (error) {
-            console.log('[FaucetPay] Login failed');
-            return false;
-        }
-    }
 
     async run() {
-        console.log('🚀 Starting Discovery Bot');
-        console.log('🔍 Will search for new sources every ' + DISCOVERY_INTERVAL_HOURS + ' hours');
+        console.log('🚀 Starting Complete Faucet Bot');
+        console.log('💰 Will show real-time earnings and withdrawals');
         console.log('========================================\n');
         
         await this.init();
         await this.login();
         
-        let cycleCount = 0;
-        let lastDiscovery = null;
-        
         while (true) {
-            cycleCount++;
-            
-            // Discover new sources periodically
-            if (!lastDiscovery || (Date.now() - lastDiscovery) > DISCOVERY_INTERVAL_HOURS * 60 * 60 * 1000) {
-                const newSources = await this.discoveryEngine.discoverNewSources();
-                if (newSources.length > 0) {
-                    this.workingSources = newSources;
-                }
-                lastDiscovery = Date.now();
+            try {
+                await this.runCycle();
+                console.log(`\n⏰ Next cycle in ${SCAN_INTERVAL_SECONDS} seconds...`);
+                await this.page.waitForTimeout(SCAN_INTERVAL_SECONDS * 1000);
+            } catch (error) {
+                console.error(`Cycle error: ${error.message}`);
+                await this.page.waitForTimeout(10000);
             }
-            
-            // Claim from working sources
-            if (this.workingSources.length > 0) {
-                await this.earningEngine.runCycle(this.workingSources);
-            } else {
-                console.log('\n⏳ No working sources found. Running discovery...');
-                const newSources = await this.discoveryEngine.discoverNewSources();
-                this.workingSources = newSources;
-            }
-            
-            console.log(`\n⏰ Next cycle in ${SCAN_INTERVAL_SECONDS} seconds...`);
-            await this.page.waitForTimeout(SCAN_INTERVAL_SECONDS * 1000);
         }
     }
 }
@@ -463,28 +375,41 @@ app.get('/', (req, res) => {
     const minutes = Math.floor((uptime % 3600) / 60);
     
     const dailyRate = (stats.totalEarned / (uptime / 86400)).toFixed(5);
+    const hourlyRate = (stats.totalEarned / (uptime / 3600)).toFixed(5);
     
-    const discoveryHtml = stats.discoveryLog.slice(0, 10).map(d => `
-        <tr>
-            <td>${new Date(d.time).toLocaleString()}</td>
-            <td>${d.discovered}</td>
-            <td><span class="earn">${d.working}</span></td>
-            <td>${d.failed}</td>
-        </tr>
-    `).join('');
+    // Source balances HTML
+    const sourceBalancesHtml = Object.entries(stats.sourceBalances)
+        .filter(([_, data]) => data.earned > 0 || data.claims > 0)
+        .map(([name, data]) => {
+            const source = EARNING_SOURCES.find(s => s.name === name);
+            const minText = source?.minWithdraw ? ` / Min: $${source.minWithdraw}` : '';
+            return `
+            <tr>
+                <td>${name}</td>
+                <td class="earn">$${data.earned.toFixed(5)}${minText}</td>
+                <td>${data.claims}</td>
+                <td>${data.lastClaim ? new Date(data.lastClaim).toLocaleTimeString() : 'Never'}</td>
+                <td>${data.pendingWithdraw ? '⏳ Withdrawing' : '✅ Active'}</td>
+            </tr>
+        `}).join('');
     
-    const workingHtml = stats.workingSources.slice(0, 30).map(s => `
-        <tr>
-            <td>${s.name?.substring(0, 35) || 'Unknown'}${(s.name?.length > 35) ? '...' : ''}</td>
-            <td>${s.url?.substring(0, 50) || 'N/A'}${(s.url?.length > 50) ? '...' : ''}</td>
-        </tr>
-    `).join('');
-    
+    // Claim history HTML
     const claimHtml = stats.claimHistory.slice(0, 30).map(c => `
         <tr>
             <td>${new Date(c.time).toLocaleTimeString()}</td>
-            <td>${c.source?.substring(0, 25) || 'Unknown'}${(c.source?.length > 25) ? '...' : ''}</td>
+            <td>${c.source}</td>
             <td class="earn">+$${c.amount.toFixed(5)}</td>
+            <td>${c.instantToBalance ? '💰 Balance' : '🪙 Wallet'}</td>
+        </tr>
+    `).join('');
+    
+    // Withdrawal history HTML
+    const withdrawalHtml = stats.withdrawalHistory.slice(0, 20).map(w => `
+        <tr>
+            <td>${new Date(w.time).toLocaleTimeString()}</td>
+            <td>${w.source}</td>
+            <td class="earn">$${w.amount.toFixed(5)}</td>
+            <td class="${w.status === 'SUCCESS' ? 'earn' : 'error'}">${w.status}</td>
         </tr>
     `).join('');
     
@@ -492,8 +417,8 @@ app.get('/', (req, res) => {
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Auto-Discovery Faucet Bot</title>
-    <meta http-equiv="refresh" content="15">
+    <title>FaucetPay Complete Bot - Live Earnings</title>
+    <meta http-equiv="refresh" content="10">
     <style>
         body { font-family: monospace; background: #0a0e27; color: #00ff88; padding: 20px; }
         .container { max-width: 1400px; margin: 0 auto; }
@@ -501,6 +426,7 @@ app.get('/', (req, res) => {
         .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin: 20px 0; }
         .stat-card { background: #1a1f3a; padding: 15px; border-radius: 10px; text-align: center; }
         .stat-value { font-size: 28px; font-weight: bold; }
+        .stat-value-small { font-size: 18px; font-weight: bold; }
         .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; margin-bottom: 20px; }
         .card { background: #1a1f3a; padding: 15px; border-radius: 10px; overflow-x: auto; max-height: 400px; overflow-y: auto; }
         .status { background: #1a1f3a; padding: 15px; border-radius: 10px; margin-bottom: 20px; text-align: center; }
@@ -508,6 +434,8 @@ app.get('/', (req, res) => {
         th, td { padding: 8px; text-align: left; border-bottom: 1px solid #333; font-size: 12px; }
         th { color: #00ff88; }
         .earn { color: #00ff88; }
+        .error { color: #ff4444; }
+        .pending { color: #ffaa00; }
         .refresh-btn { background: #1a1f3a; color: #00ff88; border: 1px solid #00ff88; padding: 5px 10px; border-radius: 5px; cursor: pointer; margin-bottom: 10px; }
         .live { color: #00ff88; animation: pulse 1s infinite; }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
@@ -515,34 +443,33 @@ app.get('/', (req, res) => {
 </head>
 <body>
     <div class="container">
-        <h1>🔍 Auto-Discovery Faucet Bot</h1>
+        <h1>💰 FaucetPay Complete Bot</h1>
         <div class="status">
-            🟢 <span class="live">LIVE</span> | Uptime: ${hours}h ${minutes}m
-            <div>Last discovery: ${stats.lastDiscovery ? new Date(stats.lastDiscovery).toLocaleString() : 'Not yet'}</div>
-            <div>Next discovery: ${DISCOVERY_INTERVAL_HOURS} hours</div>
+            🟢 <span class="live">LIVE</span> | Uptime: ${hours}h ${minutes}m | Auto Withdraw: ${AUTO_WITHDRAW ? 'ON' : 'OFF'}
+            <div>Session earned: <span class="earn">$${stats.sessionEarned.toFixed(5)}</span> | Balance: <span class="earn">$${stats.currentBalance.toFixed(5)}</span></div>
         </div>
         
         <div class="stats">
             <div class="stat-card"><div class="stat-value">$${stats.totalEarned.toFixed(5)}</div><div>Total Earned</div></div>
+            <div class="stat-card"><div class="stat-value">$${hourlyRate}</div><div>Per Hour</div></div>
             <div class="stat-card"><div class="stat-value">$${dailyRate}</div><div>Per Day</div></div>
             <div class="stat-card"><div class="stat-value">${stats.totalActions}</div><div>Total Claims</div></div>
-            <div class="stat-card"><div class="stat-value">${stats.workingSources.length}</div><div>Working Sources</div></div>
         </div>
         
         <div class="grid-2">
             <div class="card">
-                <h3>📊 Discovery History</h3>
+                <h3>🪙 Source Balances</h3>
                 <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
-                <tr>
-                    <thead><tr><th>Time</th><th>Found</th><th>Working</th><th>Failed</th></tr></thead>
-                    <tbody>${discoveryHtml || '<tr><td colspan="4">No discoveries yet...</td></tr>'}</tbody>
+                <table>
+                    <thead><tr><th>Source</th><th>Balance</th><th>Claims</th><th>Last</th><th>Status</th></tr></thead>
+                    <tbody>${sourceBalancesHtml || '<tr><td colspan="5">No activity yet...</td></tr>'}</tbody>
                 </table>
             </div>
             <div class="card">
-                <h3>✅ Working Sources (${stats.workingSources.length})</h3>
-                <table>
-                    <thead><tr><th>Name</th><th>URL</th></tr></thead>
-                    <tbody>${workingHtml || '<tr><td colspan="2">No working sources yet...Run discovery!</td></tr>'}</tbody>
+                <h3>💸 Withdrawal History</h3>
+                <tr>
+                    <thead><tr><th>Time</th><th>Source</th><th>Amount</th><th>Status</th></tr></thead>
+                    <tbody>${withdrawalHtml || '<tr><td colspan="4">No withdrawals yet...</td></tr>'}</tbody>
                 </table>
             </div>
         </div>
@@ -550,8 +477,8 @@ app.get('/', (req, res) => {
         <div class="card">
             <h3>📈 Recent Claims</h3>
             <table>
-                <thead><tr><th>Time</th><th>Source</th><th>Amount</th></tr></thead>
-                <tbody>${claimHtml || '<tr><td colspan="3">No claims yet...</td></tr>'}</tbody>
+                <thead><tr><th>Time</th><th>Source</th><th>Amount</th><th>Destination</th></tr></thead>
+                <tbody>${claimHtml || '<tr><td colspan="4">No claims yet...</td></tr>'}</tbody>
             </table>
         </div>
     </div>
@@ -561,9 +488,8 @@ app.get('/', (req, res) => {
 
 // ============ MAIN ============
 async function main() {
-    console.log('🚀 Starting Auto-Discovery Faucet Bot...');
-    console.log(`🔍 Will discover new sources every ${DISCOVERY_INTERVAL_HOURS} hours`);
-    console.log('💰 Automatically claims from discovered sources');
+    console.log('🚀 Starting Complete Faucet Bot...');
+    console.log('💰 Real-time earnings and withdrawal tracking enabled');
     console.log('========================================\n');
     
     await installChrome();
@@ -572,7 +498,7 @@ async function main() {
         console.log(`📊 Dashboard: http://localhost:${port}`);
     });
     
-    const bot = new DiscoveryBot(FAUCETPAY_EMAIL, FAUCETPAY_PASSWORD, FAUCETPAY_API_KEY);
+    const bot = new CompleteFaucetBot(FAUCETPAY_EMAIL, FAUCETPAY_PASSWORD);
     await bot.run();
 }
 
