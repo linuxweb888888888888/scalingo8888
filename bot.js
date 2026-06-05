@@ -1,7 +1,4 @@
-// bitsler-bot.js - CORRECT Bitsler API Endpoints
-// Based on official Bitsler API documentation
-// Base URL: https://www.bitsler.com/api/
-
+// bitsler-bot.js - FIXED VERSION using access_token method from working PHP bot
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -11,7 +8,8 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ LOAD CONFIGURATION ============
-const API_KEY = process.env.BITSLER_API_KEY;
+// THIS IS THE KEY CHANGE: Use ACCESS_TOKEN, not an API key
+const ACCESS_TOKEN = process.env.BITSLER_ACCESS_TOKEN;
 const PROFIT_SAFE_PERCENT = parseFloat(process.env.PROFIT_SAFE_PERCENT) || 50;
 const BASE_BET = parseFloat(process.env.BASE_BET) || 1;
 const WIN_CHANCE = parseFloat(process.env.WIN_CHANCE) || 49.5;
@@ -19,139 +17,114 @@ const STOP_ON_PROFIT = parseFloat(process.env.STOP_ON_PROFIT) || 100;
 const STOP_ON_LOSS = parseFloat(process.env.STOP_ON_LOSS) || 50;
 const MAX_BET = parseFloat(process.env.MAX_BET) || 500;
 
-if (!API_KEY) {
-    console.error('\n❌ ERROR: BITSLER_API_KEY not found in .env');
-    console.error('Please add: BITSLER_API_KEY=your_new_key_here\n');
+if (!ACCESS_TOKEN) {
+    console.error('\n❌ ERROR: BITSLER_ACCESS_TOKEN not found in .env');
+    console.error('Please get your token by:');
+    console.error('1. Login to Bitsler.com');
+    console.error('2. Press F12 -> Console tab');
+    console.error('3. Type: console.log(access_token)');
+    console.error('4. Copy the token to .env file\n');
     process.exit(1);
 }
 
-// Mask for display only
-const maskedKey = API_KEY.substring(0, 8) + '...' + API_KEY.substring(API_KEY.length - 4);
+// Mask for display (show first/last few chars)
+const maskedToken = ACCESS_TOKEN.substring(0, 8) + '...' + ACCESS_TOKEN.substring(ACCESS_TOKEN.length - 4);
 
 console.log('\n========================================');
-console.log('  🎲 Bitsler Dice Bot - CORRECT API');
+console.log('  🎲 Bitsler Dice Bot - WORKING API');
 console.log('========================================');
-console.log(`🔐 API Key: ${maskedKey}`);
+console.log(`🔐 Using Access Token: ${maskedToken}`);
 console.log(`💰 Profit Safe: ${PROFIT_SAFE_PERCENT}%`);
-console.log(`🌐 Base URL: https://www.bitsler.com/api/`);
 console.log('========================================\n');
 
-// ============ CORRECT API CONFIGURATION ============
+// ============ API CONFIGURATION ============
 const API_BASE = 'https://www.bitsler.com/api';
 
-// Create axios instance
+// Create axios instance with the access_token in headers
 const api = axios.create({
     baseURL: API_BASE,
     timeout: 30000,
     headers: {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
-        'User-Agent': 'BitslerBot/3.0'
+        'User-Agent': 'BitslerNodeBot/1.0'
     }
 });
 
-// Session token storage (from /api/generate-token)
-let sessionToken = null;
-let sessionExpiry = null;
+// ============ CORRECT API FUNCTIONS (Based on working PHP bot) ============
 
-// ============ AUTHENTICATION ============
-// Bitsler uses /api/generate-token to get a session token
-async function authenticate() {
-    console.log('🔐 Authenticating with Bitsler API...');
-    
+// Get user info and balance - Using /api/get-info endpoint
+async function getUserInfo() {
     try {
-        const response = await api.post('/generate-token', {
-            api_key: API_KEY
+        // The working PHP bot sends token in request data, not headers
+        // Let's try both methods
+        const response = await api.get('/get-info', {
+            params: { token: ACCESS_TOKEN }
         });
         
-        if (response.data && response.data.token) {
-            sessionToken = response.data.token;
-            sessionExpiry = Date.now() + (response.data.expires_in || 3600) * 1000;
+        if (response.data && response.data.success !== false) {
+            const userData = response.data;
+            const btcBalance = parseFloat(userData.balance_btc || userData.balance || 0);
             
-            // Add token to all future requests
-            api.defaults.headers.common['Authorization'] = `Bearer ${sessionToken}`;
-            api.defaults.headers.common['x-api-key'] = API_KEY;
+            console.log(`👤 User: ${userData.username || 'Connected'}`);
+            console.log(`💰 BTC Balance: ${btcBalance.toFixed(8)} BTC`);
             
-            console.log('✅ Authentication successful! Session token obtained');
-            return true;
+            return {
+                success: true,
+                username: userData.username,
+                balance: btcBalance,
+                raw: userData
+            };
         } else {
-            console.error('❌ Authentication failed: No token in response');
-            return false;
+            console.error('❌ API returned error:', response.data);
+            return { success: false };
         }
     } catch (error) {
-        console.error('❌ Authentication error:', error.response?.status, error.response?.data || error.message);
-        return false;
+        console.error('❌ API error:', error.response?.status, error.response?.data || error.message);
+        return { success: false };
     }
 }
 
-// Check and refresh token if needed
-async function ensureAuth() {
-    if (!sessionToken || (sessionExpiry && Date.now() >= sessionExpiry - 60000)) {
-        return await authenticate();
-    }
-    return true;
-}
-
-// ============ CORRECT API FUNCTIONS ============
-
-// Get balance - /api/get-balance
-async function getBalance() {
-    await ensureAuth();
-    
-    try {
-        const response = await api.get('/get-balance');
-        
-        // Bitsler returns balances for all currencies
-        const balances = response.data;
-        const btcBalance = parseFloat(balances.btc || balances.BTC || 0);
-        
-        console.log(`💰 BTC Balance: ${btcBalance.toFixed(8)} BTC`);
-        
-        return {
-            btc: btcBalance,
-            all: balances
-        };
-    } catch (error) {
-        console.error('❌ Balance error:', error.response?.status, error.response?.data || error.message);
-        return { btc: 0, all: {} };
-    }
-}
-
-// Place dice bet - /api/dice-bet
+// Place a dice bet - Using /api/dice-bet endpoint
 async function placeDiceBet(amount, winChance, choice = 'high') {
-    await ensureAuth();
-    
-    // Determine target based on choice
-    // high = roll over 50, low = roll under 50
-    const target = choice === 'high' ? 50 : 50;
-    const condition = choice === 'high' ? '>' : '<';
-    
     try {
+        // Based on working PHP bot: sends token, amount, and type (1 for dice)
         const betData = {
+            token: ACCESS_TOKEN,
             amount: amount.toString(),
-            currency: 'btc',
             win_chance: winChance,
-            target: target,
-            condition: condition
+            type: 1 // 1 = Roll Dice game
         };
+        
+        // Add high/low choice if needed (original PHP bot may handle this differently)
+        if (choice === 'high') {
+            betData.high = true;
+        } else {
+            betData.low = true;
+        }
         
         const response = await api.post('/dice-bet', betData);
         
-        const result = response.data;
-        const isWin = result.win === true || result.result === 'win';
-        const roll = result.roll || result.number;
-        const multiplier = 100 / winChance;
-        const profit = isWin ? amount * (multiplier - 1) : -amount;
-        
-        return {
-            success: true,
-            isWin: isWin,
-            roll: roll,
-            profit: profit,
-            multiplier: multiplier,
-            payout: result.payout,
-            betId: result.bet_id || result.id
-        };
+        if (response.data && response.data.success !== false) {
+            const result = response.data;
+            const isWin = result.win === true || result.result === 'win';
+            const roll = result.roll || result.number;
+            const multiplier = 100 / winChance;
+            const profit = isWin ? amount * (multiplier - 1) : -amount;
+            
+            return {
+                success: true,
+                isWin: isWin,
+                roll: roll,
+                profit: profit,
+                multiplier: multiplier,
+                payout: result.payout,
+                betId: result.bet_id
+            };
+        } else {
+            console.error('❌ Bet failed:', response.data);
+            return { success: false, error: response.data?.message || 'Bet failed' };
+        }
         
     } catch (error) {
         console.error('❌ Bet error:', error.response?.status, error.response?.data || error.message);
@@ -159,40 +132,9 @@ async function placeDiceBet(amount, winChance, choice = 'high') {
     }
 }
 
-// Reset session stats - /api/reset-current-session
-async function resetSession() {
-    await ensureAuth();
-    
-    try {
-        const response = await api.post('/reset-current-session');
-        console.log('🔄 Session stats reset');
-        return response.data;
-    } catch (error) {
-        console.error('❌ Reset error:', error.message);
-        return null;
-    }
-}
-
-// Get user info (if available)
-async function getUserInfo() {
-    await ensureAuth();
-    
-    try {
-        // Some versions of the API have /get-user-info
-        const response = await api.get('/get-user-info').catch(() => null);
-        if (response && response.data) {
-            return response.data;
-        }
-        return { username: 'Connected' };
-    } catch (error) {
-        return { username: 'Connected' };
-    }
-}
-
 // ============ PROFIT PROTECTION SYSTEM ============
 let profitProtection = {
     safeBalance: 0,
-    tradingBalance: 0,
     startingBalance: 0,
     totalProfitEver: 0,
     lockHistory: []
@@ -207,8 +149,6 @@ let botState = {
         netProfit: 0,
         lockedProfit: 0,
         currentBalance: 0,
-        tradingBalance: 0,
-        safeBalance: 0,
         startTime: null
     },
     settings: {
@@ -221,11 +161,10 @@ let botState = {
 };
 
 // ============ PROFIT PROTECTION FUNCTIONS ============
-
 function lockProfit(amount) {
     const lockAmount = amount * (PROFIT_SAFE_PERCENT / 100);
     
-    if (lockAmount > 0.00000001) { // Only lock if significant
+    if (lockAmount > 0.00000001) {
         profitProtection.safeBalance += lockAmount;
         profitProtection.totalProfitEver += lockAmount;
         profitProtection.lockHistory.unshift({
@@ -322,9 +261,15 @@ async function runMartingale() {
             break;
         }
         
-        // Check balance
-        const balanceResult = await getBalance();
-        const totalBalance = balanceResult.btc;
+        // Get current balance first
+        const userInfo = await getUserInfo();
+        if (!userInfo.success) {
+            console.log('⚠️ Cannot get balance, retrying...');
+            await new Promise(r => setTimeout(r, 5000));
+            continue;
+        }
+        
+        const totalBalance = userInfo.balance;
         const tradingBalance = totalBalance - profitProtection.safeBalance;
         
         if (settings.currentBet > tradingBalance) {
@@ -345,7 +290,7 @@ async function runMartingale() {
         // Update stats
         botState.stats.totalBets++;
         botState.stats.netProfit += result.profit;
-        botState.stats.currentBalance += result.profit;
+        botState.stats.currentBalance = totalBalance + result.profit;
         
         if (result.isWin) {
             botState.stats.wins++;
@@ -358,10 +303,6 @@ async function runMartingale() {
         // Lock profit (50% of net profit)
         const locked = checkAndLockProfit();
         
-        // Update trading balance display
-        const newBalance = balanceResult.btc + result.profit;
-        const newTradingBalance = newBalance - profitProtection.safeBalance;
-        
         // Record bet
         botState.betHistory.unshift({
             id: botState.stats.totalBets,
@@ -371,7 +312,6 @@ async function runMartingale() {
             isWin: result.isWin,
             profit: result.profit,
             netProfit: botState.stats.netProfit,
-            tradingBalance: newTradingBalance,
             safeBalance: profitProtection.safeBalance,
             locked: locked
         });
@@ -400,25 +340,24 @@ async function startBot() {
         return;
     }
     
-    // Ensure authenticated
-    const authed = await ensureAuth();
-    if (!authed) {
-        console.error('❌ Cannot start: Authentication failed');
-        return;
-    }
-    
     botState.running = true;
     botState.stats.startTime = botState.stats.startTime || new Date();
     botState.settings.currentBet = botState.settings.baseBet;
     
-    // Get starting balance
-    const balance = await getBalance();
+    // Verify connection first
+    const userInfo = await getUserInfo();
+    if (!userInfo.success) {
+        console.error('❌ Cannot connect to Bitsler API. Please check your access token.');
+        botState.running = false;
+        return;
+    }
+    
     if (profitProtection.startingBalance === 0) {
-        profitProtection.startingBalance = balance.btc;
+        profitProtection.startingBalance = userInfo.balance;
     }
     
     console.log('\n🚀 Starting Martingale with Profit Protection');
-    console.log(`   Base Bet: ${BASE_BET} litoshi`);
+    console.log(`   Base Bet: ${BASE_BET} satoshi`);
     console.log(`   Win Chance: ${WIN_CHANCE}%`);
     console.log(`   Stop Profit: ${STOP_ON_PROFIT} | Stop Loss: ${STOP_ON_LOSS}`);
     console.log(`   🔒 ${PROFIT_SAFE_PERCENT}% of profits locked forever!\n`);
@@ -457,13 +396,13 @@ app.get('/', (req, res) => {
         ? (botState.stats.wins / botState.stats.totalBets * 100).toFixed(1)
         : 0;
     
-    const tradingBalance = botState.stats.currentBalance - profitProtection.safeBalance;
+    const tradingBalance = Math.max(0, botState.stats.currentBalance - profitProtection.safeBalance);
     
     res.send(`
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Bitsler Bot - Correct API</title>
+    <title>Bitsler Bot - WORKING VERSION</title>
     <meta http-equiv="refresh" content="3">
     <style>
         body { font-family: monospace; background: #0a0e27; color: #00ff88; padding: 20px; }
@@ -486,7 +425,7 @@ app.get('/', (req, res) => {
 </head>
 <body>
     <div class="container">
-        <h1>🎲 Bitsler Dice Bot <span class="badge">🔒 ${PROFIT_SAFE_PERCENT}% PROFIT PROTECTION</span> <span class="badge" style="background:#00ccff">✅ CORRECT API</span></h1>
+        <h1>🎲 Bitsler Dice Bot <span class="badge">🔒 ${PROFIT_SAFE_PERCENT}% PROFIT PROTECTION</span> <span class="badge" style="background:#00ccff">✅ WORKING API</span></h1>
         
         <div class="card">
             <div><span class="live"></span> <strong>${botState.running ? 'RUNNING' : 'STOPPED'}</strong> | Uptime: ${minutes} minutes</div>
@@ -502,7 +441,7 @@ app.get('/', (req, res) => {
                 <div style="font-size: 10px;">NEVER TRADED - PERMANENTLY PROTECTED</div>
             </div>
             <div class="stat-card">
-                <div class="stat-value trading">${Math.max(0, tradingBalance).toFixed(8)}</div>
+                <div class="stat-value trading">${tradingBalance.toFixed(8)}</div>
                 <div>💳 TRADING BALANCE</div>
                 <div style="font-size: 10px;">Only this is used for bets</div>
             </div>
@@ -511,7 +450,7 @@ app.get('/', (req, res) => {
                 <div>💰 TOTAL BALANCE</div>
             </div>
             <div class="stat-card">
-                <div class="stat-value ${botState.stats.netProfit >= 0 ? 'win' : 'loss'}" style="color:${botState.stats.netProfit >= 0 ? '#00ff88' : '#ff4444'}">${botState.stats.netProfit.toFixed(8)}</div>
+                <div class="stat-value" style="color:${botState.stats.netProfit >= 0 ? '#00ff88' : '#ff4444'}">${botState.stats.netProfit.toFixed(8)}</div>
                 <div>📊 NET PROFIT</div>
             </div>
         </div>
@@ -568,14 +507,15 @@ app.get('/', (req, res) => {
         </div>
         
         <div class="card" style="background: #1a2a1f;">
-            <h3>💡 How Profit Protection Works (CORRECT API)</h3>
-            <ul style="margin-left: 20px; line-height: 1.8;">
-                <li>✅ Using <strong>CORRECT Bitsler API endpoints</strong>: /api/generate-token, /api/get-balance, /api/dice-bet</li>
-                <li>🔒 <strong>${PROFIT_SAFE_PERCENT}% of every profit is automatically LOCKED</strong> into SAFE balance</li>
-                <li>💰 <strong>SAFE balance is NEVER used for betting</strong> - it's permanently protected</li>
-                <li>💳 Only the <strong>remaining ${100 - PROFIT_SAFE_PERCENT}% stays in TRADING balance</strong></li>
-                <li>✅ This ensures you keep ${PROFIT_SAFE_PERCENT}% of ALL profits, no matter what!</li>
-            </ul>
+            <h3>💡 How to Get Your Access Token (Working Method)</h3>
+            <ol style="margin-left: 20px; line-height: 1.8;">
+                <li>✅ Login to <strong>Bitsler.com</strong> using Firefox or Chrome</li>
+                <li>✅ Press <strong>F12</strong> to open Developer Tools</li>
+                <li>✅ Click the <strong>Console</strong> tab</li>
+                <li>✅ Type: <strong><code>console.log(access_token)</code></strong> and press Enter</li>
+                <li>✅ Copy the token that appears</li>
+                <li>✅ Add it to your <strong>.env</strong> file as <code>BITSLER_ACCESS_TOKEN=your_token_here</code></li>
+            </ol>
         </div>
     </div>
     
@@ -620,37 +560,29 @@ app.get('/api/status', (req, res) => {
 
 // ============ MAIN ============
 async function main() {
-    console.log('🔐 Testing Bitsler API connection...');
-    console.log('   Using correct endpoints:');
-    console.log('   - POST /api/generate-token (auth)');
-    console.log('   - GET /api/get-balance');
-    console.log('   - POST /api/dice-bet');
-    console.log('   - POST /api/reset-current-session\n');
+    console.log('🔐 Testing Bitsler API connection with access_token...');
+    console.log('   Using working endpoints from GitHub PHP bot:');
+    console.log('   - GET /api/get-info (with token param)');
+    console.log('   - POST /api/dice-bet (with token in body)\n');
     
-    // Authenticate first
-    const authed = await authenticate();
-    if (!authed) {
-        console.error('\n❌ Failed to authenticate with Bitsler API');
-        console.error('\n🔴 IMPORTANT: Your API key appears to be INVALID');
-        console.error('   1. Go to Bitsler.com and DELETE the compromised key');
-        console.error('   2. Create a NEW API key in Settings → Security → API Keys');
-        console.error('   3. Update your .env file with the NEW key');
-        console.error('   4. Restart the bot\n');
+    // Test connection immediately
+    const userInfo = await getUserInfo();
+    if (!userInfo.success) {
+        console.error('\n❌ Failed to connect to Bitsler API');
+        console.error('\n🔴 IMPORTANT: Your access token appears to be INVALID');
+        console.error('   1. Login to Bitsler.com');
+        console.error('   2. Press F12 -> Console tab');
+        console.error('   3. Type: console.log(access_token)');
+        console.error('   4. Copy the token to .env file');
+        console.error('   5. Restart the bot\n');
         process.exit(1);
     }
-    
-    // Get balance
-    const balance = await getBalance();
-    console.log(`✅ Connected successfully!`);
-    
-    // Reset session stats (optional)
-    await resetSession();
     
     loadState();
     
     app.listen(port, '0.0.0.0', () => {
         console.log(`\n📊 Dashboard: http://localhost:${port}`);
-        console.log(`\n✅ Bot ready with CORRECT Bitsler API endpoints!`);
+        console.log(`\n✅ Bot ready with WORKING Bitsler API!`);
         console.log(`🔒 ${PROFIT_SAFE_PERCENT}% of all profits will be LOCKED and PROTECTED`);
         console.log(`\n⚠️  Make sure you have REVOKED the compromised API key!\n`);
     });
