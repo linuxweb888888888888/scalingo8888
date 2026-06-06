@@ -15,7 +15,7 @@ const DEFAULTS = {
     payout: 1.4,              
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001,
-    winStreakCap: 5           // Increased to 5 - bot resets after 5 wins in a row
+    winStreakCap: 5           
 };
 
 // ============ BOT STATE ============
@@ -76,10 +76,14 @@ async function placeBet() {
 
     try {
         const response = await axios.post(url, payload);
-        return response.data;
+        return { success: true, data: response.data };
     } catch (error) { 
-        console.error(`[!] API Error: ${error.response?.data?.Message || error.message}`);
-        return null; 
+        const errorMsg = error.response?.data?.Message || error.message;
+        console.error(`[!] API Error: ${errorMsg}`);
+        
+        // Check if the error is specifically about balance
+        const isBalanceError = errorMsg.toLowerCase().includes("balance");
+        return { success: false, isBalanceError: isBalanceError };
     }
 }
 
@@ -88,37 +92,41 @@ async function runStrategy() {
     botState.running = true;
     while (botState.running) {
         const result = await placeBet();
-        if (!result) { 
+        
+        if (!result.success) { 
+            // If the bet was too large for the balance, reset everything to base
+            if (result.isBalanceError) {
+                console.log("⚠️ Balance too low for current bet. Resetting to base...");
+                botState.settings.currentBet = botState.settings.baseBet;
+                botState.currentWinStreak = 0;
+            }
+            
             await new Promise(r => setTimeout(r, 5000)); 
             continue; 
         }
 
+        const data = result.data;
         botState.stats.totalBets++;
-        // Use the actual wager from the API result for history
-        const actualWager = result.Bet || botState.settings.currentBet; 
-        const profit = result.Profit || 0;
+        const actualWager = data.Bet || botState.settings.currentBet; 
+        const profit = data.Profit || 0;
         
         botState.stats.netProfit += profit;
-        botState.stats.currentBalance = result.Balance || 0;
+        botState.stats.currentBalance = data.Balance || 0;
         botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
 
-        // Treat as win if profit is 0 or more (handles low-satoshi rounding)
         if (profit >= 0) {
             botState.stats.wins++;
             botState.currentWinStreak++;
             botState.profitProtection.safeBalance += (profit * 0.50); 
 
             if (botState.currentWinStreak >= DEFAULTS.winStreakCap) {
-                // Streak reached! Bank the profit and reset.
                 botState.settings.currentBet = botState.settings.baseBet;
                 botState.currentWinStreak = 0;
             } else {
-                // Multiply the bet for the next round
                 let nextBet = botState.settings.currentBet * botState.settings.multiplier;
                 botState.settings.currentBet = Math.ceil(nextBet * 100000000) / 100000000;
             }
         } else {
-            // Loss Case: Reset immediately
             botState.stats.losses++;
             botState.currentWinStreak = 0;
             botState.settings.currentBet = botState.settings.baseBet;
@@ -128,7 +136,7 @@ async function runStrategy() {
             id: botState.stats.totalBets, 
             time: new Date(), 
             bet: actualWager, 
-            roll: result.Roll, 
+            roll: data.Roll, 
             profit: profit, 
             isWin: profit >= 0
         });
@@ -149,11 +157,11 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro | Fixed Logs</title>
+    <title>Dice Pro | Anti-Crash Edition</title>
     <meta http-equiv="refresh" content="5">
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --success: #10b981; --danger: #ef4444; }
-        body { font-family: 'Inter', sans-serif; background-color: var(--bg); color: var(--text-main); padding: 2rem; }
+        body { font-family: sans-serif; background-color: var(--bg); color: var(--text-main); padding: 2rem; }
         .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
         .card { background: var(--card-bg); padding: 1rem; border-radius: 8px; border: 1px solid #e2e8f0; }
         table { width: 100%; border-collapse: collapse; background: white; }
@@ -187,6 +195,6 @@ app.get('/', (req, res) => {
 });
 
 app.listen(port, '0.0.0.0', () => {
-    console.log(`🚀 Bot Active on port ${port}`);
+    console.log(`🚀 Anti-Crash Bot Online on port ${port}`);
     runStrategy();
 });
