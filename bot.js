@@ -6,18 +6,18 @@ const port = process.env.PORT || 3000;
 
 // ============ MYDICEBOT CONFIGURATION ============
 const CONFIG = {
-    // SECURITY: Use environment variables. Do not hardcode keys if sharing code.
     API_KEY: process.env.API_KEY || "wnFmqb88iyIVPgJJHRMrSfyPOaoySEbnFTrV4xsKJCxHQXjnPy",
     COIN: "BTC", 
     PAYOUT: 2.0, 
     
+    // MATHEMATICAL STRATEGY: SMART_SCALER
+    // Automatically adjusts bets based on your balance to survive long streaks.
     ACTIVE_STRATEGY: "SMART_SCALER", 
 
     SETTINGS: {
         baseBet: 0.00000001,
         maxBet: 0.00500000,
-        // Compounding logic: Balance / 2^survivalStreak. 
-        // 15 = can survive 15 losses in a row.
+        // How many losses in a row do you want to survive? (14-16 is recommended for 2x payout)
         survivalStreak: 15, 
     },
     
@@ -47,29 +47,26 @@ let botState = {
     history: []
 };
 
-// ============ MATHEMATICAL LOGIC (COMPOUNDING) ============
+// ============ MATHEMATICAL LOGIC ============
 const Strategies = {
     SMART_SCALER: (isWin) => {
-        // COMPOUNDING CALCULATION:
-        // We divide current balance by 2^survivalStreak to find the safest possible bet.
-        // As balance grows, dynamicBase grows. As balance shrinks, dynamicBase shrinks.
+        // Calculate the "Safe Base" (Balance divided by 2 to the power of survival streak)
+        // This ensures math-wise that we can lose X times before hitting 0.
         const divisor = Math.pow(2, CONFIG.SETTINGS.survivalStreak);
-        const dynamicBase = Number((botState.balance.current / divisor).toFixed(8));
-        
-        // Ensure we never bet lower than the absolute minimum baseBet
-        const safeBase = Math.max(CONFIG.SETTINGS.baseBet, dynamicBase);
+        const dynamicBase = Math.max(CONFIG.SETTINGS.baseBet, botState.balance.current / divisor);
 
         if (isWin) {
             botState.stats.currentStreak = 0;
-            botState.currentBet = safeBase; // Reset to the NEW compounded base
+            botState.currentBet = dynamicBase;
         } else {
             botState.stats.currentStreak++;
             botState.stats.maxLossStreak = Math.max(botState.stats.maxLossStreak, botState.stats.currentStreak);
             
+            // If we hit our survival limit, reset to base to save the remaining bankroll
             if (botState.stats.currentStreak >= CONFIG.SETTINGS.survivalStreak) {
-                botState.currentBet = safeBase; // Survival limit hit, reset to save bankroll
+                botState.currentBet = dynamicBase;
             } else {
-                botState.currentBet *= 2; // Martingale step
+                botState.currentBet *= 2;
             }
         }
     }
@@ -101,15 +98,9 @@ async function runEngine() {
     botState.status = "Engine Active";
     
     while (botState.running) {
-        // Stop Condition Check: Profit
+        // Stop Condition Check
         if (botState.stats.profit >= CONFIG.STOP_CONDITIONS.stopAtProfit) {
             botState.status = "Profit Target Reached";
-            botState.running = false; break;
-        }
-        
-        // Stop Condition Check: Loss
-        if (botState.stats.profit <= CONFIG.STOP_CONDITIONS.stopAtLoss) {
-            botState.status = "Stop Loss Reached";
             botState.running = false; break;
         }
 
@@ -130,7 +121,7 @@ async function runEngine() {
         const isWin = result.Profit > 0;
         if (isWin) botState.stats.wins++; else botState.stats.losses++;
 
-        // Strategy Execution (Compounding happens here)
+        // Strategy Execution
         Strategies[CONFIG.ACTIVE_STRATEGY](isWin);
 
         // History Log
@@ -149,8 +140,9 @@ async function runEngine() {
     }
 }
 
-// ============ DASHBOARD (DESIGN UNCHANGED) ============
+// ============ DASHBOARD ============
 app.get('/api/data', (req, res) => {
+    // Calculate extra metrics for the UI
     const elapsedHrs = (Date.now() - botState.startTime) / 3600000;
     const profitPerHour = (botState.stats.profit / elapsedHrs) || 0;
     res.json({ ...botState, profitPerHour, uptime: elapsedHrs });
@@ -276,7 +268,7 @@ app.get('/', (req, res) => {
 
 // ============ START BOT ============
 app.listen(port, '0.0.0.0', () => {
-    console.log(`\n\x1b[36mMyDiceBot Pro Running (Compounding Active)\x1b[0m`);
+    console.log(`\n\x1b[36mMyDiceBot Pro Running\x1b[0m`);
     console.log(`\x1b[32mDashboard: http://localhost:${port}\x1b[0m\n`);
     runEngine();
 });
