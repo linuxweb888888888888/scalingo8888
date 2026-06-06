@@ -11,8 +11,8 @@ const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
-    multiplier: 5,          
-    payout: 1.4,              
+    multiplier: 1.2,          
+    payout: 1.7,              
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001  
 };
@@ -23,7 +23,6 @@ let botState = {
     running: false,
     coin: DEFAULTS.coin,
     activeSeed: "",
-    lossStreak: 0, // Track consecutive losses
     profitProtection: { safeBalance: 0 },
     stats: {
         totalBets: 0,
@@ -75,7 +74,7 @@ function loadState() {
 
 // ============ API LOGIC ============
 async function placeBet() {
-    // Generate new seed every 10 bets
+    // Generate new random seed every 10 bets
     if (botState.stats.totalBets % 10 === 0 || !botState.activeSeed) {
         const randomSuffix = Math.random().toString(36).replace(/[^a-z0-9]/gi, '').substring(0, 10);
         botState.activeSeed = "node20" + randomSuffix;
@@ -114,28 +113,20 @@ async function runStrategy() {
         botState.stats.netProfit += profit;
         botState.stats.currentBalance = result.Balance || 0;
 
+        // Always update the dynamic base based on current balance
         botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
 
         if (profit > 0) {
-            // WIN CASE
+            // WIN: Apply multiplier to the next bet (Winning Streak logic)
             botState.stats.wins++;
-            botState.lossStreak = 0; // Reset streak on win
             botState.profitProtection.safeBalance += (profit * 0.50); 
-            botState.settings.currentBet = botState.settings.baseBet;
+            
+            let nextBet = botState.settings.currentBet * botState.settings.multiplier;
+            botState.settings.currentBet = Math.ceil(nextBet * 100000000) / 100000000;
         } else {
-            // LOSS CASE
+            // LOSS: Reset immediately to the current base bet
             botState.stats.losses++;
-            botState.lossStreak++; // Increment streak
-
-            if (botState.lossStreak >= 2) {
-                // If 2 loss streak reached, reset to minimum base
-                botState.settings.currentBet = botState.settings.baseBet;
-                botState.lossStreak = 0; // Reset counter after enforcing minimum
-            } else {
-                // First loss: apply multiplier
-                let nextBet = botState.settings.currentBet * botState.settings.multiplier;
-                botState.settings.currentBet = Math.ceil(nextBet * 100000000) / 100000000;
-            }
+            botState.settings.currentBet = botState.settings.baseBet;
         }
 
         botState.betHistory.unshift({ 
@@ -163,7 +154,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro | 2-Loss Reset Strategy</title>
+    <title>Dice Pro | Winning Streak Strategy</title>
     <meta http-equiv="refresh" content="5">
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
@@ -198,7 +189,7 @@ app.get('/', (req, res) => {
             <div class="card accent"><div class="label">🔒 Protected Profit (50%)</div><div class="btc-val">${fmt(botState.profitProtection.safeBalance)}</div><div class="usd-val">${usd(botState.profitProtection.safeBalance)}</div></div>
             <div class="card"><div class="label">💰 Wallet Balance</div><div class="btc-val">${fmt(botState.stats.currentBalance)}</div><div class="usd-val">${usd(botState.stats.currentBalance)}</div></div>
             <div class="card"><div class="label">📈 Session Profit</div><div class="btc-val ${botState.stats.netProfit >= 0 ? 'win' : 'loss'}">${fmt(botState.stats.netProfit)}</div><div class="usd-val">${usd(botState.stats.netProfit)}</div></div>
-            <div class="card"><div class="label">🎯 Target Next Bet</div><div class="btc-val">${fmt(botState.settings.currentBet)} ${botState.lossStreak > 0 ? '(Streak: '+botState.lossStreak+')' : ''}</div><div class="usd-val">${usd(botState.settings.currentBet)}</div></div>
+            <div class="card"><div class="label">🎯 Target Next Bet</div><div class="btc-val">${fmt(botState.settings.currentBet)}</div><div class="usd-val">${usd(botState.settings.currentBet)}</div></div>
         </div>
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div style="font-weight:700">${winRate}%</div></div>
