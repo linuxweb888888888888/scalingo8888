@@ -10,8 +10,8 @@ const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
-    multiplier: 1.8,          // Adjusted for better balance
-    payout: 2.0,              // 2.0x gives you a 1:1 risk/reward
+    multiplier: 5,          // Adjusted for better balance
+    payout: 1.4,              // 2.0x gives you a 1:1 risk/reward
     balanceStep: 0.00000050,  
     betIncrement: 0.00000002,
     maxBalanceRisk: 0.10      // NEW: Never bet more than 10% of total balance
