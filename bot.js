@@ -6,7 +6,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "885aP8IKvVJu9R7wAgyThBFCSnlu3Y6ZTMhRa8f8D21jbEihDv";
+const API_KEY = process.env.API_KEY || "wnFmqb88iyIVPgJJHRMrSfyPOaoySEbnFTrV4xsKJCxHQXjnPy";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
@@ -21,9 +21,12 @@ let btcPrice = 60964;
 let botState = {
     running: true,
     statusMessage: "Initializing...",
-    recoveryPot: 0, // Total currently lost in this streak
+    recoveryPot: 0, 
     coin: DEFAULTS.coin,
-    profitProtection: { safeBalance: 0 }, 
+    profitProtection: { 
+        safeBalance: 0,
+        lockPercent: 0.80 // CHANGED: Now locking 80% of profit
+    }, 
     stats: {
         totalBets: 0,
         wins: 0,
@@ -58,7 +61,7 @@ function calculateScaledBase(balance) {
 
 function resetSession() {
     botState.statusMessage = "REBOOTING: Floor Hit. Starting Fresh...";
-    botState.profitProtection.safeBalance = 0;
+    botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.98; // Protect 98% of remaining on crash
     botState.recoveryPot = 0;
     botState.stats = {
         totalBets: 0, wins: 0, losses: 0, netProfit: 0, maxSessionProfit: 0,
@@ -74,7 +77,6 @@ function resetSession() {
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
     
-    // STRICT ALPHANUMERIC SEED
     const rawSuffix = Math.random().toString(36).substring(2); 
     const alphanumericSuffix = rawSuffix.replace(/[^a-z0-9]/gi, '').substring(0, 12);
     const safeSeed = "pro" + alphanumericSuffix; 
@@ -97,7 +99,7 @@ async function placeBet() {
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = "Linear Recovery Mode (No Doubling)";
+    botState.statusMessage = "Linear Recovery Mode (80% Profit Lock)";
     
     while (true) {
         // Floor Auto-Reboot
@@ -122,28 +124,21 @@ async function runStrategy() {
             botState.stats.maxSessionProfit = botState.stats.netProfit;
         }
 
-        // --- LINEAR GROWTH LOGIC ---
         botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
 
         if (profit > 0) {
             botState.stats.wins++;
-            // Reduce the recovery pot by the profit earned
             botState.recoveryPot -= profit;
             if (botState.recoveryPot < 0) botState.recoveryPot = 0;
 
-            // If we have cleared the pot, go back to base bet. 
-            // If pot still exists, stay at current level to keep chipping away.
             if (botState.recoveryPot === 0) {
                 botState.settings.currentBet = botState.settings.baseBet;
-                botState.profitProtection.safeBalance += (profit * 0.50); 
+                // CHANGED: Now adding 80% of profit to the safe floor
+                botState.profitProtection.safeBalance += (profit * 0.80); 
             }
         } else {
             botState.stats.losses++;
-            // Add the loss to the pot
             botState.recoveryPot += Math.abs(profit);
-            
-            // INCREMENT: Just add 1 unit to the bet. Never double.
-            // Example: 0.01 -> 0.02 -> 0.03 -> 0.04
             botState.settings.currentBet += DEFAULTS.betIncrement;
         }
 
@@ -171,7 +166,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.3 | Linear Sum</title>
+    <title>Dice Pro v3.3 | 80% Lock</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -204,7 +199,7 @@ app.get('/', (req, res) => {
             <div class="card"><div class="label">💳 Trading Balance</div><div id="t-bal" class="btc-val" style="color:var(--danger)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">⚖️ Recovery Pot (Remaining)</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div class="usd-val">Mode: Linear Growth</div></div>
+            <div class="card"><div class="label">⚖️ Recovery Pot (Remaining)</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div class="usd-val">Mode: 80% Profit Lock</div></div>
         </div>
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
