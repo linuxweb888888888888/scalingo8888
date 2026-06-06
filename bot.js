@@ -11,7 +11,7 @@ const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
-    multiplier: 1.2,          
+    multiplier: 1.5,          
     payout: 1.7,              
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001  
@@ -22,6 +22,7 @@ let btcPrice = 65000;
 let botState = {
     running: false,
     coin: DEFAULTS.coin,
+    activeSeed: "", // Track the persistent seed
     profitProtection: { safeBalance: 0 },
     stats: {
         totalBets: 0,
@@ -73,15 +74,19 @@ function loadState() {
 
 // ============ API LOGIC ============
 async function placeBet() {
-    const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
-    const randomSuffix = Math.random().toString(36).replace(/[^a-z0-9]/gi, '').substring(0, 10);
-    const safeSeed = "node20" + randomSuffix; 
+    // Generate new seed every 10 bets or if no seed exists
+    if (botState.stats.totalBets % 10 === 0 || !botState.activeSeed) {
+        const randomSuffix = Math.random().toString(36).replace(/[^a-z0-9]/gi, '').substring(0, 10);
+        botState.activeSeed = "node20" + randomSuffix;
+    }
 
+    const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
+    
     const payload = { 
         Bet: botState.settings.currentBet, 
         Payout: botState.settings.payout, 
         UnderOver: true, 
-        ClientSeed: safeSeed 
+        ClientSeed: botState.activeSeed 
     };
 
     try {
@@ -117,9 +122,6 @@ async function runStrategy() {
         } else {
             botState.stats.losses++;
             
-            // FIX: Use Math.ceil to force the bet to increase by at least 1 satoshi
-            // Old way: (0.00000001 * 1.2) = 0.000000012 -> rounded to 0.00000001 (No increase)
-            // New way: Math.ceil(0.000000012 * 1e8) / 1e8 = 0.00000002 (Correct increase)
             let nextBet = botState.settings.currentBet * botState.settings.multiplier;
             botState.settings.currentBet = Math.ceil(nextBet * 100000000) / 100000000;
         }
@@ -135,7 +137,7 @@ async function runStrategy() {
     }
 }
 
-// ============ WEB DASHBOARD (White Neat Design) ============
+// ============ WEB DASHBOARD ============
 app.get('/', (req, res) => {
     const fmt = (num) => (num || 0).toFixed(8);
     const usd = (num) => ((num || 0) * btcPrice).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
