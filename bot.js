@@ -12,16 +12,16 @@ const DEFAULTS = {
     payout: 2.0,              
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001,
-    maxTotalBetPercent: 0.02,  // 2% Max Wager for safety
-    potSafetyLimit: 0.15,      // 15% Safety Cap
-    baseCooldown: 1050         // Standard API Rate Limit
+    maxTotalBetPercent: 0.025, // Increased to 2.5% for hyper-recovery
+    potSafetyLimit: 0.15,      
+    baseCooldown: 1050         
 };
 
 // ============ BOT STATE ============
 let btcPrice = 60826; 
 let botState = {
     running: true,
-    statusMessage: "Engine Primed: High-Yield Mode",
+    statusMessage: "Engine Status: HYPER-VELOCITY ACTIVE",
     recoveryPot: 0, 
     winStreak: 0,
     seedShifts: 0,
@@ -54,9 +54,9 @@ updateBTCPrice();
 function calculateScaledBase(balance) {
     const units = Math.floor(balance / DEFAULTS.balanceStep);
     let base = Number((Math.max(1, units) * DEFAULTS.betIncrement).toFixed(8));
-    // Dynamic Growth: Inject 2% of session profit into base bet
+    // HYPER GROWTH: Inject 4% of session profit into base bet
     if (botState.stats.netProfit > 0) {
-        base += (botState.stats.netProfit * 0.02);
+        base += (botState.stats.netProfit * 0.04);
     }
     return Number(base.toFixed(8));
 }
@@ -64,7 +64,7 @@ function calculateScaledBase(balance) {
 function detectDangerZone() {
     if (botState.rollValueHistory.length < 3) return false;
     const last3Rolls = botState.rollValueHistory.slice(-3);
-    const isHighCluster = last3Rolls.every(val => val > 65); // Tighter danger threshold
+    const isHighCluster = last3Rolls.every(val => val > 65); 
     const isLossStreak = botState.streakHistory.slice(-4).every(val => val === false);
     return isHighCluster || isLossStreak;
 }
@@ -87,7 +87,7 @@ async function placeBet() {
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
     while (true) {
-        // INSTANT SEED ROTATION (No Cooldown)
+        // INSTANT SEED ROTATION (Anti-Pattern)
         if (detectDangerZone()) {
             botState.settings.clientSeed = "pro" + Math.random().toString(36).substring(2, 12);
             botState.seedShifts++;
@@ -98,7 +98,7 @@ async function runStrategy() {
         // SAFETY: Pot Cap
         if (botState.recoveryPot > (botState.stats.currentBalance * DEFAULTS.potSafetyLimit)) {
             botState.recoveryPot = 0;
-            botState.statusMessage = "🛡️ Safety Trigger: Pot Cleared";
+            botState.statusMessage = "🛡️ SAFETY: Pot Cap Hit - Resetting";
         }
 
         const result = await placeBet();
@@ -126,28 +126,27 @@ async function runStrategy() {
             botState.winStreak++;
             botState.recoveryPot = Math.max(0, botState.recoveryPot - profit);
             if (!botState.statusMessage.includes('⚠️')) {
-                botState.statusMessage = botState.winStreak > 2 ? `🚀 BOOST MODE: x${botState.winStreak}` : "Yielding Profit";
+                botState.statusMessage = botState.winStreak > 2 ? `🔥 HYPER-STREAK: x${botState.winStreak}` : "Maximizing Yield";
             }
         } else {
             botState.stats.losses++;
             botState.winStreak = 0;
-            // SMART RECOVERY: Recover 105% on small pots to grow faster
-            const recFactor = botState.recoveryPot < (botState.stats.currentBalance * 0.01) ? 1.05 : 0.85;
-            botState.recoveryPot += (Math.abs(profit) * recFactor);
-            if (!botState.statusMessage.includes('⚠️')) botState.statusMessage = "Recovery Active";
+            // HYPER RECOVERY: Recover 115% to ensure loss phases end in profit surplus
+            botState.recoveryPot += (Math.abs(profit) * 1.15);
+            if (!botState.statusMessage.includes('⚠️')) botState.statusMessage = "Recovering Loss (Accelerated)";
         }
 
-        // TIERED RECOVERY DIVISORS
-        let divisor = 12; // Hyper-aggressive base
-        if (botState.recoveryPot > botState.stats.currentBalance * 0.01) divisor = 18;
-        if (botState.recoveryPot > botState.stats.currentBalance * 0.03) divisor = 28;
-        if (botState.recoveryPot > botState.stats.currentBalance * 0.07) divisor = 40; // Ultra-safe
+        // AGGRESSIVE TIERED DIVISORS (Lower = Faster Recovery)
+        let divisor = 8; // Hyper-Fast Recovery
+        if (botState.recoveryPot > botState.stats.currentBalance * 0.01) divisor = 14;
+        if (botState.recoveryPot > botState.stats.currentBalance * 0.03) divisor = 22;
+        if (botState.recoveryPot > botState.stats.currentBalance * 0.07) divisor = 35; 
 
         let recoveryPart = botState.recoveryPot / divisor;
         let targetBet = botState.settings.baseBet + recoveryPart;
 
-        // STREAK COMPOUNDING
-        if (botState.winStreak >= 2) targetBet *= 1.20; 
+        // COMPOUNDING SURGE
+        if (botState.winStreak >= 2) targetBet *= 1.35; 
 
         let absoluteMax = botState.stats.currentBalance * DEFAULTS.maxTotalBetPercent;
         botState.settings.currentBet = Math.min(targetBet, absoluteMax);
@@ -162,7 +161,7 @@ async function runStrategy() {
     }
 }
 
-// ============ WEB DASHBOARD ============
+// ============ WEB DASHBOARD (v3.8 Legacy Design) ============
 app.get('/api/stats', (req, res) => {
     const hours = Math.max(0.01, (Date.now() - botState.stats.startTime) / 3600000);
     res.json({ botState, btcPrice, hoursPassed: hours.toFixed(2) });
@@ -174,7 +173,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v6.0 | High-Yield</title>
+    <title>Dice Pro v7.0 | Hyper-Velocity</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -199,15 +198,15 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <div class="header">
-            <h1>Dice Pro <span style="color:var(--primary)">v6.0 Turbo</span></h1>
+            <h1>Dice Pro <span style="color:var(--primary)">v7.0 Hyper</span></h1>
             <div id="roll-circles" class="roll-circles"></div>
         </div>
-        <div class="status-bar" id="status-msg">Engine Primed...</div>
+        <div class="status-bar" id="status-msg">Hyper Engine Primed...</div>
         <div class="grid">
-            <div class="card"><div class="label">Total Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
+            <div class="card"><div class="label">Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--danger)">0.00</div><div class="usd-val">Tiered Divisor</div></div>
-            <div class="card"><div class="label">Next Wager</div><div id="n-bet" class="btc-val" style="color:var(--primary)">0.00</div><div id="uptime" class="usd-val">Uptime: 0h</div></div>
+            <div class="card"><div class="label">Recovery Pot (115%)</div><div id="pot-display" class="btc-val" style="color:var(--danger)">0.00</div><div class="usd-val">Lower Divisor Active</div></div>
+            <div class="card"><div class="label">Current Wager</div><div id="n-bet" class="btc-val" style="color:var(--primary)">0.00</div><div id="uptime" class="usd-val">Uptime: 0h</div></div>
         </div>
         <div class="label">Performance Projections</div>
         <div class="proj-grid">
@@ -231,7 +230,7 @@ app.get('/', (req, res) => {
                 
                 const statusEl = document.getElementById('status-msg');
                 statusEl.innerText = "Status: " + botState.statusMessage;
-                statusEl.style.borderLeftColor = botState.statusMessage.includes('⚠️') ? "#ef4444" : "#2563eb";
+                statusEl.style.borderLeftColor = botState.statusMessage.includes('⚠️') ? "#ef4444" : "#10b981";
 
                 document.getElementById('w-bal').innerText = f(botState.stats.currentBalance);
                 document.getElementById('w-usd').innerText = u(botState.stats.currentBalance);
@@ -240,7 +239,7 @@ app.get('/', (req, res) => {
                 document.getElementById('n-usd').innerText = u(botState.stats.netProfit);
                 document.getElementById('pot-display').innerText = f(botState.recoveryPot);
                 document.getElementById('n-bet').innerText = f(botState.settings.currentBet);
-                document.getElementById('uptime').innerText = "Uptime: " + hoursPassed + "h | Seeds Shifted: " + botState.seedShifts;
+                document.getElementById('uptime').innerText = "Uptime: " + hoursPassed + "h | Shift: " + botState.seedShifts;
 
                 const ph = botState.stats.netProfit / hoursPassed;
                 document.getElementById('p-hr-b').innerText = f(ph);
