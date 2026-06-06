@@ -1,28 +1,26 @@
 const axios = require('axios');
 const express = require('express');
-const fs = require('fs');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ============ CONFIGURATION (MARTINGALE MODE) ============
+// ============ CONFIGURATION (STABLE FLAT MODE) ============
 const API_KEY = process.env.API_KEY || "iBrrtRzWFFE0bOGkTAf0MGx4mhqjFV4gWZT9TAViThZpsnGTib";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
-    payout: 1.2,               // Standard Martingale requires 2.0x
-    balanceStep: 0.00000050,  
-    betIncrement: 0.00000001,
-    martingaleMultiplier: 1.4,   // Double on loss
-    maxTotalBetPercent: 0.015, // SAFETY: Never bet more than 1.5% of balance
+    payout: 1.2,               // 2.0x Payout (Standard for Flat Betting)
+    balanceStep: 0.00000050,   // Scaling: For every 50 sats in balance...
+    betIncrement: 0.00000001,  // ...increase base bet by 1 sat
+    maxTotalBetPercent: 0.015, // SAFETY: Hard cap bet at 1.5% of balance
 };
 
 // ============ BOT STATE ============
-let btcPrice = 60826; 
+let btcPrice = 60000; 
 let botState = {
     running: true,
-    statusMessage: "Initializing...",
+    statusMessage: "Initializing Stable Strategy...",
     coin: DEFAULTS.coin,
     currentSeed: "pro" + Math.random().toString(36).substring(2, 12),
     betsSinceSeedChange: 0,
@@ -60,7 +58,7 @@ function calculateScaledBase(balance) {
 // ============ API LOGIC ============
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
-    const side = botState.stats.totalBets % 2 === 0;
+    const side = Math.random() > 0.5; // Randomize Hi/Lo for stability
 
     const payload = { 
         Bet: Number(botState.settings.currentBet.toFixed(8)), 
@@ -78,13 +76,13 @@ async function placeBet() {
     }
 }
 
-// ============ MAIN STRATEGY ============
+// ============ MAIN STRATEGY (FLAT BETTING) ============
 async function runStrategy() {
-    botState.statusMessage = "Martingale (2x) Strategy Active";
+    botState.statusMessage = "Stable Strategy Active (Flat Betting)";
     
     while (true) {
-        // --- SEED ROTATION (Every 10 Bets) ---
-        if (botState.betsSinceSeedChange >= 10) {
+        // --- SEED ROTATION ---
+        if (botState.betsSinceSeedChange >= 25) {
             botState.currentSeed = "pro" + Math.random().toString(36).substring(2, 12);
             botState.betsSinceSeedChange = 0;
         }
@@ -102,31 +100,24 @@ async function runStrategy() {
         botState.stats.netProfit += profit;
         botState.stats.currentBalance = result.Balance || 0;
 
-        // Auto-scale the base bet according to balance
+        // --- STABLE LOGIC ---
+        // Bet is recalculated based on balance, but DOES NOT multiply on loss.
         botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
+        botState.settings.currentBet = botState.settings.baseBet;
 
-        // --- MARTINGALE LOGIC ---
-        if (profit > 0) {
-            botState.stats.wins++;
-            // WIN: Reset to base bet
-            botState.settings.currentBet = botState.settings.baseBet;
-        } else {
-            botState.stats.losses++;
-            // LOSS: Double the next bet
-            botState.settings.currentBet = botState.settings.currentBet * DEFAULTS.martingaleMultiplier;
-        }
+        if (profit > 0) botState.stats.wins++;
+        else botState.stats.losses++;
 
-        // SAFETY: Apply hard cap
+        // SAFETY: Apply hard cap regardless of scaling
         let absoluteMax = botState.stats.currentBalance * DEFAULTS.maxTotalBetPercent;
         if (botState.settings.currentBet > absoluteMax) {
-            botState.statusMessage = "Safety Cap Hit: Resetting to Base";
-            botState.settings.currentBet = botState.settings.baseBet;
+            botState.settings.currentBet = absoluteMax;
         }
 
         botState.betHistory.unshift({ 
             id: botState.stats.totalBets, time: new Date().toLocaleTimeString(), 
             bet: result.Bet, roll: result.Roll, profit: profit, isWin: profit > 0, 
-            pot: "N/A", dBase: botState.settings.baseBet
+            dBase: botState.settings.baseBet
         });
         if (botState.betHistory.length > 30) botState.betHistory.pop();
 
@@ -147,7 +138,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.8 | Martingale Edition</title>
+    <title>Dice Pro v3.8 | Stable Edition</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -172,7 +163,7 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <div class="header">
-            <h1>Dice Pro <span style="color:var(--primary)">v3.8</span></h1>
+            <h1>Dice Pro <span style="color:var(--primary)">v3.8 Stable</span></h1>
             <div style="text-align: right"><div class="label">Market BTC/USD</div><div id="price-tag" style="font-weight: 700;">$0.00</div></div>
         </div>
         <div class="status-bar" id="status-msg">Status: Initializing...</div>
@@ -180,7 +171,7 @@ app.get('/', (req, res) => {
             <div class="card"><div class="label">💳 Safe Tradable</div><div id="t-bal" class="btc-val" style="color:var(--primary)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">⚖️ Martingale</div><div id="pot-display" class="btc-val" style="color:var(--danger)">2x</div><div class="usd-val">Capped at 1.5% Bal</div></div>
+            <div class="card"><div class="label">⚖️ Strategy Mode</div><div id="pot-display" class="btc-val" style="color:var(--success)">FLAT</div><div class="usd-val">No Martingale Risk</div></div>
         </div>
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
@@ -196,7 +187,7 @@ app.get('/', (req, res) => {
             <div class="proj-card"><div class="label">Yearly</div><span id="p-year-b" class="win">0.00</span><br><span id="p-year-u" class="usd-val">0.00</span></div>
         </div>
         <table>
-            <thead><tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Left</th></tr></thead>
+            <thead><tr><th>ID</th><th>Base Bet</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Status</th></tr></thead>
             <tbody id="h-body"></tbody>
         </table>
     </div>
@@ -228,7 +219,7 @@ app.get('/', (req, res) => {
                 document.getElementById('p-year-b').innerText = f(ph*24*365); document.getElementById('p-year-u').innerText = u(ph*24*365);
 
                 document.getElementById('h-body').innerHTML = botState.betHistory.map(b => \`
-                    <tr><td>#\${b.id}</td><td>\${f(b.dBase)}</td><td>\${f(b.bet)}</td><td>\${b.roll}</td><td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td><td>---</td></tr>
+                    <tr><td>#\${b.id}</td><td>\${f(b.dBase)}</td><td>\${f(b.bet)}</td><td>\${b.roll}</td><td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td><td>\${b.isWin?'WIN':'LOSS'}</td></tr>
                 \`).join('');
             } catch(e) {}
         }
