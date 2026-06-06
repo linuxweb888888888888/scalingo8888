@@ -5,18 +5,17 @@ const fs = require('fs');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ============ CONFIGURATION (1.2x HIGH WIN-RATE) ============
+// ============ CONFIGURATION (MARTINGALE MODE) ============
 const API_KEY = process.env.API_KEY || "QmmX28yULnLF784oJjDMiatV8MPhNAxK2aoKba0sjbwyCJ3PLP";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
-    payout: 1.7,               // 82.5% Win Rate
-    balanceStep: 0.00000500,   // Conservative scaling for low payout
+    payout: 1.7,               // Standard Martingale requires 2.0x
+    balanceStep: 0.00000050,  
     betIncrement: 0.00000001,
-    recoveryDivisor: 40,       // IMPORTANT: Debt spread over 40 wins to stay safe
-    maxTotalBetPercent: 0.01,  // SAFETY: Max bet 1% of balance
-    potSafetyLimit: 0.05       // SAFETY: Reset if debt exceeds 5% of balance
+    martingaleMultiplier: 2,   // Double on loss
+    maxTotalBetPercent: 0.015, // SAFETY: Never bet more than 1.5% of balance
 };
 
 // ============ BOT STATE ============
@@ -24,7 +23,6 @@ let btcPrice = 60826;
 let botState = {
     running: true,
     statusMessage: "Initializing...",
-    recoveryPot: 0, 
     coin: DEFAULTS.coin,
     currentSeed: "pro" + Math.random().toString(36).substring(2, 12),
     betsSinceSeedChange: 0,
@@ -33,7 +31,6 @@ let botState = {
         wins: 0,
         losses: 0,
         netProfit: 0,
-        maxSessionProfit: 0,
         currentBalance: 0,
         startTime: Date.now(),
     },
@@ -63,8 +60,6 @@ function calculateScaledBase(balance) {
 // ============ API LOGIC ============
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
-    
-    // Switch sides every bet to increase randomness coverage
     const side = botState.stats.totalBets % 2 === 0;
 
     const payload = { 
@@ -85,19 +80,13 @@ async function placeBet() {
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = "Ultra-High Win Rate Mode Active (82%)";
+    botState.statusMessage = "Martingale (2x) Strategy Active";
     
     while (true) {
         // --- SEED ROTATION (Every 10 Bets) ---
         if (botState.betsSinceSeedChange >= 10) {
             botState.currentSeed = "pro" + Math.random().toString(36).substring(2, 12);
             botState.betsSinceSeedChange = 0;
-        }
-
-        // SAFETY: If pot hits 5% of balance, it's too dangerous. Reset.
-        if (botState.recoveryPot > (botState.stats.currentBalance * DEFAULTS.potSafetyLimit)) {
-            botState.statusMessage = "CRITICAL SAFETY: Debt Pot Reset to Save Balance.";
-            botState.recoveryPot = 0;
         }
 
         const result = await placeBet();
@@ -113,39 +102,35 @@ async function runStrategy() {
         botState.stats.netProfit += profit;
         botState.stats.currentBalance = result.Balance || 0;
 
+        // Auto-scale the base bet according to balance
         botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
 
+        // --- MARTINGALE LOGIC ---
         if (profit > 0) {
             botState.stats.wins++;
-            botState.recoveryPot -= profit;
-            if (botState.recoveryPot < 0) botState.recoveryPot = 0;
+            // WIN: Reset to base bet
+            botState.settings.currentBet = botState.settings.baseBet;
         } else {
             botState.stats.losses++;
-            // 1.2x Math: We add 98% of loss to pot for recovery
-            botState.recoveryPot += (Math.abs(profit) * 0.98);
+            // LOSS: Double the next bet
+            botState.settings.currentBet = botState.settings.currentBet * DEFAULTS.martingaleMultiplier;
         }
 
-        // --- 1.2x RECOVERY CALCULATION ---
-        // At 1.2x payout, we profit only 0.2 units per 1 unit wagered.
-        // Therefore, to clear 1 unit of debt, we must wager 5 units.
-        let recoveryTargetPerWin = botState.recoveryPot / DEFAULTS.recoveryDivisor;
-        let additionalWager = recoveryTargetPerWin / 0.2; 
-        
-        let targetBet = botState.settings.baseBet + additionalWager;
-
-        // Hard safety cap (1% of balance) to prevent account liquidation
+        // SAFETY: Apply hard cap
         let absoluteMax = botState.stats.currentBalance * DEFAULTS.maxTotalBetPercent;
-        botState.settings.currentBet = Math.min(targetBet, absoluteMax);
+        if (botState.settings.currentBet > absoluteMax) {
+            botState.statusMessage = "Safety Cap Hit: Resetting to Base";
+            botState.settings.currentBet = botState.settings.baseBet;
+        }
 
         botState.betHistory.unshift({ 
             id: botState.stats.totalBets, time: new Date().toLocaleTimeString(), 
             bet: result.Bet, roll: result.Roll, profit: profit, isWin: profit > 0, 
-            pot: botState.recoveryPot.toFixed(8), dBase: botState.settings.baseBet
+            pot: "N/A", dBase: botState.settings.baseBet
         });
         if (botState.betHistory.length > 30) botState.betHistory.pop();
 
-        // Optimized speed for 1.2x volume
-        await new Promise(r => setTimeout(r, 850)); 
+        await new Promise(r => setTimeout(r, 1100)); 
     }
 }
 
@@ -155,14 +140,14 @@ app.get('/api/stats', (req, res) => {
     res.json({ botState, btcPrice, hoursPassed: hours.toFixed(2) });
 });
 
-// ============ WEB DASHBOARD ============
+// ============ WEB DASHBOARD (ORIGINAL DESIGN) ============
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.8 | Ultra-High Win Rate</title>
+    <title>Dice Pro v3.8 | Martingale Edition</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -195,7 +180,7 @@ app.get('/', (req, res) => {
             <div class="card"><div class="label">💳 Safe Tradable</div><div id="t-bal" class="btc-val" style="color:var(--primary)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">⚖️ Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--danger)">0.00</div><div class="usd-val">Capped at 1% Bal</div></div>
+            <div class="card"><div class="label">⚖️ Martingale</div><div id="pot-display" class="btc-val" style="color:var(--danger)">2x</div><div class="usd-val">Capped at 1.5% Bal</div></div>
         </div>
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
@@ -231,7 +216,6 @@ app.get('/', (req, res) => {
                 document.getElementById('w-usd').innerText = u(botState.stats.currentBalance);
                 document.getElementById('n-prof').innerText = f(botState.stats.netProfit);
                 document.getElementById('n-usd').innerText = u(botState.stats.netProfit);
-                document.getElementById('pot-display').innerText = f(botState.recoveryPot);
                 document.getElementById('wr').innerText = ((botState.stats.wins/botState.stats.totalBets)*100 || 0).toFixed(1) + "%";
                 document.getElementById('s-base').innerText = f(botState.settings.baseBet);
                 document.getElementById('n-bet').innerText = f(botState.settings.currentBet);
@@ -244,7 +228,7 @@ app.get('/', (req, res) => {
                 document.getElementById('p-year-b').innerText = f(ph*24*365); document.getElementById('p-year-u').innerText = u(ph*24*365);
 
                 document.getElementById('h-body').innerHTML = botState.betHistory.map(b => \`
-                    <tr><td>#\${b.id}</td><td>\${f(b.dBase)}</td><td>\${f(b.bet)}</td><td>\${b.roll}</td><td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td><td>\${b.pot} BTC</td></tr>
+                    <tr><td>#\${b.id}</td><td>\${f(b.dBase)}</td><td>\${f(b.bet)}</td><td>\${b.roll}</td><td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td><td>---</td></tr>
                 \`).join('');
             } catch(e) {}
         }
