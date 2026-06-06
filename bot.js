@@ -5,18 +5,19 @@ const fs = require('fs');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ============ CONFIGURATION (Aggressive Speed Tuning) ============
-const API_KEY = process.env.API_KEY || "885aP8IKvVJu9R7wAgyThBFCSnlu3Y6ZTMhRa8f8D21jbEihDv";
+// ============ CONFIGURATION (Efficient Scaling v3.9) ============
+const API_KEY = process.env.API_KEY || "uVGG7F3K9Lib69b8H7g216G932YUwCp4M1A7fJfWhNJ9VcMGwg";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
     payout: 2.0,              
-    balanceStep: 0.00000010,   // Faster Scaling (Was 0.50)
+    balanceStep: 0.00000010,   
     betIncrement: 0.00000001,
-    recoveryDivisor: 10,       // Faster Recovery (Was 25)
-    maxTotalBetPercent: 0.03,  // Higher Ceiling for speed (Was 0.015)
-    potSafetyLimit: 0.15       // (Was 0.10)
+    recoveryDivisor: 12,       // Base recovery speed (Efficient)
+    maxRecoveryDivisor: 40,    // Safety slowdown for large pots
+    maxTotalBetPercent: 0.02,  // 2% Hard cap for safety
+    potSafetyLimit: 0.12       // Reset if pot hits 12% of balance
 };
 
 // ============ BOT STATE ============
@@ -82,11 +83,11 @@ async function placeBet() {
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = "Fast-Profit Mode Active (v3.8 Modified)";
+    botState.statusMessage = "Efficient-Scaling Active";
     
     while (true) {
         if (botState.recoveryPot > (botState.stats.currentBalance * DEFAULTS.potSafetyLimit)) {
-            botState.statusMessage = "Pot Safety Reset: Protecting Balance.";
+            botState.statusMessage = "Safety Reset: Pot Cleared.";
             botState.recoveryPot = 0;
         }
 
@@ -109,14 +110,22 @@ async function runStrategy() {
             if (botState.recoveryPot < 0) botState.recoveryPot = 0;
         } else {
             botState.stats.losses++;
-            botState.recoveryPot += Math.abs(profit); // 100% loss addition for faster recovery
+            botState.recoveryPot += Math.abs(result.Bet); 
         }
 
-        // --- CALCULATE NEXT BET ---
-        let recoveryPart = botState.recoveryPot / DEFAULTS.recoveryDivisor;
+        // --- EFFICIENT SCALING CALCULATION ---
+        // We calculate how "heavy" the pot is compared to our base bet
+        let potSeverity = botState.recoveryPot / (botState.settings.baseBet || 0.00000001);
+        
+        // Dynamic Divisor: If the pot gets too big, we increase the divisor to slow down recovery
+        let dynamicDivisor = DEFAULTS.recoveryDivisor;
+        if (potSeverity > 50) dynamicDivisor = 20; 
+        if (potSeverity > 150) dynamicDivisor = DEFAULTS.maxRecoveryDivisor;
+
+        let recoveryPart = botState.recoveryPot / dynamicDivisor;
         let targetBet = botState.settings.baseBet + recoveryPart;
 
-        // Apply aggressive but strict safety cap
+        // Apply strict safety cap (max 2% of balance)
         let absoluteMax = botState.stats.currentBalance * DEFAULTS.maxTotalBetPercent;
         botState.settings.currentBet = Math.min(targetBet, absoluteMax);
 
@@ -137,14 +146,14 @@ app.get('/api/stats', (req, res) => {
     res.json({ botState, btcPrice, hoursPassed: hours.toFixed(2) });
 });
 
-// ============ WEB DASHBOARD (IDENTICAL DESIGN) ============
+// ============ WEB DASHBOARD ============
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.8 | Fast Profit</title>
+    <title>Dice Pro v3.9 | Efficient Profit</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -169,7 +178,7 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <div class="header">
-            <h1>Dice Pro <span style="color:var(--primary)">v3.8 Fast</span></h1>
+            <h1>Dice Pro <span style="color:var(--primary)">v3.9 Efficient</span></h1>
             <div style="text-align: right"><div class="label">Market BTC/USD</div><div id="price-tag" style="font-weight: 700;">$0.00</div></div>
         </div>
         <div class="status-bar" id="status-msg">Status: Initializing...</div>
@@ -177,7 +186,7 @@ app.get('/', (req, res) => {
             <div class="card"><div class="label">💳 Safe Tradable</div><div id="t-bal" class="btc-val" style="color:var(--primary)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">⚖️ Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--danger)">0.00</div><div class="usd-val">Capped at 3.0% Bal</div></div>
+            <div class="card"><div class="label">⚖️ Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--danger)">0.00</div><div class="usd-val">Auto-Scaling Divisor</div></div>
         </div>
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
