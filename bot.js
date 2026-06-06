@@ -11,10 +11,10 @@ const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
-    payout: 2.0,              
+    payout: 1.5,               // CHANGED: Lower payout = Higher Win Rate (~66%)
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001,
-    recoveryDivisor: 25,       // Spreads recovery over 25 wins
+    recoveryDivisor: 12,       // CHANGED: Lower divisor to compensate for lower payout profit
     maxTotalBetPercent: 0.015, // SAFETY: Never bet more than 1.5% of balance
     potSafetyLimit: 0.10       // SAFETY: If pot > 10% of balance, reset pot
 };
@@ -26,9 +26,8 @@ let botState = {
     statusMessage: "Initializing...",
     recoveryPot: 0, 
     coin: DEFAULTS.coin,
-    currentSeed: "pro" + Math.random().toString(36).substring(2, 12), // Initial seed
-    betsSinceSeedChange: 0, // Counter for rotation
-    profitProtection: { safeBalance: 0 }, 
+    currentSeed: "pro" + Math.random().toString(36).substring(2, 12),
+    betsSinceSeedChange: 0,
     stats: {
         totalBets: 0,
         wins: 0,
@@ -61,21 +60,17 @@ function calculateScaledBase(balance) {
     return Number((Math.max(1, units) * DEFAULTS.betIncrement).toFixed(8));
 }
 
-function resetSession() {
-    botState.statusMessage = "REBOOTING: Floor Hit or Safety Triggered.";
-    botState.recoveryPot = 0;
-    botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
-    botState.settings.currentBet = botState.settings.baseBet;
-}
-
 // ============ API LOGIC ============
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
+    
+    // STRATEGY: Alternate Under/Over every bet to increase variety/win chance
+    const side = botState.stats.totalBets % 2 === 0;
 
     const payload = { 
         Bet: Number(botState.settings.currentBet.toFixed(8)), 
         Payout: botState.settings.payout, 
-        UnderOver: true, 
+        UnderOver: side, 
         ClientSeed: botState.currentSeed 
     };
 
@@ -90,16 +85,16 @@ async function placeBet() {
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = "Safety-Capped Recovery Active";
+    botState.statusMessage = "High Win-Rate Mode Active (66%)";
     
     while (true) {
-        // --- SEED ROTATION LOGIC (CHANGED TO 10) ---
+        // --- SEED ROTATION (Every 10 Bets) ---
         if (botState.betsSinceSeedChange >= 10) {
             botState.currentSeed = "pro" + Math.random().toString(36).substring(2, 12);
             botState.betsSinceSeedChange = 0;
         }
 
-        // SAFETY: If pot is too huge compared to balance, kill the pot to prevent liquidation
+        // SAFETY: Pot Cap
         if (botState.recoveryPot > (botState.stats.currentBalance * DEFAULTS.potSafetyLimit)) {
             botState.statusMessage = "Pot Safety Triggered: Resetting to Base.";
             botState.recoveryPot = 0;
@@ -112,7 +107,7 @@ async function runStrategy() {
         }
 
         botState.stats.totalBets++;
-        botState.betsSinceSeedChange++; // Increment rotation counter
+        botState.betsSinceSeedChange++;
         
         const profit = result.Profit || 0;
         botState.stats.netProfit += profit;
@@ -122,13 +117,16 @@ async function runStrategy() {
 
         if (profit > 0) {
             botState.stats.wins++;
+            // Reduce pot by actual profit gained
             botState.recoveryPot -= profit;
             if (botState.recoveryPot < 0) botState.recoveryPot = 0;
         } else {
             botState.stats.losses++;
-            botState.recoveryPot += (Math.abs(profit) * 0.8);
+            // Add 90% of loss to pot (slightly higher for lower payout recovery)
+            botState.recoveryPot += (Math.abs(profit) * 0.9);
         }
 
+        // --- CALCULATE NEXT BET ---
         let recoveryPart = botState.recoveryPot / DEFAULTS.recoveryDivisor;
         let targetBet = botState.settings.baseBet + recoveryPart;
 
@@ -159,7 +157,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.8 | Original Design</title>
+    <title>Dice Pro v3.8 | High Win Rate Edition</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
