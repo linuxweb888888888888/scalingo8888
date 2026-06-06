@@ -6,7 +6,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION (Efficient Scaling v3.9.1) ============
-const API_KEY = process.env.API_KEY || "uVGG7F3K9Lib69b8H7g216G932YUwCp4M1A7fJfWhNJ9VcMGwg";
+const API_KEY = process.env.API_KEY || "885aP8IKvVJu9R7wAgyThBFCSnlu3Y6ZTMhRa8f8D21jbEihDv";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
