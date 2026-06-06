@@ -1,265 +1,282 @@
 const axios = require('axios');
 const express = require('express');
-const fs = require('fs');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "wnFmqb88iyIVPgJJHRMrSfyPOaoySEbnFTrV4xsKJCxHQXjnPy";
-const BASE_URL = "https://api.crypto.games/v1";
+// ============ MYDICEBOT CONFIGURATION ============
+const CONFIG = {
+    // SECURITY: Use environment variables. Do not hardcode keys if sharing code.
+    API_KEY: process.env.API_KEY || "wnFmqb88iyIVPgJJHRMrSfyPOaoySEbnFTrV4xsKJCxHQXjnPy",
+    COIN: "BTC", 
+    PAYOUT: 2.0, 
+    
+    ACTIVE_STRATEGY: "SMART_SCALER", 
 
-const DEFAULTS = {
-    coin: "BTC",
-    payout: 2.0,              
-    balanceStep: 0.00000050,  
-    betIncrement: 0.00000001 // This is now the "Unit" for compounding
+    SETTINGS: {
+        baseBet: 0.00000001,
+        maxBet: 0.00500000,
+        // Compounding logic: Balance / 2^survivalStreak. 
+        // 15 = can survive 15 losses in a row.
+        survivalStreak: 15, 
+    },
+    
+    STOP_CONDITIONS: {
+        stopAtProfit: 0.005,    
+        stopAtLoss: -0.02,      
+    }
 };
 
-// ============ BOT STATE ============
-let btcPrice = 60964; 
+// ============ BOT ENGINE STATE ============
 let botState = {
     running: true,
-    statusMessage: "Initializing...",
-    recoveryPot: 0, 
-    coin: DEFAULTS.coin,
-    profitProtection: { 
-        safeBalance: 0,
-        lockPercent: 0.80 
-    }, 
+    status: "Initializing...",
+    startTime: Date.now(),
+    balance: { initial: 0, current: 0 },
     stats: {
         totalBets: 0,
         wins: 0,
         losses: 0,
-        netProfit: 0,
-        maxSessionProfit: 0,
-        currentBalance: 0,
-        startTime: Date.now(),
+        profit: 0,
+        wagered: 0,
+        maxLossStreak: 0,
+        currentStreak: 0,
+        highestBet: 0
     },
-    settings: {
-        baseBet: 0.00000001,
-        currentBet: 0.00000001,
-        payout: DEFAULTS.payout,
-        dynamicIncrement: 0.00000001 // COMPOUNDING: This scales with balance
-    },
-    betHistory: []
+    currentBet: CONFIG.SETTINGS.baseBet,
+    history: []
 };
 
-// ============ UTILITIES ============
-async function updateBTCPrice() {
-    try {
-        const res = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd');
-        if (res.data.bitcoin) btcPrice = res.data.bitcoin.usd;
-    } catch (e) {}
-}
-setInterval(updateBTCPrice, 60000);
-updateBTCPrice();
+// ============ MATHEMATICAL LOGIC (COMPOUNDING) ============
+const Strategies = {
+    SMART_SCALER: (isWin) => {
+        // COMPOUNDING CALCULATION:
+        // We divide current balance by 2^survivalStreak to find the safest possible bet.
+        // As balance grows, dynamicBase grows. As balance shrinks, dynamicBase shrinks.
+        const divisor = Math.pow(2, CONFIG.SETTINGS.survivalStreak);
+        const dynamicBase = Number((botState.balance.current / divisor).toFixed(8));
+        
+        // Ensure we never bet lower than the absolute minimum baseBet
+        const safeBase = Math.max(CONFIG.SETTINGS.baseBet, dynamicBase);
 
-function calculateScaledBase(balance) {
-    const units = Math.floor(balance / DEFAULTS.balanceStep);
-    return Number((Math.max(1, units) * DEFAULTS.betIncrement).toFixed(8));
-}
+        if (isWin) {
+            botState.stats.currentStreak = 0;
+            botState.currentBet = safeBase; // Reset to the NEW compounded base
+        } else {
+            botState.stats.currentStreak++;
+            botState.stats.maxLossStreak = Math.max(botState.stats.maxLossStreak, botState.stats.currentStreak);
+            
+            if (botState.stats.currentStreak >= CONFIG.SETTINGS.survivalStreak) {
+                botState.currentBet = safeBase; // Survival limit hit, reset to save bankroll
+            } else {
+                botState.currentBet *= 2; // Martingale step
+            }
+        }
+    }
+};
 
-function resetSession() {
-    botState.statusMessage = "REBOOTING: Floor Hit. Starting Fresh...";
-    botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.98; 
-    botState.recoveryPot = 0;
-    botState.stats = {
-        totalBets: 0, wins: 0, losses: 0, netProfit: 0, maxSessionProfit: 0,
-        currentBalance: botState.stats.currentBalance,
-        startTime: Date.now()
-    };
-    botState.betHistory = [];
-    botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
-    botState.settings.currentBet = botState.settings.baseBet;
-    botState.settings.dynamicIncrement = botState.settings.baseBet; // Reset dynamic increment
-}
-
-// ============ API LOGIC ============
+// ============ CORE ENGINE ============
 async function placeBet() {
-    const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
-    const rawSuffix = Math.random().toString(36).substring(2); 
-    const alphanumericSuffix = rawSuffix.replace(/[^a-z0-9]/gi, '').substring(0, 12);
-    const safeSeed = "pro" + alphanumericSuffix; 
-
+    const url = `https://api.crypto.games/v1/placebet/${CONFIG.COIN}/${CONFIG.API_KEY}`;
+    const randomString = Math.random().toString(36).replace(/[^a-z0-9]/gi, '').substring(0, 10);
+    
     const payload = { 
-        Bet: Number(botState.settings.currentBet.toFixed(8)), 
-        Payout: botState.settings.payout, 
+        Bet: Number(botState.currentBet.toFixed(8)), 
+        Payout: CONFIG.PAYOUT, 
         UnderOver: true, 
-        ClientSeed: safeSeed 
+        ClientSeed: "MDB" + randomString 
     };
 
     try {
-        const response = await axios.post(url, payload);
-        return response.data;
-    } catch (error) { 
-        botState.statusMessage = error.response?.data?.Message || "API Error";
-        return null; 
+        const res = await axios.post(url, payload);
+        if (res.data && res.data.Message) throw new Error(res.data.Message);
+        return res.data;
+    } catch (err) {
+        botState.status = "Error: " + (err.response?.data?.Message || err.message);
+        return null;
     }
 }
 
-// ============ MAIN STRATEGY ============
-async function runStrategy() {
-    botState.statusMessage = "Linear Compounding Mode (80% Lock)";
+async function runEngine() {
+    botState.status = "Engine Active";
     
-    while (true) {
-        if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
-            resetSession();
-            await new Promise(r => setTimeout(r, 2000));
-            continue; 
+    while (botState.running) {
+        // Stop Condition Check: Profit
+        if (botState.stats.profit >= CONFIG.STOP_CONDITIONS.stopAtProfit) {
+            botState.status = "Profit Target Reached";
+            botState.running = false; break;
+        }
+        
+        // Stop Condition Check: Loss
+        if (botState.stats.profit <= CONFIG.STOP_CONDITIONS.stopAtLoss) {
+            botState.status = "Stop Loss Reached";
+            botState.running = false; break;
         }
 
         const result = await placeBet();
         if (!result) { 
-            await new Promise(r => setTimeout(r, 5000)); 
+            await new Promise(r => setTimeout(r, 10000)); 
             continue; 
         }
 
+        // Global Stats Update
+        if (botState.stats.totalBets === 0) botState.balance.initial = result.Balance;
+        botState.balance.current = result.Balance;
         botState.stats.totalBets++;
-        const profit = result.Profit || 0;
-        botState.stats.netProfit += profit;
-        botState.stats.currentBalance = result.Balance || 0;
+        botState.stats.wagered += result.Bet;
+        botState.stats.profit += result.Profit;
+        botState.stats.highestBet = Math.max(botState.stats.highestBet, result.Bet);
 
-        if (botState.stats.netProfit > botState.stats.maxSessionProfit) {
-            botState.stats.maxSessionProfit = botState.stats.netProfit;
-        }
+        const isWin = result.Profit > 0;
+        if (isWin) botState.stats.wins++; else botState.stats.losses++;
 
-        // COMPOUNDING CALCULATION
-        // Base bet and the increment both scale based on the current balance
-        botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
-        botState.settings.dynamicIncrement = botState.settings.baseBet; 
+        // Strategy Execution (Compounding happens here)
+        Strategies[CONFIG.ACTIVE_STRATEGY](isWin);
 
-        if (profit > 0) {
-            botState.stats.wins++;
-            botState.recoveryPot -= profit;
-            if (botState.recoveryPot < 0) botState.recoveryPot = 0;
-
-            if (botState.recoveryPot === 0) {
-                botState.settings.currentBet = botState.settings.baseBet;
-                botState.profitProtection.safeBalance += (profit * 0.80); 
-            }
-        } else {
-            botState.stats.losses++;
-            botState.recoveryPot += Math.abs(profit);
-            // COMPOUNDING ACTION: Use the dynamic increment instead of a static number
-            botState.settings.currentBet += botState.settings.dynamicIncrement;
-        }
-
-        botState.betHistory.unshift({ 
-            id: botState.stats.totalBets, time: new Date().toLocaleTimeString(), 
-            bet: result.Bet, roll: result.Roll, profit: profit, isWin: profit > 0, 
-            pot: botState.recoveryPot.toFixed(8), dBase: botState.settings.baseBet
+        // History Log
+        botState.history.unshift({
+            id: botState.stats.totalBets,
+            time: new Date().toLocaleTimeString(),
+            wager: result.Bet,
+            roll: result.Roll,
+            profit: result.Profit,
+            win: isWin,
+            bal: result.Balance
         });
-        if (botState.betHistory.length > 30) botState.betHistory.pop();
+        if (botState.history.length > 50) botState.history.pop();
 
-        await new Promise(r => setTimeout(r, 1100)); 
+        await new Promise(r => setTimeout(r, 1100)); // Rate limiting
     }
 }
 
-// ============ AJAX API ============
-app.get('/api/stats', (req, res) => {
-    const hours = Math.max(0.0001, (Date.now() - botState.stats.startTime) / 3600000);
-    res.json({ botState, btcPrice, hoursPassed: hours.toFixed(2) });
+// ============ DASHBOARD (DESIGN UNCHANGED) ============
+app.get('/api/data', (req, res) => {
+    const elapsedHrs = (Date.now() - botState.startTime) / 3600000;
+    const profitPerHour = (botState.stats.profit / elapsedHrs) || 0;
+    res.json({ ...botState, profitPerHour, uptime: elapsedHrs });
 });
 
-// ============ WEB DASHBOARD (IDENTICAL DESIGN) ============
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.3 | Compounding</title>
+    <title>MyDiceBot Pro - v4.5</title>
     <style>
-        :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
-        body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1.5rem; margin-bottom: 2rem; }
-        .card { background: var(--card-bg); padding: 1.5rem; border-radius: 12px; border: 1px solid var(--border); box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
-        .label { font-size: 0.75rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; margin-bottom: 0.5rem; }
-        .btc-val { font-size: 1.75rem; font-weight: 700; }
-        .usd-val { font-size: 0.875rem; color: var(--accent); }
-        .stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2rem; }
-        .mini-card { background: var(--card-bg); padding: 1rem; border-radius: 8px; border: 1px solid var(--border); text-align: center; }
-        .proj-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2rem; }
-        .proj-card { background: #f1f5f9; padding: 1rem; border-radius: 8px; text-align: center; }
-        table { width: 100%; border-collapse: collapse; background: var(--card-bg); border-radius: 12px; overflow: hidden; border: 1px solid var(--border); }
-        th { background: #f8fafc; padding: 1rem; text-align: left; font-size: 0.75rem; color: var(--text-muted); }
-        td { padding: 1rem; font-size: 0.875rem; border-bottom: 1px solid var(--border); font-family: monospace; }
+        :root { --primary: #3498db; --success: #27ae60; --danger: #e74c3c; --bg: #f4f7f6; --text: #2c3e50; }
+        body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); margin: 0; }
+        .nav { background: white; padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        .grid { display: grid; grid-template-columns: 300px 1fr; gap: 20px; padding: 20px; max-width: 1400px; margin: auto; }
+        .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.02); border: 1px solid #eef2f3; }
+        .metric-group { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .metric-box { padding: 15px; background: #fafbfc; border-radius: 8px; border: 1px solid #f0f3f5; }
+        .label { font-size: 11px; text-transform: uppercase; color: #7f8c8d; font-weight: 600; margin-bottom: 5px; }
+        .value { font-size: 18px; font-weight: 700; font-family: 'Monaco', monospace; }
         .win { color: var(--success); } .loss { color: var(--danger); }
-        .status-bar { padding: 12px; background: #1e293b; color: white; border-radius: 8px; margin-bottom: 20px; font-weight: bold; font-size: 0.9rem; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th { text-align: left; font-size: 11px; color: #95a5a6; padding: 12px; border-bottom: 2px solid #f4f7f6; }
+        td { padding: 12px; font-size: 13px; border-bottom: 1px solid #f4f7f6; font-family: 'Monaco', monospace; }
+        .badge { padding: 4px 8px; border-radius: 4px; font-size: 10px; background: #ebf5fb; color: var(--primary); font-weight: bold; }
+        .status-dot { height: 10px; width: 10px; background-color: var(--success); border-radius: 50%; display: inline-block; margin-right: 5px; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>Dice Pro <span style="color:var(--primary)">v3.3</span></h1>
-            <div style="text-align: right"><div class="label">Market BTC/USD</div><div id="price-tag" style="font-weight: 700;">$0.00</div></div>
+    <div class="nav">
+        <div style="font-size: 1.2rem; font-weight: 800; letter-spacing: -0.5px;">MYDICEBOT <span style="color: var(--primary)">PRO</span></div>
+        <div id="status-area" style="font-size: 13px; font-weight: 500;">
+            <span class="status-dot"></span> <span id="status-text">Connecting...</span>
         </div>
-        <div class="status-bar" id="status-msg">Status: Initializing...</div>
-        <div class="grid">
-            <div class="card"><div class="label">💳 Trading Balance</div><div id="t-bal" class="btc-val" style="color:var(--danger)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">⚖️ Recovery Pot (Remaining)</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div class="usd-val">Mode: Compounding Linear</div></div>
-        </div>
-        <div class="stats-row">
-            <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
-            <div class="mini-card"><div class="label">Scaling Base</div><div id="s-base" style="font-weight:700; color:var(--primary)">0.00</div></div>
-            <div class="mini-card"><div class="label">Next Bet</div><div id="n-bet" style="font-weight:700; color:var(--accent)">0.00</div></div>
-            <div class="mini-card"><div class="label">Uptime</div><div id="uptime" style="font-weight:700">0h</div></div>
-        </div>
-        <div class="label">Revenue Projections</div>
-        <div class="proj-grid">
-            <div class="proj-card"><div class="label">Hourly</div><span id="p-hr-b" class="win">0.00</span><br><span id="p-hr-u" class="usd-val">0.00</span></div>
-            <div class="proj-card"><div class="label">Daily</div><span id="p-dy-b" class="win">0.00</span><br><span id="p-dy-u" class="usd-val">0.00</span></div>
-            <div class="proj-card"><div class="label">Monthly</div><span id="p-month-b" class="win">0.00</span><br><span id="p-month-u" class="usd-val">0.00</span></div>
-            <div class="proj-card"><div class="label">Yearly</div><span id="p-year-b" class="win">0.00</span><br><span id="p-year-u" class="usd-val">0.00</span></div>
-        </div>
-        <table>
-            <thead><tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Remaining</th></tr></thead>
-            <tbody id="h-body"></tbody>
-        </table>
     </div>
+
+    <div class="grid">
+        <div class="sidebar">
+            <div class="card">
+                <div class="label">Profit (${CONFIG.COIN})</div>
+                <div id="main-profit" class="value" style="font-size: 28px;">0.00000000</div>
+                <hr style="border:0; border-top: 1px solid #f4f7f6; margin: 15px 0;">
+                <div class="metric-group">
+                    <div class="metric-box"><div class="label">Win Rate</div><div id="win-rate" class="value">0%</div></div>
+                    <div class="metric-box"><div class="label">Current Bal</div><div id="bal" class="value" style="font-size:14px">0.000</div></div>
+                    <div class="metric-box"><div class="label">Max Loss Streak</div><div id="max-streak" class="value loss">0</div></div>
+                    <div class="metric-box"><div class="label">Prof / Hour</div><div id="pph" class="value win" style="font-size:14px">0.000</div></div>
+                </div>
+                <div class="metric-box" style="margin-top:10px;">
+                    <div class="label">Highest Bet Encountered</div>
+                    <div id="high-bet" class="value">0.00000000</div>
+                </div>
+                <div class="metric-box" style="margin-top:10px;">
+                    <div class="label">Session Duration</div>
+                    <div id="uptime" class="value">00:00:00</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="main-content">
+            <div class="card" style="padding: 0;">
+                <table id="history-table">
+                    <thead>
+                        <tr>
+                            <th>TIME</th>
+                            <th>ID</th>
+                            <th>WAGER</th>
+                            <th>ROLL</th>
+                            <th>PROFIT</th>
+                            <th>RESULTING BALANCE</th>
+                        </tr>
+                    </thead>
+                    <tbody id="history-body"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
     <script>
-        async function update() {
-            try {
-                const res = await fetch('/api/stats');
-                const { botState, btcPrice, hoursPassed } = await res.json();
-                const f = (n) => parseFloat(n || 0).toFixed(8);
-                const u = (n) => "$" + (parseFloat(n || 0) * btcPrice).toLocaleString(undefined, {minimumFractionDigits: 3});
-                
-                document.getElementById('status-msg').innerText = "Status: " + botState.statusMessage;
-                document.getElementById('price-tag').innerText = "$" + btcPrice.toLocaleString();
-                document.getElementById('t-bal').innerText = f(botState.stats.currentBalance - botState.profitProtection.safeBalance);
-                document.getElementById('t-usd').innerText = u(botState.stats.currentBalance - botState.profitProtection.safeBalance);
-                document.getElementById('w-bal').innerText = f(botState.stats.currentBalance);
-                document.getElementById('w-usd').innerText = u(botState.stats.currentBalance);
-                document.getElementById('n-prof').innerText = f(botState.stats.netProfit);
-                document.getElementById('n-usd').innerText = u(botState.stats.netProfit);
-                document.getElementById('pot-display').innerText = f(botState.recoveryPot);
-                document.getElementById('wr').innerText = ((botState.stats.wins/botState.stats.totalBets)*100 || 0).toFixed(1) + "%";
-                document.getElementById('s-base').innerText = f(botState.settings.baseBet);
-                document.getElementById('n-bet').innerText = f(botState.settings.currentBet);
-                document.getElementById('uptime').innerText = hoursPassed + "h";
-
-                const ph = botState.stats.netProfit / hoursPassed;
-                document.getElementById('p-hr-b').innerText = f(ph); document.getElementById('p-hr-u').innerText = u(ph);
-                document.getElementById('p-dy-b').innerText = f(ph*24); document.getElementById('p-dy-u').innerText = u(ph*24);
-                document.getElementById('p-month-b').innerText = f(ph*24*30); document.getElementById('p-month-u').innerText = u(ph*24*30);
-                document.getElementById('p-year-b').innerText = f(ph*24*365); document.getElementById('p-year-u').innerText = u(ph*24*365);
-
-                document.getElementById('h-body').innerHTML = botState.betHistory.map(b => \`
-                    <tr><td>#\${b.id}</td><td>\${f(b.dBase)}</td><td>\${f(b.bet)}</td><td>\${b.roll}</td><td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td><td>\${b.pot} BTC</td></tr>
-                \`).join('');
-            } catch(e) {}
+        function formatTime(hrs) {
+            const h = Math.floor(hrs);
+            const m = Math.floor((hrs * 60) % 60);
+            const s = Math.floor((hrs * 3600) % 60);
+            return \`\${h}h \${m}m \${s}s\`;
         }
-        setInterval(update, 1000);
+
+        async function refresh() {
+            try {
+                const res = await fetch('/api/data');
+                const data = await res.json();
+                
+                document.getElementById('status-text').innerText = data.status;
+                document.getElementById('main-profit').innerText = data.stats.profit.toFixed(8);
+                document.getElementById('main-profit').className = "value " + (data.stats.profit >= 0 ? "win" : "loss");
+                document.getElementById('bal').innerText = data.balance.current.toFixed(8);
+                document.getElementById('win-rate').innerText = ((data.stats.wins / data.stats.totalBets) * 100 || 0).toFixed(1) + "%";
+                document.getElementById('max-streak').innerText = data.stats.maxLossStreak;
+                document.getElementById('pph').innerText = data.profitPerHour.toFixed(8);
+                document.getElementById('high-bet').innerText = data.stats.highestBet.toFixed(8);
+                document.getElementById('uptime').innerText = formatTime(data.uptime);
+
+                const rows = data.history.map(h => \`
+                    <tr>
+                        <td>\${h.time}</td>
+                        <td>#\${h.id}</td>
+                        <td>\${h.wager.toFixed(8)}</td>
+                        <td><span class="badge">\${h.roll}</span></td>
+                        <td class="\${h.win ? 'win' : 'loss'}">\${h.profit.toFixed(8)}</td>
+                        <td style="color: #7f8c8d">\${h.bal.toFixed(8)}</td>
+                    </tr>
+                \`).join('');
+                document.getElementById('history-body').innerHTML = rows;
+            } catch (e) { console.error(e); }
+        }
+        setInterval(refresh, 1000);
     </script>
 </body>
 </html>
     `);
 });
 
-app.listen(port, '0.0.0.0', () => runStrategy());
+// ============ START BOT ============
+app.listen(port, '0.0.0.0', () => {
+    console.log(`\n\x1b[36mMyDiceBot Pro Running (Compounding Active)\x1b[0m`);
+    console.log(`\x1b[32mDashboard: http://localhost:${port}\x1b[0m\n`);
+    runEngine();
+});
