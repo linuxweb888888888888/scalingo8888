@@ -39,7 +39,8 @@ let botState = {
     settings: {
         baseBet: 0.00000001,
         currentBet: 0.00000001,
-        payout: DEFAULTS.payout
+        payout: DEFAULTS.payout,
+        clientSeed: "pro" + Math.random().toString(36).substring(2, 12) // Initial Seed
     },
     betHistory: []
 };
@@ -69,13 +70,12 @@ function resetSession() {
 // ============ API LOGIC ============
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
-    const safeSeed = "pro" + Math.random().toString(36).substring(2, 12); 
 
     const payload = { 
         Bet: Number(botState.settings.currentBet.toFixed(8)), 
         Payout: botState.settings.payout, 
         UnderOver: true, 
-        ClientSeed: safeSeed 
+        ClientSeed: botState.settings.clientSeed // Uses the persistent seed
     };
 
     try {
@@ -92,7 +92,14 @@ async function runStrategy() {
     botState.statusMessage = "Safety-Capped Recovery Active";
     
     while (true) {
-        // SAFETY: If pot is too huge compared to balance, kill the pot to prevent liquidation
+        // --- AUTO RESEED LOGIC ---
+        // Every 50 bets, generate a new client seed
+        if (botState.stats.totalBets > 0 && botState.stats.totalBets % 50 === 0) {
+            botState.settings.clientSeed = "pro" + Math.random().toString(36).substring(2, 12);
+            botState.statusMessage = "Auto-Reseed Triggered (50 Bets)";
+        }
+
+        // SAFETY: If pot is too huge compared to balance, kill the pot
         if (botState.recoveryPot > (botState.stats.currentBalance * DEFAULTS.potSafetyLimit)) {
             botState.statusMessage = "Pot Safety Triggered: Resetting to Base.";
             botState.recoveryPot = 0;
@@ -117,15 +124,12 @@ async function runStrategy() {
             if (botState.recoveryPot < 0) botState.recoveryPot = 0;
         } else {
             botState.stats.losses++;
-            // DAMPENING: Only add 80% of loss to pot to slow down escalation
             botState.recoveryPot += (Math.abs(profit) * 0.8);
         }
 
-        // --- CALCULATE NEXT BET WITH STRICT CAPS ---
         let recoveryPart = botState.recoveryPot / DEFAULTS.recoveryDivisor;
         let targetBet = botState.settings.baseBet + recoveryPart;
 
-        // FINAL SAFETY CHECK: Never exceed 1.5% of total balance
         let absoluteMax = botState.stats.currentBalance * DEFAULTS.maxTotalBetPercent;
         botState.settings.currentBet = Math.min(targetBet, absoluteMax);
 
