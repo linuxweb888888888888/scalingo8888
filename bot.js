@@ -7,31 +7,31 @@ const port = process.env.PORT || 3000;
 // ============ MYDICEBOT CONFIGURATION ============
 const CONFIG = {
     API_KEY: process.env.API_KEY || "wnFmqb88iyIVPgJJHRMrSfyPOaoySEbnFTrV4xsKJCxHQXjnPy",
-    COIN: "BTC", // BTC, ETH, DOGE, LTC, etc.
-    PAYOUT: 2.0,
+    COIN: "BTC", 
+    PAYOUT: 2.0, 
     
-    // STRATEGY SELECTION: "MARTINGALE", "ALEMBERT", "FIBONACCI", "LABOUCHERE", "OSCARS_GRIND"
-    ACTIVE_STRATEGY: "ALEMBERT", 
+    // MATHEMATICAL STRATEGY: SMART_SCALER
+    // Automatically adjusts bets based on your balance to survive long streaks.
+    ACTIVE_STRATEGY: "SMART_SCALER", 
 
     SETTINGS: {
         baseBet: 0.00000001,
-        maxBet: 0.00100000,
-        unit: 0.00000001,                // Used for D'Alembert and Oscar's Grind
-        labouchereSequence: [1, 2, 3],   // Initial sequence for Labouchere
+        maxBet: 0.00500000,
+        // How many losses in a row do you want to survive? (14-16 is recommended for 2x payout)
+        survivalStreak: 15, 
     },
     
     STOP_CONDITIONS: {
-        stopAtProfit: 0.005,    // Stop if profit reaches this
-        stopAtLoss: -0.01,      // Stop if loss reaches this
+        stopAtProfit: 0.005,    
+        stopAtLoss: -0.02,      
     }
 };
 
 // ============ BOT ENGINE STATE ============
 let botState = {
     running: true,
-    status: "Initializing",
+    status: "Initializing...",
     startTime: Date.now(),
-    btcPrice: 0,
     balance: { initial: 0, current: 0 },
     stats: {
         totalBets: 0,
@@ -39,88 +39,42 @@ let botState = {
         losses: 0,
         profit: 0,
         wagered: 0,
+        maxLossStreak: 0,
+        currentStreak: 0,
+        highestBet: 0
     },
     currentBet: CONFIG.SETTINGS.baseBet,
-    history: [],
-    // Strategy Internal States
-    internal: {
-        fibIndex: 0,
-        labSequence: [...CONFIG.SETTINGS.labouchereSequence],
-        oscarUnit: 1,
-        oscarCycleProfit: 0
-    }
+    history: []
 };
 
-// ============ STRATEGY LOGIC ============
+// ============ MATHEMATICAL LOGIC ============
 const Strategies = {
-    MARTINGALE: (isWin) => {
+    SMART_SCALER: (isWin) => {
+        // Calculate the "Safe Base" (Balance divided by 2 to the power of survival streak)
+        // This ensures math-wise that we can lose X times before hitting 0.
+        const divisor = Math.pow(2, CONFIG.SETTINGS.survivalStreak);
+        const dynamicBase = Math.max(CONFIG.SETTINGS.baseBet, botState.balance.current / divisor);
+
         if (isWin) {
-            botState.currentBet = CONFIG.SETTINGS.baseBet;
+            botState.stats.currentStreak = 0;
+            botState.currentBet = dynamicBase;
         } else {
-            botState.currentBet *= 2;
-        }
-    },
-
-    ALEMBERT: (isWin) => {
-        if (isWin) {
-            botState.currentBet = Math.max(CONFIG.SETTINGS.baseBet, botState.currentBet - CONFIG.SETTINGS.unit);
-        } else {
-            botState.currentBet += CONFIG.SETTINGS.unit;
-        }
-    },
-
-    FIBONACCI: (isWin) => {
-        const fib = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377];
-        if (isWin) {
-            botState.internal.fibIndex = Math.max(0, botState.internal.fibIndex - 2);
-        } else {
-            botState.internal.fibIndex++;
-        }
-        const mult = fib[botState.internal.fibIndex] || fib[fib.length - 1];
-        botState.currentBet = CONFIG.SETTINGS.baseBet * mult;
-    },
-
-    LABOUCHERE: (isWin) => {
-        let seq = botState.internal.labSequence;
-        if (seq.length === 0) seq = [...CONFIG.SETTINGS.labouchereSequence];
-
-        if (isWin) {
-            seq.shift();
-            seq.pop();
-            if (seq.length === 0) seq = [...CONFIG.SETTINGS.labouchereSequence];
-        } else {
-            const lastBetUnits = (seq[0] || 0) + (seq[seq.length - 1] || 0);
-            seq.push(lastBetUnits || 1);
-        }
-        
-        botState.internal.labSequence = seq;
-        const nextUnits = seq.length > 1 ? seq[0] + seq[seq.length - 1] : seq[0];
-        botState.currentBet = CONFIG.SETTINGS.baseBet * (nextUnits || 1);
-    },
-
-    OSCARS_GRIND: (isWin) => {
-        const unit = CONFIG.SETTINGS.unit;
-        if (isWin) {
-            botState.internal.oscarCycleProfit += (botState.currentBet * (CONFIG.PAYOUT - 1));
-            if (botState.internal.oscarCycleProfit >= unit) {
-                // Cycle complete
-                botState.internal.oscarCycleProfit = 0;
-                botState.internal.oscarUnit = 1;
+            botState.stats.currentStreak++;
+            botState.stats.maxLossStreak = Math.max(botState.stats.maxLossStreak, botState.stats.currentStreak);
+            
+            // If we hit our survival limit, reset to base to save the remaining bankroll
+            if (botState.stats.currentStreak >= CONFIG.SETTINGS.survivalStreak) {
+                botState.currentBet = dynamicBase;
             } else {
-                botState.internal.oscarUnit++;
+                botState.currentBet *= 2;
             }
-        } else {
-            botState.internal.oscarCycleProfit -= botState.currentBet;
         }
-        botState.currentBet = unit * botState.internal.oscarUnit;
     }
 };
 
 // ============ CORE ENGINE ============
 async function placeBet() {
     const url = `https://api.crypto.games/v1/placebet/${CONFIG.COIN}/${CONFIG.API_KEY}`;
-    
-    // FIX: ClientSeed must be ALPHANUMERIC ONLY (no underscores)
     const randomString = Math.random().toString(36).replace(/[^a-z0-9]/gi, '').substring(0, 10);
     
     const payload = { 
@@ -132,52 +86,45 @@ async function placeBet() {
 
     try {
         const res = await axios.post(url, payload);
+        if (res.data && res.data.Message) throw new Error(res.data.Message);
         return res.data;
     } catch (err) {
-        botState.status = "API Error: " + (err.response?.data?.Message || "Service Unavailable");
+        botState.status = "Error: " + (err.response?.data?.Message || err.message);
         return null;
     }
 }
 
 async function runEngine() {
-    botState.status = `Running ${CONFIG.ACTIVE_STRATEGY}...`;
+    botState.status = "Engine Active";
     
     while (botState.running) {
-        // 1. Check Stop Conditions
+        // Stop Condition Check
         if (botState.stats.profit >= CONFIG.STOP_CONDITIONS.stopAtProfit) {
-            botState.status = "Target Profit Reached.";
-            botState.running = false; break;
-        }
-        if (botState.stats.profit <= CONFIG.STOP_CONDITIONS.stopAtLoss) {
-            botState.status = "Stop Loss Hit.";
+            botState.status = "Profit Target Reached";
             botState.running = false; break;
         }
 
-        // 2. Execute Bet
         const result = await placeBet();
         if (!result) { 
-            await new Promise(r => setTimeout(r, 10000)); // Wait 10s on error
+            await new Promise(r => setTimeout(r, 10000)); 
             continue; 
         }
 
-        // 3. Update Balance & Stats
+        // Global Stats Update
         if (botState.stats.totalBets === 0) botState.balance.initial = result.Balance;
         botState.balance.current = result.Balance;
         botState.stats.totalBets++;
         botState.stats.wagered += result.Bet;
         botState.stats.profit += result.Profit;
+        botState.stats.highestBet = Math.max(botState.stats.highestBet, result.Bet);
 
         const isWin = result.Profit > 0;
         if (isWin) botState.stats.wins++; else botState.stats.losses++;
 
-        // 4. Run Strategy Logic
+        // Strategy Execution
         Strategies[CONFIG.ACTIVE_STRATEGY](isWin);
 
-        // 5. Safety Caps
-        if (botState.currentBet > CONFIG.SETTINGS.maxBet) botState.currentBet = CONFIG.SETTINGS.maxBet;
-        if (botState.currentBet > botState.balance.current) botState.currentBet = CONFIG.SETTINGS.baseBet;
-
-        // 6. Log to History
+        // History Log
         botState.history.unshift({
             id: botState.stats.totalBets,
             time: new Date().toLocaleTimeString(),
@@ -189,83 +136,130 @@ async function runEngine() {
         });
         if (botState.history.length > 50) botState.history.pop();
 
-        // 7. Rate Limit (approx 1 bet per second)
-        await new Promise(r => setTimeout(r, 1100));
+        await new Promise(r => setTimeout(r, 1100)); // Rate limiting
     }
 }
 
-// ============ DASHBOARD & API ============
-app.get('/api/data', (req, res) => res.json(botState));
+// ============ DASHBOARD ============
+app.get('/api/data', (req, res) => {
+    // Calculate extra metrics for the UI
+    const elapsedHrs = (Date.now() - botState.startTime) / 3600000;
+    const profitPerHour = (botState.stats.profit / elapsedHrs) || 0;
+    res.json({ ...botState, profitPerHour, uptime: elapsedHrs });
+});
 
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>MyDiceBot-Node v4.0</title>
+    <meta charset="UTF-8">
+    <title>MyDiceBot Pro - v4.5</title>
     <style>
-        body { font-family: 'Segoe UI', sans-serif; background: #0b0e11; color: #eaecef; margin: 0; display: flex; flex-direction: column; height: 100vh; }
-        .nav { background: #181a20; padding: 15px 30px; display: flex; justify-content: space-between; border-bottom: 1px solid #2b2f36; }
-        .container { display: grid; grid-template-columns: 320px 1fr; flex: 1; overflow: hidden; }
-        .sidebar { background: #181a20; padding: 20px; border-right: 1px solid #2b2f36; }
-        .main { padding: 20px; overflow-y: auto; }
-        .stat-card { background: #1e2329; padding: 15px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #f0b90b; }
-        .stat-val { font-size: 22px; font-weight: bold; color: #f0b90b; font-family: monospace; }
-        .win { color: #0ecb81 !important; } .loss { color: #f6465d !important; }
-        table { width: 100%; border-collapse: collapse; background: #181a20; border-radius: 8px; }
-        th { text-align: left; padding: 12px; color: #848e9c; font-size: 12px; text-transform: uppercase; }
-        td { padding: 12px; border-top: 1px solid #2b2f36; font-family: monospace; font-size: 13px; }
-        .badge { padding: 4px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; background: #2b2f36; }
+        :root { --primary: #3498db; --success: #27ae60; --danger: #e74c3c; --bg: #f4f7f6; --text: #2c3e50; }
+        body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); margin: 0; }
+        .nav { background: white; padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        .grid { display: grid; grid-template-columns: 300px 1fr; gap: 20px; padding: 20px; max-width: 1400px; margin: auto; }
+        .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.02); border: 1px solid #eef2f3; }
+        .metric-group { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .metric-box { padding: 15px; background: #fafbfc; border-radius: 8px; border: 1px solid #f0f3f5; }
+        .label { font-size: 11px; text-transform: uppercase; color: #7f8c8d; font-weight: 600; margin-bottom: 5px; }
+        .value { font-size: 18px; font-weight: 700; font-family: 'Monaco', monospace; }
+        .win { color: var(--success); } .loss { color: var(--danger); }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th { text-align: left; font-size: 11px; color: #95a5a6; padding: 12px; border-bottom: 2px solid #f4f7f6; }
+        td { padding: 12px; font-size: 13px; border-bottom: 1px solid #f4f7f6; font-family: 'Monaco', monospace; }
+        .badge { padding: 4px 8px; border-radius: 4px; font-size: 10px; background: #ebf5fb; color: var(--primary); font-weight: bold; }
+        .status-dot { height: 10px; width: 10px; background-color: var(--success); border-radius: 50%; display: inline-block; margin-right: 5px; }
     </style>
 </head>
 <body>
     <div class="nav">
-        <div style="font-weight: bold; font-size: 20px;">MyDiceBot <span style="color:#f0b90b">Pro</span></div>
-        <div id="status-text">Status: Starting...</div>
+        <div style="font-size: 1.2rem; font-weight: 800; letter-spacing: -0.5px;">MYDICEBOT <span style="color: var(--primary)">PRO</span></div>
+        <div id="status-area" style="font-size: 13px; font-weight: 500;">
+            <span class="status-dot"></span> <span id="status-text">Connecting...</span>
+        </div>
     </div>
-    <div class="container">
+
+    <div class="grid">
         <div class="sidebar">
-            <div class="stat-card"><div>Strategy</div><div class="stat-val" style="font-size:16px">${CONFIG.ACTIVE_STRATEGY}</div></div>
-            <div class="stat-card"><div>Profit (${CONFIG.COIN})</div><div id="p-btc" class="stat-val">0.00000000</div></div>
-            <div class="stat-card"><div>Current Balance</div><div id="balance" class="stat-val">0.00000000</div></div>
-            <div class="stat-card"><div>Win Rate</div><div id="wr" class="stat-val">0%</div></div>
-            <div class="stat-card"><div>Wagered</div><div id="wagered" class="stat-val">0.00000000</div></div>
+            <div class="card">
+                <div class="label">Profit (${CONFIG.COIN})</div>
+                <div id="main-profit" class="value" style="font-size: 28px;">0.00000000</div>
+                <hr style="border:0; border-top: 1px solid #f4f7f6; margin: 15px 0;">
+                <div class="metric-group">
+                    <div class="metric-box"><div class="label">Win Rate</div><div id="win-rate" class="value">0%</div></div>
+                    <div class="metric-box"><div class="label">Current Bal</div><div id="bal" class="value" style="font-size:14px">0.000</div></div>
+                    <div class="metric-box"><div class="label">Max Loss Streak</div><div id="max-streak" class="value loss">0</div></div>
+                    <div class="metric-box"><div class="label">Prof / Hour</div><div id="pph" class="value win" style="font-size:14px">0.000</div></div>
+                </div>
+                <div class="metric-box" style="margin-top:10px;">
+                    <div class="label">Highest Bet Encountered</div>
+                    <div id="high-bet" class="value">0.00000000</div>
+                </div>
+                <div class="metric-box" style="margin-top:10px;">
+                    <div class="label">Session Duration</div>
+                    <div id="uptime" class="value">00:00:00</div>
+                </div>
+            </div>
         </div>
-        <div class="main">
-            <table>
-                <thead><tr><th>ID</th><th>Wager</th><th>Roll</th><th>Profit</th><th>Balance</th></tr></thead>
-                <tbody id="hist-body"></tbody>
-            </table>
+
+        <div class="main-content">
+            <div class="card" style="padding: 0;">
+                <table id="history-table">
+                    <thead>
+                        <tr>
+                            <th>TIME</th>
+                            <th>ID</th>
+                            <th>WAGER</th>
+                            <th>ROLL</th>
+                            <th>PROFIT</th>
+                            <th>RESULTING BALANCE</th>
+                        </tr>
+                    </thead>
+                    <tbody id="history-body"></tbody>
+                </table>
+            </div>
         </div>
     </div>
+
     <script>
-        async function update() {
+        function formatTime(hrs) {
+            const h = Math.floor(hrs);
+            const m = Math.floor((hrs * 60) % 60);
+            const s = Math.floor((hrs * 3600) % 60);
+            return \`\${h}h \${m}m \${s}s\`;
+        }
+
+        async function refresh() {
             try {
-                const r = await fetch('/api/data');
-                const data = await r.json();
+                const res = await fetch('/api/data');
+                const data = await res.json();
                 
-                document.getElementById('status-text').innerText = "Status: " + data.status;
-                document.getElementById('p-btc').innerText = data.stats.profit.toFixed(8);
-                document.getElementById('p-btc').className = data.stats.profit >= 0 ? "stat-val win" : "stat-val loss";
-                document.getElementById('balance').innerText = data.balance.current.toFixed(8);
-                document.getElementById('wagered').innerText = data.stats.wagered.toFixed(8);
-                
-                const wr = (data.stats.wins / data.stats.totalBets * 100) || 0;
-                document.getElementById('wr').innerText = wr.toFixed(1) + "%";
+                document.getElementById('status-text').innerText = data.status;
+                document.getElementById('main-profit').innerText = data.stats.profit.toFixed(8);
+                document.getElementById('main-profit').className = "value " + (data.stats.profit >= 0 ? "win" : "loss");
+                document.getElementById('bal').innerText = data.balance.current.toFixed(8);
+                document.getElementById('win-rate').innerText = ((data.stats.wins / data.stats.totalBets) * 100 || 0).toFixed(1) + "%";
+                document.getElementById('max-streak').innerText = data.stats.maxLossStreak;
+                document.getElementById('pph').innerText = data.profitPerHour.toFixed(8);
+                document.getElementById('high-bet').innerText = data.stats.highestBet.toFixed(8);
+                document.getElementById('uptime').innerText = formatTime(data.uptime);
 
                 const rows = data.history.map(h => \`
                     <tr>
+                        <td>\${h.time}</td>
                         <td>#\${h.id}</td>
                         <td>\${h.wager.toFixed(8)}</td>
                         <td><span class="badge">\${h.roll}</span></td>
-                        <td class="\${h.win?'win':'loss'}">\${h.profit.toFixed(8)}</td>
-                        <td>\${h.bal.toFixed(8)}</td>
+                        <td class="\${h.win ? 'win' : 'loss'}">\${h.profit.toFixed(8)}</td>
+                        <td style="color: #7f8c8d">\${h.bal.toFixed(8)}</td>
                     </tr>
                 \`).join('');
-                document.getElementById('hist-body').innerHTML = rows;
-            } catch(e) {}
+                document.getElementById('history-body').innerHTML = rows;
+            } catch (e) { console.error(e); }
         }
-        setInterval(update, 1000);
+        setInterval(refresh, 1000);
     </script>
 </body>
 </html>
@@ -274,6 +268,7 @@ app.get('/', (req, res) => {
 
 // ============ START BOT ============
 app.listen(port, '0.0.0.0', () => {
-    console.log(`\x1b[32m[MyDiceBot] Dashboard: http://localhost:${port}\x1b[0m`);
+    console.log(`\n\x1b[36mMyDiceBot Pro Running\x1b[0m`);
+    console.log(`\x1b[32mDashboard: http://localhost:${port}\x1b[0m\n`);
     runEngine();
 });
