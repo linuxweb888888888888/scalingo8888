@@ -5,18 +5,18 @@ const fs = require('fs');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ============ CONFIGURATION (MAX PROFIT MODE) ============
+// ============ CONFIGURATION (1.2x HIGH WIN-RATE) ============
 const API_KEY = process.env.API_KEY || "QmmX28yULnLF784oJjDMiatV8MPhNAxK2aoKba0sjbwyCJ3PLP";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
-    payout: 1.5,               // High win-rate (66%)
-    balanceStep: 0.00000020,   // AGGRESSIVE: 1 unit per 20 sats (Was 50)
+    payout: 1.2,               // 82.5% Win Rate
+    balanceStep: 0.00000500,   // Conservative scaling for low payout
     betIncrement: 0.00000001,
-    recoveryDivisor: 5,        // AGGRESSIVE: Clear debt in ~5 wins (Was 12)
-    maxTotalBetPercent: 0.03,  // RISKIER: Max bet capped at 3% (Was 1.5%)
-    potSafetyLimit: 0.12       // SAFETY: Reset if debt > 12% of balance
+    recoveryDivisor: 40,       // IMPORTANT: Debt spread over 40 wins to stay safe
+    maxTotalBetPercent: 0.01,  // SAFETY: Max bet 1% of balance
+    potSafetyLimit: 0.05       // SAFETY: Reset if debt exceeds 5% of balance
 };
 
 // ============ BOT STATE ============
@@ -64,7 +64,7 @@ function calculateScaledBase(balance) {
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
     
-    // STRATEGY: Alternate Under/Over every bet
+    // Switch sides every bet to increase randomness coverage
     const side = botState.stats.totalBets % 2 === 0;
 
     const payload = { 
@@ -85,7 +85,7 @@ async function placeBet() {
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = "MAX PROFIT MODE: Aggressive Scaling Active";
+    botState.statusMessage = "Ultra-High Win Rate Mode Active (82%)";
     
     while (true) {
         // --- SEED ROTATION (Every 10 Bets) ---
@@ -94,9 +94,9 @@ async function runStrategy() {
             botState.betsSinceSeedChange = 0;
         }
 
-        // SAFETY: Pot Cap
+        // SAFETY: If pot hits 5% of balance, it's too dangerous. Reset.
         if (botState.recoveryPot > (botState.stats.currentBalance * DEFAULTS.potSafetyLimit)) {
-            botState.statusMessage = "Pot Safety Triggered: Resetting to Base.";
+            botState.statusMessage = "CRITICAL SAFETY: Debt Pot Reset to Save Balance.";
             botState.recoveryPot = 0;
         }
 
@@ -121,15 +121,19 @@ async function runStrategy() {
             if (botState.recoveryPot < 0) botState.recoveryPot = 0;
         } else {
             botState.stats.losses++;
-            // MAX PROFIT: Adding 95% of loss to pot for faster bounce-back
-            botState.recoveryPot += (Math.abs(profit) * 0.95);
+            // 1.2x Math: We add 98% of loss to pot for recovery
+            botState.recoveryPot += (Math.abs(profit) * 0.98);
         }
 
-        // --- AGGRESSIVE RECOVERY CALCULATION ---
-        let recoveryPart = botState.recoveryPot / DEFAULTS.recoveryDivisor;
-        let targetBet = botState.settings.baseBet + recoveryPart;
+        // --- 1.2x RECOVERY CALCULATION ---
+        // At 1.2x payout, we profit only 0.2 units per 1 unit wagered.
+        // Therefore, to clear 1 unit of debt, we must wager 5 units.
+        let recoveryTargetPerWin = botState.recoveryPot / DEFAULTS.recoveryDivisor;
+        let additionalWager = recoveryTargetPerWin / 0.2; 
+        
+        let targetBet = botState.settings.baseBet + additionalWager;
 
-        // Capped at 3% of balance for high-velocity profit
+        // Hard safety cap (1% of balance) to prevent account liquidation
         let absoluteMax = botState.stats.currentBalance * DEFAULTS.maxTotalBetPercent;
         botState.settings.currentBet = Math.min(targetBet, absoluteMax);
 
@@ -140,8 +144,8 @@ async function runStrategy() {
         });
         if (botState.betHistory.length > 30) botState.betHistory.pop();
 
-        // Speed optimized for Crypto.games limits
-        await new Promise(r => setTimeout(r, 700)); 
+        // Optimized speed for 1.2x volume
+        await new Promise(r => setTimeout(r, 850)); 
     }
 }
 
@@ -151,14 +155,14 @@ app.get('/api/stats', (req, res) => {
     res.json({ botState, btcPrice, hoursPassed: hours.toFixed(2) });
 });
 
-// ============ WEB DASHBOARD (ORIGINAL DESIGN) ============
+// ============ WEB DASHBOARD ============
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.8 | MAX PROFIT EDITION</title>
+    <title>Dice Pro v3.8 | Ultra-High Win Rate</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -191,7 +195,7 @@ app.get('/', (req, res) => {
             <div class="card"><div class="label">💳 Safe Tradable</div><div id="t-bal" class="btc-val" style="color:var(--primary)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">⚖️ Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--danger)">0.00</div><div class="usd-val">Capped at 3.0% Bal</div></div>
+            <div class="card"><div class="label">⚖️ Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--danger)">0.00</div><div class="usd-val">Capped at 1% Bal</div></div>
         </div>
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
