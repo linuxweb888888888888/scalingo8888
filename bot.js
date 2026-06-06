@@ -10,8 +10,8 @@ const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
-    multiplier: 2.0,          // Double bet on win to maximize the streak profit
-    payout: 2.0,              // 2.0x makes 1 Win = 1 Loss. Much easier to profit.
+    multiplier: 4.0,          // Double bet on win to maximize the streak profit
+    payout: 1.4,              // 2.0x makes 1 Win = 1 Loss. Much easier to profit.
     balanceStep: 0.00000050,  
     betIncrement: 0.00000005, // Slightly higher base to ensure profit growth
     maxBalanceRisk: 0.15      
