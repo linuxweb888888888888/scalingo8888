@@ -10,10 +10,10 @@ const BASE_URL = "https://api.crypto.games/v1";
 const DEFAULTS = {
     coin: "BTC",
     payout: 2.0,              
-    balanceStep: 0.00000010,  // Tightened for small balances
+    balanceStep: 0.00000010,  
     betIncrement: 0.00000001,
-    maxTotalBetPercent: 0.05,  // Increased to 5% to allow for fast recovery on small bal
-    potSafetyLimit: 0.20,      // 20% Safety Cap
+    maxTotalBetPercent: 0.06,  // Increased to 6% for aggressive small-balance recovery
+    potSafetyLimit: 0.25,      // 25% Safety Cap
     baseCooldown: 1050         
 };
 
@@ -21,9 +21,10 @@ const DEFAULTS = {
 let btcPrice = 60826; 
 let botState = {
     running: true,
-    statusMessage: "Apex Engine: Profit Extraction Active",
+    statusMessage: "Dual-Side Engine: Analyzing Trends",
     recoveryPot: 0, 
     winStreak: 0,
+    betUnder: true, // true = UNDER, false = OVER
     seedShifts: 0,
     coin: DEFAULTS.coin,
     rollValueHistory: [], 
@@ -54,20 +55,35 @@ updateBTCPrice();
 function calculateScaledBase(balance) {
     const units = Math.floor(balance / DEFAULTS.balanceStep);
     let base = Number((Math.max(1, units) * DEFAULTS.betIncrement).toFixed(8));
-    // Aggressive Growth: Inject 5% of session profit directly into the next base bet
+    // Aggressive Growth: 6% of session profit added to base
     if (botState.stats.netProfit > 0) {
-        base += (botState.stats.netProfit * 0.05);
+        base += (botState.stats.netProfit * 0.06);
     }
     return Math.max(0.00000001, Number(base.toFixed(8)));
 }
 
-function detectDangerZone() {
-    if (botState.rollValueHistory.length < 3) return false;
+// Logic to decide whether to switch UNDER or OVER
+function updateBettingSide() {
+    if (botState.rollValueHistory.length < 3) return;
+    
     const last3Rolls = botState.rollValueHistory.slice(-3);
-    // Since we bet UNDER 50, rolls over 55 are the danger cluster
-    const isHighCluster = last3Rolls.every(val => val > 55); 
-    const isLossStreak = botState.streakHistory.slice(-4).every(val => val === false);
-    return isHighCluster || isLossStreak;
+    const avg = last3Rolls.reduce((a, b) => a + b, 0) / 3;
+
+    // Trend Following: 
+    // If average is high, switch to OVER (false). If low, switch to UNDER (true).
+    if (avg > 55 && botState.betUnder === true) {
+        botState.betUnder = false;
+        botState.statusMessage = "🔄 TREND SHIFT: Switching to OVER";
+    } else if (avg < 45 && botState.betUnder === false) {
+        botState.betUnder = true;
+        botState.statusMessage = "🔄 TREND SHIFT: Switching to UNDER";
+    }
+}
+
+function detectDangerZone() {
+    if (botState.streakHistory.length < 4) return false;
+    // Trigger seed shift if 4 losses in a row
+    return botState.streakHistory.slice(-4).every(val => val === false);
 }
 
 // ============ API LOGIC ============
@@ -76,7 +92,7 @@ async function placeBet() {
     const payload = { 
         Bet: Number(botState.settings.currentBet.toFixed(8)), 
         Payout: botState.settings.payout, 
-        UnderOver: true, // Betting UNDER
+        UnderOver: botState.betUnder, 
         ClientSeed: botState.settings.clientSeed
     };
     try {
@@ -88,12 +104,13 @@ async function placeBet() {
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
     while (true) {
-        // INSTANT SEED ROTATION
+        updateBettingSide();
+
         if (detectDangerZone()) {
             botState.settings.clientSeed = "pro" + Math.random().toString(36).substring(2, 12);
             botState.seedShifts++;
             botState.streakHistory = [];
-            botState.statusMessage = "⚠️ PATTERN ALERT: Shifting Seed...";
+            botState.statusMessage = "⚠️ STREAK ALERT: Shifting Seed...";
         }
 
         const result = await placeBet();
@@ -120,34 +137,35 @@ async function runStrategy() {
             botState.stats.wins++;
             botState.winStreak++;
             botState.recoveryPot = Math.max(0, botState.recoveryPot - profit);
-            if (!botState.statusMessage.includes('⚠️')) {
-                botState.statusMessage = botState.winStreak > 2 ? `🚀 APEX STREAK: x${botState.winStreak}` : "Extracting Profit";
+            if (!botState.statusMessage.includes('🔄')) {
+                botState.statusMessage = "Profit Extracting...";
             }
         } else {
             botState.stats.losses++;
             botState.winStreak = 0;
-            // RECOVERY BOOST: Aim to recover 130% of the loss to flip the session to green
-            botState.recoveryPot += (Math.abs(profit) * 1.30);
-            if (!botState.statusMessage.includes('⚠️')) botState.statusMessage = "Hyper-Recovery Active";
+            // RECOVERY BOOST: 135% Recovery Surge
+            botState.recoveryPot += (Math.abs(profit) * 1.35);
+            botState.statusMessage = "Hyper-Recovery Active";
         }
 
-        // TIGHT DIVISORS FOR SMALL BALANCE (Lower = Faster Back-to-Green)
-        let divisor = 4.0; // Aggressive recovery strike
-        if (botState.recoveryPot > botState.stats.currentBalance * 0.05) divisor = 8.0;
-        if (botState.recoveryPot > botState.stats.currentBalance * 0.10) divisor = 15.0; 
+        // TIERED AGGRESSIVE DIVISORS
+        let divisor = 3.5; 
+        if (botState.recoveryPot > botState.stats.currentBalance * 0.05) divisor = 7.0;
+        if (botState.recoveryPot > botState.stats.currentBalance * 0.12) divisor = 12.0; 
 
         let recoveryPart = botState.recoveryPot / divisor;
         let targetBet = botState.settings.baseBet + recoveryPart;
 
-        // WIN COMPOUNDING
-        if (botState.winStreak >= 2) targetBet *= 1.25; 
+        // WIN COMPOUNDING (Profit Booster)
+        if (botState.winStreak >= 2) targetBet *= 1.30; 
 
         let absoluteMax = botState.stats.currentBalance * DEFAULTS.maxTotalBetPercent;
         botState.settings.currentBet = Math.min(targetBet, absoluteMax);
 
         botState.betHistory.unshift({ 
             id: botState.stats.totalBets, bet: result.Bet, roll: currentRoll, 
-            profit: profit, isWin: isWin, pot: botState.recoveryPot.toFixed(8)
+            profit: profit, isWin: isWin, pot: botState.recoveryPot.toFixed(8),
+            side: botState.betUnder ? "UNDER" : "OVER"
         });
         if (botState.betHistory.length > 25) botState.betHistory.pop();
 
@@ -167,7 +185,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v7.5 | Apex</title>
+    <title>Dice Pro v8.0 | Dual-Side Apex</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -179,38 +197,30 @@ app.get('/', (req, res) => {
         .btc-val { font-size: 1.75rem; font-weight: 700; }
         .usd-val { font-size: 0.875rem; color: var(--accent); }
         .status-bar { padding: 12px; background: #1e293b; color: white; border-radius: 8px; margin-bottom: 20px; font-weight: bold; font-size: 0.9rem; border-left: 5px solid var(--primary); }
-        .proj-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2rem; }
-        .proj-card { background: #f1f5f9; padding: 1rem; border-radius: 8px; text-align: center; }
         .roll-circles { display: flex; gap: 8px; }
         .roll-circle { width: 35px; height: 35px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 0.7rem; font-weight: bold; background: white; border: 2px solid var(--border); }
         table { width: 100%; border-collapse: collapse; background: var(--card-bg); border-radius: 12px; overflow: hidden; border: 1px solid var(--border); }
         th { background: #f8fafc; padding: 1rem; text-align: left; font-size: 0.75rem; color: var(--text-muted); }
         td { padding: 1rem; font-size: 0.875rem; border-bottom: 1px solid var(--border); font-family: monospace; }
         .win { color: var(--success); } .loss { color: var(--danger); }
+        .side-badge { padding: 2px 6px; border-radius: 4px; font-size: 0.7rem; font-weight: bold; background: #e2e8f0; color: #1e293b; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>Dice Pro <span style="color:var(--primary)">v7.5 Apex</span></h1>
+            <h1>Dice Pro <span style="color:var(--primary)">v8.0 Dual-Side</span></h1>
             <div id="roll-circles" class="roll-circles"></div>
         </div>
-        <div class="status-bar" id="status-msg">Engine Active...</div>
+        <div class="status-bar" id="status-msg">Analyzing Market Patterns...</div>
         <div class="grid">
-            <div class="card"><div class="label">Total Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
+            <div class="card"><div class="label">Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">Recovery Pot (130%)</div><div id="pot-display" class="btc-val" style="color:var(--danger)">0.00</div><div class="usd-val">Fast Strike Recovery</div></div>
+            <div class="card"><div class="label">Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--danger)">0.00</div><div id="current-side" class="usd-val" style="color:var(--primary); font-weight:bold;">SIDE: UNDER</div></div>
             <div class="card"><div class="label">Next Wager</div><div id="n-bet" class="btc-val" style="color:var(--primary)">0.00</div><div id="uptime" class="usd-val">Uptime: 0h</div></div>
         </div>
-        <div class="label">Performance Projections</div>
-        <div class="proj-grid">
-            <div class="proj-card"><div class="label">Hourly</div><span id="p-hr-b" class="win">0.00</span></div>
-            <div class="proj-card"><div class="label">Daily</div><span id="p-dy-b" class="win">0.00</span></div>
-            <div class="proj-card"><div class="label">Monthly</div><span id="p-month-b" class="win">0.00</span></div>
-            <div class="proj-card"><div class="label">Yearly</div><span id="p-year-b" class="win">0.00</span></div>
-        </div>
         <table>
-            <thead><tr><th>ID</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Balance</th></tr></thead>
+            <thead><tr><th>ID</th><th>Side</th><th>Wager</th><th>Roll</th><th>Profit</th><th>Pot</th></tr></thead>
             <tbody id="h-body"></tbody>
         </table>
     </div>
@@ -222,24 +232,16 @@ app.get('/', (req, res) => {
                 const f = (n) => parseFloat(n || 0).toFixed(8);
                 const u = (n) => "$" + (parseFloat(n || 0) * btcPrice).toLocaleString(undefined, {minimumFractionDigits: 2});
                 
-                const statusEl = document.getElementById('status-msg');
-                statusEl.innerText = "Status: " + botState.statusMessage;
-                statusEl.style.borderLeftColor = botState.statusMessage.includes('⚠️') ? "#ef4444" : "#10b981";
-
+                document.getElementById('status-msg').innerText = "Status: " + botState.statusMessage;
                 document.getElementById('w-bal').innerText = f(botState.stats.currentBalance);
                 document.getElementById('w-usd').innerText = u(botState.stats.currentBalance);
                 document.getElementById('n-prof').innerText = f(botState.stats.netProfit);
                 document.getElementById('n-prof').className = botState.stats.netProfit >= 0 ? 'btc-val win' : 'btc-val loss';
                 document.getElementById('n-usd').innerText = u(botState.stats.netProfit);
                 document.getElementById('pot-display').innerText = f(botState.recoveryPot);
+                document.getElementById('current-side').innerText = "SIDE: " + (botState.betUnder ? "UNDER" : "OVER");
                 document.getElementById('n-bet').innerText = f(botState.settings.currentBet);
-                document.getElementById('uptime').innerText = "Uptime: " + hoursPassed + "h | Seeds Shifted: " + botState.seedShifts;
-
-                const ph = botState.stats.netProfit / hoursPassed;
-                document.getElementById('p-hr-b').innerText = f(ph);
-                document.getElementById('p-dy-b').innerText = f(ph*24);
-                document.getElementById('p-month-b').innerText = f(ph*24*30);
-                document.getElementById('p-year-b').innerText = f(ph*24*365);
+                document.getElementById('uptime').innerText = "Uptime: " + hoursPassed + "h | Shifts: " + botState.seedShifts;
 
                 const rolls = botState.rollValueHistory.slice(-6).reverse();
                 document.getElementById('roll-circles').innerHTML = rolls.map(r => \`
@@ -247,7 +249,14 @@ app.get('/', (req, res) => {
                 \`).join('');
 
                 document.getElementById('h-body').innerHTML = botState.betHistory.map(b => \`
-                    <tr><td>#\${b.id}</td><td>\${f(b.bet)}</td><td>\${b.roll}</td><td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td><td>\${b.pot}</td></tr>
+                    <tr>
+                        <td>#\${b.id}</td>
+                        <td><span class="side-badge">\${b.side}</span></td>
+                        <td>\${f(b.bet)}</td>
+                        <td>\${b.roll}</td>
+                        <td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td>
+                        <td>\${b.pot}</td>
+                    </tr>
                 \`).join('');
             } catch(e) {}
         }
