@@ -11,7 +11,7 @@ const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
-    payout: 1.2,               // 82.5% Win Rate
+    payout: 1.7,               // 82.5% Win Rate
     balanceStep: 0.00000500,   // Conservative scaling for low payout
     betIncrement: 0.00000001,
     recoveryDivisor: 40,       // IMPORTANT: Debt spread over 40 wins to stay safe
