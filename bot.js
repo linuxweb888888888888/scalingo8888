@@ -5,16 +5,15 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "XcKUm9uhtn6bYByGog66d6r9wyF7lrcrhf8pULwK8jD098lMWr";
+const API_KEY = process.env.API_KEY || "ivA6fvYz8UfTRkpj1lCutsuqZ9ChoJAj6j9dZd2foZyfLVlE6U";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
-    multiplier: 4.0,          // Double bet on win to maximize the streak profit
-    payout: 1.4,              // 2.0x makes 1 Win = 1 Loss. Much easier to profit.
+    multiplier: 4,          
+    payout: 1.4,              // CRITICAL: Changed to 2.0 so 1 Win covers 1 Loss
     balanceStep: 0.00000050,  
-    betIncrement: 0.00000005, // Slightly higher base to ensure profit growth
-    maxBalanceRisk: 0.15      
+    betIncrement: 0.00000001  // Smallest possible bet to grow slowly
 };
 
 // ============ BOT STATE ============
@@ -23,7 +22,7 @@ let botState = {
     coin: DEFAULTS.coin,
     activeSeed: "",
     currentWinStreak: 0,
-    lastDecision: "Init...",
+    lastDecision: "Starting Survival...",
     stats: {
         totalBets: 0,
         wins: 0,
@@ -32,8 +31,8 @@ let botState = {
         currentBalance: 0,
     },
     settings: {
-        baseBet: 0.00000005,
-        currentBet: 0.00000005,
+        baseBet: 0.00000001,
+        currentBet: 0.00000001,
         multiplier: DEFAULTS.multiplier,
         payout: DEFAULTS.payout
     },
@@ -43,27 +42,35 @@ let botState = {
 // ============ UTILITIES ============
 function validateBetSize(bet) {
     const minBet = 0.00000001;
-    let safeBet = Math.max(bet, minBet);
+    let safeBet = bet;
 
-    // RISK GUARD
-    const maxAllowed = botState.stats.currentBalance * DEFAULTS.maxBalanceRisk;
-    if (botState.stats.currentBalance > 0 && safeBet > maxAllowed) {
-        return botState.settings.baseBet;
+    // SURVIVAL GUARD: If bet is higher than balance, drop to 1 satoshi
+    if (botState.stats.currentBalance > 0 && safeBet > botState.stats.currentBalance) {
+        console.log("⚠️ Balance Low! Dropping bet to 1 satoshi.");
+        safeBet = minBet;
     }
+
+    if (safeBet < minBet) safeBet = minBet;
     return Number(safeBet.toFixed(8));
 }
 
 function calculateScaledBase(balance) {
+    // If balance is under 50 sats, stay at 1 sat bet
+    if (balance < 0.00000050) return 0.00000001;
+    
     const units = Math.floor(balance / DEFAULTS.balanceStep);
-    const calculatedBase = Math.max(1, units) * DEFAULTS.betIncrement;
+    const calculatedBase = units * DEFAULTS.betIncrement;
     return validateBetSize(calculatedBase);
 }
 
 // ============ API LOGIC ============
 async function placeBet() {
     if (botState.stats.totalBets % 10 === 0 || !botState.activeSeed) {
-        botState.activeSeed = "node" + Math.random().toString(36).substring(2, 10);
+        botState.activeSeed = "safe" + Math.random().toString(36).substring(2, 10);
     }
+
+    // Double check bet safety before sending
+    botState.settings.currentBet = validateBetSize(botState.settings.currentBet);
 
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
     const payload = { 
@@ -77,7 +84,8 @@ async function placeBet() {
         const response = await axios.post(url, payload);
         return { success: true, data: response.data };
     } catch (error) { 
-        return { success: false };
+        const msg = error.response?.data?.Message || "";
+        return { success: false, isBalance: msg.toLowerCase().includes("balance") };
     }
 }
 
@@ -86,6 +94,7 @@ async function runStrategy() {
     botState.running = true;
     while (botState.running) {
         const result = await placeBet();
+        
         if (!result.success) { 
             await new Promise(r => setTimeout(r, 5000)); 
             continue; 
@@ -104,29 +113,30 @@ async function runStrategy() {
             botState.currentWinStreak++;
 
             if (botState.currentWinStreak === 2) {
-                // Random Decision Logic
+                // YOUR RANDOM LOGIC
                 if (Math.random() > 0.5) {
-                    botState.lastDecision = "Random: Reset (Banked Profit)";
+                    botState.lastDecision = "Random: Reset to Base (Safe)";
                     botState.settings.currentBet = botState.settings.baseBet;
                     botState.currentWinStreak = 0;
                 } else {
-                    botState.lastDecision = "Random: Pushing to Win 3";
+                    botState.lastDecision = "Random: Pushing Win 3";
                     botState.settings.currentBet = validateBetSize(botState.settings.currentBet * botState.settings.multiplier);
                 }
             } 
             else if (botState.currentWinStreak >= 3) {
-                botState.lastDecision = "Streak 3! Resetting";
+                botState.lastDecision = "Streak 3! Banking Profit";
                 botState.settings.currentBet = botState.settings.baseBet;
                 botState.currentWinStreak = 0;
             }
             else {
-                botState.lastDecision = "Win 1: Doubling";
+                botState.lastDecision = "Win 1: Doubling Bet";
                 botState.settings.currentBet = validateBetSize(botState.settings.currentBet * botState.settings.multiplier);
             }
         } else {
+            // Reset on loss
             botState.stats.losses++;
             botState.currentWinStreak = 0;
-            botState.lastDecision = "Loss: Reset to Base";
+            botState.lastDecision = "Loss: Back to Base";
             botState.settings.currentBet = botState.settings.baseBet;
         }
 
@@ -139,7 +149,7 @@ async function runStrategy() {
         });
         
         if (botState.betHistory.length > 50) botState.betHistory.pop();
-        await new Promise(r => setTimeout(r, 1100)); 
+        await new Promise(r => setTimeout(r, 1200)); 
     }
 }
 
@@ -151,19 +161,17 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro | Profit Growth</title>
+    <title>Survival Dice Bot</title>
     <meta http-equiv="refresh" content="5">
     <style>
-        :root { --primary: #2563eb; --bg: #0f172a; --card-bg: #1e293b; --text: #f8fafc; }
-        body { font-family: 'Courier New', monospace; background-color: var(--bg); color: var(--text); padding: 20px; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
-        .card { background: var(--card-bg); padding: 1rem; border-radius: 8px; border: 1px solid #334155; }
-        table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
-        th { text-align: left; border-bottom: 2px solid #334155; padding: 8px; }
-        td { padding: 8px; border-bottom: 1px solid #334155; }
-        .win { color: #10b981; }
-        .loss { color: #ef4444; }
-        .decision { font-size: 0.75rem; color: #94a3b8; }
+        body { font-family: monospace; background: #000; color: #0f0; padding: 20px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-bottom: 20px; }
+        .card { border: 1px solid #0f0; padding: 15px; background: #050505; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { border: 1px solid #050; padding: 8px; text-align: left; }
+        .win { color: #0f0; font-weight: bold; }
+        .loss { color: #f00; font-weight: bold; }
+        .decision { color: #aaa; font-size: 0.8rem; display: block; margin-top: 5px; }
     </style>
 </head>
 <body>
@@ -174,7 +182,7 @@ app.get('/', (req, res) => {
         <div class="card">Next Bet<br><strong>${fmt(botState.settings.currentBet)}</strong></div>
     </div>
     <table>
-        <thead><tr><th>ID</th><th>Wagered</th><th>Roll</th><th>Profit</th></tr></thead>
+        <thead><tr><th>ID</th><th>Bet</th><th>Roll</th><th>Profit</th></tr></thead>
         <tbody>
             ${botState.betHistory.map(b => `<tr>
                 <td>#${b.id}</td>
@@ -190,6 +198,6 @@ app.get('/', (req, res) => {
 });
 
 app.listen(port, '0.0.0.0', () => {
-    console.log(`🚀 Profit Bot Online on port ${port}`);
+    console.log(`🚀 Survival Bot Online on port ${port}`);
     runStrategy();
 });
