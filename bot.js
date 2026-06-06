@@ -41,18 +41,20 @@ let botState = {
         currentStreak: 0,
         highestBet: 0
     },
-    currentBet: 0.00000001, // Initial placeholder
+    currentBet: 0.00000001, 
     history: []
 };
 
 // ============ MATHEMATICAL LOGIC ============
 const Strategies = {
     SMART_SCALER: (isWin) => {
-        // Logic: Base bet is Balance / 100, rounded down to 8 decimal places
+        // Logic: Base bet is Balance / 1000
         const calculateDynamicBase = () => {
-            const rawBase = botState.balance.current / 100;
-            // Rounds down to the 8th decimal (0.00000001)
-            return Math.max(0.00000001, Math.floor(rawBase * 100000000) / 100000000);
+            const rawBase = botState.balance.current / 1000;
+            // Round down to 8 decimal places
+            const roundedBase = Math.floor(rawBase * 100000000) / 100000000;
+            // Keep at 0.00000001 if the result is smaller than that
+            return Math.max(0.00000001, roundedBase);
         };
 
         const dynamicBase = calculateDynamicBase();
@@ -64,7 +66,7 @@ const Strategies = {
             botState.stats.currentStreak++;
             botState.stats.maxLossStreak = Math.max(botState.stats.maxLossStreak, botState.stats.currentStreak);
             
-            // If we hit our survival limit, reset to base to save bankroll
+            // Survival limit check
             if (botState.stats.currentStreak >= CONFIG.SETTINGS.survivalStreak) {
                 botState.currentBet = dynamicBase;
             } else {
@@ -72,7 +74,7 @@ const Strategies = {
             }
         }
 
-        // Safety cap to prevent exceeding maxBet config
+        // Safety cap
         if (botState.currentBet > CONFIG.SETTINGS.maxBet) {
             botState.currentBet = CONFIG.SETTINGS.maxBet;
         }
@@ -118,9 +120,9 @@ async function runEngine() {
 
         if (botState.stats.totalBets === 0) {
             botState.balance.initial = result.Balance;
-            // On the very first bet, calculate the correct base bet from initial balance
             botState.balance.current = result.Balance;
-            const initialBase = Math.floor((result.Balance / 100) * 100000000) / 100000000;
+            // Initial base calculation: Balance / 1000, floor 8, min 0.00000001
+            const initialBase = Math.floor((result.Balance / 1000) * 100000000) / 100000000;
             botState.currentBet = Math.max(0.00000001, initialBase);
         }
         
