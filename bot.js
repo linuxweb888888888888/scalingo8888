@@ -12,16 +12,16 @@ const DEFAULTS = {
     payout: 2.0,              
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001,
-    maxTotalBetPercent: 0.018, // Slightly increased for compounding
-    potSafetyLimit: 0.12,      // 12% safety cap
-    baseCooldown: 1050         // Speed optimized for Crypto.Games API
+    maxTotalBetPercent: 0.018, 
+    potSafetyLimit: 0.12,      
+    baseCooldown: 1050         // Keep this to respect API rate limits (1 bet per sec)
 };
 
 // ============ BOT STATE ============
 let btcPrice = 60826; 
 let botState = {
     running: true,
-    statusMessage: "Initializing Advanced Engine...",
+    statusMessage: "Initializing Aggressive Engine...",
     recoveryPot: 0, 
     winStreak: 0,
     coin: DEFAULTS.coin,
@@ -57,9 +57,8 @@ updateBTCPrice();
 function calculateScaledBase(balance) {
     const units = Math.floor(balance / DEFAULTS.balanceStep);
     let base = Number((Math.max(1, units) * DEFAULTS.betIncrement).toFixed(8));
-    // Profit Compounding: Add 1% of net profit to base if in surplus
     if (botState.stats.netProfit > 0) {
-        base += (botState.stats.netProfit * 0.01);
+        base += (botState.stats.netProfit * 0.012); // Slightly higher compounding
     }
     return Number(base.toFixed(8));
 }
@@ -67,7 +66,7 @@ function calculateScaledBase(balance) {
 function detectCluster() {
     if (botState.rollValueHistory.length < 3) return false;
     const last3 = botState.rollValueHistory.slice(-3);
-    const isHighCluster = last3.every(val => val > 70); // Betting Under 50, so >70 is danger
+    const isHighCluster = last3.every(val => val > 70); 
     const isLossStreak = botState.streakHistory.slice(-4).every(val => val === false);
     return isHighCluster || isLossStreak;
 }
@@ -85,7 +84,6 @@ async function placeBet() {
         const response = await axios.post(url, payload);
         return response.data;
     } catch (error) { 
-        botState.statusMessage = "API Lag: Retrying...";
         return null; 
     }
 }
@@ -93,29 +91,30 @@ async function placeBet() {
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
     while (true) {
-        // SAFETY: Numerical & Streak Detection
+        // --- INSTANT SEED SHIFT (NO COOLDOWN) ---
         if (detectCluster()) {
             botState.statusMessage = "⚠️ PATTERN ALERT: Shifting Seed & Cooling Down...";
             botState.settings.clientSeed = "pro" + Math.random().toString(36).substring(2, 12);
             botState.streakHistory = [];
-            await new Promise(r => setTimeout(r, 6000));
-            continue;
+            // Cooldown removed as requested
         }
 
         // SAFETY: Pot Cap
         if (botState.recoveryPot > (botState.stats.currentBalance * DEFAULTS.potSafetyLimit)) {
             botState.recoveryPot = 0;
-            botState.statusMessage = "Pot Safety Reset Activated";
+            botState.statusMessage = "Safety Reset: Pot Cleared";
         }
 
         const result = await placeBet();
-        if (!result) { await new Promise(r => setTimeout(r, 2000)); continue; }
+        if (!result) { 
+            await new Promise(r => setTimeout(r, 1000)); 
+            continue; 
+        }
 
         const currentRoll = parseFloat(result.Roll);
         const profit = result.Profit || 0;
         const isWin = profit > 0;
 
-        // Update Histories
         botState.rollValueHistory.push(currentRoll);
         botState.streakHistory.push(isWin);
         if (botState.rollValueHistory.length > 10) botState.rollValueHistory.shift();
@@ -130,23 +129,24 @@ async function runStrategy() {
             botState.stats.wins++;
             botState.winStreak++;
             botState.recoveryPot = Math.max(0, botState.recoveryPot - profit);
-            botState.statusMessage = botState.winStreak > 2 ? `🔥 WIN STREAK: x${botState.winStreak}` : "Stable Gains";
+            if (!botState.statusMessage.includes('⚠️')) {
+                botState.statusMessage = botState.winStreak > 2 ? `🔥 STREAK: x${botState.winStreak}` : "Profit Optimized";
+            }
         } else {
             botState.stats.losses++;
             botState.winStreak = 0;
             botState.recoveryPot += (Math.abs(profit) * 0.85);
-            botState.statusMessage = "Recovery Mode Active";
+            if (!botState.statusMessage.includes('⚠️')) {
+                botState.statusMessage = "Recovering Loss...";
+            }
         }
 
-        // ADAPTIVE RECOVERY LOGIC
-        // If pot is high, use a safer (larger) divisor. If pot is low, recover fast.
-        let dynamicDivisor = botState.recoveryPot > (botState.stats.currentBalance * 0.03) ? 35 : 18;
-        
+        // ADAPTIVE PROFIT SCALING
+        let dynamicDivisor = botState.recoveryPot > (botState.stats.currentBalance * 0.03) ? 30 : 16;
         let recoveryPart = botState.recoveryPot / dynamicDivisor;
         let targetBet = botState.settings.baseBet + recoveryPart;
 
-        // STREAK BOOSTER: If on a 3+ win streak, add 10% to the target bet to compound profit
-        if (botState.winStreak >= 3) targetBet *= 1.10;
+        if (botState.winStreak >= 3) targetBet *= 1.15; // Increased booster for faster profit
 
         let absoluteMax = botState.stats.currentBalance * DEFAULTS.maxTotalBetPercent;
         botState.settings.currentBet = Math.min(targetBet, absoluteMax);
@@ -157,11 +157,12 @@ async function runStrategy() {
         });
         if (botState.betHistory.length > 25) botState.betHistory.pop();
 
+        // Respect API rate limit only
         await new Promise(r => setTimeout(r, DEFAULTS.baseCooldown)); 
     }
 }
 
-// ============ WEB DASHBOARD (v3.8 Design) ============
+// ============ WEB DASHBOARD (v3.8 Original Design) ============
 app.get('/api/stats', (req, res) => {
     const hours = Math.max(0.01, (Date.now() - botState.stats.startTime) / 3600000);
     res.json({ botState, btcPrice, hoursPassed: hours.toFixed(2) });
@@ -173,7 +174,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v5.0 | Adaptive Profit</title>
+    <title>Dice Pro v5.5 | Turbo Mode</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -184,7 +185,7 @@ app.get('/', (req, res) => {
         .label { font-size: 0.75rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; margin-bottom: 0.5rem; }
         .btc-val { font-size: 1.75rem; font-weight: 700; }
         .usd-val { font-size: 0.875rem; color: var(--accent); }
-        .status-bar { padding: 12px; background: #1e293b; color: white; border-radius: 8px; margin-bottom: 20px; font-weight: bold; font-size: 0.9rem; border-left: 5px solid var(--primary); transition: 0.3s; }
+        .status-bar { padding: 12px; background: #1e293b; color: white; border-radius: 8px; margin-bottom: 20px; font-weight: bold; font-size: 0.9rem; border-left: 5px solid var(--primary); }
         .proj-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2rem; }
         .proj-card { background: #f1f5f9; padding: 1rem; border-radius: 8px; text-align: center; }
         .roll-circles { display: flex; gap: 8px; }
@@ -198,14 +199,14 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <div class="header">
-            <h1>Dice Pro <span style="color:var(--primary)">v5.0</span></h1>
+            <h1>Dice Pro <span style="color:var(--primary)">v5.5 Turbo</span></h1>
             <div id="roll-circles" class="roll-circles"></div>
         </div>
         <div class="status-bar" id="status-msg">Adaptive Engine Running...</div>
         <div class="grid">
             <div class="card"><div class="label">Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--danger)">0.00</div><div class="usd-val">Adaptive Divisor</div></div>
+            <div class="card"><div class="label">Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--danger)">0.00</div><div class="usd-val">Turbo Recovery</div></div>
             <div class="card"><div class="label">Next Bet</div><div id="n-bet" class="btc-val" style="color:var(--primary)">0.00</div><div id="uptime" class="usd-val">0h</div></div>
         </div>
         <div class="label">Revenue Projections</div>
@@ -230,7 +231,7 @@ app.get('/', (req, res) => {
                 
                 const statusEl = document.getElementById('status-msg');
                 statusEl.innerText = "Status: " + botState.statusMessage;
-                statusEl.style.borderLeftColor = botState.winStreak >= 3 ? "#10b981" : "#2563eb";
+                statusEl.style.borderLeftColor = botState.statusMessage.includes('⚠️') ? "#ef4444" : "#2563eb";
 
                 document.getElementById('w-bal').innerText = f(botState.stats.currentBalance);
                 document.getElementById('w-usd').innerText = u(botState.stats.currentBalance);
