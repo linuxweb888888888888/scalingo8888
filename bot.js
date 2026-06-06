@@ -5,18 +5,18 @@ const fs = require('fs');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ============ CONFIGURATION ============
+// ============ CONFIGURATION (MAX PROFIT MODE) ============
 const API_KEY = process.env.API_KEY || "QmmX28yULnLF784oJjDMiatV8MPhNAxK2aoKba0sjbwyCJ3PLP";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
-    payout: 1.5,               // CHANGED: Lower payout = Higher Win Rate (~66%)
-    balanceStep: 0.00000050,  
+    payout: 1.5,               // High win-rate (66%)
+    balanceStep: 0.00000020,   // AGGRESSIVE: 1 unit per 20 sats (Was 50)
     betIncrement: 0.00000001,
-    recoveryDivisor: 12,       // CHANGED: Lower divisor to compensate for lower payout profit
-    maxTotalBetPercent: 0.015, // SAFETY: Never bet more than 1.5% of balance
-    potSafetyLimit: 0.10       // SAFETY: If pot > 10% of balance, reset pot
+    recoveryDivisor: 5,        // AGGRESSIVE: Clear debt in ~5 wins (Was 12)
+    maxTotalBetPercent: 0.03,  // RISKIER: Max bet capped at 3% (Was 1.5%)
+    potSafetyLimit: 0.12       // SAFETY: Reset if debt > 12% of balance
 };
 
 // ============ BOT STATE ============
@@ -64,7 +64,7 @@ function calculateScaledBase(balance) {
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
     
-    // STRATEGY: Alternate Under/Over every bet to increase variety/win chance
+    // STRATEGY: Alternate Under/Over every bet
     const side = botState.stats.totalBets % 2 === 0;
 
     const payload = { 
@@ -85,7 +85,7 @@ async function placeBet() {
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = "High Win-Rate Mode Active (66%)";
+    botState.statusMessage = "MAX PROFIT MODE: Aggressive Scaling Active";
     
     while (true) {
         // --- SEED ROTATION (Every 10 Bets) ---
@@ -117,19 +117,19 @@ async function runStrategy() {
 
         if (profit > 0) {
             botState.stats.wins++;
-            // Reduce pot by actual profit gained
             botState.recoveryPot -= profit;
             if (botState.recoveryPot < 0) botState.recoveryPot = 0;
         } else {
             botState.stats.losses++;
-            // Add 90% of loss to pot (slightly higher for lower payout recovery)
-            botState.recoveryPot += (Math.abs(profit) * 0.9);
+            // MAX PROFIT: Adding 95% of loss to pot for faster bounce-back
+            botState.recoveryPot += (Math.abs(profit) * 0.95);
         }
 
-        // --- CALCULATE NEXT BET ---
+        // --- AGGRESSIVE RECOVERY CALCULATION ---
         let recoveryPart = botState.recoveryPot / DEFAULTS.recoveryDivisor;
         let targetBet = botState.settings.baseBet + recoveryPart;
 
+        // Capped at 3% of balance for high-velocity profit
         let absoluteMax = botState.stats.currentBalance * DEFAULTS.maxTotalBetPercent;
         botState.settings.currentBet = Math.min(targetBet, absoluteMax);
 
@@ -140,7 +140,8 @@ async function runStrategy() {
         });
         if (botState.betHistory.length > 30) botState.betHistory.pop();
 
-        await new Promise(r => setTimeout(r, 1100)); 
+        // Speed optimized for Crypto.games limits
+        await new Promise(r => setTimeout(r, 700)); 
     }
 }
 
@@ -157,7 +158,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.8 | High Win Rate Edition</title>
+    <title>Dice Pro v3.8 | MAX PROFIT EDITION</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -190,7 +191,7 @@ app.get('/', (req, res) => {
             <div class="card"><div class="label">💳 Safe Tradable</div><div id="t-bal" class="btc-val" style="color:var(--primary)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">⚖️ Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--danger)">0.00</div><div class="usd-val">Capped at 1.5% Bal</div></div>
+            <div class="card"><div class="label">⚖️ Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--danger)">0.00</div><div class="usd-val">Capped at 3.0% Bal</div></div>
         </div>
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
