@@ -11,7 +11,7 @@ const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
-    multiplier: 1.5,          
+    multiplier: 1.2,          
     payout: 1.7,              
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001  
@@ -22,7 +22,7 @@ let btcPrice = 65000;
 let botState = {
     running: false,
     coin: DEFAULTS.coin,
-    activeSeed: "", // Track the persistent seed
+    activeSeed: "",
     profitProtection: { safeBalance: 0 },
     stats: {
         totalBets: 0,
@@ -74,7 +74,7 @@ function loadState() {
 
 // ============ API LOGIC ============
 async function placeBet() {
-    // Generate new seed every 10 bets or if no seed exists
+    // Generate new random seed every 10 bets
     if (botState.stats.totalBets % 10 === 0 || !botState.activeSeed) {
         const randomSuffix = Math.random().toString(36).replace(/[^a-z0-9]/gi, '').substring(0, 10);
         botState.activeSeed = "node20" + randomSuffix;
@@ -113,17 +113,20 @@ async function runStrategy() {
         botState.stats.netProfit += profit;
         botState.stats.currentBalance = result.Balance || 0;
 
+        // Always update the dynamic base based on current balance
         botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
 
         if (profit > 0) {
+            // WIN: Apply multiplier to the next bet (Winning Streak logic)
             botState.stats.wins++;
             botState.profitProtection.safeBalance += (profit * 0.50); 
-            botState.settings.currentBet = botState.settings.baseBet;
-        } else {
-            botState.stats.losses++;
             
             let nextBet = botState.settings.currentBet * botState.settings.multiplier;
             botState.settings.currentBet = Math.ceil(nextBet * 100000000) / 100000000;
+        } else {
+            // LOSS: Reset immediately to the current base bet
+            botState.stats.losses++;
+            botState.settings.currentBet = botState.settings.baseBet;
         }
 
         botState.betHistory.unshift({ 
@@ -151,7 +154,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro | Corrected Martingale</title>
+    <title>Dice Pro | Winning Streak Strategy</title>
     <meta http-equiv="refresh" content="5">
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
