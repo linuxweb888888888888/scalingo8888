@@ -76,7 +76,7 @@ async function placeBet() {
         Bet: Number(botState.settings.currentBet.toFixed(8)), 
         Payout: botState.settings.payout, 
         UnderOver: true, 
-        ClientSeed: botState.currentSeed // Uses persistent seed
+        ClientSeed: botState.currentSeed 
     };
 
     try {
@@ -93,11 +93,10 @@ async function runStrategy() {
     botState.statusMessage = "Safety-Capped Recovery Active";
     
     while (true) {
-        // --- SEED ROTATION LOGIC ---
-        if (botState.betsSinceSeedChange >= 50) {
+        // --- SEED ROTATION LOGIC (CHANGED TO 10) ---
+        if (botState.betsSinceSeedChange >= 10) {
             botState.currentSeed = "pro" + Math.random().toString(36).substring(2, 12);
             botState.betsSinceSeedChange = 0;
-            console.log("Seed rotated: " + botState.currentSeed);
         }
 
         // SAFETY: If pot is too huge compared to balance, kill the pot to prevent liquidation
@@ -127,15 +126,12 @@ async function runStrategy() {
             if (botState.recoveryPot < 0) botState.recoveryPot = 0;
         } else {
             botState.stats.losses++;
-            // DAMPENING: Only add 80% of loss to pot to slow down escalation
             botState.recoveryPot += (Math.abs(profit) * 0.8);
         }
 
-        // --- CALCULATE NEXT BET WITH STRICT CAPS ---
         let recoveryPart = botState.recoveryPot / DEFAULTS.recoveryDivisor;
         let targetBet = botState.settings.baseBet + recoveryPart;
 
-        // FINAL SAFETY CHECK: Never exceed 1.5% of total balance
         let absoluteMax = botState.stats.currentBalance * DEFAULTS.maxTotalBetPercent;
         botState.settings.currentBet = Math.min(targetBet, absoluteMax);
 
