@@ -26,6 +26,8 @@ let botState = {
     statusMessage: "Initializing...",
     recoveryPot: 0, 
     coin: DEFAULTS.coin,
+    currentSeed: "pro" + Math.random().toString(36).substring(2, 12), // Initial seed
+    betsSinceSeedChange: 0, // Counter for rotation
     profitProtection: { safeBalance: 0 }, 
     stats: {
         totalBets: 0,
@@ -69,13 +71,12 @@ function resetSession() {
 // ============ API LOGIC ============
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
-    const safeSeed = "pro" + Math.random().toString(36).substring(2, 12); 
 
     const payload = { 
         Bet: Number(botState.settings.currentBet.toFixed(8)), 
         Payout: botState.settings.payout, 
         UnderOver: true, 
-        ClientSeed: safeSeed 
+        ClientSeed: botState.currentSeed // Uses persistent seed
     };
 
     try {
@@ -92,6 +93,13 @@ async function runStrategy() {
     botState.statusMessage = "Safety-Capped Recovery Active";
     
     while (true) {
+        // --- SEED ROTATION LOGIC ---
+        if (botState.betsSinceSeedChange >= 50) {
+            botState.currentSeed = "pro" + Math.random().toString(36).substring(2, 12);
+            botState.betsSinceSeedChange = 0;
+            console.log("Seed rotated: " + botState.currentSeed);
+        }
+
         // SAFETY: If pot is too huge compared to balance, kill the pot to prevent liquidation
         if (botState.recoveryPot > (botState.stats.currentBalance * DEFAULTS.potSafetyLimit)) {
             botState.statusMessage = "Pot Safety Triggered: Resetting to Base.";
@@ -105,6 +113,8 @@ async function runStrategy() {
         }
 
         botState.stats.totalBets++;
+        botState.betsSinceSeedChange++; // Increment rotation counter
+        
         const profit = result.Profit || 0;
         botState.stats.netProfit += profit;
         botState.stats.currentBalance = result.Balance || 0;
