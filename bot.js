@@ -11,11 +11,13 @@ const CONFIG = {
     PAYOUT: 2.0, 
     
     // MATHEMATICAL STRATEGY: SMART_SCALER
+    // Automatically adjusts bets based on your balance to survive long streaks.
     ACTIVE_STRATEGY: "SMART_SCALER", 
 
     SETTINGS: {
+        baseBet: 0.00000001,
         maxBet: 0.00500000,
-        // How many losses in a row do you want to survive?
+        // How many losses in a row do you want to survive? (14-16 is recommended for 2x payout)
         survivalStreak: 15, 
     },
     
@@ -41,23 +43,17 @@ let botState = {
         currentStreak: 0,
         highestBet: 0
     },
-    currentBet: 0.00000001, 
+    currentBet: CONFIG.SETTINGS.baseBet,
     history: []
 };
 
 // ============ MATHEMATICAL LOGIC ============
 const Strategies = {
     SMART_SCALER: (isWin) => {
-        // Logic: Base bet is Balance / 1000
-        const calculateDynamicBase = () => {
-            const rawBase = botState.balance.current / 1000;
-            // Round down to 8 decimal places
-            const roundedBase = Math.floor(rawBase * 100000000) / 100000000;
-            // Keep at 0.00000001 if the result is smaller than that
-            return Math.max(0.00000001, roundedBase);
-        };
-
-        const dynamicBase = calculateDynamicBase();
+        // Calculate the "Safe Base" (Balance divided by 2 to the power of survival streak)
+        // This ensures math-wise that we can lose X times before hitting 0.
+        const divisor = Math.pow(2, CONFIG.SETTINGS.survivalStreak);
+        const dynamicBase = Math.max(CONFIG.SETTINGS.baseBet, botState.balance.current / divisor);
 
         if (isWin) {
             botState.stats.currentStreak = 0;
@@ -66,17 +62,12 @@ const Strategies = {
             botState.stats.currentStreak++;
             botState.stats.maxLossStreak = Math.max(botState.stats.maxLossStreak, botState.stats.currentStreak);
             
-            // Survival limit check
+            // If we hit our survival limit, reset to base to save the remaining bankroll
             if (botState.stats.currentStreak >= CONFIG.SETTINGS.survivalStreak) {
                 botState.currentBet = dynamicBase;
             } else {
-                botState.currentBet = botState.currentBet * 2;
+                botState.currentBet *= 2;
             }
-        }
-
-        // Safety cap
-        if (botState.currentBet > CONFIG.SETTINGS.maxBet) {
-            botState.currentBet = CONFIG.SETTINGS.maxBet;
         }
     }
 };
@@ -107,6 +98,7 @@ async function runEngine() {
     botState.status = "Engine Active";
     
     while (botState.running) {
+        // Stop Condition Check
         if (botState.stats.profit >= CONFIG.STOP_CONDITIONS.stopAtProfit) {
             botState.status = "Profit Target Reached";
             botState.running = false; break;
@@ -118,14 +110,8 @@ async function runEngine() {
             continue; 
         }
 
-        if (botState.stats.totalBets === 0) {
-            botState.balance.initial = result.Balance;
-            botState.balance.current = result.Balance;
-            // Initial base calculation: Balance / 1000, floor 8, min 0.00000001
-            const initialBase = Math.floor((result.Balance / 1000) * 100000000) / 100000000;
-            botState.currentBet = Math.max(0.00000001, initialBase);
-        }
-        
+        // Global Stats Update
+        if (botState.stats.totalBets === 0) botState.balance.initial = result.Balance;
         botState.balance.current = result.Balance;
         botState.stats.totalBets++;
         botState.stats.wagered += result.Bet;
@@ -135,8 +121,10 @@ async function runEngine() {
         const isWin = result.Profit > 0;
         if (isWin) botState.stats.wins++; else botState.stats.losses++;
 
+        // Strategy Execution
         Strategies[CONFIG.ACTIVE_STRATEGY](isWin);
 
+        // History Log
         botState.history.unshift({
             id: botState.stats.totalBets,
             time: new Date().toLocaleTimeString(),
@@ -148,12 +136,13 @@ async function runEngine() {
         });
         if (botState.history.length > 50) botState.history.pop();
 
-        await new Promise(r => setTimeout(r, 1100)); 
+        await new Promise(r => setTimeout(r, 1100)); // Rate limiting
     }
 }
 
 // ============ DASHBOARD ============
 app.get('/api/data', (req, res) => {
+    // Calculate extra metrics for the UI
     const elapsedHrs = (Date.now() - botState.startTime) / 3600000;
     const profitPerHour = (botState.stats.profit / elapsedHrs) || 0;
     res.json({ ...botState, profitPerHour, uptime: elapsedHrs });
