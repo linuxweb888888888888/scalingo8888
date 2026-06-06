@@ -6,6 +6,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
+// IMPORTANT: Secure your API Key in an environment variable!
 const API_KEY = process.env.API_KEY || "ivA6fvYz8UfTRkpj1lCutsuqZ9ChoJAj6j9dZd2foZyfLVlE6U";
 const BASE_URL = "https://api.crypto.games/v1";
 
@@ -15,7 +16,7 @@ const DEFAULTS = {
     payout: 1.4,              
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001,
-    winStreakCap: 5           
+    winStreakCap: 3           // CHANGED: Now resets after 3 consecutive wins
 };
 
 // ============ BOT STATE ============
@@ -81,7 +82,6 @@ async function placeBet() {
         const errorMsg = error.response?.data?.Message || error.message;
         console.error(`[!] API Error: ${errorMsg}`);
         
-        // Check if the error is specifically about balance
         const isBalanceError = errorMsg.toLowerCase().includes("balance");
         return { success: false, isBalanceError: isBalanceError };
     }
@@ -94,13 +94,11 @@ async function runStrategy() {
         const result = await placeBet();
         
         if (!result.success) { 
-            // If the bet was too large for the balance, reset everything to base
             if (result.isBalanceError) {
-                console.log("⚠️ Balance too low for current bet. Resetting to base...");
+                console.log("⚠️ Balance too low. Resetting to base...");
                 botState.settings.currentBet = botState.settings.baseBet;
                 botState.currentWinStreak = 0;
             }
-            
             await new Promise(r => setTimeout(r, 5000)); 
             continue; 
         }
@@ -119,14 +117,17 @@ async function runStrategy() {
             botState.currentWinStreak++;
             botState.profitProtection.safeBalance += (profit * 0.50); 
 
+            // Logic: If we hit the cap (3 wins), go back to base bet
             if (botState.currentWinStreak >= DEFAULTS.winStreakCap) {
                 botState.settings.currentBet = botState.settings.baseBet;
                 botState.currentWinStreak = 0;
             } else {
+                // Otherwise, multiply the bet for the next round
                 let nextBet = botState.settings.currentBet * botState.settings.multiplier;
                 botState.settings.currentBet = Math.ceil(nextBet * 100000000) / 100000000;
             }
         } else {
+            // Reset on Loss
             botState.stats.losses++;
             botState.currentWinStreak = 0;
             botState.settings.currentBet = botState.settings.baseBet;
@@ -150,8 +151,6 @@ async function runStrategy() {
 // ============ WEB DASHBOARD ============
 app.get('/', (req, res) => {
     const fmt = (num) => (num || 0).toFixed(8);
-    const winRate = botState.stats.totalBets > 0 ? ((botState.stats.wins / botState.stats.totalBets) * 100).toFixed(1) : 0;
-
     res.send(`
 <!DOCTYPE html>
 <html lang="en">
