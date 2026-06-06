@@ -6,7 +6,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION (MARTINGALE MODE) ============
-const API_KEY = process.env.API_KEY || "QmmX28yULnLF784oJjDMiatV8MPhNAxK2aoKba0sjbwyCJ3PLP";
+const API_KEY = process.env.API_KEY || "iBrrtRzWFFE0bOGkTAf0MGx4mhqjFV4gWZT9TAViThZpsnGTib";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
