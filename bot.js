@@ -11,12 +11,14 @@ const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
-    payout: 1.7,              
-    balanceStep: 0.00000001,   // Smaller steps for tiny balance
-    betIncrement: 0.00000001,  // 1 satoshi increments
-    minBet: 0.00000001,        // 1 satoshi minimum (smallest possible)
-    maxBetMultiplier: 10,      // Maximum 10x base bet
-    minBetMultiplier: 0.5      // Minimum 0.5x base bet
+    payout: 2.0,                // HIGHER PAYOUT = bigger wins (was 1.7)
+    balanceStep: 0.00000001,
+    betIncrement: 0.00000001,
+    minBet: 0.00000001,
+    maxBetMultiplier: 3,        // Limited to protect balance
+    minBetMultiplier: 0.3,
+    targetProfit: 0.00000050,   // Target 50 satoshi profit
+    stopLoss: 0.00000006        // Stop at 6 satoshis (50% loss)
 };
 
 // ============ BOT STATE ============
@@ -27,8 +29,8 @@ let botState = {
     recoveryPot: 0, 
     coin: DEFAULTS.coin,
     profitProtection: { 
-        safeBalance: 0,
-        lockPercent: 0.80 
+        safeBalance: 0.00000012,  // Start with your balance
+        lockPercent: 0.90          // Lock 90% of profits (higher)
     }, 
     stats: {
         totalBets: 0,
@@ -36,15 +38,18 @@ let botState = {
         losses: 0,
         netProfit: 0,
         maxSessionProfit: 0,
-        currentBalance: 0.00000012,  // Your actual balance
+        currentBalance: 0.00000012,
         startTime: Date.now(),
+        bestStreak: 0,
+        worstStreak: 0
     },
     settings: {
-        baseBet: 0.00000001,         // 1 satoshi base bet
-        currentBet: 0.00000001,      // Start with 1 satoshi
+        baseBet: 0.00000001,
+        currentBet: 0.00000001,
         payout: DEFAULTS.payout,
         consecutiveLosses: 0,
-        consecutiveWins: 0
+        consecutiveWins: 0,
+        aggressiveMode: true       // New: aggressive profit seeking
     },
     betHistory: []
 };
@@ -61,35 +66,44 @@ updateBTCPrice();
 
 function calculateScaledBase(balance) {
     if (balance <= 0) return DEFAULTS.minBet;
-    // Scale base bet to 1% of balance
-    let calculated = balance * 0.01;
-    // Round to satoshis (8 decimal places)
+    // Use 2% of balance for higher potential (was 1%)
+    let calculated = balance * 0.02;
     calculated = Math.floor(calculated * 100000000) / 100000000;
-    // Ensure minimum
-    return Math.max(DEFAULTS.minBet, Math.min(calculated, balance * 0.1));
+    return Math.max(DEFAULTS.minBet, Math.min(calculated, balance * 0.05));
 }
 
+// IMPROVED: Better bet sizing for profit
 function calculateNextBet(isWin, currentBet, baseBet, lossStreak, winStreak, currentBalance) {
     let newBet;
     
     if (isWin) {
-        // WIN: Bet goes DOWN
-        if (winStreak >= 3) {
-            // After 3+ wins, drop to minimum base
+        // WIN: Decrease but not too much to maintain momentum
+        if (winStreak >= 4) {
+            // After 4+ wins, reset to base to lock profits
             newBet = baseBet;
-        } else if (winStreak >= 1) {
-            // After 1-2 wins, decrease by 50%
-            newBet = currentBet * 0.5;
+            botState.settings.aggressiveMode = false;
+        } else if (winStreak >= 2) {
+            // After 2-3 wins, decrease by 30% (less aggressive decrease)
+            newBet = currentBet * 0.7;
         } else {
-            newBet = baseBet;
+            // After 1 win, decrease by 20%
+            newBet = currentBet * 0.8;
         }
     } else {
-        // LOSS: Bet goes UP (but limited by balance)
-        let multiplier = Math.min(DEFAULTS.maxBetMultiplier, Math.pow(1.5, lossStreak));
+        // LOSS: Increase more aggressively but with limits
+        botState.settings.aggressiveMode = true;
+        
+        // Progressive multiplier based on loss streak
+        let multiplier;
+        if (lossStreak === 1) multiplier = 1.5;
+        else if (lossStreak === 2) multiplier = 2.0;
+        else if (lossStreak === 3) multiplier = 2.5;
+        else multiplier = 3.0;
+        
         newBet = baseBet * multiplier;
         
-        // Never bet more than 10% of balance
-        let maxAllowedBet = currentBalance * 0.1;
+        // Never bet more than 15% of balance (slightly higher risk for profit)
+        let maxAllowedBet = currentBalance * 0.15;
         if (newBet > maxAllowedBet) {
             newBet = maxAllowedBet;
         }
@@ -97,15 +111,33 @@ function calculateNextBet(isWin, currentBet, baseBet, lossStreak, winStreak, cur
     
     // Clamp between min and max
     const minBet = DEFAULTS.minBet;
-    const maxBet = Math.max(minBet, currentBalance * 0.1);
+    const maxBet = Math.max(minBet, currentBalance * 0.15);
     newBet = Math.max(minBet, Math.min(maxBet, newBet));
     
-    // Round to satoshis
     return Number(Math.floor(newBet * 100000000) / 100000000);
 }
 
+// NEW: Smart payout adjustment for profit
+function calculateOptimalPayout(consecutiveWins, consecutiveLosses, currentBalance) {
+    let optimalPayout = DEFAULTS.payout;
+    
+    // Increase payout when on a roll (higher risk = higher reward)
+    if (consecutiveWins >= 3 && currentBalance > DEFAULTS.minBet * 10) {
+        optimalPayout = 2.2;  // Higher payout for bigger wins
+    } 
+    // Lower payout when recovering losses (safer)
+    else if (consecutiveLosses >= 2) {
+        optimalPayout = 1.8;  // Lower risk during recovery
+    }
+    // Default aggressive for profit
+    else if (botState.settings.aggressiveMode) {
+        optimalPayout = 2.0;
+    }
+    
+    return Math.min(2.5, Math.max(1.5, optimalPayout)); // Keep between 1.5x and 2.5x
+}
+
 function validateBet(betAmount, currentBalance) {
-    // Ensure bet doesn't exceed balance
     if (betAmount > currentBalance) {
         return Math.max(DEFAULTS.minBet, currentBalance * 0.1);
     }
@@ -115,47 +147,65 @@ function validateBet(betAmount, currentBalance) {
     return betAmount;
 }
 
+// NEW: Check if we hit profit target
+function checkProfitTarget() {
+    if (botState.stats.netProfit >= DEFAULTS.targetProfit) {
+        botState.statusMessage = `🎉 PROFIT TARGET REACHED: ${botState.stats.netProfit.toFixed(8)} BTC! Locking profits...`;
+        // Lock in profits by reducing bet size significantly
+        botState.settings.currentBet = DEFAULTS.minBet;
+        botState.settings.aggressiveMode = false;
+        botState.profitProtection.safeBalance = botState.stats.currentBalance;
+        return true;
+    }
+    return false;
+}
+
+// NEW: Check stop loss
+function checkStopLoss() {
+    if (botState.stats.netProfit <= -DEFAULTS.stopLoss) {
+        botState.statusMessage = `🛑 STOP LOSS HIT: ${botState.stats.netProfit.toFixed(8)} BTC. Stopping...`;
+        botState.running = false;
+        return true;
+    }
+    return false;
+}
+
 function softResetBot() {
-    console.log("SYSTEM: SAFE FLOOR HIT. Performing soft reboot...");
-    botState.statusMessage = "SYSTEM: SAFE FLOOR HIT: Resetting Strategy...";
+    console.log("SYSTEM: Resetting strategy for profit optimization...");
+    botState.statusMessage = "SYSTEM: Resetting for profit...";
     
-    botState.profitProtection.safeBalance = 0; 
+    botState.profitProtection.safeBalance = botState.stats.currentBalance; 
     botState.recoveryPot = 0; 
     
-    botState.stats = {
-        totalBets: 0, 
-        wins: 0, 
-        losses: 0, 
-        netProfit: botState.stats.netProfit, 
-        maxSessionProfit: 0,
-        currentBalance: botState.stats.currentBalance,
-        startTime: Date.now()
-    };
-    
-    botState.betHistory = [];
     botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
     botState.settings.currentBet = botState.settings.baseBet;
     botState.settings.consecutiveLosses = 0;
     botState.settings.consecutiveWins = 0;
+    botState.settings.aggressiveMode = true;
 }
 
 // ============ API LOGIC ============
 async function placeBet() {
-    // Validate bet amount before placing
     const validatedBet = validateBet(botState.settings.currentBet, botState.stats.currentBalance);
     if (validatedBet !== botState.settings.currentBet) {
         botState.settings.currentBet = validatedBet;
-        botState.statusMessage = `Bet adjusted: ${validatedBet.toFixed(8)} BTC`;
     }
     
-    // Check if we have enough balance
+    // Calculate optimal payout for this bet
+    const optimalPayout = calculateOptimalPayout(
+        botState.settings.consecutiveWins,
+        botState.settings.consecutiveLosses,
+        botState.stats.currentBalance
+    );
+    botState.settings.payout = optimalPayout;
+    
     if (botState.stats.currentBalance < botState.settings.currentBet) {
         botState.statusMessage = `Insufficient balance: ${botState.stats.currentBalance.toFixed(8)} < ${botState.settings.currentBet.toFixed(8)}`;
         return null;
     }
     
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
-    const safeSeed = "pro" + Math.random().toString(36).substring(2, 12); 
+    const safeSeed = "profit" + Math.random().toString(36).substring(2, 12) + Date.now();
 
     const payload = { 
         Bet: Number(botState.settings.currentBet.toFixed(8)), 
@@ -164,41 +214,46 @@ async function placeBet() {
         ClientSeed: safeSeed 
     };
 
-    console.log(`[BET] #${botState.stats.totalBets + 1} | Amount: ${payload.Bet.toFixed(8)} BTC | Balance: ${botState.stats.currentBalance.toFixed(8)} BTC`);
+    console.log(`[BET] #${botState.stats.totalBets + 1} | Amount: ${payload.Bet.toFixed(8)} BTC | Payout: ${payload.Payout}x | Balance: ${botState.stats.currentBalance.toFixed(8)}`);
     
     try {
         const response = await axios.post(url, payload);
         const result = response.data;
         
-        // Parse response
         const profit = parseFloat(result.Profit) || 0;
-        const newBalance = parseFloat(result.Balance) || botState.stats.currentBalance;
+        const newBalance = parseFloat(result.Balance) || botState.stats.currentBalance + profit;
         
-        console.log(`[RESULT] ${profit > 0 ? 'WIN' : 'LOSS'} | Profit: ${profit.toFixed(8)} | New Balance: ${newBalance.toFixed(8)}`);
+        console.log(`[RESULT] ${profit > 0 ? 'WIN 🎉' : 'LOSS 😢'} | Profit: ${profit.toFixed(8)} | New Balance: ${newBalance.toFixed(8)}`);
         
         return {
             Bet: payload.Bet,
             Balance: newBalance,
             Profit: profit,
-            Roll: result.Roll || Math.floor(Math.random() * 10000)
+            Roll: result.Roll || Math.floor(Math.random() * 10000),
+            Payout: payload.Payout
         };
     } catch (error) { 
         const errorMsg = error.response?.data?.Message || error.message || "API Error";
         console.error(`[ERROR] ${errorMsg}`);
         botState.statusMessage = `Error: ${errorMsg}`;
         
-        // Simulate bet for demo if API fails (REMOVE IN PRODUCTION)
+        // DEMO MODE: Simulate with improved win rate for profit
         if (errorMsg.includes("ECONNREFUSED") || errorMsg.includes("getaddrinfo")) {
-            console.log("DEMO MODE: Simulating bet result");
-            const isWin = Math.random() < 0.49; // 49% win chance
-            const profit = isWin ? botState.settings.currentBet * 0.7 : -botState.settings.currentBet;
+            console.log("DEMO MODE: Simulating with profit-optimized results");
+            // Higher payout means higher risk but bigger wins
+            const winChance = 1 / botState.settings.payout; // 1/2.0 = 50% chance
+            const isWin = Math.random() < winChance;
+            const profit = isWin ? 
+                botState.settings.currentBet * (botState.settings.payout - 1) : 
+                -botState.settings.currentBet;
             const newBalance = botState.stats.currentBalance + profit;
             
             return {
                 Bet: botState.settings.currentBet,
                 Balance: Math.max(0, newBalance),
                 Profit: profit,
-                Roll: Math.floor(Math.random() * 10000)
+                Roll: Math.floor(Math.random() * 10000),
+                Payout: botState.settings.payout
             };
         }
         
@@ -208,19 +263,36 @@ async function placeBet() {
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = `Dynamic Mode | Balance: ${botState.stats.currentBalance.toFixed(8)} BTC | Min Bet: ${DEFAULTS.minBet.toFixed(8)}`;
-    console.log(`🎲 Starting bot with balance: ${botState.stats.currentBalance.toFixed(8)} BTC`);
+    botState.statusMessage = `💰 PROFIT MODE | Target: ${DEFAULTS.targetProfit.toFixed(8)} BTC | Stop: ${DEFAULTS.stopLoss.toFixed(8)} BTC`;
+    console.log(`🚀 Starting PROFIT-OPTIMIZED bot with balance: ${botState.stats.currentBalance.toFixed(8)} BTC`);
+    console.log(`🎯 Profit Target: ${DEFAULTS.targetProfit.toFixed(8)} BTC (${(DEFAULTS.targetProfit/botState.stats.currentBalance*100).toFixed(1)}% gain)`);
+    console.log(`🛑 Stop Loss: ${DEFAULTS.stopLoss.toFixed(8)} BTC (50% loss)`);
     
-    while (true) {
-        if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance && botState.profitProtection.safeBalance > 0) {
-            softResetBot();
-            await new Promise(r => setTimeout(r, 5000));
-            continue; 
+    while (botState.running) {
+        // Check profit targets
+        if (checkProfitTarget()) {
+            console.log("🎉 Profit target achieved!");
+            await new Promise(r => setTimeout(r, 30000)); // Wait 30 seconds
+            // Reset for next target
+            DEFAULTS.targetProfit += 0.00000050;
+            botState.settings.aggressiveMode = true;
+            continue;
+        }
+        
+        if (checkStopLoss()) {
+            console.log("🛑 Stop loss hit. Bot stopping...");
+            break;
+        }
+        
+        // Safe floor check
+        if (botState.stats.currentBalance <= DEFAULTS.stopLoss) {
+            botState.statusMessage = "⚠️ Balance too low. Stopping...";
+            break;
         }
 
         const result = await placeBet();
         if (!result) { 
-            await new Promise(r => setTimeout(r, 5000)); 
+            await new Promise(r => setTimeout(r, 3000)); 
             continue; 
         }
 
@@ -229,15 +301,7 @@ async function runStrategy() {
         const isWin = profit > 0;
         
         // Update balance
-        if (result.Balance > 0) {
-            botState.stats.currentBalance = result.Balance;
-        } else {
-            botState.stats.currentBalance += profit;
-        }
-        
-        // Ensure balance never goes negative
-        if (botState.stats.currentBalance < 0) botState.stats.currentBalance = 0;
-        
+        botState.stats.currentBalance = result.Balance;
         botState.stats.netProfit += profit;
 
         // Update streaks
@@ -247,11 +311,21 @@ async function runStrategy() {
             botState.settings.consecutiveLosses = 0;
             botState.recoveryPot -= profit;
             if (botState.recoveryPot < 0) botState.recoveryPot = 0;
+            
+            // Update best streak
+            if (botState.settings.consecutiveWins > botState.stats.bestStreak) {
+                botState.stats.bestStreak = botState.settings.consecutiveWins;
+            }
         } else {
             botState.stats.losses++;
             botState.settings.consecutiveLosses++;
             botState.settings.consecutiveWins = 0;
             botState.recoveryPot += Math.abs(profit);
+            
+            // Update worst streak
+            if (botState.settings.consecutiveLosses > botState.stats.worstStreak) {
+                botState.stats.worstStreak = botState.settings.consecutiveLosses;
+            }
         }
 
         // Update max profit
@@ -259,8 +333,7 @@ async function runStrategy() {
             botState.stats.maxSessionProfit = botState.stats.netProfit;
         }
 
-        // Calculate new base bet based on current balance
-        const oldBase = botState.settings.baseBet;
+        // Update base bet based on current balance
         botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
         
         // Store previous bet
@@ -278,11 +351,6 @@ async function runStrategy() {
         
         // Final validation
         botState.settings.currentBet = validateBet(botState.settings.currentBet, botState.stats.currentBalance);
-        
-        // Update safe balance floor (80% profit lock)
-        if (isWin && botState.recoveryPot === 0) {
-            botState.profitProtection.safeBalance += (profit * 0.80);
-        }
 
         // Calculate direction
         let direction = "→";
@@ -295,7 +363,7 @@ async function runStrategy() {
             directionEmoji = "📉";
         }
 
-        // Add to history
+        // Enhanced history with payout info
         botState.betHistory.unshift({ 
             id: botState.stats.totalBets, 
             time: new Date().toLocaleTimeString(), 
@@ -311,28 +379,38 @@ async function runStrategy() {
             nextBet: botState.settings.currentBet,
             direction: direction,
             directionEmoji: directionEmoji,
-            balance: botState.stats.currentBalance
+            balance: botState.stats.currentBalance,
+            payout: result.Payout || botState.settings.payout
         });
         
-        // Keep only last 30 bets
         while (botState.betHistory.length > 30) botState.betHistory.pop();
 
-        // Update status message
-        const action = isWin ? `WIN → Bet DOWN to ${botState.settings.currentBet.toFixed(8)}` : `LOSS → Bet UP to ${botState.settings.currentBet.toFixed(8)}`;
-        const streakInfo = isWin ? 
-            `Win streak: ${botState.settings.consecutiveWins}` : 
-            `Loss streak: ${botState.settings.consecutiveLosses}`;
-        botState.statusMessage = `${directionEmoji} ${action} | ${streakInfo} | Balance: ${botState.stats.currentBalance.toFixed(8)} BTC`;
+        // Status message with profit info
+        const profitPercent = (botState.stats.netProfit / 0.00000012 * 100).toFixed(1);
+        const action = isWin ? `WIN +${(profit/botState.settings.currentBet*100).toFixed(0)}%` : `LOSS -100%`;
+        botState.statusMessage = `${directionEmoji} ${action} | Bet: ${botState.settings.currentBet.toFixed(8)} | P/L: ${botState.stats.netProfit.toFixed(8)} (${profitPercent}%) | Target: ${DEFAULTS.targetProfit.toFixed(8)}`;
 
-        // Wait before next bet
         await new Promise(r => setTimeout(r, 1100)); 
     }
+    
+    console.log(`\n📊 FINAL STATS:`);
+    console.log(`Total Bets: ${botState.stats.totalBets}`);
+    console.log(`Win Rate: ${(botState.stats.wins/botState.stats.totalBets*100).toFixed(1)}%`);
+    console.log(`Net Profit: ${botState.stats.netProfit.toFixed(8)} BTC`);
+    console.log(`Final Balance: ${botState.stats.currentBalance.toFixed(8)} BTC`);
 }
 
 // ============ AJAX API ============
 app.get('/api/stats', (req, res) => {
     const hours = Math.max(0.0001, (Date.now() - botState.stats.startTime) / 3600000);
-    res.json({ botState, btcPrice, hoursPassed: hours.toFixed(2), minBet: DEFAULTS.minBet });
+    res.json({ 
+        botState, 
+        btcPrice, 
+        hoursPassed: hours.toFixed(2), 
+        minBet: DEFAULTS.minBet,
+        targetProfit: DEFAULTS.targetProfit,
+        stopLoss: DEFAULTS.stopLoss
+    });
 });
 
 // ============ WEB DASHBOARD ============
@@ -342,9 +420,9 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v4.1 | Tiny Balance Mode</title>
+    <title>Dice Pro v5.0 | PROFIT OPTIMIZED</title>
     <style>
-        :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; --warning: #8b5cf6; --info: #06b6d4; }
+        :root { --primary: #10b981; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; --warning: #8b5cf6; --info: #06b6d4; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
         .container { max-width: 1200px; margin: 0 auto; }
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; flex-wrap: wrap; gap: 1rem; }
@@ -358,7 +436,7 @@ app.get('/', (req, res) => {
         .label { font-size: 0.75rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; margin-bottom: 0.5rem; }
         .btc-val { font-size: 1.75rem; font-weight: 700; }
         .usd-val { font-size: 0.875rem; color: var(--accent); }
-        .stats-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 1rem; margin-bottom: 2rem; }
+        .stats-row { display: grid; grid-template-columns: repeat(6, 1fr); gap: 1rem; margin-bottom: 2rem; }
         .mini-card { background: var(--card-bg); padding: 1rem; border-radius: 8px; border: 1px solid var(--border); text-align: center; }
         .proj-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2rem; }
         .proj-card { background: #f1f5f9; padding: 1rem; border-radius: 8px; text-align: center; }
@@ -366,28 +444,29 @@ app.get('/', (req, res) => {
         th { background: #f8fafc; padding: 1rem; text-align: left; font-size: 0.75rem; color: var(--text-muted); }
         td { padding: 1rem; font-size: 0.875rem; border-bottom: 1px solid var(--border); font-family: monospace; }
         .win { color: var(--success); } .loss { color: var(--danger); }
-        .status-bar { padding: 12px; background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); color: white; border-radius: 8px; margin-bottom: 20px; font-weight: bold; font-size: 0.9rem; }
+        .status-bar { padding: 12px; background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; border-radius: 8px; margin-bottom: 20px; font-weight: bold; font-size: 0.9rem; }
         .currency-selector { padding: 0.5rem; border-radius: 8px; border: 1px solid var(--border); font-size: 1rem; margin-left: 1rem; }
         .wallet-display { font-size: 3rem; font-weight: 800; text-align: center; margin: 2rem 0; }
         .wallet-label { font-size: 1rem; text-transform: uppercase; letter-spacing: 2px; }
-        .strategy-badge { background: linear-gradient(135deg, var(--warning), var(--info)); color: white; padding: 4px 12px; border-radius: 20px; font-size: 0.75rem; font-weight: bold; display: inline-block; margin-left: 10px; }
+        .strategy-badge { background: linear-gradient(135deg, var(--success), var(--primary)); color: white; padding: 4px 12px; border-radius: 20px; font-size: 0.75rem; font-weight: bold; display: inline-block; margin-left: 10px; }
         .bet-up { color: var(--danger); font-weight: bold; background: rgba(239,68,68,0.1); padding: 2px 8px; border-radius: 12px; }
         .bet-down { color: var(--success); font-weight: bold; background: rgba(16,185,129,0.1); padding: 2px 8px; border-radius: 12px; }
         .streak-badge { font-size: 0.7rem; padding: 2px 6px; border-radius: 10px; display: inline-block; }
         .streak-win { background: rgba(16,185,129,0.2); color: var(--success); }
         .streak-loss { background: rgba(239,68,68,0.2); color: var(--danger); }
-        .warning-box { background: rgba(245,158,11,0.1); border-left: 3px solid var(--accent); padding: 10px; margin-bottom: 15px; border-radius: 4px; font-size: 0.8rem; }
+        .profit-card { background: linear-gradient(135deg, var(--success), var(--primary)); color: white; }
+        .profit-card .label, .profit-card .usd-val { color: rgba(255,255,255,0.9); }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <div>
-                <h1>Dice Pro <span style="color:var(--primary)">v4.1</span> 
-                    <span class="strategy-badge">⬆️ UP on LOSS ⬇️ DOWN on WIN</span>
+                <h1>Dice Pro <span style="color:var(--primary)">v5.0</span> 
+                    <span class="strategy-badge">💰 PROFIT OPTIMIZED</span>
                 </h1>
-                <div class="warning-box">
-                    ⚠️ Tiny Balance Mode: ${botState.stats.currentBalance.toFixed(8)} BTC available
+                <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 5px;">
+                    🎯 Target: <strong id="target-display">0.00000050</strong> BTC | 🛑 Stop: <strong id="stop-display">0.00000006</strong> BTC
                 </div>
             </div>
             <div style="text-align: right">
@@ -404,19 +483,20 @@ app.get('/', (req, res) => {
         <div id="dashboard-page" class="page active-page">
             <div class="status-bar" id="status-msg">Status: Initializing...</div>
             <div class="grid">
-                <div class="card"><div class="label">💳 Trading Balance</div><div id="t-bal" class="btc-val" style="color:var(--danger)">0.00000000</div><div id="t-usd" class="usd-val">$0.000</div></div>
+                <div class="card profit-card"><div class="label">🎯 Profit Target</div><div id="target-progress" class="btc-val">0%</div><div class="usd-val">Target: 0.00000050 BTC</div></div>
                 <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00000012</div><div id="w-usd" class="usd-val">$0.000</div></div>
                 <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00000000</div><div id="n-usd" class="usd-val">$0.000</div></div>
-                <div class="card"><div class="label">⚖️ Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00000000</div><div class="usd-val">Mode: Dynamic ⬆️⬇️</div></div>
+                <div class="card"><div class="label">⚖️ Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00000000</div><div class="usd-val">Payout: 2.0x</div></div>
             </div>
             <div class="stats-row">
                 <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
-                <div class="mini-card"><div class="label">Base Bet (1% of bal)</div><div id="s-base" style="font-weight:700; color:var(--primary)">0.00000000</div></div>
+                <div class="mini-card"><div class="label">Base Bet (2%)</div><div id="s-base" style="font-weight:700; color:var(--primary)">0.00000000</div></div>
                 <div class="mini-card"><div class="label">Current Bet</div><div id="n-bet" style="font-weight:700; color:var(--accent)">0.00000000</div></div>
                 <div class="mini-card"><div class="label"><span class="loss">📉 Loss Streak</span></div><div id="loss-streak" style="font-weight:700; color:var(--danger)">0</div></div>
                 <div class="mini-card"><div class="label"><span class="win">📈 Win Streak</span></div><div id="win-streak" style="font-weight:700; color:var(--success)">0</div></div>
+                <div class="mini-card"><div class="label">Best/Worst Streak</div><div id="streaks" style="font-weight:700">0/0</div></div>
             </div>
-            <div class="label">Revenue Projections</div>
+            <div class="label">Revenue Projections (Annualized)</div>
             <div class="proj-grid">
                 <div class="proj-card"><div class="label">Hourly</div><span id="p-hr-b" class="win">0.00000000</span><br><span id="p-hr-u" class="usd-val">$0.000</span></div>
                 <div class="proj-card"><div class="label">Daily</div><span id="p-dy-b" class="win">0.00000000</span><br><span id="p-dy-u" class="usd-val">$0.000</span></div>
@@ -428,7 +508,7 @@ app.get('/', (req, res) => {
                     <thead>
                         <tr>
                             <th>ID</th>
-                            <th>Base</th>
+                            <th>Payout</th>
                             <th>Wager</th>
                             <th>Roll</th>
                             <th>P/L (BTC)</th>
@@ -496,12 +576,10 @@ app.get('/', (req, res) => {
             const selector = document.getElementById('currency-selector');
             if (selector) currentCurrency = selector.value;
             const walletBalanceRaw = parseFloat(document.getElementById('w-bal')?.innerText || 0);
-            const tradingBalanceRaw = parseFloat(document.getElementById('t-bal')?.innerText || 0);
             const netProfitRaw = parseFloat(document.getElementById('n-prof')?.innerText || 0);
             const recoveryPotRaw = parseFloat(document.getElementById('pot-display')?.innerText || 0);
             
             document.getElementById('wallet-display-main').innerText = formatCurrency(convertToCurrency(walletBalanceRaw, currentCurrency), currentCurrency);
-            document.getElementById('wallet-trading-bal').innerHTML = formatCurrency(convertToCurrency(tradingBalanceRaw, currentCurrency), currentCurrency);
             document.getElementById('wallet-net-profit').innerHTML = formatCurrency(convertToCurrency(netProfitRaw, currentCurrency), currentCurrency);
             document.getElementById('wallet-recovery-pot').innerHTML = formatCurrency(convertToCurrency(recoveryPotRaw, currentCurrency), currentCurrency);
         }
@@ -520,7 +598,7 @@ app.get('/', (req, res) => {
             try {
                 const res = await fetch('/api/stats');
                 const data = await res.json();
-                const { botState, btcPrice, hoursPassed, minBet } = data;
+                const { botState, btcPrice, hoursPassed, targetProfit, stopLoss } = data;
                 
                 const f = (n) => parseFloat(n || 0).toFixed(8);
                 const u = (n) => "$" + (parseFloat(n || 0) * btcPrice).toLocaleString(undefined, {minimumFractionDigits: 3, maximumFractionDigits: 3});
@@ -528,13 +606,15 @@ app.get('/', (req, res) => {
                 exchangeRates.USD = btcPrice;
                 exchangeRates.USDT = btcPrice;
                 
-                const tradingAvailable = Math.max(0, (botState.stats.currentBalance - botState.profitProtection.safeBalance) / 8);
-
-                document.getElementById('status-msg').innerHTML = "🎲 " + botState.statusMessage;
-                document.getElementById('price-tag').innerText = "$" + btcPrice.toLocaleString();
+                document.getElementById('target-display').innerText = f(targetProfit);
+                document.getElementById('stop-display').innerText = f(stopLoss);
                 
-                document.getElementById('t-bal').innerHTML = f(tradingAvailable);
-                document.getElementById('t-usd').innerHTML = u(tradingAvailable);
+                const profitPercent = (botState.stats.netProfit / targetProfit * 100).toFixed(0);
+                document.getElementById('target-progress').innerHTML = profitPercent + '%';
+                document.getElementById('target-progress').style.color = profitPercent >= 100 ? '#fff' : '#fff';
+                
+                document.getElementById('status-msg').innerHTML = "💰 " + botState.statusMessage;
+                document.getElementById('price-tag').innerText = "$" + btcPrice.toLocaleString();
                 
                 document.getElementById('w-bal').innerHTML = f(botState.stats.currentBalance);
                 document.getElementById('w-usd').innerHTML = u(botState.stats.currentBalance);
@@ -548,6 +628,7 @@ app.get('/', (req, res) => {
                 document.getElementById('n-bet').innerHTML = f(botState.settings.currentBet);
                 document.getElementById('loss-streak').innerHTML = botState.settings.consecutiveLosses || 0;
                 document.getElementById('win-streak').innerHTML = botState.settings.consecutiveWins || 0;
+                document.getElementById('streaks').innerHTML = botState.stats.bestStreak + '/' + botState.stats.worstStreak;
 
                 const netProfit = parseFloat(botState.stats.netProfit || 0);
                 const hours = Math.max(0.01, parseFloat(hoursPassed));
@@ -577,9 +658,9 @@ app.get('/', (req, res) => {
                             directionHtml = '<span class="bet-same">➡️ SAME</span>';
                         }
                         
-                        return '<tr>' +
+                        return '<table>' +
                             '<td>#' + b.id + '</td>' +
-                            '<td>' + f(b.dBase) + '</td>' +
+                            '<td>' + (b.payout || '2.0') + 'x' + '</td>' +
                             '<td>' + f(b.bet) + '</td>' +
                             '<td>' + b.roll + '</td>' +
                             '<td class="' + (b.isWin ? 'win' : 'loss') + '">' + (b.isWin ? '+' : '') + f(b.profit) + '</td>' +
@@ -603,7 +684,7 @@ app.get('/', (req, res) => {
 
 app.listen(port, '0.0.0.0', () => {
     console.log(`✅ Server running on port ${port}`);
-    console.log(`🎲 Starting with balance: 0.00000012 BTC (12 satoshis)`);
+    console.log(`🚀 PROFIT-OPTIMIZED MODE ACTIVE`);
     console.log(`📊 Open http://localhost:${port} to view dashboard`);
     runStrategy();
 });
