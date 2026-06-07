@@ -11,7 +11,7 @@ const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
-    payout: 2.0,              
+    payout: 1.7,              
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001,
     recoveryDivisor: 10,      // Spreads recovery over 50 wins (Much Slower)
