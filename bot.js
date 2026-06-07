@@ -5,16 +5,16 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "q6maMp6C0Gxu88dKwNHxGm8SiyRytDIzWNOtfOJV9C24ENS2Nu";
+const API_KEY = process.env.API_KEY || "t5QJoXcM1J4mZovfiP8G4GcEgZjdyhnZgK8UhpLf4x3GEK0iXH";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
-    payout: 2.5,              
+    payout: 2.0,              
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001,
-    maxBetPercent: 0.01,       
-    streakReset: 5             
+    maxBetPercent: 0.01,       // SAFETY: Single bet will NEVER exceed 1% of balance
+    streakReset: 5             // Reset to base after 5 losses to stop the "high bet" spiral
 };
 
 // ============ BOT STATE ============
@@ -24,7 +24,6 @@ let botState = {
     statusMessage: "Active: Compound Growth Mode",
     lossStreak: 0,
     coin: DEFAULTS.coin,
-    currentSeed: "pro" + Math.random().toString(36).substring(2, 10), // Initial Seed
     stats: {
         totalBets: 0,
         wins: 0,
@@ -50,7 +49,6 @@ async function updateBTCPrice() {
     } catch (e) {}
 }
 setInterval(updateBTCPrice, 60000);
-updateBTCPrice();
 
 function calculateScaledBase(balance) {
     const units = Math.floor(balance / DEFAULTS.balanceStep);
@@ -60,18 +58,14 @@ function calculateScaledBase(balance) {
 
 // ============ API LOGIC ============
 async function placeBet() {
-    // ROTATE SEED EVERY 10 BETS
-    if (botState.stats.totalBets > 0 && botState.stats.totalBets % 10 === 0) {
-        botState.currentSeed = "pro" + Math.random().toString(36).substring(2, 10);
-        botState.statusMessage = "Seed Rotated for Security.";
-    }
-
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
+    const safeSeed = "pro" + Math.random().toString(36).substring(2, 10); 
+
     const payload = { 
         Bet: Number(botState.settings.currentBet.toFixed(8)), 
         Payout: botState.settings.payout, 
         UnderOver: true, 
-        ClientSeed: botState.currentSeed 
+        ClientSeed: safeSeed 
     };
 
     try {
@@ -97,25 +91,34 @@ async function runStrategy() {
         botState.stats.netProfit += profit;
         botState.stats.currentBalance = result.Balance || 0;
 
+        // 1. Calculate the standard base for the current balance
         const dynamicBase = calculateScaledBase(botState.stats.currentBalance);
         botState.settings.baseBet = dynamicBase;
 
         if (profit > 0) {
+            // --- ON WIN ---
             botState.stats.wins++;
             botState.lossStreak = 0;
             botState.statusMessage = "Profit detected. Compounding...";
+            
+            // On a win, we stay at base bet but add a tiny "streak bonus" (10% of base)
             botState.settings.currentBet = dynamicBase + (dynamicBase * 0.1);
         } else {
+            // --- ON LOSS ---
             botState.stats.losses++;
             botState.lossStreak++;
             botState.statusMessage = `Loss Streak: ${botState.lossStreak}`;
 
             if (botState.lossStreak >= DEFAULTS.streakReset) {
+                // If we lose 5 times, go back to MINIMUM to save the balance
                 botState.statusMessage = "Safety Reset: Loss streak too high.";
                 botState.settings.currentBet = dynamicBase;
                 botState.lossStreak = 0;
             } else {
+                // Martingale limited: Double only if it's safe
                 let nextBet = botState.settings.currentBet * 2;
+                
+                // SAFETY CHECK: Never bet more than 1% of balance
                 const maxAllowed = botState.stats.currentBalance * DEFAULTS.maxBetPercent;
                 if (nextBet > maxAllowed) {
                     botState.settings.currentBet = dynamicBase;
@@ -142,19 +145,8 @@ async function runStrategy() {
 
 // ============ WEB DASHBOARD ============
 app.get('/api/stats', (req, res) => {
-    const elapsedMs = Date.now() - botState.stats.startTime;
-    const hours = Math.max(0.0001, elapsedMs / 3600000);
-    
-    // Projections
-    const btcPerHour = botState.stats.netProfit / hours;
-    const projections = {
-        hour: { btc: btcPerHour, usd: btcPerHour * btcPrice },
-        day: { btc: btcPerHour * 24, usd: btcPerHour * 24 * btcPrice },
-        month: { btc: btcPerHour * 24 * 30, usd: btcPerHour * 24 * 30 * btcPrice },
-        year: { btc: btcPerHour * 24 * 365, usd: btcPerHour * 24 * 365 * btcPrice }
-    };
-
-    res.json({ botState, btcPrice, hoursPassed: hours.toFixed(2), projections });
+    const hours = Math.max(0.0001, (Date.now() - botState.stats.startTime) / 3600000);
+    res.json({ botState, btcPrice, hoursPassed: hours.toFixed(2) });
 });
 
 app.get('/', (req, res) => {
@@ -174,10 +166,6 @@ app.get('/', (req, res) => {
         th { text-align: left; color: #94a3b8; font-size: 0.8rem; padding: 10px; }
         td { padding: 10px; border-bottom: 1px solid #334155; font-family: monospace; }
         .win { color: var(--success); } .loss { color: var(--danger); }
-        .proj-grid { margin-top: 30px; display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; }
-        .proj-card { background: #020617; padding: 15px; border-radius: 8px; border-left: 4px solid var(--primary); }
-        .proj-title { font-size: 0.7rem; color: #94a3b8; text-transform: uppercase; }
-        .proj-val { font-family: monospace; font-size: 0.9rem; margin-top: 5px; }
     </style>
 </head>
 <body>
@@ -191,30 +179,6 @@ app.get('/', (req, res) => {
         <div class="card"><div>Win Rate</div><div class="val" id="wr">0%</div></div>
     </div>
 
-    <h3 style="margin-top:30px;">Earnings Projections (ESTIMATED)</h3>
-    <div class="proj-grid">
-        <div class="proj-card">
-            <div class="proj-title">Hourly</div>
-            <div class="proj-val" id="ph-btc">0.00 BTC</div>
-            <div class="proj-val" id="ph-usd" style="color:var(--success)">$0.00</div>
-        </div>
-        <div class="proj-card">
-            <div class="proj-title">Daily</div>
-            <div class="proj-val" id="pd-btc">0.00 BTC</div>
-            <div class="proj-val" id="pd-usd" style="color:var(--success)">$0.00</div>
-        </div>
-        <div class="proj-card">
-            <div class="proj-title">Monthly</div>
-            <div class="proj-val" id="pm-btc">0.00 BTC</div>
-            <div class="proj-val" id="pm-usd" style="color:var(--success)">$0.00</div>
-        </div>
-        <div class="proj-card">
-            <div class="proj-title">Yearly</div>
-            <div class="proj-val" id="py-btc">0.00 BTC</div>
-            <div class="proj-val" id="py-usd" style="color:var(--success)">$0.00</div>
-        </div>
-    </div>
-
     <table>
         <thead><tr><th>ID</th><th>Wager</th><th>Roll</th><th>Profit</th><th>Result</th></tr></thead>
         <tbody id="history"></tbody>
@@ -222,36 +186,25 @@ app.get('/', (req, res) => {
 
     <script>
         async function update() {
-            try {
-                const res = await fetch('/api/stats');
-                const data = await res.json();
-                const { botState, btcPrice, projections } = data;
+            const res = await fetch('/api/stats');
+            const data = await res.json();
+            const { botState, btcPrice } = data;
 
-                document.getElementById('status').innerText = "SYSTEM STATUS: " + botState.statusMessage + " | SEED: " + botState.currentSeed;
-                document.getElementById('bal').innerText = botState.stats.currentBalance.toFixed(8);
-                document.getElementById('profit').innerText = botState.stats.netProfit.toFixed(8);
-                document.getElementById('next').innerText = botState.settings.currentBet.toFixed(8);
-                document.getElementById('wr').innerText = ((botState.stats.wins/botState.stats.totalBets)*100 || 0).toFixed(1) + "%";
+            document.getElementById('status').innerText = "SYSTEM STATUS: " + botState.statusMessage;
+            document.getElementById('bal').innerText = botState.stats.currentBalance.toFixed(8);
+            document.getElementById('profit').innerText = botState.stats.netProfit.toFixed(8);
+            document.getElementById('next').innerText = botState.settings.currentBet.toFixed(8);
+            document.getElementById('wr').innerText = ((botState.stats.wins/botState.stats.totalBets)*100 || 0).toFixed(1) + "%";
 
-                // Update Projections
-                const periods = ['h', 'd', 'm', 'y'];
-                const keys = ['hour', 'day', 'month', 'year'];
-                
-                keys.forEach((key, i) => {
-                    document.getElementById('p' + periods[i] + '-btc').innerText = projections[key].btc.toFixed(8) + " BTC";
-                    document.getElementById('p' + periods[i] + '-usd').innerText = "$" + projections[key].usd.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-                });
-
-                document.getElementById('history').innerHTML = botState.betHistory.map(b => \`
-                    <tr>
-                        <td>#\${b.id}</td>
-                        <td>\${parseFloat(b.bet).toFixed(8)}</td>
-                        <td>\${b.roll}</td>
-                        <td class="\${b.isWin?'win':'loss'}">\${parseFloat(b.profit).toFixed(8)}</td>
-                        <td class="\${b.isWin?'win':'loss'}">\${b.isWin?'WIN':'LOSS'}</td>
-                    </tr>
-                \`).join('');
-            } catch (e) { console.log(e); }
+            document.getElementById('history').innerHTML = botState.betHistory.map(b => \`
+                <tr>
+                    <td>#\${b.id}</td>
+                    <td>\${parseFloat(b.bet).toFixed(8)}</td>
+                    <td>\${b.roll}</td>
+                    <td class="\${b.isWin?'win':'loss'}">\${parseFloat(b.profit).toFixed(8)}</td>
+                    <td class="\${b.isWin?'win':'loss'}">\${b.isWin?'WIN':'LOSS'}</td>
+                </tr>
+            \`).join('');
         }
         setInterval(update, 1000);
     </script>
