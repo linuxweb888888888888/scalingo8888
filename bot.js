@@ -10,7 +10,7 @@ const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
-    payout: 1.2,               // 2.0x Payout (Standard for Flat Betting)
+    payout: 1.7,               // 2.0x Payout (Standard for Flat Betting)
     balanceStep: 0.00000050,   // Scaling: For every 50 sats in balance...
     betIncrement: 0.00000001,  // ...increase base bet by 1 sat
     maxTotalBetPercent: 0.015, // SAFETY: Hard cap bet at 1.5% of balance
