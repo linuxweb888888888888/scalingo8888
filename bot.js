@@ -65,7 +65,7 @@ function resetSession() {
     botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.98; // Protect 98% of remaining on crash
     botState.recoveryPot = 0;
     botState.stats = {
-        totalBets: 0, wins: 0, losses: 0, netProfit: 0, maxSessionProfit: 0,
+        totalBets: 0, wins: 0, losses: 0, netProfit: botState.stats.netProfit, maxSessionProfit: 0,
         currentBalance: botState.stats.currentBalance,
         startTime: Date.now()
     };
@@ -210,10 +210,10 @@ app.get('/', (req, res) => {
         </div>
         <div class="label">Revenue Projections</div>
         <div class="proj-grid">
-            <div class="proj-card"><div class="label">Hourly</div><span id="p-hr-b" class="win">0.00</span><br><span id="p-hr-u" class="usd-val">$0.00</span></div>
-            <div class="proj-card"><div class="label">Daily</div><span id="p-dy-b" class="win">0.00</span><br><span id="p-dy-u" class="usd-val">$0.00</span></div>
-            <div class="proj-card"><div class="label">Monthly</div><span id="p-month-b" class="win">0.00</span><br><span id="p-month-u" class="usd-val">$0.00</span></div>
-            <div class="proj-card"><div class="label">Yearly</div><span id="p-year-b" class="win">0.00</span><br><span id="p-year-u" class="usd-val">$0.00</span></div>
+            <div class="proj-card"><div class="label">Hourly</div><span id="p-hr-b" class="win">0.00</span><br><span id="p-hr-u" class="usd-val">0.00</span></div>
+            <div class="proj-card"><div class="label">Daily</div><span id="p-dy-b" class="win">0.00</span><br><span id="p-dy-u" class="usd-val">0.00</span></div>
+            <div class="proj-card"><div class="label">Monthly</div><span id="p-month-b" class="win">0.00</span><br><span id="p-month-u" class="usd-val">0.00</span></div>
+            <div class="proj-card"><div class="label">Yearly</div><span id="p-year-b" class="win">0.00</span><br><span id="p-year-u" class="usd-val">0.00</span></div>
         </div>
         <table>
             <thead><tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Remaining</th></tr></thead>
@@ -242,23 +242,10 @@ app.get('/', (req, res) => {
                 document.getElementById('n-bet').innerText = f(botState.settings.currentBet);
                 document.getElementById('uptime').innerText = hoursPassed + "h";
 
-                // Calculate projections based on Net Profit with safety checks to prevent Infinity
-                const netProfit = parseFloat(botState.stats.netProfit || 0);
+                // Calculate projections based on Wallet Balance (not Net Profit)
+                const walletBalance = parseFloat(botState.stats.currentBalance || 0);
                 const hours = parseFloat(hoursPassed);
-                let hourlyProjection = 0;
-                
-                if (hours > 0 && netProfit !== 0) {
-                    hourlyProjection = netProfit / hours;
-                } else if (hours > 0 && netProfit === 0) {
-                    hourlyProjection = 0;
-                } else {
-                    hourlyProjection = 0;
-                }
-                
-                // Ensure we never show Infinity or NaN
-                if (!isFinite(hourlyProjection) || isNaN(hourlyProjection)) {
-                    hourlyProjection = 0;
-                }
+                const hourlyProjection = walletBalance / hours;
                 
                 document.getElementById('p-hr-b').innerText = f(hourlyProjection);
                 document.getElementById('p-hr-u').innerText = u(hourlyProjection);
