@@ -6,13 +6,13 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "Vr6NovoNr48oAjI53T0Ch5UKSaELTrRgZ0COLoEjjtWARuQ26k";
+const API_KEY = process.env.API_KEY || "i57lk4i2fyabkEBmL5Kq4GiPZIg5WszlcTG6P9Y778UJtoaDmu";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
     payout: 1.7,              
-    balanceStep: 0.00000025,  
+    balanceStep: 0.0000001,  
     betIncrement: 0.00000001
 };
 
@@ -24,7 +24,7 @@ let botState = {
     recoveryPot: 0, 
     coin: DEFAULTS.coin,
     profitProtection: { 
-        safeBalance: 0, // This is the 'Floor'. 0 means Trading Bal = Wallet Bal
+        safeBalance: 0,
         lockPercent: 0.80 
     }, 
     stats: {
@@ -59,17 +59,9 @@ function calculateScaledBase(balance) {
     return Number((Math.max(1, units) * DEFAULTS.betIncrement).toFixed(8));
 }
 
-/**
- * SOFT REBOOT: REAL RESET
- * This sets the safe floor to 0, making Trading Balance = Wallet Balance
- */
 function softResetBot() {
-    botState.statusMessage = "SYSTEM: SAFE FLOOR HIT: Real Resetting Balance...";
-    
-    // REAL RESET: Setting safeBalance to 0 makes your Trading Balance 
-    // exactly the same as your Wallet Balance.
+    botState.statusMessage = "SYSTEM: SAFE FLOOR HIT: Resetting Balance...";
     botState.profitProtection.safeBalance = 0; 
-    
     botState.recoveryPot = 0;
     botState.stats = {
         totalBets: 0, 
@@ -111,7 +103,6 @@ async function runStrategy() {
     botState.statusMessage = "Linear Recovery Mode (80% Profit Lock)";
     
     while (true) {
-        // Floor Auto-Reboot Trigger
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
             softResetBot();
             await new Promise(r => setTimeout(r, 5000));
@@ -142,7 +133,6 @@ async function runStrategy() {
 
             if (botState.recoveryPot === 0) {
                 botState.settings.currentBet = botState.settings.baseBet;
-                // As you win, it starts locking profit again starting from 0
                 botState.profitProtection.safeBalance += (profit * 0.80); 
             }
         } else {
@@ -223,7 +213,6 @@ app.get('/', (req, res) => {
         <div id="dashboard-page" class="page active-page">
             <div class="status-bar" id="status-msg">Status: Initializing...</div>
             <div class="grid">
-                <!-- TRADING BALANCE now equals WALLET BALANCE on reset -->
                 <div class="card"><div class="label">💳 Trading Balance</div><div id="t-bal" class="btc-val" style="color:var(--danger)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
                 <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
                 <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
@@ -249,7 +238,6 @@ app.get('/', (req, res) => {
         </div>
         
         <div id="wallet-page" class="page">
-            <!-- DESIGN KEPT THE SAME AS REQUESTED -->
             <div class="status-bar" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
                 💰 WALLET BALANCE - Select Currency Below
             </div>
@@ -270,6 +258,7 @@ app.get('/', (req, res) => {
                 <div style="font-size: 1.2rem; opacity: 0.9;" id="wallet-conversion-note">≈ $0.00 USD</div>
             </div>
             <div class="grid" style="margin-top: 2rem;">
+                <!-- TRADING BALANCE logic applied here too -->
                 <div class="card"><div class="label">💳 Trading Balance</div><div id="wallet-trading-bal" class="btc-val">0.00</div><div id="wallet-trading-conv" class="usd-val">$0.00</div></div>
                 <div class="card"><div class="label">📈 Net Profit</div><div id="wallet-net-profit" class="btc-val">0.00</div><div id="wallet-profit-conv" class="usd-val">$0.00</div></div>
                 <div class="card"><div class="label">⚖️ Recovery Pot</div><div id="wallet-recovery-pot" class="btc-val">0.00</div><div id="wallet-recovery-conv" class="usd-val">$0.00</div></div>
@@ -300,8 +289,12 @@ app.get('/', (req, res) => {
         function updateWalletDisplay() {
             const selector = document.getElementById('currency-selector');
             if (selector) currentCurrency = selector.value;
+            
             const walletBalanceRaw = parseFloat(document.getElementById('w-bal')?.innerText || 0);
+            
+            // Logic: (Wallet - Floor) / 2
             const tradingBalanceRaw = parseFloat(document.getElementById('t-bal')?.innerText || 0);
+            
             const netProfitRaw = parseFloat(document.getElementById('n-prof')?.innerText || 0);
             const recoveryPotRaw = parseFloat(document.getElementById('pot-display')?.innerText || 0);
             
@@ -329,10 +322,16 @@ app.get('/', (req, res) => {
                 exchangeRates.USD = btcPrice;
                 exchangeRates.USDT = btcPrice;
                 
+                // CALCULATION: (Current Balance - Safe Balance) divided by 2
+                const halfTradingAmount = (botState.stats.currentBalance - botState.profitProtection.safeBalance) / 2;
+
                 document.getElementById('status-msg').innerText = "Status: " + botState.statusMessage;
                 document.getElementById('price-tag').innerText = "$" + btcPrice.toLocaleString();
-                document.getElementById('t-bal').innerText = f(botState.stats.currentBalance - botState.profitProtection.safeBalance);
-                document.getElementById('t-usd').innerText = u(botState.stats.currentBalance - botState.profitProtection.safeBalance);
+                
+                // APPLIED TO DASHBOARD
+                document.getElementById('t-bal').innerText = f(halfTradingAmount);
+                document.getElementById('t-usd').innerText = u(halfTradingAmount);
+                
                 document.getElementById('w-bal').innerText = f(botState.stats.currentBalance);
                 document.getElementById('w-usd').innerText = u(botState.stats.currentBalance);
                 document.getElementById('n-prof').innerText = f(botState.stats.netProfit);
