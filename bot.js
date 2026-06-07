@@ -6,7 +6,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION - PROFIT OPTIMIZED ============
-const API_KEY = process.env.API_KEY || "ubusPY6aoXmQXKbS8S6y0gaTVBEDGDu39NMLaS52NV3F3DdKGN";
+const API_KEY = "ubusPY6aoXmQXKbS8S6y0gaTVBEDGDu39NMLaS52NV3F3DdKGN";
 const BASE_URL = "https://api.crypto.games/v1";
 
 // PROFIT-OPTIMIZED CONFIGURATION (Fixed negative EV)
