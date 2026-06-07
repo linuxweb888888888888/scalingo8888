@@ -12,7 +12,7 @@ const BASE_URL = "https://api.crypto.games/v1";
 const DEFAULTS = {
     coin: "BTC",
     payout: 1.7,              
-    balanceStep: 0.0000001,  
+    balanceStep: 0.00000025,  
     betIncrement: 0.00000001
 };
 
