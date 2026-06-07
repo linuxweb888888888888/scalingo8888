@@ -5,7 +5,7 @@ const fs = require('fs');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ============ CONFIGURATION (Efficient Scaling v3.9) ============
+// ============ CONFIGURATION (Efficient Scaling v3.9.1) ============
 const API_KEY = process.env.API_KEY || "0n751mjysO1s1Pb4b9rBlribcBqFztjGfUp7GDsfQFJM7mOdc2";
 const BASE_URL = "https://api.crypto.games/v1";
 
@@ -14,9 +14,9 @@ const DEFAULTS = {
     payout: 2.0,              
     balanceStep: 0.00000010,   
     betIncrement: 0.00000001,
-    recoveryDivisor: 12,       // Base recovery speed (Efficient)
-    maxRecoveryDivisor: 40,    // Safety slowdown for large pots
-    maxTotalBetPercent: 0.02,  // 2% Hard cap for safety
+    recoveryDivisor: 12,       // Fast recovery for small pots
+    maxRecoveryDivisor: 40,    // Safe recovery for large pots
+    maxTotalBetPercent: 0.02,  // Hard cap: 2% of balance
     potSafetyLimit: 0.12       // Reset if pot hits 12% of balance
 };
 
@@ -27,13 +27,11 @@ let botState = {
     statusMessage: "Initializing...",
     recoveryPot: 0, 
     coin: DEFAULTS.coin,
-    profitProtection: { safeBalance: 0 }, 
     stats: {
         totalBets: 0,
         wins: 0,
         losses: 0,
         netProfit: 0,
-        maxSessionProfit: 0,
         currentBalance: 0,
         startTime: Date.now(),
     },
@@ -60,20 +58,30 @@ function calculateScaledBase(balance) {
     return Number((Math.max(1, units) * DEFAULTS.betIncrement).toFixed(8));
 }
 
-// ============ API LOGIC ============
+// ============ API LOGIC (Fixed for "Invalid Parameters") ============
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
     const safeSeed = "pro" + Math.random().toString(36).substring(2, 12); 
 
+    // FIX: Ensure bet is exactly 8 decimals and never below 0.00000001
+    const finalBet = Math.max(0.00000001, Number(botState.settings.currentBet.toFixed(8)));
+    
+    // FIX: Ensure payout is 2 decimals
+    const finalPayout = Number(botState.settings.payout.toFixed(2));
+
     const payload = { 
-        Bet: Number(botState.settings.currentBet.toFixed(8)), 
-        Payout: botState.settings.payout, 
+        Bet: finalBet, 
+        Payout: finalPayout, 
         UnderOver: true, 
         ClientSeed: safeSeed 
     };
 
     try {
         const response = await axios.post(url, payload);
+        if (response.data && response.data.Success === false) {
+            botState.statusMessage = response.data.Message || "Bet Rejected";
+            return null;
+        }
         return response.data;
     } catch (error) { 
         botState.statusMessage = error.response?.data?.Message || "API Error";
@@ -86,6 +94,7 @@ async function runStrategy() {
     botState.statusMessage = "Efficient-Scaling Active";
     
     while (true) {
+        // Safety: Clear pot if it exceeds safety limit
         if (botState.recoveryPot > (botState.stats.currentBalance * DEFAULTS.potSafetyLimit)) {
             botState.statusMessage = "Safety Reset: Pot Cleared.";
             botState.recoveryPot = 0;
@@ -97,27 +106,28 @@ async function runStrategy() {
             continue; 
         }
 
+        // Update basic stats
         botState.stats.totalBets++;
         const profit = result.Profit || 0;
         botState.stats.netProfit += profit;
         botState.stats.currentBalance = result.Balance || 0;
 
+        // Scale base bet according to balance
         botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
 
+        // Update Recovery Pot
         if (profit > 0) {
             botState.stats.wins++;
-            botState.recoveryPot -= profit;
-            if (botState.recoveryPot < 0) botState.recoveryPot = 0;
+            botState.recoveryPot = Math.max(0, botState.recoveryPot - profit);
         } else {
             botState.stats.losses++;
             botState.recoveryPot += Math.abs(result.Bet); 
         }
 
         // --- EFFICIENT SCALING CALCULATION ---
-        // We calculate how "heavy" the pot is compared to our base bet
         let potSeverity = botState.recoveryPot / (botState.settings.baseBet || 0.00000001);
         
-        // Dynamic Divisor: If the pot gets too big, we increase the divisor to slow down recovery
+        // Dynamic Divisor: As the pot grows, we slow down to prevent bet "explosions"
         let dynamicDivisor = DEFAULTS.recoveryDivisor;
         if (potSeverity > 50) dynamicDivisor = 20; 
         if (potSeverity > 150) dynamicDivisor = DEFAULTS.maxRecoveryDivisor;
@@ -127,8 +137,12 @@ async function runStrategy() {
 
         // Apply strict safety cap (max 2% of balance)
         let absoluteMax = botState.stats.currentBalance * DEFAULTS.maxTotalBetPercent;
-        botState.settings.currentBet = Math.min(targetBet, absoluteMax);
+        let finalCalculated = Math.min(targetBet, absoluteMax);
 
+        // FINAL CHECK: Never bet below minimum allowed by API
+        botState.settings.currentBet = Math.max(0.00000001, finalCalculated);
+
+        // Update history
         botState.betHistory.unshift({ 
             id: botState.stats.totalBets, time: new Date().toLocaleTimeString(), 
             bet: result.Bet, roll: result.Roll, profit: profit, isWin: profit > 0, 
@@ -146,7 +160,7 @@ app.get('/api/stats', (req, res) => {
     res.json({ botState, btcPrice, hoursPassed: hours.toFixed(2) });
 });
 
-// ============ WEB DASHBOARD ============
+// ============ WEB DASHBOARD (Original Design) ============
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
