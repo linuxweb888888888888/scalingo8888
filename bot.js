@@ -20,12 +20,12 @@ const DEFAULTS = {
 let btcPrice = 60964; 
 let botState = {
     running: true,
-    statusMessage: "Linear Recovery Mode (80% Profit Lock)",
+    statusMessage: "Initializing...",
     recoveryPot: 0, 
     coin: DEFAULTS.coin,
     profitProtection: { 
         safeBalance: 0,
-        lockPercent: 0.80
+        lockPercent: 0.80 // Locking 80% of profit
     }, 
     stats: {
         totalBets: 0,
@@ -59,32 +59,37 @@ function calculateScaledBase(balance) {
     return Number((Math.max(1, units) * DEFAULTS.betIncrement).toFixed(8));
 }
 
-function resetSession() {
-    // Store the current balance before reset
-    const currentBalance = botState.stats.currentBalance;
-    const totalNetProfit = botState.stats.netProfit;
+/**
+ * SOFT REBOOT / RESET LOGIC
+ * Resets strategy variables while keeping the dashboard/server alive.
+ */
+function softResetBot() {
+    console.log("SYSTEM: SAFE FLOOR HIT. Performing soft reboot...");
     
-    // Complete session reset - exactly like a fresh reboot
-    botState.statusMessage = "Linear Recovery Mode (80% Profit Lock)";
+    botState.statusMessage = "SYSTEM: SAFE FLOOR HIT: Locking Profits... Soft Rebooting...";
+    
+    // Protect 98% of what remains
+    botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.98; 
+    
+    // Clear Recovery Logic
     botState.recoveryPot = 0;
-    botState.profitProtection.safeBalance = currentBalance * 0.98;
     
-    // Reset stats completely - fresh session
+    // Reset Session Stats but preserve lifetime Net Profit
     botState.stats = {
-        totalBets: 0,
-        wins: 0,
-        losses: 0,
-        netProfit: totalNetProfit,  // Preserve overall profit
+        totalBets: 0, 
+        wins: 0, 
+        losses: 0, 
+        netProfit: botState.stats.netProfit, 
         maxSessionProfit: 0,
-        currentBalance: currentBalance,
-        startTime: Date.now(),  // Reset start time for projections
+        currentBalance: botState.stats.currentBalance,
+        startTime: Date.now() // Resets uptime clock for the new "session"
     };
     
-    // Clear bet history
+    // Wipe history to clear visual clutter on reboot
     botState.betHistory = [];
     
-    // Reset betting settings
-    botState.settings.baseBet = calculateScaledBase(currentBalance);
+    // Recalculate bets for the new balance level
+    botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
     botState.settings.currentBet = botState.settings.baseBet;
 }
 
@@ -114,11 +119,13 @@ async function placeBet() {
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
+    botState.statusMessage = "Linear Recovery Mode (80% Profit Lock)";
+    
     while (true) {
-        // AUTO-REBOOT: When safe floor is hit, perform complete soft reset
+        // Floor Auto-Reboot Trigger
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
-            resetSession();
-            // Wait 5 seconds before continuing after reboot
+            softResetBot();
+            // Wait 5 seconds to let the API/Server "breathe" during the soft reboot
             await new Promise(r => setTimeout(r, 5000));
             continue; 
         }
@@ -147,6 +154,7 @@ async function runStrategy() {
 
             if (botState.recoveryPot === 0) {
                 botState.settings.currentBet = botState.settings.baseBet;
+                // Lock 80% of the win into the safe floor
                 botState.profitProtection.safeBalance += (profit * 0.80); 
             }
         } else {
@@ -156,14 +164,9 @@ async function runStrategy() {
         }
 
         botState.betHistory.unshift({ 
-            id: botState.stats.totalBets, 
-            time: new Date().toLocaleTimeString(), 
-            bet: result.Bet, 
-            roll: result.Roll, 
-            profit: profit, 
-            isWin: profit > 0, 
-            pot: botState.recoveryPot.toFixed(8), 
-            dBase: botState.settings.baseBet
+            id: botState.stats.totalBets, time: new Date().toLocaleTimeString(), 
+            bet: result.Bet, roll: result.Roll, profit: profit, isWin: profit > 0, 
+            pot: botState.recoveryPot.toFixed(8), dBase: botState.settings.baseBet
         });
         if (botState.betHistory.length > 30) botState.betHistory.pop();
 
@@ -174,12 +177,7 @@ async function runStrategy() {
 // ============ AJAX API ============
 app.get('/api/stats', (req, res) => {
     const hours = Math.max(0.0001, (Date.now() - botState.stats.startTime) / 3600000);
-    
-    res.json({ 
-        botState, 
-        btcPrice, 
-        hoursPassed: hours.toFixed(4)
-    });
+    res.json({ botState, btcPrice, hoursPassed: hours.toFixed(2) });
 });
 
 // ============ WEB DASHBOARD ============
@@ -189,9 +187,9 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.3 | 80% Lock | Auto-Reboot</title>
+    <title>Dice Pro v3.3 | 80% Lock</title>
     <style>
-        :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; --warning: #8b5cf6; }
+        :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
         .container { max-width: 1200px; margin: 0 auto; }
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; }
@@ -217,14 +215,12 @@ app.get('/', (req, res) => {
         .currency-selector { padding: 0.5rem; border-radius: 8px; border: 1px solid var(--border); font-size: 1rem; margin-left: 1rem; }
         .wallet-display { font-size: 3rem; font-weight: 800; text-align: center; margin: 2rem 0; }
         .wallet-label { font-size: 1rem; text-transform: uppercase; letter-spacing: 2px; }
-        .reboot-badge { display: inline-block; background: #8b5cf6; color: white; padding: 2px 8px; border-radius: 12px; font-size: 0.7rem; margin-left: 10px; }
-        .infinity { color: var(--accent); font-weight: bold; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>Dice Pro <span style="color:var(--primary)">v3.3</span> <span class="reboot-badge">Auto-Reboot Active</span></h1>
+            <h1>Dice Pro <span style="color:var(--primary)">v3.3</span></h1>
             <div style="text-align: right">
                 <div class="label">Market BTC/USD</div>
                 <div id="price-tag" style="font-weight: 700;">$0.00</div>
@@ -252,20 +248,15 @@ app.get('/', (req, res) => {
             </div>
             <div class="label">Revenue Projections</div>
             <div class="proj-grid">
-                <div class="proj-card"><div class="label">Hourly</div><span id="p-hr-b" class="win">0.00</span><br><span id="p-hr-u" class="usd-val">$0.00</span></div>
-                <div class="proj-card"><div class="label">Daily</div><span id="p-dy-b" class="win">0.00</span><br><span id="p-dy-u" class="usd-val">$0.00</span></div>
-                <div class="proj-card"><div class="label">Monthly</div><span id="p-month-b" class="win">0.00</span><br><span id="p-month-u" class="usd-val">$0.00</span></div>
-                <div class="proj-card"><div class="label">Yearly</div><span id="p-year-b" class="win">0.00</span><br><span id="p-year-u" class="usd-val">$0.00</span></div>
+                <div class="proj-card"><div class="label">Hourly</div><span id="p-hr-b" class="win">0.00</span><br><span id="p-hr-u" class="usd-val">0.00</span></div>
+                <div class="proj-card"><div class="label">Daily</div><span id="p-dy-b" class="win">0.00</span><br><span id="p-dy-u" class="usd-val">0.00</span></div>
+                <div class="proj-card"><div class="label">Monthly</div><span id="p-month-b" class="win">0.00</span><br><span id="p-month-u" class="usd-val">0.00</span></div>
+                <div class="proj-card"><div class="label">Yearly</div><span id="p-year-b" class="win">0.00</span><br><span id="p-year-u" class="usd-val">0.00</span></div>
             </div>
-            <div class="label">Recent Bets</div>
-            <div style="overflow-x: auto;">
-                <table>
-                    <thead>
-                        <tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Remaining</th></tr>
-                    </thead>
-                    <tbody id="h-body"></tbody>
-                </table>
-            </div>
+            <table>
+                <thead><tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Remaining</th></tr></thead>
+                <tbody id="h-body"></tbody>
+            </table>
         </div>
         
         <div id="wallet-page" class="page">
@@ -330,13 +321,6 @@ app.get('/', (req, res) => {
             return amount.toString();
         }
         
-        function formatProjection(value) {
-            if (!isFinite(value) || value === Infinity || value === -Infinity) {
-                return '∞';
-            }
-            return value.toFixed(8);
-        }
-        
         function updateWalletDisplay() {
             const selector = document.getElementById('currency-selector');
             if (selector) currentCurrency = selector.value;
@@ -371,33 +355,6 @@ app.get('/', (req, res) => {
                 const usdValue = convertToCurrency(walletBalanceRaw, 'USD');
                 conversionNote.innerText = '≈ $' + usdValue.toLocaleString(undefined, {minimumFractionDigits: 2});
             }
-            
-            const tradingConv = document.getElementById('wallet-trading-conv');
-            if (tradingConv && currentCurrency !== 'BTC') {
-                const btcTrading = tradingBalanceRaw;
-                tradingConv.innerText = '≈ ' + btcTrading.toFixed(8) + ' BTC';
-            } else if (tradingConv) {
-                const usdTrading = convertToCurrency(tradingBalanceRaw, 'USD');
-                tradingConv.innerText = '≈ $' + usdTrading.toLocaleString(undefined, {minimumFractionDigits: 2});
-            }
-            
-            const profitConv = document.getElementById('wallet-profit-conv');
-            if (profitConv && currentCurrency !== 'BTC') {
-                const btcProfit = netProfitRaw;
-                profitConv.innerText = '≈ ' + btcProfit.toFixed(8) + ' BTC';
-            } else if (profitConv) {
-                const usdProfit = convertToCurrency(netProfitRaw, 'USD');
-                profitConv.innerText = '≈ $' + usdProfit.toLocaleString(undefined, {minimumFractionDigits: 2});
-            }
-            
-            const recoveryConv = document.getElementById('wallet-recovery-conv');
-            if (recoveryConv && currentCurrency !== 'BTC') {
-                const btcRecovery = recoveryPotRaw;
-                recoveryConv.innerText = '≈ ' + btcRecovery.toFixed(8) + ' BTC';
-            } else if (recoveryConv) {
-                const usdRecovery = convertToCurrency(recoveryPotRaw, 'USD');
-                recoveryConv.innerText = '≈ $' + usdRecovery.toLocaleString(undefined, {minimumFractionDigits: 2});
-            }
         }
         
         function showPage(pageName) {
@@ -428,139 +385,47 @@ app.get('/', (req, res) => {
                 exchangeRates.USD = btcPrice;
                 exchangeRates.USDT = btcPrice;
                 
-                const statusElem = document.getElementById('status-msg');
-                statusElem.innerText = "Status: " + botState.statusMessage;
-                
+                document.getElementById('status-msg').innerText = "Status: " + botState.statusMessage;
                 document.getElementById('price-tag').innerText = "$" + btcPrice.toLocaleString();
-                
-                // Calculate trading balance (current balance - protected balance)
-                const tradingBalance = Math.max(0, botState.stats.currentBalance - botState.profitProtection.safeBalance);
-                
-                document.getElementById('t-bal').innerText = f(tradingBalance);
-                document.getElementById('t-usd').innerText = u(tradingBalance);
+                document.getElementById('t-bal').innerText = f(botState.stats.currentBalance - botState.profitProtection.safeBalance);
+                document.getElementById('t-usd').innerText = u(botState.stats.currentBalance - botState.profitProtection.safeBalance);
                 document.getElementById('w-bal').innerText = f(botState.stats.currentBalance);
                 document.getElementById('w-usd').innerText = u(botState.stats.currentBalance);
                 document.getElementById('n-prof').innerText = f(botState.stats.netProfit);
                 document.getElementById('n-usd').innerText = u(botState.stats.netProfit);
                 document.getElementById('pot-display').innerText = f(botState.recoveryPot);
-                document.getElementById('wr').innerText = ((botState.stats.wins/(botState.stats.totalBets || 1))*100 || 0).toFixed(1) + "%";
+                document.getElementById('wr').innerText = ((botState.stats.wins/botState.stats.totalBets)*100 || 0).toFixed(1) + "%";
                 document.getElementById('s-base').innerText = f(botState.settings.baseBet);
                 document.getElementById('n-bet').innerText = f(botState.settings.currentBet);
-                
-                const uptimeHours = parseFloat(hoursPassed);
-                if (uptimeHours < 0.0001) {
-                    document.getElementById('uptime').innerText = "0.00h";
-                } else {
-                    document.getElementById('uptime').innerText = uptimeHours.toFixed(2) + "h";
-                }
+                document.getElementById('uptime').innerText = hoursPassed + "h";
 
-                const walletBalance = parseFloat(botState.stats.currentBalance || 0);
-                const hours = parseFloat(hoursPassed);
+                const netProfit = parseFloat(botState.stats.netProfit || 0);
+                const hours = Math.max(0.01, parseFloat(hoursPassed));
+                const hourlyProjection = netProfit / hours;
                 
-                // Handle projections - show Infinity when hours are near zero (fresh reboot)
-                let hourlyProjection, dailyProjection, monthlyProjection, yearlyProjection;
-                
-                if (hours < 0.001 || walletBalance === 0) {
-                    hourlyProjection = Infinity;
-                    dailyProjection = Infinity;
-                    monthlyProjection = Infinity;
-                    yearlyProjection = Infinity;
-                } else {
-                    hourlyProjection = walletBalance / hours;
-                    dailyProjection = hourlyProjection * 24;
-                    monthlyProjection = hourlyProjection * 24 * 30;
-                    yearlyProjection = hourlyProjection * 24 * 365;
-                }
-                
-                // Update projection displays
-                const hrBtcElem = document.getElementById('p-hr-b');
-                const hrUsdElem = document.getElementById('p-hr-u');
-                const dyBtcElem = document.getElementById('p-dy-b');
-                const dyUsdElem = document.getElementById('p-dy-u');
-                const monthBtcElem = document.getElementById('p-month-b');
-                const monthUsdElem = document.getElementById('p-month-u');
-                const yearBtcElem = document.getElementById('p-year-b');
-                const yearUsdElem = document.getElementById('p-year-u');
-                
-                if (!isFinite(hourlyProjection)) {
-                    hrBtcElem.innerHTML = '∞';
-                    hrBtcElem.className = 'infinity';
-                    hrUsdElem.innerHTML = '$∞';
-                    hrUsdElem.className = 'infinity';
-                } else {
-                    hrBtcElem.innerHTML = f(hourlyProjection);
-                    hrBtcElem.className = 'win';
-                    hrUsdElem.innerHTML = u(hourlyProjection);
-                    hrUsdElem.className = 'usd-val';
-                }
-                
-                if (!isFinite(dailyProjection)) {
-                    dyBtcElem.innerHTML = '∞';
-                    dyBtcElem.className = 'infinity';
-                    dyUsdElem.innerHTML = '$∞';
-                    dyUsdElem.className = 'infinity';
-                } else {
-                    dyBtcElem.innerHTML = f(dailyProjection);
-                    dyBtcElem.className = 'win';
-                    dyUsdElem.innerHTML = u(dailyProjection);
-                    dyUsdElem.className = 'usd-val';
-                }
-                
-                if (!isFinite(monthlyProjection)) {
-                    monthBtcElem.innerHTML = '∞';
-                    monthBtcElem.className = 'infinity';
-                    monthUsdElem.innerHTML = '$∞';
-                    monthUsdElem.className = 'infinity';
-                } else {
-                    monthBtcElem.innerHTML = f(monthlyProjection);
-                    monthBtcElem.className = 'win';
-                    monthUsdElem.innerHTML = u(monthlyProjection);
-                    monthUsdElem.className = 'usd-val';
-                }
-                
-                if (!isFinite(yearlyProjection)) {
-                    yearBtcElem.innerHTML = '∞';
-                    yearBtcElem.className = 'infinity';
-                    yearUsdElem.innerHTML = '$∞';
-                    yearUsdElem.className = 'infinity';
-                } else {
-                    yearBtcElem.innerHTML = f(yearlyProjection);
-                    yearBtcElem.className = 'win';
-                    yearUsdElem.innerHTML = u(yearlyProjection);
-                    yearUsdElem.className = 'usd-val';
-                }
+                document.getElementById('p-hr-b').innerText = f(hourlyProjection);
+                document.getElementById('p-hr-u').innerText = u(hourlyProjection);
+                document.getElementById('p-dy-b').innerText = f(hourlyProjection * 24);
+                document.getElementById('p-dy-u').innerText = u(hourlyProjection * 24);
+                document.getElementById('p-month-b').innerText = f(hourlyProjection * 24 * 30);
+                document.getElementById('p-month-u').innerText = u(hourlyProjection * 24 * 30);
+                document.getElementById('p-year-b').innerText = f(hourlyProjection * 24 * 365);
+                document.getElementById('p-year-u').innerText = u(hourlyProjection * 24 * 365);
 
-                if (botState.betHistory && botState.betHistory.length > 0) {
-                    document.getElementById('h-body').innerHTML = botState.betHistory.map(b => `
-                        <tr>
-                            <td>#${b.id}</td>
-                            <td>${f(b.dBase)}</td>
-                            <td>${f(b.bet)}</td>
-                            <td>${b.roll}</td>
-                            <td class="${b.isWin?'win':'loss'}">${f(b.profit)}</td>
-                            <td>${b.pot} BTC</td>
-                        </tr>
-                    `).join('');
-                } else {
-                    document.getElementById('h-body').innerHTML = '<tr><td colspan="6" style="text-align: center;">No bets yet - waiting for session start...</td></tr>';
-                }
+                document.getElementById('h-body').innerHTML = botState.betHistory.map(b => \`
+                    <tr><td>#\${b.id}</td><td>\${f(b.dBase)}</td><td>\${f(b.bet)}</td><td>\${b.roll}</td><td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td><td>\${b.pot} BTC</td></tr>
+                \`).join('');
                 
                 if (document.getElementById('wallet-page').classList.contains('active-page')) {
                     updateWalletDisplay();
                 }
-            } catch(e) {
-                console.error('Update error:', e);
-            }
+            } catch(e) {}
         }
         setInterval(update, 1000);
-        update();
     </script>
 </body>
 </html>
     `);
 });
 
-app.listen(port, '0.0.0.0', () => {
-    console.log(`Bot dashboard running on port ${port}`);
-    runStrategy();
-});
+app.listen(port, '0.0.0.0', () => runStrategy());
