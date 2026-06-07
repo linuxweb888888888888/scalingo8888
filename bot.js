@@ -6,7 +6,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "l7Y9CyxXHMtvfbxsnNo1P20Ob6ZPUW30RWLByjrSUVcDciBHhF";
+const API_KEY = process.env.API_KEY || "OrUrwrx3KlKoBxRdDAnX85JHpADjvmtzEzPrEQR2G6892jWlTL";
 const BASE_URL = "https://api.crypto.games/v1";
 
 // DYNAMIC CONFIGURATION (Safety Optimized)
