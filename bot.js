@@ -10,7 +10,7 @@ const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
-    payout: 2.0,               
+    payout: 1.7,               
     balanceStep: 0.00000010,   // LOWERED: Now scales every 10 sats
     betIncrement: 0.00000001,  
     maxTotalBetPercent: 0.10,  // Increased for small balances
