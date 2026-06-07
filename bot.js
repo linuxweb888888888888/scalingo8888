@@ -65,11 +65,9 @@ function resetSession() {
     botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.98; // Protect 98% of remaining on crash
     botState.recoveryPot = 0;
     botState.stats = {
-        totalBets: 0, wins: 0, losses: 0, 
-        netProfit: botState.stats.netProfit, // MODIFIED: Keep adding to net profit
-        maxSessionProfit: botState.stats.maxSessionProfit, 
+        totalBets: 0, wins: 0, losses: 0, netProfit: 0, maxSessionProfit: 0,
         currentBalance: botState.stats.currentBalance,
-        startTime: botState.stats.startTime // MODIFIED: Keep start time for accurate long-term projection
+        startTime: Date.now()
     };
     botState.betHistory = [];
     botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
@@ -244,8 +242,7 @@ app.get('/', (req, res) => {
                 document.getElementById('n-bet').innerText = f(botState.settings.currentBet);
                 document.getElementById('uptime').innerText = hoursPassed + "h";
 
-                // MODIFIED: Calculate ph based on Wallet Balance (currentBalance)
-                const ph = botState.stats.currentBalance / hoursPassed;
+                const ph = botState.stats.netProfit / hoursPassed;
                 document.getElementById('p-hr-b').innerText = f(ph); document.getElementById('p-hr-u').innerText = u(ph);
                 document.getElementById('p-dy-b').innerText = f(ph*24); document.getElementById('p-dy-u').innerText = u(ph*24);
                 document.getElementById('p-month-b').innerText = f(ph*24*30); document.getElementById('p-month-u').innerText = u(ph*24*30);
