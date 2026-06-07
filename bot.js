@@ -13,6 +13,7 @@ const DEFAULTS = {
     payout: 2.0,              
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001,
+    baseMultiplier: 1.0,       // <--- NEW: Multiply the base bet by this factor
     maxBetPercent: 0.01,       
     streakReset: 5             
 };
@@ -24,7 +25,7 @@ let botState = {
     statusMessage: "Active: Compound Growth Mode",
     lossStreak: 0,
     coin: DEFAULTS.coin,
-    currentSeed: "pro" + Math.random().toString(36).substring(2, 10), // Initial Seed
+    currentSeed: "pro" + Math.random().toString(36).substring(2, 10),
     stats: {
         totalBets: 0,
         wins: 0,
@@ -35,6 +36,7 @@ let botState = {
         startTime: Date.now(),
     },
     settings: {
+        baseMultiplier: DEFAULTS.baseMultiplier, // Store multiplier in state
         baseBet: 0.00000001,
         currentBet: 0.00000001,
         payout: DEFAULTS.payout
@@ -54,13 +56,13 @@ updateBTCPrice();
 
 function calculateScaledBase(balance) {
     const units = Math.floor(balance / DEFAULTS.balanceStep);
-    let base = Number((Math.max(1, units) * DEFAULTS.betIncrement).toFixed(8));
+    // Apply the baseMultiplier to the increment calculation
+    let base = Number((Math.max(1, units) * DEFAULTS.betIncrement * botState.settings.baseMultiplier).toFixed(8));
     return base;
 }
 
 // ============ API LOGIC ============
 async function placeBet() {
-    // ROTATE SEED EVERY 10 BETS
     if (botState.stats.totalBets > 0 && botState.stats.totalBets % 10 === 0) {
         botState.currentSeed = "pro" + Math.random().toString(36).substring(2, 10);
         botState.statusMessage = "Seed Rotated for Security.";
@@ -145,7 +147,6 @@ app.get('/api/stats', (req, res) => {
     const elapsedMs = Date.now() - botState.stats.startTime;
     const hours = Math.max(0.0001, elapsedMs / 3600000);
     
-    // Projections
     const btcPerHour = botState.stats.netProfit / hours;
     const projections = {
         hour: { btc: btcPerHour, usd: btcPerHour * btcPrice },
@@ -227,13 +228,12 @@ app.get('/', (req, res) => {
                 const data = await res.json();
                 const { botState, btcPrice, projections } = data;
 
-                document.getElementById('status').innerText = "SYSTEM STATUS: " + botState.statusMessage + " | SEED: " + botState.currentSeed;
+                document.getElementById('status').innerText = "SYSTEM STATUS: " + botState.statusMessage + " | SEED: " + botState.currentSeed + " | MULTIPLIER: " + botState.settings.baseMultiplier + "x";
                 document.getElementById('bal').innerText = botState.stats.currentBalance.toFixed(8);
                 document.getElementById('profit').innerText = botState.stats.netProfit.toFixed(8);
                 document.getElementById('next').innerText = botState.settings.currentBet.toFixed(8);
                 document.getElementById('wr').innerText = ((botState.stats.wins/botState.stats.totalBets)*100 || 0).toFixed(1) + "%";
 
-                // Update Projections
                 const periods = ['h', 'd', 'm', 'y'];
                 const keys = ['hour', 'day', 'month', 'year'];
                 
