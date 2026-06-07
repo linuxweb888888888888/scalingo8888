@@ -65,7 +65,7 @@ function resetSession() {
     botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.98; // Protect 98% of remaining on crash
     botState.recoveryPot = 0;
     botState.stats = {
-        totalBets: 0, wins: 0, losses: 0, netProfit: 0, maxSessionProfit: 0,
+        totalBets: 0, wins: 0, losses: 0, netProfit: botState.stats.netProfit, maxSessionProfit: 0,
         currentBalance: botState.stats.currentBalance,
         startTime: Date.now()
     };
@@ -242,11 +242,19 @@ app.get('/', (req, res) => {
                 document.getElementById('n-bet').innerText = f(botState.settings.currentBet);
                 document.getElementById('uptime').innerText = hoursPassed + "h";
 
-                const ph = botState.stats.netProfit / hoursPassed;
-                document.getElementById('p-hr-b').innerText = f(ph); document.getElementById('p-hr-u').innerText = u(ph);
-                document.getElementById('p-dy-b').innerText = f(ph*24); document.getElementById('p-dy-u').innerText = u(ph*24);
-                document.getElementById('p-month-b').innerText = f(ph*24*30); document.getElementById('p-month-u').innerText = u(ph*24*30);
-                document.getElementById('p-year-b').innerText = f(ph*24*365); document.getElementById('p-year-u').innerText = u(ph*24*365);
+                // Calculate projections based on Wallet Balance (not Net Profit)
+                const walletBalance = parseFloat(botState.stats.currentBalance || 0);
+                const hours = parseFloat(hoursPassed);
+                const hourlyProjection = walletBalance / hours;
+                
+                document.getElementById('p-hr-b').innerText = f(hourlyProjection);
+                document.getElementById('p-hr-u').innerText = u(hourlyProjection);
+                document.getElementById('p-dy-b').innerText = f(hourlyProjection * 24);
+                document.getElementById('p-dy-u').innerText = u(hourlyProjection * 24);
+                document.getElementById('p-month-b').innerText = f(hourlyProjection * 24 * 30);
+                document.getElementById('p-month-u').innerText = u(hourlyProjection * 24 * 30);
+                document.getElementById('p-year-b').innerText = f(hourlyProjection * 24 * 365);
+                document.getElementById('p-year-u').innerText = u(hourlyProjection * 24 * 365);
 
                 document.getElementById('h-body').innerHTML = botState.betHistory.map(b => \`
                     <tr><td>#\${b.id}</td><td>\${f(b.dBase)}</td><td>\${f(b.bet)}</td><td>\${b.roll}</td><td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td><td>\${b.pot} BTC</td></tr>
