@@ -5,7 +5,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "gIm4fI5np8ovFgtS7GG2dU5mEuQQNBgzKd78WD6TdwRKClVhFN";
+const API_KEY = process.env.API_KEY || "q6maMp6C0Gxu88dKwNHxGm8SiyRytDIzWNOtfOJV9C24ENS2Nu";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
@@ -13,7 +13,7 @@ const DEFAULTS = {
     payout: 1.7,              
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001,
-    baseMultiplier: 10.0,       // <--- NEW: Multiply the base bet by this factor
+    baseMultiplier: 5.0,       // <--- NEW: Multiply the base bet by this factor
     maxBetPercent: 0.01,       
     streakReset: 5             
 };
