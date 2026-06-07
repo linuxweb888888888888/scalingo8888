@@ -60,13 +60,13 @@ function calculateScaledBase(balance) {
 }
 
 function softResetBot() {
-    botState.statusMessage = "SYSTEM: SAFE FLOOR HIT: Resetting Balance...";
-    botState.profitProtection.safeBalance = 0; 
+    console.log("SYSTEM: SAFE FLOOR HIT. Performing soft reboot...");
+    botState.statusMessage = "SYSTEM: SAFE FLOOR HIT: Resetting & Rebooting...";
+    
+    botState.profitProtection.safeBalance = 0; // Real Reset
     botState.recoveryPot = 0;
     botState.stats = {
-        totalBets: 0, 
-        wins: 0, 
-        losses: 0, 
+        totalBets: 0, wins: 0, losses: 0, 
         netProfit: botState.stats.netProfit, 
         maxSessionProfit: 0,
         currentBalance: botState.stats.currentBalance,
@@ -103,6 +103,7 @@ async function runStrategy() {
     botState.statusMessage = "Linear Recovery Mode (80% Profit Lock)";
     
     while (true) {
+        // Floor Auto-Reboot Trigger
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
             softResetBot();
             await new Promise(r => setTimeout(r, 5000));
@@ -258,7 +259,6 @@ app.get('/', (req, res) => {
                 <div style="font-size: 1.2rem; opacity: 0.9;" id="wallet-conversion-note">≈ $0.00 USD</div>
             </div>
             <div class="grid" style="margin-top: 2rem;">
-                <!-- TRADING BALANCE logic applied here too -->
                 <div class="card"><div class="label">💳 Trading Balance</div><div id="wallet-trading-bal" class="btc-val">0.00</div><div id="wallet-trading-conv" class="usd-val">$0.00</div></div>
                 <div class="card"><div class="label">📈 Net Profit</div><div id="wallet-net-profit" class="btc-val">0.00</div><div id="wallet-profit-conv" class="usd-val">$0.00</div></div>
                 <div class="card"><div class="label">⚖️ Recovery Pot</div><div id="wallet-recovery-pot" class="btc-val">0.00</div><div id="wallet-recovery-conv" class="usd-val">$0.00</div></div>
@@ -267,7 +267,7 @@ app.get('/', (req, res) => {
     </div>
     <script>
         let currentCurrency = 'BTC';
-        const exchangeRates = { BTC: 1, LTC: 0.016, USD: 60964, USDT: 60964, EUR: 0.92, GBP: 0.79, ZAR: 18.5 };
+        let exchangeRates = { BTC: 1, LTC: 0.016, USD: 60964, USDT: 60964, EUR: 0.92, GBP: 0.79, ZAR: 18.5 };
         
         function convertToCurrency(btcAmount, currency) {
             if (currency === 'BTC') return btcAmount;
@@ -291,10 +291,7 @@ app.get('/', (req, res) => {
             if (selector) currentCurrency = selector.value;
             
             const walletBalanceRaw = parseFloat(document.getElementById('w-bal')?.innerText || 0);
-            
-            // Logic: (Wallet - Floor) / 2
             const tradingBalanceRaw = parseFloat(document.getElementById('t-bal')?.innerText || 0);
-            
             const netProfitRaw = parseFloat(document.getElementById('n-prof')?.innerText || 0);
             const recoveryPotRaw = parseFloat(document.getElementById('pot-display')?.innerText || 0);
             
@@ -315,22 +312,23 @@ app.get('/', (req, res) => {
         async function update() {
             try {
                 const res = await fetch('/api/stats');
-                const { botState, btcPrice, hoursPassed } = await res.json();
+                const data = await res.json();
+                const { botState, btcPrice, hoursPassed } = data;
+                
                 const f = (n) => parseFloat(n || 0).toFixed(8);
                 const u = (n) => "$" + (parseFloat(n || 0) * btcPrice).toLocaleString(undefined, {minimumFractionDigits: 3});
                 
                 exchangeRates.USD = btcPrice;
                 exchangeRates.USDT = btcPrice;
                 
-                // CALCULATION: (Current Balance - Safe Balance) divided by 2
-                const halfTradingAmount = (botState.stats.currentBalance - botState.profitProtection.safeBalance) / 2;
+                // Trading Balance Logic: (Wallet - Floor) / 2
+                const tradingAvailable = (botState.stats.currentBalance - botState.profitProtection.safeBalance) / 2;
 
                 document.getElementById('status-msg').innerText = "Status: " + botState.statusMessage;
                 document.getElementById('price-tag').innerText = "$" + btcPrice.toLocaleString();
                 
-                // APPLIED TO DASHBOARD
-                document.getElementById('t-bal').innerText = f(halfTradingAmount);
-                document.getElementById('t-usd').innerText = u(halfTradingAmount);
+                document.getElementById('t-bal').innerText = f(tradingAvailable);
+                document.getElementById('t-usd').innerText = u(tradingAvailable);
                 
                 document.getElementById('w-bal').innerText = f(botState.stats.currentBalance);
                 document.getElementById('w-usd').innerText = u(botState.stats.currentBalance);
@@ -355,12 +353,13 @@ app.get('/', (req, res) => {
                 document.getElementById('p-year-b').innerText = f(hourlyProjection * 24 * 365);
                 document.getElementById('p-year-u').innerText = u(hourlyProjection * 24 * 365);
 
+                // FIXED: Escaped backticks and dollar signs to prevent SyntaxError
                 document.getElementById('h-body').innerHTML = botState.betHistory.map(b => \`
                     <tr><td>#\${b.id}</td><td>\${f(b.dBase)}</td><td>\${f(b.bet)}</td><td>\${b.roll}</td><td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td><td>\${b.pot} BTC</td></tr>
                 \`).join('');
                 
                 if (document.getElementById('wallet-page').classList.contains('active-page')) updateWalletDisplay();
-            } catch(e) {}
+            } catch(e) { console.error(e); }
         }
         setInterval(update, 1000);
     </script>
