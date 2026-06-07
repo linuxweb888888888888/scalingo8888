@@ -12,10 +12,11 @@ const BASE_URL = "https://api.crypto.games/v1";
 const DEFAULTS = {
     coin: "BTC",
     payout: 1.7,              
-    balanceStep: 0.00000025,  
-    betIncrement: 0.00000001,
-    maxBetMultiplier: 50,      // Maximum bet size multiplier from base
-    minBetMultiplier: 0.1      // Minimum bet size multiplier from base (10% of base)
+    balanceStep: 0.00000025,   // Increased for proper minimum bets (was 0.00000025)
+    betIncrement: 0.00000001,  // Increased minimum bet increment (was 0.00000001)
+    minBet: 0.00000001,        // MINIMUM BET: 1000 satoshis (0.00000100 BTC)
+    maxBetMultiplier: 20,      // Maximum bet size multiplier from base
+    minBetMultiplier: 0.5      // Minimum bet size multiplier from base (50% of base)
 };
 
 // ============ BOT STATE ============
@@ -39,11 +40,11 @@ let botState = {
         startTime: Date.now(),
     },
     settings: {
-        baseBet: 0.00000001,
-        currentBet: 0.00000001,
+        baseBet: DEFAULTS.minBet,
+        currentBet: DEFAULTS.minBet,
         payout: DEFAULTS.payout,
-        consecutiveLosses: 0,  // Track loss streak
-        consecutiveWins: 0     // Track win streak
+        consecutiveLosses: 0,
+        consecutiveWins: 0
     },
     betHistory: []
 };
@@ -59,8 +60,11 @@ setInterval(updateBTCPrice, 60000);
 updateBTCPrice();
 
 function calculateScaledBase(balance) {
+    // Ensure balance is enough for minimum bet
     const units = Math.floor(balance / DEFAULTS.balanceStep);
-    return Number((Math.max(1, units) * DEFAULTS.betIncrement).toFixed(8));
+    let calculated = Number((Math.max(1, units) * DEFAULTS.betIncrement).toFixed(8));
+    // Never go below minimum bet
+    return Math.max(DEFAULTS.minBet, calculated);
 }
 
 /**
@@ -73,36 +77,50 @@ function calculateNextBet(isWin, currentBet, baseBet, lossStreak, winStreak) {
     
     if (isWin) {
         // WIN: Bet goes DOWN (decrease)
-        // More wins = lower bets
         if (winStreak >= 5) {
-            // After 5+ wins, drop to minimum (10% of base)
+            // After 5+ wins, drop to minimum
             newBet = baseBet * DEFAULTS.minBetMultiplier;
         } else if (winStreak >= 3) {
-            // After 3-4 wins, drop to 30% of base
-            newBet = baseBet * 0.3;
+            // After 3-4 wins, drop to 60% of base
+            newBet = baseBet * 0.6;
         } else if (winStreak >= 1) {
-            // After 1-2 wins, decrease by 40%
-            newBet = currentBet * 0.6;
+            // After 1-2 wins, decrease by 30%
+            newBet = currentBet * 0.7;
         } else {
             newBet = baseBet;
         }
     } else {
         // LOSS: Bet goes UP (increase)
-        // More losses = higher bets (but capped)
-        let multiplier = Math.min(DEFAULTS.maxBetMultiplier, Math.pow(1.6, lossStreak));
+        let multiplier = Math.min(DEFAULTS.maxBetMultiplier, Math.pow(1.4, lossStreak));
         newBet = baseBet * multiplier;
         
-        // Also ensure we don't increase too aggressively from current bet
-        let maxIncrease = currentBet * 2.5; // Max 2.5x increase per step
+        // Max 2x increase per step
+        let maxIncrease = currentBet * 2;
         if (newBet > maxIncrease) newBet = maxIncrease;
     }
     
-    // Clamp between min and max
-    const minBet = baseBet * DEFAULTS.minBetMultiplier;
+    // Clamp between min and max (using absolute minimum bet)
+    const minBet = Math.max(DEFAULTS.minBet, baseBet * DEFAULTS.minBetMultiplier);
     const maxBet = baseBet * DEFAULTS.maxBetMultiplier;
     newBet = Math.max(minBet, Math.min(maxBet, newBet));
     
+    // Round to 8 decimal places
     return Number(newBet.toFixed(8));
+}
+
+/**
+ * VALIDATE BET BEFORE PLACING
+ */
+function validateBet(betAmount, currentBalance) {
+    if (betAmount < DEFAULTS.minBet) {
+        console.log(`Bet ${betAmount} below minimum ${DEFAULTS.minBet}, adjusting...`);
+        return DEFAULTS.minBet;
+    }
+    if (betAmount > currentBalance) {
+        console.log(`Bet ${betAmount} exceeds balance ${currentBalance}, reducing...`);
+        return currentBalance * 0.1; // Bet 10% of balance if too high
+    }
+    return betAmount;
 }
 
 /**
@@ -134,6 +152,13 @@ function softResetBot() {
 
 // ============ API LOGIC ============
 async function placeBet() {
+    // Validate bet amount before placing
+    const validatedBet = validateBet(botState.settings.currentBet, botState.stats.currentBalance);
+    if (validatedBet !== botState.settings.currentBet) {
+        botState.settings.currentBet = validatedBet;
+        botState.statusMessage = `Bet adjusted to minimum: ${validatedBet.toFixed(8)} BTC`;
+    }
+    
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
     const safeSeed = "pro" + Math.random().toString(36).substring(2, 12); 
 
@@ -144,18 +169,33 @@ async function placeBet() {
         ClientSeed: safeSeed 
     };
 
+    console.log(`[BET] Placing bet: ${payload.Bet} BTC | Payout: ${payload.Payout}`);
+    
     try {
         const response = await axios.post(url, payload);
+        console.log(`[RESULT] Win: ${response.data.Profit > 0} | Profit: ${response.data.Profit} | New Balance: ${response.data.Balance}`);
         return response.data;
     } catch (error) { 
-        botState.statusMessage = error.response?.data?.Message || "API Error";
+        const errorMsg = error.response?.data?.Message || error.message || "API Error";
+        console.error(`[ERROR] ${errorMsg}`);
+        botState.statusMessage = `Error: ${errorMsg}`;
+        
+        // If invalid bet amount, adjust base bet upward
+        if (errorMsg.includes("Invalid bet amount") || errorMsg.includes("minimum")) {
+            console.log("Adjusting minimum bet upward...");
+            DEFAULTS.minBet = Math.min(DEFAULTS.minBet * 1.5, 0.00001000); // Increase min bet up to 0.00001
+            botState.settings.baseBet = Math.max(DEFAULTS.minBet, botState.settings.baseBet);
+            botState.settings.currentBet = botState.settings.baseBet;
+            botState.statusMessage = `Adjusted min bet to ${DEFAULTS.minBet.toFixed(8)} BTC`;
+        }
+        
         return null; 
     }
 }
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = "Dynamic Up/Down Mode (Bets go UP on losses, DOWN on wins)";
+    botState.statusMessage = `Dynamic Up/Down Mode | Min Bet: ${DEFAULTS.minBet.toFixed(8)} BTC`;
     
     while (true) {
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
@@ -211,6 +251,9 @@ async function runStrategy() {
             botState.settings.consecutiveWins
         );
         
+        // Final validation before next loop
+        botState.settings.currentBet = validateBet(botState.settings.currentBet, botState.stats.currentBalance);
+        
         // Update safe balance floor (80% profit lock)
         if (isWin && botState.recoveryPot === 0) {
             botState.profitProtection.safeBalance += (profit * 0.80);
@@ -251,7 +294,7 @@ async function runStrategy() {
         const streakInfo = isWin ? 
             `Win streak: ${botState.settings.consecutiveWins} (⬇️ decreasing bet)` : 
             `Loss streak: ${botState.settings.consecutiveLosses} (⬆️ increasing bet)`;
-        botState.statusMessage = `${directionEmoji} ${action} | ${streakInfo} | Base: ${botState.settings.baseBet.toFixed(8)} BTC`;
+        botState.statusMessage = `${directionEmoji} ${action} | ${streakInfo} | Min: ${DEFAULTS.minBet.toFixed(8)} | Base: ${botState.settings.baseBet.toFixed(8)}`;
 
         await new Promise(r => setTimeout(r, 1100)); 
     }
@@ -260,7 +303,7 @@ async function runStrategy() {
 // ============ AJAX API ============
 app.get('/api/stats', (req, res) => {
     const hours = Math.max(0.0001, (Date.now() - botState.stats.startTime) / 3600000);
-    res.json({ botState, btcPrice, hoursPassed: hours.toFixed(2) });
+    res.json({ botState, btcPrice, hoursPassed: hours.toFixed(2), minBet: DEFAULTS.minBet });
 });
 
 // ============ WEB DASHBOARD ============
@@ -270,7 +313,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v4.0 | TRUE UP/DOWN Dynamic Betting</title>
+    <title>Dice Pro v4.1 | Fixed Min Bet</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; --warning: #8b5cf6; --info: #06b6d4; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -305,15 +348,19 @@ app.get('/', (req, res) => {
         .streak-badge { font-size: 0.7rem; padding: 2px 6px; border-radius: 10px; display: inline-block; }
         .streak-win { background: rgba(16,185,129,0.2); color: var(--success); }
         .streak-loss { background: rgba(239,68,68,0.2); color: var(--danger); }
+        .error-box { background: rgba(239,68,68,0.1); border-left: 3px solid var(--danger); padding: 10px; margin-bottom: 15px; border-radius: 4px; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <div>
-                <h1>Dice Pro <span style="color:var(--primary)">v4.0</span> 
+                <h1>Dice Pro <span style="color:var(--primary)">v4.1</span> 
                     <span class="strategy-badge">⬆️ UP on LOSS ⬇️ DOWN on WIN</span>
                 </h1>
+                <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 5px;">
+                    Min Bet: <strong id="min-bet-display">0.00000100</strong> BTC (1000 satoshis)
+                </div>
             </div>
             <div style="text-align: right">
                 <div class="label">Market BTC/USD</div>
@@ -443,13 +490,15 @@ app.get('/', (req, res) => {
             try {
                 const res = await fetch('/api/stats');
                 const data = await res.json();
-                const { botState, btcPrice, hoursPassed } = data;
+                const { botState, btcPrice, hoursPassed, minBet } = data;
                 
                 const f = (n) => parseFloat(n || 0).toFixed(8);
                 const u = (n) => "$" + (parseFloat(n || 0) * btcPrice).toLocaleString(undefined, {minimumFractionDigits: 3});
                 
                 exchangeRates.USD = btcPrice;
                 exchangeRates.USDT = btcPrice;
+                
+                document.getElementById('min-bet-display').innerText = f(minBet);
                 
                 const tradingAvailable = Math.max(0, (botState.stats.currentBalance - botState.profitProtection.safeBalance) / 8);
 
@@ -525,5 +574,6 @@ app.get('/', (req, res) => {
 
 app.listen(port, '0.0.0.0', () => {
     console.log(`Server running on port ${port}`);
+    console.log(`Minimum bet set to ${DEFAULTS.minBet} BTC (1000 satoshis)`);
     runStrategy();
 });
