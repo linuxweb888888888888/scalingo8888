@@ -4,8 +4,8 @@ const express = require('express');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ============ CONFIGURATION (STREAK MODE + SAFETY CAP) ============
-const API_KEY = process.env.API_KEY || "pPEMkpRD9bEckSfifZqfP233pfgjj15Dw3F0uENF7FmjFUA8Bv"; 
+// ============ CONFIGURATION (UNCAPPED STREAK MODE) ============
+const API_KEY = process.env.API_KEY || "Zjv45cyOK96TfWAZMhscPubn6C0uoUws2s9W5bH5b8UCbdyuBC"; 
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
@@ -14,15 +14,14 @@ const DEFAULTS = {
     balanceStep: 0.00000010,   
     betIncrement: 0.00000001,  
     streakMultiplier: 2.0,     // Double bet on win
-    maxStreakReset: 3,         // Bank profit after 3 wins
-    maxTotalBetPercent: 0.10,  // SAFETY: Never bet more than 10% of balance
+    maxStreakReset: 3,         // Bank profit after 3 wins (you can increase this for higher risk)
 };
 
 // ============ BOT STATE ============
 let btcPrice = 60000; 
 let botState = {
     running: true,
-    statusMessage: "Initializing Streak Strategy...",
+    statusMessage: "Initializing Uncapped Streak Strategy...",
     coin: DEFAULTS.coin,
     currentSeed: "pro" + Math.random().toString(36).substring(2, 12),
     betsSinceSeedChange: 0,
@@ -95,7 +94,7 @@ async function placeBet() {
 async function runStrategy() {
     updateBTCPrice();
     await getAccountBalance();
-    botState.statusMessage = "Streak Scaling Active (10% Safety Cap)";
+    botState.statusMessage = "Uncapped Streak Scaling Active";
     
     while (true) {
         if (botState.betsSinceSeedChange >= 15) {
@@ -103,13 +102,7 @@ async function runStrategy() {
             botState.betsSinceSeedChange = 0;
         }
 
-        // Apply 10% Safety Cap Logic
-        const absoluteMax = botState.stats.currentBalance * DEFAULTS.maxTotalBetPercent;
-        if (botState.settings.currentBet > absoluteMax) {
-            botState.statusMessage = "Safety Cap Hit: Capping Bet at 10%";
-            botState.settings.currentBet = absoluteMax;
-        }
-
+        // --- THE BETTING ACTION ---
         const result = await placeBet();
         if (!result) { 
             await new Promise(r => setTimeout(r, 5000)); 
@@ -122,7 +115,7 @@ async function runStrategy() {
         botState.stats.netProfit += profit;
         botState.stats.currentBalance = result.Balance || 0;
 
-        // --- STREAK SCALING LOGIC ---
+        // --- STREAK SCALING LOGIC (NO CAP) ---
         botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
 
         if (profit > 0) {
@@ -130,14 +123,14 @@ async function runStrategy() {
             botState.currentStreak++;
             
             if (botState.currentStreak < DEFAULTS.maxStreakReset) {
-                // WINNING: Double the bet
+                // WINNING: Multiply the bet WITHOUT any safety cap check
                 botState.settings.currentBet = botState.settings.currentBet * DEFAULTS.streakMultiplier;
-                botState.statusMessage = `Streak: ${botState.currentStreak} - Increasing Bet`;
+                botState.statusMessage = `🔥 Streak: ${botState.currentStreak} - Increasing Bet`;
             } else {
-                // STREAK RESET: Bank the money
+                // STREAK RESET: Reach max streak, return to base
                 botState.currentStreak = 0;
                 botState.settings.currentBet = botState.settings.baseBet;
-                botState.statusMessage = "Streak Peak: Profit Banked";
+                botState.statusMessage = "Peak Reached: Banking Streak Profit";
             }
         } else {
             // LOSS: Immediately reset to base
@@ -171,7 +164,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.8 | Streak Edition</title>
+    <title>Dice Pro v3.8 | Uncapped Streak</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -196,7 +189,7 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <div class="header">
-            <h1>Dice Pro <span style="color:var(--primary)">v3.8 Streak</span></h1>
+            <h1>Dice Pro <span style="color:var(--primary)">v3.8 Uncapped</span></h1>
             <div style="text-align: right"><div class="label">Market BTC/USD</div><div id="price-tag" style="font-weight: 700;">$0.00</div></div>
         </div>
         <div class="status-bar" id="status-msg">Status: Initializing...</div>
@@ -204,7 +197,7 @@ app.get('/', (req, res) => {
             <div class="card"><div class="label">💳 Safe Tradable</div><div id="t-bal" class="btc-val" style="color:var(--primary)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">⚖️ Safety Cap</div><div id="pot-display" class="btc-val" style="color:var(--danger)">10%</div><div class="usd-val">Max Balance Risk</div></div>
+            <div class="card"><div class="label">⚖️ Strategy Mode</div><div id="pot-display" class="btc-val" style="color:var(--accent)">STREAK</div><div class="usd-val">Scaling Uncapped</div></div>
         </div>
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
