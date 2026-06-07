@@ -6,17 +6,17 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "dtuczl497S18i8CM03L3gBbnws5ibpz0sC8hqhDssShAfy7SCS";
+const API_KEY = process.env.API_KEY || "Dqb68rat7k4PNx8XYYS3uEGTQSwPZbQsbzlkuiuX0CElrNiBBK";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
     payout: 1.7,              
-    balanceStep: 0.00000100,
-    betIncrement: 0.00000050,
-    minBet: 0.00000038,        // 38 satoshis minimum
-    maxBetMultiplier: 20,
-    minBetMultiplier: 0.5
+    balanceStep: 0.00000001,   // Smaller steps for tiny balance
+    betIncrement: 0.00000001,  // 1 satoshi increments
+    minBet: 0.00000001,        // 1 satoshi minimum (smallest possible)
+    maxBetMultiplier: 10,      // Maximum 10x base bet
+    minBetMultiplier: 0.5      // Minimum 0.5x base bet
 };
 
 // ============ BOT STATE ============
@@ -36,12 +36,12 @@ let botState = {
         losses: 0,
         netProfit: 0,
         maxSessionProfit: 0,
-        currentBalance: 0,
+        currentBalance: 0.00000012,  // Your actual balance
         startTime: Date.now(),
     },
     settings: {
-        baseBet: DEFAULTS.minBet,
-        currentBet: DEFAULTS.minBet,
+        baseBet: 0.00000001,         // 1 satoshi base bet
+        currentBet: 0.00000001,      // Start with 1 satoshi
         payout: DEFAULTS.payout,
         consecutiveLosses: 0,
         consecutiveWins: 0
@@ -61,60 +61,58 @@ updateBTCPrice();
 
 function calculateScaledBase(balance) {
     if (balance <= 0) return DEFAULTS.minBet;
-    const units = Math.floor(balance / DEFAULTS.balanceStep);
-    let calculated = Number((Math.max(1, units) * DEFAULTS.betIncrement).toFixed(8));
-    return Math.max(DEFAULTS.minBet, calculated);
+    // Scale base bet to 1% of balance
+    let calculated = balance * 0.01;
+    // Round to satoshis (8 decimal places)
+    calculated = Math.floor(calculated * 100000000) / 100000000;
+    // Ensure minimum
+    return Math.max(DEFAULTS.minBet, Math.min(calculated, balance * 0.1));
 }
 
-function calculateNextBet(isWin, currentBet, baseBet, lossStreak, winStreak) {
+function calculateNextBet(isWin, currentBet, baseBet, lossStreak, winStreak, currentBalance) {
     let newBet;
     
     if (isWin) {
-        if (winStreak >= 5) {
-            newBet = baseBet * DEFAULTS.minBetMultiplier;
-        } else if (winStreak >= 3) {
-            newBet = baseBet * 0.6;
+        // WIN: Bet goes DOWN
+        if (winStreak >= 3) {
+            // After 3+ wins, drop to minimum base
+            newBet = baseBet;
         } else if (winStreak >= 1) {
-            newBet = currentBet * 0.7;
+            // After 1-2 wins, decrease by 50%
+            newBet = currentBet * 0.5;
         } else {
             newBet = baseBet;
         }
     } else {
-        let multiplier = Math.min(DEFAULTS.maxBetMultiplier, Math.pow(1.4, lossStreak));
+        // LOSS: Bet goes UP (but limited by balance)
+        let multiplier = Math.min(DEFAULTS.maxBetMultiplier, Math.pow(1.5, lossStreak));
         newBet = baseBet * multiplier;
-        let maxIncrease = currentBet * 2;
-        if (newBet > maxIncrease) newBet = maxIncrease;
+        
+        // Never bet more than 10% of balance
+        let maxAllowedBet = currentBalance * 0.1;
+        if (newBet > maxAllowedBet) {
+            newBet = maxAllowedBet;
+        }
     }
     
-    const minBet = Math.max(DEFAULTS.minBet, baseBet * DEFAULTS.minBetMultiplier);
-    const maxBet = baseBet * DEFAULTS.maxBetMultiplier;
+    // Clamp between min and max
+    const minBet = DEFAULTS.minBet;
+    const maxBet = Math.max(minBet, currentBalance * 0.1);
     newBet = Math.max(minBet, Math.min(maxBet, newBet));
     
-    return Number(newBet.toFixed(8));
+    // Round to satoshis
+    return Number(Math.floor(newBet * 100000000) / 100000000);
 }
 
 function validateBet(betAmount, currentBalance) {
+    // Ensure bet doesn't exceed balance
+    if (betAmount > currentBalance) {
+        return Math.max(DEFAULTS.minBet, currentBalance * 0.1);
+    }
     if (betAmount < DEFAULTS.minBet) {
         return DEFAULTS.minBet;
     }
-    if (currentBalance > 0 && betAmount > currentBalance) {
-        return Math.max(DEFAULTS.minBet, currentBalance * 0.1);
-    }
     return betAmount;
-}
-
-async function getBalance() {
-    try {
-        const url = `${BASE_URL}/getbalance/${botState.coin}/${API_KEY}`;
-        const response = await axios.get(url);
-        if (response.data && response.data.Balance !== undefined) {
-            return response.data.Balance;
-        }
-        return null;
-    } catch (error) {
-        console.log("Could not fetch balance, will get from bet results");
-        return null;
-    }
 }
 
 function softResetBot() {
@@ -143,97 +141,75 @@ function softResetBot() {
 
 // ============ API LOGIC ============
 async function placeBet() {
+    // Validate bet amount before placing
     const validatedBet = validateBet(botState.settings.currentBet, botState.stats.currentBalance);
     if (validatedBet !== botState.settings.currentBet) {
         botState.settings.currentBet = validatedBet;
         botState.statusMessage = `Bet adjusted: ${validatedBet.toFixed(8)} BTC`;
     }
     
-    const url = `${BASE_URL}/${botState.coin}/api.php`;
-    const safeSeed = "pro" + Math.random().toString(36).substring(2, 12);
-    
-    // Try different API formats
-    let payload = null;
-    let response = null;
-    
-    // Format 1: POST with form data
-    try {
-        const formData = new URLSearchParams();
-        formData.append('key', API_KEY);
-        formData.append('amount', botState.settings.currentBet);
-        formData.append('payout', botState.settings.payout);
-        formData.append('seed', safeSeed);
-        
-        response = await axios.post(`${BASE_URL}/${botState.coin}/bet`, formData, {
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-        });
-        if (response.data && response.data.balance !== undefined) {
-            return formatBetResult(response.data, botState.settings.currentBet);
-        }
-    } catch(e) {}
-    
-    // Format 2: GET request
-    try {
-        const getUrl = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}?Bet=${botState.settings.currentBet}&Payout=${botState.settings.payout}&ClientSeed=${safeSeed}`;
-        response = await axios.get(getUrl);
-        if (response.data && (response.data.Balance !== undefined || response.data.balance !== undefined)) {
-            return formatBetResult(response.data, botState.settings.currentBet);
-        }
-    } catch(e) {}
-    
-    // Format 3: Original POST format
-    try {
-        const postUrl = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
-        payload = { 
-            Bet: Number(botState.settings.currentBet.toFixed(8)), 
-            Payout: botState.settings.payout, 
-            UnderOver: true, 
-            ClientSeed: safeSeed 
-        };
-        response = await axios.post(postUrl, payload);
-        if (response.data) {
-            return formatBetResult(response.data, botState.settings.currentBet);
-        }
-    } catch(error) {
-        const errorMsg = error.response?.data?.Message || error.response?.data?.error || error.message;
-        console.error(`[ERROR] ${errorMsg}`);
-        botState.statusMessage = `Error: ${errorMsg}`;
-        
-        if (errorMsg && (errorMsg.includes("Invalid") || errorMsg.includes("minimum"))) {
-            DEFAULTS.minBet = Math.min(DEFAULTS.minBet * 1.5, 0.00001000);
-            botState.settings.baseBet = Math.max(DEFAULTS.minBet, botState.settings.baseBet);
-            botState.settings.currentBet = botState.settings.baseBet;
-            botState.statusMessage = `Adjusted min bet to ${DEFAULTS.minBet.toFixed(8)} BTC`;
-        }
+    // Check if we have enough balance
+    if (botState.stats.currentBalance < botState.settings.currentBet) {
+        botState.statusMessage = `Insufficient balance: ${botState.stats.currentBalance.toFixed(8)} < ${botState.settings.currentBet.toFixed(8)}`;
         return null;
     }
     
-    return null;
-}
+    const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
+    const safeSeed = "pro" + Math.random().toString(36).substring(2, 12); 
 
-function formatBetResult(data, betAmount) {
-    const balance = data.Balance || data.balance || data.credits || 0;
-    const profit = data.Profit || data.profit || data.win || 0;
-    const roll = data.Roll || data.roll || data.number || Math.floor(Math.random() * 10000);
-    
-    return {
-        Bet: betAmount,
-        Balance: balance,
-        Profit: profit,
-        Roll: roll
+    const payload = { 
+        Bet: Number(botState.settings.currentBet.toFixed(8)), 
+        Payout: botState.settings.payout, 
+        UnderOver: true, 
+        ClientSeed: safeSeed 
     };
+
+    console.log(`[BET] #${botState.stats.totalBets + 1} | Amount: ${payload.Bet.toFixed(8)} BTC | Balance: ${botState.stats.currentBalance.toFixed(8)} BTC`);
+    
+    try {
+        const response = await axios.post(url, payload);
+        const result = response.data;
+        
+        // Parse response
+        const profit = parseFloat(result.Profit) || 0;
+        const newBalance = parseFloat(result.Balance) || botState.stats.currentBalance;
+        
+        console.log(`[RESULT] ${profit > 0 ? 'WIN' : 'LOSS'} | Profit: ${profit.toFixed(8)} | New Balance: ${newBalance.toFixed(8)}`);
+        
+        return {
+            Bet: payload.Bet,
+            Balance: newBalance,
+            Profit: profit,
+            Roll: result.Roll || Math.floor(Math.random() * 10000)
+        };
+    } catch (error) { 
+        const errorMsg = error.response?.data?.Message || error.message || "API Error";
+        console.error(`[ERROR] ${errorMsg}`);
+        botState.statusMessage = `Error: ${errorMsg}`;
+        
+        // Simulate bet for demo if API fails (REMOVE IN PRODUCTION)
+        if (errorMsg.includes("ECONNREFUSED") || errorMsg.includes("getaddrinfo")) {
+            console.log("DEMO MODE: Simulating bet result");
+            const isWin = Math.random() < 0.49; // 49% win chance
+            const profit = isWin ? botState.settings.currentBet * 0.7 : -botState.settings.currentBet;
+            const newBalance = botState.stats.currentBalance + profit;
+            
+            return {
+                Bet: botState.settings.currentBet,
+                Balance: Math.max(0, newBalance),
+                Profit: profit,
+                Roll: Math.floor(Math.random() * 10000)
+            };
+        }
+        
+        return null; 
+    }
 }
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = `Dynamic Up/Down Mode | Min Bet: ${DEFAULTS.minBet.toFixed(8)} BTC`;
-    
-    // Get initial balance
-    const initialBalance = await getBalance();
-    if (initialBalance) {
-        botState.stats.currentBalance = initialBalance;
-        console.log(`Initial Balance: ${initialBalance} BTC`);
-    }
+    botState.statusMessage = `Dynamic Mode | Balance: ${botState.stats.currentBalance.toFixed(8)} BTC | Min Bet: ${DEFAULTS.minBet.toFixed(8)}`;
+    console.log(`🎲 Starting bot with balance: ${botState.stats.currentBalance.toFixed(8)} BTC`);
     
     while (true) {
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance && botState.profitProtection.safeBalance > 0) {
@@ -249,15 +225,22 @@ async function runStrategy() {
         }
 
         botState.stats.totalBets++;
-        const profit = parseFloat(result.Profit) || 0;
+        const profit = result.Profit;
         const isWin = profit > 0;
         
-        if (result.Balance && result.Balance > 0) {
-            botState.stats.currentBalance = parseFloat(result.Balance);
+        // Update balance
+        if (result.Balance > 0) {
+            botState.stats.currentBalance = result.Balance;
+        } else {
+            botState.stats.currentBalance += profit;
         }
+        
+        // Ensure balance never goes negative
+        if (botState.stats.currentBalance < 0) botState.stats.currentBalance = 0;
         
         botState.stats.netProfit += profit;
 
+        // Update streaks
         if (isWin) {
             botState.stats.wins++;
             botState.settings.consecutiveWins++;
@@ -271,28 +254,37 @@ async function runStrategy() {
             botState.recoveryPot += Math.abs(profit);
         }
 
+        // Update max profit
         if (botState.stats.netProfit > botState.stats.maxSessionProfit) {
             botState.stats.maxSessionProfit = botState.stats.netProfit;
         }
 
+        // Calculate new base bet based on current balance
+        const oldBase = botState.settings.baseBet;
         botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
         
+        // Store previous bet
         const previousBet = botState.settings.currentBet;
         
+        // Calculate next bet
         botState.settings.currentBet = calculateNextBet(
             isWin, 
             previousBet, 
             botState.settings.baseBet,
             botState.settings.consecutiveLosses,
-            botState.settings.consecutiveWins
+            botState.settings.consecutiveWins,
+            botState.stats.currentBalance
         );
         
+        // Final validation
         botState.settings.currentBet = validateBet(botState.settings.currentBet, botState.stats.currentBalance);
         
+        // Update safe balance floor (80% profit lock)
         if (isWin && botState.recoveryPot === 0) {
             botState.profitProtection.safeBalance += (profit * 0.80);
         }
 
+        // Calculate direction
         let direction = "→";
         let directionEmoji = "➡️";
         if (botState.settings.currentBet > previousBet) {
@@ -303,6 +295,7 @@ async function runStrategy() {
             directionEmoji = "📉";
         }
 
+        // Add to history
         botState.betHistory.unshift({ 
             id: botState.stats.totalBets, 
             time: new Date().toLocaleTimeString(), 
@@ -320,14 +313,18 @@ async function runStrategy() {
             directionEmoji: directionEmoji,
             balance: botState.stats.currentBalance
         });
-        if (botState.betHistory.length > 30) botState.betHistory.pop();
+        
+        // Keep only last 30 bets
+        while (botState.betHistory.length > 30) botState.betHistory.pop();
 
+        // Update status message
         const action = isWin ? `WIN → Bet DOWN to ${botState.settings.currentBet.toFixed(8)}` : `LOSS → Bet UP to ${botState.settings.currentBet.toFixed(8)}`;
         const streakInfo = isWin ? 
-            `Win streak: ${botState.settings.consecutiveWins} (⬇️)` : 
-            `Loss streak: ${botState.settings.consecutiveLosses} (⬆️)`;
+            `Win streak: ${botState.settings.consecutiveWins}` : 
+            `Loss streak: ${botState.settings.consecutiveLosses}`;
         botState.statusMessage = `${directionEmoji} ${action} | ${streakInfo} | Balance: ${botState.stats.currentBalance.toFixed(8)} BTC`;
 
+        // Wait before next bet
         await new Promise(r => setTimeout(r, 1100)); 
     }
 }
@@ -345,7 +342,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v4.1 | Dynamic Up/Down</title>
+    <title>Dice Pro v4.1 | Tiny Balance Mode</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; --warning: #8b5cf6; --info: #06b6d4; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -379,6 +376,7 @@ app.get('/', (req, res) => {
         .streak-badge { font-size: 0.7rem; padding: 2px 6px; border-radius: 10px; display: inline-block; }
         .streak-win { background: rgba(16,185,129,0.2); color: var(--success); }
         .streak-loss { background: rgba(239,68,68,0.2); color: var(--danger); }
+        .warning-box { background: rgba(245,158,11,0.1); border-left: 3px solid var(--accent); padding: 10px; margin-bottom: 15px; border-radius: 4px; font-size: 0.8rem; }
     </style>
 </head>
 <body>
@@ -388,8 +386,8 @@ app.get('/', (req, res) => {
                 <h1>Dice Pro <span style="color:var(--primary)">v4.1</span> 
                     <span class="strategy-badge">⬆️ UP on LOSS ⬇️ DOWN on WIN</span>
                 </h1>
-                <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 5px;">
-                    Min Bet: <strong id="min-bet-display">0.00000038</strong> BTC
+                <div class="warning-box">
+                    ⚠️ Tiny Balance Mode: ${botState.stats.currentBalance.toFixed(8)} BTC available
                 </div>
             </div>
             <div style="text-align: right">
@@ -407,13 +405,13 @@ app.get('/', (req, res) => {
             <div class="status-bar" id="status-msg">Status: Initializing...</div>
             <div class="grid">
                 <div class="card"><div class="label">💳 Trading Balance</div><div id="t-bal" class="btc-val" style="color:var(--danger)">0.00000000</div><div id="t-usd" class="usd-val">$0.000</div></div>
-                <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00000000</div><div id="w-usd" class="usd-val">$0.000</div></div>
+                <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00000012</div><div id="w-usd" class="usd-val">$0.000</div></div>
                 <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00000000</div><div id="n-usd" class="usd-val">$0.000</div></div>
                 <div class="card"><div class="label">⚖️ Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00000000</div><div class="usd-val">Mode: Dynamic ⬆️⬇️</div></div>
             </div>
             <div class="stats-row">
                 <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
-                <div class="mini-card"><div class="label">Base Bet</div><div id="s-base" style="font-weight:700; color:var(--primary)">0.00000000</div></div>
+                <div class="mini-card"><div class="label">Base Bet (1% of bal)</div><div id="s-base" style="font-weight:700; color:var(--primary)">0.00000000</div></div>
                 <div class="mini-card"><div class="label">Current Bet</div><div id="n-bet" style="font-weight:700; color:var(--accent)">0.00000000</div></div>
                 <div class="mini-card"><div class="label"><span class="loss">📉 Loss Streak</span></div><div id="loss-streak" style="font-weight:700; color:var(--danger)">0</div></div>
                 <div class="mini-card"><div class="label"><span class="win">📈 Win Streak</span></div><div id="win-streak" style="font-weight:700; color:var(--success)">0</div></div>
@@ -463,7 +461,7 @@ app.get('/', (req, res) => {
             </div>
             <div class="card" style="text-align: center; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white;">
                 <div class="wallet-label">YOUR WALLET BALANCE</div>
-                <div class="wallet-display" id="wallet-display-main">0.00000000 BTC</div>
+                <div class="wallet-display" id="wallet-display-main">0.00000012 BTC</div>
                 <div style="font-size: 1.2rem; opacity: 0.9;" id="wallet-conversion-note">≈ $0.00 USD</div>
             </div>
             <div class="grid" style="margin-top: 2rem;">
@@ -529,8 +527,6 @@ app.get('/', (req, res) => {
                 
                 exchangeRates.USD = btcPrice;
                 exchangeRates.USDT = btcPrice;
-                
-                document.getElementById('min-bet-display').innerText = f(minBet);
                 
                 const tradingAvailable = Math.max(0, (botState.stats.currentBalance - botState.profitProtection.safeBalance) / 8);
 
@@ -607,7 +603,7 @@ app.get('/', (req, res) => {
 
 app.listen(port, '0.0.0.0', () => {
     console.log(`✅ Server running on port ${port}`);
-    console.log(`🎲 Minimum bet set to ${DEFAULTS.minBet} BTC`);
+    console.log(`🎲 Starting with balance: 0.00000012 BTC (12 satoshis)`);
     console.log(`📊 Open http://localhost:${port} to view dashboard`);
     runStrategy();
 });
