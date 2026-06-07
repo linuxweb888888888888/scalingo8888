@@ -31,8 +31,8 @@ let botState = {
         wins: 0,
         losses: 0,
         netProfit: 0,
-        maxSessionProfit: 0, // Highest profit reached
-        pullbackPercent: 0,  // Drop from maxSessionProfit
+        maxSessionProfit: 0, 
+        pullbackPercent: 0,  
         currentBalance: 0,
         startTime: Date.now(),
     },
@@ -69,7 +69,11 @@ function saveState() {
 // ============ API LOGIC ============
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
-    const safeSeed = "node20" + Math.random().toString(36).substring(0, 10); 
+    
+    // STRICT ALPHANUMERIC SEED GENERATION
+    const rawSuffix = Math.random().toString(36).substring(2); 
+    const alphanumericSuffix = rawSuffix.replace(/[^a-z0-9]/gi, '').substring(0, 10);
+    const safeSeed = "node" + alphanumericSuffix; 
 
     const payload = { 
         Bet: botState.settings.currentBet, 
@@ -92,7 +96,6 @@ async function runStrategy() {
     botState.statusMessage = "Running Strategy...";
     
     while (true) {
-        // 1. HARD FLOOR PROTECTION
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
             botState.running = false;
             botState.statusMessage = "STOPPED: Protected Profit Floor Hit!";
@@ -125,7 +128,6 @@ async function runStrategy() {
                 botState.nextResumeTime = Date.now() + 60000;
                 botState.statusMessage = `PULLBACK GUARD: Pausing 60s (${botState.stats.pullbackPercent.toFixed(1)}% Drop)`;
                 
-                // Reset max profit so we track the "new" climb after pause
                 botState.stats.maxSessionProfit = botState.stats.netProfit;
                 
                 await new Promise(r => setTimeout(r, 60000));
@@ -182,7 +184,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro | Pullback Logic</title>
+    <title>Dice Pro | Alphanumeric Seed</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -209,7 +211,7 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <div class="header">
-            <h1>Dice Pro <span style="color:var(--primary)">v2.3</span></h1>
+            <h1>Dice Pro <span style="color:var(--primary)">v2.4</span></h1>
             <div style="text-align: right"><div class="label">Market BTC/USD</div><div id="price-tag" style="font-weight: 700;">$0.00</div></div>
         </div>
         <div class="status-bar">
