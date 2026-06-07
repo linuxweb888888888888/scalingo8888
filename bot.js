@@ -14,7 +14,7 @@ const DEFAULTS = {
     payout: 2.0,              
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001,
-    recoveryDivisor: 50,      // Spreads recovery over 50 wins (Much Slower)
+    recoveryDivisor: 10,      // Spreads recovery over 50 wins (Much Slower)
     maxRecoveryMult: 5        // Recovery part will never exceed 5x the base bet
 };
 
