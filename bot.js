@@ -6,7 +6,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "cPiZ4J5dMW5CDcPZkSAwU8JxmzISV1bjQ0dZKuzI9EXqmLyl2M";
+const API_KEY = process.env.API_KEY || "aBmmu0A3Df56Ri1YWFpR8hqWpQkZKdMjtvOkETGAZJvg0O87fI";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
@@ -59,22 +59,37 @@ function calculateScaledBase(balance) {
     return Number((Math.max(1, units) * DEFAULTS.betIncrement).toFixed(8));
 }
 
+/**
+ * SOFT REBOOT: REAL RESET
+ * This function handles the resetting of the bet and the floor.
+ */
 function softResetBot() {
     console.log("SYSTEM: SAFE FLOOR HIT. Performing soft reboot...");
-    botState.statusMessage = "SYSTEM: SAFE FLOOR HIT: Resetting & Rebooting...";
+    botState.statusMessage = "SYSTEM: SAFE FLOOR HIT: Resetting Bet & Floor...";
     
-    botState.profitProtection.safeBalance = 0; // Real Reset
-    botState.recoveryPot = 0;
+    // 1. Reset the Floor to 0 (Real Reset)
+    botState.profitProtection.safeBalance = 0; 
+    
+    // 2. Reset the Betting Logic
+    botState.recoveryPot = 0; // Wipes the "loss chase"
+    
+    // 3. Reset Session Stats
     botState.stats = {
-        totalBets: 0, wins: 0, losses: 0, 
+        totalBets: 0, 
+        wins: 0, 
+        losses: 0, 
         netProfit: botState.stats.netProfit, 
         maxSessionProfit: 0,
         currentBalance: botState.stats.currentBalance,
         startTime: Date.now()
     };
+    
+    // 4. Wipe history visuals
     botState.betHistory = [];
+    
+    // 5. Reset the Bet to the Base level
     botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
-    botState.settings.currentBet = botState.settings.baseBet;
+    botState.settings.currentBet = botState.settings.baseBet; 
 }
 
 // ============ API LOGIC ============
@@ -289,7 +304,6 @@ app.get('/', (req, res) => {
         function updateWalletDisplay() {
             const selector = document.getElementById('currency-selector');
             if (selector) currentCurrency = selector.value;
-            
             const walletBalanceRaw = parseFloat(document.getElementById('w-bal')?.innerText || 0);
             const tradingBalanceRaw = parseFloat(document.getElementById('t-bal')?.innerText || 0);
             const netProfitRaw = parseFloat(document.getElementById('n-prof')?.innerText || 0);
@@ -321,8 +335,8 @@ app.get('/', (req, res) => {
                 exchangeRates.USD = btcPrice;
                 exchangeRates.USDT = btcPrice;
                 
-                // Trading Balance Logic: (Wallet - Floor) / 2
-                const tradingAvailable = (botState.stats.currentBalance - botState.profitProtection.safeBalance) / 2;
+                // CALCULATION: (Wallet Balance - Floor) divided by 4
+                const tradingAvailable = (botState.stats.currentBalance - botState.profitProtection.safeBalance) / 4;
 
                 document.getElementById('status-msg').innerText = "Status: " + botState.statusMessage;
                 document.getElementById('price-tag').innerText = "$" + btcPrice.toLocaleString();
@@ -353,7 +367,6 @@ app.get('/', (req, res) => {
                 document.getElementById('p-year-b').innerText = f(hourlyProjection * 24 * 365);
                 document.getElementById('p-year-u').innerText = u(hourlyProjection * 24 * 365);
 
-                // FIXED: Escaped backticks and dollar signs to prevent SyntaxError
                 document.getElementById('h-body').innerHTML = botState.betHistory.map(b => \`
                     <tr><td>#\${b.id}</td><td>\${f(b.dBase)}</td><td>\${f(b.bet)}</td><td>\${b.roll}</td><td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td><td>\${b.pot} BTC</td></tr>
                 \`).join('');
