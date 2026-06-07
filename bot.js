@@ -5,33 +5,34 @@ const fs = require('fs');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ============ CONFIGURATION (Efficient Scaling v3.9.1) ============
+// ============ CONFIGURATION ============
 const API_KEY = process.env.API_KEY || "0n751mjysO1s1Pb4b9rBlribcBqFztjGfUp7GDsfQFJM7mOdc2";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
     payout: 2.0,              
-    balanceStep: 0.00000010,   
-    betIncrement: 0.00000001,
-    recoveryDivisor: 12,       // Fast recovery for small pots
-    maxRecoveryDivisor: 40,    // Safe recovery for large pots
-    maxTotalBetPercent: 0.02,  // Hard cap: 2% of balance
-    potSafetyLimit: 0.12       // Reset if pot hits 12% of balance
+    balanceStep: 0.00000050,  
+    betIncrement: 0.00000001
 };
 
 // ============ BOT STATE ============
-let btcPrice = 60826; 
+let btcPrice = 60964; 
 let botState = {
     running: true,
     statusMessage: "Initializing...",
     recoveryPot: 0, 
     coin: DEFAULTS.coin,
+    profitProtection: { 
+        safeBalance: 0,
+        lockPercent: 0.80 // CHANGED: Now locking 80% of profit
+    }, 
     stats: {
         totalBets: 0,
         wins: 0,
         losses: 0,
         netProfit: 0,
+        maxSessionProfit: 0,
         currentBalance: 0,
         startTime: Date.now(),
     },
@@ -58,30 +59,37 @@ function calculateScaledBase(balance) {
     return Number((Math.max(1, units) * DEFAULTS.betIncrement).toFixed(8));
 }
 
-// ============ API LOGIC (Fixed for "Invalid Parameters") ============
+function resetSession() {
+    botState.statusMessage = "REBOOTING: Floor Hit. Starting Fresh...";
+    botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.98; // Protect 98% of remaining on crash
+    botState.recoveryPot = 0;
+    botState.stats = {
+        totalBets: 0, wins: 0, losses: 0, netProfit: 0, maxSessionProfit: 0,
+        currentBalance: botState.stats.currentBalance,
+        startTime: Date.now()
+    };
+    botState.betHistory = [];
+    botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
+    botState.settings.currentBet = botState.settings.baseBet;
+}
+
+// ============ API LOGIC ============
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
-    const safeSeed = "pro" + Math.random().toString(36).substring(2, 12); 
-
-    // FIX: Ensure bet is exactly 8 decimals and never below 0.00000001
-    const finalBet = Math.max(0.00000001, Number(botState.settings.currentBet.toFixed(8)));
     
-    // FIX: Ensure payout is 2 decimals
-    const finalPayout = Number(botState.settings.payout.toFixed(2));
+    const rawSuffix = Math.random().toString(36).substring(2); 
+    const alphanumericSuffix = rawSuffix.replace(/[^a-z0-9]/gi, '').substring(0, 12);
+    const safeSeed = "pro" + alphanumericSuffix; 
 
     const payload = { 
-        Bet: finalBet, 
-        Payout: finalPayout, 
+        Bet: Number(botState.settings.currentBet.toFixed(8)), 
+        Payout: botState.settings.payout, 
         UnderOver: true, 
         ClientSeed: safeSeed 
     };
 
     try {
         const response = await axios.post(url, payload);
-        if (response.data && response.data.Success === false) {
-            botState.statusMessage = response.data.Message || "Bet Rejected";
-            return null;
-        }
         return response.data;
     } catch (error) { 
         botState.statusMessage = error.response?.data?.Message || "API Error";
@@ -91,13 +99,14 @@ async function placeBet() {
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = "Efficient-Scaling Active";
+    botState.statusMessage = "Linear Recovery Mode (80% Profit Lock)";
     
     while (true) {
-        // Safety: Clear pot if it exceeds safety limit
-        if (botState.recoveryPot > (botState.stats.currentBalance * DEFAULTS.potSafetyLimit)) {
-            botState.statusMessage = "Safety Reset: Pot Cleared.";
-            botState.recoveryPot = 0;
+        // Floor Auto-Reboot
+        if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
+            resetSession();
+            await new Promise(r => setTimeout(r, 2000));
+            continue; 
         }
 
         const result = await placeBet();
@@ -106,43 +115,33 @@ async function runStrategy() {
             continue; 
         }
 
-        // Update basic stats
         botState.stats.totalBets++;
         const profit = result.Profit || 0;
         botState.stats.netProfit += profit;
         botState.stats.currentBalance = result.Balance || 0;
 
-        // Scale base bet according to balance
-        botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
-
-        // Update Recovery Pot
-        if (profit > 0) {
-            botState.stats.wins++;
-            botState.recoveryPot = Math.max(0, botState.recoveryPot - profit);
-        } else {
-            botState.stats.losses++;
-            botState.recoveryPot += Math.abs(result.Bet); 
+        if (botState.stats.netProfit > botState.stats.maxSessionProfit) {
+            botState.stats.maxSessionProfit = botState.stats.netProfit;
         }
 
-        // --- EFFICIENT SCALING CALCULATION ---
-        let potSeverity = botState.recoveryPot / (botState.settings.baseBet || 0.00000001);
-        
-        // Dynamic Divisor: As the pot grows, we slow down to prevent bet "explosions"
-        let dynamicDivisor = DEFAULTS.recoveryDivisor;
-        if (potSeverity > 50) dynamicDivisor = 20; 
-        if (potSeverity > 150) dynamicDivisor = DEFAULTS.maxRecoveryDivisor;
+        botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
 
-        let recoveryPart = botState.recoveryPot / dynamicDivisor;
-        let targetBet = botState.settings.baseBet + recoveryPart;
+        if (profit > 0) {
+            botState.stats.wins++;
+            botState.recoveryPot -= profit;
+            if (botState.recoveryPot < 0) botState.recoveryPot = 0;
 
-        // Apply strict safety cap (max 2% of balance)
-        let absoluteMax = botState.stats.currentBalance * DEFAULTS.maxTotalBetPercent;
-        let finalCalculated = Math.min(targetBet, absoluteMax);
+            if (botState.recoveryPot === 0) {
+                botState.settings.currentBet = botState.settings.baseBet;
+                // CHANGED: Now adding 80% of profit to the safe floor
+                botState.profitProtection.safeBalance += (profit * 0.80); 
+            }
+        } else {
+            botState.stats.losses++;
+            botState.recoveryPot += Math.abs(profit);
+            botState.settings.currentBet += DEFAULTS.betIncrement;
+        }
 
-        // FINAL CHECK: Never bet below minimum allowed by API
-        botState.settings.currentBet = Math.max(0.00000001, finalCalculated);
-
-        // Update history
         botState.betHistory.unshift({ 
             id: botState.stats.totalBets, time: new Date().toLocaleTimeString(), 
             bet: result.Bet, roll: result.Roll, profit: profit, isWin: profit > 0, 
@@ -160,14 +159,14 @@ app.get('/api/stats', (req, res) => {
     res.json({ botState, btcPrice, hoursPassed: hours.toFixed(2) });
 });
 
-// ============ WEB DASHBOARD (Original Design) ============
+// ============ WEB DASHBOARD ============
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.9 | Efficient Profit</title>
+    <title>Dice Pro v3.3 | 80% Lock</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -192,15 +191,15 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <div class="header">
-            <h1>Dice Pro <span style="color:var(--primary)">v3.9 Efficient</span></h1>
+            <h1>Dice Pro <span style="color:var(--primary)">v3.3</span></h1>
             <div style="text-align: right"><div class="label">Market BTC/USD</div><div id="price-tag" style="font-weight: 700;">$0.00</div></div>
         </div>
         <div class="status-bar" id="status-msg">Status: Initializing...</div>
         <div class="grid">
-            <div class="card"><div class="label">💳 Safe Tradable</div><div id="t-bal" class="btc-val" style="color:var(--primary)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
+            <div class="card"><div class="label">💳 Trading Balance</div><div id="t-bal" class="btc-val" style="color:var(--danger)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">⚖️ Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--danger)">0.00</div><div class="usd-val">Auto-Scaling Divisor</div></div>
+            <div class="card"><div class="label">⚖️ Recovery Pot (Remaining)</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div class="usd-val">Mode: 80% Profit Lock</div></div>
         </div>
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
@@ -216,7 +215,7 @@ app.get('/', (req, res) => {
             <div class="proj-card"><div class="label">Yearly</div><span id="p-year-b" class="win">0.00</span><br><span id="p-year-u" class="usd-val">0.00</span></div>
         </div>
         <table>
-            <thead><tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Left</th></tr></thead>
+            <thead><tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Remaining</th></tr></thead>
             <tbody id="h-body"></tbody>
         </table>
     </div>
@@ -226,12 +225,12 @@ app.get('/', (req, res) => {
                 const res = await fetch('/api/stats');
                 const { botState, btcPrice, hoursPassed } = await res.json();
                 const f = (n) => parseFloat(n || 0).toFixed(8);
-                const u = (n) => "$" + (parseFloat(n || 0) * btcPrice).toLocaleString(undefined, {minimumFractionDigits: 2});
+                const u = (n) => "$" + (parseFloat(n || 0) * btcPrice).toLocaleString(undefined, {minimumFractionDigits: 3});
                 
                 document.getElementById('status-msg').innerText = "Status: " + botState.statusMessage;
                 document.getElementById('price-tag').innerText = "$" + btcPrice.toLocaleString();
-                document.getElementById('t-bal').innerText = f(botState.stats.currentBalance);
-                document.getElementById('t-usd').innerText = u(botState.stats.currentBalance);
+                document.getElementById('t-bal').innerText = f(botState.stats.currentBalance - botState.profitProtection.safeBalance);
+                document.getElementById('t-usd').innerText = u(botState.stats.currentBalance - botState.profitProtection.safeBalance);
                 document.getElementById('w-bal').innerText = f(botState.stats.currentBalance);
                 document.getElementById('w-usd').innerText = u(botState.stats.currentBalance);
                 document.getElementById('n-prof').innerText = f(botState.stats.netProfit);
