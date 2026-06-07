@@ -6,7 +6,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "aBmmu0A3Df56Ri1YWFpR8hqWpQkZKdMjtvOkETGAZJvg0O87fI";
+const API_KEY = process.env.API_KEY || "i57lk4i2fyabkEBmL5Kq4GiPZIg5WszlcTG6P9Y778UJtoaDmu";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
@@ -61,19 +61,15 @@ function calculateScaledBase(balance) {
 
 /**
  * SOFT REBOOT: REAL RESET
- * This function handles the resetting of the bet and the floor.
+ * Clears floor and resets bet to base.
  */
 function softResetBot() {
     console.log("SYSTEM: SAFE FLOOR HIT. Performing soft reboot...");
     botState.statusMessage = "SYSTEM: SAFE FLOOR HIT: Resetting Bet & Floor...";
     
-    // 1. Reset the Floor to 0 (Real Reset)
     botState.profitProtection.safeBalance = 0; 
+    botState.recoveryPot = 0; 
     
-    // 2. Reset the Betting Logic
-    botState.recoveryPot = 0; // Wipes the "loss chase"
-    
-    // 3. Reset Session Stats
     botState.stats = {
         totalBets: 0, 
         wins: 0, 
@@ -84,10 +80,7 @@ function softResetBot() {
         startTime: Date.now()
     };
     
-    // 4. Wipe history visuals
     botState.betHistory = [];
-    
-    // 5. Reset the Bet to the Base level
     botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
     botState.settings.currentBet = botState.settings.baseBet; 
 }
@@ -118,7 +111,6 @@ async function runStrategy() {
     botState.statusMessage = "Linear Recovery Mode (80% Profit Lock)";
     
     while (true) {
-        // Floor Auto-Reboot Trigger
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
             softResetBot();
             await new Promise(r => setTimeout(r, 5000));
@@ -335,8 +327,8 @@ app.get('/', (req, res) => {
                 exchangeRates.USD = btcPrice;
                 exchangeRates.USDT = btcPrice;
                 
-                // CALCULATION: (Wallet Balance - Floor) divided by 4
-                const tradingAvailable = (botState.stats.currentBalance - botState.profitProtection.safeBalance) / 4;
+                // CALCULATION: (Wallet Balance - Floor) divided by 8
+                const tradingAvailable = (botState.stats.currentBalance - botState.profitProtection.safeBalance) / 8;
 
                 document.getElementById('status-msg').innerText = "Status: " + botState.statusMessage;
                 document.getElementById('price-tag').innerText = "$" + btcPrice.toLocaleString();
