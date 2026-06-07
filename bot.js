@@ -60,15 +60,21 @@ function calculateScaledBase(balance) {
 }
 
 function resetSession() {
-    // UPDATED MESSAGE
     botState.statusMessage = "SYSTEM: SAFE FLOOR HIT: Locking Profits...";
-    botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.98; // Protect 98% of remaining on crash
+    botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.98; 
     botState.recoveryPot = 0;
+    
+    // UPDATED: Preserve netProfit, maxSessionProfit, and startTime
     botState.stats = {
-        totalBets: 0, wins: 0, losses: 0, netProfit: 0, maxSessionProfit: 0,
+        totalBets: 0, 
+        wins: 0, 
+        losses: 0, 
+        netProfit: botState.stats.netProfit, 
+        maxSessionProfit: botState.stats.maxSessionProfit,
         currentBalance: botState.stats.currentBalance,
-        startTime: Date.now()
+        startTime: botState.stats.startTime
     };
+    
     botState.betHistory = [];
     botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
     botState.settings.currentBet = botState.settings.baseBet;
@@ -103,10 +109,8 @@ async function runStrategy() {
     botState.statusMessage = "Linear Recovery Mode (80% Profit Lock)";
     
     while (true) {
-        // Floor Auto-Reboot
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
             resetSession();
-            // UPDATED: Now waits for 5 seconds (5000ms)
             await new Promise(r => setTimeout(r, 5000));
             continue; 
         }
@@ -119,7 +123,7 @@ async function runStrategy() {
 
         botState.stats.totalBets++;
         const profit = result.Profit || 0;
-        botState.stats.netProfit += profit;
+        botState.stats.netProfit += profit; // Keeps adding globally now
         botState.stats.currentBalance = result.Balance || 0;
 
         if (botState.stats.netProfit > botState.stats.maxSessionProfit) {
@@ -242,7 +246,8 @@ app.get('/', (req, res) => {
                 document.getElementById('n-bet').innerText = f(botState.settings.currentBet);
                 document.getElementById('uptime').innerText = hoursPassed + "h";
 
-                const ph = botState.stats.netProfit / hoursPassed;
+                // UPDATED: Calculate ph based on Wallet Balance (currentBalance)
+                const ph = botState.stats.currentBalance / hoursPassed;
                 document.getElementById('p-hr-b').innerText = f(ph); document.getElementById('p-hr-u').innerText = u(ph);
                 document.getElementById('p-dy-b').innerText = f(ph*24); document.getElementById('p-dy-u').innerText = u(ph*24);
                 document.getElementById('p-month-b').innerText = f(ph*24*30); document.getElementById('p-month-u').innerText = u(ph*24*30);
