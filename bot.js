@@ -13,8 +13,7 @@ const DEFAULTS = {
     coin: "BTC",
     payout: 2.0,              
     balanceStep: 0.00000050,  
-    betIncrement: 0.00000001,
-    maxBetMultiplier: 50 // MODERATOR: Resets bet if it exceeds 50x Base
+    betIncrement: 0.00000001
 };
 
 // ============ BOT STATE ============
@@ -26,7 +25,7 @@ let botState = {
     coin: DEFAULTS.coin,
     profitProtection: { 
         safeBalance: 0,
-        lockPercent: 0.80 // CHANGED: Now locking 80% of profit
+        lockPercent: 0.80 // Locking 80% of profit
     }, 
     stats: {
         totalBets: 0,
@@ -61,7 +60,8 @@ function calculateScaledBase(balance) {
 }
 
 function resetSession() {
-    botState.statusMessage = "REBOOTING: Floor Hit. Starting Fresh...";
+    // UPDATED MESSAGE
+    botState.statusMessage = "SYSTEM: SAFE FLOOR HIT: Locking Profits...";
     botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.98; // Protect 98% of remaining on crash
     botState.recoveryPot = 0;
     botState.stats = {
@@ -106,7 +106,8 @@ async function runStrategy() {
         // Floor Auto-Reboot
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
             resetSession();
-            await new Promise(r => setTimeout(r, 2000));
+            // UPDATED: Now waits for 5 seconds (5000ms)
+            await new Promise(r => setTimeout(r, 5000));
             continue; 
         }
 
@@ -140,14 +141,6 @@ async function runStrategy() {
             botState.stats.losses++;
             botState.recoveryPot += Math.abs(profit);
             botState.settings.currentBet += DEFAULTS.betIncrement;
-
-            // ============ MODERATOR ADDITION ============
-            // If the bet reaches the max multiplier, reset to base to protect balance
-            if (botState.settings.currentBet > (botState.settings.baseBet * DEFAULTS.maxBetMultiplier)) {
-                botState.settings.currentBet = botState.settings.baseBet;
-                botState.statusMessage = "MODERATOR: High Bet Cap Triggered (Reset to Base)";
-            }
-            // ============================================
         }
 
         botState.betHistory.unshift({ 
