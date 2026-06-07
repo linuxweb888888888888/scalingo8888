@@ -6,7 +6,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION - PROFIT OPTIMIZED ============
-const API_KEY = "ubusPY6aoXmQXKbS8S6y0gaTVBEDGDu39NMLaS52NV3F3DdKGN";
+const API_KEY = process.env.API_KEY || "ubusPY6aoXmQXKbS8S6y0gaTVBEDGDu39NMLaS52NV3F3DdKGN";
 const BASE_URL = "https://api.crypto.games/v1";
 
 // PROFIT-OPTIMIZED CONFIGURATION (Fixed negative EV)
@@ -805,7 +805,9 @@ app.get('/', (req, res) => {
     
     <div style="overflow-x: auto; margin-top: 1.5rem;">
         <table>
-            <thead><tr><th>#</th><th>Status</th><th>Payout</th><th>Wager</th><th>Roll</th><th>P/L</th><th>%</th><th>Streak</th><th>Growth</th><th>EV</th></tr></thead>
+            <thead>
+                <tr><th>#</th><th>Status</th><th>Payout</th><th>Wager</th><th>Roll</th><th>P/L</th><th>%</th><th>Streak</th><th>Growth</th><th>EV</th></tr>
+            </thead>
             <tbody id="history-body"><tr><td colspan="10" style="text-align:center;">Starting profit-optimized engine...</td></tr></tbody>
         </table>
     </div>
@@ -858,18 +860,18 @@ app.get('/', (req, res) => {
             if (botState.betHistory && botState.betHistory.length > 0) {
                 document.getElementById('history-body').innerHTML = botState.betHistory.slice(0, 30).map(b => {
                     let icon = b.recoveryMode ? '🔄' : (b.isWin ? '✅' : '❌');
-                    return `<tr>
-                        <td>#${b.id}</td>
-                        <td>${icon}</td>
-                        <td>${b.payout}x</td>
-                        <td>${f(b.bet)}</td>
-                        <td>${b.roll}</td>
-                        <td class="${b.isWin ? 'win' : 'loss'}">${b.isWin ? '+' : ''}${f(b.profit)}</td>
-                        <td class="${b.isWin ? 'win' : 'loss'}">${b.profitPercent}%</td>
-                        <td>${b.winStreak > 0 ? '🔥' + b.winStreak : (b.lossStreak > 0 ? '📉' + b.lossStreak : '-')}</td>
-                        <td>${b.growth}x</td>
-                        <td>${b.ev}</td>
-                    </tr>`;
+                    return '<tr>' +
+                        '<td>#' + b.id + '</td>' +
+                        '<td>' + icon + '</td>' +
+                        '<td>' + b.payout + 'x</td>' +
+                        '<td>' + f(b.bet) + '</td>' +
+                        '<td>' + b.roll + '</td>' +
+                        '<td class="' + (b.isWin ? 'win' : 'loss') + '">' + (b.isWin ? '+' : '') + f(b.profit) + '</td>' +
+                        '<td class="' + (b.isWin ? 'win' : 'loss') + '">' + b.profitPercent + '%</td>' +
+                        '<td>' + (b.winStreak > 0 ? '🔥' + b.winStreak : (b.lossStreak > 0 ? '📉' + b.lossStreak : '-')) + '</td>' +
+                        '<td>' + b.growth + 'x</td>' +
+                        '<td>' + b.ev + '</td>' +
+                        '</tr>';
                 }).join('');
             }
         } catch(e) { console.error(e); }
