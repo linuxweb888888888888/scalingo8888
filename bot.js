@@ -13,7 +13,7 @@ const DEFAULTS = {
     payout: 2.0,              
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001,
-    maxBetPercent: 0.01,       
+    maxBetPercent: 0.1,       
     streakReset: 5             
 };
 
