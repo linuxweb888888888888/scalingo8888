@@ -15,7 +15,7 @@ let CONFIG = {
     minBet: 0.00000001,
     baseBetPercent: 0.10,      // Starts at 10% of balance
     maxBetPercent: 0.30,       // Max 30% of balance
-    payout: 3.0,               // Base payout
+    payout: 1.7,               // Base payout
     targetMultiplier: 16.67,   // Target 1667% return
     stopLossPercent: 0.50,     // Stop loss at 50% drawdown
     useKelly: true,
