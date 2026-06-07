@@ -24,8 +24,8 @@ let botState = {
     recoveryPot: 0, 
     coin: DEFAULTS.coin,
     profitProtection: { 
-        safeBalance: 0,
-        lockPercent: 0.80 // Locking 80% of profit
+        safeBalance: 0, // This is the 'Floor'. 0 means Trading Bal = Wallet Bal
+        lockPercent: 0.80 
     }, 
     stats: {
         totalBets: 0,
@@ -60,21 +60,17 @@ function calculateScaledBase(balance) {
 }
 
 /**
- * SOFT REBOOT / RESET LOGIC
- * Resets strategy variables while keeping the dashboard/server alive.
+ * SOFT REBOOT: REAL RESET
+ * This sets the safe floor to 0, making Trading Balance = Wallet Balance
  */
 function softResetBot() {
-    console.log("SYSTEM: SAFE FLOOR HIT. Performing soft reboot...");
+    botState.statusMessage = "SYSTEM: SAFE FLOOR HIT: Real Resetting Balance...";
     
-    botState.statusMessage = "SYSTEM: SAFE FLOOR HIT: Locking Profits... Soft Rebooting...";
+    // REAL RESET: Setting safeBalance to 0 makes your Trading Balance 
+    // exactly the same as your Wallet Balance.
+    botState.profitProtection.safeBalance = 0; 
     
-    // Protect 98% of what remains
-    botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.98; 
-    
-    // Clear Recovery Logic
     botState.recoveryPot = 0;
-    
-    // Reset Session Stats but preserve lifetime Net Profit
     botState.stats = {
         totalBets: 0, 
         wins: 0, 
@@ -82,13 +78,9 @@ function softResetBot() {
         netProfit: botState.stats.netProfit, 
         maxSessionProfit: 0,
         currentBalance: botState.stats.currentBalance,
-        startTime: Date.now() // Resets uptime clock for the new "session"
+        startTime: Date.now()
     };
-    
-    // Wipe history to clear visual clutter on reboot
     botState.betHistory = [];
-    
-    // Recalculate bets for the new balance level
     botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
     botState.settings.currentBet = botState.settings.baseBet;
 }
@@ -96,10 +88,7 @@ function softResetBot() {
 // ============ API LOGIC ============
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
-    
-    const rawSuffix = Math.random().toString(36).substring(2); 
-    const alphanumericSuffix = rawSuffix.replace(/[^a-z0-9]/gi, '').substring(0, 12);
-    const safeSeed = "pro" + alphanumericSuffix; 
+    const safeSeed = "pro" + Math.random().toString(36).substring(2, 12); 
 
     const payload = { 
         Bet: Number(botState.settings.currentBet.toFixed(8)), 
@@ -125,7 +114,6 @@ async function runStrategy() {
         // Floor Auto-Reboot Trigger
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
             softResetBot();
-            // Wait 5 seconds to let the API/Server "breathe" during the soft reboot
             await new Promise(r => setTimeout(r, 5000));
             continue; 
         }
@@ -154,7 +142,7 @@ async function runStrategy() {
 
             if (botState.recoveryPot === 0) {
                 botState.settings.currentBet = botState.settings.baseBet;
-                // Lock 80% of the win into the safe floor
+                // As you win, it starts locking profit again starting from 0
                 botState.profitProtection.safeBalance += (profit * 0.80); 
             }
         } else {
@@ -235,6 +223,7 @@ app.get('/', (req, res) => {
         <div id="dashboard-page" class="page active-page">
             <div class="status-bar" id="status-msg">Status: Initializing...</div>
             <div class="grid">
+                <!-- TRADING BALANCE now equals WALLET BALANCE on reset -->
                 <div class="card"><div class="label">💳 Trading Balance</div><div id="t-bal" class="btc-val" style="color:var(--danger)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
                 <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
                 <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
@@ -260,6 +249,7 @@ app.get('/', (req, res) => {
         </div>
         
         <div id="wallet-page" class="page">
+            <!-- DESIGN KEPT THE SAME AS REQUESTED -->
             <div class="status-bar" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
                 💰 WALLET BALANCE - Select Currency Below
             </div>
@@ -288,21 +278,12 @@ app.get('/', (req, res) => {
     </div>
     <script>
         let currentCurrency = 'BTC';
-        const exchangeRates = {
-            BTC: 1,
-            LTC: 0.016,
-            USD: 60964,
-            USDT: 60964,
-            EUR: 0.92,
-            GBP: 0.79,
-            ZAR: 18.5
-        };
+        const exchangeRates = { BTC: 1, LTC: 0.016, USD: 60964, USDT: 60964, EUR: 0.92, GBP: 0.79, ZAR: 18.5 };
         
         function convertToCurrency(btcAmount, currency) {
             if (currency === 'BTC') return btcAmount;
             const usdAmount = btcAmount * exchangeRates.USD;
-            if (currency === 'USD') return usdAmount;
-            if (currency === 'USDT') return usdAmount;
+            if (currency === 'USD' || currency === 'USDT') return usdAmount;
             if (currency === 'EUR') return usdAmount * exchangeRates.EUR;
             if (currency === 'GBP') return usdAmount * exchangeRates.GBP;
             if (currency === 'ZAR') return usdAmount * exchangeRates.ZAR;
@@ -311,68 +292,31 @@ app.get('/', (req, res) => {
         }
         
         function formatCurrency(amount, currency) {
-            if (currency === 'BTC') return amount.toFixed(8) + ' BTC';
-            if (currency === 'LTC') return amount.toFixed(8) + ' LTC';
-            if (currency === 'USD') return '$' + amount.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-            if (currency === 'USDT') return '₮' + amount.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-            if (currency === 'EUR') return '€' + amount.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-            if (currency === 'GBP') return '£' + amount.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-            if (currency === 'ZAR') return 'R' + amount.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-            return amount.toString();
+            if (currency === 'BTC' || currency === 'LTC') return amount.toFixed(8) + ' ' + currency;
+            let symbol = currency === 'USD' ? '$' : currency === 'USDT' ? '₮' : currency === 'EUR' ? '€' : currency === 'GBP' ? '£' : 'R';
+            return symbol + amount.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
         }
         
         function updateWalletDisplay() {
             const selector = document.getElementById('currency-selector');
             if (selector) currentCurrency = selector.value;
-            
             const walletBalanceRaw = parseFloat(document.getElementById('w-bal')?.innerText || 0);
             const tradingBalanceRaw = parseFloat(document.getElementById('t-bal')?.innerText || 0);
             const netProfitRaw = parseFloat(document.getElementById('n-prof')?.innerText || 0);
             const recoveryPotRaw = parseFloat(document.getElementById('pot-display')?.innerText || 0);
             
-            const walletConverted = convertToCurrency(walletBalanceRaw, currentCurrency);
-            const tradingConverted = convertToCurrency(tradingBalanceRaw, currentCurrency);
-            const profitConverted = convertToCurrency(netProfitRaw, currentCurrency);
-            const recoveryConverted = convertToCurrency(recoveryPotRaw, currentCurrency);
-            
-            const walletDisplayElem = document.getElementById('wallet-display-main');
-            if (walletDisplayElem) walletDisplayElem.innerText = formatCurrency(walletConverted, currentCurrency);
-            
-            const tradingElem = document.getElementById('wallet-trading-bal');
-            if (tradingElem) tradingElem.innerText = formatCurrency(tradingConverted, currentCurrency);
-            
-            const profitElem = document.getElementById('wallet-net-profit');
-            if (profitElem) profitElem.innerText = formatCurrency(profitConverted, currentCurrency);
-            
-            const recoveryElem = document.getElementById('wallet-recovery-pot');
-            if (recoveryElem) recoveryElem.innerText = formatCurrency(recoveryConverted, currentCurrency);
-            
-            const conversionNote = document.getElementById('wallet-conversion-note');
-            if (conversionNote && currentCurrency !== 'BTC') {
-                const btcValue = walletBalanceRaw;
-                conversionNote.innerText = '≈ ' + btcValue.toFixed(8) + ' BTC';
-            } else if (conversionNote) {
-                const usdValue = convertToCurrency(walletBalanceRaw, 'USD');
-                conversionNote.innerText = '≈ $' + usdValue.toLocaleString(undefined, {minimumFractionDigits: 2});
-            }
+            document.getElementById('wallet-display-main').innerText = formatCurrency(convertToCurrency(walletBalanceRaw, currentCurrency), currentCurrency);
+            document.getElementById('wallet-trading-bal').innerText = formatCurrency(convertToCurrency(tradingBalanceRaw, currentCurrency), currentCurrency);
+            document.getElementById('wallet-net-profit').innerText = formatCurrency(convertToCurrency(netProfitRaw, currentCurrency), currentCurrency);
+            document.getElementById('wallet-recovery-pot').innerText = formatCurrency(convertToCurrency(recoveryPotRaw, currentCurrency), currentCurrency);
         }
         
-        function showPage(pageName) {
-            document.querySelectorAll('.page').forEach(page => {
-                page.classList.remove('active-page');
-            });
-            document.querySelectorAll('.menu-item').forEach(item => {
-                item.classList.remove('active');
-            });
-            
-            if (pageName === 'dashboard') {
-                document.getElementById('dashboard-page').classList.add('active-page');
-                document.querySelector('.menu-item:first-child').classList.add('active');
-            } else if (pageName === 'wallet') {
-                document.getElementById('wallet-page').classList.add('active-page');
-                document.querySelector('.menu-item:last-child').classList.add('active');
-                updateWalletDisplay();
-            }
+        function showPage(p) {
+            document.querySelectorAll('.page').forEach(x => x.classList.remove('active-page'));
+            document.querySelectorAll('.menu-item').forEach(x => x.classList.remove('active'));
+            document.getElementById(p + '-page').classList.add('active-page');
+            document.querySelector(p === 'dashboard' ? '.menu-item:first-child' : '.menu-item:last-child').classList.add('active');
+            if(p === 'wallet') updateWalletDisplay();
         }
         
         async function update() {
@@ -416,9 +360,7 @@ app.get('/', (req, res) => {
                     <tr><td>#\${b.id}</td><td>\${f(b.dBase)}</td><td>\${f(b.bet)}</td><td>\${b.roll}</td><td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td><td>\${b.pot} BTC</td></tr>
                 \`).join('');
                 
-                if (document.getElementById('wallet-page').classList.contains('active-page')) {
-                    updateWalletDisplay();
-                }
+                if (document.getElementById('wallet-page').classList.contains('active-page')) updateWalletDisplay();
             } catch(e) {}
         }
         setInterval(update, 1000);
