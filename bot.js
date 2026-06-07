@@ -15,7 +15,7 @@ let CONFIG = {
     minBet: 0.00000001,
     baseBetPercent: 0.10,        // Increased to 10% for better growth
     maxBetPercent: 0.25,         // Increased to 25% for better growth
-    payout: 3.2,                 // Increased for better returns
+    payout: 1.7,                 // Increased for better returns
     targetMultiplier: 50,        // Target 5000% return (50x)
     // DYNAMIC TAKE PROFIT - RELEASES AFTER LOCKING
     takeProfitPercent: 0.50,     // Take profit at 50% gain (increased from 30%)
