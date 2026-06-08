@@ -62,7 +62,7 @@ function calculateScaledBase(balance) {
 function resetSession() {
     // UPDATED MESSAGE
     botState.statusMessage = "SYSTEM: SAFE FLOOR HIT: Locking Profits...";
-    botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.98; // Protect 98% of remaining on crash
+    botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.50; // Protect 98% of remaining on crash
     botState.recoveryPot = 0;
     botState.stats = {
         totalBets: 0, wins: 0, losses: 0, netProfit: botState.stats.netProfit, maxSessionProfit: 0,
