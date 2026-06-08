@@ -78,7 +78,7 @@ async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
     
     // Cap the bet at 10% of current balance
-    const maxAllowedBet = botState.stats.currentBalance * 0.10;
+    const maxAllowedBet = botState.stats.currentBalance * 0.05;
     let finalBet = botState.settings.currentBet;
     if (finalBet > maxAllowedBet) {
         finalBet = maxAllowedBet;
