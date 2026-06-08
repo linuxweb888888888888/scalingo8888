@@ -6,7 +6,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "4sIh59nG1LYDc8ErZFwD8rcRmVX9mawxcbaQp4MdmESwEBBAun";
+const API_KEY = process.env.API_KEY || "ynXUumHAd8oYBrna4wfnHaMnlaUZzdUWY7zZSbN66tlgxAfaby";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
@@ -25,7 +25,7 @@ let botState = {
     coin: DEFAULTS.coin,
     profitProtection: { 
         safeBalance: 0,
-        lockPercent: 0.80 // Locking 80% of profit
+        lockPercent: 0.80
     }, 
     stats: {
         totalBets: 0,
@@ -77,7 +77,6 @@ function resetSession() {
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
     
-    // Cap the bet at 10% of current balance
     const maxAllowedBet = botState.stats.currentBalance * 0.05;
     let finalBet = botState.settings.currentBet;
     if (finalBet > maxAllowedBet) {
@@ -109,7 +108,6 @@ async function runStrategy() {
     botState.statusMessage = "Linear Recovery Mode (80% Profit Lock)";
     
     while (true) {
-        // Floor Auto-Reboot
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
             resetSession();
             await new Promise(r => setTimeout(r, 5000));
@@ -273,20 +271,26 @@ app.get('/', (req, res) => {
                 document.getElementById('p-year-b').innerHTML = f(hourlyProjection * 24 * 365);
                 document.getElementById('p-year-u').innerHTML = u(hourlyProjection * 24 * 365);
 
-                // Table population with 6 columns matching headers
-                if (botState.betHistory && botState.betHistory.length > 0) {
-                    document.getElementById('h-body').innerHTML = botState.betHistory.map(b => `
-                        <tr>
-                            <td>#${b.id}</td>
-                            <td>${f(b.dBase)}</td>
-                            <td>${f(b.bet)}</td>
-                            <td>${b.roll}</td>
-                            <td class="${b.isWin ? 'win' : 'loss'}">${b.profit > 0 ? '+' : ''}${f(b.profit)}</td>
-                            <td>${b.pot} BTC</td>
-                        </tr>
-                    `).join('');
-                } else {
+                // Fixed table population - using string concatenation instead of template literals
+                var tableHtml = '';
+                for (var i = 0; i < botState.betHistory.length; i++) {
+                    var b = botState.betHistory[i];
+                    var profitClass = b.isWin ? 'win' : 'loss';
+                    var profitSign = b.profit > 0 ? '+' : '';
+                    tableHtml += '<tr>' +
+                        '<td>#' + b.id + '</td>' +
+                        '<td>' + f(b.dBase) + '</td>' +
+                        '<td>' + f(b.bet) + '</td>' +
+                        '<td>' + b.roll + '</td>' +
+                        '<td class="' + profitClass + '">' + profitSign + f(b.profit) + '</td>' +
+                        '<td>' + b.pot + ' BTC</td>' +
+                        '</tr>';
+                }
+                
+                if (botState.betHistory.length === 0) {
                     document.getElementById('h-body').innerHTML = '<tr><td colspan="6" style="text-align: center;">No bets placed yet</td></tr>';
+                } else {
+                    document.getElementById('h-body').innerHTML = tableHtml;
                 }
             } catch(e) {
                 console.error("Update error:", e);
