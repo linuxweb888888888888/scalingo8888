@@ -242,12 +242,12 @@ app.get('/', (req, res) => {
         <div class="formula-hint">
             📐 Formula: Next Bet = Base + (StreakCount × Increment) for BOTH wins AND losses
         </div>
-         <table>
+        </table>
             <thead>
                 <tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot</th><th>Streak</th> </tr>
             </thead>
             <tbody id="h-body"></tbody>
-         </table>
+        </table>
     </div>
     <script>
         async function update() {
@@ -284,8 +284,9 @@ app.get('/', (req, res) => {
 
                 document.getElementById('h-body').innerHTML = botState.betHistory.map(b => {
                     let streakHtml = '';
-                    if (b.consecWins > 0) streakHtml = '<span class="streak-badge win-streak">🟢 ' + b.consecWins + 'W ↑</span>';
-                    if (b.consecLosses > 0) streakHtml = '<span class="streak-badge loss-streak">🔴 ' + b.consecLosses + 'L ↑</span>';
+                    // Show streak for ALL wins (including single wins)
+                    if (b.consecWins >= 1) streakHtml = '<span class="streak-badge win-streak">🟢 ' + b.consecWins + 'W ↑</span>';
+                    if (b.consecLosses >= 1) streakHtml = '<span class="streak-badge loss-streak">🔴 ' + b.consecLosses + 'L ↑</span>';
                     return \`
                         <tr>
                             <td style="font-family: monospace;">#\${b.id}</td>
