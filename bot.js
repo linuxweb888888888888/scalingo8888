@@ -6,7 +6,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "ynXUumHAd8oYBrna4wfnHaMnlaUZzdUWY7zZSbN66tlgxAfaby";
+const API_KEY = process.env.API_KEY || "cD9uvR6HaqA8xlMKRqfjQJZFXT0tR5Br5G5VGaQwAbqvVtYKOz";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
@@ -25,7 +25,7 @@ let botState = {
     coin: DEFAULTS.coin,
     profitProtection: { 
         safeBalance: 0,
-        lockPercent: 0.80
+        lockPercent: 0.80 // Locking 80% of profit
     }, 
     stats: {
         totalBets: 0,
@@ -60,8 +60,9 @@ function calculateScaledBase(balance) {
 }
 
 function resetSession() {
+    // UPDATED MESSAGE
     botState.statusMessage = "SYSTEM: SAFE FLOOR HIT: Locking Profits...";
-    botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.50;
+    botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.80; // Protect 98% of remaining on crash
     botState.recoveryPot = 0;
     botState.stats = {
         totalBets: 0, wins: 0, losses: 0, netProfit: botState.stats.netProfit, maxSessionProfit: 0,
@@ -77,18 +78,12 @@ function resetSession() {
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
     
-    const maxAllowedBet = botState.stats.currentBalance * 0.05;
-    let finalBet = botState.settings.currentBet;
-    if (finalBet > maxAllowedBet) {
-        finalBet = maxAllowedBet;
-    }
-    
     const rawSuffix = Math.random().toString(36).substring(2); 
     const alphanumericSuffix = rawSuffix.replace(/[^a-z0-9]/gi, '').substring(0, 12);
     const safeSeed = "pro" + alphanumericSuffix; 
 
     const payload = { 
-        Bet: Number(finalBet.toFixed(8)), 
+        Bet: Number(botState.settings.currentBet.toFixed(8)), 
         Payout: botState.settings.payout, 
         UnderOver: true, 
         ClientSeed: safeSeed 
@@ -108,8 +103,10 @@ async function runStrategy() {
     botState.statusMessage = "Linear Recovery Mode (80% Profit Lock)";
     
     while (true) {
+        // Floor Auto-Reboot
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
             resetSession();
+            // UPDATED: Now waits for 5 seconds (5000ms)
             await new Promise(r => setTimeout(r, 5000));
             continue; 
         }
@@ -218,21 +215,10 @@ app.get('/', (req, res) => {
             <div class="proj-card"><div class="label">Monthly</div><span id="p-month-b" class="win">0.00</span><br><span id="p-month-u" class="usd-val">0.00</span></div>
             <div class="proj-card"><div class="label">Yearly</div><span id="p-year-b" class="win">0.00</span><br><span id="p-year-u" class="usd-val">0.00</span></div>
         </div>
-        <div style="overflow-x: auto;">
-            <table>
-                <thead>
-                    <tr>
-                        <th>ID</th>
-                        <th>Base</th>
-                        <th>Wager</th>
-                        <th>Roll</th>
-                        <th>Net (BTC)</th>
-                        <th>Pot Remaining</th>
-                    </tr>
-                </thead>
-                <tbody id="h-body"></tbody>
-            </table>
-        </div>
+        <table>
+            <thead><tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Remaining</th></tr></thead>
+            <tbody id="h-body"></tbody>
+        </table>
     </div>
     <script>
         async function update() {
@@ -240,72 +226,46 @@ app.get('/', (req, res) => {
                 const res = await fetch('/api/stats');
                 const { botState, btcPrice, hoursPassed } = await res.json();
                 const f = (n) => parseFloat(n || 0).toFixed(8);
-                const u = (n) => "$" + (parseFloat(n || 0) * btcPrice).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                const u = (n) => "$" + (parseFloat(n || 0) * btcPrice).toLocaleString(undefined, {minimumFractionDigits: 3});
                 
-                document.getElementById('status-msg').innerHTML = "Status: " + botState.statusMessage;
-                document.getElementById('price-tag').innerHTML = "$" + btcPrice.toLocaleString();
-                document.getElementById('t-bal').innerHTML = f(botState.stats.currentBalance - botState.profitProtection.safeBalance);
-                document.getElementById('t-usd').innerHTML = u(botState.stats.currentBalance - botState.profitProtection.safeBalance);
-                document.getElementById('w-bal').innerHTML = f(botState.stats.currentBalance);
-                document.getElementById('w-usd').innerHTML = u(botState.stats.currentBalance);
-                document.getElementById('n-prof').innerHTML = f(botState.stats.netProfit);
-                document.getElementById('n-usd').innerHTML = u(botState.stats.netProfit);
-                document.getElementById('pot-display').innerHTML = f(botState.recoveryPot);
-                
-                const winRate = botState.stats.totalBets > 0 ? (botState.stats.wins / botState.stats.totalBets * 100) : 0;
-                document.getElementById('wr').innerHTML = winRate.toFixed(1) + "%";
-                document.getElementById('s-base').innerHTML = f(botState.settings.baseBet);
-                document.getElementById('n-bet').innerHTML = f(botState.settings.currentBet);
-                document.getElementById('uptime').innerHTML = hoursPassed + "h";
+                document.getElementById('status-msg').innerText = "Status: " + botState.statusMessage;
+                document.getElementById('price-tag').innerText = "$" + btcPrice.toLocaleString();
+                document.getElementById('t-bal').innerText = f(botState.stats.currentBalance - botState.profitProtection.safeBalance);
+                document.getElementById('t-usd').innerText = u(botState.stats.currentBalance - botState.profitProtection.safeBalance);
+                document.getElementById('w-bal').innerText = f(botState.stats.currentBalance);
+                document.getElementById('w-usd').innerText = u(botState.stats.currentBalance);
+                document.getElementById('n-prof').innerText = f(botState.stats.netProfit);
+                document.getElementById('n-usd').innerText = u(botState.stats.netProfit);
+                document.getElementById('pot-display').innerText = f(botState.recoveryPot);
+                document.getElementById('wr').innerText = ((botState.stats.wins/botState.stats.totalBets)*100 || 0).toFixed(1) + "%";
+                document.getElementById('s-base').innerText = f(botState.settings.baseBet);
+                document.getElementById('n-bet').innerText = f(botState.settings.currentBet);
+                document.getElementById('uptime').innerText = hoursPassed + "h";
 
+                // Calculate projections based on Wallet Balance (not Net Profit)
                 const walletBalance = parseFloat(botState.stats.currentBalance || 0);
                 const hours = parseFloat(hoursPassed);
-                const hourlyProjection = hours > 0 ? walletBalance / hours : 0;
+                const hourlyProjection = walletBalance / hours;
                 
-                document.getElementById('p-hr-b').innerHTML = f(hourlyProjection);
-                document.getElementById('p-hr-u').innerHTML = u(hourlyProjection);
-                document.getElementById('p-dy-b').innerHTML = f(hourlyProjection * 24);
-                document.getElementById('p-dy-u').innerHTML = u(hourlyProjection * 24);
-                document.getElementById('p-month-b').innerHTML = f(hourlyProjection * 24 * 30);
-                document.getElementById('p-month-u').innerHTML = u(hourlyProjection * 24 * 30);
-                document.getElementById('p-year-b').innerHTML = f(hourlyProjection * 24 * 365);
-                document.getElementById('p-year-u').innerHTML = u(hourlyProjection * 24 * 365);
+                document.getElementById('p-hr-b').innerText = f(hourlyProjection);
+                document.getElementById('p-hr-u').innerText = u(hourlyProjection);
+                document.getElementById('p-dy-b').innerText = f(hourlyProjection * 24);
+                document.getElementById('p-dy-u').innerText = u(hourlyProjection * 24);
+                document.getElementById('p-month-b').innerText = f(hourlyProjection * 24 * 30);
+                document.getElementById('p-month-u').innerText = u(hourlyProjection * 24 * 30);
+                document.getElementById('p-year-b').innerText = f(hourlyProjection * 24 * 365);
+                document.getElementById('p-year-u').innerText = u(hourlyProjection * 24 * 365);
 
-                // Fixed table population - using string concatenation instead of template literals
-                var tableHtml = '';
-                for (var i = 0; i < botState.betHistory.length; i++) {
-                    var b = botState.betHistory[i];
-                    var profitClass = b.isWin ? 'win' : 'loss';
-                    var profitSign = b.profit > 0 ? '+' : '';
-                    tableHtml += '<tr>' +
-                        '<td>#' + b.id + '</td>' +
-                        '<td>' + f(b.dBase) + '</td>' +
-                        '<td>' + f(b.bet) + '</td>' +
-                        '<td>' + b.roll + '</td>' +
-                        '<td class="' + profitClass + '">' + profitSign + f(b.profit) + '</td>' +
-                        '<td>' + b.pot + ' BTC</td>' +
-                        '</tr>';
-                }
-                
-                if (botState.betHistory.length === 0) {
-                    document.getElementById('h-body').innerHTML = '<tr><td colspan="6" style="text-align: center;">No bets placed yet</td></tr>';
-                } else {
-                    document.getElementById('h-body').innerHTML = tableHtml;
-                }
-            } catch(e) {
-                console.error("Update error:", e);
-            }
+                document.getElementById('h-body').innerHTML = botState.betHistory.map(b => \`
+                    <tr><td>#\${b.id}</td><td>\${f(b.dBase)}</td><td>\${f(b.bet)}</td><td>\${b.roll}</td><td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td><td>\${b.pot} BTC</td></tr>
+                \`).join('');
+            } catch(e) {}
         }
-        
         setInterval(update, 1000);
-        update();
     </script>
 </body>
 </html>
     `);
 });
 
-app.listen(port, '0.0.0.0', () => {
-    console.log(`Server running on port ${port}`);
-    runStrategy();
-});
+app.listen(port, '0.0.0.0', () => runStrategy());
