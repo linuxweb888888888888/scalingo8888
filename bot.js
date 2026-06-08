@@ -116,8 +116,16 @@ async function runStrategy() {
 
         botState.stats.totalBets++;
         const profit = result.Profit || 0;
+        const betAmount = result.Bet || botState.settings.currentBet;
+        
         botState.stats.netProfit += profit;
         botState.stats.currentBalance = result.Balance || 0;
+
+        // Calculate expected profit for debugging
+        const expectedWinProfit = betAmount * (botState.settings.payout - 1);
+        const expectedLoss = -betAmount;
+        
+        console.log(`[#${botState.stats.totalBets}] Bet: ${betAmount.toFixed(8)} | Actual Profit: ${profit.toFixed(8)} | Expected Win: +${expectedWinProfit.toFixed(8)} | Expected Loss: ${expectedLoss.toFixed(8)} | Payout: ${botState.settings.payout}`);
 
         if (botState.stats.netProfit > botState.stats.maxSessionProfit) {
             botState.stats.maxSessionProfit = botState.stats.netProfit;
@@ -151,14 +159,14 @@ async function runStrategy() {
             botState.recoveryPot += Math.abs(profit);
         }
 
-        // Calculate next bet based on updated streaks (BOTH win and loss streaks increase bet)
+        // Calculate next bet based on updated streaks
         botState.settings.currentBet = calculateNextBet();
 
         // Store history
         botState.betHistory.unshift({ 
             id: botState.stats.totalBets, 
             time: new Date().toLocaleTimeString(), 
-            bet: result.Bet, 
+            bet: betAmount,
             roll: result.Roll, 
             profit: profit, 
             isWin: profit > 0, 
@@ -166,7 +174,8 @@ async function runStrategy() {
             dBase: botState.settings.baseBet,
             currentBet: botState.settings.currentBet,
             consecWins: botState.consecutiveWins,
-            consecLosses: botState.consecutiveLosses
+            consecLosses: botState.consecutiveLosses,
+            expectedProfit: profit > 0 ? (betAmount * (botState.settings.payout - 1)).toFixed(8) : (-betAmount).toFixed(8)
         });
         if (botState.betHistory.length > 30) botState.betHistory.pop();
 
@@ -211,6 +220,7 @@ app.get('/', (req, res) => {
         .win { color: var(--success); } .loss { color: var(--danger); }
         .status-bar { padding: 12px; background: #1e293b; color: white; border-radius: 8px; margin-bottom: 20px; font-weight: bold; font-size: 0.9rem; }
         .formula-hint { font-size: 0.7rem; color: var(--text-muted); margin-top: 10px; text-align: center; }
+        .expected { font-size: 0.65rem; color: #64748b; margin-left: 5px; }
     </style>
 </head>
 <body>
@@ -240,9 +250,9 @@ app.get('/', (req, res) => {
         </div>
         <div class="label">Bet History (⬆️ Bet increases on BOTH win streaks AND loss streaks)</div>
         <div class="formula-hint">
-            📐 Formula: Next Bet = Base + (StreakCount × Increment) for BOTH wins AND losses
+            📐 Formula: Next Bet = Base + (StreakCount × Increment) for BOTH wins AND losses | Payout: 1.7x (Win = Bet × 0.7)
         </div>
-        </table>
+        <table>
             <thead>
                 <tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot</th><th>Streak</th> </tr>
             </thead>
@@ -284,7 +294,6 @@ app.get('/', (req, res) => {
 
                 document.getElementById('h-body').innerHTML = botState.betHistory.map(b => {
                     let streakHtml = '';
-                    // Show streak for ALL wins (including single wins)
                     if (b.consecWins >= 1) streakHtml = '<span class="streak-badge win-streak">🟢 ' + b.consecWins + 'W ↑</span>';
                     if (b.consecLosses >= 1) streakHtml = '<span class="streak-badge loss-streak">🔴 ' + b.consecLosses + 'L ↑</span>';
                     return \`
@@ -293,7 +302,10 @@ app.get('/', (req, res) => {
                             <td style="font-family: monospace;">\${f(b.dBase)}</td>
                             <td style="font-family: monospace; font-weight: bold; color: #f59e0b;">\${f(b.currentBet || b.bet)}</td>
                             <td style="font-family: monospace;">\${b.roll}</td>
-                            <td class="\${b.isWin?'win':'loss'}" style="font-family: monospace;">\${f(b.profit)}</td>
+                            <td class="\${b.isWin?'win':'loss'}" style="font-family: monospace;">
+                                \${f(b.profit)}
+                                <span class="expected">(exp: \${b.expectedProfit})</span>
+                            </td>
                             <td style="font-family: monospace;">\${b.pot}</td>
                             <td>\${streakHtml}</td>
                         </tr>
