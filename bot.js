@@ -133,7 +133,8 @@ let botState = {
         consecutiveLosses: 0,
         volatility: 1.0,
         currentConfidence: 0.5,
-        adaptiveMultiplier: 1.0
+        adaptiveMultiplier: 1.0,
+        waitingSince: null  // Track how long we've been waiting
     },
     betHistory: []
 };
@@ -412,6 +413,7 @@ async function resetSession(reason) {
     console.log(`   Profit Locked: ${botState.stats.totalLockedProfit.toFixed(8)} BTC`);
     
     botState.settings.adaptiveMultiplier = 1.0;
+    botState.settings.waitingSince = null;  // Reset waiting timer
     
     const hoursSinceDailyReset = (Date.now() - dailyResetTime) / 3600000;
     if (hoursSinceDailyReset >= 24) {
@@ -456,10 +458,31 @@ async function placeBet() {
         return null;
     }
     
+    // IMPROVED: Confidence check with timeout
     if (CONFIG.minConfidenceToBet && performanceMetrics.confidence < CONFIG.minConfidenceToBet && botState.stats.totalBets > 20) {
         botState.statusMessage = `📊 Low confidence (${(performanceMetrics.confidence*100).toFixed(0)}%) - Waiting...`;
-        await new Promise(r => setTimeout(r, 2000));
-        return null;
+        
+        // Track waiting time
+        if (!botState.settings.waitingSince) {
+            botState.settings.waitingSince = Date.now();
+        }
+        
+        const waitingTime = (Date.now() - botState.settings.waitingSince) / 1000;
+        
+        // After 2 minutes (120 seconds), force resume regardless of confidence
+        if (waitingTime > 120) {
+            botState.statusMessage = `⏰ Waited ${waitingTime.toFixed(0)}s - Forcing resume`;
+            performanceMetrics.confidence = 0.52;
+            botState.settings.waitingSince = null;
+            console.log(`\n⏰ Waited ${waitingTime.toFixed(0)} seconds - Forcing resume\n`);
+            // Continue to bet
+        } else {
+            await new Promise(r => setTimeout(r, 2000));
+            return null;
+        }
+    } else {
+        // Reset waiting timer when confidence is good
+        botState.settings.waitingSince = null;
     }
     
     if (Date.now() < botState.settings.coolDownUntil) {
@@ -599,6 +622,61 @@ async function runProfitEngine() {
     }
 }
 
+// ============ CONTROL ENDPOINTS ============
+
+// Force resume betting (bypass confidence check)
+app.get('/api/force-resume', (req, res) => {
+    performanceMetrics.confidence = 0.55;
+    performanceMetrics.last50WinRate = 0.52;
+    botState.settings.currentConfidence = 0.55;
+    botState.settings.waitingSince = null;
+    botState.statusMessage = "🟢 FORCE RESUMED - Confidence set to 55%";
+    console.log(`\n🟢 Force resume command received - Confidence set to 55%\n`);
+    res.json({ 
+        status: "resumed", 
+        confidence: 55,
+        message: "Bot will now start betting again"
+    });
+});
+
+// Lower confidence threshold temporarily
+app.get('/api/lower-threshold', (req, res) => {
+    CONFIG.minConfidenceToBet = 0.40;
+    botState.settings.waitingSince = null;
+    botState.statusMessage = `⚡ Threshold lowered to 40% - Resuming bets`;
+    console.log(`\n⚡ Confidence threshold lowered to 40%\n`);
+    res.json({ 
+        status: "threshold_lowered", 
+        minConfidence: 40,
+        message: "Bot will now bet with 40% minimum confidence"
+    });
+});
+
+// Reset threshold to default
+app.get('/api/reset-threshold', (req, res) => {
+    CONFIG.minConfidenceToBet = 0.48;
+    botState.statusMessage = `✅ Threshold reset to 48%`;
+    console.log(`\n✅ Confidence threshold reset to 48%\n`);
+    res.json({ 
+        status: "threshold_reset", 
+        minConfidence: 48,
+        message: "Confidence threshold reset to 48%"
+    });
+});
+
+// Get current status
+app.get('/api/status', (req, res) => {
+    res.json({
+        running: botState.running,
+        confidence: performanceMetrics.confidence * 100,
+        minConfidenceRequired: CONFIG.minConfidenceToBet * 100,
+        waiting: botState.settings.waitingSince ? true : false,
+        waitingTime: botState.settings.waitingSince ? ((Date.now() - botState.settings.waitingSince) / 1000).toFixed(0) : 0,
+        marketCondition: performanceMetrics.marketCondition,
+        winRate: performanceMetrics.last50WinRate * 100
+    });
+});
+
 // ============ WEB DASHBOARD ============
 app.get('/', (req, res) => {
     res.send(`
@@ -646,9 +724,31 @@ app.get('/', (req, res) => {
         .win { color: #10b981; font-weight: 600; }
         .loss { color: #ef4444; font-weight: 600; }
         tr:hover { background: #f8f9fa; }
+        .control-buttons {
+            display: flex;
+            gap: 12px;
+            margin-top: 20px;
+            justify-content: center;
+        }
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            font-family: inherit;
+            transition: all 0.2s;
+        }
+        .btn-primary { background: #10b981; color: white; }
+        .btn-primary:hover { background: #059669; transform: translateY(-2px); }
+        .btn-warning { background: #f59e0b; color: white; }
+        .btn-warning:hover { background: #d97706; transform: translateY(-2px); }
+        .btn-danger { background: #ef4444; color: white; }
+        .btn-danger:hover { background: #dc2626; transform: translateY(-2px); }
         @media (max-width: 768px) {
             .stats-grid { grid-template-columns: 1fr; }
             .mini-stats { grid-template-columns: repeat(3, 1fr); }
+            .control-buttons { flex-direction: column; }
         }
     </style>
 </head>
@@ -693,9 +793,36 @@ app.get('/', (req, res) => {
             <tbody id="historyBody"><tr><td colspan="9" style="text-align:center; padding:40px;">Loading...<\/td></tr></tbody>
         </table>
     </div>
+    
+    <div class="control-buttons">
+        <button class="btn btn-primary" onclick="forceResume()">🟢 Force Resume</button>
+        <button class="btn btn-warning" onclick="lowerThreshold()">⚡ Lower Threshold (40%)</button>
+        <button class="btn btn-danger" onclick="resetThreshold()">🔄 Reset Threshold (48%)</button>
+    </div>
 </div>
 
 <script>
+    async function forceResume() {
+        const res = await fetch('/api/force-resume');
+        const data = await res.json();
+        alert(data.message);
+        location.reload();
+    }
+    
+    async function lowerThreshold() {
+        const res = await fetch('/api/lower-threshold');
+        const data = await res.json();
+        alert(data.message);
+        location.reload();
+    }
+    
+    async function resetThreshold() {
+        const res = await fetch('/api/reset-threshold');
+        const data = await res.json();
+        alert(data.message);
+        location.reload();
+    }
+    
     async function update() {
         try {
             const res = await fetch('/api/stats');
