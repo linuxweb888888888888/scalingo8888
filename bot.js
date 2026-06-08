@@ -60,9 +60,8 @@ function calculateScaledBase(balance) {
 }
 
 function resetSession() {
-    // UPDATED MESSAGE
     botState.statusMessage = "SYSTEM: SAFE FLOOR HIT: Locking Profits...";
-    botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.50; // Protect 98% of remaining on crash
+    botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.50;
     botState.recoveryPot = 0;
     botState.stats = {
         totalBets: 0, wins: 0, losses: 0, netProfit: botState.stats.netProfit, maxSessionProfit: 0,
@@ -78,11 +77,17 @@ function resetSession() {
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
     
-    // ONLY ADDED: Cap the bet at 10% of current balance
+    // Cap the bet at 10% of current balance
     const maxAllowedBet = botState.stats.currentBalance * 0.10;
     let finalBet = botState.settings.currentBet;
     if (finalBet > maxAllowedBet) {
         finalBet = maxAllowedBet;
+    }
+    
+    // Ensure minimum bet (most crypto dice games minimum is 0.00000001 BTC)
+    const minBet = 0.00000001;
+    if (finalBet < minBet) {
+        finalBet = minBet;
     }
     
     const rawSuffix = Math.random().toString(36).substring(2); 
@@ -101,6 +106,7 @@ async function placeBet() {
         return response.data;
     } catch (error) { 
         botState.statusMessage = error.response?.data?.Message || "API Error";
+        console.error("API Error Details:", error.response?.data);
         return null; 
     }
 }
@@ -221,7 +227,7 @@ app.get('/', (req, res) => {
             <div class="proj-card"><div class="label">Monthly</div><span id="p-month-b" class="win">0.00</span><br><span id="p-month-u" class="usd-val">0.00</span></div>
             <div class="proj-card"><div class="label">Yearly</div><span id="p-year-b" class="win">0.00</span><br><span id="p-year-u" class="usd-val">0.00</span></div>
         </div>
-        <table>
+        </table>
             <thead>
                 <tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Remaining</th></tr>
             </thead>
@@ -250,7 +256,6 @@ app.get('/', (req, res) => {
                 document.getElementById('n-bet').innerText = f(botState.settings.currentBet);
                 document.getElementById('uptime').innerText = hoursPassed + "h";
 
-                // Calculate projections based on Wallet Balance (not Net Profit)
                 const walletBalance = parseFloat(botState.stats.currentBalance || 0);
                 const hours = parseFloat(hoursPassed);
                 const hourlyProjection = walletBalance / hours;
