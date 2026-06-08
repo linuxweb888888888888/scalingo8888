@@ -15,7 +15,7 @@ let CONFIG = {
     minBet: 0.00000001,
     baseBetPercent: 0.04,        // FAST: 4% base for immediate growth
     maxBetPercent: 0.12,          // ADVANCED: 12% absolute cap (prevents "big chance" wipeouts)
-    payout: 2.10,                 // FAST: Optimized 2.1x for faster doubling
+    payout: 1.7,                 // FAST: Optimized 2.1x for faster doubling
     targetMultiplier: 1000,       
     takeProfitPercent: 0.25,      // FAST: Take 25% profit chunks
     takeProfitReleaseTime: 3000,  // FAST: Only 3s pause before resuming
