@@ -41,7 +41,9 @@ let botState = {
         currentBet: 0.00000001,
         payout: DEFAULTS.payout
     },
-    betHistory: []
+    betHistory: [],
+    consecutiveWins: 0,
+    consecutiveLosses: 0
 };
 
 // ============ UTILITIES ============
@@ -85,7 +87,7 @@ async function placeBet() {
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = "Linear Recovery Mode - Reset to Base Bet on ANY Win";
+    botState.statusMessage = "Symmetric Recovery Mode - Increment on Loss, Decrement on Win";
     
     while (true) {
         const result = await placeBet();
@@ -107,27 +109,57 @@ async function runStrategy() {
 
         if (profit > 0) {
             botState.stats.wins++;
+            botState.consecutiveWins++;
+            botState.consecutiveLosses = 0;
+            
             botState.recoveryPot -= profit;
             if (botState.recoveryPot < 0) botState.recoveryPot = 0;
 
-            // ALWAYS reset to base bet on ANY win (after losing streak OR winning streak)
-            botState.settings.currentBet = botState.settings.baseBet;
+            // DECREASE bet on wins (same increment as losses)
+            if (botState.consecutiveWins === 1) {
+                // First win after a loss or start - reset to base bet
+                botState.settings.currentBet = botState.settings.baseBet;
+            } else {
+                // Decrease bet on consecutive wins (but not below base bet)
+                let decreasedBet = botState.settings.currentBet - DEFAULTS.betIncrement;
+                botState.settings.currentBet = Math.max(botState.settings.baseBet, decreasedBet);
+            }
             
             if (botState.recoveryPot === 0) {
-                botState.profitProtection.safeBalance += (profit * 0.80); 
+                botState.profitProtection.safeBalance += (profit * 0.80);
+                // Ensure we're at base bet when recovery is complete
+                botState.settings.currentBet = botState.settings.baseBet;
+                botState.consecutiveWins = 0;
             }
         } else {
             botState.stats.losses++;
+            botState.consecutiveLosses++;
+            botState.consecutiveWins = 0;
+            
             botState.recoveryPot += Math.abs(profit);
-            // Only increase bet on losses
-            botState.settings.currentBet += DEFAULTS.betIncrement;
+            
+            // INCREASE bet on losses
+            if (botState.consecutiveLosses === 1) {
+                // First loss after a win - reset to base bet first, then increment
+                botState.settings.currentBet = botState.settings.baseBet + DEFAULTS.betIncrement;
+            } else {
+                // Increase bet on consecutive losses
+                botState.settings.currentBet += DEFAULTS.betIncrement;
+            }
         }
 
         botState.betHistory.unshift({ 
-            id: botState.stats.totalBets, time: new Date().toLocaleTimeString(), 
-            bet: result.Bet, roll: result.Roll, profit: profit, isWin: profit > 0, 
-            pot: botState.recoveryPot.toFixed(8), dBase: botState.settings.baseBet,
-            currentBet: botState.settings.currentBet
+            id: botState.stats.totalBets, 
+            time: new Date().toLocaleTimeString(), 
+            bet: result.Bet, 
+            roll: result.Roll, 
+            profit: profit, 
+            isWin: profit > 0, 
+            pot: botState.recoveryPot.toFixed(8), 
+            dBase: botState.settings.baseBet,
+            currentBet: botState.settings.currentBet,
+            consecWins: botState.consecutiveWins,
+            consecLosses: botState.consecutiveLosses
         });
         if (botState.betHistory.length > 30) botState.betHistory.pop();
 
@@ -148,7 +180,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.3 | Reset on Win</title>
+    <title>Dice Pro v3.3 | Symmetric Betting</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -163,6 +195,9 @@ app.get('/', (req, res) => {
         .mini-card { background: var(--card-bg); padding: 1rem; border-radius: 8px; border: 1px solid var(--border); text-align: center; }
         .proj-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2rem; }
         .proj-card { background: #f1f5f9; padding: 1rem; border-radius: 8px; text-align: center; }
+        .streak-badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 0.7rem; font-weight: bold; }
+        .win-streak { background: #10b98120; color: #10b981; }
+        .loss-streak { background: #ef444420; color: #ef4444; }
         table { width: 100%; border-collapse: collapse; background: var(--card-bg); border-radius: 12px; overflow: hidden; border: 1px solid var(--border); }
         th { background: #f8fafc; padding: 1rem; text-align: left; font-size: 0.75rem; color: var(--text-muted); }
         td { padding: 1rem; font-size: 0.875rem; border-bottom: 1px solid var(--border); font-family: monospace; }
@@ -180,7 +215,7 @@ app.get('/', (req, res) => {
         <div class="grid">
             <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">⚖️ Recovery Pot (Remaining)</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div class="usd-val">Mode: Reset to Base on Win</div></div>
+            <div class="card"><div class="label">⚖️ Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div class="usd-val">Inc on Loss / Dec on Win</div></div>
         </div>
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
@@ -195,10 +230,13 @@ app.get('/', (req, res) => {
             <div class="proj-card"><div class="label">Monthly</div><span id="p-month-b" class="win">0.00</span><br><span id="p-month-u" class="usd-val">0.00</span></div>
             <div class="proj-card"><div class="label">Yearly</div><span id="p-year-b" class="win">0.00</span><br><span id="p-year-u" class="usd-val">0.00</span></div>
         </div>
-         <table>
-            <thead> <tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Remaining</th> </tr></thead>
+        <div class="label">Bet History (🟢 Win streak increases bet size, 🔴 Loss streak increases bet size)</div>
+        <table>
+            <thead>
+                <tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot</th><th>Streak</th></tr>
+            </thead>
             <tbody id="h-body"></tbody>
-         </table>
+        </table>
     </div>
     <script>
         async function update() {
@@ -233,16 +271,22 @@ app.get('/', (req, res) => {
                 document.getElementById('p-year-b').innerText = f(hourlyProjection * 24 * 365);
                 document.getElementById('p-year-u').innerText = u(hourlyProjection * 24 * 365);
 
-                document.getElementById('h-body').innerHTML = botState.betHistory.map(b => \`
-                    <tr>
-                        <td style="font-family: monospace;">#\${b.id}</td>
-                        <td style="font-family: monospace;">\${f(b.dBase)}</td>
-                        <td style="font-family: monospace;">\${f(b.currentBet || b.bet)}</td>
-                        <td style="font-family: monospace;">\${b.roll}</td>
-                        <td class="\${b.isWin?'win':'loss'}" style="font-family: monospace;">\${f(b.profit)}</td>
-                        <td style="font-family: monospace;">\${b.pot} BTC</td>
-                    </tr>
-                \`).join('');
+                document.getElementById('h-body').innerHTML = botState.betHistory.map(b => {
+                    let streakHtml = '';
+                    if (b.consecWins > 1) streakHtml = '<span class="streak-badge win-streak">🟢 ' + b.consecWins + 'W</span>';
+                    if (b.consecLosses > 1) streakHtml = '<span class="streak-badge loss-streak">🔴 ' + b.consecLosses + 'L</span>';
+                    return \`
+                        <tr>
+                            <td style="font-family: monospace;">#\${b.id}</td>
+                            <td style="font-family: monospace;">\${f(b.dBase)}</td>
+                            <td style="font-family: monospace; font-weight: bold;">\${f(b.currentBet || b.bet)}</td>
+                            <td style="font-family: monospace;">\${b.roll}</td>
+                            <td class="\${b.isWin?'win':'loss'}" style="font-family: monospace;">\${f(b.profit)}</td>
+                            <td style="font-family: monospace;">\${b.pot}</td>
+                            <td>\${streakHtml}</td>
+                        </tr>
+                    \`;
+                }).join('');
             } catch(e) {
                 console.error('Update error:', e);
             }
