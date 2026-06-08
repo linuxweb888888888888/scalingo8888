@@ -20,7 +20,7 @@ let CONFIG = {
     kellyFraction: 0.25,            // 25% Kelly for safety
     
     // PROFIT OPTIMIZATION
-    payout: 2.00,                   // Even money for better probability
+    payout: 1.7,                   // Even money for better probability
     targetDailyProfit: 0.00005000,  // $3.00 target at $60k BTC
     targetWeeklyProfit: 0.00030000, // $18.00 weekly target
     stopLossDaily: 0.00001500,      // $0.90 stop loss
