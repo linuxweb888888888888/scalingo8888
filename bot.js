@@ -13,7 +13,8 @@ const DEFAULTS = {
     coin: "BTC",
     payout: 1.7,              
     balanceStep: 0.00000050,  
-    betIncrement: 0.00000001
+    betIncrement: 0.00000001,
+    minBet: 0.00000001
 };
 
 // ============ BOT STATE ============
@@ -61,6 +62,23 @@ function calculateScaledBase(balance) {
     return Number((Math.max(1, units) * DEFAULTS.betIncrement).toFixed(8));
 }
 
+function calculateNextBet() {
+    const base = botState.settings.baseBet;
+    
+    if (botState.consecutiveLosses > 0) {
+        // On loss streak: increase bet
+        let nextBet = base + (botState.consecutiveLosses * DEFAULTS.betIncrement);
+        return Number(nextBet.toFixed(8));
+    } else if (botState.consecutiveWins > 0) {
+        // On win streak: ALSO increase bet
+        let nextBet = base + (botState.consecutiveWins * DEFAULTS.betIncrement);
+        return Number(nextBet.toFixed(8));
+    } else {
+        // No streak
+        return base;
+    }
+}
+
 // ============ API LOGIC ============
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
@@ -87,7 +105,7 @@ async function placeBet() {
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = "Symmetric Mode - Increment on Loss, Increment on Win Streak";
+    botState.statusMessage = "Symmetric Mode - Increase on Losses AND Increase on Wins";
     
     while (true) {
         const result = await placeBet();
@@ -105,8 +123,10 @@ async function runStrategy() {
             botState.stats.maxSessionProfit = botState.stats.netProfit;
         }
 
+        // Update base bet based on new balance
         botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
 
+        // Process win/loss and update streaks
         if (profit > 0) {
             // WIN
             botState.stats.wins++;
@@ -115,26 +135,12 @@ async function runStrategy() {
             
             botState.recoveryPot -= profit;
             if (botState.recoveryPot < 0) botState.recoveryPot = 0;
-
-            // Increment bet size on wins (but going DOWN from base)
-            // Win streak 1: baseBet
-            // Win streak 2: baseBet - increment
-            // Win streak 3: baseBet - (2 * increment)
-            if (botState.consecutiveWins === 1) {
-                // First win after a loss - set to base bet
-                botState.settings.currentBet = botState.settings.baseBet;
-            } else {
-                // Decrease bet on consecutive wins
-                let decreasedBet = botState.settings.baseBet - ((botState.consecutiveWins - 1) * DEFAULTS.betIncrement);
-                // Don't go below minimum bet (0.00000001)
-                botState.settings.currentBet = Math.max(0.00000001, decreasedBet);
-            }
             
             if (botState.recoveryPot === 0) {
                 botState.profitProtection.safeBalance += (profit * 0.80);
-                // Reset to base bet when recovery is complete
-                botState.settings.currentBet = botState.settings.baseBet;
+                // Reset streaks on full recovery
                 botState.consecutiveWins = 0;
+                botState.consecutiveLosses = 0;
             }
         } else {
             // LOSS
@@ -143,15 +149,12 @@ async function runStrategy() {
             botState.consecutiveWins = 0;
             
             botState.recoveryPot += Math.abs(profit);
-            
-            // Increment bet size on losses (going UP from base)
-            // Loss streak 1: baseBet + increment
-            // Loss streak 2: baseBet + (2 * increment)
-            // Loss streak 3: baseBet + (3 * increment)
-            let increasedBet = botState.settings.baseBet + (botState.consecutiveLosses * DEFAULTS.betIncrement);
-            botState.settings.currentBet = increasedBet;
         }
 
+        // Calculate next bet based on updated streaks (BOTH win and loss streaks increase bet)
+        botState.settings.currentBet = calculateNextBet();
+
+        // Store history
         botState.betHistory.unshift({ 
             id: botState.stats.totalBets, 
             time: new Date().toLocaleTimeString(), 
@@ -184,7 +187,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.3 | Symmetric Increment</title>
+    <title>Dice Pro v3.3 | Increase on Both Streaks</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -220,7 +223,7 @@ app.get('/', (req, res) => {
         <div class="grid">
             <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">⚖️ Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div class="usd-val">⬆️ Losses ⬇️ Wins</div></div>
+            <div class="card"><div class="label">⚖️ Recovery Pot</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div class="usd-val">⬆️ Losses ⬆️ Wins</div></div>
         </div>
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
@@ -235,16 +238,16 @@ app.get('/', (req, res) => {
             <div class="proj-card"><div class="label">Monthly</div><span id="p-month-b" class="win">0.00</span><br><span id="p-month-u" class="usd-val">0.00</span></div>
             <div class="proj-card"><div class="label">Yearly</div><span id="p-year-b" class="win">0.00</span><br><span id="p-year-u" class="usd-val">0.00</span></div>
         </div>
-        <div class="label">Bet History (Increment on Losses UP / Increment on Wins DOWN)</div>
+        <div class="label">Bet History (⬆️ Bet increases on BOTH win streaks AND loss streaks)</div>
         <div class="formula-hint">
-            📐 Formula: Loss Bet = Base + (LossStreak × Increment) | Win Bet = Base - ((WinStreak-1) × Increment) [Minimum 0.00000001]
+            📐 Formula: Next Bet = Base + (StreakCount × Increment) for BOTH wins AND losses
         </div>
-        <table>
+         <table>
             <thead>
-                <tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot</th><th>Streak</th></tr>
+                <tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot</th><th>Streak</th> </tr>
             </thead>
             <tbody id="h-body"></tbody>
-        </table>
+         </table>
     </div>
     <script>
         async function update() {
@@ -281,15 +284,13 @@ app.get('/', (req, res) => {
 
                 document.getElementById('h-body').innerHTML = botState.betHistory.map(b => {
                     let streakHtml = '';
-                    if (b.consecWins > 1) streakHtml = '<span class="streak-badge win-streak">🟢 ' + b.consecWins + 'W</span>';
-                    if (b.consecLosses > 1) streakHtml = '<span class="streak-badge loss-streak">🔴 ' + b.consecLosses + 'L</span>';
-                    if (b.consecWins === 1) streakHtml = '<span class="streak-badge win-streak">🟢 1W</span>';
-                    if (b.consecLosses === 1) streakHtml = '<span class="streak-badge loss-streak">🔴 1L</span>';
+                    if (b.consecWins > 0) streakHtml = '<span class="streak-badge win-streak">🟢 ' + b.consecWins + 'W ↑</span>';
+                    if (b.consecLosses > 0) streakHtml = '<span class="streak-badge loss-streak">🔴 ' + b.consecLosses + 'L ↑</span>';
                     return \`
                         <tr>
                             <td style="font-family: monospace;">#\${b.id}</td>
                             <td style="font-family: monospace;">\${f(b.dBase)}</td>
-                            <td style="font-family: monospace; font-weight: bold; color: \${b.currentBet > b.dBase ? '#ef4444' : '#10b981'};">\${f(b.currentBet || b.bet)}</td>
+                            <td style="font-family: monospace; font-weight: bold; color: #f59e0b;">\${f(b.currentBet || b.bet)}</td>
                             <td style="font-family: monospace;">\${b.roll}</td>
                             <td class="\${b.isWin?'win':'loss'}" style="font-family: monospace;">\${f(b.profit)}</td>
                             <td style="font-family: monospace;">\${b.pot}</td>
