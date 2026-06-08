@@ -20,7 +20,7 @@ const DEFAULTS = {
 let btcPrice = 60964; 
 let botState = {
     running: true,
-    statusMessage: "Bot Running - Continuous Betting Mode",
+    statusMessage: "Initializing...",
     recoveryPot: 0, 
     coin: DEFAULTS.coin,
     profitProtection: { 
@@ -59,20 +59,6 @@ function calculateScaledBase(balance) {
     return Number((Math.max(1, units) * DEFAULTS.betIncrement).toFixed(8));
 }
 
-function resetSession() {
-    // CONTINUOUS BETTING - No status message, just reset silently
-    botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.98;
-    botState.recoveryPot = 0;
-    botState.stats = {
-        totalBets: 0, wins: 0, losses: 0, netProfit: botState.stats.netProfit, maxSessionProfit: 0,
-        currentBalance: botState.stats.currentBalance,
-        startTime: Date.now()
-    };
-    botState.betHistory = [];
-    botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
-    botState.settings.currentBet = botState.settings.baseBet;
-}
-
 // ============ API LOGIC ============
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
@@ -99,16 +85,9 @@ async function placeBet() {
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = "Linear Recovery Mode (80% Profit Lock) - Continuous Betting";
+    botState.statusMessage = "Linear Recovery Mode (80% Profit Lock) - Full Balance Trading";
     
     while (true) {
-        // Floor Auto-Reboot - CONTINUOUS BETTING (no status message, just reset and continue)
-        if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
-            resetSession();
-            // Continue betting immediately after reset
-            continue; 
-        }
-
         const result = await placeBet();
         if (!result) { 
             await new Promise(r => setTimeout(r, 5000)); 
@@ -124,6 +103,7 @@ async function runStrategy() {
             botState.stats.maxSessionProfit = botState.stats.netProfit;
         }
 
+        // Use full balance for base bet calculation (no safe balance subtraction)
         botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
 
         if (profit > 0) {
@@ -133,6 +113,7 @@ async function runStrategy() {
 
             if (botState.recoveryPot === 0) {
                 botState.settings.currentBet = botState.settings.baseBet;
+                // Still track profit protection but don't subtract from available balance
                 botState.profitProtection.safeBalance += (profit * 0.80); 
             }
         } else {
@@ -165,13 +146,13 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.3 | 80% Lock</title>
+    <title>Dice Pro v3.3 | Full Balance Trading</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
         .container { max-width: 1200px; margin: 0 auto; }
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1.5rem; margin-bottom: 2rem; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem; margin-bottom: 2rem; }
         .card { background: var(--card-bg); padding: 1.5rem; border-radius: 12px; border: 1px solid var(--border); box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
         .label { font-size: 0.75rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; margin-bottom: 0.5rem; }
         .btc-val { font-size: 1.75rem; font-weight: 700; }
@@ -195,8 +176,7 @@ app.get('/', (req, res) => {
         </div>
         <div class="status-bar" id="status-msg">Status: Initializing...</div>
         <div class="grid">
-            <div class="card"><div class="label">💳 Trading Balance</div><div id="t-bal" class="btc-val" style="color:var(--danger)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
+            <div class="card"><div class="label">💰 Wallet Balance (Full Trading)</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">⚖️ Recovery Pot (Remaining)</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div class="usd-val">Mode: 80% Profit Lock</div></div>
         </div>
@@ -214,7 +194,7 @@ app.get('/', (req, res) => {
             <div class="proj-card"><div class="label">Yearly</div><span id="p-year-b" class="win">0.00</span><br><span id="p-year-u" class="usd-val">0.00</span></div>
         </div>
         <table>
-            <thead><tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Remaining</th></tr></thead>
+            <thead><tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Remaining</th> </thead>
             <tbody id="h-body"></tbody>
         </table>
     </div>
@@ -228,8 +208,7 @@ app.get('/', (req, res) => {
                 
                 document.getElementById('status-msg').innerText = "Status: " + botState.statusMessage;
                 document.getElementById('price-tag').innerText = "$" + btcPrice.toLocaleString();
-                document.getElementById('t-bal').innerText = f(botState.stats.currentBalance - botState.profitProtection.safeBalance);
-                document.getElementById('t-usd').innerText = u(botState.stats.currentBalance - botState.profitProtection.safeBalance);
+                // Show full wallet balance (no trading balance subtraction)
                 document.getElementById('w-bal').innerText = f(botState.stats.currentBalance);
                 document.getElementById('w-usd').innerText = u(botState.stats.currentBalance);
                 document.getElementById('n-prof').innerText = f(botState.stats.netProfit);
@@ -240,7 +219,7 @@ app.get('/', (req, res) => {
                 document.getElementById('n-bet').innerText = f(botState.settings.currentBet);
                 document.getElementById('uptime').innerText = hoursPassed + "h";
 
-                // Calculate projections based on Wallet Balance (not Net Profit)
+                // Calculate projections based on full Wallet Balance
                 const walletBalance = parseFloat(botState.stats.currentBalance || 0);
                 const hours = parseFloat(hoursPassed);
                 const hourlyProjection = walletBalance / hours;
@@ -255,15 +234,26 @@ app.get('/', (req, res) => {
                 document.getElementById('p-year-u').innerText = u(hourlyProjection * 24 * 365);
 
                 document.getElementById('h-body').innerHTML = botState.betHistory.map(b => \`
-                    <tr><td>#\${b.id}</td><td>\${f(b.dBase)}</td><td>\${f(b.bet)}</td><td>\${b.roll}</td><td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td><td>\${b.pot} BTC</td></tr>
+                    <tr><td style="font-family: monospace;">#\${b.id}</td>
+                    <td style="font-family: monospace;">\${f(b.dBase)}</td>
+                    <td style="font-family: monospace;">\${f(b.bet)}</td>
+                    <td style="font-family: monospace;">\${b.roll}</td>
+                    <td class="\${b.isWin?'win':'loss'}" style="font-family: monospace;">\${f(b.profit)}</td>
+                    <td style="font-family: monospace;">\${b.pot} BTC</td>
                 \`).join('');
-            } catch(e) {}
+            } catch(e) {
+                console.error('Update error:', e);
+            }
         }
         setInterval(update, 1000);
+        update(); // Initial call
     </script>
 </body>
 </html>
     `);
 });
 
-app.listen(port, '0.0.0.0', () => runStrategy());
+app.listen(port, '0.0.0.0', () => {
+    console.log(`Server running on port ${port}`);
+    runStrategy();
+});
