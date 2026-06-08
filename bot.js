@@ -6,14 +6,16 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "SEUgOqI5AKIKlNkotQjpX1qVdaapIf49ytvC3mUoABUYDDGUcm";
+const API_KEY = process.env.API_KEY || "4sIh59nG1LYDc8ErZFwD8rcRmVX9mawxcbaQp4MdmESwEBBAun";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
     payout: 2.0,              
     balanceStep: 0.00000050,  
-    betIncrement: 0.00000001
+    betIncrement: 0.00000001,
+    maxBetPercent: 0.10,      // Max bet = 10% of wallet
+    safeFloorPercent: 0.50    // Safe floor = 50% of balance (changed from 98%)
 };
 
 // ============ BOT STATE ============
@@ -25,7 +27,7 @@ let botState = {
     coin: DEFAULTS.coin,
     profitProtection: { 
         safeBalance: 0,
-        lockPercent: 0.80 // Locking 80% of profit
+        lockPercent: DEFAULTS.safeFloorPercent
     }, 
     stats: {
         totalBets: 0,
@@ -60,12 +62,16 @@ function calculateScaledBase(balance) {
 }
 
 function resetSession() {
-    // UPDATED MESSAGE
-    botState.statusMessage = "SYSTEM: SAFE FLOOR HIT: Locking Profits...";
-    botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.50; // Protect 98% of remaining on crash
+    // UPDATED: Now uses safeFloorPercent (50%)
+    botState.statusMessage = "SYSTEM: SAFE FLOOR HIT: Locking 50% of funds...";
+    botState.profitProtection.safeBalance = botState.stats.currentBalance * DEFAULTS.safeFloorPercent;
     botState.recoveryPot = 0;
     botState.stats = {
-        totalBets: 0, wins: 0, losses: 0, netProfit: botState.stats.netProfit, maxSessionProfit: 0,
+        totalBets: 0, 
+        wins: 0, 
+        losses: 0, 
+        netProfit: botState.stats.netProfit, 
+        maxSessionProfit: 0,
         currentBalance: botState.stats.currentBalance,
         startTime: Date.now()
     };
@@ -78,12 +84,27 @@ function resetSession() {
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
     
+    // Calculate maximum allowed bet (10% of current balance)
+    const maxAllowedBet = botState.stats.currentBalance * DEFAULTS.maxBetPercent;
+    
+    // Cap the bet if it exceeds 10% or is more than available balance
+    let finalBet = Math.min(botState.settings.currentBet, maxAllowedBet);
+    finalBet = Math.min(finalBet, botState.stats.currentBalance);
+    
+    // Round to 8 decimal places
+    finalBet = Number(finalBet.toFixed(8));
+    
+    // Warning message if bet was capped
+    if (finalBet < botState.settings.currentBet) {
+        botState.statusMessage = `WARNING: Bet capped at ${DEFAULTS.maxBetPercent * 100}% of wallet (${finalBet.toFixed(8)} BTC)`;
+    }
+    
     const rawSuffix = Math.random().toString(36).substring(2); 
     const alphanumericSuffix = rawSuffix.replace(/[^a-z0-9]/gi, '').substring(0, 12);
     const safeSeed = "pro" + alphanumericSuffix; 
 
     const payload = { 
-        Bet: Number(botState.settings.currentBet.toFixed(8)), 
+        Bet: finalBet, 
         Payout: botState.settings.payout, 
         UnderOver: true, 
         ClientSeed: safeSeed 
@@ -100,15 +121,28 @@ async function placeBet() {
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = "Linear Recovery Mode (80% Profit Lock)";
+    botState.statusMessage = "Linear Recovery Mode (50% Profit Lock)";
     
-    while (true) {
+    while (botState.running) {
         // Floor Auto-Reboot
         if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
             resetSession();
-            // UPDATED: Now waits for 5 seconds (5000ms)
             await new Promise(r => setTimeout(r, 5000));
             continue; 
+        }
+        
+        // Pre-bet safety check
+        const maxAllowedBet = botState.stats.currentBalance * DEFAULTS.maxBetPercent;
+        if (botState.settings.currentBet > maxAllowedBet) {
+            botState.settings.currentBet = maxAllowedBet;
+            botState.statusMessage = `BET CAPPED: Current bet reduced to ${DEFAULTS.maxBetPercent * 100}% of wallet`;
+        }
+        
+        // Don't bet if bet size > available balance
+        if (botState.settings.currentBet > botState.stats.currentBalance) {
+            botState.statusMessage = "ERROR: Bet exceeds wallet balance. Stopping...";
+            botState.running = false;
+            break;
         }
 
         const result = await placeBet();
@@ -135,18 +169,35 @@ async function runStrategy() {
 
             if (botState.recoveryPot === 0) {
                 botState.settings.currentBet = botState.settings.baseBet;
-                botState.profitProtection.safeBalance += (profit * 0.80); 
+                // Lock 50% of profit (using safeFloorPercent)
+                botState.profitProtection.safeBalance += (profit * DEFAULTS.safeFloorPercent);
             }
         } else {
             botState.stats.losses++;
             botState.recoveryPot += Math.abs(profit);
-            botState.settings.currentBet += DEFAULTS.betIncrement;
+            
+            // Calculate proposed new bet
+            let newBet = botState.settings.currentBet + DEFAULTS.betIncrement;
+            
+            // Check if new bet exceeds 10% of wallet
+            const maxAllowedBet = botState.stats.currentBalance * DEFAULTS.maxBetPercent;
+            if (newBet > maxAllowedBet) {
+                newBet = maxAllowedBet;
+                botState.statusMessage = `MAX BET LIMIT REACHED: Capped at ${DEFAULTS.maxBetPercent * 100}% of wallet`;
+            }
+            
+            botState.settings.currentBet = newBet;
         }
 
         botState.betHistory.unshift({ 
-            id: botState.stats.totalBets, time: new Date().toLocaleTimeString(), 
-            bet: result.Bet, roll: result.Roll, profit: profit, isWin: profit > 0, 
-            pot: botState.recoveryPot.toFixed(8), dBase: botState.settings.baseBet
+            id: botState.stats.totalBets, 
+            time: new Date().toLocaleTimeString(), 
+            bet: result.Bet, 
+            roll: result.Roll, 
+            profit: profit, 
+            isWin: profit > 0, 
+            pot: botState.recoveryPot.toFixed(8), 
+            dBase: botState.settings.baseBet
         });
         if (botState.betHistory.length > 30) botState.betHistory.pop();
 
@@ -167,7 +218,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.3 | 80% Lock</title>
+    <title>Dice Pro v3.4 | 50% Lock + 10% Max Bet</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -178,7 +229,7 @@ app.get('/', (req, res) => {
         .label { font-size: 0.75rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; margin-bottom: 0.5rem; }
         .btc-val { font-size: 1.75rem; font-weight: 700; }
         .usd-val { font-size: 0.875rem; color: var(--accent); }
-        .stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2rem; }
+        .stats-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 1rem; margin-bottom: 2rem; }
         .mini-card { background: var(--card-bg); padding: 1rem; border-radius: 8px; border: 1px solid var(--border); text-align: center; }
         .proj-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2rem; }
         .proj-card { background: #f1f5f9; padding: 1rem; border-radius: 8px; text-align: center; }
@@ -192,7 +243,7 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <div class="header">
-            <h1>Dice Pro <span style="color:var(--primary)">v3.3</span></h1>
+            <h1>Dice Pro <span style="color:var(--primary)">v3.4</span></h1>
             <div style="text-align: right"><div class="label">Market BTC/USD</div><div id="price-tag" style="font-weight: 700;">$0.00</div></div>
         </div>
         <div class="status-bar" id="status-msg">Status: Initializing...</div>
@@ -200,12 +251,13 @@ app.get('/', (req, res) => {
             <div class="card"><div class="label">💳 Trading Balance</div><div id="t-bal" class="btc-val" style="color:var(--danger)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">📈 Net Profit</div><div id="n-prof" class="btc-val">0.00</div><div id="n-usd" class="usd-val">$0.00</div></div>
-            <div class="card"><div class="label">⚖️ Recovery Pot (Remaining)</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div class="usd-val">Mode: 80% Profit Lock</div></div>
+            <div class="card"><div class="label">⚖️ Recovery Pot (Remaining)</div><div id="pot-display" class="btc-val" style="color:var(--primary)">0.00</div><div class="usd-val">Mode: 50% Profit Lock</div></div>
         </div>
         <div class="stats-row">
             <div class="mini-card"><div class="label">Win Rate</div><div id="wr" style="font-weight:700">0%</div></div>
             <div class="mini-card"><div class="label">Scaling Base</div><div id="s-base" style="font-weight:700; color:var(--primary)">0.00</div></div>
             <div class="mini-card"><div class="label">Next Bet</div><div id="n-bet" style="font-weight:700; color:var(--accent)">0.00</div></div>
+            <div class="mini-card"><div class="label">Max Bet (10%)</div><div id="max-bet" style="font-weight:700; color:var(--danger)">0.00</div></div>
             <div class="mini-card"><div class="label">Uptime</div><div id="uptime" style="font-weight:700">0h</div></div>
         </div>
         <div class="label">Revenue Projections</div>
@@ -216,7 +268,9 @@ app.get('/', (req, res) => {
             <div class="proj-card"><div class="label">Yearly</div><span id="p-year-b" class="win">0.00</span><br><span id="p-year-u" class="usd-val">0.00</span></div>
         </div>
         <table>
-            <thead><tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Remaining</th></tr></thead>
+            <thead>
+                <tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Remaining</th></tr>
+            </thead>
             <tbody id="h-body"></tbody>
         </table>
     </div>
@@ -240,9 +294,10 @@ app.get('/', (req, res) => {
                 document.getElementById('wr').innerText = ((botState.stats.wins/botState.stats.totalBets)*100 || 0).toFixed(1) + "%";
                 document.getElementById('s-base').innerText = f(botState.settings.baseBet);
                 document.getElementById('n-bet').innerText = f(botState.settings.currentBet);
+                document.getElementById('max-bet').innerText = f(botState.stats.currentBalance * 0.10);
                 document.getElementById('uptime').innerText = hoursPassed + "h";
 
-                // Calculate projections based on Wallet Balance (not Net Profit)
+                // Calculate projections based on Wallet Balance
                 const walletBalance = parseFloat(botState.stats.currentBalance || 0);
                 const hours = parseFloat(hoursPassed);
                 const hourlyProjection = walletBalance / hours;
@@ -257,15 +312,27 @@ app.get('/', (req, res) => {
                 document.getElementById('p-year-u').innerText = u(hourlyProjection * 24 * 365);
 
                 document.getElementById('h-body').innerHTML = botState.betHistory.map(b => \`
-                    <tr><td>#\${b.id}</td><td>\${f(b.dBase)}</td><td>\${f(b.bet)}</td><td>\${b.roll}</td><td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td><td>\${b.pot} BTC</td></tr>
+                    <tr>
+                        <td>#\${b.id}</td>
+                        <td>\${f(b.dBase)}</td>
+                        <td>\${f(b.bet)}</td>
+                        <td>\${b.roll}</td>
+                        <td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td>
+                        <td>\${b.pot} BTC</td>
+                    </tr>
                 \`).join('');
             } catch(e) {}
         }
         setInterval(update, 1000);
+        update();
     </script>
 </body>
 </html>
     `);
 });
 
-app.listen(port, '0.0.0.0', () => runStrategy());
+// ============ START SERVER ============
+app.listen(port, '0.0.0.0', () => {
+    console.log(`Server running on port ${port}`);
+    runStrategy();
+});
