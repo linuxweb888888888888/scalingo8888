@@ -6,7 +6,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "ynXUumHAd8oYBrna4wfnHaMnlaUZzdUWY7zZSbN66tlgxAfaby";
+const API_KEY = process.env.API_KEY || "M7kmPCdpBfGBgY3SUX65E1C0EGiUaPa13U9lcIMGRFDBcikOcy";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
@@ -44,6 +44,37 @@ let botState = {
     betHistory: []
 };
 
+// ============ SEED MANAGEMENT ============
+let currentSeed = null;
+let betsSinceSeedChange = 0;
+const SEED_CHANGE_INTERVAL = 10;
+
+function generateNewSeed() {
+    const rawSuffix = Math.random().toString(36).substring(2);
+    const alphanumericSuffix = rawSuffix.replace(/[^a-z0-9]/gi, '').substring(0, 12);
+    const safeSeed = "pro" + alphanumericSuffix;
+    return safeSeed;
+}
+
+function getCurrentSeed() {
+    if (currentSeed === null) {
+        currentSeed = generateNewSeed();
+        betsSinceSeedChange = 0;
+        botState.statusMessage = `New seed generated: ${currentSeed}`;
+    }
+    return currentSeed;
+}
+
+function checkAndRotateSeed() {
+    betsSinceSeedChange++;
+    if (betsSinceSeedChange >= SEED_CHANGE_INTERVAL) {
+        currentSeed = generateNewSeed();
+        betsSinceSeedChange = 0;
+        botState.statusMessage = `Seed rotated (every ${SEED_CHANGE_INTERVAL} bets) - New seed: ${currentSeed}`;
+        console.log(`[SEED] Rotated to: ${currentSeed}`);
+    }
+}
+
 // ============ UTILITIES ============
 async function updateBTCPrice() {
     try {
@@ -72,15 +103,18 @@ function resetSession() {
     botState.betHistory = [];
     botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
     botState.settings.currentBet = botState.settings.baseBet;
+    
+    // Reset seed on session reset
+    currentSeed = null;
+    betsSinceSeedChange = 0;
 }
 
 // ============ API LOGIC ============
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
     
-    const rawSuffix = Math.random().toString(36).substring(2); 
-    const alphanumericSuffix = rawSuffix.replace(/[^a-z0-9]/gi, '').substring(0, 12);
-    const safeSeed = "pro" + alphanumericSuffix; 
+    // Get current seed (will generate first one if null)
+    const safeSeed = getCurrentSeed();
 
     const payload = { 
         Bet: Number(botState.settings.currentBet.toFixed(8)), 
@@ -91,6 +125,8 @@ async function placeBet() {
 
     try {
         const response = await axios.post(url, payload);
+        // After successful bet, check if we need to rotate seed
+        checkAndRotateSeed();
         return response.data;
     } catch (error) { 
         botState.statusMessage = error.response?.data?.Message || "API Error";
@@ -100,7 +136,7 @@ async function placeBet() {
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
-    botState.statusMessage = "Linear Recovery Mode (80% Profit Lock)";
+    botState.statusMessage = `Linear Recovery Mode (80% Profit Lock) - Seeds change every ${SEED_CHANGE_INTERVAL} bets`;
     
     while (true) {
         // Floor Auto-Reboot
@@ -146,7 +182,9 @@ async function runStrategy() {
         botState.betHistory.unshift({ 
             id: botState.stats.totalBets, time: new Date().toLocaleTimeString(), 
             bet: result.Bet, roll: result.Roll, profit: profit, isWin: profit > 0, 
-            pot: botState.recoveryPot.toFixed(8), dBase: botState.settings.baseBet
+            pot: botState.recoveryPot.toFixed(8), dBase: botState.settings.baseBet,
+            seed: currentSeed,
+            betsOnSeed: betsSinceSeedChange
         });
         if (botState.betHistory.length > 30) botState.betHistory.pop();
 
@@ -157,7 +195,16 @@ async function runStrategy() {
 // ============ AJAX API ============
 app.get('/api/stats', (req, res) => {
     const hours = Math.max(0.0001, (Date.now() - botState.stats.startTime) / 3600000);
-    res.json({ botState, btcPrice, hoursPassed: hours.toFixed(2) });
+    res.json({ 
+        botState, 
+        btcPrice, 
+        hoursPassed: hours.toFixed(2),
+        seedInfo: {
+            currentSeed: currentSeed,
+            betsUntilNextSeed: SEED_CHANGE_INTERVAL - betsSinceSeedChange,
+            seedChangeInterval: SEED_CHANGE_INTERVAL
+        }
+    });
 });
 
 // ============ WEB DASHBOARD ============
@@ -167,7 +214,7 @@ app.get('/', (req, res) => {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dice Pro v3.3 | 80% Lock</title>
+    <title>Dice Pro v3.3 | 80% Lock | Seed Rotation</title>
     <style>
         :root { --primary: #2563eb; --bg: #f8fafc; --card-bg: #ffffff; --text-main: #1e293b; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --accent: #f59e0b; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-main); padding: 2rem; }
@@ -182,6 +229,7 @@ app.get('/', (req, res) => {
         .mini-card { background: var(--card-bg); padding: 1rem; border-radius: 8px; border: 1px solid var(--border); text-align: center; }
         .proj-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2rem; }
         .proj-card { background: #f1f5f9; padding: 1rem; border-radius: 8px; text-align: center; }
+        .seed-info { background: #1e293b; color: white; padding: 12px; border-radius: 8px; margin-bottom: 20px; font-family: monospace; font-size: 0.8rem; }
         table { width: 100%; border-collapse: collapse; background: var(--card-bg); border-radius: 12px; overflow: hidden; border: 1px solid var(--border); }
         th { background: #f8fafc; padding: 1rem; text-align: left; font-size: 0.75rem; color: var(--text-muted); }
         td { padding: 1rem; font-size: 0.875rem; border-bottom: 1px solid var(--border); font-family: monospace; }
@@ -196,6 +244,10 @@ app.get('/', (req, res) => {
             <div style="text-align: right"><div class="label">Market BTC/USD</div><div id="price-tag" style="font-weight: 700;">$0.00</div></div>
         </div>
         <div class="status-bar" id="status-msg">Status: Initializing...</div>
+        <div class="seed-info" id="seed-info">
+            <div>🎲 Current Seed: <span id="current-seed">Loading...</span></div>
+            <div>🔄 Bets until next seed change: <span id="bets-until-seed">0</span> / <span id="seed-interval">10</span></div>
+        </div>
         <div class="grid">
             <div class="card"><div class="label">💳 Trading Balance</div><div id="t-bal" class="btc-val" style="color:var(--danger)">0.00</div><div id="t-usd" class="usd-val">$0.00</div></div>
             <div class="card"><div class="label">💰 Wallet Balance</div><div id="w-bal" class="btc-val">0.00</div><div id="w-usd" class="usd-val">$0.00</div></div>
@@ -224,7 +276,7 @@ app.get('/', (req, res) => {
         async function update() {
             try {
                 const res = await fetch('/api/stats');
-                const { botState, btcPrice, hoursPassed } = await res.json();
+                const { botState, btcPrice, hoursPassed, seedInfo } = await res.json();
                 const f = (n) => parseFloat(n || 0).toFixed(8);
                 const u = (n) => "$" + (parseFloat(n || 0) * btcPrice).toLocaleString(undefined, {minimumFractionDigits: 3});
                 
@@ -241,6 +293,13 @@ app.get('/', (req, res) => {
                 document.getElementById('s-base').innerText = f(botState.settings.baseBet);
                 document.getElementById('n-bet').innerText = f(botState.settings.currentBet);
                 document.getElementById('uptime').innerText = hoursPassed + "h";
+                
+                // Seed info display
+                if (seedInfo) {
+                    document.getElementById('current-seed').innerText = seedInfo.currentSeed || 'None';
+                    document.getElementById('bets-until-seed').innerText = seedInfo.betsUntilNextSeed;
+                    document.getElementById('seed-interval').innerText = seedInfo.seedChangeInterval;
+                }
 
                 // Calculate projections based on Wallet Balance (not Net Profit)
                 const walletBalance = parseFloat(botState.stats.currentBalance || 0);
