@@ -84,12 +84,6 @@ async function placeBet() {
         finalBet = maxAllowedBet;
     }
     
-    // Ensure minimum bet (most crypto dice games minimum is 0.00000001 BTC)
-    const minBet = 0.00000001;
-    if (finalBet < minBet) {
-        finalBet = minBet;
-    }
-    
     const rawSuffix = Math.random().toString(36).substring(2); 
     const alphanumericSuffix = rawSuffix.replace(/[^a-z0-9]/gi, '').substring(0, 12);
     const safeSeed = "pro" + alphanumericSuffix; 
@@ -106,7 +100,6 @@ async function placeBet() {
         return response.data;
     } catch (error) { 
         botState.statusMessage = error.response?.data?.Message || "API Error";
-        console.error("API Error Details:", error.response?.data);
         return null; 
     }
 }
@@ -227,12 +220,21 @@ app.get('/', (req, res) => {
             <div class="proj-card"><div class="label">Monthly</div><span id="p-month-b" class="win">0.00</span><br><span id="p-month-u" class="usd-val">0.00</span></div>
             <div class="proj-card"><div class="label">Yearly</div><span id="p-year-b" class="win">0.00</span><br><span id="p-year-u" class="usd-val">0.00</span></div>
         </div>
-        </table>
-            <thead>
-                <tr><th>ID</th><th>Base</th><th>Wager</th><th>Roll</th><th>Net (BTC)</th><th>Pot Remaining</th></tr>
-            </thead>
-            <tbody id="h-body"></tbody>
-        </table>
+        <div style="overflow-x: auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Base</th>
+                        <th>Wager</th>
+                        <th>Roll</th>
+                        <th>Net (BTC)</th>
+                        <th>Pot Remaining</th>
+                    </tr>
+                </thead>
+                <tbody id="h-body"></tbody>
+            </table>
+        </div>
     </div>
     <script>
         async function update() {
@@ -240,52 +242,66 @@ app.get('/', (req, res) => {
                 const res = await fetch('/api/stats');
                 const { botState, btcPrice, hoursPassed } = await res.json();
                 const f = (n) => parseFloat(n || 0).toFixed(8);
-                const u = (n) => "$" + (parseFloat(n || 0) * btcPrice).toLocaleString(undefined, {minimumFractionDigits: 3});
+                const u = (n) => "$" + (parseFloat(n || 0) * btcPrice).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
                 
-                document.getElementById('status-msg').innerText = "Status: " + botState.statusMessage;
-                document.getElementById('price-tag').innerText = "$" + btcPrice.toLocaleString();
-                document.getElementById('t-bal').innerText = f(botState.stats.currentBalance - botState.profitProtection.safeBalance);
-                document.getElementById('t-usd').innerText = u(botState.stats.currentBalance - botState.profitProtection.safeBalance);
-                document.getElementById('w-bal').innerText = f(botState.stats.currentBalance);
-                document.getElementById('w-usd').innerText = u(botState.stats.currentBalance);
-                document.getElementById('n-prof').innerText = f(botState.stats.netProfit);
-                document.getElementById('n-usd').innerText = u(botState.stats.netProfit);
-                document.getElementById('pot-display').innerText = f(botState.recoveryPot);
-                document.getElementById('wr').innerText = ((botState.stats.wins/botState.stats.totalBets)*100 || 0).toFixed(1) + "%";
-                document.getElementById('s-base').innerText = f(botState.settings.baseBet);
-                document.getElementById('n-bet').innerText = f(botState.settings.currentBet);
-                document.getElementById('uptime').innerText = hoursPassed + "h";
+                document.getElementById('status-msg').innerHTML = "Status: " + botState.statusMessage;
+                document.getElementById('price-tag').innerHTML = "$" + btcPrice.toLocaleString();
+                document.getElementById('t-bal').innerHTML = f(botState.stats.currentBalance - botState.profitProtection.safeBalance);
+                document.getElementById('t-usd').innerHTML = u(botState.stats.currentBalance - botState.profitProtection.safeBalance);
+                document.getElementById('w-bal').innerHTML = f(botState.stats.currentBalance);
+                document.getElementById('w-usd').innerHTML = u(botState.stats.currentBalance);
+                document.getElementById('n-prof').innerHTML = f(botState.stats.netProfit);
+                document.getElementById('n-usd').innerHTML = u(botState.stats.netProfit);
+                document.getElementById('pot-display').innerHTML = f(botState.recoveryPot);
+                
+                const winRate = botState.stats.totalBets > 0 ? (botState.stats.wins / botState.stats.totalBets * 100) : 0;
+                document.getElementById('wr').innerHTML = winRate.toFixed(1) + "%";
+                document.getElementById('s-base').innerHTML = f(botState.settings.baseBet);
+                document.getElementById('n-bet').innerHTML = f(botState.settings.currentBet);
+                document.getElementById('uptime').innerHTML = hoursPassed + "h";
 
                 const walletBalance = parseFloat(botState.stats.currentBalance || 0);
                 const hours = parseFloat(hoursPassed);
-                const hourlyProjection = walletBalance / hours;
+                const hourlyProjection = hours > 0 ? walletBalance / hours : 0;
                 
-                document.getElementById('p-hr-b').innerText = f(hourlyProjection);
-                document.getElementById('p-hr-u').innerText = u(hourlyProjection);
-                document.getElementById('p-dy-b').innerText = f(hourlyProjection * 24);
-                document.getElementById('p-dy-u').innerText = u(hourlyProjection * 24);
-                document.getElementById('p-month-b').innerText = f(hourlyProjection * 24 * 30);
-                document.getElementById('p-month-u').innerText = u(hourlyProjection * 24 * 30);
-                document.getElementById('p-year-b').innerText = f(hourlyProjection * 24 * 365);
-                document.getElementById('p-year-u').innerText = u(hourlyProjection * 24 * 365);
+                document.getElementById('p-hr-b').innerHTML = f(hourlyProjection);
+                document.getElementById('p-hr-u').innerHTML = u(hourlyProjection);
+                document.getElementById('p-dy-b').innerHTML = f(hourlyProjection * 24);
+                document.getElementById('p-dy-u').innerHTML = u(hourlyProjection * 24);
+                document.getElementById('p-month-b').innerHTML = f(hourlyProjection * 24 * 30);
+                document.getElementById('p-month-u').innerHTML = u(hourlyProjection * 24 * 30);
+                document.getElementById('p-year-b').innerHTML = f(hourlyProjection * 24 * 365);
+                document.getElementById('p-year-u').innerHTML = u(hourlyProjection * 24 * 365);
 
-                document.getElementById('h-body').innerHTML = botState.betHistory.map(b => \`
-                    <tr>
-                        <td>#\${b.id}</td>
-                        <td>\${f(b.dBase)}</td>
-                        <td>\${f(b.bet)}</td>
-                        <td>\${b.roll}</td>
-                        <td class="\${b.isWin?'win':'loss'}">\${f(b.profit)}</td>
-                        <td>\${b.pot} BTC</td>
-                    </tr>
-                \`).join('');
-            } catch(e) {}
+                // Table population with 6 columns matching headers
+                if (botState.betHistory && botState.betHistory.length > 0) {
+                    document.getElementById('h-body').innerHTML = botState.betHistory.map(b => `
+                        <tr>
+                            <td>#${b.id}</td>
+                            <td>${f(b.dBase)}</td>
+                            <td>${f(b.bet)}</td>
+                            <td>${b.roll}</td>
+                            <td class="${b.isWin ? 'win' : 'loss'}">${b.profit > 0 ? '+' : ''}${f(b.profit)}</td>
+                            <td>${b.pot} BTC</td>
+                        </tr>
+                    `).join('');
+                } else {
+                    document.getElementById('h-body').innerHTML = '<tr><td colspan="6" style="text-align: center;">No bets placed yet</td></tr>';
+                }
+            } catch(e) {
+                console.error("Update error:", e);
+            }
         }
+        
         setInterval(update, 1000);
+        update();
     </script>
 </body>
 </html>
     `);
 });
 
-app.listen(port, '0.0.0.0', () => runStrategy());
+app.listen(port, '0.0.0.0', () => {
+    console.log(`Server running on port ${port}`);
+    runStrategy();
+});
