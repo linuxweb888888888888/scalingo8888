@@ -59,21 +59,6 @@ function calculateScaledBase(balance) {
     return Number((Math.max(1, units) * DEFAULTS.betIncrement).toFixed(8));
 }
 
-function resetSession() {
-    // UPDATED MESSAGE
-    botState.statusMessage = "SYSTEM: SAFE FLOOR HIT: Locking Profits...";
-    botState.profitProtection.safeBalance = botState.stats.currentBalance * 0.98; // Protect 98% of remaining on crash
-    botState.recoveryPot = 0;
-    botState.stats = {
-        totalBets: 0, wins: 0, losses: 0, netProfit: botState.stats.netProfit, maxSessionProfit: 0,
-        currentBalance: botState.stats.currentBalance,
-        startTime: Date.now()
-    };
-    botState.betHistory = [];
-    botState.settings.baseBet = calculateScaledBase(botState.stats.currentBalance);
-    botState.settings.currentBet = botState.settings.baseBet;
-}
-
 // ============ API LOGIC ============
 async function placeBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
@@ -103,14 +88,6 @@ async function runStrategy() {
     botState.statusMessage = "Linear Recovery Mode (80% Profit Lock)";
     
     while (true) {
-        // Floor Auto-Reboot
-        if (botState.stats.totalBets > 0 && botState.stats.currentBalance <= botState.profitProtection.safeBalance) {
-            resetSession();
-            // UPDATED: Now waits for 5 seconds (5000ms)
-            await new Promise(r => setTimeout(r, 5000));
-            continue; 
-        }
-
         const result = await placeBet();
         if (!result) { 
             await new Promise(r => setTimeout(r, 5000)); 
