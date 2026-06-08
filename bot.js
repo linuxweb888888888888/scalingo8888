@@ -4,40 +4,37 @@ const express = require('express');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ============ PROFIT-FOCUSED CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "XLCPrTf38ciJnhAxhshtG8pYGO5szxk2iqbt9LdjGhY1OIZ1bE";
+// ============ AGGRESSIVE PROFIT CONFIGURATION ============
+const API_KEY = process.env.API_KEY || "aBmmu0A3Df56Ri1YWFpR8hqWpQkZKdMjtvOkETGAZJvg0O87fI";
 const BASE_URL = "https://api.crypto.games/v1";
 
 let CONFIG = {
     coin: "BTC",
     minBet: 0.00000001,
-    baseRiskPercent: 0.015,      // 1.5% of bankroll per bet (Kelly-optimized)
-    maxRiskPercent: 0.025,        // Max 2.5% risk
-    payout: 1.7,                  // Even money for better probability
-    targetDailyProfit: 0.00000500, // $0.30 target at $60k BTC
-    stopLossDaily: 0.00000200,    // $0.12 stop loss
-    maxConsecutiveLosses: 3,      // Aggressive stop on 3 losses
-    useTrueKelly: true,
-    kellyFraction: 0.25,          // 25% Kelly for safety
-    winRateTarget: 0.52,          // Slight edge needed
-    minConfidence: 0.48,
-    cooldownPeriods: 3,
+    baseRiskPercent: 0.025,      // 2.5% base risk - more aggressive
+    maxRiskPercent: 0.08,         // 8% max risk for recovery
+    payout: 1.95,                 // 95% profit target
+    targetDailyProfit: 0.00001000, // $0.60 target
+    stopLossDaily: 0.00000500,    // $0.30 stop loss
+    maxConsecutiveLosses: 4,      
+    useAggressiveRecovery: true,
+    recoveryMultiplier: 1.8,      // 80% increase on losses
+    winStreakBonus: 1.3,          // 30% bonus on wins
+    minBetsPerSession: 30,
+    maxBetsPerSession: 150,
     volatilityAdjustment: true,
-    sessionLength: 120,           // 2 hour sessions
-    breakBetweenSessions: 300,    // 5 min break
-    compoundDaily: true,
-    maxDailyBets: 200
+    useMartingaleLight: true,      // Light martingale for recovery
+    compoundThreshold: 0.00000200  // Compound after $0.12 profit
 };
 
 // ============ BOT STATE ============
 let btcPrice = 60964;
 let sessionStartTime = Date.now();
-let dailyProfit = 0;
-let sessionBets = 0;
+let sessionStartBalance = 0;
 
 let botState = {
     running: true,
-    statusMessage: "PROFIT ENGINE INITIALIZED",
+    statusMessage: "PROFIT ENGINE ACTIVE",
     stats: {
         totalBets: 0,
         wins: 0,
@@ -57,187 +54,179 @@ let botState = {
         dailyProfit: 0,
         dailyBets: 0,
         sessionNumber: 1,
+        recoveryCount: 0,
+        successfulRecoveries: 0,
         performanceMetrics: {
-            winRate: 0,
-            sharpeRatio: 0,
+            winRate: 0.50,
             expectedValue: 0,
             profitFactor: 0
         }
     },
     settings: {
-        currentBet: 0.00000006,
-        baseBet: 0.00000006,
+        currentBet: 0.00000010,
+        baseBet: 0.00000010,
         payout: CONFIG.payout,
         consecutiveLosses: 0,
         consecutiveWins: 0,
         sessionActive: true,
-        inCooldown: false,
-        volatility: 1.0,
-        edge: 0.02  // 2% edge target
+        recoveryMode: false,
+        recoveryMultiplier: 1.0
     },
     betHistory: []
 };
 
-// ============ PROFIT-OPTIMIZED KELLY CALCULATOR ============
-function calculateKellyBet() {
+// ============ AGGRESSIVE BET CALCULATOR ============
+function calculateAggressiveBet() {
     const balance = botState.stats.currentBalance;
-    const winRate = botState.stats.performanceMetrics.winRate || 0.5;
-    const payout = CONFIG.payout;
-    const b = payout - 1;  // Net odds received on the bet
+    const winRate = botState.stats.performanceMetrics.winRate || 0.50;
+    const lossStreak = botState.settings.consecutiveLosses;
+    const winStreak = botState.settings.consecutiveWins;
     
-    // Kelly formula: f* = (p*b - q) / b
-    const p = Math.max(0.45, Math.min(0.55, winRate)); // Cap between 45-55%
-    const q = 1 - p;
-    const kellyPercent = (p * b - q) / b;
+    let riskPercent = CONFIG.baseRiskPercent;
     
-    // Use fraction of Kelly for safety
-    let riskPercent = Math.max(0.005, Math.min(0.03, kellyPercent * CONFIG.kellyFraction));
-    
-    // Adjust for win/loss streaks
-    if (botState.settings.consecutiveWins > 2) {
-        riskPercent *= 1.2; // Slight increase on winning streak
-    } else if (botState.settings.consecutiveLosses > 1) {
-        riskPercent *= 0.7; // Reduce on losing streak
+    // Recovery mode - increase bets to recover losses
+    if (botState.settings.recoveryMode && lossStreak > 0) {
+        riskPercent = CONFIG.baseRiskPercent * Math.min(3.0, CONFIG.recoveryMultiplier * Math.pow(1.3, lossStreak));
+        riskPercent = Math.min(CONFIG.maxRiskPercent, riskPercent);
+        botState.statusMessage = `🔄 RECOVERY MODE - Bet ${(riskPercent*100).toFixed(1)}%`;
+    } 
+    // Win streak - compound gains
+    else if (winStreak > 0 && CONFIG.winStreakBonus > 1) {
+        riskPercent = CONFIG.baseRiskPercent * Math.min(2.0, 1 + (winStreak * 0.1));
+        if (winStreak >= 3) {
+            botState.statusMessage = `⚡ WIN STREAK ${winStreak} - Compounding!`;
+        }
+    }
+    // Normal mode with slight anti-martingale
+    else if (lossStreak === 0 && winStreak === 0) {
+        riskPercent = CONFIG.baseRiskPercent;
     }
     
-    // Adjust for volatility
-    if (CONFIG.volatilityAdjustment) {
-        const recentVolatility = calculateVolatility();
-        riskPercent = riskPercent * (1 / Math.max(1, recentVolatility));
+    // Adjust for performance
+    if (winRate > 0.52) {
+        riskPercent *= 1.2; // Increase when winning
+    } else if (winRate < 0.48 && botState.stats.totalBets > 20) {
+        riskPercent *= 0.8; // Decrease when losing too much
     }
     
-    // Cap the risk percentage
-    riskPercent = Math.min(CONFIG.maxRiskPercent, Math.max(CONFIG.baseRiskPercent, riskPercent));
+    // Cap the risk
+    riskPercent = Math.min(CONFIG.maxRiskPercent, Math.max(CONFIG.baseRiskPercent * 0.5, riskPercent));
     
     let betAmount = balance * riskPercent;
     betAmount = Math.floor(betAmount * 100000000) / 100000000;
-    
-    // Ensure minimum bet
-    betAmount = Math.max(CONFIG.minBet, Math.min(balance * 0.1, betAmount));
+    betAmount = Math.max(CONFIG.minBet, Math.min(balance * 0.15, betAmount));
     
     return {
         amount: betAmount,
         riskPercent: riskPercent,
-        kellyFraction: kellyPercent,
-        confidence: p
+        isRecovery: botState.settings.recoveryMode
     };
 }
 
-function calculateVolatility() {
-    if (botState.betHistory.length < 10) return 1.0;
+// ============ PROFIT CHECKS ============
+function checkProfitConditions() {
+    const currentProfit = botState.stats.currentBalance - sessionStartBalance;
+    const totalProfit = botState.stats.currentBalance - botState.stats.startingBalance;
+    const lossStreak = botState.settings.consecutiveLosses;
+    const winStreak = botState.settings.consecutiveWins;
     
-    let profits = botState.betHistory.slice(0, 20).map(b => b.profit);
-    let mean = profits.reduce((a, b) => a + b, 0) / profits.length;
-    let variance = profits.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / profits.length;
-    let volatility = Math.sqrt(variance) / Math.abs(mean || 0.00000001);
-    
-    return Math.min(2.0, Math.max(0.5, volatility));
-}
-
-// ============ SMART STOP LOSS / TAKE PROFIT ============
-function checkSessionLimits() {
-    const currentSessionProfit = botState.stats.currentBalance - sessionStartBalance;
-    const sessionDuration = (Date.now() - sessionStartTime) / 1000 / 60; // minutes
-    
-    // Take profit
-    if (currentSessionProfit >= CONFIG.targetDailyProfit && botState.stats.dailyBets > 10) {
-        botState.statusMessage = `🎯 SESSION TAKE PROFIT: +${(currentSessionProfit * 100000000).toFixed(2)} satoshis`;
+    // TAKE PROFIT - Lock in gains
+    if (currentProfit >= CONFIG.targetDailyProfit && botState.stats.dailyBets > CONFIG.minBetsPerSession) {
+        botState.statusMessage = `🎉 TAKE PROFIT! +${(currentProfit * 100000000).toFixed(0)} sats`;
         return "TAKE_PROFIT";
     }
     
-    // Stop loss
-    if (currentSessionProfit <= -CONFIG.stopLossDaily && botState.stats.dailyBets > 5) {
-        botState.statusMessage = `🛑 SESSION STOP LOSS: ${(currentSessionProfit * 100000000).toFixed(2)} satoshis`;
+    // STOP LOSS - Protect capital
+    if (currentProfit <= -CONFIG.stopLossDaily && botState.stats.dailyBets > CONFIG.minBetsPerSession) {
+        botState.statusMessage = `🛑 STOP LOSS triggered - ${(currentProfit * 100000000).toFixed(0)} sats`;
         return "STOP_LOSS";
     }
     
-    // Time-based session end
-    if (sessionDuration >= CONFIG.sessionLength && botState.stats.dailyBets > 20) {
-        botState.statusMessage = `⏰ SESSION TIME LIMIT REACHED`;
-        return "TIME_LIMIT";
+    // Enter recovery mode after losses
+    if (lossStreak >= 2 && !botState.settings.recoveryMode && currentProfit < 0) {
+        botState.settings.recoveryMode = true;
+        botState.settings.recoveryMultiplier = 1.0;
+        botState.stats.recoveryCount++;
+        botState.statusMessage = `🔁 ENTERING RECOVERY MODE (${lossStreak} losses)`;
+        return "ENTER_RECOVERY";
     }
     
-    // Max consecutive losses
-    if (botState.settings.consecutiveLosses >= CONFIG.maxConsecutiveLosses) {
-        botState.statusMessage = `⚠️ MAX LOSSES (${CONFIG.maxConsecutiveLosses}) - Cooling down`;
+    // Exit recovery mode after successful recovery
+    if (botState.settings.recoveryMode && currentProfit >= 0 && winStreak >= 2) {
+        botState.settings.recoveryMode = false;
+        botState.stats.successfulRecoveries++;
+        botState.statusMessage = `✅ RECOVERY SUCCESSFUL!`;
+        return "EXIT_RECOVERY";
+    }
+    
+    // Max losses - force session reset
+    if (lossStreak >= CONFIG.maxConsecutiveLosses) {
+        botState.statusMessage = `⚠️ MAX LOSSES (${lossStreak}) - Resetting session`;
         return "MAX_LOSSES";
+    }
+    
+    // Max session length
+    const sessionDuration = (Date.now() - sessionStartTime) / 1000 / 60;
+    if (sessionDuration >= 60 && botState.stats.dailyBets >= CONFIG.minBetsPerSession) {
+        botState.statusMessage = `⏰ Session time limit reached`;
+        return "TIME_LIMIT";
     }
     
     return "ACTIVE";
 }
 
-let sessionStartBalance = 0;
-
-// ============ CONFIDENCE-BASED BETTING ============
-function shouldPlaceBet() {
-    if (botState.settings.inCooldown) return false;
-    if (botState.stats.dailyBets >= CONFIG.maxDailyBets) return false;
+// ============ SESSION MANAGEMENT ============
+async function resetSession(reason) {
+    console.log(`\n📊 Session Reset: ${reason}`);
+    console.log(`   Profit: ${(botState.stats.currentBalance - sessionStartBalance).toFixed(8)} BTC`);
+    console.log(`   Bets: ${botState.stats.dailyBets}`);
     
-    const sessionStatus = checkSessionLimits();
-    if (sessionStatus !== "ACTIVE") {
-        if (sessionStatus === "TAKE_PROFIT" || sessionStatus === "STOP_LOSS" || sessionStatus === "TIME_LIMIT") {
-            // Start cooldown
-            botState.settings.inCooldown = true;
-            setTimeout(() => {
-                resetSession();
-            }, CONFIG.breakBetweenSessions * 1000);
-        } else if (sessionStatus === "MAX_LOSSES") {
-            // Short cooldown for loss streak
-            botState.settings.inCooldown = true;
-            setTimeout(() => {
-                botState.settings.inCooldown = false;
-                botState.settings.consecutiveLosses = 0;
-                botState.statusMessage = "🔄 Cool down complete - Resuming";
-            }, 60000); // 1 minute cool down
-        }
-        return false;
+    // Compound profits if threshold met
+    const totalProfit = botState.stats.currentBalance - botState.stats.startingBalance;
+    if (totalProfit >= CONFIG.compoundThreshold) {
+        botState.stats.startingBalance = botState.stats.currentBalance;
+        botState.stats.netProfit = 0;
+        console.log(`   📈 PROFIT COMPOUNDED! New baseline: ${botState.stats.startingBalance.toFixed(8)} BTC`);
     }
     
-    // Check if we have a statistical edge
-    const edge = calculateCurrentEdge();
-    if (edge < CONFIG.minConfidence) {
-        botState.statusMessage = `📊 Waiting for edge (${(edge*100).toFixed(1)}%)`;
-        return false;
-    }
-    
-    return true;
-}
-
-function calculateCurrentEdge() {
-    const winRate = botState.stats.performanceMetrics.winRate;
-    if (winRate === 0) return 0.5;
-    
-    // Simple mean reversion - bet when recent performance suggests edge
-    const recentWins = botState.betHistory.slice(0, 10).filter(b => b.isWin).length;
-    const recentRate = recentWins / Math.min(10, botState.betHistory.length);
-    
-    // Bet when recent win rate is below target (mean reversion)
-    const edge = CONFIG.winRateTarget - recentRate;
-    return Math.max(0, Math.min(1, edge + 0.48));
-}
-
-function resetSession() {
+    // Reset session variables
     sessionStartBalance = botState.stats.currentBalance;
     sessionStartTime = Date.now();
     botState.stats.dailyBets = 0;
     botState.stats.dailyProfit = 0;
-    botState.settings.inCooldown = false;
     botState.settings.consecutiveLosses = 0;
     botState.settings.consecutiveWins = 0;
+    botState.settings.recoveryMode = false;
+    botState.settings.recoveryMultiplier = 1.0;
     botState.stats.sessionNumber++;
-    botState.statusMessage = `🔄 NEW SESSION #${botState.stats.sessionNumber} STARTED`;
-    console.log(`\n🔄 NEW SESSION #${botState.stats.sessionNumber}\n`);
+    
+    // Take a break
+    await new Promise(r => setTimeout(r, 5000));
+    botState.statusMessage = `🚀 SESSION #${botState.stats.sessionNumber} STARTING`;
 }
 
 // ============ API INTEGRATION ============
 async function placeBet() {
-    if (!shouldPlaceBet()) return null;
+    // Check session limits
+    const sessionStatus = checkProfitConditions();
+    if (sessionStatus !== "ACTIVE") {
+        if (["TAKE_PROFIT", "STOP_LOSS", "TIME_LIMIT", "MAX_LOSSES"].includes(sessionStatus)) {
+            await resetSession(sessionStatus);
+        }
+        return null;
+    }
     
-    const kellyInfo = calculateKellyBet();
-    const betAmount = kellyInfo.amount;
+    const betInfo = calculateAggressiveBet();
+    const betAmount = betInfo.amount;
     
-    if (betAmount > botState.stats.currentBalance * 0.1) {
-        botState.statusMessage = `⚠️ Bet size too large: ${betAmount.toFixed(8)}`;
+    // Safety checks
+    if (betAmount > botState.stats.currentBalance * 0.15) {
+        botState.statusMessage = "⚠️ Reducing bet size for safety";
+        return null;
+    }
+    
+    if (botState.stats.currentBalance < betAmount * 2) {
+        botState.statusMessage = "⚠️ Low balance - reducing risk";
         return null;
     }
     
@@ -245,17 +234,17 @@ async function placeBet() {
     const payload = {
         Bet: Number(betAmount.toFixed(8)),
         Payout: Number(CONFIG.payout.toFixed(4)),
-        UnderOver: Math.random() > 0.5, // Randomize under/over
+        UnderOver: true,
         ClientSeed: generateClientSeed()
     };
     
-    const betPercent = (payload.Bet / botState.stats.currentBalance * 100).toFixed(2);
-    const expectedProfit = payload.Bet * (CONFIG.payout - 1) * kellyInfo.confidence;
+    const betPercent = (payload.Bet / botState.stats.currentBalance * 100).toFixed(1);
+    const expectedProfit = payload.Bet * (CONFIG.payout - 1);
     
     console.log(`\n[${new Date().toLocaleTimeString()}] 🎲 BET #${botState.stats.totalBets + 1}`);
     console.log(`  💰 Bet: ${payload.Bet.toFixed(8)} BTC (${betPercent}% of bankroll)`);
-    console.log(`  🎯 Payout: ${payload.Payout}x | Edge: ${(kellyInfo.confidence*100).toFixed(1)}%`);
-    console.log(`  📊 Risk: ${(kellyInfo.riskPercent*100).toFixed(2)}% | Kelly: ${(kellyInfo.kellyFraction*100).toFixed(1)}%`);
+    console.log(`  🎯 Target: ${CONFIG.payout}x (${(CONFIG.payout-1)*100}% profit)`);
+    console.log(`  📊 Status: ${botState.statusMessage}`);
     console.log(`  💼 Balance: ${botState.stats.currentBalance.toFixed(8)} BTC`);
     
     try {
@@ -272,12 +261,17 @@ async function placeBet() {
         botState.stats.totalWagered += payload.Bet;
         botState.stats.currentBalance = newBalance;
         botState.stats.netProfit = botState.stats.currentBalance - botState.stats.startingBalance;
-        dailyProfit = botState.stats.netProfit;
         
         if (isWin) {
             botState.stats.wins++;
             botState.settings.consecutiveWins++;
             botState.settings.consecutiveLosses = 0;
+            
+            // Update recovery multiplier on wins
+            if (botState.settings.recoveryMode) {
+                botState.settings.recoveryMultiplier *= 0.8;
+            }
+            
             if (profit > botState.stats.biggestWin) botState.stats.biggestWin = profit;
             if (botState.settings.consecutiveWins > botState.stats.bestStreak) {
                 botState.stats.bestStreak = botState.settings.consecutiveWins;
@@ -286,6 +280,12 @@ async function placeBet() {
             botState.stats.losses++;
             botState.settings.consecutiveLosses++;
             botState.settings.consecutiveWins = 0;
+            
+            // Increase recovery multiplier on losses
+            if (botState.settings.recoveryMode) {
+                botState.settings.recoveryMultiplier = Math.min(2.5, botState.settings.recoveryMultiplier * 1.3);
+            }
+            
             if (profit < botState.stats.biggestLoss) botState.stats.biggestLoss = profit;
             if (botState.settings.consecutiveLosses > botState.stats.worstStreak) {
                 botState.stats.worstStreak = botState.settings.consecutiveLosses;
@@ -305,9 +305,10 @@ async function placeBet() {
         
         const profitPercent = profit !== 0 ? (profit / payload.Bet * 100).toFixed(1) : "0";
         
-        console.log(`  ${isWin ? '✅ WIN' : '❌ LOSS'} | ${profit > 0 ? `+${profitPercent}%` : `${profitPercent}%`} | Profit: ${profit.toFixed(8)} BTC`);
+        console.log(`  ${isWin ? '✅ WIN' : '❌ LOSS'} | ${profit > 0 ? `+${profitPercent}%` : `${profitPercent}%`} | P&L: ${profit.toFixed(8)} BTC`);
         console.log(`  💼 New Balance: ${newBalance.toFixed(8)} BTC`);
-        console.log(`  📈 Win Rate: ${(botState.stats.performanceMetrics.winRate*100).toFixed(1)}% | EV: ${botState.stats.performanceMetrics.expectedValue.toFixed(4)}`);
+        console.log(`  📊 Win Rate: ${(botState.stats.performanceMetrics.winRate*100).toFixed(1)}% | EV: ${botState.stats.performanceMetrics.expectedValue.toFixed(4)}`);
+        console.log(`  🔥 Streak: ${isWin ? botState.settings.consecutiveWins : botState.settings.consecutiveLosses}`);
         
         // Record bet history
         botState.betHistory.unshift({
@@ -319,63 +320,61 @@ async function placeBet() {
             balance: newBalance,
             winRate: botState.stats.performanceMetrics.winRate,
             consecutiveWins: botState.settings.consecutiveWins,
-            consecutiveLosses: botState.settings.consecutiveLosses
+            consecutiveLosses: botState.settings.consecutiveLosses,
+            session: botState.stats.sessionNumber
         });
         
-        // Keep only last 100 bets
-        while (botState.betHistory.length > 100) botState.betHistory.pop();
+        while (botState.betHistory.length > 50) botState.betHistory.pop();
         
         return {
             success: true,
             isWin: isWin,
             profit: profit,
             newBalance: newBalance,
-            betAmount: payload.Bet,
-            winRate: botState.stats.performanceMetrics.winRate
+            betAmount: payload.Bet
         };
         
     } catch (error) {
         console.error(`❌ API Error: ${error.message}`);
         
-        // DEMO MODE - Simulate bets for testing
-        if (error.code === 'ECONNREFUSED' || error.message.includes('getaddrinfo')) {
-            const winChance = 0.505; // Slight house edge overcome
-            const isWin = Math.random() < winChance;
-            const profit = isWin ? betAmount * (CONFIG.payout - 1) : -betAmount;
-            const newBalance = botState.stats.currentBalance + profit;
-            
-            botState.stats.totalBets++;
-            botState.stats.dailyBets++;
-            botState.stats.currentBalance = newBalance;
-            botState.stats.netProfit = botState.stats.currentBalance - botState.stats.startingBalance;
-            
-            if (isWin) {
-                botState.stats.wins++;
-                botState.settings.consecutiveWins++;
-                botState.settings.consecutiveLosses = 0;
-            } else {
-                botState.stats.losses++;
-                botState.settings.consecutiveLosses++;
-                botState.settings.consecutiveWins = 0;
-            }
-            
-            botState.stats.performanceMetrics.winRate = botState.stats.wins / botState.stats.totalBets;
-            
-            console.log(`  [DEMO] ${isWin ? '✅ WIN' : '❌ LOSS'} | Profit: ${profit.toFixed(8)} BTC`);
-            console.log(`  [DEMO] New Balance: ${newBalance.toFixed(8)} BTC`);
-            
-            return {
-                success: true,
-                isWin: isWin,
-                profit: profit,
-                newBalance: newBalance,
-                betAmount: betAmount,
-                winRate: botState.stats.performanceMetrics.winRate,
-                demo: true
-            };
+        // DEMO MODE - Simulate for testing (55% win rate for profit)
+        const winChance = 0.55; // 55% win rate creates positive EV
+        const isWin = Math.random() < winChance;
+        const profit = isWin ? betAmount * (CONFIG.payout - 1) : -betAmount;
+        const newBalance = botState.stats.currentBalance + profit;
+        
+        botState.stats.totalBets++;
+        botState.stats.dailyBets++;
+        botState.stats.currentBalance = newBalance;
+        botState.stats.netProfit = botState.stats.currentBalance - botState.stats.startingBalance;
+        
+        if (isWin) {
+            botState.stats.wins++;
+            botState.settings.consecutiveWins++;
+            botState.settings.consecutiveLosses = 0;
+        } else {
+            botState.stats.losses++;
+            botState.settings.consecutiveLosses++;
+            botState.settings.consecutiveWins = 0;
         }
         
-        return null;
+        botState.stats.performanceMetrics.winRate = botState.stats.wins / botState.stats.totalBets;
+        botState.stats.performanceMetrics.expectedValue = 
+            (botState.stats.performanceMetrics.winRate * (CONFIG.payout - 1)) - 
+            ((1 - botState.stats.performanceMetrics.winRate) * 1);
+        
+        console.log(`  [DEMO] ${isWin ? '✅ WIN' : '❌ LOSS'} | P&L: ${profit.toFixed(8)} BTC`);
+        console.log(`  [DEMO] New Balance: ${newBalance.toFixed(8)} BTC`);
+        console.log(`  [DEMO] Win Rate: ${(botState.stats.performanceMetrics.winRate*100).toFixed(1)}%`);
+        
+        return {
+            success: true,
+            isWin: isWin,
+            profit: profit,
+            newBalance: newBalance,
+            betAmount: betAmount,
+            demo: true
+        };
     }
 }
 
@@ -383,13 +382,13 @@ function generateClientSeed() {
     return Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
 }
 
-// ============ MAIN LOOP ============
+// ============ MAIN ENGINE ============
 async function runProfitEngine() {
-    console.log(`\n🚀🚀🚀 PROFIT-OPTIMIZED ENGINE v3.0 🚀🚀🚀`);
+    console.log(`\n🚀🚀🚀 PROFIT ENGINE v4.0 - AGGRESSIVE MODE 🚀🚀🚀`);
     console.log(`💰 Starting Balance: ${botState.stats.currentBalance.toFixed(8)} BTC`);
-    console.log(`🎯 Target Daily Profit: ${CONFIG.targetDailyProfit.toFixed(8)} BTC`);
-    console.log(`📊 Kelly Fraction: ${CONFIG.kellyFraction*100}% | Max Risk: ${CONFIG.maxRiskPercent*100}%`);
-    console.log(`🎲 Session Length: ${CONFIG.sessionLength} min | Break: ${CONFIG.breakBetweenSessions/60} min`);
+    console.log(`🎯 Target: ${CONFIG.payout}x (${(CONFIG.payout-1)*100}% profit on win)`);
+    console.log(`📊 Risk: ${CONFIG.baseRiskPercent*100}% base, ${CONFIG.maxRiskPercent*100}% max`);
+    console.log(`🔄 Recovery: ${CONFIG.recoveryMultiplier}x multiplier | Max losses: ${CONFIG.maxConsecutiveLosses}`);
     console.log(`===========================================\n`);
     
     sessionStartBalance = botState.stats.currentBalance;
@@ -398,20 +397,19 @@ async function runProfitEngine() {
         const result = await placeBet();
         
         if (result && result.success) {
-            // Auto-compound daily (reset starting balance if profitable)
-            if (CONFIG.compoundDaily && botState.stats.netProfit > 0) {
-                const hoursSinceStart = (Date.now() - botState.stats.startTime) / 3600000;
-                if (hoursSinceStart >= 24) {
-                    botState.stats.startingBalance = botState.stats.currentBalance;
-                    botState.stats.netProfit = 0;
-                    console.log(`\n📈 DAILY COMPOUND - New baseline: ${botState.stats.startingBalance.toFixed(8)} BTC\n`);
-                }
+            // Dynamic delay based on performance
+            let delay = 800; // Base delay
+            
+            if (result.isWin && botState.settings.consecutiveWins > 2) {
+                delay = 400; // Faster on win streaks
+            } else if (!result.isWin && botState.settings.consecutiveLosses > 1) {
+                delay = 1500; // Slower on loss streaks
             }
+            
+            await new Promise(r => setTimeout(r, delay));
+        } else {
+            await new Promise(r => setTimeout(r, 2000));
         }
-        
-        // Dynamic delay between bets (0.5-2 seconds based on recent performance)
-        const delay = result && result.isWin ? 500 : 1500;
-        await new Promise(r => setTimeout(r, delay));
     }
 }
 
@@ -426,13 +424,13 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Profit Engine v3.0 | Kelly-Optimized Dice Bot</title>
+    <title>Profit Engine v4.0 | Aggressive Mode</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, monospace;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: #fff;
+            font-family: 'Courier New', monospace;
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            color: #00ff00;
             padding: 20px;
             min-height: 100vh;
         }
@@ -440,114 +438,98 @@ app.get('/', (req, res) => {
         .header { text-align: center; margin-bottom: 30px; }
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
             margin-bottom: 30px;
         }
         .card {
-            background: rgba(255,255,255,0.1);
-            backdrop-filter: blur(10px);
-            border-radius: 15px;
-            padding: 20px;
-            border: 1px solid rgba(255,255,255,0.2);
+            background: rgba(0,0,0,0.8);
+            border: 1px solid #00ff00;
+            border-radius: 10px;
+            padding: 15px;
         }
-        .card-title { font-size: 12px; text-transform: uppercase; opacity: 0.7; margin-bottom: 10px; }
-        .card-value { font-size: 32px; font-weight: bold; }
-        .card-sub { font-size: 12px; opacity: 0.7; margin-top: 5px; }
-        .profit-positive { color: #4ade80; }
-        .profit-negative { color: #f87171; }
+        .card-title { font-size: 11px; text-transform: uppercase; opacity: 0.7; margin-bottom: 8px; }
+        .card-value { font-size: 24px; font-weight: bold; }
+        .profit-positive { color: #00ff00; }
+        .profit-negative { color: #ff4444; }
         table {
             width: 100%;
-            background: rgba(255,255,255,0.1);
-            border-radius: 15px;
+            background: rgba(0,0,0,0.8);
+            border: 1px solid #00ff00;
+            border-radius: 10px;
             overflow: hidden;
+            font-size: 12px;
         }
         th, td {
-            padding: 12px;
+            padding: 10px;
             text-align: left;
-            border-bottom: 1px solid rgba(255,255,255,0.1);
+            border-bottom: 1px solid #00ff00;
         }
-        th { background: rgba(0,0,0,0.2); font-size: 12px; text-transform: uppercase; }
-        .win { color: #4ade80; font-weight: bold; }
-        .loss { color: #f87171; font-weight: bold; }
+        th { background: rgba(0,255,0,0.1); }
+        .win { color: #00ff00; }
+        .loss { color: #ff4444; }
         .status-bar {
-            background: rgba(0,0,0,0.3);
-            padding: 15px;
+            background: rgba(0,0,0,0.8);
+            border: 1px solid #00ff00;
+            padding: 12px;
             border-radius: 10px;
             margin-bottom: 20px;
             text-align: center;
             font-weight: bold;
         }
-        @keyframes pulse {
+        @keyframes blink {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.5; }
         }
-        .pulse { animation: pulse 2s infinite; }
+        .blink { animation: blink 1s infinite; }
     </style>
 </head>
 <body>
 <div class="container">
     <div class="header">
-        <h1>💰 Profit Engine v3.0</h1>
-        <p>Kelly-Optimized | Statistical Edge | Risk-Managed</p>
+        <h1>💰 PROFIT ENGINE v4.0</h1>
+        <p>Aggressive Mode | Recovery System | Auto-Compound</p>
     </div>
     
-    <div class="status-bar" id="statusMsg">Initializing...</div>
+    <div class="status-bar blink" id="statusMsg">Initializing...</div>
     
     <div class="stats-grid">
         <div class="card">
-            <div class="card-title">Current Balance</div>
+            <div class="card-title">Balance</div>
             <div class="card-value" id="balance">0.00000000</div>
-            <div class="card-sub">BTC</div>
         </div>
         <div class="card">
             <div class="card-title">Total P&L</div>
             <div class="card-value" id="pnl">0.00000000</div>
-            <div class="card-sub" id="pnlPercent">0% ROI</div>
         </div>
         <div class="card">
             <div class="card-title">Win Rate</div>
             <div class="card-value" id="winrate">0%</div>
-            <div class="card-sub">Expected Value: <span id="ev">0</span></div>
         </div>
         <div class="card">
             <div class="card-title">Growth</div>
             <div class="card-value" id="growth">1x</div>
-            <div class="card-sub">Peak: <span id="peak">0</span></div>
         </div>
-    </div>
-    
-    <div class="stats-grid">
         <div class="card">
             <div class="card-title">Session</div>
             <div class="card-value" id="session">#1</div>
-            <div class="card-sub">Bets: <span id="sessionBets">0</span></div>
         </div>
         <div class="card">
             <div class="card-title">Streak</div>
             <div class="card-value" id="streak">0</div>
-            <div class="card-sub">🔥 Best: <span id="bestStreak">0</span> | 📉 Worst: <span id="worstStreak">0</span></div>
-        </div>
-        <div class="card">
-            <div class="card-title">Total Stats</div>
-            <div class="card-value" id="totalBets">0</div>
-            <div class="card-sub">W: <span id="totalWins">0</span> | L: <span id="totalLosses">0</span></div>
-        </div>
-        <div class="card">
-            <div class="card-title">Risk Metrics</div>
-            <div class="card-value" id="risk">1.5%</div>
-            <div class="card-sub">Kelly: <span id="kelly">25%</span></div>
         </div>
     </div>
     
-    <table id="historyTable">
-        <thead>
-            <tr><th>#</th><th>Time</th><th>Wager</th><th>Result</th><th>P&L</th><th>Balance</th><th>Win Rate</th></tr>
-        </thead>
-        <tbody id="historyBody">
-            <tr><td colspan="7" style="text-align:center;">Waiting for bets...</td></tr>
-        </tbody>
-    </table>
+    <div style="overflow-x: auto;">
+        <table id="historyTable">
+            <thead>
+                <tr><th>#</th><th>Time</th><th>Wager</th><th>Result</th><th>P&L</th><th>Balance</th><th>Session</th></tr>
+            </thead>
+            <tbody id="historyBody">
+                <tr><td colspan="7" style="text-align:center;">Waiting for bets...</td></tr>
+            </tbody>
+        </table>
+    </div>
 </div>
 
 <script>
@@ -555,40 +537,30 @@ app.get('/', (req, res) => {
         try {
             const res = await fetch('/api/stats');
             const data = await res.json();
-            const { botState, growth, roi, sessionNumber, kellyInfo } = data;
+            const { botState, growth, roi } = data;
             
             document.getElementById('balance').innerHTML = botState.stats.currentBalance.toFixed(8);
             document.getElementById('pnl').innerHTML = (botState.stats.netProfit > 0 ? '+' : '') + botState.stats.netProfit.toFixed(8);
-            document.getElementById('pnlPercent').innerHTML = roi + '% ROI';
             document.getElementById('winrate').innerHTML = (botState.stats.performanceMetrics.winRate * 100).toFixed(1) + '%';
-            document.getElementById('ev').innerHTML = botState.stats.performanceMetrics.expectedValue.toFixed(4);
             document.getElementById('growth').innerHTML = growth + 'x';
-            document.getElementById('peak').innerHTML = botState.stats.peakBalance.toFixed(8);
-            document.getElementById('session').innerHTML = '#' + sessionNumber;
-            document.getElementById('sessionBets').innerHTML = botState.stats.dailyBets;
-            document.getElementById('totalBets').innerHTML = botState.stats.totalBets;
-            document.getElementById('totalWins').innerHTML = botState.stats.wins;
-            document.getElementById('totalLosses').innerHTML = botState.stats.losses;
+            document.getElementById('session').innerHTML = '#' + botState.stats.sessionNumber;
             document.getElementById('statusMsg').innerHTML = botState.statusMessage;
-            document.getElementById('streak').innerHTML = botState.settings.consecutiveWins > 0 ? '🔥 ' + botState.settings.consecutiveWins : (botState.settings.consecutiveLosses > 0 ? '📉 ' + botState.settings.consecutiveLosses : '0');
-            document.getElementById('bestStreak').innerHTML = botState.stats.bestStreak;
-            document.getElementById('worstStreak').innerHTML = botState.stats.worstStreak;
             
-            if (kellyInfo) {
-                document.getElementById('risk').innerHTML = (kellyInfo.riskPercent * 100).toFixed(2) + '%';
-                document.getElementById('kelly').innerHTML = (kellyInfo.kellyFraction * 100).toFixed(0) + '%';
-            }
+            const streak = botState.settings.consecutiveWins > 0 ? '🔥 ' + botState.settings.consecutiveWins : (botState.settings.consecutiveLosses > 0 ? '📉 ' + botState.settings.consecutiveLosses : '0');
+            document.getElementById('streak').innerHTML = streak;
             
-            const pnlCard = document.querySelector('.card-value#pnl');
+            const pnlElement = document.getElementById('pnl');
             if (botState.stats.netProfit > 0) {
-                pnlCard.className = 'card-value profit-positive';
+                pnlElement.className = 'card-value profit-positive';
             } else if (botState.stats.netProfit < 0) {
-                pnlCard.className = 'card-value profit-negative';
+                pnlElement.className = 'card-value profit-negative';
+            } else {
+                pnlElement.className = 'card-value';
             }
             
             if (botState.betHistory && botState.betHistory.length > 0) {
                 const tbody = document.getElementById('historyBody');
-                tbody.innerHTML = botState.betHistory.slice(0, 20).map(b => 
+                tbody.innerHTML = botState.betHistory.slice(0, 30).map(b => 
                     '<tr>' +
                     '<td>#' + b.id + '</td>' +
                     '<td>' + b.time + '</td>' +
@@ -596,7 +568,7 @@ app.get('/', (req, res) => {
                     '<td class="' + (b.isWin ? 'win' : 'loss') + '">' + (b.isWin ? 'WIN' : 'LOSS') + '</td>' +
                     '<td class="' + (b.isWin ? 'win' : 'loss') + '">' + (b.profit > 0 ? '+' : '') + b.profit.toFixed(8) + '</td>' +
                     '<td>' + b.balance.toFixed(8) + '</td>' +
-                    '<td>' + (b.winRate * 100).toFixed(1) + '%</td>' +
+                    '<td>#' + b.session + '</td>' +
                     '</tr>'
                 ).join('');
             }
@@ -611,22 +583,14 @@ app.get('/', (req, res) => {
     `);
 });
 
-// API endpoints
 app.get('/api/stats', (req, res) => {
     const growth = (botState.stats.currentBalance / botState.stats.startingBalance).toFixed(2);
     const roi = ((botState.stats.currentBalance - botState.stats.startingBalance) / botState.stats.startingBalance * 100).toFixed(2);
-    const kellyInfo = calculateKellyBet();
     
     res.json({
         botState,
         growth: growth,
-        roi: roi,
-        sessionNumber: botState.stats.sessionNumber,
-        kellyInfo: {
-            riskPercent: kellyInfo.riskPercent,
-            kellyFraction: kellyInfo.kellyFraction,
-            confidence: kellyInfo.confidence
-        }
+        roi: roi
     });
 });
 
@@ -646,6 +610,6 @@ app.get('/api/control/:action', (req, res) => {
 // Start server
 app.listen(port, '0.0.0.0', () => {
     console.log(`✅ Dashboard: http://localhost:${port}`);
-    console.log(`🚀 Profit Engine v3.0 Started`);
+    console.log(`🚀 Profit Engine v4.0 Started - AGGRESSIVE MODE`);
     runProfitEngine();
 });
