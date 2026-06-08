@@ -6,12 +6,12 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "cD9uvR6HaqA8xlMKRqfjQJZFXT0tR5Br5G5VGaQwAbqvVtYKOz";
+const API_KEY = process.env.API_KEY || "ynXUumHAd8oYBrna4wfnHaMnlaUZzdUWY7zZSbN66tlgxAfaby";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const DEFAULTS = {
     coin: "BTC",
-    payout: 2.0,              
+    payout: 1.7,              
     balanceStep: 0.00000050,  
     betIncrement: 0.00000001
 };
