@@ -21,7 +21,7 @@ const GAME_CONFIG = {
     maxBet: 0.00000300,     // 300 satoshi max
     
     // FIXED: Win streak progression
-    streakMultipliers: [2.5, 3, 3.5, 4, 4.5, 5, 5.5], // Progressive increase
+    streakMultipliers: [2.5, 5, 7.5, 10, 12.5, 15, 17.5], // Progressive increase
     maxStreak: 6,
     
     // Recovery from loss
