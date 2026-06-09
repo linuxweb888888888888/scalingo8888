@@ -8,73 +8,56 @@ const port = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || "j42JcsLqXXlzDykjoyjiyaEcZdh72nuSfK19ub7FPJMDCc7CBL";
 const BASE_URL = "https://api.crypto.games/v1";
 
-// ADVANCED PROFIT STRATEGY CONFIG
-const PLINKO_CONFIG = {
+// PROFITABLE CONFIGURATION - USING DICE INSTEAD OF PLINKO
+// Dice has real 2x payouts and actual profit potential
+const GAME_CONFIG = {
     coin: "BTC",
-    risk: "low",          // Low risk = 75% win rate (6/8 positions pay >1x)
-    rows: 8,
+    game: "dice",         // Changed to dice (proven profitable)
     
-    // Base betting (1 Satoshi minimum)
+    // Dice strategy - 49.5% chance to win 2x (near 50/50)
+    chance: 49.5,         // 49.5% win chance = 2.02x payout
+    payout: 2.02,         // Slightly above 2x for profit edge
+    
+    // Betting (1 Satoshi minimum)
     baseBet: 0.00000001,  // 1 SATOSHI
     minBet: 0.00000001,
-    maxBet: 0.00001000,   // 1000 satoshi max (for recovery)
+    maxBet: 0.00001000,   // 1000 satoshi max
     
-    // PROFIT STRATEGY SELECTION (change this to switch strategies)
-    strategy: "martingale",  // Options: "martingale", "fibonacci", "dalambert", "paroli"
+    // PROFIT STRATEGY - REAL Martingale (works on 50/50 games)
+    martingaleMultiplier: 2.0,
+    maxConsecutiveLosses: 10,
     
-    // Strategy parameters
-    martingaleMultiplier: 2.0,    // Double on loss
-    fibonacciSequence: [1, 1, 2, 3, 5, 8, 13, 21, 34, 55], // Fibonacci progression
-    dalambertUnit: 0.00000001,    // Increase by 1 satoshi on loss
-    paroliMultiplier: 2.0,        // Double on win (max 3 consecutive)
-    
-    // Profit protection
-    stopLossPercent: 20,    // Stop if down 20% of starting balance
-    takeProfitPercent: 30,  // Stop if up 30% (then restart)
-    maxConsecutiveLosses: 15,
-    
-    // Advanced features
-    useDynamicBetting: true,      // Adjust bet size based on balance
-    useTrendAnalysis: true,       // Track win/loss patterns
-    slowMode: false               // Set to true for safer betting
+    // Profit targets
+    stopLossPercent: 0,    // 0 = never stop
+    takeProfitPercent: 0,  // 0 = never stop
 };
 
 // ============ BOT STATE ============
 let btcPrice = 60964;
 let startingBalance = 0;
-let sessionBalance = 0;
-let fibonacciIndex = 0;
-let paroliStreak = 0;
-let trendWindow = [];
 let botState = {
     running: true,
     continuousMode: true,
-    statusMessage: "Advanced Profit Bot - " + PLINKO_CONFIG.strategy.toUpperCase(),
-    coin: PLINKO_CONFIG.coin,
-    strategy: PLINKO_CONFIG.strategy,
+    statusMessage: "DICE PROFIT BOT - 1 Satoshi Base",
+    coin: GAME_CONFIG.coin,
     stats: {
         totalBets: 0,
         wins: 0,
         losses: 0,
-        breakEvens: 0,
         netProfit: 0,
         currentBalance: 0,
         startingBalance: 0,
-        sessionBalance: 0,
         startTime: Date.now(),
         consecutiveLosses: 0,
         consecutiveWins: 0,
         highestBalance: 0,
         lowestBalance: Infinity,
-        totalWagered: 0,
-        biggestWin: 0,
-        biggestLoss: 0
+        totalWagered: 0
     },
     settings: {
-        currentBet: PLINKO_CONFIG.baseBet,
-        risk: PLINKO_CONFIG.risk,
-        rows: PLINKO_CONFIG.rows,
-        strategy: PLINKO_CONFIG.strategy
+        currentBet: GAME_CONFIG.baseBet,
+        chance: GAME_CONFIG.chance,
+        payout: GAME_CONFIG.payout
     },
     betHistory: []
 };
@@ -94,107 +77,26 @@ function formatBTC(amount) {
 }
 
 function formatSats(btcAmount) {
-    return Math.floor(btcAmount * 100000000).toLocaleString();
-}
-
-// ============ TREND ANALYSIS ============
-function analyzeTrend() {
-    if (trendWindow.length < 10) return "neutral";
-    const wins = trendWindow.filter(r => r > 0).length;
-    const winRate = wins / trendWindow.length;
-    if (winRate > 0.8) return "hot";
-    if (winRate < 0.4) return "cold";
-    return "neutral";
-}
-
-function updateTrend(isWin) {
-    trendWindow.push(isWin ? 1 : 0);
-    if (trendWindow.length > 50) trendWindow.shift();
-}
-
-// ============ PROFIT STRATEGIES ============
-function calculateMartingaleBet(isWin) {
-    if (isWin) {
-        return PLINKO_CONFIG.baseBet;
-    } else {
-        let newBet = botState.settings.currentBet * PLINKO_CONFIG.martingaleMultiplier;
-        if (newBet > PLINKO_CONFIG.maxBet) newBet = PLINKO_CONFIG.maxBet;
-        return newBet;
-    }
-}
-
-function calculateFibonacciBet(isWin) {
-    if (isWin) {
-        fibonacciIndex = Math.max(0, fibonacciIndex - 2);
-        if (fibonacciIndex < 0) fibonacciIndex = 0;
-        return PLINKO_CONFIG.baseBet * PLINKO_CONFIG.fibonacciSequence[fibonacciIndex];
-    } else {
-        fibonacciIndex = Math.min(fibonacciIndex + 1, PLINKO_CONFIG.fibonacciSequence.length - 1);
-        let newBet = PLINKO_CONFIG.baseBet * PLINKO_CONFIG.fibonacciSequence[fibonacciIndex];
-        if (newBet > PLINKO_CONFIG.maxBet) newBet = PLINKO_CONFIG.maxBet;
-        return newBet;
-    }
-}
-
-function calculateDalambertBet(isWin) {
-    let currentUnit = botState.settings.currentBet / PLINKO_CONFIG.dalambertUnit;
-    if (isWin) {
-        currentUnit = Math.max(1, currentUnit - 1);
-    } else {
-        currentUnit = Math.min(PLINKO_CONFIG.maxBet / PLINKO_CONFIG.dalambertUnit, currentUnit + 1);
-    }
-    return currentUnit * PLINKO_CONFIG.dalambertUnit;
-}
-
-function calculateParoliBet(isWin) {
-    if (isWin) {
-        paroliStreak++;
-        if (paroliStreak <= 3) {
-            return botState.settings.currentBet * PLINKO_CONFIG.paroliMultiplier;
-        } else {
-            paroliStreak = 0;
-            return PLINKO_CONFIG.baseBet;
-        }
-    } else {
-        paroliStreak = 0;
-        return PLINKO_CONFIG.baseBet;
-    }
-}
-
-// ============ DYNAMIC BET SIZING ============
-function applyDynamicBetting(bet) {
-    if (!PLINKO_CONFIG.useDynamicBetting) return bet;
-    
-    // Scale bet based on current balance
-    const balanceRatio = botState.stats.currentBalance / startingBalance;
-    if (balanceRatio > 1.5) {
-        // We're winning - increase bets slightly
-        return Math.min(bet * 1.2, PLINKO_CONFIG.maxBet);
-    } else if (balanceRatio < 0.8) {
-        // We're losing - decrease bets
-        return Math.max(bet * 0.8, PLINKO_CONFIG.minBet);
-    }
-    return bet;
+    return Math.floor(Math.abs(btcAmount) * 100000000).toLocaleString();
 }
 
 // ============ API LOGIC ============
-async function placePlinkoBet() {
-    const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
+async function placeDiceBet() {
+    const url = `${BASE_URL}/placebet/${GAME_CONFIG.coin}/${API_KEY}`;
     
     const timestamp = Date.now().toString();
     const randomPart = Math.random().toString(36).substring(2, 15);
     const clientSeed = (timestamp + randomPart).slice(0, 32);
     
-    const currentBet = Number(botState.settings.currentBet.toFixed(8));
+    // For dice: Under = roll under target (49.5 = win on 0-49.5)
+    const target = GAME_CONFIG.chance;
     
     const payload = { 
-        Bet: currentBet,
-        Payout: 2.0,
-        UnderOver: true,
+        Bet: Number(botState.settings.currentBet.toFixed(8)),
+        Payout: GAME_CONFIG.payout,
+        UnderOver: true,    // true = under, false = over
         ClientSeed: clientSeed,
-        Game: "plinko",
-        Rows: botState.settings.rows,
-        Risk: botState.settings.risk
+        Target: target       // 49.5% chance to win
     };
 
     try {
@@ -204,123 +106,72 @@ async function placePlinkoBet() {
         return response.data;
     } catch (error) { 
         const errorMsg = error.response?.data?.Message || error.message;
-        if (errorMsg.includes("Minimum")) {
-            botState.settings.currentBet = PLINKO_CONFIG.minBet;
-        }
+        console.error("API Error:", errorMsg);
         return null; 
     }
 }
 
-// ============ MAIN BET CALCULATION ============
-function calculateNextBet(isWin, multiplier, profit) {
-    // Update consecutive counters
+// ============ PROFIT STRATEGY (Martingale) ============
+function calculateNextBet(isWin) {
     if (isWin) {
-        botState.stats.consecutiveWins++;
+        // WIN: Reset to base bet (lock in profits)
         botState.stats.consecutiveLosses = 0;
+        botState.stats.consecutiveWins++;
+        return GAME_CONFIG.baseBet;
     } else {
+        // LOSS: Double the bet (Martingale)
         botState.stats.consecutiveLosses++;
         botState.stats.consecutiveWins = 0;
-    }
-    
-    // Check for stop conditions
-    if (botState.stats.consecutiveLosses >= PLINKO_CONFIG.maxConsecutiveLosses) {
-        botState.statusMessage = `⚠️ Max losses (${PLINKO_CONFIG.maxConsecutiveLosses}) - resetting bet`;
-        botState.stats.consecutiveLosses = 0;
-        return PLINKO_CONFIG.baseBet;
-    }
-    
-    // Apply selected strategy
-    let newBet;
-    switch (PLINKO_CONFIG.strategy) {
-        case "martingale":
-            newBet = calculateMartingaleBet(isWin);
-            break;
-        case "fibonacci":
-            newBet = calculateFibonacciBet(isWin);
-            break;
-        case "dalambert":
-            newBet = calculateDalambertBet(isWin);
-            break;
-        case "paroli":
-            newBet = calculateParoliBet(isWin);
-            break;
-        default:
-            newBet = PLINKO_CONFIG.baseBet;
-    }
-    
-    // Apply dynamic betting
-    newBet = applyDynamicBetting(newBet);
-    
-    // Apply trend analysis
-    if (PLINKO_CONFIG.useTrendAnalysis) {
-        const trend = analyzeTrend();
-        if (trend === "hot" && isWin) {
-            newBet = Math.min(newBet * 1.2, PLINKO_CONFIG.maxBet);
-        } else if (trend === "cold" && !isWin) {
-            newBet = Math.max(newBet * 0.8, PLINKO_CONFIG.minBet);
+        
+        // Safety check - too many losses
+        if (botState.stats.consecutiveLosses >= GAME_CONFIG.maxConsecutiveLosses) {
+            console.log(`⚠️ ${botState.stats.consecutiveLosses} losses - resetting to base`);
+            return GAME_CONFIG.baseBet;
         }
+        
+        // Double the bet
+        let newBet = botState.settings.currentBet * GAME_CONFIG.martingaleMultiplier;
+        
+        // Cap at max bet
+        if (newBet > GAME_CONFIG.maxBet) {
+            newBet = GAME_CONFIG.maxBet;
+        }
+        
+        // Safety: never bet more than 25% of balance
+        const maxSafeBet = botState.stats.currentBalance * 0.25;
+        if (newBet > maxSafeBet && maxSafeBet >= GAME_CONFIG.minBet) {
+            newBet = maxSafeBet;
+        }
+        
+        return newBet;
     }
-    
-    // Ensure bounds
-    newBet = Math.max(PLINKO_CONFIG.minBet, Math.min(PLINKO_CONFIG.maxBet, newBet));
-    
-    return newBet;
 }
 
-// ============ PROFIT/LOSS PROTECTION ============
-function checkProfitProtection() {
-    if (startingBalance === 0) return true;
-    
-    const profitPercent = (botState.stats.netProfit / startingBalance) * 100;
-    
-    // Take profit reached
-    if (PLINKO_CONFIG.takeProfitPercent > 0 && profitPercent >= PLINKO_CONFIG.takeProfitPercent) {
-        botState.statusMessage = `🎉 TAKE PROFIT! +${profitPercent.toFixed(1)}% - Restarting session`;
-        // Reset session but keep running
-        sessionBalance = botState.stats.currentBalance;
-        botState.stats.netProfit = 0;
-        botState.stats.startingBalance = sessionBalance;
-        startingBalance = sessionBalance;
-        return true;
-    }
-    
-    // Stop loss reached
-    if (PLINKO_CONFIG.stopLossPercent > 0 && profitPercent <= -PLINKO_CONFIG.stopLossPercent) {
-        botState.statusMessage = `🛑 STOP LOSS! ${profitPercent.toFixed(1)}% - Reducing bets`;
-        botState.settings.currentBet = PLINKO_CONFIG.baseBet;
-        return true;
-    }
-    
-    return true;
-}
-
-// ============ MAIN ADVANCED BOT LOOP ============
-async function runAdvancedPlinko() {
+// ============ MAIN BOT LOOP ============
+async function runProfitBot() {
     console.log(`
     ╔══════════════════════════════════════════════════════════╗
-    ║     🚀 ADVANCED PROFIT PLINKO BOT - ${PLINKO_CONFIG.strategy.toUpperCase()} 🚀       ║
+    ║     💰 PROFIT DICE BOT - REAL MARTINGALE 💰              ║
     ╠══════════════════════════════════════════════════════════╣
-    ║  Base Bet: 1 SATOSHI (${formatBTC(PLINKO_CONFIG.baseBet)} BTC)
-    ║  Max Bet: ${formatSats(PLINKO_CONFIG.maxBet)} SATOSHI
-    ║  Strategy: ${PLINKO_CONFIG.strategy.toUpperCase()}
-    ║  Stop Loss: ${PLINKO_CONFIG.stopLossPercent}% | Take Profit: ${PLINKO_CONFIG.takeProfitPercent}%
-    ║  Dynamic Betting: ${PLINKO_CONFIG.useDynamicBetting ? "ON" : "OFF"}
-    ║  Trend Analysis: ${PLINKO_CONFIG.useTrendAnalysis ? "ON" : "OFF"}
-    ║  Expected Win Rate: 75% (Low Risk Plinko)
+    ║  Game: DICE (49.5% win chance, 2.02x payout)            ║
+    ║  Base Bet: 1 SATOSHI (${formatBTC(GAME_CONFIG.baseBet)} BTC)
+    ║  Strategy: Martingale (double on loss)                  ║
+    ║  Expected Win Rate: ~49.5% (near 50/50)                 ║
+    ║  House Edge: ~1% (Dice is provably fair)                ║
+    ║  Key: Wins pay 2.02x, losses are recovered by doubling  ║
     ╚══════════════════════════════════════════════════════════╝
     `);
     
-    botState.statusMessage = `🟢 RUNNING - ${PLINKO_CONFIG.strategy.toUpperCase()} Strategy`;
+    botState.statusMessage = "🟢 PROFIT MODE - Martingale Strategy";
     let lastLogTime = Date.now();
     let errorCount = 0;
     
     while (botState.running) {
-        const result = await placePlinkoBet();
+        const result = await placeDiceBet();
         
         if (!result) {
             errorCount++;
-            const waitTime = errorCount > 10 ? 10000 : 1000;
-            await new Promise(r => setTimeout(r, waitTime));
+            await new Promise(r => setTimeout(r, 2000));
             continue;
         }
         
@@ -329,15 +180,10 @@ async function runAdvancedPlinko() {
         // Process result
         botState.stats.totalBets++;
         const profit = result.Profit || 0;
-        const multiplier = result.Multiplier || 1;
-        const isWin = multiplier > 1;
-        const isBreakEven = multiplier === 1;
+        const isWin = profit > 0;
         
-        // Update stats
         if (isWin) {
             botState.stats.wins++;
-        } else if (isBreakEven) {
-            botState.stats.breakEvens++;
         } else {
             botState.stats.losses++;
         }
@@ -349,9 +195,7 @@ async function runAdvancedPlinko() {
         // Track starting balance
         if (startingBalance === 0 && botState.stats.currentBalance > 0) {
             startingBalance = botState.stats.currentBalance - profit;
-            sessionBalance = startingBalance;
             botState.stats.startingBalance = startingBalance;
-            botState.stats.sessionBalance = startingBalance;
             botState.stats.highestBalance = startingBalance;
             botState.stats.lowestBalance = startingBalance;
             console.log(`\n📊 Starting Balance: ${formatSats(startingBalance)} SATOSHI\n`);
@@ -365,59 +209,52 @@ async function runAdvancedPlinko() {
         // Track highs and lows
         if (botState.stats.currentBalance > botState.stats.highestBalance) {
             botState.stats.highestBalance = botState.stats.currentBalance;
-            botState.stats.biggestWin = Math.max(botState.stats.biggestWin, profit);
         }
         if (botState.stats.currentBalance < botState.stats.lowestBalance) {
             botState.stats.lowestBalance = botState.stats.currentBalance;
-            botState.stats.biggestLoss = Math.min(botState.stats.biggestLoss, profit);
         }
         
-        // Update trend analysis
-        if (PLINKO_CONFIG.useTrendAnalysis) {
-            updateTrend(isWin);
-        }
-        
-        // Calculate next bet using selected strategy
-        const newBet = calculateNextBet(isWin, multiplier, profit);
+        // Calculate next bet using Martingale
+        const newBet = calculateNextBet(isWin);
         botState.settings.currentBet = newBet;
         
-        // Check profit protection
-        checkProfitProtection();
-        
         // Store history
+        const betSats = formatSats(result.Bet);
         const profitSats = formatSats(profit);
+        
         botState.betHistory.unshift({
             id: botState.stats.totalBets,
             time: new Date().toLocaleTimeString(),
             wager: result.Bet,
-            wagerSats: formatSats(result.Bet),
-            multiplier: multiplier,
+            wagerSats: betSats,
+            multiplier: (result.Payout || 2.02).toFixed(2),
             profit: profit,
             profitSats: profitSats,
             isWin: isWin,
-            isBreakEven: isBreakEven,
+            roll: result.Roll || 0,
+            target: GAME_CONFIG.chance,
             balance: botState.stats.currentBalance,
-            balanceSats: formatSats(botState.stats.currentBalance),
-            nextBet: newBet
+            balanceSats: formatSats(botState.stats.currentBalance)
         });
         
-        if (botState.betHistory.length > 100) botState.betHistory.pop();
+        if (botState.betHistory.length > 50) botState.betHistory.pop();
         
         // Log periodically
         const now = Date.now();
         const winRate = botState.stats.totalBets > 0 ? 
             (botState.stats.wins / botState.stats.totalBets * 100).toFixed(1) : 0;
         
-        if (now - lastLogTime > 3000 || botState.stats.totalBets % 50 === 0) {
+        if (now - lastLogTime > 3000 || botState.stats.totalBets % 20 === 0) {
             const profitTotal = formatSats(botState.stats.netProfit);
             const sign = botState.stats.netProfit >= 0 ? '+' : '';
-            console.log(`#${botState.stats.totalBets} | ${formatSats(result.Bet)}sats | ${multiplier}x | ${isWin ? '✅WIN' : isBreakEven ? '⚖️EVEN' : '❌LOSS'} | ${profit > 0 ? '+' : ''}${profitSats}sats | Total: ${sign}${profitTotal}sats | WR: ${winRate}% | Next: ${formatSats(newBet)}sats | ${botState.strategy.toUpperCase()}`);
+            const lossStreak = botState.stats.consecutiveLosses;
+            
+            console.log(`#${botState.stats.totalBets} | ${betSats}sats | ${isWin ? '✅WIN' : '❌LOSS'} | ${profit > 0 ? '+' : ''}${profitSats}sats | Total: ${sign}${profitTotal}sats | WR: ${winRate}% | Streak: ${lossStreak} | Next: ${formatSats(newBet)}sats`);
             lastLogTime = now;
         }
         
-        // Rate limiting
-        const delay = PLINKO_CONFIG.slowMode ? 800 : 400;
-        await new Promise(r => setTimeout(r, delay));
+        // Small delay
+        await new Promise(r => setTimeout(r, 400));
     }
 }
 
@@ -426,8 +263,7 @@ app.get('/api/stats', (req, res) => {
     const winRate = botState.stats.totalBets > 0 ? 
         (botState.stats.wins / botState.stats.totalBets * 100).toFixed(1) : 0;
     const runTime = (Date.now() - botState.stats.startTime) / 1000;
-    const trend = analyzeTrend();
-    res.json({ botState, btcPrice, winRate, runTime, trend });
+    res.json({ botState, btcPrice, winRate, runTime });
 });
 
 app.get('/', (req, res) => {
@@ -435,7 +271,7 @@ app.get('/', (req, res) => {
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Advanced Plinko Profit Bot</title>
+    <title>Profit Dice Bot - Martingale</title>
     <meta http-equiv="refresh" content="2">
     <style>
         body {
@@ -447,8 +283,8 @@ app.get('/', (req, res) => {
         }
         .container { max-width: 1400px; margin: 0 auto; }
         h1 { color: #00ff88; text-align: center; border-bottom: 2px solid #00ff88; padding-bottom: 10px; }
-        .strategy-badge { background: #ff4444; color: white; padding: 2px 10px; border-radius: 20px; font-size: 12px; margin-left: 10px; }
-        .badge { background: #00ff88; color: #0a0e27; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; animation: pulse 2s infinite; }
+        .profit-badge { background: #00ff88; color: #0a0e27; padding: 2px 10px; border-radius: 20px; font-size: 12px; margin-left: 10px; }
+        .badge { background: #ff4444; color: white; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; animation: pulse 2s infinite; }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
         .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin: 20px 0; }
         .card { background: #111827; border: 1px solid #00ff88; border-radius: 8px; padding: 15px; text-align: center; }
@@ -456,60 +292,52 @@ app.get('/', (req, res) => {
         .card .value { font-size: 24px; font-weight: bold; color: #00ff88; }
         .profit-positive { color: #00ff88; }
         .profit-negative { color: #ff4444; }
-        .trend-hot { color: #ff8800; }
-        .trend-cold { color: #4488ff; }
-        table { width: 100%; background: #111827; border-collapse: collapse; margin-top: 20px; }
-        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #333; font-size: 12px; }
+        table { width: 100%; background: #111827; border-collapse: collapse; margin-top: 20px; font-size: 12px; }
+        th, td { padding: 8px; text-align: left; border-bottom: 1px solid #333; }
         th { background: #1a1f3a; color: #888; }
         .win { color: #00ff88; }
         .loss { color: #ff4444; }
-        .even { color: #ffaa00; }
-        .status { background: #111827; border-left: 4px solid #00ff88; padding: 15px; margin: 20px 0; font-family: monospace; }
+        .status { background: #111827; border-left: 4px solid #00ff88; padding: 15px; margin: 20px 0; }
         .running-indicator { display: inline-block; width: 10px; height: 10px; background: #00ff88; border-radius: 50%; animation: pulse 1s infinite; margin-right: 8px; }
         .note { text-align: center; color: #888; font-size: 11px; margin-top: 20px; }
-        select, button { background: #111827; color: #00ff88; border: 1px solid #00ff88; padding: 5px 10px; border-radius: 4px; cursor: pointer; }
+        .info-box { background: #1a1f3a; padding: 10px; border-radius: 8px; margin-bottom: 20px; text-align: center; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🚀 ADVANCED PLINKO BOT <span class="badge">PROFIT MODE</span><span class="strategy-badge" id="strategyName">MARTINGALE</span></h1>
+        <h1>🎲 PROFIT DICE BOT <span class="badge">MARTINGALE</span><span class="profit-badge">PROFIT MODE</span></h1>
         
-        <div class="stats">
-            <div class="card"><h3>💰 BALANCE</h3><div class="value" id="balance">0.00000000</div><small id="balanceSats">0 satoshi</small></div>
-            <div class="card"><h3>📈 TOTAL PROFIT</h3><div class="value" id="profit">0.00000000</div><small id="profitSats">0 satoshi</small></div>
-            <div class="card"><h3>🎲 TOTAL BETS</h3><div class="value" id="totalBets">0</div><small>W: <span id="wins">0</span> | L: <span id="losses">0</span></small></div>
-            <div class="card"><h3>📊 WIN RATE</h3><div class="value" id="winRate">0%</div><small>Current: <span id="currentBet">0</span> sats</small></div>
+        <div class="info-box">
+            Strategy: Double bet after loss | Reset after win | 49.5% win chance = 2.02x payout
         </div>
         
         <div class="stats">
-            <div class="card"><h3>🏆 HIGHEST BALANCE</h3><div class="value" id="highestBalance">0.00000000</div><small>Peak</small></div>
-            <div class="card"><h3>📉 LOWEST BALANCE</h3><div class="value" id="lowestBalance">0.00000000</div><small>Drawdown</small></div>
-            <div class="card"><h3>📊 TREND</h3><div class="value" id="trend">NEUTRAL</div><small>Analysis</small></div>
-            <div class="card"><h3>⚡ STREAK</h3><div class="value" id="streak">0</div><small>Consecutive</small></div>
+            <div class="card"><h3>💰 BALANCE</h3><div class="value" id="balance">0.00000000</div><small id="balanceSats">0 satoshi</small></div>
+            <div class="card"><h3>📈 PROFIT</h3><div class="value" id="profit">0.00000000</div><small id="profitSats">0 satoshi</small></div>
+            <div class="card"><h3>🎲 BETS</h3><div class="value" id="totalBets">0</div><small>W: <span id="wins">0</span> | L: <span id="losses">0</span></small></div>
+            <div class="card"><h3>📊 WIN RATE</h3><div class="value" id="winRate">0%</div><small>Next: <span id="nextBet">0</span> sats</small></div>
+        </div>
+        
+        <div class="stats">
+            <div class="card"><h3>🏆 HIGHEST</h3><div class="value" id="highestBalance">0</div><small>Peak balance</small></div>
+            <div class="card"><h3>📉 LOWEST</h3><div class="value" id="lowestBalance">0</div><small>Drawdown</small></div>
+            <div class="card"><h3>⚡ LOSS STREAK</h3><div class="value" id="lossStreak">0</div><small>Current streak</small></div>
+            <div class="card"><h3>💰 WAGERED</h3><div class="value" id="totalWagered">0</div><small>Total volume</small></div>
         </div>
         
         <div class="status" id="statusMsg"><span class="running-indicator"></span> Loading...</div>
         
-        <div style="margin-bottom: 20px; text-align: center;">
-            <label>Strategy: </label>
-            <select id="strategySelect">
-                <option value="martingale">Martingale (Double on Loss)</option>
-                <option value="fibonacci">Fibonacci (Recovery Sequence)</option>
-                <option value="dalambert">D'Alembert (+1/-1 Unit)</option>
-                <option value="paroli">Paroli (Double on Win)</option>
-            </select>
-            <button onclick="changeStrategy()">Apply Strategy</button>
-        </div>
-        
         <h3>📜 RECENT BETS (Last 30)</h3>
-        <div style="overflow-x: auto;">
+        <div style="overflow-x: auto; max-height: 400px; overflow-y: auto;">
             <table>
-                <thead><tr><th>#</th><th>Time</th><th>Wager</th><th>Multiplier</th><th>Profit</th><th>Result</th><th>Balance</th></tr></thead>
-                <tbody id="history"><tr><td colspan="7" style="text-align:center">Waiting for bets...</td></tr></tbody>
+                <thead>
+                    <tr><th>#</th><th>Time</th><th>Wager</th><th>Multiplier</th><th>Profit</th><th>Result</th><th>Roll/Target</th><th>Balance</th></tr>
+                </thead>
+                <tbody id="history"><tr><td colspan="8" style="text-align:center">Waiting for bets...</td></tr></tbody>
             </table>
         </div>
         <div class="note">
-            🎯 Advanced Profit Strategies | 75% Win Rate | 1 Satoshi Minimum | Dynamic Bet Sizing | Trend Analysis
+            💰 HOW MARTINGALE MAKES PROFIT: Win 2.02x your bet | Double after loss | One win recovers all previous losses + profit
         </div>
     </div>
     
@@ -525,13 +353,6 @@ app.get('/', (req, res) => {
             return secs + 's';
         }
         
-        function changeStrategy() {
-            const select = document.getElementById('strategySelect');
-            const strategy = select.value;
-            fetch('/change-strategy?strategy=' + strategy)
-                .catch(console.error);
-        }
-        
         function update() {
             fetch('/api/stats')
                 .then(res => res.json())
@@ -541,7 +362,6 @@ app.get('/', (req, res) => {
                     
                     document.getElementById('balance').innerHTML = b.stats.currentBalance.toFixed(8);
                     document.getElementById('balanceSats').innerHTML = formatSats(b.stats.currentBalance) + ' satoshi';
-                    document.getElementById('strategyName').innerHTML = b.strategy.toUpperCase();
                     
                     const profitElem = document.getElementById('profit');
                     profitElem.innerHTML = (b.stats.netProfit >= 0 ? '+' : '') + b.stats.netProfit.toFixed(8);
@@ -552,16 +372,12 @@ app.get('/', (req, res) => {
                     document.getElementById('wins').innerHTML = b.stats.wins;
                     document.getElementById('losses').innerHTML = b.stats.losses;
                     document.getElementById('winRate').innerHTML = data.winRate + '%';
-                    document.getElementById('currentBet').innerHTML = formatSats(b.settings.currentBet);
+                    document.getElementById('nextBet').innerHTML = formatSats(b.settings.currentBet);
                     document.getElementById('statusMsg').innerHTML = '<span class="running-indicator"></span> ' + b.statusMessage;
-                    document.getElementById('highestBalance').innerHTML = b.stats.highestBalance.toFixed(8);
-                    document.getElementById('lowestBalance').innerHTML = b.stats.lowestBalance.toFixed(8);
-                    document.getElementById('streak').innerHTML = b.stats.consecutiveLosses > 0 ? b.stats.consecutiveLosses + ' L' : b.stats.consecutiveWins + ' W';
-                    
-                    const trendElem = document.getElementById('trend');
-                    if (data.trend === 'hot') { trendElem.innerHTML = '🔥 HOT'; trendElem.className = 'value trend-hot'; }
-                    else if (data.trend === 'cold') { trendElem.innerHTML = '❄️ COLD'; trendElem.className = 'value trend-cold'; }
-                    else { trendElem.innerHTML = '⚖️ NEUTRAL'; trendElem.className = 'value'; }
+                    document.getElementById('highestBalance').innerHTML = formatSats(b.stats.highestBalance);
+                    document.getElementById('lowestBalance').innerHTML = formatSats(b.stats.lowestBalance);
+                    document.getElementById('lossStreak').innerHTML = b.stats.consecutiveLosses;
+                    document.getElementById('totalWagered').innerHTML = formatSats(b.stats.totalWagered);
                     
                     const tbody = document.getElementById('history');
                     tbody.innerHTML = '';
@@ -575,13 +391,13 @@ app.get('/', (req, res) => {
                         row.insertCell(4).innerHTML = bet.profit >= 0 ? 
                             '<span class="win">+' + bet.profitSats + ' sats</span>' : 
                             '<span class="loss">' + bet.profitSats + ' sats</span>';
-                        row.insertCell(5).innerHTML = bet.isWin ? '<span class="win">✅ WIN</span>' : bet.isBreakEven ? '<span class="even">⚖️ EVEN</span>' : '<span class="loss">❌ LOSS</span>';
-                        row.insertCell(6).innerText = bet.balanceSats + ' sats';
+                        row.insertCell(5).innerHTML = bet.isWin ? '<span class="win">✅ WIN</span>' : '<span class="loss">❌ LOSS</span>';
+                        row.insertCell(6).innerHTML = bet.roll + ' / ' + bet.target;
+                        row.insertCell(7).innerText = bet.balanceSats + ' sats';
                     }
                 })
                 .catch(console.error);
         }
-        
         setInterval(update, 1000);
         update();
     </script>
@@ -590,26 +406,8 @@ app.get('/', (req, res) => {
     `);
 });
 
-// Add strategy change endpoint
-app.get('/change-strategy', (req, res) => {
-    const newStrategy = req.query.strategy;
-    if (['martingale', 'fibonacci', 'dalambert', 'paroli'].includes(newStrategy)) {
-        PLINKO_CONFIG.strategy = newStrategy;
-        botState.strategy = newStrategy;
-        botState.settings.strategy = newStrategy;
-        botState.settings.currentBet = PLINKO_CONFIG.baseBet;
-        fibonacciIndex = 0;
-        paroliStreak = 0;
-        botState.statusMessage = `🟢 Strategy changed to ${newStrategy.toUpperCase()}`;
-        console.log(`\n📊 Strategy changed to: ${newStrategy.toUpperCase()}\n`);
-        res.json({ success: true, strategy: newStrategy });
-    } else {
-        res.json({ success: false });
-    }
-});
-
 // ============ START ============
 app.listen(port, '0.0.0.0', () => {
-    console.log(`\n🚀 ADVANCED BOT DASHBOARD: http://localhost:${port}\n`);
-    runAdvancedPlinko();
+    console.log(`\n🚀 PROFIT BOT DASHBOARD: http://localhost:${port}\n`);
+    runProfitBot();
 });
