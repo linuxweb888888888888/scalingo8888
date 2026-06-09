@@ -20,7 +20,7 @@ try {
 }
 
 // IMPORTANT: Get token from environment
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN || null;
+const GITHUB_TOKEN = "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";
 
 // Test token validity immediately
 async function testTokenValidity() {
