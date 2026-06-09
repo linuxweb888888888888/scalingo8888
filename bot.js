@@ -1,26 +1,18 @@
-// server.js
+// server.js - Complete GitHub Script Loader with Execution & Package.json Generator
 const express = require('express');
 const axios = require('axios');
 const { Octokit } = require('@octokit/rest');
 const path = require('path');
 const fs = require('fs');
+const vm = require('vm');
+const { exec } = require('child_process');
+const util = require('util');
+const execPromise = util.promisify(exec);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ============================================
-// GITHUB TOKEN SETUP
-// ============================================
-// Option 1: Set as environment variable
-// Run: export GITHUB_TOKEN=your_token_here
-// 
-// Option 2: Create a .env file (recommended)
-// Create .env file with: GITHUB_TOKEN=your_token_here
-//
-// Option 3: Hardcode for testing (not recommended for production)
-// const GITHUB_TOKEN = 'your_token_here';
-
-// Load from .env file if exists
+// Load .env file
 try {
   if (fs.existsSync('.env')) {
     require('dotenv').config();
@@ -31,8 +23,9 @@ try {
 }
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || null;
+const ALLOW_SCRIPT_EXECUTION = process.env.ALLOW_SCRIPT_EXECUTION !== 'false';
 
-// Initialize Octokit with token if available
+// Initialize Octokit
 const octokit = new Octokit({
   auth: GITHUB_TOKEN,
   userAgent: 'GitHub-Script-Loader-App'
@@ -43,50 +36,337 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
 
-// Store recently viewed repositories
-let recentRepos = [];
+// Store execution history
+let executionHistory = [];
+let generatedPackages = [];
 
-// Helper function to check if token is configured
-function isTokenConfigured() {
-  return GITHUB_TOKEN && GITHUB_TOKEN.length > 0;
+// ============================================
+// PACKAGE.JSON GENERATOR
+// ============================================
+
+function analyzeAndGeneratePackageJson(scriptContent, scriptPath) {
+  const packageJson = {
+    name: path.basename(scriptPath, path.extname(scriptPath)),
+    version: "1.0.0",
+    description: "Auto-generated package.json from GitHub script",
+    main: scriptPath,
+    scripts: {
+      start: `node ${scriptPath}`,
+      test: "echo \"Error: no test specified\" && exit 1"
+    },
+    dependencies: {},
+    devDependencies: {},
+    keywords: ["github", "script", "auto-generated"],
+    author: "",
+    license: "ISC"
+  };
+  
+  // Analyze require/import statements
+  const requireMatches = scriptContent.match(/require\(['"]([^'"]+)['"]\)/g) || [];
+  const importMatches = scriptContent.match(/from ['"]([^'"]+)['"]/g) || [];
+  const dynamicImports = scriptContent.match(/import\(['"]([^'"]+)['"]\)/g) || [];
+  
+  const allModules = [];
+  
+  requireMatches.forEach(match => {
+    const module = match.match(/require\(['"]([^'"]+)['"]\)/)[1];
+    if (!module.startsWith('.') && !module.startsWith('/')) {
+      allModules.push(module);
+    }
+  });
+  
+  importMatches.forEach(match => {
+    const module = match.match(/from ['"]([^'"]+)['"]/)[1];
+    if (!module.startsWith('.') && !module.startsWith('/')) {
+      allModules.push(module);
+    }
+  });
+  
+  dynamicImports.forEach(match => {
+    const module = match.match(/import\(['"]([^'"]+)['"]\)/)[1];
+    if (!module.startsWith('.') && !module.startsWith('/')) {
+      allModules.push(module);
+    }
+  });
+  
+  // Remove duplicates and add to dependencies
+  const uniqueModules = [...new Set(allModules)];
+  uniqueModules.forEach(module => {
+    packageJson.dependencies[module] = "*";
+  });
+  
+  // Check for specific frameworks
+  if (scriptContent.includes('express')) {
+    packageJson.dependencies.express = "^4.18.2";
+    packageJson.scripts.start = `node ${scriptPath}`;
+    packageJson.scripts.dev = "nodemon ${scriptPath}";
+    packageJson.devDependencies.nodemon = "^3.0.1";
+  }
+  
+  if (scriptContent.includes('react') || scriptContent.includes('jsx')) {
+    packageJson.dependencies.react = "^18.2.0";
+    packageJson.dependencies["react-dom"] = "^18.2.0";
+    packageJson.scripts.build = "webpack --mode production";
+  }
+  
+  if (scriptContent.includes('axios')) {
+    packageJson.dependencies.axios = "^1.6.0";
+  }
+  
+  if (scriptContent.includes('lodash')) {
+    packageJson.dependencies.lodash = "^4.17.21";
+  }
+  
+  if (scriptContent.includes('mongoose')) {
+    packageJson.dependencies.mongoose = "^8.0.0";
+  }
+  
+  if (scriptContent.includes('socket.io')) {
+    packageJson.dependencies["socket.io"] = "^4.5.0";
+  }
+  
+  return packageJson;
 }
 
-// API endpoint to get rate limit info
-app.get('/api/rate-limit', async (req, res) => {
+// Generate package.json from GitHub script
+app.post('/api/generate-package', async (req, res) => {
   try {
-    const rateLimit = await octokit.rest.rateLimit.get();
+    const { owner, repo, scriptPath, branch = 'main' } = req.body;
+    
+    // Fetch script content
+    const response = await octokit.rest.repos.getContent({
+      owner,
+      repo,
+      path: scriptPath,
+      ref: branch
+    });
+    
+    const scriptContent = Buffer.from(response.data.content, 'base64').toString('utf-8');
+    const packageJson = analyzeAndGeneratePackageJson(scriptContent, scriptPath);
+    
+    // Store generated package
+    const generatedPackage = {
+      id: Date.now(),
+      owner,
+      repo,
+      scriptPath,
+      branch,
+      packageJson,
+      generatedAt: new Date().toISOString()
+    };
+    generatedPackages.unshift(generatedPackage);
+    
     res.json({
-      authenticated: isTokenConfigured(),
-      rate: rateLimit.data.resources.core,
-      token_info: isTokenConfigured() ? 'Token is configured - Higher rate limits apply' : 'No token - Limited to 60 requests/hour'
+      success: true,
+      packageJson,
+      message: 'package.json generated successfully!',
+      installCommand: `npm install ${Object.keys(packageJson.dependencies).join(' ')}`,
+      generatedPackage: generatedPackage
     });
   } catch (error) {
-    res.json({
-      authenticated: false,
+    res.status(404).json({
+      success: false,
       error: error.message
     });
   }
 });
 
-// API endpoint to browse repository contents
-app.get('/api/browse/:owner/:repo', async (req, res) => {
-  try {
-    const { owner, repo } = req.params;
-    const { path: filePath = '', branch = 'main' } = req.query;
+// Download generated package.json
+app.get('/api/download-package/:id', (req, res) => {
+  const package = generatedPackages.find(p => p.id == req.params.id);
+  if (!package) {
+    return res.status(404).json({ error: 'Package not found' });
+  }
+  
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', `attachment; filename="package.json"`);
+  res.json(package.packageJson);
+});
+
+// ============================================
+// SCRIPT EXECUTION
+// ============================================
+
+async function executeJavaScript(code, filename, args = []) {
+  return new Promise((resolve, reject) => {
+    const output = [];
+    const errors = [];
     
-    // Add to recent repos
-    const repoKey = `${owner}/${repo}`;
-    if (!recentRepos.includes(repoKey)) {
-      recentRepos.unshift(repoKey);
-      recentRepos = recentRepos.slice(0, 10);
+    const sandbox = {
+      console: {
+        log: (...args) => {
+          const msg = args.join(' ');
+          output.push(msg);
+          console.log(`[Script:${filename}]`, msg);
+        },
+        error: (...args) => {
+          const msg = args.join(' ');
+          errors.push(msg);
+          console.error(`[Script:${filename}]`, msg);
+        },
+        warn: (...args) => {
+          const msg = args.join(' ');
+          output.push(`WARN: ${msg}`);
+          console.warn(`[Script:${filename}]`, msg);
+        }
+      },
+      process: {
+        env: process.env,
+        argv: ['node', filename, ...args],
+        cwd: () => process.cwd(),
+        exit: (code) => { throw new Error(`Script attempted to exit with code ${code}`); }
+      },
+      setTimeout: setTimeout,
+      clearTimeout: clearTimeout,
+      setInterval: setInterval,
+      clearInterval: clearInterval,
+      module: { exports: {} },
+      exports: {},
+      require: (moduleName) => {
+        const safeModules = ['fs', 'path', 'util', 'crypto', 'url', 'querystring', 'os'];
+        if (safeModules.includes(moduleName)) {
+          return require(moduleName);
+        }
+        throw new Error(`Module "${moduleName}" is not allowed. Please install locally first.`);
+      },
+      args: args,
+      __filename: filename,
+      __dirname: path.dirname(filename)
+    };
+    
+    try {
+      const script = new vm.Script(code);
+      const context = vm.createContext(sandbox);
+      script.runInContext(context, {
+        timeout: 5000,
+        displayErrors: true
+      });
+      
+      resolve({
+        success: true,
+        output: output.join('\n'),
+        errors: errors.join('\n'),
+        exports: sandbox.module.exports,
+        timestamp: new Date()
+      });
+    } catch (error) {
+      reject({
+        success: false,
+        error: error.message,
+        stack: error.stack,
+        output: output.join('\n'),
+        timestamp: new Date()
+      });
     }
+  });
+}
+
+// Execute script from GitHub
+app.post('/api/execute/:owner/:repo/:filePath(*)', async (req, res) => {
+  if (!ALLOW_SCRIPT_EXECUTION) {
+    return res.status(403).json({
+      success: false,
+      error: 'Script execution is disabled on this server'
+    });
+  }
+  
+  try {
+    const { owner, repo, filePath } = req.params;
+    const { branch = 'main', args = [], useGeneratedPackage = false, packageJson } = req.body;
     
-    // Get contents of directory
+    // Fetch script content
     const response = await octokit.rest.repos.getContent({
       owner,
       repo,
       path: filePath,
       ref: branch
+    });
+    
+    const scriptContent = Buffer.from(response.data.content, 'base64').toString('utf-8');
+    
+    // Generate package.json if requested
+    let generatedPackage = null;
+    if (useGeneratedPackage) {
+      generatedPackage = analyzeAndGeneratePackageJson(scriptContent, filePath);
+    }
+    
+    // Execute script
+    const startTime = Date.now();
+    const result = await executeJavaScript(scriptContent, filePath, args);
+    const executionTime = Date.now() - startTime;
+    
+    // Store execution history
+    const executionRecord = {
+      id: Date.now(),
+      script: `${owner}/${repo}/${filePath}`,
+      branch,
+      args,
+      result: result,
+      executionTime,
+      timestamp: new Date().toISOString()
+    };
+    executionHistory.unshift(executionRecord);
+    
+    res.json({
+      success: result.success,
+      execution: {
+        output: result.output,
+        errors: result.errors || result.error,
+        executionTime: `${executionTime}ms`,
+        timestamp: new Date().toISOString()
+      },
+      generatedPackage: generatedPackage,
+      executionId: executionRecord.id
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      stack: error.stack
+    });
+  }
+});
+
+// Get execution history
+app.get('/api/execution-history', (req, res) => {
+  res.json({
+    success: true,
+    history: executionHistory.slice(0, 50)
+  });
+});
+
+// Get generated packages history
+app.get('/api/generated-packages', (req, res) => {
+  res.json({
+    success: true,
+    packages: generatedPackages
+  });
+});
+
+// ============================================
+// GITHUB BROWSING ENDPOINTS
+// ============================================
+
+app.get('/api/rate-limit', async (req, res) => {
+  try {
+    const rateLimit = await octokit.rest.rateLimit.get();
+    res.json({
+      authenticated: !!GITHUB_TOKEN,
+      rate: rateLimit.data.resources.core,
+      execution_enabled: ALLOW_SCRIPT_EXECUTION
+    });
+  } catch (error) {
+    res.json({ authenticated: false, error: error.message });
+  }
+});
+
+app.get('/api/browse/:owner/:repo', async (req, res) => {
+  try {
+    const { owner, repo } = req.params;
+    const { path: filePath = '', branch = 'main' } = req.query;
+    
+    const response = await octokit.rest.repos.getContent({
+      owner, repo, path: filePath, ref: branch
     });
     
     const contents = Array.isArray(response.data) ? response.data : [response.data];
@@ -96,465 +376,128 @@ app.get('/api/browse/:owner/:repo', async (req, res) => {
       path: item.path,
       type: item.type,
       size: item.size,
-      sha: item.sha,
-      download_url: item.download_url,
-      html_url: item.html_url
+      extension: path.extname(item.name),
+      isExecutable: ['.js', '.mjs', '.cjs', '.ts', '.py', '.rb', '.sh'].includes(path.extname(item.name))
     }));
     
-    // Get repository info
-    const repoInfo = await octokit.rest.repos.get({
-      owner,
-      repo
-    });
+    const repoInfo = await octokit.rest.repos.get({ owner, repo });
     
     res.json({
-      success: true,
-      owner,
-      repo,
-      branch,
-      currentPath: filePath,
-      items,
+      success: true, owner, repo, branch,
+      currentPath: filePath, items,
       repository: {
         name: repoInfo.data.name,
         description: repoInfo.data.description,
-        default_branch: repoInfo.data.default_branch,
         stars: repoInfo.data.stargazers_count,
-        forks: repoInfo.data.forks_count,
-        url: repoInfo.data.html_url
+        forks: repoInfo.data.forks_count
       }
     });
   } catch (error) {
-    res.status(404).json({
-      success: false,
-      error: error.message,
-      hint: 'Try a different branch name or check if repository exists'
-    });
+    res.status(404).json({ success: false, error: error.message });
   }
 });
 
-// API endpoint to get file content and history
 app.get('/api/file/:owner/:repo/:filePath(*)', async (req, res) => {
   try {
     const { owner, repo, filePath } = req.params;
     const { branch = 'main', commit } = req.query;
     
-    // Get file content
-    let content, sha;
-    try {
-      const response = await octokit.rest.repos.getContent({
-        owner,
-        repo,
-        path: filePath,
-        ref: commit || branch
-      });
-      
-      content = Buffer.from(response.data.content, 'base64').toString('utf-8');
-      sha = response.data.sha;
-    } catch (error) {
-      throw new Error(`File not found: ${error.message}`);
-    }
-    
-    // Get file history (commits)
-    const commits = await octokit.rest.repos.listCommits({
-      owner,
-      repo,
-      path: filePath,
-      sha: branch,
-      per_page: 30
-    });
-    
-    const history = commits.data.map(commit => ({
-      sha: commit.sha,
-      short_sha: commit.sha.substring(0, 7),
-      message: commit.commit.message,
-      date: commit.commit.author.date,
-      author: commit.commit.author.name,
-      author_email: commit.commit.author.email,
-      url: commit.html_url,
-      additions: commit.stats?.additions || 0,
-      deletions: commit.stats?.deletions || 0
-    }));
-    
-    // Get file details
-    const fileExtension = path.extname(filePath);
-    const isBinary = ['.jpg', '.png', '.gif', '.pdf', '.zip'].includes(fileExtension);
-    
-    res.json({
-      success: true,
-      file: {
-        name: path.basename(filePath),
-        path: filePath,
-        content: isBinary ? null : content,
-        sha,
-        size: content.length,
-        lines: content.split('\n').length,
-        extension: fileExtension,
-        isBinary
-      },
-      history,
-      branch,
-      repository: `${owner}/${repo}`
-    });
-  } catch (error) {
-    res.status(404).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// API endpoint to get specific commit version
-app.get('/api/file-version/:owner/:repo/:filePath(*)/commit/:commitSha', async (req, res) => {
-  try {
-    const { owner, repo, filePath, commitSha } = req.params;
-    
     const response = await octokit.rest.repos.getContent({
-      owner,
-      repo,
-      path: filePath,
-      ref: commitSha
+      owner, repo, path: filePath, ref: commit || branch
     });
     
     const content = Buffer.from(response.data.content, 'base64').toString('utf-8');
     
-    res.json({
-      success: true,
-      content,
-      sha: response.data.sha,
-      commit: commitSha
+    const commits = await octokit.rest.repos.listCommits({
+      owner, repo, path: filePath, sha: branch, per_page: 30
     });
-  } catch (error) {
-    res.status(404).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// API endpoint to get branches
-app.get('/api/branches/:owner/:repo', async (req, res) => {
-  try {
-    const { owner, repo } = req.params;
     
-    const branches = await octokit.rest.repos.listBranches({
-      owner,
-      repo,
-      per_page: 100
-    });
+    const history = commits.data.map(commit => ({
+      sha: commit.sha, short_sha: commit.sha.substring(0, 7),
+      message: commit.commit.message, date: commit.commit.author.date,
+      author: commit.commit.author.name
+    }));
     
     res.json({
       success: true,
-      branches: branches.data.map(b => ({
-        name: b.name,
-        commit: b.commit.sha,
-        protected: b.protected
-      }))
+      file: {
+        name: path.basename(filePath), path: filePath, content: content,
+        size: content.length, lines: content.split('\n').length,
+        extension: path.extname(filePath),
+        isExecutable: ['.js', '.mjs', '.cjs'].includes(path.extname(filePath))
+      },
+      history, branch
     });
   } catch (error) {
-    res.status(404).json({
-      success: false,
-      error: error.message
-    });
+    res.status(404).json({ success: false, error: error.message });
   }
 });
 
-// API endpoint for recent repositories
-app.get('/api/recent', (req, res) => {
-  res.json({
-    success: true,
-    recentRepos
-  });
-});
+// ============================================
+// WEB INTERFACE
+// ============================================
 
-// Main web interface
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
-    <html lang="en">
+    <html>
     <head>
       <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>GitHub File Browser with History</title>
+      <title>GitHub Script Loader - Execute & Generate Package.json</title>
       <style>
-        * {
-          margin: 0;
-          padding: 0;
-          box-sizing: border-box;
-        }
-        
-        body {
-          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-          min-height: 100vh;
-          padding: 20px;
-        }
-        
-        .container {
-          max-width: 1400px;
-          margin: 0 auto;
-          background: white;
-          border-radius: 12px;
-          box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-          overflow: hidden;
-        }
-        
-        .header {
-          background: linear-gradient(135deg, #24292e 0%, #1a1e22 100%);
-          color: white;
-          padding: 30px;
-        }
-        
-        .header h1 {
-          font-size: 28px;
-          margin-bottom: 10px;
-        }
-        
-        .header p {
-          opacity: 0.8;
-        }
-        
-        .token-status {
-          background: rgba(255,255,255,0.1);
-          padding: 10px;
-          border-radius: 6px;
-          margin-top: 15px;
-          font-size: 14px;
-        }
-        
-        .token-status.success {
-          border-left: 4px solid #28a745;
-        }
-        
-        .token-status.warning {
-          border-left: 4px solid #ffc107;
-        }
-        
-        .main-content {
-          display: flex;
-          height: calc(100vh - 250px);
-          min-height: 600px;
-        }
-        
-        .sidebar {
-          width: 300px;
-          background: #f6f8fa;
-          border-right: 1px solid #e1e4e8;
-          overflow-y: auto;
-          padding: 20px;
-        }
-        
-        .browser {
-          flex: 1;
-          display: flex;
-          flex-direction: column;
-          overflow: hidden;
-        }
-        
-        .toolbar {
-          padding: 20px;
-          background: white;
-          border-bottom: 1px solid #e1e4e8;
-        }
-        
-        .repo-input {
-          display: flex;
-          gap: 10px;
-          margin-bottom: 15px;
-        }
-        
-        .repo-input input {
-          flex: 1;
-          padding: 10px;
-          border: 2px solid #e1e4e8;
-          border-radius: 6px;
-          font-size: 14px;
-        }
-        
-        .repo-input button {
-          padding: 10px 20px;
-          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-          color: white;
-          border: none;
-          border-radius: 6px;
-          cursor: pointer;
-          font-weight: 600;
-        }
-        
-        .branch-selector {
-          display: flex;
-          gap: 10px;
-          align-items: center;
-        }
-        
-        .branch-selector select {
-          flex: 1;
-          padding: 8px;
-          border: 1px solid #e1e4e8;
-          border-radius: 4px;
-        }
-        
-        .breadcrumb {
-          padding: 15px 20px;
-          background: #f6f8fa;
-          border-bottom: 1px solid #e1e4e8;
-          font-size: 14px;
-        }
-        
-        .breadcrumb a {
-          color: #0366d6;
-          text-decoration: none;
-          cursor: pointer;
-        }
-        
-        .breadcrumb a:hover {
-          text-decoration: underline;
-        }
-        
-        .file-list {
-          flex: 1;
-          overflow-y: auto;
-          padding: 20px;
-        }
-        
-        .file-item {
-          display: flex;
-          align-items: center;
-          padding: 12px;
-          border-bottom: 1px solid #e1e4e8;
-          cursor: pointer;
-          transition: background 0.2s;
-        }
-        
-        .file-item:hover {
-          background: #f6f8fa;
-        }
-        
-        .file-icon {
-          width: 24px;
-          margin-right: 12px;
-          font-size: 18px;
-        }
-        
-        .file-name {
-          flex: 1;
-          font-size: 14px;
-        }
-        
-        .file-size {
-          color: #586069;
-          font-size: 12px;
-        }
-        
-        .content-viewer {
-          flex: 1;
-          overflow-y: auto;
-          padding: 20px;
-          background: #f6f8fa;
-        }
-        
-        .history-panel {
-          width: 350px;
-          background: white;
-          border-left: 1px solid #e1e4e8;
-          overflow-y: auto;
-          padding: 20px;
-        }
-        
-        .commit-item {
-          padding: 12px;
-          border-bottom: 1px solid #e1e4e8;
-          cursor: pointer;
-          transition: background 0.2s;
-        }
-        
-        .commit-item:hover {
-          background: #f6f8fa;
-        }
-        
-        .commit-sha {
-          font-family: monospace;
-          font-size: 12px;
-          color: #0366d6;
-          font-weight: 600;
-        }
-        
-        .commit-message {
-          font-size: 13px;
-          margin: 5px 0;
-        }
-        
-        .commit-meta {
-          font-size: 11px;
-          color: #586069;
-        }
-        
-        pre {
-          background: white;
-          padding: 15px;
-          border-radius: 6px;
-          overflow-x: auto;
-          font-size: 13px;
-          line-height: 1.5;
-        }
-        
-        .loading {
-          text-align: center;
-          padding: 40px;
-          color: #586069;
-        }
-        
-        .error {
-          color: #d73a49;
-          padding: 20px;
-          text-align: center;
-        }
-        
-        .repo-info {
-          margin-bottom: 20px;
-          padding-bottom: 20px;
-          border-bottom: 1px solid #e1e4e8;
-        }
-        
-        .repo-name {
-          font-weight: 600;
-          margin-bottom: 5px;
-        }
-        
-        .repo-stats {
-          font-size: 12px;
-          color: #586069;
-        }
-        
-        @keyframes spin {
-          0% { transform: rotate(0deg); }
-          100% { transform: rotate(360deg); }
-        }
-        
-        .spinner {
-          border: 3px solid #f3f3f3;
-          border-top: 3px solid #667eea;
-          border-radius: 50%;
-          width: 40px;
-          height: 40px;
-          animation: spin 1s linear infinite;
-          margin: 20px auto;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; }
+        .container { max-width: 1400px; margin: 0 auto; background: white; border-radius: 12px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); overflow: hidden; }
+        .header { background: linear-gradient(135deg, #24292e 0%, #1a1e22 100%); color: white; padding: 30px; }
+        .header h1 { font-size: 28px; margin-bottom: 10px; }
+        .token-status { background: rgba(255,255,255,0.1); padding: 10px; border-radius: 6px; margin-top: 15px; font-size: 14px; }
+        .main-content { display: flex; height: calc(100vh - 200px); min-height: 600px; }
+        .sidebar { width: 300px; background: #f6f8fa; border-right: 1px solid #e1e4e8; overflow-y: auto; padding: 20px; }
+        .browser { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+        .toolbar { padding: 20px; background: white; border-bottom: 1px solid #e1e4e8; }
+        .repo-input { display: flex; gap: 10px; margin-bottom: 15px; }
+        .repo-input input { flex: 1; padding: 10px; border: 2px solid #e1e4e8; border-radius: 6px; }
+        .repo-input button { padding: 10px 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; }
+        .file-list { flex: 1; overflow-y: auto; padding: 20px; }
+        .file-item { display: flex; align-items: center; padding: 12px; border-bottom: 1px solid #e1e4e8; cursor: pointer; transition: background 0.2s; }
+        .file-item:hover { background: #f6f8fa; }
+        .file-icon { width: 24px; margin-right: 12px; font-size: 18px; }
+        .file-name { flex: 1; font-size: 14px; }
+        .executable-badge { background: #28a745; color: white; padding: 2px 8px; border-radius: 12px; font-size: 11px; margin-left: 10px; }
+        .content-panel { flex: 1; overflow-y: auto; padding: 20px; background: #f6f8fa; }
+        .history-panel { width: 350px; background: white; border-left: 1px solid #e1e4e8; overflow-y: auto; padding: 20px; }
+        .commit-item { padding: 12px; border-bottom: 1px solid #e1e4e8; cursor: pointer; }
+        .commit-item:hover { background: #f6f8fa; }
+        .execution-controls { margin-top: 20px; padding: 15px; background: #f6f8fa; border-radius: 6px; }
+        .execution-controls input, .execution-controls select { padding: 8px; margin: 5px; border: 1px solid #e1e4e8; border-radius: 4px; }
+        .execution-controls button { background: #28a745; color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; margin: 5px; }
+        .generate-package-btn { background: #6f42c1; }
+        .execute-btn { background: #28a745; }
+        .output { background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 6px; font-family: 'Courier New', monospace; font-size: 12px; margin-top: 15px; max-height: 400px; overflow-y: auto; }
+        pre { white-space: pre-wrap; word-wrap: break-word; }
+        .spinner { border: 3px solid #f3f3f3; border-top: 3px solid #667eea; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 20px auto; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .success { color: #28a745; }
+        .error { color: #dc3545; }
+        button { transition: all 0.3s; }
+        button:hover { transform: translateY(-2px); box-shadow: 0 2px 8px rgba(0,0,0,0.2); }
       </style>
     </head>
     <body>
       <div class="container">
         <div class="header">
-          <h1>📁 GitHub File Browser with History</h1>
-          <p>Browse repositories, view file history, and load any file version</p>
+          <h1>🚀 GitHub Script Loader with Execution & Package.json Generator</h1>
+          <p>Browse, execute, and generate package.json from any GitHub repository</p>
           <div id="tokenStatus" class="token-status"></div>
         </div>
         
         <div class="main-content">
           <div class="sidebar">
-            <div class="repo-info">
-              <strong>📌 Recent Repositories</strong>
-            </div>
-            <div id="recentList"></div>
+            <h3>📊 Execution History</h3>
+            <div id="executionHistory"></div>
+            <hr style="margin: 20px 0;">
+            <h3>📦 Generated Packages</h3>
+            <div id="generatedPackagesList"></div>
           </div>
           
           <div class="browser">
@@ -563,23 +506,27 @@ app.get('/', (req, res) => {
                 <input type="text" id="repoInput" placeholder="owner/repository (e.g., facebook/react)" />
                 <button onclick="loadRepository()">Browse</button>
               </div>
-              <div class="branch-selector">
-                <select id="branchSelect" onchange="changeBranch()">
-                  <option value="main">main</option>
-                  <option value="master">master</option>
-                </select>
-                <span id="rateLimit" style="font-size: 12px; color: #586069;"></span>
+              <div>
+                <select id="branchSelect" onchange="changeBranch()" style="padding: 8px; width: 200px;"></select>
               </div>
             </div>
             
-            <div class="breadcrumb" id="breadcrumb"></div>
-            
             <div class="file-list" id="fileList">
-              <div class="loading">Enter a repository to start browsing...</div>
+              <div class="loading" style="text-align: center; padding: 40px;">Enter a repository to start browsing...</div>
             </div>
-            
-            <div class="content-viewer" id="contentViewer" style="display: none;">
-              <div id="fileContent"></div>
+          </div>
+          
+          <div class="content-panel" id="contentPanel" style="display: none;">
+            <div id="fileContent"></div>
+            <div class="execution-controls" id="executionControls" style="display: none;">
+              <h4>⚡ Execute Script</h4>
+              <input type="text" id="execArgs" placeholder="Command line arguments (space separated)" style="width: 100%; margin-bottom: 10px;">
+              <div>
+                <button class="generate-package-btn" onclick="generatePackageJson()">📦 Generate package.json</button>
+                <button class="execute-btn" onclick="executeScript()">▶ Execute Script</button>
+                <button class="execute-btn" onclick="executeWithPackage()">📦 Execute with Generated package.json</button>
+              </div>
+              <div id="executionOutput" class="output" style="display: none;"></div>
             </div>
           </div>
           
@@ -591,322 +538,244 @@ app.get('/', (req, res) => {
       </div>
       
       <script>
-        let currentOwner = '';
-        let currentRepo = '';
-        let currentBranch = 'main';
-        let currentPath = '';
-        let currentFilePath = '';
+        let currentOwner = '', currentRepo = '', currentBranch = 'main', currentFilePath = '', currentFileContent = '';
         
-        // Load token status and rate limit
         async function loadTokenStatus() {
-          try {
-            const response = await fetch('/api/rate-limit');
-            const data = await response.json();
-            
-            const statusDiv = document.getElementById('tokenStatus');
-            if (data.authenticated) {
-              const remaining = data.rate.remaining;
-              const limit = data.rate.limit;
-              statusDiv.className = 'token-status success';
-              statusDiv.innerHTML = \`✅ GitHub Token Active | Rate Limit: \${remaining}/\${limit} requests remaining\`;
-              document.getElementById('rateLimit').innerHTML = \`📊 \${remaining} requests left\`;
-            } else {
-              statusDiv.className = 'token-status warning';
-              statusDiv.innerHTML = \`⚠️ No GitHub Token | Limited to 60 requests/hour | <a href="#" onclick="showTokenInstructions()" style="color: white;">Click here to add token</a>\`;
-              document.getElementById('rateLimit').innerHTML = \`⚠️ 60 requests/hour limit\`;
-            }
-          } catch (error) {
-            console.error('Error loading token status:', error);
+          const response = await fetch('/api/rate-limit');
+          const data = await response.json();
+          const statusDiv = document.getElementById('tokenStatus');
+          if (data.authenticated) {
+            statusDiv.innerHTML = \`✅ GitHub Token Active | \${data.rate.remaining}/\${data.rate.limit} requests remaining\`;
+          } else {
+            statusDiv.innerHTML = \`⚠️ No GitHub Token | Limited to 60 requests/hour\`;
           }
         }
         
-        function showTokenInstructions() {
-          alert(\`To add GitHub token:
-          
-          1. Get a token from: https://github.com/settings/tokens
-          2. Create a .env file in the project root with:
-             GITHUB_TOKEN=your_token_here
-          3. Restart the server
-          
-          Or set environment variable:
-          export GITHUB_TOKEN=your_token_here\`);
-        }
-        
-        // Load recent repositories
-        async function loadRecentRepos() {
-          try {
-            const response = await fetch('/api/recent');
-            const data = await response.json();
-            const recentDiv = document.getElementById('recentList');
-            
-            if (data.recentRepos.length === 0) {
-              recentDiv.innerHTML = '<div style="font-size: 12px; color: #586069;">No recent repos</div>';
-            } else {
-              recentDiv.innerHTML = data.recentRepos.map(repo => 
-                \`<div style="padding: 8px; cursor: pointer; margin-bottom: 5px; background: white; border-radius: 4px;" onclick="loadSavedRepository('\${repo}')">
-                  📁 \${repo}
-                </div>\`
-              ).join('');
-            }
-          } catch (error) {
-            console.error('Error loading recent repos:', error);
-          }
-        }
-        
-        function loadSavedRepository(repo) {
-          document.getElementById('repoInput').value = repo;
-          loadRepository();
-        }
-        
-        // Load repository contents
         async function loadRepository() {
           const repoInput = document.getElementById('repoInput').value.trim();
-          if (!repoInput) {
-            alert('Please enter repository name (owner/repo)');
-            return;
-          }
-          
+          if (!repoInput) return alert('Enter repository (owner/repo)');
           const [owner, repo] = repoInput.split('/');
-          if (!owner || !repo) {
-            alert('Please use format: owner/repository');
-            return;
-          }
+          if (!owner || !repo) return alert('Use format: owner/repo');
           
-          currentOwner = owner;
-          currentRepo = repo;
-          currentPath = '';
-          currentBranch = document.getElementById('branchSelect').value;
-          
+          currentOwner = owner; currentRepo = repo;
           await browsePath('');
           await loadBranches();
-          await loadRecentRepos();
+          await loadExecutionHistory();
+          await loadGeneratedPackages();
         }
         
-        // Browse specific path
         async function browsePath(path) {
-          if (!currentOwner || !currentRepo) return;
-          
           const fileListDiv = document.getElementById('fileList');
           fileListDiv.innerHTML = '<div class="spinner"></div>';
           
-          try {
-            const response = await fetch(\`/api/browse/\${currentOwner}/\${currentRepo}?path=\${encodeURIComponent(path)}&branch=\${currentBranch}\`);
-            const data = await response.json();
-            
-            if (data.success) {
-              currentPath = path;
-              updateBreadcrumb();
-              displayFileList(data.items);
-              displayRepoInfo(data.repository);
-              
-              // Hide content and history viewers
-              document.getElementById('contentViewer').style.display = 'none';
-              document.getElementById('historyPanel').style.display = 'none';
-            } else {
-              fileListDiv.innerHTML = \`<div class="error">❌ \${data.error}<br>💡 \${data.hint || ''}</div>\`;
-            }
-          } catch (error) {
-            fileListDiv.innerHTML = \`<div class="error">❌ Error: \${error.message}</div>\`;
-          }
-        }
-        
-        // Load branches
-        async function loadBranches() {
-          try {
-            const response = await fetch(\`/api/branches/\${currentOwner}/\${currentRepo}\`);
-            const data = await response.json();
-            
-            if (data.success) {
-              const branchSelect = document.getElementById('branchSelect');
-              const currentValue = branchSelect.value;
-              branchSelect.innerHTML = data.branches.map(b => 
-                \`<option value="\${b.name}" \${b.name === currentValue ? 'selected' : ''}>\${b.name}</option>\`
-              ).join('');
-            }
-          } catch (error) {
-            console.error('Error loading branches:', error);
-          }
-        }
-        
-        function changeBranch() {
-          currentBranch = document.getElementById('branchSelect').value;
-          browsePath(currentPath);
-        }
-        
-        function updateBreadcrumb() {
-          const breadcrumbDiv = document.getElementById('breadcrumb');
-          const parts = currentPath.split('/').filter(p => p);
-          let html = '<a onclick="browsePath(\'\')">🏠 ' + currentOwner + '/' + currentRepo + '</a>';
+          const response = await fetch(\`/api/browse/\${currentOwner}/\${currentRepo}?path=\${encodeURIComponent(path)}&branch=\${currentBranch}\`);
+          const data = await response.json();
           
-          let cumulativePath = '';
-          parts.forEach((part, index) => {
-            cumulativePath += (cumulativePath ? '/' : '') + part;
-            html += ' / <a onclick="browsePath(\'' + cumulativePath + '\')">' + part + '</a>';
-          });
-          
-          breadcrumbDiv.innerHTML = html;
+          if (data.success) {
+            displayFileList(data.items);
+            document.getElementById('contentPanel').style.display = 'none';
+            document.getElementById('historyPanel').style.display = 'none';
+          } else {
+            fileListDiv.innerHTML = \`<div class="error">❌ \${data.error}</div>\`;
+          }
         }
         
         function displayFileList(items) {
           const fileListDiv = document.getElementById('fileList');
-          
-          if (items.length === 0) {
-            fileListDiv.innerHTML = '<div class="loading">📂 This directory is empty</div>';
-            return;
-          }
-          
-          fileListDiv.innerHTML = items.map(item => {
-            const icon = item.type === 'dir' ? '📁' : '📄';
-            const size = item.type === 'file' ? formatBytes(item.size) : '';
-            return \`
-              <div class="file-item" onclick="openItem('\${item.type}', '\${item.path}')">
-                <div class="file-icon">\${icon}</div>
-                <div class="file-name">\${item.name}</div>
-                <div class="file-size">\${size}</div>
-              </div>
-            \`;
-          }).join('');
+          fileListDiv.innerHTML = items.map(item => \`
+            <div class="file-item" onclick="openItem('\${item.type}', '\${item.path}')">
+              <div class="file-icon">\${item.type === 'dir' ? '📁' : '📄'}</div>
+              <div class="file-name">\${item.name}</div>
+              \${item.isExecutable ? '<span class="executable-badge">▶ Executable</span>' : ''}
+            </div>
+          \`).join('');
         }
         
-        function displayRepoInfo(repo) {
-          const sidebar = document.querySelector('.sidebar');
-          const existingInfo = document.querySelector('.repo-details');
-          if (existingInfo) existingInfo.remove();
-          
-          const infoDiv = document.createElement('div');
-          infoDiv.className = 'repo-details';
-          infoDiv.style.marginBottom = '20px';
-          infoDiv.style.padding = '15px';
-          infoDiv.style.background = 'white';
-          infoDiv.style.borderRadius = '6px';
-          infoDiv.innerHTML = \`
-            <div class="repo-name">⭐ \${repo.name}</div>
-            <div class="repo-stats">🌟 \${repo.stars} stars | 🍴 \${repo.forks} forks</div>
-            <div class="repo-stats" style="margin-top: 5px;">\${repo.description || 'No description'}</div>
-          \`;
-          
-          sidebar.insertBefore(infoDiv, sidebar.firstChild);
+        async function loadBranches() {
+          // Simplified - just try common branches
+          const branchSelect = document.getElementById('branchSelect');
+          branchSelect.innerHTML = '<option value="main">main</option><option value="master">master</option>';
         }
         
-        function openItem(type, path) {
+        function changeBranch() {
+          currentBranch = document.getElementById('branchSelect').value;
+          browsePath('');
+        }
+        
+        async function openItem(type, path) {
           if (type === 'dir') {
             browsePath(path);
           } else {
-            loadFile(path);
+            await loadFile(path);
           }
         }
         
         async function loadFile(filePath) {
           currentFilePath = filePath;
-          const contentViewer = document.getElementById('contentViewer');
-          const historyPanel = document.getElementById('historyPanel');
-          const fileContentDiv = document.getElementById('fileContent');
-          const commitHistoryDiv = document.getElementById('commitHistory');
+          const response = await fetch(\`/api/file/\${currentOwner}/\${currentRepo}/\${filePath}?branch=\${currentBranch}\`);
+          const data = await response.json();
           
-          contentViewer.style.display = 'block';
-          historyPanel.style.display = 'block';
-          fileContentDiv.innerHTML = '<div class="spinner"></div>';
-          commitHistoryDiv.innerHTML = '<div class="loading">Loading history...</div>';
-          
-          try {
-            const response = await fetch(\`/api/file/\${currentOwner}/\${currentRepo}/\${filePath}?branch=\${currentBranch}\`);
-            const data = await response.json();
+          if (data.success) {
+            currentFileContent = data.file.content;
+            document.getElementById('contentPanel').style.display = 'block';
+            document.getElementById('historyPanel').style.display = 'block';
+            document.getElementById('executionControls').style.display = data.file.isExecutable ? 'block' : 'none';
             
-            if (data.success) {
-              // Display file content
-              const extension = data.file.extension;
-              let contentHtml = '';
-              
-              if (data.file.isBinary) {
-                contentHtml = '<div class="loading">🔒 Binary file - cannot display</div>';
-              } else if (['.jpg', '.png', '.gif', '.svg'].includes(extension)) {
-                contentHtml = \`<img src="data:image/\${extension.slice(1)};base64,\${btoa(data.file.content)}" style="max-width: 100%;">\`;
-              } else {
-                contentHtml = \`
-                  <div style="margin-bottom: 10px;">
-                    <strong>📄 \${data.file.name}</strong>
-                    <span style="float: right; font-size: 12px; color: #586069;">\${data.file.lines} lines | \${formatBytes(data.file.size)}</span>
-                  </div>
-                  <pre>\${escapeHtml(data.file.content)}</pre>
-                \`;
-              }
-              
-              fileContentDiv.innerHTML = contentHtml;
-              
-              // Display commit history
-              if (data.history.length === 0) {
-                commitHistoryDiv.innerHTML = '<div class="loading">No commit history found</div>';
-              } else {
-                commitHistoryDiv.innerHTML = data.history.map(commit => \`
-                  <div class="commit-item" onclick="loadCommitVersion('\${commit.sha}')">
-                    <div class="commit-sha">\${commit.short_sha}</div>
-                    <div class="commit-message">\${escapeHtml(commit.message.split('\\n')[0])}</div>
-                    <div class="commit-meta">
-                      👤 \${commit.author}<br>
-                      📅 \${new Date(commit.date).toLocaleDateString()}<br>
-                      📊 +\${commit.additions}/-\${commit.deletions}
-                    </div>
-                  </div>
-                \`).join('');
-              }
-            } else {
-              fileContentDiv.innerHTML = \`<div class="error">❌ \${data.error}</div>\`;
-              commitHistoryDiv.innerHTML = '';
-            }
-          } catch (error) {
-            fileContentDiv.innerHTML = \`<div class="error">❌ Error: \${error.message}</div>\`;
+            document.getElementById('fileContent').innerHTML = \`
+              <h3>📄 \${data.file.name}</h3>
+              <p><strong>Size:</strong> \${data.file.size} bytes | <strong>Lines:</strong> \${data.file.lines}</p>
+              <pre>\${escapeHtml(data.file.content.substring(0, 5000))}\${data.file.content.length > 5000 ? '\\n\\n... (truncated)' : ''}</pre>
+            \`;
+            
+            document.getElementById('commitHistory').innerHTML = data.history.map(commit => \`
+              <div class="commit-item" onclick="loadCommitVersion('\${commit.sha}')">
+                <strong>\${commit.short_sha}</strong><br>
+                \${commit.message.substring(0, 80)}<br>
+                <small>\${commit.author} - \${new Date(commit.date).toLocaleDateString()}</small>
+              </div>
+            \`).join('');
           }
         }
         
-        async function loadCommitVersion(commitSha) {
-          if (!currentFilePath) return;
+        async function generatePackageJson() {
+          const response = await fetch('/api/generate-package', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              owner: currentOwner,
+              repo: currentRepo,
+              scriptPath: currentFilePath,
+              branch: currentBranch
+            })
+          });
           
-          const fileContentDiv = document.getElementById('fileContent');
-          fileContentDiv.innerHTML = '<div class="spinner"></div>';
-          
-          try {
-            const response = await fetch(\`/api/file-version/\${currentOwner}/\${currentRepo}/\${currentFilePath}/commit/\${commitSha}\`);
-            const data = await response.json();
-            
-            if (data.success) {
-              fileContentDiv.innerHTML = \`
-                <div style="margin-bottom: 10px;">
-                  <strong>📄 Version from commit \${commitSha.substring(0, 7)}</strong>
-                  <button onclick="loadFile(currentFilePath)" style="float: right; padding: 5px 10px; background: #0366d6; color: white; border: none; border-radius: 4px; cursor: pointer;">Back to latest</button>
-                </div>
-                <pre>\${escapeHtml(data.content)}</pre>
-              \`;
-            }
-          } catch (error) {
-            fileContentDiv.innerHTML = \`<div class="error">❌ Error loading version: \${error.message}</div>\`;
+          const data = await response.json();
+          if (data.success) {
+            alert(\`✅ package.json generated!\\n\\nInstall with: \${data.installCommand}\\n\\nDependencies detected: \${Object.keys(data.packageJson.dependencies).join(', ') || 'none'}\`);
+            document.getElementById('executionOutput').style.display = 'block';
+            document.getElementById('executionOutput').innerHTML = \`
+              <div class="success">✅ Generated package.json:</div>
+              <pre>\${JSON.stringify(data.packageJson, null, 2)}</pre>
+            \`;
+            await loadGeneratedPackages();
+          } else {
+            alert('Error: ' + data.error);
           }
         }
         
-        function formatBytes(bytes) {
-          if (bytes === 0) return '0 Bytes';
-          const k = 1024;
-          const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-          const i = Math.floor(Math.log(bytes) / Math.log(k));
-          return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        async function executeScript() {
+          const args = document.getElementById('execArgs').value.split(' ').filter(a => a);
+          const outputDiv = document.getElementById('executionOutput');
+          outputDiv.style.display = 'block';
+          outputDiv.innerHTML = '<div class="spinner"></div><div>Executing script...</div>';
+          
+          const response = await fetch(\`/api/execute/\${currentOwner}/\${currentRepo}/\${currentFilePath}?branch=\${currentBranch}\`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ args: args, useGeneratedPackage: false })
+          });
+          
+          const data = await response.json();
+          if (data.success) {
+            outputDiv.innerHTML = \`
+              <div class="success">✅ Execution completed in \${data.execution.executionTime}</div>
+              <div style="margin-top: 10px;"><strong>Output:</strong></div>
+              <pre>\${escapeHtml(data.execution.output || 'No output')}</pre>
+              \${data.execution.errors ? \`<div class="error"><strong>Errors:</strong></div><pre>\${escapeHtml(data.execution.errors)}</pre>\` : ''}
+            \`;
+          } else {
+            outputDiv.innerHTML = \`<div class="error">❌ Execution failed: \${data.error}</div><pre>\${escapeHtml(data.stack || '')}</pre>\`;
+          }
+          await loadExecutionHistory();
         }
         
-        function escapeHtml(text) {
-          const div = document.createElement('div');
-          div.textContent = text;
-          return div.innerHTML;
+        async function executeWithPackage() {
+          const args = document.getElementById('execArgs').value.split(' ').filter(a => a);
+          const outputDiv = document.getElementById('executionOutput');
+          outputDiv.style.display = 'block';
+          outputDiv.innerHTML = '<div class="spinner"></div><div>Generating package.json and executing...</div>';
+          
+          // First generate package.json
+          const genResponse = await fetch('/api/generate-package', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              owner: currentOwner,
+              repo: currentRepo,
+              scriptPath: currentFilePath,
+              branch: currentBranch
+            })
+          });
+          
+          const genData = await genResponse.json();
+          if (!genData.success) {
+            outputDiv.innerHTML = \`<div class="error">Failed to generate package.json: \${genData.error}</div>\`;
+            return;
+          }
+          
+          // Execute with generated package info
+          const response = await fetch(\`/api/execute/\${currentOwner}/\${currentRepo}/\${currentFilePath}?branch=\${currentBranch}\`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+              args: args, 
+              useGeneratedPackage: true,
+              packageJson: genData.packageJson
+            })
+          });
+          
+          const data = await response.json();
+          if (data.success) {
+            outputDiv.innerHTML = \`
+              <div class="success">✅ Execution completed with generated package.json!</div>
+              <div style="margin-top: 10px;"><strong>Generated Dependencies:</strong> \${Object.keys(genData.packageJson.dependencies).join(', ') || 'none'}</div>
+              <div style="margin-top: 10px;"><strong>Output:</strong></div>
+              <pre>\${escapeHtml(data.execution.output || 'No output')}</pre>
+            \`;
+          } else {
+            outputDiv.innerHTML = \`<div class="error">❌ Execution failed: \${data.error}</div>\`;
+          }
+          await loadExecutionHistory();
         }
         
-        // Initial load
+        async function loadExecutionHistory() {
+          const response = await fetch('/api/execution-history');
+          const data = await response.json();
+          const historyDiv = document.getElementById('executionHistory');
+          if (data.history.length === 0) {
+            historyDiv.innerHTML = '<div style="font-size: 12px; color: #586069;">No executions yet</div>';
+          } else {
+            historyDiv.innerHTML = data.history.slice(0, 10).map(exec => \`
+              <div style="padding: 10px; margin-bottom: 10px; background: white; border-radius: 4px; font-size: 12px;">
+                <strong>\${exec.script.split('/').pop()}</strong><br>
+                <small>\${new Date(exec.timestamp).toLocaleString()}</small><br>
+                <span class="\${exec.result.success ? 'success' : 'error'}">\${exec.result.success ? '✅ Success' : '❌ Failed'}</span>
+              </div>
+            \`).join('');
+          }
+        }
+        
+        async function loadGeneratedPackages() {
+          const response = await fetch('/api/generated-packages');
+          const data = await response.json();
+          const packagesDiv = document.getElementById('generatedPackagesList');
+          if (data.packages.length === 0) {
+            packagesDiv.innerHTML = '<div style="font-size: 12px; color: #586069;">No packages generated yet</div>';
+          } else {
+            packagesDiv.innerHTML = data.packages.slice(0, 5).map(pkg => \`
+              <div style="padding: 10px; margin-bottom: 10px; background: white; border-radius: 4px; font-size: 12px;">
+                <strong>\${pkg.scriptPath.split('/').pop()}</strong><br>
+                <small>\${Object.keys(pkg.packageJson.dependencies).length} dependencies</small><br>
+                <a href="/api/download-package/\${pkg.id}" download style="color: #0366d6;">📥 Download package.json</a>
+              </div>
+            \`).join('');
+          }
+        }
+        
+        function escapeHtml(text) { return text ? String(text).replace(/[&<>]/g, function(m) { if (m === '&') return '&amp;'; if (m === '<') return '&lt;'; if (m === '>') return '&gt;'; return m; }) : ''; }
+        
         loadTokenStatus();
-        loadRecentRepos();
-        
-        // Auto-load example on start
-        setTimeout(() => {
-          if (!currentOwner) {
-            document.getElementById('repoInput').value = 'facebook/react';
-            loadRepository();
-          }
-        }, 500);
+        setInterval(loadTokenStatus, 60000);
       </script>
     </body>
     </html>
@@ -916,38 +785,16 @@ app.get('/', (req, res) => {
 // Start server
 app.listen(PORT, () => {
   console.log('\n========================================');
-  console.log('🚀 GitHub File Browser Server Started');
+  console.log('🚀 GitHub Script Loader Server Started');
   console.log('========================================');
-  console.log(`📡 Server running at: http://localhost:${PORT}`);
-  console.log('\n🔑 GitHub Token Configuration:');
-  
-  if (GITHUB_TOKEN) {
-    console.log('✅ GitHub Token is ACTIVE');
-    console.log(`   Token: ${GITHUB_TOKEN.substring(0, 10)}...${GITHUB_TOKEN.substring(GITHUB_TOKEN.length - 4)}`);
-    console.log('   Rate Limit: 5000 requests/hour');
-  } else {
-    console.log('⚠️  No GitHub Token Found');
-    console.log('   Rate Limit: 60 requests/hour');
-    console.log('\n📝 To add a GitHub token:');
-    console.log('   Option 1: Create .env file with: GITHUB_TOKEN=your_token_here');
-    console.log('   Option 2: Set environment variable: export GITHUB_TOKEN=your_token_here');
-    console.log('   Option 3: Get token from: https://github.com/settings/tokens');
-  }
-  
-  console.log('\n📖 Usage:');
-  console.log('   - Open browser to http://localhost:3000');
-  console.log('   - Enter repository (e.g., facebook/react)');
-  console.log('   - Browse files and folders');
-  console.log('   - Click any file to view content and history');
-  console.log('   - Click on commits to view previous versions');
+  console.log(`📡 Server: http://localhost:${PORT}`);
+  console.log(`🔑 GitHub Token: ${GITHUB_TOKEN ? '✅ Active' : '❌ Not set'}`);
+  console.log(`⚡ Script Execution: ${ALLOW_SCRIPT_EXECUTION ? '✅ Enabled' : '❌ Disabled'}`);
+  console.log('\n✨ Features:');
+  console.log('  • Browse any GitHub repository');
+  console.log('  • View file content and history');
+  console.log('  • Execute JavaScript files directly');
+  console.log('  • Auto-generate package.json from dependencies');
+  console.log('  • Download generated package.json');
   console.log('\n========================================\n');
-});
-
-// Error handling
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', error);
-});
-
-process.on('unhandledRejection', (error) => {
-  console.error('Unhandled Rejection:', error);
 });
