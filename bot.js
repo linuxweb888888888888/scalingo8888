@@ -1,678 +1,957 @@
-// server.js - Fixed version with proper token authentication
+// bitcoin-keygen-server.js - Complete Bitcoin Key Generator with Web Dashboard
 const express = require('express');
+const crypto = require('crypto');
 const axios = require('axios');
-const { Octokit } = require('@octokit/rest');
 const path = require('path');
-const fs = require('fs');
-const vm = require('vm');
+const os = require('os');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const port = process.env.PORT || 3000;
 
-// Load .env file
-try {
-  if (fs.existsSync('.env')) {
-    require('dotenv').config();
-    console.log('✅ Loaded .env file');
-  }
-} catch (err) {
-  console.log('No .env file found');
-}
-
-// IMPORTANT: Get token from environment
-const GITHUB_TOKEN = "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";
-
-// Test token validity immediately
-async function testTokenValidity() {
-  if (!GITHUB_TOKEN) {
-    console.log('⚠️  No GitHub token provided');
-    return false;
-  }
-  
-  try {
-    // Test with both authentication methods
-    const testUrl = 'https://api.github.com/rate_limit';
-    
-    // Method 1: Using 'token' prefix (classic way)
-    const response1 = await axios.get(testUrl, {
-      headers: {
-        'Authorization': `token ${GITHUB_TOKEN}`,
-        'User-Agent': 'GitHub-Script-Loader',
-        'Accept': 'application/vnd.github.v3+json'
-      }
-    });
-    
-    if (response1.status === 200) {
-      console.log('✅ GitHub token is VALID (using token prefix)');
-      console.log(`   Rate limit: ${response1.data.rate.remaining}/${response1.data.rate.limit} requests remaining`);
-      return true;
-    }
-  } catch (error) {
-    console.log('❌ Token test failed:', error.response?.data?.message || error.message);
-    
-    // Try alternative authentication method
-    try {
-      const response2 = await axios.get(testUrl, {
-        headers: {
-          'Authorization': `Bearer ${GITHUB_TOKEN}`,
-          'User-Agent': 'GitHub-Script-Loader',
-          'Accept': 'application/vnd.github.v3+json'
-        }
-      });
-      
-      if (response2.status === 200) {
-        console.log('✅ GitHub token is VALID (using Bearer prefix)');
-        return true;
-      }
-    } catch (error2) {
-      console.log('❌ Token also failed with Bearer prefix');
-    }
-    
-    console.log('\n🔧 TOKEN ISSUES DETECTED:');
-    console.log('   1. Token may be expired or revoked');
-    console.log('   2. Token may not have required permissions');
-    console.log('   3. Token format might be incorrect');
-    console.log('\n📝 To fix:');
-    console.log('   - Go to: https://github.com/settings/tokens');
-    console.log('   - Generate a new classic token');
-    console.log('   - Select at least "repo" and "public_repo" scopes');
-    console.log('   - Copy the new token to .env file');
-    return false;
-  }
-}
-
-// Initialize Octokit with proper authentication
-let octokit;
-if (GITHUB_TOKEN) {
-  // Try both authentication methods
-  octokit = new Octokit({
-    auth: GITHUB_TOKEN,
-    userAgent: 'GitHub-Script-Loader',
-    timeZone: 'UTC',
-    baseUrl: 'https://api.github.com'
-  });
-} else {
-  octokit = new Octokit({
-    userAgent: 'GitHub-Script-Loader'
-  });
-}
-
-// Middleware
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.static('public'));
 
-// Store data
-let executionHistory = [];
-let generatedPackages = [];
+// ============ SECP256K1 CURVE PARAMETERS ============
+const SECP256K1 = {
+    ORDER: BigInt('0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141'),
+    G: {
+        x: BigInt('0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798'),
+        y: BigInt('0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8')
+    },
+    P: BigInt('0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F')
+};
 
-// ============================================
-// FIXED GITHUB API CALLS
-// ============================================
+// ============ METRICS STORAGE ============
+let metrics = {
+    totalKeysGenerated: 0,
+    totalKeysValidated: 0,
+    totalKeysWithFunds: 0,
+    totalBalanceFound: 0,
+    generationSpeed: 0,
+    validationSpeed: 0,
+    startTime: Date.now(),
+    recentKeys: [],
+    foundWallets: [],
+    generationHistory: [],
+    validationHistory: []
+};
 
-// Helper function to make authenticated requests
-async function makeGitHubRequest(url, options = {}) {
-  const headers = {
-    'User-Agent': 'GitHub-Script-Loader',
-    'Accept': 'application/vnd.github.v3+json',
-    ...options.headers
-  };
-  
-  // Try different authentication methods
-  if (GITHUB_TOKEN) {
-    // Try Bearer first (newer method)
-    try {
-      const response = await axios({
-        method: options.method || 'GET',
-        url,
-        headers: {
-          ...headers,
-          'Authorization': `Bearer ${GITHUB_TOKEN}`
-        },
-        data: options.data,
-        params: options.params
-      });
-      return response;
-    } catch (bearerError) {
-      // If Bearer fails, try token method
-      if (bearerError.response?.status === 401) {
-        const response = await axios({
-          method: options.method || 'GET',
-          url,
-          headers: {
-            ...headers,
-            'Authorization': `token ${GITHUB_TOKEN}`
-          },
-          data: options.data,
-          params: options.params
-        });
-        return response;
-      }
-      throw bearerError;
+// ============ ELLIPTIC CURVE MATH ============
+function modInverse(a, m) {
+    let [old_r, r] = [a, m];
+    let [old_s, s] = [1n, 0n];
+    let [old_t, t] = [0n, 1n];
+    
+    while (r !== 0n) {
+        const quotient = old_r / r;
+        [old_r, r] = [r, old_r - quotient * r];
+        [old_s, s] = [s, old_s - quotient * s];
+        [old_t, t] = [t, old_t - quotient * t];
     }
-  } else {
-    return await axios({
-      method: options.method || 'GET',
-      url,
-      headers,
-      data: options.data,
-      params: options.params
-    });
-  }
+    
+    return (old_s % m + m) % m;
 }
 
-// API endpoint to test token
-app.get('/api/test-token', async (req, res) => {
-  try {
-    const tokenValid = await testTokenValidity();
-    res.json({
-      hasToken: !!GITHUB_TOKEN,
-      tokenValid: tokenValid,
-      tokenPrefix: GITHUB_TOKEN ? GITHUB_TOKEN.substring(0, 10) + '...' : null,
-      message: tokenValid ? 'Token is working correctly' : 'Token is invalid or missing'
-    });
-  } catch (error) {
-    res.json({
-      hasToken: !!GITHUB_TOKEN,
-      tokenValid: false,
-      error: error.message
-    });
-  }
-});
-
-// Get rate limit info with proper auth
-app.get('/api/rate-limit', async (req, res) => {
-  try {
-    const response = await makeGitHubRequest('https://api.github.com/rate_limit');
-    res.json({
-      authenticated: !!GITHUB_TOKEN,
-      rate: response.data.rate,
-      token_valid: response.status === 200
-    });
-  } catch (error) {
-    res.json({
-      authenticated: false,
-      error: error.response?.data?.message || error.message,
-      status: error.response?.status
-    });
-  }
-});
-
-// Browse repository contents
-app.get('/api/browse/:owner/:repo', async (req, res) => {
-  try {
-    const { owner, repo } = req.params;
-    const { path: filePath = '', branch = 'main' } = req.query;
+function pointAdd(p1, p2) {
+    if (p1 === null) return p2;
+    if (p2 === null) return p1;
     
-    const url = `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}?ref=${branch}`;
-    const response = await makeGitHubRequest(url);
+    const [x1, y1] = [p1.x, p1.y];
+    const [x2, y2] = [p2.x, p2.y];
     
-    const contents = Array.isArray(response.data) ? response.data : [response.data];
-    
-    const items = contents.map(item => ({
-      name: item.name,
-      path: item.path,
-      type: item.type,
-      size: item.size,
-      extension: path.extname(item.name),
-      isExecutable: ['.js', '.mjs', '.cjs', '.ts', '.py', '.rb', '.sh'].includes(path.extname(item.name))
-    }));
-    
-    // Get repo info
-    const repoUrl = `https://api.github.com/repos/${owner}/${repo}`;
-    const repoResponse = await makeGitHubRequest(repoUrl);
-    
-    res.json({
-      success: true,
-      owner, repo, branch,
-      currentPath: filePath,
-      items,
-      repository: {
-        name: repoResponse.data.name,
-        description: repoResponse.data.description,
-        stars: repoResponse.data.stargazers_count,
-        forks: repoResponse.data.forks_count,
-        private: repoResponse.data.private
-      }
-    });
-  } catch (error) {
-    console.error('Browse error:', error.response?.data);
-    res.status(error.response?.status || 404).json({
-      success: false,
-      error: error.response?.data?.message || error.message,
-      status: error.response?.status,
-      documentation: 'https://docs.github.com/rest'
-    });
-  }
-});
-
-// Get file content
-app.get('/api/file/:owner/:repo/:filePath(*)', async (req, res) => {
-  try {
-    const { owner, repo, filePath } = req.params;
-    const { branch = 'main' } = req.query;
-    
-    const url = `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}?ref=${branch}`;
-    const response = await makeGitHubRequest(url);
-    
-    const content = Buffer.from(response.data.content, 'base64').toString('utf-8');
-    
-    // Get file history
-    const historyUrl = `https://api.github.com/repos/${owner}/${repo}/commits?path=${filePath}&sha=${branch}&per_page=30`;
-    const historyResponse = await makeGitHubRequest(historyUrl);
-    
-    const history = historyResponse.data.map(commit => ({
-      sha: commit.sha,
-      short_sha: commit.sha.substring(0, 7),
-      message: commit.commit.message,
-      date: commit.commit.author.date,
-      author: commit.commit.author.name
-    }));
-    
-    res.json({
-      success: true,
-      file: {
-        name: path.basename(filePath),
-        path: filePath,
-        content: content,
-        size: content.length,
-        lines: content.split('\n').length,
-        extension: path.extname(filePath),
-        isExecutable: ['.js', '.mjs', '.cjs'].includes(path.extname(filePath))
-      },
-      history,
-      branch
-    });
-  } catch (error) {
-    res.status(error.response?.status || 404).json({
-      success: false,
-      error: error.response?.data?.message || error.message
-    });
-  }
-});
-
-// Generate package.json
-app.post('/api/generate-package', async (req, res) => {
-  try {
-    const { owner, repo, scriptPath, branch = 'main' } = req.body;
-    
-    const url = `https://api.github.com/repos/${owner}/${repo}/contents/${scriptPath}?ref=${branch}`;
-    const response = await makeGitHubRequest(url);
-    const scriptContent = Buffer.from(response.data.content, 'base64').toString('utf-8');
-    
-    // Analyze dependencies
-    const packageJson = {
-      name: path.basename(scriptPath, path.extname(scriptPath)),
-      version: "1.0.0",
-      description: "Generated from GitHub script",
-      main: scriptPath,
-      scripts: {
-        start: `node ${scriptPath}`,
-        test: "echo \"Error: no test specified\" && exit 1"
-      },
-      dependencies: {},
-      devDependencies: {},
-      license: "ISC"
-    };
-    
-    // Detect require/import statements
-    const requireMatches = scriptContent.match(/require\(['"]([^'"]+)['"]\)/g) || [];
-    const importMatches = scriptContent.match(/from ['"]([^'"]+)['"]/g) || [];
-    
-    const allModules = [];
-    requireMatches.forEach(match => {
-      const module = match.match(/require\(['"]([^'"]+)['"]\)/)[1];
-      if (!module.startsWith('.') && !module.startsWith('/')) {
-        allModules.push(module);
-      }
-    });
-    
-    importMatches.forEach(match => {
-      const module = match.match(/from ['"]([^'"]+)['"]/)[1];
-      if (!module.startsWith('.') && !module.startsWith('/')) {
-        allModules.push(module);
-      }
-    });
-    
-    const uniqueModules = [...new Set(allModules)];
-    uniqueModules.forEach(module => {
-      if (module === 'express') packageJson.dependencies.express = "^4.18.2";
-      else if (module === 'axios') packageJson.dependencies.axios = "^1.6.0";
-      else if (module === 'react') packageJson.dependencies.react = "^18.2.0";
-      else packageJson.dependencies[module] = "*";
-    });
-    
-    const generatedPackage = {
-      id: Date.now(),
-      owner, repo, scriptPath, branch,
-      packageJson,
-      generatedAt: new Date().toISOString()
-    };
-    generatedPackages.unshift(generatedPackage);
-    
-    res.json({
-      success: true,
-      packageJson,
-      installCommand: `npm install ${Object.keys(packageJson.dependencies).join(' ')}`,
-      generatedPackage
-    });
-  } catch (error) {
-    res.status(404).json({
-      success: false,
-      error: error.response?.data?.message || error.message
-    });
-  }
-});
-
-// Execute script
-app.post('/api/execute/:owner/:repo/:filePath(*)', async (req, res) => {
-  try {
-    const { owner, repo, filePath } = req.params;
-    const { branch = 'main', args = [] } = req.body;
-    
-    const url = `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}?ref=${branch}`;
-    const response = await makeGitHubRequest(url);
-    const scriptContent = Buffer.from(response.data.content, 'base64').toString('utf-8');
-    
-    // Execute in sandbox
-    const output = [];
-    const errors = [];
-    
-    const sandbox = {
-      console: {
-        log: (...args) => output.push(args.join(' ')),
-        error: (...args) => errors.push(args.join(' ')),
-        warn: (...args) => output.push(`WARN: ${args.join(' ')}`)
-      },
-      process: {
-        env: process.env,
-        argv: ['node', filePath, ...args],
-        cwd: () => process.cwd()
-      },
-      setTimeout: setTimeout,
-      clearTimeout: clearTimeout,
-      setInterval: setInterval,
-      clearInterval: clearInterval,
-      module: { exports: {} },
-      exports: {},
-      require: (moduleName) => {
-        const safeModules = ['fs', 'path', 'util', 'crypto', 'url', 'querystring', 'os'];
-        if (safeModules.includes(moduleName)) {
-          return require(moduleName);
-        }
-        throw new Error(`Module "${moduleName}" not available in sandbox`);
-      },
-      args: args,
-      __filename: filePath,
-      __dirname: path.dirname(filePath)
-    };
-    
-    const startTime = Date.now();
-    try {
-      const script = new vm.Script(scriptContent);
-      const context = vm.createContext(sandbox);
-      script.runInContext(context, { timeout: 5000, displayErrors: true });
-      
-      const executionTime = Date.now() - startTime;
-      const executionRecord = {
-        id: Date.now(),
-        script: `${owner}/${repo}/${filePath}`,
-        branch, args,
-        result: { success: true, output: output.join('\n') },
-        executionTime,
-        timestamp: new Date().toISOString()
-      };
-      executionHistory.unshift(executionRecord);
-      
-      res.json({
-        success: true,
-        execution: {
-          output: output.join('\n'),
-          errors: errors.join('\n'),
-          executionTime: `${executionTime}ms`,
-          timestamp: new Date().toISOString()
-        },
-        executionId: executionRecord.id
-      });
-    } catch (execError) {
-      res.status(400).json({
-        success: false,
-        error: execError.message,
-        stack: execError.stack,
-        output: output.join('\n')
-      });
+    if (x1 === x2 && y1 === y2) {
+        const slope = (3n * x1 * x1) * modInverse(2n * y1, SECP256K1.P) % SECP256K1.P;
+        const x3 = (slope * slope - 2n * x1) % SECP256K1.P;
+        const y3 = (slope * (x1 - x3) - y1) % SECP256K1.P;
+        return { x: (x3 + SECP256K1.P) % SECP256K1.P, y: (y3 + SECP256K1.P) % SECP256K1.P };
+    } else {
+        const slope = (y2 - y1) * modInverse(x2 - x1, SECP256K1.P) % SECP256K1.P;
+        const x3 = (slope * slope - x1 - x2) % SECP256K1.P;
+        const y3 = (slope * (x1 - x3) - y1) % SECP256K1.P;
+        return { x: (x3 + SECP256K1.P) % SECP256K1.P, y: (y3 + SECP256K1.P) % SECP256K1.P };
     }
-  } catch (error) {
-    res.status(404).json({
-      success: false,
-      error: error.response?.data?.message || error.message
+}
+
+function pointMultiply(k, point) {
+    let result = null;
+    let addend = point;
+    let scalar = k;
+    
+    while (scalar > 0n) {
+        if (scalar & 1n) result = pointAdd(result, addend);
+        addend = pointAdd(addend, addend);
+        scalar >>= 1n;
+    }
+    return result;
+}
+
+// ============ ADDRESS GENERATION ============
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+function base58Encode(buffer) {
+    let num = 0n;
+    for (const byte of buffer) num = (num << 8n) | BigInt(byte);
+    
+    let result = '';
+    while (num > 0n) {
+        result = BASE58_ALPHABET[Number(num % 58n)] + result;
+        num = num / 58n;
+    }
+    
+    for (const byte of buffer) {
+        if (byte === 0) result = '1' + result;
+        else break;
+    }
+    return result;
+}
+
+function hash160(buffer) {
+    const sha256 = crypto.createHash('sha256').update(buffer).digest();
+    return crypto.createHash('ripemd160').update(sha256).digest();
+}
+
+function generateRandomPrivateKey() {
+    let privateKeyHex;
+    let attempts = 0;
+    
+    do {
+        const privateKeyBytes = crypto.randomBytes(32);
+        privateKeyHex = privateKeyBytes.toString('hex');
+        const privateKeyBigInt = BigInt('0x' + privateKeyHex);
+        attempts++;
+        
+        if (privateKeyBigInt !== 0n && privateKeyBigInt < SECP256K1.ORDER) {
+            break;
+        }
+    } while (true);
+    
+    return privateKeyHex;
+}
+
+function privateKeyToPublicKey(privateKeyHex) {
+    const privateKeyBigInt = BigInt('0x' + privateKeyHex);
+    const publicKeyPoint = pointMultiply(privateKeyBigInt, SECP256K1.G);
+    
+    const xHex = publicKeyPoint.x.toString(16).padStart(64, '0');
+    const yHex = publicKeyPoint.y.toString(16).padStart(64, '0');
+    const prefix = (publicKeyPoint.y & 1n) === 0n ? '02' : '03';
+    const compressed = prefix + xHex;
+    
+    return { compressed, x: xHex, y: yHex };
+}
+
+function publicKeyToAddress(publicKeyHex) {
+    const publicKeyBuffer = Buffer.from(publicKeyHex, 'hex');
+    const hash160Buffer = hash160(publicKeyBuffer);
+    const versionedBuffer = Buffer.concat([Buffer.from([0x00]), hash160Buffer]);
+    const checksum = crypto.createHash('sha256')
+        .update(crypto.createHash('sha256').update(versionedBuffer).digest())
+        .digest()
+        .slice(0, 4);
+    const addressBuffer = Buffer.concat([versionedBuffer, checksum]);
+    return base58Encode(addressBuffer);
+}
+
+function privateKeyToAddress(privateKeyHex) {
+    const publicKey = privateKeyToPublicKey(privateKeyHex);
+    return publicKeyToAddress(publicKey.compressed);
+}
+
+// ============ VALIDATION FUNCTIONS ============
+function validatePrivateKeyFormat(privateKeyHex) {
+    if (!/^[0-9a-fA-F]{64}$/.test(privateKeyHex)) {
+        return { valid: false, reason: 'Invalid hex format (must be 64 characters)' };
+    }
+    
+    const privateKeyBigInt = BigInt('0x' + privateKeyHex);
+    
+    if (privateKeyBigInt === 0n) {
+        return { valid: false, reason: 'Private key cannot be zero' };
+    }
+    
+    if (privateKeyBigInt >= SECP256K1.ORDER) {
+        return { valid: false, reason: 'Private key exceeds curve order' };
+    }
+    
+    return { valid: true };
+}
+
+function validateAddressFormat(address) {
+    try {
+        if (!address || typeof address !== 'string') return { valid: false, reason: 'Invalid address string' };
+        
+        let num = 0n;
+        for (const char of address) {
+            const idx = BASE58_ALPHABET.indexOf(char);
+            if (idx === -1) return { valid: false, reason: 'Invalid character in address' };
+            num = num * 58n + BigInt(idx);
+        }
+        
+        const bytes = [];
+        while (num > 0n) {
+            bytes.unshift(Number(num & 0xFFn));
+            num >>= 8n;
+        }
+        
+        for (const char of address) {
+            if (char === '1') bytes.unshift(0);
+            else break;
+        }
+        
+        const buffer = Buffer.from(bytes);
+        
+        if (buffer.length !== 25) return { valid: false, reason: 'Invalid address length' };
+        if (buffer[0] !== 0x00) return { valid: false, reason: 'Not a mainnet address' };
+        
+        const payload = buffer.slice(0, 21);
+        const checksum = buffer.slice(21, 25);
+        const calculatedChecksum = crypto.createHash('sha256')
+            .update(crypto.createHash('sha256').update(payload).digest())
+            .digest()
+            .slice(0, 4);
+        
+        if (!checksum.equals(calculatedChecksum)) return { valid: false, reason: 'Invalid checksum' };
+        
+        return { valid: true, hash160: payload.slice(1).toString('hex') };
+    } catch (error) {
+        return { valid: false, reason: error.message };
+    }
+}
+
+async function checkWalletBalance(address) {
+    try {
+        const response = await axios.get(`https://blockchain.info/q/addressbalance/${address}`, { timeout: 10000 });
+        const balanceSatoshis = response.data;
+        const balanceBTC = balanceSatoshis / 100000000;
+        
+        return { hasFunds: balanceBTC > 0, balanceBTC, balanceSatoshis, address };
+    } catch (error) {
+        return { hasFunds: false, balanceBTC: 0, balanceSatoshis: 0, address, error: error.message };
+    }
+}
+
+// ============ BULK GENERATION WITH SPEED TRACKING ============
+async function generateKeys(count, callback) {
+    const startTime = Date.now();
+    const keys = [];
+    
+    for (let i = 0; i < count; i++) {
+        const privateKey = generateRandomPrivateKey();
+        const address = privateKeyToAddress(privateKey);
+        keys.push({ privateKey, address, index: i + 1 });
+        
+        if (callback && i % Math.floor(count / 10) === 0) {
+            callback({ progress: ((i + 1) / count) * 100, generated: i + 1, total: count });
+        }
+    }
+    
+    const endTime = Date.now();
+    const duration = (endTime - startTime) / 1000;
+    const speed = count / duration;
+    
+    metrics.generationSpeed = speed;
+    metrics.generationHistory.unshift({ timestamp: new Date(), count, duration, speed });
+    if (metrics.generationHistory.length > 50) metrics.generationHistory.pop();
+    
+    return { keys, duration, speed, count };
+}
+
+async function validateKeys(keys, checkBalance = true) {
+    const startTime = Date.now();
+    const results = [];
+    let fundedCount = 0;
+    let totalBalance = 0;
+    
+    for (let i = 0; i < keys.length; i++) {
+        const key = keys[i];
+        const privateKey = typeof key === 'string' ? key : key.privateKey;
+        
+        const formatValid = validatePrivateKeyFormat(privateKey);
+        if (!formatValid.valid) {
+            results.push({ privateKey, valid: false, error: formatValid.reason });
+            continue;
+        }
+        
+        const address = privateKeyToAddress(privateKey);
+        let balance = null;
+        
+        if (checkBalance) {
+            balance = await checkWalletBalance(address);
+            if (balance.hasFunds) {
+                fundedCount++;
+                totalBalance += balance.balanceBTC;
+                metrics.foundWallets.unshift({
+                    privateKey,
+                    address,
+                    balance: balance.balanceBTC,
+                    timestamp: new Date()
+                });
+                if (metrics.foundWallets.length > 100) metrics.foundWallets.pop();
+            }
+        }
+        
+        results.push({
+            privateKey,
+            address,
+            valid: true,
+            hasFunds: balance?.hasFunds || false,
+            balanceBTC: balance?.balanceBTC || 0,
+            balanceSatoshis: balance?.balanceSatoshis || 0
+        });
+        
+        metrics.totalKeysValidated++;
+        if (balance?.hasFunds) {
+            metrics.totalKeysWithFunds++;
+            metrics.totalBalanceFound += balance.balanceBTC;
+        }
+        
+        if (i % 10 === 0) {
+            const progress = ((i + 1) / keys.length) * 100;
+            if (callback) callback({ progress, validated: i + 1, total: keys.length, funded: fundedCount });
+        }
+        
+        // Rate limiting
+        await new Promise(r => setTimeout(r, 100));
+    }
+    
+    const endTime = Date.now();
+    const duration = (endTime - startTime) / 1000;
+    const speed = keys.length / duration;
+    
+    metrics.validationSpeed = speed;
+    metrics.validationHistory.unshift({ timestamp: new Date(), count: keys.length, duration, speed, funded: fundedCount });
+    if (metrics.validationHistory.length > 50) metrics.validationHistory.pop();
+    
+    return { results, duration, speed, fundedCount, totalBalance };
+}
+
+// ============ ESTIMATION FUNCTIONS ============
+function estimateTimeToFind(countPerSecond, totalKeyspace = Math.pow(2, 256)) {
+    const yearsToSearchAll = totalKeyspace / (countPerSecond * 365 * 24 * 60 * 60);
+    const probabilityPercent = (countPerSecond / totalKeyspace) * 100;
+    
+    return {
+        keysPerSecond: countPerSecond,
+        keysPerDay: countPerSecond * 86400,
+        keysPerYear: countPerSecond * 31536000,
+        yearsToSearchAll: yearsToSearchAll.toExponential(2),
+        probabilityPercent: probabilityPercent.toExponential(2),
+        estimatedWalletsFound: (countPerSecond * 86400 * 365) / 1000000 // Rough estimate
+    };
+}
+
+// ============ API ENDPOINTS ============
+
+// Generate keys
+app.post('/api/generate', async (req, res) => {
+    const { count = 10 } = req.body;
+    const maxCount = Math.min(count, 1000);
+    
+    metrics.totalKeysGenerated += maxCount;
+    
+    const result = await generateKeys(maxCount);
+    
+    metrics.recentKeys.unshift(...result.keys.slice(0, 10));
+    if (metrics.recentKeys.length > 100) metrics.recentKeys = metrics.recentKeys.slice(0, 100);
+    
+    res.json({
+        success: true,
+        keys: result.keys,
+        duration: result.duration,
+        speed: result.speed,
+        count: result.keys.length
     });
-  }
 });
 
-// Serve web interface
+// Validate keys
+app.post('/api/validate', async (req, res) => {
+    const { keys, checkBalance = true } = req.body;
+    const keysList = Array.isArray(keys) ? keys : [keys];
+    
+    const result = await validateKeys(keysList, checkBalance);
+    
+    res.json({
+        success: true,
+        results: result.results,
+        duration: result.duration,
+        speed: result.speed,
+        fundedCount: result.fundedCount,
+        totalBalance: result.totalBalance
+    });
+});
+
+// Generate and validate (find wallets)
+app.post('/api/find-wallets', async (req, res) => {
+    const { count = 100, checkBalance = true } = req.body;
+    const maxCount = Math.min(count, 500);
+    
+    // Generate keys
+    const generateResult = await generateKeys(maxCount);
+    
+    // Validate keys (check balances)
+    const privateKeys = generateResult.keys.map(k => k.privateKey);
+    const validateResult = await validateKeys(privateKeys, checkBalance);
+    
+    metrics.totalKeysGenerated += maxCount;
+    
+    res.json({
+        success: true,
+        generated: generateResult.keys.length,
+        duration: generateResult.duration + validateResult.duration,
+        generationSpeed: generateResult.speed,
+        validationSpeed: validateResult.speed,
+        fundedFound: validateResult.fundedCount,
+        totalBalanceFound: validateResult.totalBalance,
+        fundedWallets: validateResult.results.filter(r => r.hasFunds)
+    });
+});
+
+// Get metrics
+app.get('/api/metrics', (req, res) => {
+    const uptime = (Date.now() - metrics.startTime) / 1000;
+    const uptimeHours = Math.floor(uptime / 3600);
+    const uptimeMinutes = Math.floor((uptime % 3600) / 60);
+    const uptimeSeconds = Math.floor(uptime % 60);
+    
+    const estimate = estimateTimeToFind(metrics.generationSpeed || 100);
+    
+    res.json({
+        stats: {
+            totalKeysGenerated: metrics.totalKeysGenerated,
+            totalKeysValidated: metrics.totalKeysValidated,
+            totalKeysWithFunds: metrics.totalKeysWithFunds,
+            totalBalanceFound: metrics.totalBalanceFound.toFixed(8),
+            generationSpeed: metrics.generationSpeed.toFixed(2),
+            validationSpeed: metrics.validationSpeed.toFixed(2),
+            uptime: `${uptimeHours}h ${uptimeMinutes}m ${uptimeSeconds}s`
+        },
+        recentKeys: metrics.recentKeys.slice(0, 20),
+        foundWallets: metrics.foundWallets.slice(0, 20),
+        generationHistory: metrics.generationHistory.slice(0, 20),
+        validationHistory: metrics.validationHistory.slice(0, 20),
+        estimates: estimate
+    });
+});
+
+// Validate single private key
+app.post('/api/validate-single', async (req, res) => {
+    const { privateKey } = req.body;
+    
+    const formatValid = validatePrivateKeyFormat(privateKey);
+    if (!formatValid.valid) {
+        return res.json({ valid: false, error: formatValid.reason });
+    }
+    
+    const address = privateKeyToAddress(privateKey);
+    const balance = await checkWalletBalance(address);
+    
+    metrics.totalKeysValidated++;
+    if (balance.hasFunds) {
+        metrics.totalKeysWithFunds++;
+        metrics.totalBalanceFound += balance.balanceBTC;
+        metrics.foundWallets.unshift({
+            privateKey,
+            address,
+            balance: balance.balanceBTC,
+            timestamp: new Date()
+        });
+    }
+    
+    res.json({
+        valid: true,
+        privateKey,
+        address,
+        hasFunds: balance.hasFunds,
+        balanceBTC: balance.balanceBTC,
+        balanceSatoshis: balance.balanceSatoshis
+    });
+});
+
+// Validate address only
+app.post('/api/validate-address', async (req, res) => {
+    const { address } = req.body;
+    
+    const formatValid = validateAddressFormat(address);
+    if (!formatValid.valid) {
+        return res.json({ valid: false, error: formatValid.reason });
+    }
+    
+    const balance = await checkWalletBalance(address);
+    
+    res.json({
+        valid: true,
+        address,
+        hasFunds: balance.hasFunds,
+        balanceBTC: balance.balanceBTC,
+        balanceSatoshis: balance.balanceSatoshis
+    });
+});
+
+// ============ DASHBOARD ============
 app.get('/', (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>GitHub Script Loader - Fixed Token Auth</title>
-      <style>
-        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
-        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }
-        .token-status { padding: 15px; margin-bottom: 20px; border-radius: 6px; }
-        .token-status.valid { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .token-status.invalid { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        .token-status.warning { background: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
-        input, button { padding: 10px; margin: 5px; }
-        input { width: calc(100% - 24px); }
-        button { background: #0366d6; color: white; border: none; cursor: pointer; border-radius: 4px; }
-        button:hover { background: #0255b3; }
-        .file-list { margin-top: 20px; }
-        .file-item { padding: 10px; border-bottom: 1px solid #e1e4e8; cursor: pointer; }
-        .file-item:hover { background: #f6f8fa; }
-        pre { background: #f6f8fa; padding: 15px; overflow-x: auto; border-radius: 4px; }
-        .error { color: red; }
-        .success { color: green; }
-      </style>
-    </head>
-    <body>
-      <div class="container">
-        <h1>🔧 GitHub Script Loader - Fixed Authentication</h1>
-        <div id="tokenStatus" class="token-status">Loading token status...</div>
+    res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bitcoin Key Generator & Wallet Finder</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
+            font-family: 'Inter', sans-serif;
+            color: #fff;
+            min-height: 100vh;
+        }
+        .container { max-width: 1400px; margin: 0 auto; padding: 40px 20px; }
+        h1 { text-align: center; font-size: 2.5rem; margin-bottom: 10px; }
+        h1 span { background: linear-gradient(135deg, #00d4ff, #667eea); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .subtitle { text-align: center; opacity: 0.8; margin-bottom: 40px; }
         
-        <div>
-          <h3>📁 Browse Repository</h3>
-          <input type="text" id="repoInput" placeholder="owner/repo (e.g., facebook/react)" />
-          <button onclick="loadRepository()">Browse</button>
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 40px; }
+        .stat-card { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 15px; padding: 20px; text-align: center; border: 1px solid rgba(255,255,255,0.2); }
+        .stat-value { font-size: 2rem; font-weight: bold; color: #00d4ff; }
+        .stat-label { font-size: 0.8rem; opacity: 0.7; margin-top: 5px; }
+        
+        .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; margin-bottom: 40px; }
+        .card { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 15px; padding: 20px; border: 1px solid rgba(255,255,255,0.2); }
+        .card h3 { margin-bottom: 15px; color: #00d4ff; }
+        
+        input, textarea, select { width: 100%; padding: 12px; margin-bottom: 15px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); border-radius: 8px; color: #fff; font-family: monospace; }
+        button { background: linear-gradient(135deg, #667eea, #764ba2); color: white; border: none; padding: 12px 24px; border-radius: 8px; cursor: pointer; font-weight: 600; transition: transform 0.2s; margin-right: 10px; margin-bottom: 10px; }
+        button:hover { transform: scale(1.02); }
+        .btn-danger { background: linear-gradient(135deg, #f093fb, #f5576c); }
+        .btn-success { background: linear-gradient(135deg, #4facfe, #00f2fe); }
+        
+        .result { background: rgba(0,0,0,0.3); border-radius: 8px; padding: 15px; margin-top: 15px; max-height: 400px; overflow-y: auto; font-family: monospace; font-size: 12px; }
+        .key-item { border-bottom: 1px solid rgba(255,255,255,0.1); padding: 10px; margin-bottom: 5px; }
+        .funded { background: rgba(0,255,0,0.1); border-left: 3px solid #00ff00; }
+        .progress-bar { width: 100%; height: 20px; background: rgba(255,255,255,0.1); border-radius: 10px; overflow: hidden; margin-top: 10px; }
+        .progress-fill { height: 100%; background: linear-gradient(90deg, #00d4ff, #667eea); transition: width 0.3s; }
+        .status { margin-top: 10px; font-size: 12px; }
+        .speed { color: #00d4ff; font-weight: bold; }
+        .found { color: #00ff00; font-weight: bold; }
+        
+        .tabs { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+        .tab { background: rgba(255,255,255,0.1); padding: 10px 20px; border-radius: 8px; cursor: pointer; transition: all 0.2s; }
+        .tab.active { background: linear-gradient(135deg, #667eea, #764ba2); }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1); font-size: 12px; }
+        th { color: #00d4ff; }
+        .address { font-family: monospace; font-size: 11px; }
+        
+        @media (max-width: 768px) {
+            .grid-2 { grid-template-columns: 1fr; }
+            .stats-grid { grid-template-columns: repeat(2, 1fr); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 <span>Bitcoin Key Generator</span> & Wallet Finder</h1>
+        <div class="subtitle">Generate, validate, and check Bitcoin private keys for funds</div>
+        
+        <!-- Stats -->
+        <div class="stats-grid" id="statsGrid">
+            <div class="stat-card"><div class="stat-value" id="totalKeys">0</div><div class="stat-label">Keys Generated</div></div>
+            <div class="stat-card"><div class="stat-value" id="validatedKeys">0</div><div class="stat-label">Keys Validated</div></div>
+            <div class="stat-card"><div class="stat-value" id="fundsFound">0</div><div class="stat-label">Wallets with Funds</div></div>
+            <div class="stat-card"><div class="stat-value" id="balanceFound">0 BTC</div><div class="stat-label">Total Balance Found</div></div>
+            <div class="stat-card"><div class="stat-value" id="genSpeed">0</div><div class="stat-label">Gen Speed (keys/sec)</div></div>
+            <div class="stat-card"><div class="stat-value" id="valSpeed">0</div><div class="stat-label">Val Speed (keys/sec)</div></div>
         </div>
         
-        <div id="content"></div>
-      </div>
-      
-      <script>
-        async function checkToken() {
-          const response = await fetch('/api/test-token');
-          const data = await response.json();
-          const statusDiv = document.getElementById('tokenStatus');
-          
-          if (!data.hasToken) {
-            statusDiv.className = 'token-status warning';
-            statusDiv.innerHTML = \`
-              ⚠️ No GitHub Token Configured<br>
-              <strong>Rate Limit: 60 requests/hour</strong><br><br>
-              <strong>To add a token:</strong><br>
-              1. Go to <a href="https://github.com/settings/tokens" target="_blank">GitHub Tokens</a><br>
-              2. Generate new classic token<br>
-              3. Select 'repo' and 'public_repo' scopes<br>
-              4. Add to .env file: GITHUB_TOKEN=your_token_here<br>
-              5. Restart the server
-            \`;
-          } else if (data.tokenValid) {
-            statusDiv.className = 'token-status valid';
-            statusDiv.innerHTML = \`✅ GitHub Token Active | Token: \${data.tokenPrefix}<br>Working correctly with higher rate limits\`;
-          } else {
-            statusDiv.className = 'token-status invalid';
-            statusDiv.innerHTML = \`
-              ❌ Invalid GitHub Token<br>
-              Error: \${data.error || 'Bad credentials'}<br><br>
-              <strong>To fix:</strong><br>
-              1. Go to <a href="https://github.com/settings/tokens" target="_blank">GitHub Tokens</a><br>
-              2. Delete the old token<br>
-              3. Generate a NEW classic token<br>
-              4. Select 'repo' and 'public_repo' scopes<br>
-              5. Update .env file with the NEW token<br>
-              6. Restart the server
-            \`;
-          }
-        }
+        <!-- Tabs -->
+        <div class="tabs">
+            <div class="tab active" onclick="showTab('generate')">🚀 Generate Keys</div>
+            <div class="tab" onclick="showTab('validate')">🔍 Validate Keys</div>
+            <div class="tab" onclick="showTab('find')">💰 Find Wallets</div>
+            <div class="tab" onclick="showTab('single')">🔑 Single Key</div>
+            <div class="tab" onclick="showTab('found')">🏆 Found Wallets</div>
+            <div class="tab" onclick="showTab('estimates')">📊 Estimates</div>
+        </div>
         
-        async function loadRepository() {
-          const repoInput = document.getElementById('repoInput').value;
-          if (!repoInput) return;
-          
-          const [owner, repo] = repoInput.split('/');
-          const contentDiv = document.getElementById('content');
-          contentDiv.innerHTML = '<div class="loading">Loading...</div>';
-          
-          try {
-            const response = await fetch(\`/api/browse/\${owner}/\${repo}\`);
-            const data = await response.json();
+        <!-- Generate Tab -->
+        <div id="tab-generate" class="tab-content active">
+            <div class="grid-2">
+                <div class="card">
+                    <h3>⚙️ Generation Settings</h3>
+                    <label>Number of Keys:</label>
+                    <input type="number" id="genCount" value="100" min="1" max="1000">
+                    <button onclick="generateKeys()">🎲 Generate Keys</button>
+                    <div class="progress-bar"><div class="progress-fill" id="genProgress" style="width:0%"></div></div>
+                    <div class="status" id="genStatus">Ready to generate keys...</div>
+                </div>
+                <div class="card">
+                    <h3>📋 Generated Keys</h3>
+                    <div class="result" id="genResult">Click generate to create keys...</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Validate Tab -->
+        <div id="tab-validate" class="tab-content">
+            <div class="grid-2">
+                <div class="card">
+                    <h3>🔍 Validation Settings</h3>
+                    <label>Enter Private Keys (one per line or comma separated):</label>
+                    <textarea id="validateKeys" rows="5" placeholder="Enter private keys here..."></textarea>
+                    <label>
+                        <input type="checkbox" id="checkBalance" checked> Check blockchain balance
+                    </label>
+                    <button onclick="validateKeys()">🔍 Validate Keys</button>
+                    <div class="progress-bar"><div class="progress-fill" id="valProgress" style="width:0%"></div></div>
+                    <div class="status" id="valStatus">Ready to validate...</div>
+                </div>
+                <div class="card">
+                    <h3>📊 Validation Results</h3>
+                    <div class="result" id="valResult">Enter keys to validate...</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Find Wallets Tab -->
+        <div id="tab-find" class="tab-content">
+            <div class="grid-2">
+                <div class="card">
+                    <h3>💰 Find Wallets with Funds</h3>
+                    <label>Number of Keys to Generate & Check:</label>
+                    <input type="number" id="findCount" value="100" min="1" max="500">
+                    <label>
+                        <input type="checkbox" id="findCheckBalance" checked> Check blockchain balance
+                    </label>
+                    <button onclick="findWallets()" class="btn-success">🚀 Start Finding Wallets</button>
+                    <div class="progress-bar"><div class="progress-fill" id="findProgress" style="width:0%"></div></div>
+                    <div class="status" id="findStatus">Ready to search...</div>
+                </div>
+                <div class="card">
+                    <h3>🎯 Wallets Found</h3>
+                    <div class="result" id="findResult">No wallets found yet...</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Single Key Tab -->
+        <div id="tab-single" class="tab-content">
+            <div class="grid-2">
+                <div class="card">
+                    <h3>🔑 Single Key Check</h3>
+                    <label>Private Key (hex):</label>
+                    <input type="text" id="singleKey" placeholder="64 character hex string">
+                    <button onclick="checkSingleKey()">🔍 Check Key</button>
+                </div>
+                <div class="card">
+                    <h3>📋 Result</h3>
+                    <div class="result" id="singleResult">Enter a private key to check...</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Found Wallets Tab -->
+        <div id="tab-found" class="tab-content">
+            <div class="card">
+                <h3>🏆 Wallets Found with Funds</h3>
+                <div class="result" id="foundWalletsList" style="max-height: 500px;">
+                    <div class="key-item">No wallets found yet. Run "Find Wallets" to discover funded wallets.</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Estimates Tab -->
+        <div id="tab-estimates" class="tab-content">
+            <div class="card">
+                <h3>📊 Speed & Probability Estimates</h3>
+                <div id="estimatesContent" style="font-family: monospace; line-height: 1.8;">
+                    Loading estimates...
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let currentGenerationSpeed = 0;
+        let currentValidationSpeed = 0;
+        
+        // Tab switching
+        function showTab(tab) {
+            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.getElementById(`tab-${tab}`).classList.add('active');
+            event.target.classList.add('active');
             
-            if (data.success) {
-              contentDiv.innerHTML = \`
-                <div class="file-list">
-                  <h3>📂 \${owner}/\${repo}</h3>
-                  <p>⭐ \${data.repository.stars} stars | 🍴 \${data.repository.forks} forks</p>
-                  \${data.items.map(item => \`
-                    <div class="file-item" onclick="loadFile('\${item.path}')">
-                      \${item.type === 'dir' ? '📁' : '📄'} \${item.name}
-                      \${item.isExecutable ? ' [EXECUTABLE]' : ''}
-                    </div>
-                  \`).join('')}
-                </div>
-              \`;
-            } else {
-              contentDiv.innerHTML = \`<div class="error">Error: \${data.error}</div>\`;
+            if (tab === 'found') loadFoundWallets();
+            if (tab === 'estimates') loadEstimates();
+        }
+        
+        // Load metrics
+        async function loadMetrics() {
+            try {
+                const res = await fetch('/api/metrics');
+                const data = await res.json();
+                
+                document.getElementById('totalKeys').innerText = data.stats.totalKeysGenerated.toLocaleString();
+                document.getElementById('validatedKeys').innerText = data.stats.totalKeysValidated.toLocaleString();
+                document.getElementById('fundsFound').innerText = data.stats.totalKeysWithFunds.toLocaleString();
+                document.getElementById('balanceFound').innerText = parseFloat(data.stats.totalBalanceFound).toFixed(8) + ' BTC';
+                document.getElementById('genSpeed').innerText = parseFloat(data.stats.generationSpeed).toFixed(2);
+                document.getElementById('valSpeed').innerText = parseFloat(data.stats.validationSpeed).toFixed(2);
+                
+                currentGenerationSpeed = parseFloat(data.stats.generationSpeed);
+                currentValidationSpeed = parseFloat(data.stats.validationSpeed);
+            } catch(e) { console.error(e); }
+        }
+        
+        // Generate Keys
+        async function generateKeys() {
+            const count = parseInt(document.getElementById('genCount').value);
+            const genResult = document.getElementById('genResult');
+            const genProgress = document.getElementById('genProgress');
+            const genStatus = document.getElementById('genStatus');
+            
+            genStatus.innerText = `Generating ${count} keys...`;
+            genProgress.style.width = '50%';
+            
+            try {
+                const res = await fetch('/api/generate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ count })
+                });
+                const data = await res.json();
+                
+                genProgress.style.width = '100%';
+                genStatus.innerText = `✅ Generated ${data.keys.length} keys in ${data.duration.toFixed(2)}s (${data.speed.toFixed(2)} keys/sec)`;
+                
+                let html = '';
+                for (const key of data.keys.slice(0, 20)) {
+                    html += `<div class="key-item">
+                        <strong>#${key.index}</strong><br>
+                        Private Key: <span style="font-family:monospace; font-size:11px">${key.privateKey}</span><br>
+                        Address: <span style="font-family:monospace; font-size:11px">${key.address}</span>
+                    </div>`;
+                }
+                if (data.keys.length > 20) html += `<div>... and ${data.keys.length - 20} more</div>`;
+                genResult.innerHTML = html;
+                
+                loadMetrics();
+            } catch(e) {
+                genStatus.innerText = `❌ Error: ${e.message}`;
             }
-          } catch (error) {
-            contentDiv.innerHTML = \`<div class="error">Error: \${error.message}</div>\`;
-          }
         }
         
-        async function loadFile(filePath) {
-          const repoInput = document.getElementById('repoInput').value;
-          const [owner, repo] = repoInput.split('/');
-          const contentDiv = document.getElementById('content');
-          
-          const response = await fetch(\`/api/file/\${owner}/\${repo}/\${filePath}\`);
-          const data = await response.json();
-          
-          if (data.success) {
-            contentDiv.innerHTML = \`
-              <h3>📄 \${data.file.name}</h3>
-              <p>Size: \${data.file.size} bytes | Lines: \${data.file.lines}</p>
-              \${data.file.isExecutable ? \`
-                <button onclick="executeScript('\${filePath}')">▶ Execute Script</button>
-                <button onclick="generatePackage('\${filePath}')">📦 Generate package.json</button>
-              \` : ''}
-              <pre>\${escapeHtml(data.file.content)}</pre>
-              <h3>📜 History</h3>
-              \${data.history.map(commit => \`
-                <div style="padding: 10px; border-bottom: 1px solid #e1e4e8;">
-                  <strong>\${commit.short_sha}</strong> - \${commit.message}<br>
-                  <small>\${commit.author} - \${new Date(commit.date).toLocaleString()}</small>
-                </div>
-              \`).join('')}
-            \`;
-          }
+        // Validate Keys
+        async function validateKeys() {
+            const keysText = document.getElementById('validateKeys').value;
+            const checkBalance = document.getElementById('checkBalance').checked;
+            const keys = keysText.split(/[,\n]/).map(k => k.trim()).filter(k => k);
+            const valResult = document.getElementById('valResult');
+            const valProgress = document.getElementById('valProgress');
+            const valStatus = document.getElementById('valStatus');
+            
+            if (keys.length === 0) {
+                valStatus.innerText = 'Please enter at least one private key';
+                return;
+            }
+            
+            valStatus.innerText = `Validating ${keys.length} keys...`;
+            valProgress.style.width = '50%';
+            
+            try {
+                const res = await fetch('/api/validate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ keys, checkBalance })
+                });
+                const data = await res.json();
+                
+                valProgress.style.width = '100%';
+                valStatus.innerText = `✅ Validated ${data.results.length} keys in ${data.duration.toFixed(2)}s (${data.speed.toFixed(2)} keys/sec) | Funded: ${data.fundedCount} | Total: ${data.totalBalance.toFixed(8)} BTC`;
+                
+                let html = '';
+                for (const result of data.results.slice(0, 50)) {
+                    const status = result.hasFunds ? '💰 HAS FUNDS!' : (result.valid ? '✅ Valid' : '❌ Invalid');
+                    html += `<div class="key-item ${result.hasFunds ? 'funded' : ''}">
+                        <strong>${status}</strong><br>
+                        Private Key: <span style="font-family:monospace; font-size:10px">${result.privateKey}</span><br>
+                        Address: <span style="font-family:monospace; font-size:10px">${result.address}</span>
+                        ${result.hasFunds ? `<br><span style="color:#00ff00">💰 Balance: ${result.balanceBTC} BTC</span>` : ''}
+                    </div>`;
+                }
+                valResult.innerHTML = html;
+                
+                loadMetrics();
+            } catch(e) {
+                valStatus.innerText = `❌ Error: ${e.message}`;
+            }
         }
         
-        async function executeScript(filePath) {
-          const repoInput = document.getElementById('repoInput').value;
-          const [owner, repo] = repoInput.split('/');
-          
-          const response = await fetch(\`/api/execute/\${owner}/\${repo}/\${filePath}\`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ args: [] })
-          });
-          
-          const data = await response.json();
-          if (data.success) {
-            alert(\`Execution completed!\\n\\nOutput:\\n\${data.execution.output}\`);
-          } else {
-            alert(\`Execution failed: \${data.error}\`);
-          }
+        // Find Wallets
+        async function findWallets() {
+            const count = parseInt(document.getElementById('findCount').value);
+            const checkBalance = document.getElementById('findCheckBalance').checked;
+            const findResult = document.getElementById('findResult');
+            const findProgress = document.getElementById('findProgress');
+            const findStatus = document.getElementById('findStatus');
+            
+            findStatus.innerText = `Generating and checking ${count} keys...`;
+            findProgress.style.width = '30%';
+            
+            try {
+                const res = await fetch('/api/find-wallets', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ count, checkBalance })
+                });
+                const data = await res.json();
+                
+                findProgress.style.width = '100%';
+                findStatus.innerText = `✅ Found ${data.fundedFound} wallets with funds! Total balance: ${data.totalBalanceFound.toFixed(8)} BTC | Speed: ${data.generationSpeed.toFixed(2)} gen/s, ${data.validationSpeed.toFixed(2)} val/s`;
+                
+                if (data.fundedFound > 0) {
+                    let html = '';
+                    for (const wallet of data.fundedWallets.slice(0, 20)) {
+                        html += `<div class="key-item funded">
+                            <strong>💰 WALLET WITH FUNDS!</strong><br>
+                            Private Key: <span style="font-family:monospace; font-size:10px">${wallet.privateKey}</span><br>
+                            Address: <span style="font-family:monospace; font-size:10px">${wallet.address}</span><br>
+                            <span style="color:#00ff00">Balance: ${wallet.balanceBTC} BTC</span>
+                        </div>`;
+                    }
+                    findResult.innerHTML = html;
+                } else {
+                    findResult.innerHTML = '<div class="key-item">No wallets with funds found in this batch. Keep trying!</div>';
+                }
+                
+                loadMetrics();
+                loadFoundWallets();
+            } catch(e) {
+                findStatus.innerText = `❌ Error: ${e.message}`;
+            }
         }
         
-        async function generatePackage(filePath) {
-          const repoInput = document.getElementById('repoInput').value;
-          const [owner, repo] = repoInput.split('/');
-          
-          const response = await fetch('/api/generate-package', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ owner, repo, scriptPath: filePath })
-          });
-          
-          const data = await response.json();
-          if (data.success) {
-            alert(\`package.json generated!\\n\\nDependencies: \${Object.keys(data.packageJson.dependencies).join(', ') || 'none'}\\n\\nInstall: \${data.installCommand}\`);
-          } else {
-            alert(\`Failed: \${data.error}\`);
-          }
+        // Check single key
+        async function checkSingleKey() {
+            const privateKey = document.getElementById('singleKey').value.trim();
+            const singleResult = document.getElementById('singleResult');
+            
+            if (!privateKey) {
+                singleResult.innerHTML = '<div class="key-item">Please enter a private key</div>';
+                return;
+            }
+            
+            singleResult.innerHTML = '<div class="key-item">Checking...</div>';
+            
+            try {
+                const res = await fetch('/api/validate-single', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ privateKey })
+                });
+                const data = await res.json();
+                
+                if (data.valid) {
+                    singleResult.innerHTML = `<div class="key-item ${data.hasFunds ? 'funded' : ''}">
+                        <strong>${data.hasFunds ? '💰 VALID WALLET WITH FUNDS!' : '✅ Valid private key'}</strong><br>
+                        Private Key: <span style="font-family:monospace; font-size:11px">${data.privateKey}</span><br>
+                        Address: <span style="font-family:monospace; font-size:11px">${data.address}</span>
+                        ${data.hasFunds ? `<br><span style="color:#00ff00">💰 Balance: ${data.balanceBTC} BTC (${data.balanceSatoshis.toLocaleString()} satoshis)</span>` : '<br>No funds found on this address'}
+                    </div>`;
+                } else {
+                    singleResult.innerHTML = `<div class="key-item">❌ Invalid private key: ${data.error}</div>`;
+                }
+                
+                loadMetrics();
+            } catch(e) {
+                singleResult.innerHTML = `<div class="key-item">❌ Error: ${e.message}</div>`;
+            }
         }
         
-        function escapeHtml(text) {
-          const div = document.createElement('div');
-          div.textContent = text;
-          return div.innerHTML;
+        // Load found wallets
+        async function loadFoundWallets() {
+            try {
+                const res = await fetch('/api/metrics');
+                const data = await res.json();
+                const found = document.getElementById('foundWalletsList');
+                
+                if (data.foundWallets && data.foundWallets.length > 0) {
+                    let html = '';
+                    for (const wallet of data.foundWallets) {
+                        html += `<div class="key-item funded">
+                            <strong>💰 FOUND ${wallet.balance} BTC</strong><br>
+                            Private Key: <span style="font-family:monospace; font-size:10px">${wallet.privateKey}</span><br>
+                            Address: <span style="font-family:monospace; font-size:10px">${wallet.address}</span><br>
+                            Found: ${new Date(wallet.timestamp).toLocaleString()}
+                        </div>`;
+                    }
+                    found.innerHTML = html;
+                } else {
+                    found.innerHTML = '<div class="key-item">No wallets found yet. Run "Find Wallets" to search.</div>';
+                }
+            } catch(e) { console.error(e); }
         }
         
-        checkToken();
-      </script>
-    </body>
-    </html>
-  `);
+        // Load estimates
+        async function loadEstimates() {
+            try {
+                const res = await fetch('/api/metrics');
+                const data = await res.json();
+                const est = data.estimates;
+                const estimatesDiv = document.getElementById('estimatesContent');
+                
+                estimatesDiv.innerHTML = `
+                    <div class="key-item">
+                        <strong>📊 CURRENT PERFORMANCE</strong><br>
+                        Generation Speed: ${data.stats.generationSpeed || 0} keys/sec<br>
+                        Validation Speed: ${data.stats.validationSpeed || 0} keys/sec<br>
+                        Total Keys Generated: ${data.stats.totalKeysGenerated.toLocaleString()}<br>
+                        Total Keys Validated: ${data.stats.totalKeysValidated.toLocaleString()}
+                    </div>
+                    <div class="key-item">
+                        <strong>⏱️ TIME ESTIMATES (at ${est.keysPerSecond?.toFixed(2) || 0} keys/sec)</strong><br>
+                        Keys per Day: ${(est.keysPerDay || 0).toLocaleString()}<br>
+                        Keys per Year: ${(est.keysPerYear || 0).toExponential(2)}<br>
+                        Years to search all possible keys: ${est.yearsToSearchAll || 'N/A'}<br>
+                        Probability per key: ${est.probabilityPercent || 'N/A'}%
+                    </div>
+                    <div class="key-item">
+                        <strong>💡 REALITY CHECK</strong><br>
+                        Total possible Bitcoin private keys: ~2^256 (${Math.pow(2, 256).toExponential(2)})<br>
+                        This is more than the number of atoms in the universe.<br>
+                        Finding a key with funds is statistically impossible.<br>
+                        This tool is for educational purposes only.
+                    </div>
+                `;
+            } catch(e) { console.error(e); }
+        }
+        
+        // Auto-refresh metrics
+        setInterval(loadMetrics, 5000);
+        loadMetrics();
+    </script>
+</body>
+</html>`);
 });
 
-// Start server with token validation
-async function startServer() {
-  console.log('\n========================================');
-  console.log('🔧 GitHub Script Loader Server');
-  console.log('========================================');
-  
-  // Test token on startup
-  const tokenValid = await testTokenValidity();
-  
-  if (!GITHUB_TOKEN) {
-    console.log('\n⚠️  WARNING: No GitHub token configured');
-    console.log('   Rate limit: 60 requests/hour');
-    console.log('\n   To add a token:');
-    console.log('   1. Visit: https://github.com/settings/tokens');
-    console.log('   2. Generate new classic token');
-    console.log('   3. Select "repo" and "public_repo" scopes');
-    console.log('   4. Add to .env file: GITHUB_TOKEN=your_token');
-    console.log('   5. Restart the server\n');
-  } else if (!tokenValid) {
-    console.log('\n❌ ERROR: Invalid GitHub token!');
-    console.log('   The token provided is not working.');
-    console.log('\n   To fix:');
-    console.log('   1. Visit: https://github.com/settings/tokens');
-    console.log('   2. Delete the old token');
-    console.log('   3. Generate a NEW classic token');
-    console.log('   4. Make sure to select "repo" scope');
-    console.log('   5. Update .env file with the NEW token');
-    console.log('   6. Restart the server\n');
-  } else {
-    console.log('\n✅ GitHub token is valid and working!');
-    console.log('   Rate limit: 5000 requests/hour\n');
-  }
-  
-  app.listen(PORT, () => {
-    console.log(`📡 Server running at: http://localhost:${PORT}`);
-    console.log('========================================\n');
-  });
-}
-
-startServer();
+// ============ START SERVER ============
+app.listen(port, '0.0.0.0', () => {
+    console.log(`
+╔══════════════════════════════════════════════════════════════╗
+║         Bitcoin Key Generator & Wallet Finder Server         ║
+╠══════════════════════════════════════════════════════════════╣
+║  Dashboard:  http://localhost:${port}                         ║
+║  API Base:   http://localhost:${port}/api/                    ║
+╠══════════════════════════════════════════════════════════════╣
+║  Endpoints:                                                  ║
+║    POST /api/generate        - Generate random keys          ║
+║    POST /api/validate        - Validate private keys         ║
+║    POST /api/find-wallets    - Generate & check for funds    ║
+║    POST /api/validate-single - Check single private key      ║
+║    POST /api/validate-address- Check Bitcoin address         ║
+║    GET  /api/metrics         - Get system metrics            ║
+╚══════════════════════════════════════════════════════════════╝
+    `);
+});
