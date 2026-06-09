@@ -1,43 +1,30 @@
 {
-  "name": "bitcoin-keygen-wallet-finder",
+  "name": "real-bitcoin-finder",
   "version": "1.0.0",
-  "description": "Bitcoin Private Key Generator, Wallet Validator, and Balance Checker with Web Dashboard",
-  "main": "bitcoin-keygen-server.js",
+  "description": "Real Bitcoin wallet finder using secp256k1 cryptography",
+  "main": "bot.js",
   "scripts": {
-    "start": "node bitcoin-keygen-server.js",
-    "dev": "nodemon bitcoin-keygen-server.js",
-    "test": "node test.js"
+    "start": "node bot.js",
+    "dev": "nodemon bot.js"
   },
   "keywords": [
     "bitcoin",
-    "private-key",
-    "wallet-generator",
     "cryptocurrency",
-    "blockchain",
-    "btc",
-    "key-generator",
-    "wallet-finder",
-    "crypto-tools"
+    "secp256k1",
+    "wallet",
+    "blockchain"
   ],
-  "author": "Bitcoin KeyGen Tool",
+  "author": "",
   "license": "MIT",
   "dependencies": {
+    "express": "^4.18.2",
     "axios": "^1.6.0",
-    "express": "^4.18.2"
+    "secp256k1": "^5.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
   },
   "engines": {
-    "node": ">=14.0.0",
-    "npm": ">=6.0.0"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/yourusername/bitcoin-keygen-wallet-finder"
-  },
-  "bugs": {
-    "url": "https://github.com/yourusername/bitcoin-keygen-wallet-finder/issues"
-  },
-  "homepage": "https://github.com/yourusername/bitcoin-keygen-wallet-finder#readme"
+    "node": ">=16.0.0"
+  }
 }
