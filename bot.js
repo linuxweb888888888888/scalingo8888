@@ -1,65 +1,57 @@
 const axios = require('axios');
 const express = require('express');
-const fs = require('fs');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ============ CONFIGURATION ============
+// ============ CONFIGURATION (SMALL BALANCE OPTIMIZED) ============
 const API_KEY = process.env.API_KEY || "YOUR_API_KEY_HERE";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const PLINKO_CONFIG = {
     coin: "BTC",
-    // Plinko specific settings
-    risk: "medium",      // Options: "low", "medium", "high"
-    rows: 16,            // Number of pin rows (8-16 typical)
-    // Betting strategy
-    baseBet: 0.00000010,  // 1000 satoshis base bet
-    maxBet: 0.00001000,   // Cap at 100k satoshis
-    targetProfit: 0.00010000,  // Stop if profit hits 0.001 BTC
-    stopLoss: 0.00005000,      // Stop if loss hits 0.0005 BTC
+    risk: "low",
+    rows: 8,
+    baseBet: 0.00000001,
+    maxBet: 0.00000050,
+    recoveryMultiplier: 1.2,
+    targetProfit: 0.00001000,
+    stopLoss: 0.00000500,
+    maxDrawdownPercent: 0.30,
 };
 
-// Plinko payout multipliers for different risk levels
+// Plinko payout multipliers
 const PLINKO_PAYOUTS = {
     low: {
-        8: [5.6, 2.1, 1.1, 1, 1, 1.1, 2.1, 5.6],
-        16: [16, 9, 3, 1.4, 1.2, 1.1, 1, 1, 1, 1, 1.1, 1.2, 1.4, 3, 9, 16]
+        8: [5.6, 2.1, 1.1, 1.0, 1.0, 1.1, 2.1, 5.6],
     },
-    medium: {
-        8: [13, 3, 1.3, 0.7, 0.7, 1.3, 3, 13],
-        16: [29, 13, 5, 2.3, 1.4, 1, 0.7, 0.5, 0.5, 0.7, 1, 1.4, 2.3, 5, 13, 29]
-    },
-    high: {
-        8: [29, 4, 1.5, 0.3, 0.3, 1.5, 4, 29],
-        16: [89, 29, 13, 5, 2.3, 1.2, 0.5, 0.3, 0.3, 0.5, 1.2, 2.3, 5, 13, 29, 89]
-    }
 };
 
 // ============ BOT STATE ============
 let btcPrice = 60964;
+let startingBalance = 0;
 let botState = {
     running: true,
-    statusMessage: "Initializing Plinko Bot...",
+    statusMessage: "Initializing Micro Plinko Bot...",
     coin: PLINKO_CONFIG.coin,
     stats: {
         totalBets: 0,
-        wins: 0,        // Bets with multiplier > 1x
-        losses: 0,      // Bets with multiplier < 1x
+        wins: 0,
+        losses: 0,
         netProfit: 0,
         currentBalance: 0,
+        startingBalance: 0,
         startTime: Date.now(),
         maxDrawdown: 0,
         peakBalance: 0,
+        sessionHigh: 0,
     },
     settings: {
         currentBet: PLINKO_CONFIG.baseBet,
         risk: PLINKO_CONFIG.risk,
         rows: PLINKO_CONFIG.rows,
     },
-    betHistory: [],
-    sessionActive: true
+    betHistory: []
 };
 
 // ============ UTILITIES ============
@@ -72,30 +64,32 @@ async function updateBTCPrice() {
 setInterval(updateBTCPrice, 60000);
 updateBTCPrice();
 
-function getRandomPosition(rows) {
-    // Returns random landing position (0 to rows-1)
-    return Math.floor(Math.random() * rows);
-}
-
-function getMultiplier(risk, rows, position) {
-    const payouts = PLINKO_PAYOUTS[risk][rows];
-    return payouts[position] || 1;
+function formatBTC(amount) {
+    return (amount || 0).toFixed(8);
 }
 
 // ============ API LOGIC ============
+async function getBalance() {
+    const url = `${BASE_URL}/balance/${botState.coin}/${API_KEY}`;
+    try {
+        const response = await axios.get(url);
+        return response.data.Balance || 0;
+    } catch (error) {
+        console.error("Balance check error:", error.message);
+        return null;
+    }
+}
+
 async function placePlinkoBet() {
-    // Crypto.Games Plinko endpoint format
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
+    const clientSeed = `plinko_micro_${Date.now()}_${Math.random().toString(36).substring(7)}`;
     
-    const clientSeed = `plinko_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-    
-    // For Plinko, we need to specify the game type
     const payload = { 
         Bet: Number(botState.settings.currentBet.toFixed(8)),
-        Payout: 2.0,  // Placeholder - actual payout determined by landing position
+        Payout: 2.0,
         UnderOver: true,
         ClientSeed: clientSeed,
-        Game: "plinko",  // Specify Plinko game
+        Game: "plinko",
         Rows: botState.settings.rows,
         Risk: botState.settings.risk
     };
@@ -106,40 +100,87 @@ async function placePlinkoBet() {
         });
         return response.data;
     } catch (error) { 
-        console.error("API Error:", error.response?.data || error.message);
-        botState.statusMessage = `API Error: ${error.response?.data?.Message || error.message}`;
+        const errorMsg = error.response?.data?.Message || error.message;
+        console.error("API Error:", errorMsg);
+        botState.statusMessage = `API Error: ${errorMsg}`;
         return null; 
     }
 }
 
-// ============ MARTINGALE-LIKE PLINKO STRATEGY ============
+// ============ SAFETY CHECK ============
+function checkSafetyConditions() {
+    if (botState.stats.netProfit <= -PLINKO_CONFIG.stopLoss) {
+        botState.statusMessage = `STOP LOSS TRIGGERED! Loss: ${formatBTC(botState.stats.netProfit)} BTC`;
+        botState.running = false;
+        return false;
+    }
+    
+    if (botState.stats.netProfit >= PLINKO_CONFIG.targetProfit) {
+        botState.statusMessage = `TARGET REACHED! Profit: ${formatBTC(botState.stats.netProfit)} BTC`;
+        botState.running = false;
+        return false;
+    }
+    
+    if (startingBalance > 0) {
+        const currentDrawdown = (startingBalance - botState.stats.currentBalance) / startingBalance;
+        if (currentDrawdown >= PLINKO_CONFIG.maxDrawdownPercent) {
+            botState.statusMessage = `MAX DRAWDOWN REACHED! Down ${(currentDrawdown * 100).toFixed(1)}%`;
+            botState.running = false;
+            return false;
+        }
+    }
+    
+    const maxSafeBet = botState.stats.currentBalance * 0.10;
+    if (botState.settings.currentBet > maxSafeBet && maxSafeBet > 0) {
+        botState.settings.currentBet = Math.max(PLINKO_CONFIG.baseBet, maxSafeBet);
+    }
+    
+    return true;
+}
+
+// ============ MAIN STRATEGY ============
 async function runPlinkoStrategy() {
-    botState.statusMessage = "Plinko Bot Running - Medium Risk";
+    const initialBalance = await getBalance();
+    if (initialBalance === null) {
+        console.error("Failed to get balance. Check your API key.");
+        botState.statusMessage = "FAILED: Cannot connect to API";
+        return;
+    }
+    
+    startingBalance = initialBalance;
+    botState.stats.startingBalance = startingBalance;
+    botState.stats.currentBalance = startingBalance;
+    botState.stats.peakBalance = startingBalance;
+    botState.stats.sessionHigh = startingBalance;
+    
+    console.log(`
+    Starting Balance: ${formatBTC(startingBalance)} BTC
+    Base Bet: ${formatBTC(PLINKO_CONFIG.baseBet)} BTC (1 SATOSHI!)
+    `);
+    
+    botState.statusMessage = "Bot Running - Low Risk / 1 Satoshi Base Bet";
     
     while (botState.running) {
-        // Check stop conditions
-        if (botState.stats.netProfit >= PLINKO_CONFIG.targetProfit) {
-            botState.statusMessage = `🎯 Target profit reached: ${botState.stats.netProfit.toFixed(8)} BTC`;
-            botState.running = false;
-            break;
+        const freshBalance = await getBalance();
+        if (freshBalance !== null) {
+            botState.stats.currentBalance = freshBalance;
+            botState.stats.netProfit = freshBalance - startingBalance;
         }
         
-        if (botState.stats.netProfit <= -PLINKO_CONFIG.stopLoss) {
-            botState.statusMessage = `🛑 Stop loss triggered: ${botState.stats.netProfit.toFixed(8)} BTC`;
-            botState.running = false;
-            break;
-        }
-        
-        // Update current balance and track drawdown
         if (botState.stats.currentBalance > botState.stats.peakBalance) {
             botState.stats.peakBalance = botState.stats.currentBalance;
         }
+        
         const drawdown = botState.stats.peakBalance - botState.stats.currentBalance;
         if (drawdown > botState.stats.maxDrawdown) {
             botState.stats.maxDrawdown = drawdown;
         }
         
-        // Place the bet
+        if (!checkSafetyConditions()) {
+            console.log("\nBot stopped:", botState.statusMessage);
+            break;
+        }
+        
         const result = await placePlinkoBet();
         
         if (!result) { 
@@ -147,28 +188,27 @@ async function runPlinkoStrategy() {
             continue; 
         }
         
-        // Process result
         botState.stats.totalBets++;
         const profit = result.Profit || 0;
         const multiplier = result.Multiplier || 1;
         
-        botState.stats.netProfit += profit;
-        botState.stats.currentBalance = result.Balance || 0;
+        botState.stats.currentBalance = result.Balance || botState.stats.currentBalance;
+        botState.stats.netProfit = botState.stats.currentBalance - startingBalance;
         
-        // Track win/loss (multiplier > 1 = win, < 1 = loss)
+        if (botState.stats.currentBalance > botState.stats.sessionHigh) {
+            botState.stats.sessionHigh = botState.stats.currentBalance;
+        }
+        
         if (multiplier > 1) {
             botState.stats.wins++;
-            // After a win, reset to base bet
             botState.settings.currentBet = PLINKO_CONFIG.baseBet;
         } else {
             botState.stats.losses++;
-            // After a loss, increase bet (recovery mode)
-            let newBet = botState.settings.currentBet * 1.5;
+            let newBet = botState.settings.currentBet * PLINKO_CONFIG.recoveryMultiplier;
             if (newBet > PLINKO_CONFIG.maxBet) newBet = PLINKO_CONFIG.maxBet;
             botState.settings.currentBet = newBet;
         }
         
-        // Store history
         botState.betHistory.unshift({ 
             id: botState.stats.totalBets,
             time: new Date().toLocaleTimeString(),
@@ -176,24 +216,15 @@ async function runPlinkoStrategy() {
             multiplier: multiplier,
             profit: profit,
             isWin: multiplier > 1,
-            position: result.Position || "?",
             currentBet: botState.settings.currentBet
         });
         
-        // Keep last 50 bets
         if (botState.betHistory.length > 50) botState.betHistory.pop();
         
-        // Calculate win rate display
-        const winRate = botState.stats.totalBets > 0 ? 
-            (botState.stats.wins / botState.stats.totalBets * 100).toFixed(1) : 0;
+        console.log(`Bet #${botState.stats.totalBets}: ${formatBTC(result.Bet)} | ${multiplier}x | ${profit > 0 ? '+' : ''}${formatBTC(profit)} | Balance: ${formatBTC(botState.stats.currentBalance)}`);
         
-        console.log(`[${new Date().toLocaleTimeString()}] Bet #${botState.stats.totalBets}: ${result.Bet.toFixed(8)} BTC | Multiplier: ${multiplier}x | ${profit > 0 ? 'WIN' : 'LOSS'} +${profit.toFixed(8)} | Balance: ${botState.stats.currentBalance.toFixed(8)} | WR: ${winRate}%`);
-        
-        // Rate limiting - Plinko is fast but don't overwhelm API
         await new Promise(r => setTimeout(r, 800));
     }
-    
-    console.log("Bot stopped:", botState.statusMessage);
 }
 
 // ============ EXPRESS DASHBOARD ============
@@ -206,7 +237,6 @@ app.get('/api/stats', (req, res) => {
         botState, 
         btcPrice, 
         hoursPassed: hours.toFixed(2),
-        config: PLINKO_CONFIG,
         winRate
     });
 });
@@ -214,184 +244,85 @@ app.get('/api/stats', (req, res) => {
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <title>Plinko Bot | Crypto.Games Automation</title>
+    <title>Plinko Bot</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-        .container { max-width: 1300px; margin: 0 auto; }
-        .header { text-align: center; margin-bottom: 30px; color: white; }
-        .header h1 { font-size: 2.5rem; margin-bottom: 10px; }
-        .header p { opacity: 0.9; }
-        
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; margin-bottom: 30px; }
-        .stat-card { background: white; border-radius: 15px; padding: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); }
-        .stat-label { font-size: 0.8rem; text-transform: uppercase; color: #666; letter-spacing: 1px; margin-bottom: 8px; }
-        .stat-value { font-size: 1.8rem; font-weight: bold; color: #333; }
-        .stat-sub { font-size: 0.9rem; color: #888; margin-top: 5px; }
-        
-        .plinko-visual { background: white; border-radius: 15px; padding: 20px; margin-bottom: 30px; }
-        .pin-row { display: flex; justify-content: center; margin: 5px 0; }
-        .pin { width: 30px; height: 30px; background: #764ba2; border-radius: 50%; margin: 0 15px; display: inline-block; }
-        .bucket { width: 40px; height: 50px; background: #667eea; border-radius: 5px; margin: 0 10px; display: inline-flex; align-items: center; justify-content: center; color: white; font-weight: bold; }
-        
-        .history-table { background: white; border-radius: 15px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.1); }
-        table { width: 100%; border-collapse: collapse; }
-        th { background: #f8f9fa; padding: 15px; text-align: left; font-weight: 600; color: #555; }
-        td { padding: 12px 15px; border-bottom: 1px solid #eee; font-family: monospace; }
-        .win { color: #10b981; font-weight: bold; }
-        .loss { color: #ef4444; font-weight: bold; }
-        .status-bar { background: #1e293b; color: white; padding: 15px; border-radius: 10px; margin-bottom: 20px; font-weight: bold; text-align: center; }
-        
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-        .running { animation: pulse 2s infinite; }
+        body { font-family: Arial; margin: 20px; background: #1a1a2e; color: white; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .card { background: #16213e; padding: 20px; border-radius: 10px; margin: 10px 0; }
+        .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; }
+        .stat { background: #0f3460; padding: 15px; border-radius: 8px; text-align: center; }
+        .stat-value { font-size: 24px; font-weight: bold; color: #e94560; }
+        .win { color: #4CAF50; }
+        .loss { color: #f44336; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #333; }
+        .status { padding: 10px; border-radius: 5px; margin-bottom: 20px; background: #e94560; }
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="header">
-            <h1>🎯 PLINKO BOT</h1>
-            <p>Crypto.Games Automated Betting System</p>
+        <h1>Plinko Bot - Micro Balance</h1>
+        <div class="status" id="statusMsg">Loading...</div>
+        
+        <div class="stats">
+            <div class="stat"><div>Balance</div><div class="stat-value" id="balance">0</div></div>
+            <div class="stat"><div>Profit</div><div class="stat-value" id="profit">0</div></div>
+            <div class="stat"><div>Total Bets</div><div class="stat-value" id="totalBets">0</div></div>
+            <div class="stat"><div>Win Rate</div><div class="stat-value" id="winRate">0%</div></div>
         </div>
         
-        <div class="status-bar" id="statusMsg">🟢 Bot Status: Running...</div>
-        
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-label">💰 Wallet Balance</div>
-                <div class="stat-value" id="walletBalance">0.00000000</div>
-                <div class="stat-sub" id="walletUSD">$0.00</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">📈 Net Profit</div>
-                <div class="stat-value" id="netProfit" style="color: #10b981;">0.00000000</div>
-                <div class="stat-sub" id="profitUSD">$0.00</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">🎲 Total Bets</div>
-                <div class="stat-value" id="totalBets">0</div>
-                <div class="stat-sub">Wins: <span id="wins">0</span> | Losses: <span id="losses">0</span></div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">📊 Win Rate</div>
-                <div class="stat-value" id="winRate">0%</div>
-                <div class="stat-sub">Current Bet: <span id="currentBet">0</span> BTC</div>
-            </div>
+        <div class="card">
+            <h3>Current Bet: <span id="currentBet">0</span> BTC</h3>
+            <h3>Wins: <span id="wins">0</span> | Losses: <span id="losses">0</span></h3>
         </div>
         
-        <div class="plinko-visual">
-            <h3 style="margin-bottom: 20px;">🎮 Plinko Board (${PLINKO_CONFIG.rows} Rows | ${PLINKO_CONFIG.risk.toUpperCase()} Risk)</h3>
-            <div id="plinkoBoard" style="text-align: center; overflow-x: auto;">
-                <!-- Dynamic Plinko visualization -->
-            </div>
-        </div>
-        
-        <div class="history-table">
-            <table>
-                <thead>
-                    <tr>
-                        <th>#</th>
-                        <th>Time</th>
-                        <th>Wager (BTC)</th>
-                        <th>Multiplier</th>
-                        <th>Profit (BTC)</th>
-                        <th>Result</th>
-                        <th>Next Bet</th>
-                    </tr>
-                </thead>
-                <tbody id="historyBody">
-                    <tr><td colspan="7" style="text-align: center;">Waiting for bets...</td></tr>
-                </tbody>
-            </div>
-        </div>
+        <table id="historyTable">
+            <thead><tr><th>#</th><th>Time</th><th>Wager</th><th>Multiplier</th><th>Profit</th></tr></thead>
+            <tbody id="historyBody"></tbody>
+        </table>
     </div>
     
     <script>
-        async function updateDashboard() {
+        async function update() {
             try {
                 const res = await fetch('/api/stats');
                 const data = await res.json();
-                const { botState, btcPrice, winRate } = data;
+                const b = data.botState;
                 
-                // Update basic stats
-                document.getElementById('walletBalance').innerText = botState.stats.currentBalance.toFixed(8);
-                document.getElementById('walletUSD').innerText = '$' + (botState.stats.currentBalance * btcPrice).toLocaleString(undefined, {minimumFractionDigits: 2});
-                document.getElementById('netProfit').innerText = (botState.stats.netProfit > 0 ? '+' : '') + botState.stats.netProfit.toFixed(8);
-                document.getElementById('profitUSD').innerText = '$' + (Math.abs(botState.stats.netProfit) * btcPrice).toLocaleString(undefined, {minimumFractionDigits: 2});
-                document.getElementById('totalBets').innerText = botState.stats.totalBets;
-                document.getElementById('wins').innerText = botState.stats.wins;
-                document.getElementById('losses').innerText = botState.stats.losses;
-                document.getElementById('winRate').innerText = winRate + '%';
-                document.getElementById('currentBet').innerText = botState.settings.currentBet.toFixed(8);
-                document.getElementById('statusMsg').innerHTML = botState.running ? '🟢 Bot Status: ' + botState.statusMessage : '🔴 Bot Status: ' + botState.statusMessage;
+                document.getElementById('statusMsg').innerHTML = b.statusMessage;
+                document.getElementById('balance').innerHTML = b.stats.currentBalance.toFixed(8) + ' BTC';
+                document.getElementById('profit').innerHTML = (b.stats.netProfit > 0 ? '+' : '') + b.stats.netProfit.toFixed(8) + ' BTC';
+                document.getElementById('totalBets').innerHTML = b.stats.totalBets;
+                document.getElementById('winRate').innerHTML = data.winRate + '%';
+                document.getElementById('currentBet').innerHTML = b.settings.currentBet.toFixed(8);
+                document.getElementById('wins').innerHTML = b.stats.wins;
+                document.getElementById('losses').innerHTML = b.stats.losses;
                 
-                // Update history table
-                const historyBody = document.getElementById('historyBody');
-                if (botState.betHistory.length > 0) {
-                    historyBody.innerHTML = botState.betHistory.map(b => `
-                        <tr>
-                            <td>#${b.id}</td>
-                            <td>${b.time}</td>
-                            <td>${b.bet.toFixed(8)}</td>
-                            <td>${b.multiplier}x</td>
-                            <td class="${b.isWin ? 'win' : 'loss'}">${b.profit > 0 ? '+' : ''}${b.profit.toFixed(8)}</td>
-                            <td class="${b.isWin ? 'win' : 'loss'}">${b.isWin ? '🎉 WIN' : '💀 LOSS'}</td>
-                            <td>${b.currentBet.toFixed(8)}</td>
-                        </tr>
-                    `).join('');
+                const tbody = document.getElementById('historyBody');
+                tbody.innerHTML = '';
+                for (let i = 0; i < b.betHistory.length; i++) {
+                    const bet = b.betHistory[i];
+                    const row = tbody.insertRow();
+                    row.insertCell(0).innerText = '#' + bet.id;
+                    row.insertCell(1).innerText = bet.time;
+                    row.insertCell(2).innerText = bet.bet.toFixed(8);
+                    row.insertCell(3).innerText = bet.multiplier + 'x';
+                    row.insertCell(4).innerHTML = bet.profit > 0 ? '<span class="win">+' + bet.profit.toFixed(8) + '</span>' : '<span class="loss">' + bet.profit.toFixed(8) + '</span>';
                 }
-                
-                // Simple Plinko visualization
-                const positions = botState.betHistory[0]?.position || 8;
-                const rows = ${PLINKO_CONFIG.rows};
-                let boardHtml = '';
-                for (let i = 1; i <= rows; i++) {
-                    boardHtml += '<div class="pin-row">';
-                    for (let j = 0; j < i; j++) {
-                        boardHtml += '<div class="pin"></div>';
-                    }
-                    boardHtml += '</div>';
-                }
-                boardHtml += '<div class="pin-row">';
-                const multipliers = ${JSON.stringify(PLINKO_PAYOUTS[PLINKO_CONFIG.risk][PLINKO_CONFIG.rows])};
-                for (let m of multipliers) {
-                    boardHtml += `<div class="bucket">${m}x</div>`;
-                }
-                boardHtml += '</div>';
-                document.getElementById('plinkoBoard').innerHTML = boardHtml;
-                
-            } catch(e) {
-                console.error('Dashboard update error:', e);
-            }
+            } catch(e) { console.error(e); }
         }
-        
-        setInterval(updateDashboard, 1000);
-        updateDashboard();
+        setInterval(update, 1000);
+        update();
     </script>
 </body>
 </html>
     `);
 });
 
-// ============ START BOT ============
+// ============ START SERVER ============
 app.listen(port, '0.0.0.0', () => {
-    console.log(`
-    ╔═══════════════════════════════════════════╗
-    ║     🎯 PLINKO BOT STARTED 🎯              ║
-    ╠═══════════════════════════════════════════╣
-    ║  Dashboard: http://localhost:${port}      ║
-    ║  Game: Plinko (${PLINKO_CONFIG.rows} rows / ${PLINKO_CONFIG.risk} risk)    ║
-    ║  Base Bet: ${PLINKO_CONFIG.baseBet} BTC           ║
-    ║  Target: ${PLINKO_CONFIG.targetProfit} BTC        ║
-    ║  Stop Loss: ${PLINKO_CONFIG.stopLoss} BTC         ║
-    ╚═══════════════════════════════════════════╝
-    `);
+    console.log(`Server running on port ${port}`);
     runPlinkoStrategy();
 });
