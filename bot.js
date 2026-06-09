@@ -8,15 +8,23 @@ const port = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || "FrRtbXf3294xXJJyiK9RYWhiqmj6f471xYBghxZE2cgW4Ddc3p";
 const BASE_URL = "https://api.crypto.games/v1";
 
-// CONTINUOUS PROFITABLE STRATEGY CONFIG
+// ULTRA-SAFE CONFIG - 1 SATOSHI MINIMUM
 const PLINKO_CONFIG = {
     coin: "BTC",
-    risk: "low",
-    rows: 8,
-    baseBet: 0.00000010,  // 10 Satoshi base
-    maxBet: 0.00001000,   // Increased max for continuous recovery
-    lossIncrease: 1.5,     // 50% increase on loss (martingale style)
-    maxConsecutiveLosses: 10 // Allow more losses before stopping (continuous mode)
+    risk: "low",          // Low risk = more winning positions
+    rows: 8,              // 8 rows gives best probability
+    
+    // MINIMUM BET SETTINGS
+    baseBet: 0.00000001,  // 1 SATOSHI - ABSOLUTE MINIMUM
+    minBet: 0.00000001,   // Never go below 1 satoshi
+    maxBet: 0.00000050,   // Cap at 50 satoshi (safe for small balances)
+    
+    // Recovery settings
+    lossIncrease: 1.2,    // Only 20% increase on loss (gentle recovery)
+    maxConsecutiveLosses: 15, // Allow many losses (1 satoshi is cheap)
+    
+    // Balance protection
+    maxBetPercent: 0.05   // Never bet more than 5% of balance
 };
 
 // ============ BOT STATE ============
@@ -24,8 +32,8 @@ let btcPrice = 60964;
 let startingBalance = 0;
 let botState = {
     running: true,
-    continuousMode: true,  // NEVER STOPS
-    statusMessage: "Continuous Plinko Bot - Grinding Profits",
+    continuousMode: true,
+    statusMessage: "ULTRA-SAFE 1 Satoshi Mode",
     coin: PLINKO_CONFIG.coin,
     stats: {
         totalBets: 0,
@@ -61,7 +69,11 @@ function formatBTC(amount) {
     return (amount || 0).toFixed(8);
 }
 
-// ============ API LOGIC (WORKING VERSION) ============
+function formatSats(btcAmount) {
+    return Math.floor(btcAmount * 100000000);
+}
+
+// ============ API LOGIC ============
 async function placePlinkoBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
     
@@ -69,8 +81,10 @@ async function placePlinkoBet() {
     const randomPart = Math.random().toString(36).substring(2, 15);
     const clientSeed = (timestamp + randomPart).slice(0, 32);
     
+    const currentBet = Number(botState.settings.currentBet.toFixed(8));
+    
     const payload = { 
-        Bet: Number(botState.settings.currentBet.toFixed(8)),
+        Bet: currentBet,
         Payout: 2.0,
         UnderOver: true,
         ClientSeed: clientSeed,
@@ -86,35 +100,48 @@ async function placePlinkoBet() {
         return response.data;
     } catch (error) { 
         const errorMsg = error.response?.data?.Message || error.message;
-        console.error("API Error:", errorMsg);
+        if (errorMsg.includes("Minimum")) {
+            console.log("⚠️ Minimum bet error - using 1 satoshi");
+            botState.settings.currentBet = PLINKO_CONFIG.minBet;
+        }
         return null; 
     }
 }
 
-// ============ CONTINUOUS BETTING STRATEGY ============
+// ============ SAFE BET CALCULATION ============
 function calculateNextBet(isWin, multiplier) {
     if (isWin) {
-        // WIN: Reset consecutive losses and lower bet
+        // WIN: Reset to 1 satoshi
         botState.stats.consecutiveLosses = 0;
-        return PLINKO_CONFIG.baseBet;
+        return PLINKO_CONFIG.minBet;
     } else {
-        // LOSS: Increase bet to recover (but never exceed maxBet)
+        // LOSS: Gentle increase
         botState.stats.consecutiveLosses++;
         
-        // Safety: If too many losses, reset bet to avoid catastrophic loss
+        // After many losses, reset to min (safety)
         if (botState.stats.consecutiveLosses >= PLINKO_CONFIG.maxConsecutiveLosses) {
-            console.log(`⚠️ ${botState.stats.consecutiveLosses} losses in a row - resetting to base bet`);
+            console.log(`⚠️ ${botState.stats.consecutiveLosses} losses - resetting to 1 satoshi`);
             botState.stats.consecutiveLosses = 0;
-            return PLINKO_CONFIG.baseBet;
+            return PLINKO_CONFIG.minBet;
         }
         
+        // Gentle 20% increase
         let newBet = botState.settings.currentBet * PLINKO_CONFIG.lossIncrease;
-        if (newBet > PLINKO_CONFIG.maxBet) newBet = PLINKO_CONFIG.maxBet;
         
-        // Never bet more than 10% of remaining balance
-        const maxSafeBet = botState.stats.currentBalance * 0.1;
-        if (newBet > maxSafeBet && maxSafeBet > PLINKO_CONFIG.baseBet) {
+        // Cap at max bet
+        if (newBet > PLINKO_CONFIG.maxBet) {
+            newBet = PLINKO_CONFIG.maxBet;
+        }
+        
+        // NEVER bet more than 5% of current balance
+        const maxSafeBet = botState.stats.currentBalance * PLINKO_CONFIG.maxBetPercent;
+        if (newBet > maxSafeBet && maxSafeBet >= PLINKO_CONFIG.minBet) {
             newBet = maxSafeBet;
+        }
+        
+        // Ensure minimum
+        if (newBet < PLINKO_CONFIG.minBet) {
+            newBet = PLINKO_CONFIG.minBet;
         }
         
         return newBet;
@@ -123,31 +150,43 @@ function calculateNextBet(isWin, multiplier) {
 
 // ============ MAIN CONTINUOUS BOT LOOP ============
 async function runContinuousPlinko() {
+    // Wait a moment for balance to be available
+    await new Promise(r => setTimeout(r, 1000));
+    
     console.log(`
     ╔══════════════════════════════════════════════════╗
-    ║     🔥 CONTINUOUS PLINKO BOT STARTED 🔥          ║
+    ║     🛡️ ULTRA-SAFE 1 SATOSHI PLINKO BOT 🛡️        ║
     ╠══════════════════════════════════════════════════╣
-    ║  Mode: INFINITE (Never Stops)                    ║
-    ║  Base Bet: ${formatBTC(PLINKO_CONFIG.baseBet)} BTC
-    ║  Max Bet: ${formatBTC(PLINKO_CONFIG.maxBet)} BTC
-    ║  Recovery: ${PLINKO_CONFIG.lossIncrease}x on loss
-    ║  Strategy: Reset to base after win              ║
-    ║  Expected Win Rate: 75% (Low Risk Plinko)       ║
+    ║  Base Bet: 0.00000001 BTC (1 SATOSHI!)           ║
+    ║  Max Bet: ${formatBTC(PLINKO_CONFIG.maxBet)} BTC (${formatSats(PLINKO_CONFIG.maxBet)} sats)
+    ║  Recovery: ${PLINKO_CONFIG.lossIncrease}x (gentle 20%)
+    ║  Max Loss Streak: ${PLINKO_CONFIG.maxConsecutiveLosses} before reset
+    ║  Risk: LOW - 75% expected win rate
+    ║  Strategy: Grind forever, never risk big
     ╚══════════════════════════════════════════════════╝
     `);
     
-    botState.statusMessage = "🟢 CONTINUOUS MODE - Betting Forever";
+    botState.statusMessage = "🟢 1 SATOSHI MODE - Betting forever";
     let lastLogTime = Date.now();
+    let errorCount = 0;
     
     while (botState.running) {
         // Place bet
         const result = await placePlinkoBet();
         
         if (!result) {
-            console.log("⚠️ Bet failed - waiting 2 seconds...");
-            await new Promise(r => setTimeout(r, 2000));
+            errorCount++;
+            if (errorCount > 10) {
+                console.log("❌ Too many API errors - waiting 10 seconds...");
+                await new Promise(r => setTimeout(r, 10000));
+                errorCount = 0;
+            } else {
+                await new Promise(r => setTimeout(r, 1000));
+            }
             continue;
         }
+        
+        errorCount = 0;
         
         // Process result
         botState.stats.totalBets++;
@@ -170,6 +209,8 @@ async function runContinuousPlinko() {
             botState.stats.startingBalance = startingBalance;
             botState.stats.highestBalance = startingBalance;
             botState.stats.lowestBalance = startingBalance;
+            
+            console.log(`\n📊 Starting Balance: ${formatBTC(startingBalance)} BTC (${formatSats(startingBalance)} satoshi)\n`);
         }
         
         // Update profit
@@ -197,23 +238,25 @@ async function runContinuousPlinko() {
             multiplier: multiplier,
             profit: profit,
             isWin: isWin,
-            balance: botState.stats.currentBalance
+            balance: botState.stats.currentBalance,
+            betSats: formatSats(result.Bet)
         });
         
         if (botState.betHistory.length > 100) botState.betHistory.pop();
         
-        // Log every 10 seconds or on big wins/losses
+        // Log periodically
         const now = Date.now();
         const winRate = (botState.stats.wins / botState.stats.totalBets * 100).toFixed(1);
-        const isSignificant = Math.abs(profit) > PLINKO_CONFIG.baseBet * 10;
+        const betSats = formatSats(result.Bet);
         
-        if (now - lastLogTime > 10000 || isSignificant || botState.stats.totalBets % 50 === 0) {
-            console.log(`#${botState.stats.totalBets} | ${new Date().toLocaleTimeString()} | ${formatBTC(result.Bet)} | ${multiplier}x | ${isWin ? '✅WIN' : '❌LOSS'} | ${profit > 0 ? '+' : ''}${formatBTC(profit)} | Bal: ${formatBTC(botState.stats.currentBalance)} | WR: ${winRate}% | Consecutive: ${botState.stats.consecutiveLosses}`);
+        if (now - lastLogTime > 5000 || botState.stats.totalBets % 100 === 0) {
+            const profitSats = formatSats(botState.stats.netProfit);
+            console.log(`#${botState.stats.totalBets} | ${betSats}sats | ${multiplier}x | ${isWin ? '✅' : '❌'} | ${profit > 0 ? '+' : ''}${formatSats(profit)}sats | Profit: ${profitSats > 0 ? '+' : ''}${profitSats}sats | WR: ${winRate}% | Streak: ${botState.stats.consecutiveLosses}`);
             lastLogTime = now;
         }
         
-        // Small delay to avoid rate limiting
-        await new Promise(r => setTimeout(r, 300));
+        // Small delay for safety
+        await new Promise(r => setTimeout(r, 400));
     }
 }
 
@@ -230,7 +273,7 @@ app.get('/', (req, res) => {
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Continuous Plinko Bot</title>
+    <title>1 Satoshi Plinko Bot</title>
     <meta http-equiv="refresh" content="2">
     <style>
         body {
@@ -250,6 +293,14 @@ app.get('/', (req, res) => {
             border-bottom: 2px solid #00ff88;
             padding-bottom: 10px;
         }
+        .satoshi-badge {
+            background: #ff4444;
+            color: white;
+            padding: 2px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+            margin-left: 10px;
+        }
         .badge {
             background: #00ff88;
             color: #0a0e27;
@@ -257,7 +308,6 @@ app.get('/', (req, res) => {
             border-radius: 4px;
             font-size: 10px;
             font-weight: bold;
-            display: inline-block;
             animation: pulse 2s infinite;
         }
         @keyframes pulse {
@@ -324,22 +374,28 @@ app.get('/', (req, res) => {
             animation: pulse 1s infinite;
             margin-right: 8px;
         }
+        .note {
+            text-align: center;
+            color: #888;
+            font-size: 11px;
+            margin-top: 20px;
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🔥 CONTINUOUS PLINKO BOT <span class="badge">LIVE</span></h1>
+        <h1>🪙 1 SATOSHI PLINKO BOT <span class="badge">LIVE</span><span class="satoshi-badge">MINIMUM BET</span></h1>
         
         <div class="stats">
             <div class="card">
                 <h3>💰 BALANCE</h3>
                 <div class="value" id="balance">0.00000000</div>
-                <small id="balanceUSD">$0.00</small>
+                <small id="balanceSats">0 satoshi</small>
             </div>
             <div class="card">
                 <h3>📈 TOTAL PROFIT</h3>
                 <div class="value" id="profit">0.00000000</div>
-                <small id="profitUSD">$0.00</small>
+                <small id="profitSats">0 satoshi</small>
             </div>
             <div class="card">
                 <h3>🎲 TOTAL BETS</h3>
@@ -370,7 +426,7 @@ app.get('/', (req, res) => {
                 <small>Continuous betting</small>
             </div>
             <div class="card">
-                <h3>⚡ CONSECUTIVE LOSSES</h3>
+                <h3>⚡ LOSS STREAK</h3>
                 <div class="value" id="consecutiveLosses">0</div>
                 <small>Current streak</small>
             </div>
@@ -384,16 +440,31 @@ app.get('/', (req, res) => {
         <div style="overflow-x: auto;">
             <table>
                 <thead>
-                    <tr><th>#</th><th>Time</th><th>Wager (BTC)</th><th>Multiplier</th><th>Profit</th><th>Result</th><th>Balance</th></tr>
+                    <tr>
+                        <th>#</th>
+                        <th>Time</th>
+                        <th>Wager</th>
+                        <th>Multiplier</th>
+                        <th>Profit</th>
+                        <th>Result</th>
+                        <th>Balance</th>
+                    </tr>
                 </thead>
                 <tbody id="history">
-                    <tr><td colspan="7" style="text-align:center">Waiting for bets......</td></tr>
+                    <tr><td colspan="7" style="text-align:center">Waiting for bets...</td></tr>
                 </tbody>
             </table>
+        </div>
+        <div class="note">
+            ⚡ Betting 1 SATOSHI minimum | Gentle 20% recovery | Never bets more than 5% of balance
         </div>
     </div>
     
     <script>
+        function formatSats(btc) {
+            return Math.floor(btc * 100000000).toLocaleString();
+        }
+        
         function formatTime(seconds) {
             const hours = Math.floor(seconds / 3600);
             const minutes = Math.floor((seconds % 3600) / 60);
@@ -411,13 +482,13 @@ app.get('/', (req, res) => {
                     const btcPrice = data.btcPrice;
                     
                     document.getElementById('balance').innerHTML = b.stats.currentBalance.toFixed(8);
-                    document.getElementById('balanceUSD').innerHTML = '$' + (b.stats.currentBalance * btcPrice).toFixed(2);
+                    document.getElementById('balanceSats').innerHTML = formatSats(b.stats.currentBalance) + ' satoshi';
                     
                     const profitElem = document.getElementById('profit');
                     profitElem.innerHTML = (b.stats.netProfit >= 0 ? '+' : '') + b.stats.netProfit.toFixed(8);
                     profitElem.className = 'value ' + (b.stats.netProfit >= 0 ? 'profit-positive' : 'profit-negative');
+                    document.getElementById('profitSats').innerHTML = (b.stats.netProfit >= 0 ? '+' : '') + formatSats(Math.abs(b.stats.netProfit)) + ' satoshi';
                     
-                    document.getElementById('profitUSD').innerHTML = '$' + (Math.abs(b.stats.netProfit) * btcPrice).toFixed(2);
                     document.getElementById('totalBets').innerHTML = b.stats.totalBets;
                     document.getElementById('wins').innerHTML = b.stats.wins;
                     document.getElementById('losses').innerHTML = b.stats.losses;
@@ -436,11 +507,11 @@ app.get('/', (req, res) => {
                         const row = tbody.insertRow();
                         row.insertCell(0).innerText = '#' + bet.id;
                         row.insertCell(1).innerText = bet.time;
-                        row.insertCell(2).innerText = bet.wager.toFixed(8);
+                        row.insertCell(2).innerHTML = bet.betSats + ' sats';
                         row.insertCell(3).innerText = bet.multiplier + 'x';
                         row.insertCell(4).innerHTML = bet.profit >= 0 ? 
-                            '<span class="win">+' + bet.profit.toFixed(8) + '</span>' : 
-                            '<span class="loss">' + bet.profit.toFixed(8) + '</span>';
+                            '<span class="win">+' + formatSats(bet.profit) + ' sats</span>' : 
+                            '<span class="loss">' + formatSats(bet.profit) + ' sats</span>';
                         row.insertCell(5).innerHTML = bet.isWin ? 
                             '<span class="win">✅ WIN</span>' : 
                             '<span class="loss">❌ LOSS</span>';
@@ -457,8 +528,8 @@ app.get('/', (req, res) => {
     `);
 });
 
-// ============ START CONTINUOUS BOT ============
+// ============ START ============
 app.listen(port, '0.0.0.0', () => {
-    console.log(`\n🚀 CONTINUOUS BOT DASHBOARD: http://localhost:${port}\n`);
+    console.log(`\n🚀 1 SATOSHI BOT DASHBOARD: http://localhost:${port}\n`);
     runContinuousPlinko();
 });
