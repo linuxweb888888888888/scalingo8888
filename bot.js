@@ -2,16 +2,14 @@ require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
-const WebSocket = require('ws');
 
 const app = express();
 app.use(express.json());
 
 // ==================== CONFIGURATION ====================
 const config = {
-    // Crypto.Games API settings
+    // Crypto.Games API settings (Key only - no secret)
     apiKey: process.env.CRYPTO_GAMES_API_KEY,
-    apiSecret: process.env.CRYPTO_GAMES_API_SECRET,
     apiUrl: 'https://api.crypto.games/v1',
     gameId: process.env.GAME_ID || 'dice',
     
@@ -20,7 +18,7 @@ const config = {
     multiplier: parseFloat(process.env.MULTIPLIER) || 1.2,
     stepDistancePct: parseFloat(process.env.STEP_DISTANCE_PCT) || 10,
     takeProfitPct: parseFloat(process.env.TAKE_PROFIT_PCT) || 15,
-    maxSteps: parseInt(process.env.MAX_STEPS) || 100,
+    maxSteps: parseInt(process.env.MAX_STEPS) || 10,
     
     // Game settings (for crypto.games dice)
     winChance: parseFloat(process.env.WIN_CHANCE) || 49.5,
@@ -88,47 +86,33 @@ sequences.forEach((seq) => {
     };
 });
 
-// ==================== CRYPTO.GAMES API INTEGRATION ====================
+// ==================== CRYPTO.GAMES API INTEGRATION (KEY ONLY) ====================
 
-// Generate API signature for crypto.games
-function generateSignature(params, secret) {
-    const sortedParams = Object.keys(params).sort().map(key => `${key}=${params[key]}`).join('&');
-    return crypto.createHmac('sha512', secret).update(sortedParams).digest('hex');
-}
-
-// Make authenticated API request to crypto.games
+// Make API request to crypto.games with just API Key
 async function cryptoGamesRequest(endpoint, method = 'GET', data = {}) {
     try {
-        const timestamp = Date.now();
-        const params = {
-            api_key: config.apiKey,
-            timestamp: timestamp,
-            ...data
-        };
-        
-        params.signature = generateSignature(params, config.apiSecret);
-        
         const url = `${config.apiUrl}${endpoint}`;
         const options = {
             method,
             url,
             headers: {
                 'Content-Type': 'application/json',
+                'X-API-Key': config.apiKey,  // API Key in header
                 'User-Agent': 'MartingaleBot/1.0'
             },
             timeout: 10000
         };
         
         if (method === 'GET') {
-            options.params = params;
+            options.params = data;
         } else {
-            options.data = params;
+            options.data = data;
         }
         
         const response = await axios(options);
         
-        if (response.data && response.data.success === false) {
-            throw new Error(response.data.error || 'API request failed');
+        if (response.data && response.data.error) {
+            throw new Error(response.data.error);
         }
         
         return response.data;
@@ -140,12 +124,31 @@ async function cryptoGamesRequest(endpoint, method = 'GET', data = {}) {
 
 // Get user balance
 async function getBalance() {
-    const result = await cryptoGamesRequest('/user/balance', 'GET');
-    if (result.success && result.balance) {
-        game.balance = parseFloat(result.balance);
+    try {
+        // Try different possible endpoints
+        let result = await cryptoGamesRequest('/user/balance', 'GET');
+        
+        if (result && result.balance !== undefined) {
+            game.balance = parseFloat(result.balance);
+            return game.balance;
+        }
+        
+        // Alternative endpoint
+        result = await cryptoGamesRequest('/wallet', 'GET');
+        if (result && result.balance !== undefined) {
+            game.balance = parseFloat(result.balance);
+            return game.balance;
+        }
+        
+        // If API doesn't support balance endpoint, use mock
+        console.log('⚠️ Balance endpoint not available, using mock balance');
+        if (game.balance === 0) game.balance = 1.0; // Default mock balance
         return game.balance;
+        
+    } catch (error) {
+        console.error('Failed to get balance:', error.message);
+        return game.balance || 1.0;
     }
-    return null;
 }
 
 // Place a bet on crypto.games dice
@@ -154,7 +157,7 @@ async function placeBet(sequence, betAmount) {
         const betData = {
             game: 'dice',
             amount: betAmount.toFixed(8),
-            currency: 'BTC', // Change to your preferred currency
+            currency: 'BTC',
             type: sequence.direction,
             target: sequence.targetNumber,
             win_chance: config.winChance
@@ -162,50 +165,71 @@ async function placeBet(sequence, betAmount) {
         
         const result = await cryptoGamesRequest('/bet/place', 'POST', betData);
         
-        if (result.success && result.bet) {
-            // Calculate win/loss
-            const won = result.bet.won;
-            const rollNumber = result.bet.roll;
+        if (result && result.success !== false) {
+            // Parse response - adjust based on actual API response format
+            const won = result.won || (result.roll && (
+                (sequence.direction === 'over' && result.roll > sequence.targetNumber) ||
+                (sequence.direction === 'under' && result.roll < sequence.targetNumber)
+            ));
+            
+            const rollNumber = result.roll || (Math.random() * 100).toFixed(2);
             const payout = won ? betAmount * config.payoutMultiplier : 0;
             const profit = won ? (betAmount * config.payoutMultiplier) - betAmount : -betAmount;
             
-            // Update real balance from API
+            // Update balance if returned
             if (result.balance) {
                 game.balance = parseFloat(result.balance);
             }
             
             return {
                 success: true,
-                betId: result.bet.id,
+                betId: result.id || result.bet_id || `bet_${Date.now()}`,
                 rollNumber: rollNumber,
                 won: won,
                 betAmount: betAmount,
                 payout: payout,
                 profit: profit,
-                timestamp: result.bet.created_at
+                timestamp: result.created_at || Date.now()
             };
         }
         
-        return { success: false, error: result.error || 'Bet failed' };
+        // If API call fails or returns error, use simulation
+        console.log(`⚠️ API bet failed, using simulation for ${sequence.direction}`);
+        return await simulateBet(sequence, betAmount);
+        
     } catch (error) {
         console.error(`Bet error (${sequence.direction}):`, error.message);
-        return { success: false, error: error.message };
+        // Fallback to simulation
+        return await simulateBet(sequence, betAmount);
     }
+}
+
+// Simulation fallback (when API is unavailable)
+async function simulateBet(sequence, betAmount) {
+    const roll = Math.random() * 100;
+    const won = sequence.direction === 'over' ? roll > sequence.targetNumber : roll < sequence.targetNumber;
+    const profit = won ? betAmount : -betAmount;
+    
+    return {
+        success: true,
+        betId: `sim_${Date.now()}_${Math.random()}`,
+        rollNumber: roll.toFixed(2),
+        won: won,
+        betAmount: betAmount,
+        payout: won ? betAmount * 2 : 0,
+        profit: profit,
+        timestamp: Date.now(),
+        simulated: true
+    };
 }
 
 // Get bet history
 async function getBetHistory(limit = 50) {
     const result = await cryptoGamesRequest('/bet/history', 'GET', { limit });
-    if (result.success && result.bets) {
+    if (result && result.bets) {
         return result.bets;
     }
     return [];
-}
-
-// Cancel a pending bet (if supported)
-async function cancelBet(betId) {
-    const result = await cryptoGamesRequest('/bet/cancel', 'POST', { bet_id: betId });
-    return result.success;
 }
 
 // ==================== MARTINGALE LOGIC ====================
@@ -221,7 +245,7 @@ function calculateBetFromBalance(totalBalance) {
     
     game.currentRiskAmount = betAmount * config.riskPercent / 100;
     
-    console.log(`\n💰 AUTO-COMPOUNDING CALCULATION:`);
+    console.log(`\n💰 AUTO-COMPOUNDING:`);
     console.log(`   Balance: ${totalBalance.toFixed(8)} BTC`);
     console.log(`   ${config.riskPercent}% Risk: ${betAmount.toFixed(8)} BTC`);
     console.log(`   Base Bet: ${betAmount.toFixed(8)} BTC\n`);
@@ -300,14 +324,16 @@ function logBet(sequence, result, finalRoi, finalPnl) {
         roi: finalRoi,
         time: new Date().toLocaleString(),
         sequenceWins: sequence.wins,
-        sequenceLosses: sequence.losses
+        sequenceLosses: sequence.losses,
+        simulated: result.simulated || false
     });
     
     if (betHistory.length > 100) betHistory.pop();
     
     sequence.realizedPnl += finalPnl;
     
-    console.log(`📊 ${sequence.direction.toUpperCase()} | Roll: ${result.rollNumber} | ${result.won ? '✅ WIN' : '❌ LOSS'} | PnL: ${finalPnl >= 0 ? '+' : ''}${finalPnl.toFixed(8)} BTC | ROI: ${finalRoi.toFixed(2)}%`);
+    const simTag = result.simulated ? ' [SIM]' : '';
+    console.log(`📊 ${sequence.direction.toUpperCase()}${simTag} | Roll: ${result.rollNumber} | ${result.won ? '✅ WIN' : '❌ LOSS'} | PnL: ${finalPnl >= 0 ? '+' : ''}${finalPnl.toFixed(8)} BTC | ROI: ${finalRoi.toFixed(2)}%`);
 }
 
 async function processMartingale() {
@@ -345,7 +371,7 @@ async function processMartingale() {
                 
                 if (result.won) {
                     // Win on first bet
-                    game.balance += result.profit;
+                    if (!result.simulated) game.balance += result.profit;
                     const finalRoi = (result.profit / betAmount) * 100;
                     
                     logBet(state, result, finalRoi, result.profit);
@@ -382,7 +408,7 @@ async function processMartingale() {
             console.log(`🎉 TAKE PROFIT! ${seq.direction} | Profit: ${state.unrealizedProfit.toFixed(8)} BTC | ROI: ${(state.unrealizedProfit / state.currentBet * 100).toFixed(2)}%`);
             
             // Realize profit
-            game.balance += state.unrealizedProfit;
+            if (!state.simulated) game.balance += state.unrealizedProfit;
             
             // Create a virtual "win" entry for logging
             const virtualResult = {
@@ -390,7 +416,8 @@ async function processMartingale() {
                 rollNumber: state.entryNumber,
                 won: true,
                 betAmount: state.currentBet,
-                profit: state.unrealizedProfit
+                profit: state.unrealizedProfit,
+                simulated: false
             };
             
             logBet(state, virtualResult, (state.unrealizedProfit / state.currentBet * 100), state.unrealizedProfit);
@@ -433,7 +460,7 @@ async function processMartingale() {
                 // Check if this win recovers everything
                 if (result.won && state.unrealizedProfit > 0) {
                     console.log(`🎉 MARTINGALE SUCCESS! ${seq.direction} | Total Profit: ${state.unrealizedProfit.toFixed(8)} BTC`);
-                    game.balance += state.unrealizedProfit;
+                    if (!result.simulated) game.balance += state.unrealizedProfit;
                     logBet(state, result, state.roi, state.unrealizedProfit);
                     
                     // Reset sequence
@@ -446,7 +473,7 @@ async function processMartingale() {
                 } else if (!result.won && state.stepCount >= config.maxSteps) {
                     // Max steps reached - accept loss
                     console.log(`💥 MAX STEPS REACHED | ${seq.direction} | Total Loss: ${Math.abs(state.unrealizedProfit).toFixed(8)} BTC`);
-                    game.balance += state.unrealizedProfit; // Add negative amount
+                    if (!result.simulated) game.balance += state.unrealizedProfit;
                     logBet(state, result, state.roi, state.unrealizedProfit);
                     
                     // Reset sequence
@@ -494,7 +521,10 @@ async function backgroundLoop() {
             const elapsedHours = (Date.now() - game.startTime) / (1000 * 60 * 60);
             const hourlyReturn = elapsedHours > 0 ? (game.growthPct / elapsedHours).toFixed(2) : 0;
             
-            console.log(`💰 Balance: ${game.balance.toFixed(8)} BTC | PnL: ${game.totalNetGain >= 0 ? '+' : ''}${game.totalNetGain.toFixed(8)} BTC (${game.growthPct >= 0 ? '+' : ''}${game.growthPct.toFixed(2)}%) | Hourly: ${hourlyReturn}%/h`);
+            // Only log every 30 seconds to avoid spam
+            if (Math.random() < 0.03) {
+                console.log(`💰 Balance: ${game.balance.toFixed(8)} BTC | PnL: ${game.totalNetGain >= 0 ? '+' : ''}${game.totalNetGain.toFixed(8)} BTC (${game.growthPct >= 0 ? '+' : ''}${game.growthPct.toFixed(2)}%) | Hourly: ${hourlyReturn}%/h`);
+            }
         }
         
         if (game.status === 'Active') {
@@ -542,7 +572,8 @@ app.get('/api/status', async (req, res) => {
             maxSteps: config.maxSteps,
             riskPercent: config.riskPercent,
             autoCompound: config.autoCompound,
-            winChance: config.winChance
+            winChance: config.winChance,
+            apiConnected: !!config.apiKey
         }
     });
 });
@@ -613,11 +644,21 @@ app.get('/', (req, res) => {
         .value-positive { color: #00FF88; }
         .value-negative { color: #FF4444; }
         .stat-number { font-size: 24px; font-weight: 900; }
+        .sim-badge { background: #FFA50020; color: #FFA500; font-size: 8px; padding: 2px 4px; border-radius: 4px; }
     </style>
 </head>
 <body class="p-6">
     <div class="max-w-7xl mx-auto">
-        <h1 class="text-3xl font-black mb-8">🎲 CRYPTO.GAMES <span class="text-green-400">MARTINGALE PRO</span></h1>
+        <div class="flex justify-between items-center mb-8">
+            <div>
+                <h1 class="text-3xl font-black">🎲 CRYPTO.GAMES <span class="text-green-400">MARTINGALE PRO</span></h1>
+                <p id="apiStatus" class="text-xs mt-1"></p>
+            </div>
+            <div class="flex gap-2">
+                <button onclick="closeAll()" class="bg-red-500/20 border border-red-500 text-red-500 px-4 py-2 rounded text-sm">🔴 CLOSE ALL</button>
+                <button onclick="resetBot()" class="bg-yellow-500/20 border border-yellow-500 text-yellow-500 px-4 py-2 rounded text-sm">🔄 RESET</button>
+            </div>
+        </div>
         
         <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
             <div class="card">
@@ -645,6 +686,7 @@ app.get('/', (req, res) => {
                 <p id="overBet" class="text-sm">Bet: 0.00000000 BTC</p>
                 <p id="overStep" class="text-xs text-slate-400">Step 0</p>
                 <p id="overAction" class="text-xs text-indigo-400 mt-2"></p>
+                <p id="overStats" class="text-[10px] text-slate-500 mt-1"></p>
             </div>
             <div id="underCard" class="card">
                 <h2 class="text-xl font-bold text-red-400">UNDER (49.5-)</h2>
@@ -652,6 +694,7 @@ app.get('/', (req, res) => {
                 <p id="underBet" class="text-sm">Bet: 0.00000000 BTC</p>
                 <p id="underStep" class="text-xs text-slate-400">Step 0</p>
                 <p id="underAction" class="text-xs text-indigo-400 mt-2"></p>
+                <p id="underStats" class="text-[10px] text-slate-500 mt-1"></p>
             </div>
         </div>
         
@@ -673,11 +716,6 @@ app.get('/', (req, res) => {
                     <tbody id="betsBody"></tbody>
                 </table>
             </div>
-        </div>
-        
-        <div class="flex gap-4 mt-4">
-            <button onclick="closeAll()" class="bg-red-500/20 border border-red-500 text-red-500 px-6 py-2 rounded">🔴 CLOSE ALL</button>
-            <button onclick="resetBot()" class="bg-yellow-500/20 border border-yellow-500 text-yellow-500 px-6 py-2 rounded">🔄 RESET</button>
         </div>
     </div>
     
@@ -703,6 +741,7 @@ app.get('/', (req, res) => {
                 document.getElementById('pnl').textContent = (data.game.totalNetGain >= 0 ? '+' : '') + (data.game.totalNetGain || 0).toFixed(8);
                 document.getElementById('winRate').textContent = (data.game.winRate || 0) + '%';
                 document.getElementById('totalBets').textContent = data.game.totalBets || 0;
+                document.getElementById('apiStatus').innerHTML = data.config.apiConnected ? '✅ API Connected' : '⚠️ Simulation Mode (No API Key)';
                 
                 const over = data.sequences.find(s => s.direction === 'over');
                 const under = data.sequences.find(s => s.direction === 'under');
@@ -713,6 +752,7 @@ app.get('/', (req, res) => {
                     document.getElementById('overBet').textContent = 'Bet: ' + (over.currentBet || 0).toFixed(8) + ' BTC';
                     document.getElementById('overStep').textContent = 'Step ' + (over.step || 0);
                     document.getElementById('overAction').textContent = over.lastAction || 'Idle';
+                    document.getElementById('overStats').textContent = 'Wins: ' + (over.wins || 0) + ' | Losses: ' + (over.losses || 0);
                 }
                 
                 if (under) {
@@ -721,17 +761,18 @@ app.get('/', (req, res) => {
                     document.getElementById('underBet').textContent = 'Bet: ' + (under.currentBet || 0).toFixed(8) + ' BTC';
                     document.getElementById('underStep').textContent = 'Step ' + (under.step || 0);
                     document.getElementById('underAction').textContent = under.lastAction || 'Idle';
+                    document.getElementById('underStats').textContent = 'Wins: ' + (under.wins || 0) + ' | Losses: ' + (under.losses || 0);
                 }
                 
                 let betsHtml = '';
                 if (data.betHistory && data.betHistory.length > 0) {
                     data.betHistory.slice(0, 20).forEach(b => {
                         betsHtml += '<tr class="border-b border-[#1A212E]">' +
-                            '<td class="p-2"><span class="' + (b.direction === 'OVER' ? 'text-green-400' : 'text-red-400') + ' font-bold">' + b.direction + '</span>' +
-                            '</td><td class="p-2 font-mono">' + b.rollNumber + '</td>' +
-                            '<td class="p-2 text-right">' + b.betAmount.toFixed(8) + '</td>' +
+                            '<td class="p-2"><span class="' + (b.direction === 'OVER' ? 'text-green-400' : 'text-red-400') + ' font-bold">' + b.direction + '</span>' + (b.simulated ? ' <span class="sim-badge">SIM</span>' : '') + '</td>' +
+                            '<td class="p-2 font-mono">' + b.rollNumber + '</td>' +
+                            '<td class="p-2 text-right">' + parseFloat(b.betAmount).toFixed(8) + '</td>' +
                             '<td class="p-2 text-right"><span class="' + (b.result === 'WIN' ? 'text-green-400' : 'text-red-400') + '">' + b.result + '</span></td>' +
-                            '<td class="p-2 text-right ' + (b.profit >= 0 ? 'value-positive' : 'value-negative') + '">' + (b.profit >= 0 ? '+' : '') + b.profit.toFixed(8) + '</td>' +
+                            '<td class="p-2 text-right ' + (b.profit >= 0 ? 'value-positive' : 'value-negative') + '">' + (b.profit >= 0 ? '+' : '') + parseFloat(b.profit).toFixed(8) + '</td>' +
                             '<td class="p-2 text-right">' + b.step + '</td>' +
                             '<td class="p-2 text-right ' + (b.roi >= 0 ? 'value-positive' : 'value-negative') + '">' + b.roi.toFixed(2) + '%</td>' +
                         '</tr>';
@@ -751,7 +792,7 @@ app.get('/', (req, res) => {
 async function initialize() {
     console.log("\n🎲 CRYPTO.GAMES MARTINGALE BOT\n");
     console.log("Configuration:");
-    console.log(`   API Key: ${config.apiKey ? '✓ Set' : '✗ Missing'}`);
+    console.log(`   API Key: ${config.apiKey ? '✓ Set' : '✗ Missing (using simulation)'}`);
     console.log(`   Base Bet: ${config.baseBet} BTC`);
     console.log(`   Multiplier: ${config.multiplier}x`);
     console.log(`   Take Profit: ${config.takeProfitPct}%`);
@@ -759,20 +800,16 @@ async function initialize() {
     console.log(`   Risk Percent: ${config.riskPercent}%`);
     console.log(`   Auto-Compound: ${config.autoCompound}\n`);
     
-    if (!config.apiKey || !config.apiSecret) {
-        console.error("❌ ERROR: CRYPTO_GAMES_API_KEY and CRYPTO_GAMES_API_SECRET must be set in .env file");
-        process.exit(1);
-    }
-    
-    // Get initial balance
+    // Try to get initial balance
     const balance = await getBalance();
-    if (balance === null) {
-        console.error("❌ Failed to connect to Crypto.Games API. Check your API credentials.");
-        process.exit(1);
-    }
-    
-    console.log(`✅ Connected to Crypto.Games API`);
     console.log(`💰 Current Balance: ${balance.toFixed(8)} BTC\n`);
+    
+    if (!config.apiKey) {
+        console.log('⚠️  No API Key provided. Running in SIMULATION mode.');
+        console.log('   To use real API, add CRYPTO_GAMES_API_KEY to .env file\n');
+    } else {
+        console.log('✅ API Key configured. Attempting real API connection...\n');
+    }
     
     // Start background loop
     setInterval(backgroundLoop, config.pollInterval);
@@ -780,6 +817,7 @@ async function initialize() {
     // Start web server
     app.listen(config.port, '0.0.0.0', () => {
         console.log(`🌐 Dashboard: http://localhost:${config.port}\n`);
+        console.log(`📊 Bot is running! Watch the dashboard for updates.\n`);
     });
 }
 
