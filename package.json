@@ -4,27 +4,14 @@
   "description": "Real Bitcoin wallet finder using secp256k1 cryptography",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js",
-    "dev": "nodemon bot.js"
+    "start": "node bot.js"
   },
-  "keywords": [
-    "bitcoin",
-    "cryptocurrency",
-    "secp256k1",
-    "wallet",
-    "blockchain"
-  ],
-  "author": "",
-  "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
     "axios": "^1.6.0",
-    "secp256k1": "^5.0.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.1"
+    "@noble/secp256k1": "^2.0.0"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=18.0.0"
   }
 }
