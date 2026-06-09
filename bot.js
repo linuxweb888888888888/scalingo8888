@@ -23,7 +23,7 @@ const GAME_CONFIG = {
     
     // WIN STREAK STRATEGY (NOT Martingale!)
     // Increase bet on WIN, reset on LOSS
-    winStreakMultiplier: 1.5,  // Increase 50% after win
+    winStreakMultiplier: 2.5,  // Increase 50% after win
     maxWinStreak: 5,           // Max 5 wins in a row
     
     // Loss recovery
