@@ -220,17 +220,17 @@ function validateAddressFormat(address) {
 
 async function checkWalletBalance(address) {
     try {
-        const response = await axios.get(`https://blockchain.info/q/addressbalance/${address}`, { timeout: 10000 });
+        const response = await axios.get('https://blockchain.info/q/addressbalance/' + address, { timeout: 10000 });
         const balanceSatoshis = response.data;
         const balanceBTC = balanceSatoshis / 100000000;
         
-        return { hasFunds: balanceBTC > 0, balanceBTC, balanceSatoshis, address };
+        return { hasFunds: balanceBTC > 0, balanceBTC: balanceBTC, balanceSatoshis: balanceSatoshis, address: address };
     } catch (error) {
-        return { hasFunds: false, balanceBTC: 0, balanceSatoshis: 0, address, error: error.message };
+        return { hasFunds: false, balanceBTC: 0, balanceSatoshis: 0, address: address, error: error.message };
     }
 }
 
-// ============ BULK GENERATION WITH SPEED TRACKING ============
+// ============ BULK GENERATION ============
 async function generateKeys(count, callback) {
     const startTime = Date.now();
     const keys = [];
@@ -238,7 +238,7 @@ async function generateKeys(count, callback) {
     for (let i = 0; i < count; i++) {
         const privateKey = generateRandomPrivateKey();
         const address = privateKeyToAddress(privateKey);
-        keys.push({ privateKey, address, index: i + 1 });
+        keys.push({ privateKey: privateKey, address: address, index: i + 1 });
         
         if (callback && i % Math.floor(count / 10) === 0) {
             callback({ progress: ((i + 1) / count) * 100, generated: i + 1, total: count });
@@ -250,10 +250,10 @@ async function generateKeys(count, callback) {
     const speed = count / duration;
     
     metrics.generationSpeed = speed;
-    metrics.generationHistory.unshift({ timestamp: new Date(), count, duration, speed });
+    metrics.generationHistory.unshift({ timestamp: new Date(), count: count, duration: duration, speed: speed });
     if (metrics.generationHistory.length > 50) metrics.generationHistory.pop();
     
-    return { keys, duration, speed, count };
+    return { keys: keys, duration: duration, speed: speed, count: count };
 }
 
 async function validateKeys(keys, checkBalance = true) {
@@ -268,7 +268,7 @@ async function validateKeys(keys, checkBalance = true) {
         
         const formatValid = validatePrivateKeyFormat(privateKey);
         if (!formatValid.valid) {
-            results.push({ privateKey, valid: false, error: formatValid.reason });
+            results.push({ privateKey: privateKey, valid: false, error: formatValid.reason });
             continue;
         }
         
@@ -281,8 +281,8 @@ async function validateKeys(keys, checkBalance = true) {
                 fundedCount++;
                 totalBalance += balance.balanceBTC;
                 metrics.foundWallets.unshift({
-                    privateKey,
-                    address,
+                    privateKey: privateKey,
+                    address: address,
                     balance: balance.balanceBTC,
                     timestamp: new Date()
                 });
@@ -291,8 +291,8 @@ async function validateKeys(keys, checkBalance = true) {
         }
         
         results.push({
-            privateKey,
-            address,
+            privateKey: privateKey,
+            address: address,
             valid: true,
             hasFunds: balance?.hasFunds || false,
             balanceBTC: balance?.balanceBTC || 0,
@@ -307,10 +307,9 @@ async function validateKeys(keys, checkBalance = true) {
         
         if (i % 10 === 0) {
             const progress = ((i + 1) / keys.length) * 100;
-            if (callback) callback({ progress, validated: i + 1, total: keys.length, funded: fundedCount });
+            if (callback) callback({ progress: progress, validated: i + 1, total: keys.length, funded: fundedCount });
         }
         
-        // Rate limiting
         await new Promise(r => setTimeout(r, 100));
     }
     
@@ -319,14 +318,14 @@ async function validateKeys(keys, checkBalance = true) {
     const speed = keys.length / duration;
     
     metrics.validationSpeed = speed;
-    metrics.validationHistory.unshift({ timestamp: new Date(), count: keys.length, duration, speed, funded: fundedCount });
+    metrics.validationHistory.unshift({ timestamp: new Date(), count: keys.length, duration: duration, speed: speed, funded: fundedCount });
     if (metrics.validationHistory.length > 50) metrics.validationHistory.pop();
     
-    return { results, duration, speed, fundedCount, totalBalance };
+    return { results: results, duration: duration, speed: speed, fundedCount: fundedCount, totalBalance: totalBalance };
 }
 
-// ============ ESTIMATION FUNCTIONS ============
-function estimateTimeToFind(countPerSecond, totalKeyspace = Math.pow(2, 256)) {
+function estimateTimeToFind(countPerSecond) {
+    const totalKeyspace = Math.pow(2, 256);
     const yearsToSearchAll = totalKeyspace / (countPerSecond * 365 * 24 * 60 * 60);
     const probabilityPercent = (countPerSecond / totalKeyspace) * 100;
     
@@ -335,21 +334,17 @@ function estimateTimeToFind(countPerSecond, totalKeyspace = Math.pow(2, 256)) {
         keysPerDay: countPerSecond * 86400,
         keysPerYear: countPerSecond * 31536000,
         yearsToSearchAll: yearsToSearchAll.toExponential(2),
-        probabilityPercent: probabilityPercent.toExponential(2),
-        estimatedWalletsFound: (countPerSecond * 86400 * 365) / 1000000 // Rough estimate
+        probabilityPercent: probabilityPercent.toExponential(2)
     };
 }
 
 // ============ API ENDPOINTS ============
-
-// Generate keys
 app.post('/api/generate', async (req, res) => {
-    const { count = 10 } = req.body;
-    const maxCount = Math.min(count, 1000);
+    const count = Math.min(req.body.count || 10, 1000);
     
-    metrics.totalKeysGenerated += maxCount;
+    metrics.totalKeysGenerated += count;
     
-    const result = await generateKeys(maxCount);
+    const result = await generateKeys(count);
     
     metrics.recentKeys.unshift(...result.keys.slice(0, 10));
     if (metrics.recentKeys.length > 100) metrics.recentKeys = metrics.recentKeys.slice(0, 100);
@@ -363,12 +358,11 @@ app.post('/api/generate', async (req, res) => {
     });
 });
 
-// Validate keys
 app.post('/api/validate', async (req, res) => {
-    const { keys, checkBalance = true } = req.body;
-    const keysList = Array.isArray(keys) ? keys : [keys];
+    const keys = Array.isArray(req.body.keys) ? req.body.keys : [req.body.keys];
+    const checkBalance = req.body.checkBalance !== false;
     
-    const result = await validateKeys(keysList, checkBalance);
+    const result = await validateKeys(keys, checkBalance);
     
     res.json({
         success: true,
@@ -380,19 +374,15 @@ app.post('/api/validate', async (req, res) => {
     });
 });
 
-// Generate and validate (find wallets)
 app.post('/api/find-wallets', async (req, res) => {
-    const { count = 100, checkBalance = true } = req.body;
-    const maxCount = Math.min(count, 500);
+    const count = Math.min(req.body.count || 100, 500);
+    const checkBalance = req.body.checkBalance !== false;
     
-    // Generate keys
-    const generateResult = await generateKeys(maxCount);
-    
-    // Validate keys (check balances)
+    const generateResult = await generateKeys(count);
     const privateKeys = generateResult.keys.map(k => k.privateKey);
     const validateResult = await validateKeys(privateKeys, checkBalance);
     
-    metrics.totalKeysGenerated += maxCount;
+    metrics.totalKeysGenerated += count;
     
     res.json({
         success: true,
@@ -406,7 +396,58 @@ app.post('/api/find-wallets', async (req, res) => {
     });
 });
 
-// Get metrics
+app.post('/api/validate-single', async (req, res) => {
+    const privateKey = req.body.privateKey;
+    
+    const formatValid = validatePrivateKeyFormat(privateKey);
+    if (!formatValid.valid) {
+        return res.json({ valid: false, error: formatValid.reason });
+    }
+    
+    const address = privateKeyToAddress(privateKey);
+    const balance = await checkWalletBalance(address);
+    
+    metrics.totalKeysValidated++;
+    if (balance.hasFunds) {
+        metrics.totalKeysWithFunds++;
+        metrics.totalBalanceFound += balance.balanceBTC;
+        metrics.foundWallets.unshift({
+            privateKey: privateKey,
+            address: address,
+            balance: balance.balanceBTC,
+            timestamp: new Date()
+        });
+    }
+    
+    res.json({
+        valid: true,
+        privateKey: privateKey,
+        address: address,
+        hasFunds: balance.hasFunds,
+        balanceBTC: balance.balanceBTC,
+        balanceSatoshis: balance.balanceSatoshis
+    });
+});
+
+app.post('/api/validate-address', async (req, res) => {
+    const address = req.body.address;
+    
+    const formatValid = validateAddressFormat(address);
+    if (!formatValid.valid) {
+        return res.json({ valid: false, error: formatValid.reason });
+    }
+    
+    const balance = await checkWalletBalance(address);
+    
+    res.json({
+        valid: true,
+        address: address,
+        hasFunds: balance.hasFunds,
+        balanceBTC: balance.balanceBTC,
+        balanceSatoshis: balance.balanceSatoshis
+    });
+});
+
 app.get('/api/metrics', (req, res) => {
     const uptime = (Date.now() - metrics.startTime) / 1000;
     const uptimeHours = Math.floor(uptime / 3600);
@@ -423,7 +464,7 @@ app.get('/api/metrics', (req, res) => {
             totalBalanceFound: metrics.totalBalanceFound.toFixed(8),
             generationSpeed: metrics.generationSpeed.toFixed(2),
             validationSpeed: metrics.validationSpeed.toFixed(2),
-            uptime: `${uptimeHours}h ${uptimeMinutes}m ${uptimeSeconds}s`
+            uptime: uptimeHours + 'h ' + uptimeMinutes + 'm ' + uptimeSeconds + 's'
         },
         recentKeys: metrics.recentKeys.slice(0, 20),
         foundWallets: metrics.foundWallets.slice(0, 20),
@@ -433,525 +474,361 @@ app.get('/api/metrics', (req, res) => {
     });
 });
 
-// Validate single private key
-app.post('/api/validate-single', async (req, res) => {
-    const { privateKey } = req.body;
-    
-    const formatValid = validatePrivateKeyFormat(privateKey);
-    if (!formatValid.valid) {
-        return res.json({ valid: false, error: formatValid.reason });
-    }
-    
-    const address = privateKeyToAddress(privateKey);
-    const balance = await checkWalletBalance(address);
-    
-    metrics.totalKeysValidated++;
-    if (balance.hasFunds) {
-        metrics.totalKeysWithFunds++;
-        metrics.totalBalanceFound += balance.balanceBTC;
-        metrics.foundWallets.unshift({
-            privateKey,
-            address,
-            balance: balance.balanceBTC,
-            timestamp: new Date()
-        });
-    }
-    
-    res.json({
-        valid: true,
-        privateKey,
-        address,
-        hasFunds: balance.hasFunds,
-        balanceBTC: balance.balanceBTC,
-        balanceSatoshis: balance.balanceSatoshis
-    });
-});
-
-// Validate address only
-app.post('/api/validate-address', async (req, res) => {
-    const { address } = req.body;
-    
-    const formatValid = validateAddressFormat(address);
-    if (!formatValid.valid) {
-        return res.json({ valid: false, error: formatValid.reason });
-    }
-    
-    const balance = await checkWalletBalance(address);
-    
-    res.json({
-        valid: true,
-        address,
-        hasFunds: balance.hasFunds,
-        balanceBTC: balance.balanceBTC,
-        balanceSatoshis: balance.balanceSatoshis
-    });
-});
-
 // ============ DASHBOARD ============
 app.get('/', (req, res) => {
-    res.send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bitcoin Key Generator & Wallet Finder</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
-            font-family: 'Inter', sans-serif;
-            color: #fff;
-            min-height: 100vh;
-        }
-        .container { max-width: 1400px; margin: 0 auto; padding: 40px 20px; }
-        h1 { text-align: center; font-size: 2.5rem; margin-bottom: 10px; }
-        h1 span { background: linear-gradient(135deg, #00d4ff, #667eea); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-        .subtitle { text-align: center; opacity: 0.8; margin-bottom: 40px; }
-        
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 40px; }
-        .stat-card { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 15px; padding: 20px; text-align: center; border: 1px solid rgba(255,255,255,0.2); }
-        .stat-value { font-size: 2rem; font-weight: bold; color: #00d4ff; }
-        .stat-label { font-size: 0.8rem; opacity: 0.7; margin-top: 5px; }
-        
-        .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; margin-bottom: 40px; }
-        .card { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 15px; padding: 20px; border: 1px solid rgba(255,255,255,0.2); }
-        .card h3 { margin-bottom: 15px; color: #00d4ff; }
-        
-        input, textarea, select { width: 100%; padding: 12px; margin-bottom: 15px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); border-radius: 8px; color: #fff; font-family: monospace; }
-        button { background: linear-gradient(135deg, #667eea, #764ba2); color: white; border: none; padding: 12px 24px; border-radius: 8px; cursor: pointer; font-weight: 600; transition: transform 0.2s; margin-right: 10px; margin-bottom: 10px; }
-        button:hover { transform: scale(1.02); }
-        .btn-danger { background: linear-gradient(135deg, #f093fb, #f5576c); }
-        .btn-success { background: linear-gradient(135deg, #4facfe, #00f2fe); }
-        
-        .result { background: rgba(0,0,0,0.3); border-radius: 8px; padding: 15px; margin-top: 15px; max-height: 400px; overflow-y: auto; font-family: monospace; font-size: 12px; }
-        .key-item { border-bottom: 1px solid rgba(255,255,255,0.1); padding: 10px; margin-bottom: 5px; }
-        .funded { background: rgba(0,255,0,0.1); border-left: 3px solid #00ff00; }
-        .progress-bar { width: 100%; height: 20px; background: rgba(255,255,255,0.1); border-radius: 10px; overflow: hidden; margin-top: 10px; }
-        .progress-fill { height: 100%; background: linear-gradient(90deg, #00d4ff, #667eea); transition: width 0.3s; }
-        .status { margin-top: 10px; font-size: 12px; }
-        .speed { color: #00d4ff; font-weight: bold; }
-        .found { color: #00ff00; font-weight: bold; }
-        
-        .tabs { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
-        .tab { background: rgba(255,255,255,0.1); padding: 10px 20px; border-radius: 8px; cursor: pointer; transition: all 0.2s; }
-        .tab.active { background: linear-gradient(135deg, #667eea, #764ba2); }
-        .tab-content { display: none; }
-        .tab-content.active { display: block; }
-        
-        table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1); font-size: 12px; }
-        th { color: #00d4ff; }
-        .address { font-family: monospace; font-size: 11px; }
-        
-        @media (max-width: 768px) {
-            .grid-2 { grid-template-columns: 1fr; }
-            .stats-grid { grid-template-columns: repeat(2, 1fr); }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🔐 <span>Bitcoin Key Generator</span> & Wallet Finder</h1>
-        <div class="subtitle">Generate, validate, and check Bitcoin private keys for funds</div>
-        
-        <!-- Stats -->
-        <div class="stats-grid" id="statsGrid">
-            <div class="stat-card"><div class="stat-value" id="totalKeys">0</div><div class="stat-label">Keys Generated</div></div>
-            <div class="stat-card"><div class="stat-value" id="validatedKeys">0</div><div class="stat-label">Keys Validated</div></div>
-            <div class="stat-card"><div class="stat-value" id="fundsFound">0</div><div class="stat-label">Wallets with Funds</div></div>
-            <div class="stat-card"><div class="stat-value" id="balanceFound">0 BTC</div><div class="stat-label">Total Balance Found</div></div>
-            <div class="stat-card"><div class="stat-value" id="genSpeed">0</div><div class="stat-label">Gen Speed (keys/sec)</div></div>
-            <div class="stat-card"><div class="stat-value" id="valSpeed">0</div><div class="stat-label">Val Speed (keys/sec)</div></div>
-        </div>
-        
-        <!-- Tabs -->
-        <div class="tabs">
-            <div class="tab active" onclick="showTab('generate')">🚀 Generate Keys</div>
-            <div class="tab" onclick="showTab('validate')">🔍 Validate Keys</div>
-            <div class="tab" onclick="showTab('find')">💰 Find Wallets</div>
-            <div class="tab" onclick="showTab('single')">🔑 Single Key</div>
-            <div class="tab" onclick="showTab('found')">🏆 Found Wallets</div>
-            <div class="tab" onclick="showTab('estimates')">📊 Estimates</div>
-        </div>
-        
-        <!-- Generate Tab -->
-        <div id="tab-generate" class="tab-content active">
-            <div class="grid-2">
-                <div class="card">
-                    <h3>⚙️ Generation Settings</h3>
-                    <label>Number of Keys:</label>
-                    <input type="number" id="genCount" value="100" min="1" max="1000">
-                    <button onclick="generateKeys()">🎲 Generate Keys</button>
-                    <div class="progress-bar"><div class="progress-fill" id="genProgress" style="width:0%"></div></div>
-                    <div class="status" id="genStatus">Ready to generate keys...</div>
-                </div>
-                <div class="card">
-                    <h3>📋 Generated Keys</h3>
-                    <div class="result" id="genResult">Click generate to create keys...</div>
-                </div>
-            </div>
-        </div>
-        
-        <!-- Validate Tab -->
-        <div id="tab-validate" class="tab-content">
-            <div class="grid-2">
-                <div class="card">
-                    <h3>🔍 Validation Settings</h3>
-                    <label>Enter Private Keys (one per line or comma separated):</label>
-                    <textarea id="validateKeys" rows="5" placeholder="Enter private keys here..."></textarea>
-                    <label>
-                        <input type="checkbox" id="checkBalance" checked> Check blockchain balance
-                    </label>
-                    <button onclick="validateKeys()">🔍 Validate Keys</button>
-                    <div class="progress-bar"><div class="progress-fill" id="valProgress" style="width:0%"></div></div>
-                    <div class="status" id="valStatus">Ready to validate...</div>
-                </div>
-                <div class="card">
-                    <h3>📊 Validation Results</h3>
-                    <div class="result" id="valResult">Enter keys to validate...</div>
-                </div>
-            </div>
-        </div>
-        
-        <!-- Find Wallets Tab -->
-        <div id="tab-find" class="tab-content">
-            <div class="grid-2">
-                <div class="card">
-                    <h3>💰 Find Wallets with Funds</h3>
-                    <label>Number of Keys to Generate & Check:</label>
-                    <input type="number" id="findCount" value="100" min="1" max="500">
-                    <label>
-                        <input type="checkbox" id="findCheckBalance" checked> Check blockchain balance
-                    </label>
-                    <button onclick="findWallets()" class="btn-success">🚀 Start Finding Wallets</button>
-                    <div class="progress-bar"><div class="progress-fill" id="findProgress" style="width:0%"></div></div>
-                    <div class="status" id="findStatus">Ready to search...</div>
-                </div>
-                <div class="card">
-                    <h3>🎯 Wallets Found</h3>
-                    <div class="result" id="findResult">No wallets found yet...</div>
-                </div>
-            </div>
-        </div>
-        
-        <!-- Single Key Tab -->
-        <div id="tab-single" class="tab-content">
-            <div class="grid-2">
-                <div class="card">
-                    <h3>🔑 Single Key Check</h3>
-                    <label>Private Key (hex):</label>
-                    <input type="text" id="singleKey" placeholder="64 character hex string">
-                    <button onclick="checkSingleKey()">🔍 Check Key</button>
-                </div>
-                <div class="card">
-                    <h3>📋 Result</h3>
-                    <div class="result" id="singleResult">Enter a private key to check...</div>
-                </div>
-            </div>
-        </div>
-        
-        <!-- Found Wallets Tab -->
-        <div id="tab-found" class="tab-content">
-            <div class="card">
-                <h3>🏆 Wallets Found with Funds</h3>
-                <div class="result" id="foundWalletsList" style="max-height: 500px;">
-                    <div class="key-item">No wallets found yet. Run "Find Wallets" to discover funded wallets.</div>
-                </div>
-            </div>
-        </div>
-        
-        <!-- Estimates Tab -->
-        <div id="tab-estimates" class="tab-content">
-            <div class="card">
-                <h3>📊 Speed & Probability Estimates</h3>
-                <div id="estimatesContent" style="font-family: monospace; line-height: 1.8;">
-                    Loading estimates...
-                </div>
-            </div>
-        </div>
-    </div>
-    
-    <script>
-        let currentGenerationSpeed = 0;
-        let currentValidationSpeed = 0;
-        
-        // Tab switching
-        function showTab(tab) {
-            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-            document.getElementById(`tab-${tab}`).classList.add('active');
-            event.target.classList.add('active');
-            
-            if (tab === 'found') loadFoundWallets();
-            if (tab === 'estimates') loadEstimates();
-        }
-        
-        // Load metrics
-        async function loadMetrics() {
-            try {
-                const res = await fetch('/api/metrics');
-                const data = await res.json();
-                
-                document.getElementById('totalKeys').innerText = data.stats.totalKeysGenerated.toLocaleString();
-                document.getElementById('validatedKeys').innerText = data.stats.totalKeysValidated.toLocaleString();
-                document.getElementById('fundsFound').innerText = data.stats.totalKeysWithFunds.toLocaleString();
-                document.getElementById('balanceFound').innerText = parseFloat(data.stats.totalBalanceFound).toFixed(8) + ' BTC';
-                document.getElementById('genSpeed').innerText = parseFloat(data.stats.generationSpeed).toFixed(2);
-                document.getElementById('valSpeed').innerText = parseFloat(data.stats.validationSpeed).toFixed(2);
-                
-                currentGenerationSpeed = parseFloat(data.stats.generationSpeed);
-                currentValidationSpeed = parseFloat(data.stats.validationSpeed);
-            } catch(e) { console.error(e); }
-        }
-        
-        // Generate Keys
-        async function generateKeys() {
-            const count = parseInt(document.getElementById('genCount').value);
-            const genResult = document.getElementById('genResult');
-            const genProgress = document.getElementById('genProgress');
-            const genStatus = document.getElementById('genStatus');
-            
-            genStatus.innerText = `Generating ${count} keys...`;
-            genProgress.style.width = '50%';
-            
-            try {
-                const res = await fetch('/api/generate', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ count })
-                });
-                const data = await res.json();
-                
-                genProgress.style.width = '100%';
-                genStatus.innerText = `✅ Generated ${data.keys.length} keys in ${data.duration.toFixed(2)}s (${data.speed.toFixed(2)} keys/sec)`;
-                
-                let html = '';
-                for (const key of data.keys.slice(0, 20)) {
-                    html += `<div class="key-item">
-                        <strong>#${key.index}</strong><br>
-                        Private Key: <span style="font-family:monospace; font-size:11px">${key.privateKey}</span><br>
-                        Address: <span style="font-family:monospace; font-size:11px">${key.address}</span>
-                    </div>`;
-                }
-                if (data.keys.length > 20) html += `<div>... and ${data.keys.length - 20} more</div>`;
-                genResult.innerHTML = html;
-                
-                loadMetrics();
-            } catch(e) {
-                genStatus.innerText = `❌ Error: ${e.message}`;
-            }
-        }
-        
-        // Validate Keys
-        async function validateKeys() {
-            const keysText = document.getElementById('validateKeys').value;
-            const checkBalance = document.getElementById('checkBalance').checked;
-            const keys = keysText.split(/[,\n]/).map(k => k.trim()).filter(k => k);
-            const valResult = document.getElementById('valResult');
-            const valProgress = document.getElementById('valProgress');
-            const valStatus = document.getElementById('valStatus');
-            
-            if (keys.length === 0) {
-                valStatus.innerText = 'Please enter at least one private key';
-                return;
-            }
-            
-            valStatus.innerText = `Validating ${keys.length} keys...`;
-            valProgress.style.width = '50%';
-            
-            try {
-                const res = await fetch('/api/validate', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ keys, checkBalance })
-                });
-                const data = await res.json();
-                
-                valProgress.style.width = '100%';
-                valStatus.innerText = `✅ Validated ${data.results.length} keys in ${data.duration.toFixed(2)}s (${data.speed.toFixed(2)} keys/sec) | Funded: ${data.fundedCount} | Total: ${data.totalBalance.toFixed(8)} BTC`;
-                
-                let html = '';
-                for (const result of data.results.slice(0, 50)) {
-                    const status = result.hasFunds ? '💰 HAS FUNDS!' : (result.valid ? '✅ Valid' : '❌ Invalid');
-                    html += `<div class="key-item ${result.hasFunds ? 'funded' : ''}">
-                        <strong>${status}</strong><br>
-                        Private Key: <span style="font-family:monospace; font-size:10px">${result.privateKey}</span><br>
-                        Address: <span style="font-family:monospace; font-size:10px">${result.address}</span>
-                        ${result.hasFunds ? `<br><span style="color:#00ff00">💰 Balance: ${result.balanceBTC} BTC</span>` : ''}
-                    </div>`;
-                }
-                valResult.innerHTML = html;
-                
-                loadMetrics();
-            } catch(e) {
-                valStatus.innerText = `❌ Error: ${e.message}`;
-            }
-        }
-        
-        // Find Wallets
-        async function findWallets() {
-            const count = parseInt(document.getElementById('findCount').value);
-            const checkBalance = document.getElementById('findCheckBalance').checked;
-            const findResult = document.getElementById('findResult');
-            const findProgress = document.getElementById('findProgress');
-            const findStatus = document.getElementById('findStatus');
-            
-            findStatus.innerText = `Generating and checking ${count} keys...`;
-            findProgress.style.width = '30%';
-            
-            try {
-                const res = await fetch('/api/find-wallets', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ count, checkBalance })
-                });
-                const data = await res.json();
-                
-                findProgress.style.width = '100%';
-                findStatus.innerText = `✅ Found ${data.fundedFound} wallets with funds! Total balance: ${data.totalBalanceFound.toFixed(8)} BTC | Speed: ${data.generationSpeed.toFixed(2)} gen/s, ${data.validationSpeed.toFixed(2)} val/s`;
-                
-                if (data.fundedFound > 0) {
-                    let html = '';
-                    for (const wallet of data.fundedWallets.slice(0, 20)) {
-                        html += `<div class="key-item funded">
-                            <strong>💰 WALLET WITH FUNDS!</strong><br>
-                            Private Key: <span style="font-family:monospace; font-size:10px">${wallet.privateKey}</span><br>
-                            Address: <span style="font-family:monospace; font-size:10px">${wallet.address}</span><br>
-                            <span style="color:#00ff00">Balance: ${wallet.balanceBTC} BTC</span>
-                        </div>`;
-                    }
-                    findResult.innerHTML = html;
-                } else {
-                    findResult.innerHTML = '<div class="key-item">No wallets with funds found in this batch. Keep trying!</div>';
-                }
-                
-                loadMetrics();
-                loadFoundWallets();
-            } catch(e) {
-                findStatus.innerText = `❌ Error: ${e.message}`;
-            }
-        }
-        
-        // Check single key
-        async function checkSingleKey() {
-            const privateKey = document.getElementById('singleKey').value.trim();
-            const singleResult = document.getElementById('singleResult');
-            
-            if (!privateKey) {
-                singleResult.innerHTML = '<div class="key-item">Please enter a private key</div>';
-                return;
-            }
-            
-            singleResult.innerHTML = '<div class="key-item">Checking...</div>';
-            
-            try {
-                const res = await fetch('/api/validate-single', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ privateKey })
-                });
-                const data = await res.json();
-                
-                if (data.valid) {
-                    singleResult.innerHTML = `<div class="key-item ${data.hasFunds ? 'funded' : ''}">
-                        <strong>${data.hasFunds ? '💰 VALID WALLET WITH FUNDS!' : '✅ Valid private key'}</strong><br>
-                        Private Key: <span style="font-family:monospace; font-size:11px">${data.privateKey}</span><br>
-                        Address: <span style="font-family:monospace; font-size:11px">${data.address}</span>
-                        ${data.hasFunds ? `<br><span style="color:#00ff00">💰 Balance: ${data.balanceBTC} BTC (${data.balanceSatoshis.toLocaleString()} satoshis)</span>` : '<br>No funds found on this address'}
-                    </div>`;
-                } else {
-                    singleResult.innerHTML = `<div class="key-item">❌ Invalid private key: ${data.error}</div>`;
-                }
-                
-                loadMetrics();
-            } catch(e) {
-                singleResult.innerHTML = `<div class="key-item">❌ Error: ${e.message}</div>`;
-            }
-        }
-        
-        // Load found wallets
-        async function loadFoundWallets() {
-            try {
-                const res = await fetch('/api/metrics');
-                const data = await res.json();
-                const found = document.getElementById('foundWalletsList');
-                
-                if (data.foundWallets && data.foundWallets.length > 0) {
-                    let html = '';
-                    for (const wallet of data.foundWallets) {
-                        html += `<div class="key-item funded">
-                            <strong>💰 FOUND ${wallet.balance} BTC</strong><br>
-                            Private Key: <span style="font-family:monospace; font-size:10px">${wallet.privateKey}</span><br>
-                            Address: <span style="font-family:monospace; font-size:10px">${wallet.address}</span><br>
-                            Found: ${new Date(wallet.timestamp).toLocaleString()}
-                        </div>`;
-                    }
-                    found.innerHTML = html;
-                } else {
-                    found.innerHTML = '<div class="key-item">No wallets found yet. Run "Find Wallets" to search.</div>';
-                }
-            } catch(e) { console.error(e); }
-        }
-        
-        // Load estimates
-        async function loadEstimates() {
-            try {
-                const res = await fetch('/api/metrics');
-                const data = await res.json();
-                const est = data.estimates;
-                const estimatesDiv = document.getElementById('estimatesContent');
-                
-                estimatesDiv.innerHTML = `
-                    <div class="key-item">
-                        <strong>📊 CURRENT PERFORMANCE</strong><br>
-                        Generation Speed: ${data.stats.generationSpeed || 0} keys/sec<br>
-                        Validation Speed: ${data.stats.validationSpeed || 0} keys/sec<br>
-                        Total Keys Generated: ${data.stats.totalKeysGenerated.toLocaleString()}<br>
-                        Total Keys Validated: ${data.stats.totalKeysValidated.toLocaleString()}
-                    </div>
-                    <div class="key-item">
-                        <strong>⏱️ TIME ESTIMATES (at ${est.keysPerSecond?.toFixed(2) || 0} keys/sec)</strong><br>
-                        Keys per Day: ${(est.keysPerDay || 0).toLocaleString()}<br>
-                        Keys per Year: ${(est.keysPerYear || 0).toExponential(2)}<br>
-                        Years to search all possible keys: ${est.yearsToSearchAll || 'N/A'}<br>
-                        Probability per key: ${est.probabilityPercent || 'N/A'}%
-                    </div>
-                    <div class="key-item">
-                        <strong>💡 REALITY CHECK</strong><br>
-                        Total possible Bitcoin private keys: ~2^256 (${Math.pow(2, 256).toExponential(2)})<br>
-                        This is more than the number of atoms in the universe.<br>
-                        Finding a key with funds is statistically impossible.<br>
-                        This tool is for educational purposes only.
-                    </div>
-                `;
-            } catch(e) { console.error(e); }
-        }
-        
-        // Auto-refresh metrics
-        setInterval(loadMetrics, 5000);
-        loadMetrics();
-    </script>
-</body>
-</html>`);
+    res.send('<!DOCTYPE html>\n' +
+'<html lang="en">\n' +
+'<head>\n' +
+'    <meta charset="UTF-8">\n' +
+'    <meta name="viewport" content="width=device-width, initial-scale=1.0">\n' +
+'    <title>Bitcoin Key Generator & Wallet Finder</title>\n' +
+'    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">\n' +
+'    <style>\n' +
+'        * { margin: 0; padding: 0; box-sizing: border-box; }\n' +
+'        body {\n' +
+'            background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);\n' +
+'            font-family: "Inter", sans-serif;\n' +
+'            color: #fff;\n' +
+'            min-height: 100vh;\n' +
+'        }\n' +
+'        .container { max-width: 1400px; margin: 0 auto; padding: 40px 20px; }\n' +
+'        h1 { text-align: center; font-size: 2.5rem; margin-bottom: 10px; }\n' +
+'        h1 span { background: linear-gradient(135deg, #00d4ff, #667eea); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }\n' +
+'        .subtitle { text-align: center; opacity: 0.8; margin-bottom: 40px; }\n' +
+'        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 40px; }\n' +
+'        .stat-card { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 15px; padding: 20px; text-align: center; border: 1px solid rgba(255,255,255,0.2); }\n' +
+'        .stat-value { font-size: 2rem; font-weight: bold; color: #00d4ff; }\n' +
+'        .stat-label { font-size: 0.8rem; opacity: 0.7; margin-top: 5px; }\n' +
+'        .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; margin-bottom: 40px; }\n' +
+'        .card { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 15px; padding: 20px; border: 1px solid rgba(255,255,255,0.2); }\n' +
+'        .card h3 { margin-bottom: 15px; color: #00d4ff; }\n' +
+'        input, textarea, select { width: 100%; padding: 12px; margin-bottom: 15px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); border-radius: 8px; color: #fff; font-family: monospace; }\n' +
+'        button { background: linear-gradient(135deg, #667eea, #764ba2); color: white; border: none; padding: 12px 24px; border-radius: 8px; cursor: pointer; font-weight: 600; transition: transform 0.2s; margin-right: 10px; margin-bottom: 10px; }\n' +
+'        button:hover { transform: scale(1.02); }\n' +
+'        .btn-success { background: linear-gradient(135deg, #4facfe, #00f2fe); }\n' +
+'        .result { background: rgba(0,0,0,0.3); border-radius: 8px; padding: 15px; margin-top: 15px; max-height: 400px; overflow-y: auto; font-family: monospace; font-size: 12px; }\n' +
+'        .key-item { border-bottom: 1px solid rgba(255,255,255,0.1); padding: 10px; margin-bottom: 5px; }\n' +
+'        .funded { background: rgba(0,255,0,0.1); border-left: 3px solid #00ff00; }\n' +
+'        .progress-bar { width: 100%; height: 20px; background: rgba(255,255,255,0.1); border-radius: 10px; overflow: hidden; margin-top: 10px; }\n' +
+'        .progress-fill { height: 100%; background: linear-gradient(90deg, #00d4ff, #667eea); transition: width 0.3s; }\n' +
+'        .status { margin-top: 10px; font-size: 12px; }\n' +
+'        .tabs { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }\n' +
+'        .tab { background: rgba(255,255,255,0.1); padding: 10px 20px; border-radius: 8px; cursor: pointer; transition: all 0.2s; }\n' +
+'        .tab.active { background: linear-gradient(135deg, #667eea, #764ba2); }\n' +
+'        .tab-content { display: none; }\n' +
+'        .tab-content.active { display: block; }\n' +
+'        @media (max-width: 768px) { .grid-2 { grid-template-columns: 1fr; } }\n' +
+'    </style>\n' +
+'</head>\n' +
+'<body>\n' +
+'<div class="container">\n' +
+'    <h1>🔐 <span>Bitcoin Key Generator</span> & Wallet Finder</h1>\n' +
+'    <div class="subtitle">Generate, validate, and check Bitcoin private keys for funds</div>\n' +
+'    \n' +
+'    <div class="stats-grid" id="statsGrid">\n' +
+'        <div class="stat-card"><div class="stat-value" id="totalKeys">0</div><div class="stat-label">Keys Generated</div></div>\n' +
+'        <div class="stat-card"><div class="stat-value" id="validatedKeys">0</div><div class="stat-label">Keys Validated</div></div>\n' +
+'        <div class="stat-card"><div class="stat-value" id="fundsFound">0</div><div class="stat-label">Wallets with Funds</div></div>\n' +
+'        <div class="stat-card"><div class="stat-value" id="balanceFound">0 BTC</div><div class="stat-label">Total Balance Found</div></div>\n' +
+'        <div class="stat-card"><div class="stat-value" id="genSpeed">0</div><div class="stat-label">Gen Speed (keys/sec)</div></div>\n' +
+'        <div class="stat-card"><div class="stat-value" id="valSpeed">0</div><div class="stat-label">Val Speed (keys/sec)</div></div>\n' +
+'    </div>\n' +
+'    \n' +
+'    <div class="tabs">\n' +
+'        <div class="tab active" onclick="showTab(\'generate\')">🚀 Generate Keys</div>\n' +
+'        <div class="tab" onclick="showTab(\'validate\')">🔍 Validate Keys</div>\n' +
+'        <div class="tab" onclick="showTab(\'find\')">💰 Find Wallets</div>\n' +
+'        <div class="tab" onclick="showTab(\'single\')">🔑 Single Key</div>\n' +
+'        <div class="tab" onclick="showTab(\'found\')">🏆 Found Wallets</div>\n' +
+'        <div class="tab" onclick="showTab(\'estimates\')">📊 Estimates</div>\n' +
+'    </div>\n' +
+'    \n' +
+'    <div id="tab-generate" class="tab-content active">\n' +
+'        <div class="grid-2">\n' +
+'            <div class="card">\n' +
+'                <h3>⚙️ Generation Settings</h3>\n' +
+'                <label>Number of Keys:</label>\n' +
+'                <input type="number" id="genCount" value="100" min="1" max="1000">\n' +
+'                <button onclick="generateKeys()">🎲 Generate Keys</button>\n' +
+'                <div class="progress-bar"><div class="progress-fill" id="genProgress" style="width:0%"></div></div>\n' +
+'                <div class="status" id="genStatus">Ready to generate keys...</div>\n' +
+'            </div>\n' +
+'            <div class="card">\n' +
+'                <h3>📋 Generated Keys</h3>\n' +
+'                <div class="result" id="genResult">Click generate to create keys...</div>\n' +
+'            </div>\n' +
+'        </div>\n' +
+'    </div>\n' +
+'    \n' +
+'    <div id="tab-validate" class="tab-content">\n' +
+'        <div class="grid-2">\n' +
+'            <div class="card">\n' +
+'                <h3>🔍 Validation Settings</h3>\n' +
+'                <label>Enter Private Keys (one per line or comma separated):</label>\n' +
+'                <textarea id="validateKeys" rows="5" placeholder="Enter private keys here..."></textarea>\n' +
+'                <label><input type="checkbox" id="checkBalance" checked> Check blockchain balance</label>\n' +
+'                <button onclick="validateKeys()">🔍 Validate Keys</button>\n' +
+'                <div class="progress-bar"><div class="progress-fill" id="valProgress" style="width:0%"></div></div>\n' +
+'                <div class="status" id="valStatus">Ready to validate...</div>\n' +
+'            </div>\n' +
+'            <div class="card">\n' +
+'                <h3>📊 Validation Results</h3>\n' +
+'                <div class="result" id="valResult">Enter keys to validate...</div>\n' +
+'            </div>\n' +
+'        </div>\n' +
+'    </div>\n' +
+'    \n' +
+'    <div id="tab-find" class="tab-content">\n' +
+'        <div class="grid-2">\n' +
+'            <div class="card">\n' +
+'                <h3>💰 Find Wallets with Funds</h3>\n' +
+'                <label>Number of Keys to Generate & Check:</label>\n' +
+'                <input type="number" id="findCount" value="100" min="1" max="500">\n' +
+'                <label><input type="checkbox" id="findCheckBalance" checked> Check blockchain balance</label>\n' +
+'                <button onclick="findWallets()" class="btn-success">🚀 Start Finding Wallets</button>\n' +
+'                <div class="progress-bar"><div class="progress-fill" id="findProgress" style="width:0%"></div></div>\n' +
+'                <div class="status" id="findStatus">Ready to search...</div>\n' +
+'            </div>\n' +
+'            <div class="card">\n' +
+'                <h3>🎯 Wallets Found</h3>\n' +
+'                <div class="result" id="findResult">No wallets found yet...</div>\n' +
+'            </div>\n' +
+'        </div>\n' +
+'    </div>\n' +
+'    \n' +
+'    <div id="tab-single" class="tab-content">\n' +
+'        <div class="grid-2">\n' +
+'            <div class="card">\n' +
+'                <h3>🔑 Single Key Check</h3>\n' +
+'                <label>Private Key (hex):</label>\n' +
+'                <input type="text" id="singleKey" placeholder="64 character hex string">\n' +
+'                <button onclick="checkSingleKey()">🔍 Check Key</button>\n' +
+'            </div>\n' +
+'            <div class="card">\n' +
+'                <h3>📋 Result</h3>\n' +
+'                <div class="result" id="singleResult">Enter a private key to check...</div>\n' +
+'            </div>\n' +
+'        </div>\n' +
+'    </div>\n' +
+'    \n' +
+'    <div id="tab-found" class="tab-content">\n' +
+'        <div class="card">\n' +
+'            <h3>🏆 Wallets Found with Funds</h3>\n' +
+'            <div class="result" id="foundWalletsList">No wallets found yet. Run "Find Wallets" to discover funded wallets.</div>\n' +
+'        </div>\n' +
+'    </div>\n' +
+'    \n' +
+'    <div id="tab-estimates" class="tab-content">\n' +
+'        <div class="card">\n' +
+'            <h3>📊 Speed & Probability Estimates</h3>\n' +
+'            <div class="result" id="estimatesContent">Loading estimates...</div>\n' +
+'        </div>\n' +
+'    </div>\n' +
+'</div>\n' +
+'\n' +
+'<script>\n' +
+'let currentGenerationSpeed = 0;\n' +
+'let currentValidationSpeed = 0;\n' +
+'\n' +
+'function showTab(tab) {\n' +
+'    document.querySelectorAll(".tab-content").forEach(function(t) { t.classList.remove("active"); });\n' +
+'    document.querySelectorAll(".tab").forEach(function(t) { t.classList.remove("active"); });\n' +
+'    document.getElementById("tab-" + tab).classList.add("active");\n' +
+'    event.target.classList.add("active");\n' +
+'    if (tab === "found") loadFoundWallets();\n' +
+'    if (tab === "estimates") loadEstimates();\n' +
+'}\n' +
+'\n' +
+'async function loadMetrics() {\n' +
+'    try {\n' +
+'        const res = await fetch("/api/metrics");\n' +
+'        const data = await res.json();\n' +
+'        document.getElementById("totalKeys").innerText = data.stats.totalKeysGenerated.toLocaleString();\n' +
+'        document.getElementById("validatedKeys").innerText = data.stats.totalKeysValidated.toLocaleString();\n' +
+'        document.getElementById("fundsFound").innerText = data.stats.totalKeysWithFunds.toLocaleString();\n' +
+'        document.getElementById("balanceFound").innerText = parseFloat(data.stats.totalBalanceFound).toFixed(8) + " BTC";\n' +
+'        document.getElementById("genSpeed").innerText = parseFloat(data.stats.generationSpeed).toFixed(2);\n' +
+'        document.getElementById("valSpeed").innerText = parseFloat(data.stats.validationSpeed).toFixed(2);\n' +
+'        currentGenerationSpeed = parseFloat(data.stats.generationSpeed);\n' +
+'        currentValidationSpeed = parseFloat(data.stats.validationSpeed);\n' +
+'    } catch(e) { console.error(e); }\n' +
+'}\n' +
+'\n' +
+'async function generateKeys() {\n' +
+'    const count = parseInt(document.getElementById("genCount").value);\n' +
+'    const genResult = document.getElementById("genResult");\n' +
+'    const genProgress = document.getElementById("genProgress");\n' +
+'    const genStatus = document.getElementById("genStatus");\n' +
+'    \n' +
+'    genStatus.innerText = "Generating " + count + " keys...";\n' +
+'    genProgress.style.width = "50%";\n' +
+'    \n' +
+'    try {\n' +
+'        const res = await fetch("/api/generate", {\n' +
+'            method: "POST",\n' +
+'            headers: { "Content-Type": "application/json" },\n' +
+'            body: JSON.stringify({ count: count })\n' +
+'        });\n' +
+'        const data = await res.json();\n' +
+'        genProgress.style.width = "100%";\n' +
+'        genStatus.innerText = "✅ Generated " + data.keys.length + " keys in " + data.duration.toFixed(2) + "s (" + data.speed.toFixed(2) + " keys/sec)";\n' +
+'        let html = "";\n' +
+'        for (let i = 0; i < Math.min(data.keys.length, 20); i++) {\n' +
+'            const key = data.keys[i];\n' +
+'            html += "<div class=\"key-item\"><strong>#" + key.index + "</strong><br>Private Key: <span style=\"font-family:monospace; font-size:11px\">" + key.privateKey + "</span><br>Address: <span style=\"font-family:monospace; font-size:11px\">" + key.address + "</span></div>";\n' +
+'        }\n' +
+'        if (data.keys.length > 20) html += "<div>... and " + (data.keys.length - 20) + " more</div>";\n' +
+'        genResult.innerHTML = html;\n' +
+'        loadMetrics();\n' +
+'    } catch(e) {\n' +
+'        genStatus.innerText = "❌ Error: " + e.message;\n' +
+'    }\n' +
+'}\n' +
+'\n' +
+'async function validateKeys() {\n' +
+'    const keysText = document.getElementById("validateKeys").value;\n' +
+'    const checkBalance = document.getElementById("checkBalance").checked;\n' +
+'    const keys = keysText.split(/[,\\n]/).map(function(k) { return k.trim(); }).filter(function(k) { return k; });\n' +
+'    const valResult = document.getElementById("valResult");\n' +
+'    const valProgress = document.getElementById("valProgress");\n' +
+'    const valStatus = document.getElementById("valStatus");\n' +
+'    \n' +
+'    if (keys.length === 0) {\n' +
+'        valStatus.innerText = "Please enter at least one private key";\n' +
+'        return;\n' +
+'    }\n' +
+'    \n' +
+'    valStatus.innerText = "Validating " + keys.length + " keys...";\n' +
+'    valProgress.style.width = "50%";\n' +
+'    \n' +
+'    try {\n' +
+'        const res = await fetch("/api/validate", {\n' +
+'            method: "POST",\n' +
+'            headers: { "Content-Type": "application/json" },\n' +
+'            body: JSON.stringify({ keys: keys, checkBalance: checkBalance })\n' +
+'        });\n' +
+'        const data = await res.json();\n' +
+'        valProgress.style.width = "100%";\n' +
+'        valStatus.innerText = "✅ Validated " + data.results.length + " keys in " + data.duration.toFixed(2) + "s (" + data.speed.toFixed(2) + " keys/sec) | Funded: " + data.fundedCount + " | Total: " + data.totalBalance.toFixed(8) + " BTC";\n' +
+'        let html = "";\n' +
+'        for (let i = 0; i < Math.min(data.results.length, 50); i++) {\n' +
+'            const result = data.results[i];\n' +
+'            const status = result.hasFunds ? "💰 HAS FUNDS!" : (result.valid ? "✅ Valid" : "❌ Invalid");\n' +
+'            html += "<div class=\"key-item" + (result.hasFunds ? " funded" : "") + "\"><strong>" + status + "</strong><br>Private Key: <span style=\"font-family:monospace; font-size:10px\">" + result.privateKey + "</span><br>Address: <span style=\"font-family:monospace; font-size:10px\">" + result.address + "</span>" + (result.hasFunds ? "<br><span style=\"color:#00ff00\">💰 Balance: " + result.balanceBTC + " BTC</span>" : "") + "</div>";\n' +
+'        }\n' +
+'        valResult.innerHTML = html;\n' +
+'        loadMetrics();\n' +
+'    } catch(e) {\n' +
+'        valStatus.innerText = "❌ Error: " + e.message;\n' +
+'    }\n' +
+'}\n' +
+'\n' +
+'async function findWallets() {\n' +
+'    const count = parseInt(document.getElementById("findCount").value);\n' +
+'    const checkBalance = document.getElementById("findCheckBalance").checked;\n' +
+'    const findResult = document.getElementById("findResult");\n' +
+'    const findProgress = document.getElementById("findProgress");\n' +
+'    const findStatus = document.getElementById("findStatus");\n' +
+'    \n' +
+'    findStatus.innerText = "Generating and checking " + count + " keys...";\n' +
+'    findProgress.style.width = "30%";\n' +
+'    \n' +
+'    try {\n' +
+'        const res = await fetch("/api/find-wallets", {\n' +
+'            method: "POST",\n' +
+'            headers: { "Content-Type": "application/json" },\n' +
+'            body: JSON.stringify({ count: count, checkBalance: checkBalance })\n' +
+'        });\n' +
+'        const data = await res.json();\n' +
+'        findProgress.style.width = "100%";\n' +
+'        findStatus.innerText = "✅ Found " + data.fundedFound + " wallets with funds! Total balance: " + data.totalBalanceFound.toFixed(8) + " BTC | Speed: " + data.generationSpeed.toFixed(2) + " gen/s, " + data.validationSpeed.toFixed(2) + " val/s";\n' +
+'        if (data.fundedFound > 0) {\n' +
+'            let html = "";\n' +
+'            for (let i = 0; i < Math.min(data.fundedWallets.length, 20); i++) {\n' +
+'                const wallet = data.fundedWallets[i];\n' +
+'                html += "<div class=\"key-item funded\"><strong>💰 WALLET WITH FUNDS!</strong><br>Private Key: <span style=\"font-family:monospace; font-size:10px\">" + wallet.privateKey + "</span><br>Address: <span style=\"font-family:monospace; font-size:10px\">" + wallet.address + "</span><br><span style=\"color:#00ff00\">Balance: " + wallet.balanceBTC + " BTC</span></div>";\n' +
+'            }\n' +
+'            findResult.innerHTML = html;\n' +
+'        } else {\n' +
+'            findResult.innerHTML = "<div class=\"key-item\">No wallets with funds found in this batch. Keep trying!</div>";\n' +
+'        }\n' +
+'        loadMetrics();\n' +
+'        loadFoundWallets();\n' +
+'    } catch(e) {\n' +
+'        findStatus.innerText = "❌ Error: " + e.message;\n' +
+'    }\n' +
+'}\n' +
+'\n' +
+'async function checkSingleKey() {\n' +
+'    const privateKey = document.getElementById("singleKey").value.trim();\n' +
+'    const singleResult = document.getElementById("singleResult");\n' +
+'    \n' +
+'    if (!privateKey) {\n' +
+'        singleResult.innerHTML = "<div class=\"key-item\">Please enter a private key</div>";\n' +
+'        return;\n' +
+'    }\n' +
+'    \n' +
+'    singleResult.innerHTML = "<div class=\"key-item\">Checking...</div>";\n' +
+'    \n' +
+'    try {\n' +
+'        const res = await fetch("/api/validate-single", {\n' +
+'            method: "POST",\n' +
+'            headers: { "Content-Type": "application/json" },\n' +
+'            body: JSON.stringify({ privateKey: privateKey })\n' +
+'        });\n' +
+'        const data = await res.json();\n' +
+'        if (data.valid) {\n' +
+'            singleResult.innerHTML = "<div class=\"key-item" + (data.hasFunds ? " funded" : "") + "\"><strong>" + (data.hasFunds ? "💰 VALID WALLET WITH FUNDS!" : "✅ Valid private key") + "</strong><br>Private Key: <span style=\"font-family:monospace; font-size:11px\">" + data.privateKey + "</span><br>Address: <span style=\"font-family:monospace; font-size:11px\">" + data.address + "</span>" + (data.hasFunds ? "<br><span style=\"color:#00ff00\">💰 Balance: " + data.balanceBTC + " BTC (" + data.balanceSatoshis.toLocaleString() + " satoshis)</span>" : "<br>No funds found on this address") + "</div>";\n' +
+'        } else {\n' +
+'            singleResult.innerHTML = "<div class=\"key-item\">❌ Invalid private key: " + data.error + "</div>";\n' +
+'        }\n' +
+'        loadMetrics();\n' +
+'    } catch(e) {\n' +
+'        singleResult.innerHTML = "<div class=\"key-item\">❌ Error: " + e.message + "</div>";\n' +
+'    }\n' +
+'}\n' +
+'\n' +
+'async function loadFoundWallets() {\n' +
+'    try {\n' +
+'        const res = await fetch("/api/metrics");\n' +
+'        const data = await res.json();\n' +
+'        const found = document.getElementById("foundWalletsList");\n' +
+'        if (data.foundWallets && data.foundWallets.length > 0) {\n' +
+'            let html = "";\n' +
+'            for (let i = 0; i < data.foundWallets.length; i++) {\n' +
+'                const wallet = data.foundWallets[i];\n' +
+'                html += "<div class=\"key-item funded\"><strong>💰 FOUND " + wallet.balance + " BTC</strong><br>Private Key: <span style=\"font-family:monospace; font-size:10px\">" + wallet.privateKey + "</span><br>Address: <span style=\"font-family:monospace; font-size:10px\">" + wallet.address + "</span><br>Found: " + new Date(wallet.timestamp).toLocaleString() + "</div>";\n' +
+'            }\n' +
+'            found.innerHTML = html;\n' +
+'        } else {\n' +
+'            found.innerHTML = "<div class=\"key-item\">No wallets found yet. Run \"Find Wallets\" to search.</div>";\n' +
+'        }\n' +
+'    } catch(e) { console.error(e); }\n' +
+'}\n' +
+'\n' +
+'async function loadEstimates() {\n' +
+'    try {\n' +
+'        const res = await fetch("/api/metrics");\n' +
+'        const data = await res.json();\n' +
+'        const est = data.estimates;\n' +
+'        const estimatesDiv = document.getElementById("estimatesContent");\n' +
+'        estimatesDiv.innerHTML = "<div class=\"key-item\"><strong>📊 CURRENT PERFORMANCE</strong><br>Generation Speed: " + (data.stats.generationSpeed || 0) + " keys/sec<br>Validation Speed: " + (data.stats.validationSpeed || 0) + " keys/sec<br>Total Keys Generated: " + data.stats.totalKeysGenerated.toLocaleString() + "<br>Total Keys Validated: " + data.stats.totalKeysValidated.toLocaleString() + "</div><div class=\"key-item\"><strong>⏱️ TIME ESTIMATES</strong><br>Keys per Day: " + (est.keysPerDay || 0).toLocaleString() + "<br>Keys per Year: " + (est.keysPerYear || 0).toExponential(2) + "<br>Years to search all possible keys: " + (est.yearsToSearchAll || "N/A") + "<br>Probability per key: " + (est.probabilityPercent || "N/A") + "%</div><div class=\"key-item\"><strong>💡 REALITY CHECK</strong><br>Total possible Bitcoin private keys: ~2^256 (1.16e77)<br>This is more than the number of atoms in the universe.<br>Finding a key with funds is statistically impossible.<br>This tool is for educational purposes only.</div>";\n' +
+'    } catch(e) { console.error(e); }\n' +
+'}\n' +
+'\n' +
+'setInterval(loadMetrics, 5000);\n' +
+'loadMetrics();\n' +
+'</script>\n' +
+'</body>\n' +
+'</html>');
 });
 
 // ============ START SERVER ============
 app.listen(port, '0.0.0.0', () => {
-    console.log(`
-╔══════════════════════════════════════════════════════════════╗
-║         Bitcoin Key Generator & Wallet Finder Server         ║
-╠══════════════════════════════════════════════════════════════╣
-║  Dashboard:  http://localhost:${port}                         ║
-║  API Base:   http://localhost:${port}/api/                    ║
-╠══════════════════════════════════════════════════════════════╣
-║  Endpoints:                                                  ║
-║    POST /api/generate        - Generate random keys          ║
-║    POST /api/validate        - Validate private keys         ║
-║    POST /api/find-wallets    - Generate & check for funds    ║
-║    POST /api/validate-single - Check single private key      ║
-║    POST /api/validate-address- Check Bitcoin address         ║
-║    GET  /api/metrics         - Get system metrics            ║
-╚══════════════════════════════════════════════════════════════╝
-    `);
+    console.log('\n========================================');
+    console.log('  Bitcoin Key Generator & Wallet Finder');
+    console.log('========================================');
+    console.log('  Dashboard: http://localhost:' + port);
+    console.log('  API Base:   http://localhost:' + port + '/api/');
+    console.log('========================================\n');
 });
