@@ -14,7 +14,7 @@ const GAME_CONFIG = {
     
     // HIGHER PAYOUT for profit (2.5x instead of 2.02x)
     // Lower win chance but higher payout = better Martingale recovery
-    targetPayout: 2.5,      // 2.5x payout on win
+    targetPayout: 1.4,      // 2.5x payout on win
     winChance: 40,          // 40% chance to win (house edge still low)
     
     // Betting (1 Satoshi minimum)
