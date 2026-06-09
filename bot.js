@@ -8,18 +8,15 @@ const port = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || "FrRtbXf3294xXJJyiK9RYWhiqmj6f471xYBghxZE2cgW4Ddc3p";
 const BASE_URL = "https://api.crypto.games/v1";
 
-// PROFITABLE STRATEGY CONFIG
+// CONTINUOUS PROFITABLE STRATEGY CONFIG
 const PLINKO_CONFIG = {
     coin: "BTC",
     risk: "low",
     rows: 8,
-    baseBet: 0.00000010,
-    maxBet: 0.00000100,
-    dailyTarget: 0.00005000,
-    sessionStopLoss: 0.00002000,
-    winIncrease: 1.0,
-    lossIncrease: 1.5,
-    maxConsecutiveLosses: 5
+    baseBet: 0.00000010,  // 10 Satoshi base
+    maxBet: 0.00001000,   // Increased max for continuous recovery
+    lossIncrease: 1.5,     // 50% increase on loss (martingale style)
+    maxConsecutiveLosses: 10 // Allow more losses before stopping (continuous mode)
 };
 
 // ============ BOT STATE ============
@@ -27,7 +24,8 @@ let btcPrice = 60964;
 let startingBalance = 0;
 let botState = {
     running: true,
-    statusMessage: "Initializing Profitable Plinko Bot...",
+    continuousMode: true,  // NEVER STOPS
+    statusMessage: "Continuous Plinko Bot - Grinding Profits",
     coin: PLINKO_CONFIG.coin,
     stats: {
         totalBets: 0,
@@ -37,7 +35,9 @@ let botState = {
         currentBalance: 0,
         startingBalance: 0,
         startTime: Date.now(),
-        consecutiveLosses: 0
+        consecutiveLosses: 0,
+        highestBalance: 0,
+        lowestBalance: Infinity
     },
     settings: {
         currentBet: PLINKO_CONFIG.baseBet,
@@ -65,7 +65,6 @@ function formatBTC(amount) {
 async function placePlinkoBet() {
     const url = `${BASE_URL}/placebet/${botState.coin}/${API_KEY}`;
     
-    // Generate alphanumeric client seed (same as working version)
     const timestamp = Date.now().toString();
     const randomPart = Math.random().toString(36).substring(2, 15);
     const clientSeed = (timestamp + randomPart).slice(0, 32);
@@ -88,75 +87,64 @@ async function placePlinkoBet() {
     } catch (error) { 
         const errorMsg = error.response?.data?.Message || error.message;
         console.error("API Error:", errorMsg);
-        botState.statusMessage = `API Error: ${errorMsg}`;
         return null; 
     }
 }
 
-// ============ PROFIT STRATEGY ============
-function calculateNewBet(isWin, multiplier) {
+// ============ CONTINUOUS BETTING STRATEGY ============
+function calculateNextBet(isWin, multiplier) {
     if (isWin) {
+        // WIN: Reset consecutive losses and lower bet
         botState.stats.consecutiveLosses = 0;
         return PLINKO_CONFIG.baseBet;
     } else {
+        // LOSS: Increase bet to recover (but never exceed maxBet)
         botState.stats.consecutiveLosses++;
         
+        // Safety: If too many losses, reset bet to avoid catastrophic loss
         if (botState.stats.consecutiveLosses >= PLINKO_CONFIG.maxConsecutiveLosses) {
-            botState.statusMessage = "MAX LOSSES REACHED - Stopping";
-            botState.running = false;
-            return botState.settings.currentBet;
+            console.log(`⚠️ ${botState.stats.consecutiveLosses} losses in a row - resetting to base bet`);
+            botState.stats.consecutiveLosses = 0;
+            return PLINKO_CONFIG.baseBet;
         }
         
         let newBet = botState.settings.currentBet * PLINKO_CONFIG.lossIncrease;
         if (newBet > PLINKO_CONFIG.maxBet) newBet = PLINKO_CONFIG.maxBet;
+        
+        // Never bet more than 10% of remaining balance
+        const maxSafeBet = botState.stats.currentBalance * 0.1;
+        if (newBet > maxSafeBet && maxSafeBet > PLINKO_CONFIG.baseBet) {
+            newBet = maxSafeBet;
+        }
+        
         return newBet;
     }
 }
 
-function checkProfitTargets() {
-    if (botState.stats.netProfit >= PLINKO_CONFIG.dailyTarget) {
-        botState.statusMessage = `TARGET REACHED! Profit: ${formatBTC(botState.stats.netProfit)} BTC`;
-        botState.running = false;
-        return false;
-    }
-    
-    if (botState.stats.netProfit <= -PLINKO_CONFIG.sessionStopLoss) {
-        botState.statusMessage = `STOP LOSS HIT! Loss: ${formatBTC(botState.stats.netProfit)} BTC`;
-        botState.running = false;
-        return false;
-    }
-    
-    return true;
-}
-
-// ============ MAIN BOT LOOP ============
-async function runProfitablePlinko() {
-    startingBalance = 0.00010000; // Default fallback
-    
+// ============ MAIN CONTINUOUS BOT LOOP ============
+async function runContinuousPlinko() {
     console.log(`
     ╔══════════════════════════════════════════════════╗
-    ║     💰 PROFITABLE PLINKO BOT STARTED 💰          ║
+    ║     🔥 CONTINUOUS PLINKO BOT STARTED 🔥          ║
     ╠══════════════════════════════════════════════════╣
+    ║  Mode: INFINITE (Never Stops)                    ║
     ║  Base Bet: ${formatBTC(PLINKO_CONFIG.baseBet)} BTC
     ║  Max Bet: ${formatBTC(PLINKO_CONFIG.maxBet)} BTC
-    ║  Daily Target: ${formatBTC(PLINKO_CONFIG.dailyTarget)} BTC
-    ║  Stop Loss: ${formatBTC(PLINKO_CONFIG.sessionStopLoss)} BTC
-    ║  Expected Win Rate: 75%
+    ║  Recovery: ${PLINKO_CONFIG.lossIncrease}x on loss
+    ║  Strategy: Reset to base after win              ║
+    ║  Expected Win Rate: 75% (Low Risk Plinko)       ║
     ╚══════════════════════════════════════════════════╝
     `);
     
-    botState.statusMessage = "BOT RUNNING - Targeting profit";
+    botState.statusMessage = "🟢 CONTINUOUS MODE - Betting Forever";
+    let lastLogTime = Date.now();
     
     while (botState.running) {
-        // Check profit targets
-        if (!checkProfitTargets()) {
-            console.log(`\n Bot finished: ${botState.statusMessage}`);
-            break;
-        }
-        
         // Place bet
         const result = await placePlinkoBet();
+        
         if (!result) {
+            console.log("⚠️ Bet failed - waiting 2 seconds...");
             await new Promise(r => setTimeout(r, 2000));
             continue;
         }
@@ -175,20 +163,33 @@ async function runProfitablePlinko() {
         
         // Update balance
         botState.stats.currentBalance = result.Balance || botState.stats.currentBalance;
-        botState.stats.netProfit = profit;
+        
+        // Track starting balance on first bet
         if (startingBalance === 0 && botState.stats.currentBalance > 0) {
             startingBalance = botState.stats.currentBalance - profit;
             botState.stats.startingBalance = startingBalance;
-            botState.stats.netProfit = botState.stats.currentBalance - startingBalance;
-        } else if (startingBalance > 0) {
+            botState.stats.highestBalance = startingBalance;
+            botState.stats.lowestBalance = startingBalance;
+        }
+        
+        // Update profit
+        if (startingBalance > 0) {
             botState.stats.netProfit = botState.stats.currentBalance - startingBalance;
         }
         
+        // Track highs and lows
+        if (botState.stats.currentBalance > botState.stats.highestBalance) {
+            botState.stats.highestBalance = botState.stats.currentBalance;
+        }
+        if (botState.stats.currentBalance < botState.stats.lowestBalance) {
+            botState.stats.lowestBalance = botState.stats.currentBalance;
+        }
+        
         // Calculate next bet
-        const newBet = calculateNewBet(isWin, multiplier);
+        const newBet = calculateNextBet(isWin, multiplier);
         botState.settings.currentBet = newBet;
         
-        // Store history
+        // Store history (keep last 100 bets)
         botState.betHistory.unshift({
             id: botState.stats.totalBets,
             time: new Date().toLocaleTimeString(),
@@ -199,22 +200,29 @@ async function runProfitablePlinko() {
             balance: botState.stats.currentBalance
         });
         
-        if (botState.betHistory.length > 50) botState.betHistory.pop();
+        if (botState.betHistory.length > 100) botState.betHistory.pop();
         
-        // Log to console
-        const winRate = botState.stats.totalBets > 0 ? 
-            (botState.stats.wins / botState.stats.totalBets * 100).toFixed(1) : 0;
-        console.log(`#${botState.stats.totalBets} | ${new Date().toLocaleTimeString()} | ${formatBTC(result.Bet)} | ${multiplier}x | ${isWin ? 'WIN' : 'LOSS'} | ${formatBTC(profit)} | Bal: ${formatBTC(botState.stats.currentBalance)} | WR: ${winRate}%`);
+        // Log every 10 seconds or on big wins/losses
+        const now = Date.now();
+        const winRate = (botState.stats.wins / botState.stats.totalBets * 100).toFixed(1);
+        const isSignificant = Math.abs(profit) > PLINKO_CONFIG.baseBet * 10;
         
-        await new Promise(r => setTimeout(r, 500));
+        if (now - lastLogTime > 10000 || isSignificant || botState.stats.totalBets % 50 === 0) {
+            console.log(`#${botState.stats.totalBets} | ${new Date().toLocaleTimeString()} | ${formatBTC(result.Bet)} | ${multiplier}x | ${isWin ? '✅WIN' : '❌LOSS'} | ${profit > 0 ? '+' : ''}${formatBTC(profit)} | Bal: ${formatBTC(botState.stats.currentBalance)} | WR: ${winRate}% | Consecutive: ${botState.stats.consecutiveLosses}`);
+            lastLogTime = now;
+        }
+        
+        // Small delay to avoid rate limiting
+        await new Promise(r => setTimeout(r, 300));
     }
 }
 
-// ============ WEB DASHBOARD (FIXED) ============
+// ============ WEB DASHBOARD ============
 app.get('/api/stats', (req, res) => {
     const winRate = botState.stats.totalBets > 0 ? 
         (botState.stats.wins / botState.stats.totalBets * 100).toFixed(1) : 0;
-    res.json({ botState, btcPrice, winRate });
+    const runTime = (Date.now() - botState.stats.startTime) / 1000;
+    res.json({ botState, btcPrice, winRate, runTime });
 });
 
 app.get('/', (req, res) => {
@@ -222,7 +230,7 @@ app.get('/', (req, res) => {
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Plinko Profit Bot</title>
+    <title>Continuous Plinko Bot</title>
     <meta http-equiv="refresh" content="2">
     <style>
         body {
@@ -241,6 +249,20 @@ app.get('/', (req, res) => {
             text-align: center;
             border-bottom: 2px solid #00ff88;
             padding-bottom: 10px;
+        }
+        .badge {
+            background: #00ff88;
+            color: #0a0e27;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: bold;
+            display: inline-block;
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
         }
         .stats {
             display: grid;
@@ -278,6 +300,7 @@ app.get('/', (req, res) => {
             padding: 10px;
             text-align: left;
             border-bottom: 1px solid #333;
+            font-size: 12px;
         }
         th {
             background: #1a1f3a;
@@ -292,50 +315,94 @@ app.get('/', (req, res) => {
             margin: 20px 0;
             font-family: monospace;
         }
+        .running-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            background: #00ff88;
+            border-radius: 50%;
+            animation: pulse 1s infinite;
+            margin-right: 8px;
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>PLINKO PROFIT BOT</h1>
+        <h1>🔥 CONTINUOUS PLINKO BOT <span class="badge">LIVE</span></h1>
         
         <div class="stats">
             <div class="card">
-                <h3>BALANCE</h3>
+                <h3>💰 BALANCE</h3>
                 <div class="value" id="balance">0.00000000</div>
                 <small id="balanceUSD">$0.00</small>
             </div>
             <div class="card">
-                <h3>PROFIT</h3>
+                <h3>📈 TOTAL PROFIT</h3>
                 <div class="value" id="profit">0.00000000</div>
                 <small id="profitUSD">$0.00</small>
             </div>
             <div class="card">
-                <h3>BETS</h3>
+                <h3>🎲 TOTAL BETS</h3>
                 <div class="value" id="totalBets">0</div>
                 <small>W: <span id="wins">0</span> | L: <span id="losses">0</span></small>
             </div>
             <div class="card">
-                <h3>WIN RATE</h3>
+                <h3>📊 WIN RATE</h3>
                 <div class="value" id="winRate">0%</div>
-                <small>Next: <span id="nextBet">0</span> BTC</small>
+                <small>Current: <span id="currentBet">0</span> BTC</small>
+            </div>
+        </div>
+        
+        <div class="stats">
+            <div class="card">
+                <h3>🏆 HIGHEST BALANCE</h3>
+                <div class="value" id="highestBalance">0.00000000</div>
+                <small>All-time high</small>
+            </div>
+            <div class="card">
+                <h3>📉 LOWEST BALANCE</h3>
+                <div class="value" id="lowestBalance">0.00000000</div>
+                <small>All-time low</small>
+            </div>
+            <div class="card">
+                <h3>⏱️ RUN TIME</h3>
+                <div class="value" id="runTime">0s</div>
+                <small>Continuous betting</small>
+            </div>
+            <div class="card">
+                <h3>⚡ CONSECUTIVE LOSSES</h3>
+                <div class="value" id="consecutiveLosses">0</div>
+                <small>Current streak</small>
             </div>
         </div>
         
         <div class="status" id="statusMsg">
-            Loading...
+            <span class="running-indicator"></span> Loading...
         </div>
         
-        <table>
-            <thead>
-                <tr><th>#</th><th>Time</th><th>Wager</th><th>Multiplier</th><th>Profit</th><th>Result</th><th>Balance</th></tr>
-            </thead>
-            <tbody id="history">
-                <tr><td colspan="7" style="text-align:center">Waiting for bets...</td></tr>
-            </tbody>
-        </table>
+        <h3>📜 RECENT BETS (Last 30)</h3>
+        <div style="overflow-x: auto;">
+            <table>
+                <thead>
+                    <tr><th>#</th><th>Time</th><th>Wager (BTC)</th><th>Multiplier</th><th>Profit</th><th>Result</th><th>Balance</th></tr>
+                </thead>
+                <tbody id="history">
+                    <tr><td colspan="7" style="text-align:center">Waiting for bets......</td></tr>
+                </tbody>
+            </table>
+        </div>
     </div>
     
     <script>
+        function formatTime(seconds) {
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            const secs = Math.floor(seconds % 60);
+            if (hours > 0) return hours + 'h ' + minutes + 'm';
+            if (minutes > 0) return minutes + 'm ' + secs + 's';
+            return secs + 's';
+        }
+        
         function update() {
             fetch('/api/stats')
                 .then(res => res.json())
@@ -355,12 +422,16 @@ app.get('/', (req, res) => {
                     document.getElementById('wins').innerHTML = b.stats.wins;
                     document.getElementById('losses').innerHTML = b.stats.losses;
                     document.getElementById('winRate').innerHTML = data.winRate + '%';
-                    document.getElementById('nextBet').innerHTML = b.settings.currentBet.toFixed(8);
-                    document.getElementById('statusMsg').innerHTML = b.statusMessage;
+                    document.getElementById('currentBet').innerHTML = b.settings.currentBet.toFixed(8);
+                    document.getElementById('statusMsg').innerHTML = '<span class="running-indicator"></span> ' + b.statusMessage;
+                    document.getElementById('highestBalance').innerHTML = b.stats.highestBalance.toFixed(8);
+                    document.getElementById('lowestBalance').innerHTML = b.stats.lowestBalance.toFixed(8);
+                    document.getElementById('runTime').innerHTML = formatTime(data.runTime);
+                    document.getElementById('consecutiveLosses').innerHTML = b.stats.consecutiveLosses;
                     
                     const tbody = document.getElementById('history');
                     tbody.innerHTML = '';
-                    for (let i = 0; i < b.betHistory.length; i++) {
+                    for (let i = 0; i < Math.min(30, b.betHistory.length); i++) {
                         const bet = b.betHistory[i];
                         const row = tbody.insertRow();
                         row.insertCell(0).innerText = '#' + bet.id;
@@ -371,8 +442,8 @@ app.get('/', (req, res) => {
                             '<span class="win">+' + bet.profit.toFixed(8) + '</span>' : 
                             '<span class="loss">' + bet.profit.toFixed(8) + '</span>';
                         row.insertCell(5).innerHTML = bet.isWin ? 
-                            '<span class="win">WIN</span>' : 
-                            '<span class="loss">LOSS</span>';
+                            '<span class="win">✅ WIN</span>' : 
+                            '<span class="loss">❌ LOSS</span>';
                         row.insertCell(6).innerText = bet.balance.toFixed(8);
                     }
                 })
@@ -386,8 +457,8 @@ app.get('/', (req, res) => {
     `);
 });
 
-// ============ START ============
+// ============ START CONTINUOUS BOT ============
 app.listen(port, '0.0.0.0', () => {
-    console.log(`\n Dashboard: http://localhost:${port}\n`);
-    runProfitablePlinko();
+    console.log(`\n🚀 CONTINUOUS BOT DASHBOARD: http://localhost:${port}\n`);
+    runContinuousPlinko();
 });
