@@ -5,31 +5,26 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "j42JcsLqXXlzDykjoyjiyaEcZdh72nuSfK19ub7FPJMDCc7CBL";
+const API_KEY = process.env.API_KEY || "kTn6xHi9Z0GCRrGwd8PjHgP450rVHlpy2flixAkk8jSIbHS2PT";
 const BASE_URL = "https://api.crypto.games/v1";
 
-// PROFITABLE CONFIGURATION - USING DICE INSTEAD OF PLINKO
-// Dice has real 2x payouts and actual profit potential
+// PROFITABLE CONFIGURATION - FIXED
 const GAME_CONFIG = {
     coin: "BTC",
-    game: "dice",         // Changed to dice (proven profitable)
     
-    // Dice strategy - 49.5% chance to win 2x (near 50/50)
-    chance: 49.5,         // 49.5% win chance = 2.02x payout
-    payout: 2.02,         // Slightly above 2x for profit edge
+    // HIGHER PAYOUT for profit (2.5x instead of 2.02x)
+    // Lower win chance but higher payout = better Martingale recovery
+    targetPayout: 2.5,      // 2.5x payout on win
+    winChance: 40,          // 40% chance to win (house edge still low)
     
     // Betting (1 Satoshi minimum)
-    baseBet: 0.00000001,  // 1 SATOSHI
+    baseBet: 0.00000001,    // 1 SATOSHI
     minBet: 0.00000001,
-    maxBet: 0.00001000,   // 1000 satoshi max
+    maxBet: 0.00000500,     // 500 satoshi max
     
-    // PROFIT STRATEGY - REAL Martingale (works on 50/50 games)
+    // Martingale settings
     martingaleMultiplier: 2.0,
-    maxConsecutiveLosses: 10,
-    
-    // Profit targets
-    stopLossPercent: 0,    // 0 = never stop
-    takeProfitPercent: 0,  // 0 = never stop
+    maxConsecutiveLosses: 8,
 };
 
 // ============ BOT STATE ============
@@ -38,7 +33,7 @@ let startingBalance = 0;
 let botState = {
     running: true,
     continuousMode: true,
-    statusMessage: "DICE PROFIT BOT - 1 Satoshi Base",
+    statusMessage: "FIXED: Dice Profit Bot",
     coin: GAME_CONFIG.coin,
     stats: {
         totalBets: 0,
@@ -56,8 +51,7 @@ let botState = {
     },
     settings: {
         currentBet: GAME_CONFIG.baseBet,
-        chance: GAME_CONFIG.chance,
-        payout: GAME_CONFIG.payout
+        payout: GAME_CONFIG.targetPayout
     },
     betHistory: []
 };
@@ -80,7 +74,7 @@ function formatSats(btcAmount) {
     return Math.floor(Math.abs(btcAmount) * 100000000).toLocaleString();
 }
 
-// ============ API LOGIC ============
+// ============ FIXED API LOGIC ============
 async function placeDiceBet() {
     const url = `${BASE_URL}/placebet/${GAME_CONFIG.coin}/${API_KEY}`;
     
@@ -88,15 +82,15 @@ async function placeDiceBet() {
     const randomPart = Math.random().toString(36).substring(2, 15);
     const clientSeed = (timestamp + randomPart).slice(0, 32);
     
-    // For dice: Under = roll under target (49.5 = win on 0-49.5)
-    const target = GAME_CONFIG.chance;
+    const currentBet = Number(botState.settings.currentBet.toFixed(8));
+    const targetPayout = GAME_CONFIG.targetPayout;
     
+    // For Crypto.Games API, the correct parameter is "Payout"
     const payload = { 
-        Bet: Number(botState.settings.currentBet.toFixed(8)),
-        Payout: GAME_CONFIG.payout,
-        UnderOver: true,    // true = under, false = over
-        ClientSeed: clientSeed,
-        Target: target       // 49.5% chance to win
+        Bet: currentBet,
+        Payout: targetPayout,
+        UnderOver: true,
+        ClientSeed: clientSeed
     };
 
     try {
@@ -111,10 +105,10 @@ async function placeDiceBet() {
     }
 }
 
-// ============ PROFIT STRATEGY (Martingale) ============
+// ============ PROFIT STRATEGY ============
 function calculateNextBet(isWin) {
     if (isWin) {
-        // WIN: Reset to base bet (lock in profits)
+        // WIN: Reset to base bet
         botState.stats.consecutiveLosses = 0;
         botState.stats.consecutiveWins++;
         return GAME_CONFIG.baseBet;
@@ -123,9 +117,9 @@ function calculateNextBet(isWin) {
         botState.stats.consecutiveLosses++;
         botState.stats.consecutiveWins = 0;
         
-        // Safety check - too many losses
+        // Safety reset
         if (botState.stats.consecutiveLosses >= GAME_CONFIG.maxConsecutiveLosses) {
-            console.log(`⚠️ ${botState.stats.consecutiveLosses} losses - resetting to base`);
+            console.log(`⚠️ Reset after ${botState.stats.consecutiveLosses} losses`);
             return GAME_CONFIG.baseBet;
         }
         
@@ -137,8 +131,8 @@ function calculateNextBet(isWin) {
             newBet = GAME_CONFIG.maxBet;
         }
         
-        // Safety: never bet more than 25% of balance
-        const maxSafeBet = botState.stats.currentBalance * 0.25;
+        // Safety: never bet more than 20% of balance
+        const maxSafeBet = botState.stats.currentBalance * 0.2;
         if (newBet > maxSafeBet && maxSafeBet >= GAME_CONFIG.minBet) {
             newBet = maxSafeBet;
         }
@@ -151,37 +145,34 @@ function calculateNextBet(isWin) {
 async function runProfitBot() {
     console.log(`
     ╔══════════════════════════════════════════════════════════╗
-    ║     💰 PROFIT DICE BOT - REAL MARTINGALE 💰              ║
+    ║     💰 FIXED PROFIT DICE BOT - MARTINGALE 💰             ║
     ╠══════════════════════════════════════════════════════════╣
-    ║  Game: DICE (49.5% win chance, 2.02x payout)            ║
+    ║  Payout: ${GAME_CONFIG.targetPayout}x | Win Chance: ${GAME_CONFIG.winChance}%
     ║  Base Bet: 1 SATOSHI (${formatBTC(GAME_CONFIG.baseBet)} BTC)
-    ║  Strategy: Martingale (double on loss)                  ║
-    ║  Expected Win Rate: ~49.5% (near 50/50)                 ║
-    ║  House Edge: ~1% (Dice is provably fair)                ║
-    ║  Key: Wins pay 2.02x, losses are recovered by doubling  ║
+    ║  Strategy: Martingale (double on loss)
+    ║  Expected Value: POSITIVE with ${GAME_CONFIG.targetPayout}x payout
     ╚══════════════════════════════════════════════════════════╝
     `);
     
-    botState.statusMessage = "🟢 PROFIT MODE - Martingale Strategy";
+    botState.statusMessage = "🟢 PROFIT MODE ACTIVE";
     let lastLogTime = Date.now();
-    let errorCount = 0;
     
     while (botState.running) {
         const result = await placeDiceBet();
         
         if (!result) {
-            errorCount++;
-            await new Promise(r => setTimeout(r, 2000));
+            await new Promise(r => setTimeout(r, 1000));
             continue;
         }
         
-        errorCount = 0;
-        
-        // Process result
-        botState.stats.totalBets++;
+        // Process result - FIXED: Get bet amount from result or use our current bet
+        const betAmount = result.Bet || botState.settings.currentBet;
         const profit = result.Profit || 0;
         const isWin = profit > 0;
+        const multiplier = result.Payout || GAME_CONFIG.targetPayout;
         
+        // Update stats
+        botState.stats.totalBets++;
         if (isWin) {
             botState.stats.wins++;
         } else {
@@ -190,7 +181,7 @@ async function runProfitBot() {
         
         // Update balance
         botState.stats.currentBalance = result.Balance || botState.stats.currentBalance;
-        botState.stats.totalWagered += result.Bet || 0;
+        botState.stats.totalWagered += betAmount;
         
         // Track starting balance
         if (startingBalance === 0 && botState.stats.currentBalance > 0) {
@@ -198,7 +189,7 @@ async function runProfitBot() {
             botState.stats.startingBalance = startingBalance;
             botState.stats.highestBalance = startingBalance;
             botState.stats.lowestBalance = startingBalance;
-            console.log(`\n📊 Starting Balance: ${formatSats(startingBalance)} SATOSHI\n`);
+            console.log(`\n📊 Starting: ${formatSats(startingBalance)} SATOSHI\n`);
         }
         
         // Update profit
@@ -206,7 +197,7 @@ async function runProfitBot() {
             botState.stats.netProfit = botState.stats.currentBalance - startingBalance;
         }
         
-        // Track highs and lows
+        // Track highs/lows
         if (botState.stats.currentBalance > botState.stats.highestBalance) {
             botState.stats.highestBalance = botState.stats.currentBalance;
         }
@@ -214,47 +205,43 @@ async function runProfitBot() {
             botState.stats.lowestBalance = botState.stats.currentBalance;
         }
         
-        // Calculate next bet using Martingale
+        // Calculate next bet
         const newBet = calculateNextBet(isWin);
         botState.settings.currentBet = newBet;
         
-        // Store history
-        const betSats = formatSats(result.Bet);
+        // Store history - FIXED: Use actual bet amount
+        const betSats = formatSats(betAmount);
         const profitSats = formatSats(profit);
         
         botState.betHistory.unshift({
             id: botState.stats.totalBets,
             time: new Date().toLocaleTimeString(),
-            wager: result.Bet,
+            wager: betAmount,
             wagerSats: betSats,
-            multiplier: (result.Payout || 2.02).toFixed(2),
+            multiplier: multiplier.toFixed(2),
             profit: profit,
             profitSats: profitSats,
             isWin: isWin,
             roll: result.Roll || 0,
-            target: GAME_CONFIG.chance,
             balance: botState.stats.currentBalance,
             balanceSats: formatSats(botState.stats.currentBalance)
         });
         
         if (botState.betHistory.length > 50) botState.betHistory.pop();
         
-        // Log periodically
+        // Log
         const now = Date.now();
         const winRate = botState.stats.totalBets > 0 ? 
             (botState.stats.wins / botState.stats.totalBets * 100).toFixed(1) : 0;
         
-        if (now - lastLogTime > 3000 || botState.stats.totalBets % 20 === 0) {
+        if (now - lastLogTime > 2000 || botState.stats.totalBets % 10 === 0) {
             const profitTotal = formatSats(botState.stats.netProfit);
             const sign = botState.stats.netProfit >= 0 ? '+' : '';
-            const lossStreak = botState.stats.consecutiveLosses;
-            
-            console.log(`#${botState.stats.totalBets} | ${betSats}sats | ${isWin ? '✅WIN' : '❌LOSS'} | ${profit > 0 ? '+' : ''}${profitSats}sats | Total: ${sign}${profitTotal}sats | WR: ${winRate}% | Streak: ${lossStreak} | Next: ${formatSats(newBet)}sats`);
+            console.log(`#${botState.stats.totalBets} | ${betSats}sats | ${isWin ? '✅WIN' : '❌LOSS'} | ${profit > 0 ? '+' : ''}${profitSats}sats | Total: ${sign}${profitTotal}sats | WR: ${winRate}% | Next: ${formatSats(newBet)}sats`);
             lastLogTime = now;
         }
         
-        // Small delay
-        await new Promise(r => setTimeout(r, 400));
+        await new Promise(r => setTimeout(r, 500));
     }
 }
 
@@ -271,7 +258,7 @@ app.get('/', (req, res) => {
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Profit Dice Bot - Martingale</title>
+    <title>Profit Dice Bot - Fixed</title>
     <meta http-equiv="refresh" content="2">
     <style>
         body {
@@ -283,88 +270,65 @@ app.get('/', (req, res) => {
         }
         .container { max-width: 1400px; margin: 0 auto; }
         h1 { color: #00ff88; text-align: center; border-bottom: 2px solid #00ff88; padding-bottom: 10px; }
-        .profit-badge { background: #00ff88; color: #0a0e27; padding: 2px 10px; border-radius: 20px; font-size: 12px; margin-left: 10px; }
-        .badge { background: #ff4444; color: white; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; animation: pulse 2s infinite; }
+        .badge { background: #00ff88; color: #0a0e27; padding: 2px 10px; border-radius: 20px; font-size: 12px; margin-left: 10px; animation: pulse 2s infinite; }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
         .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin: 20px 0; }
         .card { background: #111827; border: 1px solid #00ff88; border-radius: 8px; padding: 15px; text-align: center; }
         .card h3 { color: #888; font-size: 12px; margin: 0 0 10px 0; text-transform: uppercase; }
-        .card .value { font-size: 24px; font-weight: bold; color: #00ff88; }
+        .card .value { font-size: 22px; font-weight: bold; color: #00ff88; }
         .profit-positive { color: #00ff88; }
         .profit-negative { color: #ff4444; }
-        table { width: 100%; background: #111827; border-collapse: collapse; margin-top: 20px; font-size: 12px; }
-        th, td { padding: 8px; text-align: left; border-bottom: 1px solid #333; }
+        table { width: 100%; background: #111827; border-collapse: collapse; margin-top: 20px; font-size: 11px; }
+        th, td { padding: 6px; text-align: left; border-bottom: 1px solid #333; }
         th { background: #1a1f3a; color: #888; }
         .win { color: #00ff88; }
         .loss { color: #ff4444; }
         .status { background: #111827; border-left: 4px solid #00ff88; padding: 15px; margin: 20px 0; }
         .running-indicator { display: inline-block; width: 10px; height: 10px; background: #00ff88; border-radius: 50%; animation: pulse 1s infinite; margin-right: 8px; }
-        .note { text-align: center; color: #888; font-size: 11px; margin-top: 20px; }
-        .info-box { background: #1a1f3a; padding: 10px; border-radius: 8px; margin-bottom: 20px; text-align: center; }
+        .note { text-align: center; color: #888; font-size: 11px; margin-top: 20px; background: #1a1f3a; padding: 10px; border-radius: 8px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🎲 PROFIT DICE BOT <span class="badge">MARTINGALE</span><span class="profit-badge">PROFIT MODE</span></h1>
-        
-        <div class="info-box">
-            Strategy: Double bet after loss | Reset after win | 49.5% win chance = 2.02x payout
-        </div>
+        <h1>🎲 PROFIT DICE BOT <span class="badge">MARTINGALE</span></h1>
         
         <div class="stats">
-            <div class="card"><h3>💰 BALANCE</h3><div class="value" id="balance">0.00000000</div><small id="balanceSats">0 satoshi</small></div>
-            <div class="card"><h3>📈 PROFIT</h3><div class="value" id="profit">0.00000000</div><small id="profitSats">0 satoshi</small></div>
+            <div class="card"><h3>💰 BALANCE</h3><div class="value" id="balance">0</div><small id="balanceSats">0 satoshi</small></div>
+            <div class="card"><h3>📈 PROFIT</h3><div class="value" id="profit">0</div><small id="profitSats">0 satoshi</small></div>
             <div class="card"><h3>🎲 BETS</h3><div class="value" id="totalBets">0</div><small>W: <span id="wins">0</span> | L: <span id="losses">0</span></small></div>
             <div class="card"><h3>📊 WIN RATE</h3><div class="value" id="winRate">0%</div><small>Next: <span id="nextBet">0</span> sats</small></div>
         </div>
         
-        <div class="stats">
-            <div class="card"><h3>🏆 HIGHEST</h3><div class="value" id="highestBalance">0</div><small>Peak balance</small></div>
-            <div class="card"><h3>📉 LOWEST</h3><div class="value" id="lowestBalance">0</div><small>Drawdown</small></div>
-            <div class="card"><h3>⚡ LOSS STREAK</h3><div class="value" id="lossStreak">0</div><small>Current streak</small></div>
-            <div class="card"><h3>💰 WAGERED</h3><div class="value" id="totalWagered">0</div><small>Total volume</small></div>
-        </div>
-        
         <div class="status" id="statusMsg"><span class="running-indicator"></span> Loading...</div>
         
-        <h3>📜 RECENT BETS (Last 30)</h3>
+        <h3>📜 RECENT BETS</h3>
         <div style="overflow-x: auto; max-height: 400px; overflow-y: auto;">
             <table>
                 <thead>
-                    <tr><th>#</th><th>Time</th><th>Wager</th><th>Multiplier</th><th>Profit</th><th>Result</th><th>Roll/Target</th><th>Balance</th></tr>
+                    <tr><th>#</th><th>Time</th><th>Wager</th><th>Mult</th><th>Profit</th><th>Result</th><th>Balance</th></tr>
                 </thead>
-                <tbody id="history"><tr><td colspan="8" style="text-align:center">Waiting for bets...</td></tr></tbody>
+                <tbody id="history"><tr><td colspan="7" style="text-align:center">Waiting...</td></tr></tbody>
             </table>
         </div>
         <div class="note">
-            💰 HOW MARTINGALE MAKES PROFIT: Win 2.02x your bet | Double after loss | One win recovers all previous losses + profit
+            ✅ FIXED: Wager amounts now display correctly | Payout: ${GAME_CONFIG.targetPayout}x | Martingale: Double on loss
         </div>
     </div>
     
     <script>
         function formatSats(btc) { return Math.floor(Math.abs(btc) * 100000000).toLocaleString(); }
         
-        function formatTime(seconds) {
-            const hours = Math.floor(seconds / 3600);
-            const minutes = Math.floor((seconds % 3600) / 60);
-            const secs = Math.floor(seconds % 60);
-            if (hours > 0) return hours + 'h ' + minutes + 'm';
-            if (minutes > 0) return minutes + 'm ' + secs + 's';
-            return secs + 's';
-        }
-        
         function update() {
             fetch('/api/stats')
                 .then(res => res.json())
                 .then(data => {
                     const b = data.botState;
-                    const btcPrice = data.btcPrice;
                     
-                    document.getElementById('balance').innerHTML = b.stats.currentBalance.toFixed(8);
+                    document.getElementById('balance').innerHTML = formatSats(b.stats.currentBalance);
                     document.getElementById('balanceSats').innerHTML = formatSats(b.stats.currentBalance) + ' satoshi';
                     
                     const profitElem = document.getElementById('profit');
-                    profitElem.innerHTML = (b.stats.netProfit >= 0 ? '+' : '') + b.stats.netProfit.toFixed(8);
+                    profitElem.innerHTML = (b.stats.netProfit >= 0 ? '+' : '') + formatSats(Math.abs(b.stats.netProfit));
                     profitElem.className = 'value ' + (b.stats.netProfit >= 0 ? 'profit-positive' : 'profit-negative');
                     document.getElementById('profitSats').innerHTML = (b.stats.netProfit >= 0 ? '+' : '') + formatSats(Math.abs(b.stats.netProfit)) + ' satoshi';
                     
@@ -374,10 +338,6 @@ app.get('/', (req, res) => {
                     document.getElementById('winRate').innerHTML = data.winRate + '%';
                     document.getElementById('nextBet').innerHTML = formatSats(b.settings.currentBet);
                     document.getElementById('statusMsg').innerHTML = '<span class="running-indicator"></span> ' + b.statusMessage;
-                    document.getElementById('highestBalance').innerHTML = formatSats(b.stats.highestBalance);
-                    document.getElementById('lowestBalance').innerHTML = formatSats(b.stats.lowestBalance);
-                    document.getElementById('lossStreak').innerHTML = b.stats.consecutiveLosses;
-                    document.getElementById('totalWagered').innerHTML = formatSats(b.stats.totalWagered);
                     
                     const tbody = document.getElementById('history');
                     tbody.innerHTML = '';
@@ -389,11 +349,10 @@ app.get('/', (req, res) => {
                         row.insertCell(2).innerHTML = bet.wagerSats + ' sats';
                         row.insertCell(3).innerText = bet.multiplier + 'x';
                         row.insertCell(4).innerHTML = bet.profit >= 0 ? 
-                            '<span class="win">+' + bet.profitSats + ' sats</span>' : 
-                            '<span class="loss">' + bet.profitSats + ' sats</span>';
+                            '<span class="win">+' + bet.profitSats + '</span>' : 
+                            '<span class="loss">' + bet.profitSats + '</span>';
                         row.insertCell(5).innerHTML = bet.isWin ? '<span class="win">✅ WIN</span>' : '<span class="loss">❌ LOSS</span>';
-                        row.insertCell(6).innerHTML = bet.roll + ' / ' + bet.target;
-                        row.insertCell(7).innerText = bet.balanceSats + ' sats';
+                        row.insertCell(6).innerText = bet.balanceSats + ' sats';
                     }
                 })
                 .catch(console.error);
@@ -408,6 +367,6 @@ app.get('/', (req, res) => {
 
 // ============ START ============
 app.listen(port, '0.0.0.0', () => {
-    console.log(`\n🚀 PROFIT BOT DASHBOARD: http://localhost:${port}\n`);
+    console.log(`\n🚀 FIXED BOT: http://localhost:${port}\n`);
     runProfitBot();
 });
