@@ -3,114 +3,130 @@ const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
 const WebSocket = require('ws');
-const zlib = require('zlib');
 
 const app = express();
 app.use(express.json());
 
 // ==================== CONFIGURATION ====================
-const apiAccounts = [];
-let accountIndex = 1;
-while (process.env[`HTX_API_KEY_${accountIndex}`]) {
-    apiAccounts.push({
-        apiKey: process.env[`HTX_API_KEY_${accountIndex}`],
-        secretKey: process.env[`HTX_SECRET_KEY_${accountIndex}`],
-        accountId: accountIndex
-    });
-    accountIndex++;
-}
-
 const config = {
-    symbol: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase(),
-    symbolClean: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase().replace('-', ''),
-    leverage: parseInt(process.env.LEVERAGE) || 75,
-    port: process.env.PORT || 3000,
-    restHost: 'api.hbdm.com',
-    wsHost: 'wss://api.hbdm.com/linear-swap-ws',
-    accounts: apiAccounts,
-    baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
-    multiplier: 1.2,
-    stepDistancePct: 10, // Triggers at -10% ROI
-    takeProfitPct: 15,
-    maxStartSpread: parseFloat(process.env.MAX_START_SPREAD) || 0.1,
-    takerFeeRate: 0.0005,
-    pollInterval: 500,
-    contractMultiplier: 0.001,
+    // Dice game settings
+    gameUrl: process.env.GAME_API_URL || 'https://api.crypto-game.com',
+    apiKey: process.env.API_KEY,
+    privateKey: process.env.PRIVATE_KEY,
+    
+    // Martingale settings
+    baseBet: parseFloat(process.env.BASE_BET) || 1, // Starting bet in USDT/crypto
+    multiplier: 1.2, // Bet increase per step (1.2x)
+    stepDistancePct: 10, // Trigger next step at -10% ROI
+    takeProfitPct: 15, // Take profit at +15% ROI
+    maxSteps: 10, // Maximum martingale steps
+    
+    // Game settings
+    winChance: parseFloat(process.env.WIN_CHANCE) || 49.5, // 49.5% = 2x payout
+    payoutMultiplier: 2, // 2x payout for 49.5% win chance
+    houseEdge: 1, // 1% house edge
+    
+    // Risk management
+    maxBet: parseFloat(process.env.MAX_BET) || 1000,
+    minBalance: parseFloat(process.env.MIN_BALANCE) || 10,
+    riskPercent: 2, // Risk 2% of bankroll per sequence
     autoCompound: true,
-    riskPercent: 2,
-    shibPerContract: 1000,
-    walletPerContract: 0.0066135  // $0.0066135 wallet = 1 contract at 75x leverage
+    
+    // Hedge betting (long/short equivalent)
+    hedgeEnabled: process.env.HEDGE_ENABLED === 'true' || true,
+    hedgeRatio: 0.5, // 50% of main bet on hedge
+    
+    // Monitoring
+    port: process.env.PORT || 3000,
+    pollInterval: 500
 };
 
-let market = {
-    status: 'Active', bid: 0, ask: 0, spread: 0,
-    totalNetGain: 0, growthPct: 0, dgr: 0,
-    initialTotalEquity: 0, startTime: Date.now(),
-    lastPriceUpdate: 0,
-    walletHistory: [],
-    peakEquity: 0,
+let game = {
+    status: 'Active',
+    balance: 0,
+    initialBalance: 0,
+    totalNetGain: 0,
+    growthPct: 0,
+    startTime: Date.now(),
+    peakBalance: 0,
     maxDrawdown: 0,
-    totalTrades: 0,
-    winningTrades: 0,
-    losingTrades: 0,
+    totalBets: 0,
+    winningBets: 0,
+    losingBets: 0,
     totalFeesPaid: 0,
-    currentBaseVolume: parseInt(process.env.BASE_VOLUME) || 1,
-    currentBaseShib: 0,
+    currentBaseBet: config.baseBet,
     currentRiskAmount: 0,
-    lastBaseUpdate: Date.now()
+    lastPriceUpdate: Date.now(),
+    balanceHistory: []
 };
 
-let tradeHistory = [];
-let accountStates = {};
-let lastPositionFetch = {};
-let lastBalanceFetch = {};
+let betHistory = [];
+let gameStates = {};
 
-function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
-    if (!config.autoCompound || totalEquity <= 0) {
-        return config.baseVolume;
+// Two "accounts" for hedging (long = over 50.5, short = under 49.5)
+const gameAccounts = [
+    { id: 1, direction: 'over', target: 50.5, description: 'OVER (Bullish)' },
+    { id: 2, direction: 'under', target: 49.5, description: 'UNDER (Bearish)' }
+];
+
+gameAccounts.forEach((account, idx) => {
+    gameStates[account.id] = {
+        direction: account.direction,
+        targetNumber: account.target,
+        roi: 0,
+        currentBet: 0,
+        unrealizedProfit: 0,
+        entryPrice: 0, // The number rolled
+        currentEquity: 0,
+        availableBalance: 0,
+        initialEquity: null,
+        isLocked: false,
+        pendingBetId: null,
+        lastAction: 'Idle',
+        startTime: null,
+        lastStepPrice: 0,
+        lastAddedBet: 0,
+        realizedPnl: 0,
+        totalFees: 0,
+        stepCount: 0,
+        sequenceWins: 0,
+        sequenceLosses: 0
+    };
+});
+
+function calculateBetFromBalance(totalBalance) {
+    if (!config.autoCompound || totalBalance <= 0) {
+        return config.baseBet;
     }
     
-    // Formula: $0.0066135 wallet = 1 contract at 75x leverage
-    // So: volume = totalEquity ÷ 0.0066135
-    let volume = Math.floor(totalEquity / config.walletPerContract);
+    // Risk 2% of balance per sequence
+    let betAmount = Math.floor(totalBalance * (config.riskPercent / 100));
     
-    // Ensure minimum 1 contract
-    volume = Math.max(1, volume);
+    // Ensure minimum and maximum
+    betAmount = Math.max(config.baseBet, betAmount);
+    betAmount = Math.min(config.maxBet, betAmount);
     
-    // Cap at 1,000,000 contracts for safety
-    const MAX_VOLUME = 1000000;
-    if (volume > MAX_VOLUME) {
-        volume = MAX_VOLUME;
-    }
-    
-    const riskAmount = totalEquity * (config.riskPercent / 100);
-    const positionUsdt = riskAmount * config.leverage;
-    const shibAmount = volume * config.shibPerContract;
-    
-    market.currentRiskAmount = riskAmount;
-    market.currentBaseShib = shibAmount;
+    game.currentRiskAmount = betAmount * config.riskPercent / 100;
     
     console.log(`\n💰 AUTO-COMPOUNDING CALCULATION:`);
-    console.log(`   Wallet: $${totalEquity.toFixed(8)}`);
-    console.log(`   ${config.riskPercent}% Risk: $${riskAmount.toFixed(8)}`);
-    console.log(`   @ ${config.leverage}x → $${positionUsdt.toFixed(8)} position`);
-    console.log(`   Formula: $${config.walletPerContract.toFixed(8)} wallet = 1 contract`);
-    console.log(`   Volume: ${volume.toLocaleString()} contract(s) = ${shibAmount.toLocaleString()} SHIB`);
-    console.log(`   Risk per contract: $${(riskAmount/volume).toFixed(8)}\n`);
+    console.log(`   Balance: $${totalBalance.toFixed(8)}`);
+    console.log(`   ${config.riskPercent}% Risk: $${betAmount.toFixed(8)}`);
+    console.log(`   Base Bet: ${betAmount.toFixed(8)} USDT`);
+    console.log(`   Risk per bet: $${(betAmount * 0.02).toFixed(8)}\n`);
     
-    return volume;
+    return betAmount;
 }
 
-function calculateStepFromVolume(volume, baseVolume, multiplier) {
-    if (volume === 0) return 0;
+function calculateStepFromBet(currentBet, baseBet, multiplier) {
+    if (currentBet === 0) return 0;
     
-    let totalVolume = 0;
+    let totalBet = 0;
     let step = 0;
     
-    while (totalVolume < volume) {
-        const stepVolume = step === 0 ? baseVolume : Math.ceil(baseVolume * Math.pow(multiplier, step));
-        totalVolume += stepVolume;
-        if (totalVolume <= volume) {
+    while (totalBet < currentBet) {
+        const stepBet = step === 0 ? baseBet : Math.ceil(baseBet * Math.pow(multiplier, step));
+        totalBet += stepBet;
+        if (totalBet <= currentBet) {
             step++;
         } else {
             break;
@@ -120,525 +136,324 @@ function calculateStepFromVolume(volume, baseVolume, multiplier) {
     return step;
 }
 
-function calculateVolumeForStep(step, baseVolume, multiplier) {
-    let totalVolume = 0;
+function calculateBetForStep(step, baseBet, multiplier) {
+    let totalBet = 0;
     for (let i = 0; i <= step; i++) {
-        const stepVolume = i === 0 ? baseVolume : Math.ceil(baseVolume * Math.pow(multiplier, i));
-        totalVolume += stepVolume;
+        const stepBet = i === 0 ? baseBet : Math.ceil(baseBet * Math.pow(multiplier, i));
+        totalBet += stepBet;
     }
-    return totalVolume;
+    return totalBet;
 }
 
-function calculateTargetPrice(state) {
-    const requiredPriceMovePct = config.takeProfitPct / config.leverage;
+function calculateTargetNumber(state, currentNumber) {
+    // For over bets: need a number above target (higher = win)
+    // For under bets: need a number below target (lower = win)
+    const requiredDistancePct = config.takeProfitPct / 100;
     
-    if (state.direction === 'buy') {
-        const targetPrice = state.entryPrice * (1 + (requiredPriceMovePct / 100));
-        const feeAdjustedTarget = targetPrice * (1 + config.takerFeeRate);
-        return feeAdjustedTarget;
+    if (state.direction === 'over') {
+        // Win when number > target, profit based on how far above
+        return state.targetNumber + (50 * requiredDistancePct);
     } else {
-        const targetPrice = state.entryPrice * (1 - (requiredPriceMovePct / 100));
-        const feeAdjustedTarget = targetPrice * (1 - config.takerFeeRate);
-        return feeAdjustedTarget;
+        // Win when number < target, profit based on how far below
+        return state.targetNumber - (50 * requiredDistancePct);
     }
 }
 
-function updateWalletGrowth(totalEquity) {
+function updateBalanceGrowth(totalBalance) {
     const now = Date.now();
     
-    const lastRecord = market.walletHistory[market.walletHistory.length - 1];
-    if (!lastRecord || (now - lastRecord.timestamp) > 60000 || Math.abs(lastRecord.equity - totalEquity) > 0.000001) {
-        market.walletHistory.push({
+    const lastRecord = game.balanceHistory[game.balanceHistory.length - 1];
+    if (!lastRecord || (now - lastRecord.timestamp) > 60000 || Math.abs(lastRecord.balance - totalBalance) > 0.000001) {
+        game.balanceHistory.push({
             timestamp: now,
             time: new Date().toLocaleString(),
-            equity: totalEquity,
-            pnl: totalEquity - market.initialTotalEquity,
-            pnlPercent: market.initialTotalEquity > 0 ? ((totalEquity - market.initialTotalEquity) / market.initialTotalEquity) * 100 : 0,
-            baseVolume: market.currentBaseVolume,
-            baseShib: market.currentBaseShib,
-            riskAmount: market.currentRiskAmount
+            balance: totalBalance,
+            pnl: totalBalance - game.initialBalance,
+            pnlPercent: game.initialBalance > 0 ? ((totalBalance - game.initialBalance) / game.initialBalance) * 100 : 0,
+            baseBet: game.currentBaseBet,
+            riskAmount: game.currentRiskAmount
         });
         
-        if (market.walletHistory.length > 100) market.walletHistory.shift();
+        if (game.balanceHistory.length > 100) game.balanceHistory.shift();
     }
     
-    if (totalEquity > market.peakEquity) {
-        market.peakEquity = totalEquity;
+    if (totalBalance > game.peakBalance) {
+        game.peakBalance = totalBalance;
     }
     
-    if (market.peakEquity > 0) {
-        const currentDrawdown = ((market.peakEquity - totalEquity) / market.peakEquity) * 100;
-        if (currentDrawdown > market.maxDrawdown) {
-            market.maxDrawdown = currentDrawdown;
+    if (game.peakBalance > 0) {
+        const currentDrawdown = ((game.peakBalance - totalBalance) / game.peakBalance) * 100;
+        if (currentDrawdown > game.maxDrawdown) {
+            game.maxDrawdown = currentDrawdown;
         }
     }
 }
 
-config.accounts.forEach((account, idx) => {
-    accountStates[account.accountId] = {
-        direction: idx === 0 ? 'buy' : 'sell',
-        roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
-        currentEquity: 0, availableMargin: 0, initialEquity: null,
-        isLocked: false,
-        pendingOrderId: null,
-        lastAction: 'Idle',
-        lastStepPrice: 0, lastAddedVolume: 0, startTime: null,
-        lastExchangeRoi: 0,
-        roiLatencyMs: 0,
-        roiLatencyHistory: [],
-        lastRoiUpdateTime: Date.now(),
-        targetPrice: 0,
-        realizedPnl: 0,
-        totalFees: 0
-    };
-});
-
-function getSignature(account, method, path, params = {}) {
-    const timestamp = new Date().toISOString().split('.')[0];
-    const allParams = {
-        AccessKeyId: account.apiKey,
-        SignatureMethod: 'HmacSHA256',
-        SignatureVersion: '2',
-        Timestamp: timestamp,
-        ...params
-    };
-    
-    const sortedParams = Object.keys(allParams).sort().map(key => `${key}=${encodeURIComponent(allParams[key])}`).join('&');
-    const payload = [method.toUpperCase(), config.restHost, path, sortedParams].join('\n');
-    const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
-    
-    return { timestamp, signature, sortedParams };
-}
-
-async function htxRequest(account, method, path, data = {}) {
+async function placeBet(account, state, betAmount, isHedge = false) {
     try {
-        const { timestamp, signature, sortedParams } = getSignature(account, method, path, method === 'GET' ? data : {});
-        const url = `https://${config.restHost}${path}?${sortedParams}&Signature=${encodeURIComponent(signature)}`;
+        // Random number generation for dice (0-100)
+        const roll = Math.random() * 100;
+        const won = state.direction === 'over' ? roll > state.targetNumber : roll < state.targetNumber;
+        const payout = won ? betAmount * config.payoutMultiplier : 0;
+        const profit = won ? (betAmount * config.payoutMultiplier) - betAmount : -betAmount;
         
-        const options = {
-            method,
-            url,
-            headers: {
-                'Content-Type': 'application/json',
-                'User-Agent': 'Mozilla/5.0'
-            },
-            timeout: 5000
+        // Simulate API delay
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
+        return {
+            success: true,
+            betId: crypto.randomBytes(16).toString('hex'),
+            roll: roll,
+            won: won,
+            betAmount: betAmount,
+            payout: payout,
+            profit: profit,
+            rollNumber: roll.toFixed(2)
         };
         
-        if (method === 'POST') {
-            options.data = data;
-        }
-        
-        const res = await axios(options);
-        return res.data;
     } catch (e) {
-        console.error(`API Error: ${e.message}`);
-        return { status: 'error', msg: e.message };
+        console.error(`Bet Error: ${e.message}`);
+        return { success: false, error: e.message };
     }
 }
 
-async function fetchPriceRest() {
-    try {
-        const url = `https://${config.restHost}/linear-swap-ex/market/detail/merged?contract_code=${config.symbol}`;
-        const res = await axios.get(url, { timeout: 3000 });
-        if (res.data?.tick) {
-            market.bid = parseFloat(res.data.tick.bid[0]);
-            market.ask = parseFloat(res.data.tick.ask[0]);
-            market.spread = ((market.ask - market.bid) / market.bid) * 100;
-            market.lastPriceUpdate = Date.now();
-        }
-    } catch (e) {}
-}
-
-async function syncAccount(acc, state) {
+async function syncGameState(account, state) {
     const now = Date.now();
     
-    if (state.pendingOrderId) {
-        const orderRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order_info', {
-            contract_code: config.symbol,
-            order_id: state.pendingOrderId
-        });
-        if (orderRes?.data?.[0]?.status === 6 || orderRes?.data?.[0]?.status === 7) {
-            state.pendingOrderId = null;
-            state.isLocked = false;
-        } else if (orderRes?.data?.[0]?.status === 4 || orderRes?.data?.[0]?.status === 5) {
-            state.pendingOrderId = null;
-            state.isLocked = false;
-        } else {
-            return;
-        }
+    // Simulate balance check (in real implementation, call game API)
+    // For demo, we'll simulate balance changes
+    if (game.initialBalance === 0 && game.balance > 0) {
+        game.initialBalance = game.balance;
+        game.peakBalance = game.balance;
     }
-
-    if (state.isLocked) return;
-
-    if (lastPositionFetch[acc.accountId] && (now - lastPositionFetch[acc.accountId]) < config.pollInterval) {
-        return;
-    }
-    lastPositionFetch[acc.accountId] = now;
-
-    const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', {
-        contract_code: config.symbol
-    });
-
-    if (posRes?.status === 'ok' && posRes.data) {
-        const positions = posRes.data;
-        const pos = positions.find(p => p.direction === state.direction);
-        
-        if (pos && parseFloat(pos.volume) > 0) {
-            const newVolume = parseFloat(pos.volume);
-            const newEntryPrice = parseFloat(pos.cost_open);
-            const rawProfitRate = parseFloat(pos.profit_rate);
-            const newExchangeRoi = rawProfitRate * 100;
-            const newUnrealizedUsdt = parseFloat(pos.profit);
-            
-            state.volume = newVolume;
-            state.entryPrice = newEntryPrice;
-            state.unrealizedUsdt = newUnrealizedUsdt;
-            
-            const calculatedStep = calculateStepFromVolume(newVolume, market.currentBaseVolume, config.multiplier);
-            
-            if (Math.abs(newExchangeRoi - state.roi) > 0.01) {
-                const timeSinceLastUpdate = now - state.lastRoiUpdateTime;
-                
-                state.roiLatencyMs = timeSinceLastUpdate;
-                state.roiLatencyHistory.unshift({
-                    timestamp: now,
-                    exchangeRoi: newExchangeRoi,
-                    botRoi: state.roi,
-                    latencyMs: timeSinceLastUpdate,
-                    difference: Math.abs(newExchangeRoi - state.roi).toFixed(2),
-                    volume: newVolume,
-                    step: calculatedStep
-                });
-                
-                if (state.roiLatencyHistory.length > 10) state.roiLatencyHistory.pop();
-                
-                console.log(`[${state.direction.toUpperCase()}] ROI: ${newExchangeRoi.toFixed(2)}% | Vol: ${newVolume} | Step: ${calculatedStep} (delay: ${timeSinceLastUpdate}ms)`);
-                
-                state.roi = newExchangeRoi;
-                state.lastExchangeRoi = newExchangeRoi;
-                state.lastRoiUpdateTime = now;
-            }
-            
-            state.targetPrice = calculateTargetPrice(state);
-            
-            if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
-            if (!state.startTime) state.startTime = new Date().toLocaleString();
-        } else {
-            if (state.volume !== 0) {
-                console.log(`✅ [${state.direction.toUpperCase()}] Position closed at ${new Date().toLocaleTimeString()}`);
-                state.volume = 0;
-                state.roi = 0;
-                state.unrealizedUsdt = 0;
-                state.entryPrice = 0;
-                state.lastStepPrice = 0;
-                state.startTime = null;
-                state.lastAddedVolume = 0;
-                state.lastExchangeRoi = 0;
-                state.targetPrice = 0;
-            }
-        }
-    }
-
-    if (lastBalanceFetch[acc.accountId] && (now - lastBalanceFetch[acc.accountId]) < 10000) {
-        return;
-    }
-    lastBalanceFetch[acc.accountId] = now;
-
-    const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', {
-        margin_asset: 'USDT'
-    });
-
-    if (accRes?.status === 'ok' && accRes.data?.[0]) {
-        const oldEquity = state.currentEquity;
-        state.currentEquity = parseFloat(accRes.data[0].margin_balance);
-        state.availableMargin = parseFloat(accRes.data[0].withdraw_available);
-        
-        if (state.initialEquity === null) {
-            state.initialEquity = state.currentEquity;
-        }
-        
-        if (oldEquity > 0 && Math.abs(state.currentEquity - oldEquity) > 0.000001) {
-            const change = state.currentEquity - oldEquity;
-            if (Math.abs(change) > 0.0001) {
-                console.log(`[${state.direction.toUpperCase()}] Equity: $${oldEquity.toFixed(8)} → $${state.currentEquity.toFixed(8)} (${change >= 0 ? '+' : ''}$${change.toFixed(8)})`);
-            }
-        }
+    
+    state.currentEquity = game.balance;
+    state.availableBalance = game.balance;
+    
+    if (state.initialEquity === null) {
+        state.initialEquity = state.currentEquity;
     }
 }
 
-function logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl) {
-    const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
-    const estimatedFee = Math.abs(finalPnl) * config.takerFeeRate;
+function logBetExchangeStyle(state, result, exitTime, finalRoi, finalPnl) {
+    const step = calculateStepFromBet(state.currentBet, game.currentBaseBet, config.multiplier);
+    const estimatedFee = Math.abs(finalPnl) * 0.01; // 1% fee estimate
     
-    market.totalTrades++;
+    game.totalBets++;
     if (finalPnl >= 0) {
-        market.winningTrades++;
+        game.winningBets++;
+        state.sequenceWins++;
     } else {
-        market.losingTrades++;
+        game.losingBets++;
+        state.sequenceLosses++;
     }
-    market.totalFeesPaid += estimatedFee;
+    game.totalFeesPaid += estimatedFee;
     
-    tradeHistory.unshift({
-        symbol: config.symbol.replace('-', '') + 'Perpetual',
-        side: state.direction === 'buy' ? 'LONG' : 'SHORT',
-        openTime: state.startTime,
-        closeTime: exitTime,
-        volume: state.volume,
+    betHistory.unshift({
+        direction: state.direction.toUpperCase(),
+        rollNumber: result.rollNumber,
+        betAmount: result.betAmount.toFixed(8),
+        result: result.won ? 'WIN' : 'LOSS',
+        profit: finalPnl.toFixed(8),
         step: step,
-        entryPrice: state.entryPrice.toFixed(8),
-        exitPrice: exitPrice.toFixed(8),
         roi: finalRoi.toFixed(2) + '%',
-        netPnlUsdt: finalPnl.toFixed(8),
-        estimatedFee: estimatedFee.toFixed(8)
+        time: exitTime,
+        sequenceWins: state.sequenceWins,
+        sequenceLosses: state.sequenceLosses
     });
     
-    if (tradeHistory.length > 20) tradeHistory.pop();
+    if (betHistory.length > 50) betHistory.pop();
     
     state.realizedPnl += finalPnl;
     state.totalFees += estimatedFee;
     
-    console.log(`📊 TRADE CLOSED: ${state.direction.toUpperCase()} | ROI: ${finalRoi.toFixed(2)}% | PnL: ${finalPnl >= 0 ? '+' : ''}$${finalPnl.toFixed(8)} | Fee: $${estimatedFee.toFixed(8)}`);
-}
-
-function startWS() {
-    const ws = new WebSocket(config.wsHost);
-    
-    ws.on('open', () => {
-        console.log('✅ WebSocket connected');
-        ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' }));
-    });
-    
-    ws.on('message', (data) => {
-        zlib.gunzip(data, (err, dec) => {
-            if (err) return;
-            try {
-                const msg = JSON.parse(dec.toString());
-                if (msg.tick && msg.ch && msg.ch.includes('bbo')) {
-                    market.bid = msg.tick.bid[0];
-                    market.ask = msg.tick.ask[0];
-                    market.spread = ((market.ask - market.bid) / market.bid) * 100;
-                    market.lastPriceUpdate = Date.now();
-                }
-                if (msg.ping) {
-                    ws.send(JSON.stringify({ pong: msg.ping }));
-                }
-            } catch (e) {}
-        });
-    });
-    
-    ws.on('error', (err) => {
-        console.error('WebSocket error:', err.message);
-    });
-    
-    ws.on('close', () => {
-        console.log('WebSocket disconnected, reconnecting in 5s...');
-        setTimeout(startWS, 5000);
-    });
+    console.log(`📊 ${state.direction.toUpperCase()} | Roll: ${result.rollNumber} | ${result.won ? 'WIN' : 'LOSS'} | ROI: ${finalRoi.toFixed(2)}% | PnL: ${finalPnl >= 0 ? '+' : ''}$${finalPnl.toFixed(8)}`);
 }
 
 async function processMartingale() {
-    for (const acc of config.accounts) {
-        const state = accountStates[acc.accountId];
-        if (state.isLocked || market.bid === 0 || market.ask === 0) continue;
+    for (const account of gameAccounts) {
+        const state = gameStates[account.id];
+        if (state.isLocked) continue;
         
-        const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
+        // Get current bet amount based on auto-compounding
+        const currentBaseBet = calculateBetFromBalance(game.balance);
+        game.currentBaseBet = currentBaseBet;
         
-        if (currentPrice === 0) continue;
-
-        if (state.volume === 0) {
-            if (market.spread > config.maxStartSpread && market.spread > 0) {
-                state.lastAction = `Wait Spread (${market.spread.toFixed(2)}% > ${config.maxStartSpread}%)`;
-                continue;
-            }
+        if (state.currentBet === 0) {
+            // No active sequence, start new one
+            const betAmount = currentBaseBet;
             
-            console.log(`🚀 Opening ${state.direction} position at ${currentPrice.toFixed(8)} with ${market.currentBaseVolume} contract(s)`);
+            console.log(`🎲 Starting ${state.direction} sequence with ${betAmount.toFixed(8)} USDT (${state.targetNumber} ${state.direction === 'over' ? '↑' : '↓'})`);
             state.isLocked = true;
-            state.lastAction = "Opening Position...";
+            state.lastAction = "Placing Bet...";
+            state.stepCount = 0;
             
-            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol,
-                volume: market.currentBaseVolume,
-                direction: state.direction,
-                offset: 'open',
-                lever_rate: config.leverage,
-                order_price_type: 'optimal_20'
-            });
+            const result = await placeBet(account, state, betAmount);
             
-            if (res?.status === 'ok' && res.data?.order_id_str) {
-                state.pendingOrderId = res.data.order_id_str;
-                state.lastAction = "Position Opening";
+            if (result.success) {
+                state.pendingBetId = result.betId;
+                state.currentBet = betAmount;
+                state.entryPrice = result.rollNumber;
+                state.lastStepPrice = result.rollNumber;
+                state.lastAddedBet = betAmount;
                 
-                setTimeout(async () => {
-                    const orderInfo = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order_info', {
-                        contract_code: config.symbol,
-                        order_id: res.data.order_id_str
-                    });
+                if (result.won) {
+                    // Win on first bet - take profit
+                    const profit = result.profit;
+                    game.balance += profit;
+                    const finalRoi = (profit / betAmount) * 100;
                     
-                    if (orderInfo?.data?.[0]?.status === 6) {
-                        state.entryPrice = parseFloat(orderInfo.data[0].price_avg);
-                        state.targetPrice = calculateTargetPrice(state);
-                        console.log(`✅ Position opened at ${state.entryPrice.toFixed(8)}, TP target: ${state.targetPrice.toFixed(8)}`);
-                        state.isLocked = false;
-                    }
-                }, 2000);
+                    logBetExchangeStyle(state, result, new Date().toLocaleString(), finalRoi, profit);
+                    
+                    // Reset sequence
+                    state.currentBet = 0;
+                    state.roi = 0;
+                    state.unrealizedProfit = 0;
+                    state.stepCount = 0;
+                    state.lastStepPrice = 0;
+                    state.startTime = null;
+                    state.isLocked = false;
+                } else {
+                    // Loss on first bet - start martingale
+                    state.startTime = new Date().toLocaleString();
+                    state.roi = -100; // -100% ROI on lost bet
+                    state.unrealizedProfit = result.profit;
+                    state.isLocked = false;
+                    console.log(`📉 LOSS on ${state.direction} - Starting martingale sequence`);
+                }
             } else {
                 state.isLocked = false;
-                state.lastAction = "Open Failed";
-                console.error(`Open order failed:`, res);
+                state.lastAction = "Bet Failed";
             }
             continue;
         }
-
-        let shouldTakeProfit = false;
-        let exitPrice = 0;
         
-        if (state.direction === 'buy') {
-            if (market.ask >= state.targetPrice && state.targetPrice > 0) {
-                shouldTakeProfit = true;
-                exitPrice = market.ask;
-                console.log(`🎯 LONG TP triggered! ASK: ${market.ask.toFixed(8)} >= Target: ${state.targetPrice.toFixed(8)}`);
-            }
-        } else {
-            if (market.bid <= state.targetPrice && state.targetPrice > 0) {
-                shouldTakeProfit = true;
-                exitPrice = market.bid;
-                console.log(`🎯 SHORT TP triggered! BID: ${market.bid.toFixed(8)} <= Target: ${state.targetPrice.toFixed(8)}`);
-            }
-        }
+        // We have an active sequence, check if we should add martingale step
+        const currentStep = calculateStepFromBet(state.currentBet, currentBaseBet, config.multiplier);
+        const totalLoss = Math.abs(state.unrealizedProfit);
+        const lossPercent = (totalLoss / state.currentBet) * 100;
         
-        if (shouldTakeProfit) {
-            const finalRoi = config.takeProfitPct;
-            const finalPnl = state.unrealizedUsdt;
-            const exitTime = new Date().toLocaleString();
-            const currentStep = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
-            
-            console.log(`✅ Taking ${state.direction} profit at ${exitPrice.toFixed(8)} (Target ROI: ${finalRoi}%, Step ${currentStep}, Vol: ${state.volume})`);
-            state.isLocked = true;
-            state.lastAction = "Taking Profit...";
-            
-            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol,
-                volume: state.volume,
-                direction: state.direction === 'buy' ? 'sell' : 'buy',
-                offset: 'close',
-                lever_rate: config.leverage,
-                order_price_type: 'optimal_20'
-            });
-            
-            if (res?.status === 'ok' && res.data?.order_id_str) {
-                state.pendingOrderId = res.data.order_id_str;
-                state.lastAction = "Take Profit Close";
-                logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl);
-                
-                state.volume = 0;
-                state.roi = 0;
-                state.unrealizedUsdt = 0;
-                state.entryPrice = 0;
-                state.lastStepPrice = 0;
-                state.startTime = null;
-                state.lastAddedVolume = 0;
-                state.targetPrice = 0;
-            } else {
-                state.isLocked = false;
-                state.lastAction = "TP Failed";
-                console.error(`Take profit failed:`, res);
-            }
-            continue;
-        }
-
-        const currentStep = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
-        
-        // Trigger martingale step when ROI reaches -10% or lower (negative)
-        if (state.roi <= -10 && state.volume > 0) {
+        // Trigger martingale step when loss reaches -10% or more
+        if (lossPercent >= config.stepDistancePct && state.stepCount < config.maxSteps) {
             const nextStepNumber = currentStep + 1;
-            let nextVol;
+            let nextBet;
             
             if (nextStepNumber === 1) {
-                nextVol = Math.ceil(market.currentBaseVolume * config.multiplier);
+                nextBet = Math.ceil(currentBaseBet * config.multiplier);
             } else {
-                nextVol = Math.ceil(market.currentBaseVolume * Math.pow(config.multiplier, nextStepNumber));
+                nextBet = Math.ceil(currentBaseBet * Math.pow(config.multiplier, nextStepNumber));
             }
             
-            console.log(`📈 MARTINGALE STEP ${nextStepNumber} for ${state.direction} - ROI: ${state.roi.toFixed(2)}% (LOSS) | Current Vol: ${state.volume} | Adding: ${nextVol} contracts`);
+            // Cap at max bet
+            nextBet = Math.min(nextBet, config.maxBet);
+            
+            console.log(`📈 MARTINGALE STEP ${nextStepNumber} for ${state.direction} - Loss: ${lossPercent.toFixed(2)}% | Current Total: ${state.currentBet.toFixed(8)} | Adding: ${nextBet.toFixed(8)}`);
             state.isLocked = true;
+            state.stepCount++;
             
-            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol,
-                volume: nextVol,
-                direction: state.direction,
-                offset: 'open',
-                lever_rate: config.leverage,
-                order_price_type: 'optimal_20'
-            });
+            const result = await placeBet(account, state, nextBet);
             
-            if (res?.status === 'ok' && res.data?.order_id_str) {
-                state.pendingOrderId = res.data.order_id_str;
-                state.lastStepPrice = currentPrice;
-                state.lastAddedVolume = nextVol;
-                state.lastAction = `Martingale Step ${nextStepNumber} (-${Math.abs(state.roi).toFixed(1)}% loss, Added: ${nextVol})`;
+            if (result.success) {
+                state.pendingBetId = result.betId;
+                state.currentBet += nextBet;
+                state.lastAddedBet = nextBet;
+                state.lastStepPrice = result.rollNumber;
+                
+                // Check if this win recovers all losses + profit
+                const totalWon = result.won ? result.payout : 0;
+                const totalInvested = state.currentBet;
+                const netPosition = totalWon - totalInvested;
+                
+                if (result.won && netPosition > 0) {
+                    // Martingale succeeded - take profit
+                    const finalRoi = (netPosition / state.currentBet) * 100;
+                    console.log(`🎉 MARTINGALE SUCCESS! ${state.direction} | Recovered ${totalInvested.toFixed(8)} + Profit ${netPosition.toFixed(8)}`);
+                    
+                    game.balance += netPosition;
+                    logBetExchangeStyle(state, result, new Date().toLocaleString(), finalRoi, netPosition);
+                    
+                    // Reset sequence
+                    state.currentBet = 0;
+                    state.roi = 0;
+                    state.unrealizedProfit = 0;
+                    state.stepCount = 0;
+                    state.lastStepPrice = 0;
+                    state.startTime = null;
+                    state.isLocked = false;
+                } else if (result.won && netPosition <= 0) {
+                    // Win but not enough to recover - keep sequence
+                    state.unrealizedProfit += result.profit;
+                    state.roi = (state.unrealizedProfit / state.currentBet) * 100;
+                    state.isLocked = false;
+                    console.log(`⚠️ Partial recovery - still down ${Math.abs(state.unrealizedProfit).toFixed(8)}`);
+                } else {
+                    // Loss - continue martingale
+                    state.unrealizedProfit += result.profit;
+                    state.roi = (state.unrealizedProfit / state.currentBet) * 100;
+                    state.isLocked = false;
+                    
+                    if (state.stepCount >= config.maxSteps) {
+                        console.log(`💥 MAX STEPS REACHED for ${state.direction} - Total loss: ${Math.abs(state.unrealizedProfit).toFixed(8)}`);
+                        game.balance += state.unrealizedProfit; // Realize loss
+                        logBetExchangeStyle(state, result, new Date().toLocaleString(), state.roi, state.unrealizedProfit);
+                        
+                        // Reset sequence
+                        state.currentBet = 0;
+                        state.roi = 0;
+                        state.unrealizedProfit = 0;
+                        state.stepCount = 0;
+                        state.lastStepPrice = 0;
+                        state.startTime = null;
+                        state.isLocked = false;
+                    }
+                }
             } else {
                 state.isLocked = false;
                 state.lastAction = "Step Failed";
             }
         } else {
-            const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
-            const requiredMove = (config.takeProfitPct / config.leverage).toFixed(3);
-            state.lastAction = `Active - Step ${step} | Vol: ${state.volume} | ROI: ${state.roi.toFixed(2)}%`;
+            const step = calculateStepFromBet(state.currentBet, currentBaseBet, config.multiplier);
+            state.lastAction = `Active - Step ${step} | Total Bet: ${state.currentBet.toFixed(8)} | Loss: ${Math.abs(state.unrealizedProfit).toFixed(8)}`;
         }
     }
 }
 
 async function backgroundLoop() {
     try {
-        if (Date.now() - market.lastPriceUpdate > 2000) {
-            await fetchPriceRest();
+        // Update game.balance (simulate or fetch from API)
+        // For demo, balance is updated in bet results
+        
+        for (const account of gameAccounts) {
+            await syncGameState(account, gameStates[account.id]);
         }
         
-        for (const acc of config.accounts) {
-            await syncAccount(acc, accountStates[acc.accountId]);
+        const s1 = gameStates[1];
+        const s2 = gameStates[2];
+        
+        if (game.initialBalance === 0 && game.balance > 0) {
+            game.initialBalance = game.balance;
+            game.peakBalance = game.balance;
+            console.log(`\n💰 INITIAL BALANCE: $${game.initialBalance.toFixed(8)} USDT\n`);
         }
         
-        const s1 = accountStates[1];
-        const s2 = accountStates[2];
-        
-        if (s1 && s2) {
-            if (market.initialTotalEquity === 0 && s1.initialEquity !== null && s2.initialEquity !== null) {
-                market.initialTotalEquity = s1.initialEquity + s2.initialEquity;
-                market.peakEquity = market.initialTotalEquity;
-                console.log(`\n💰 INITIAL TOTAL EQUITY: $${market.initialTotalEquity.toFixed(8)} USDT\n`);
-            }
+        if (game.initialBalance > 0) {
+            const totalBalance = game.balance;
             
-            if (market.initialTotalEquity > 0) {
-                const totalEquity = s1.currentEquity + s2.currentEquity;
-                const totalRealizedPnl = s1.realizedPnl + s2.realizedPnl;
-                const totalFees = s1.totalFees + s2.totalFees;
-                
-                market.totalNetGain = totalEquity - market.initialTotalEquity;
-                market.growthPct = (market.totalNetGain / market.initialTotalEquity) * 100;
-                const elapsedHours = (Date.now() - market.startTime) / (1000 * 60 * 60);
-                market.dgr = elapsedHours > 0 ? (market.growthPct / elapsedHours) : 0;
-                
-                if (config.autoCompound && market.bid > 0) {
-                    const newBaseVolume = calculateBaseVolumeFromWallet(totalEquity, market.bid);
-                    if (newBaseVolume !== market.currentBaseVolume) {
-                        console.log(`📈 AUTO-COMPOUND: Base volume updated: ${market.currentBaseVolume} → ${newBaseVolume} contract(s)`);
-                        market.currentBaseVolume = newBaseVolume;
-                        market.lastBaseUpdate = Date.now();
-                    }
-                }
-                
-                updateWalletGrowth(totalEquity);
-                
-                const lastRecord = market.walletHistory[market.walletHistory.length - 2];
-                if (lastRecord && Math.abs(market.growthPct - lastRecord.pnlPercent) > 0.1) {
-                    console.log(`💰 WALLET: $${totalEquity.toFixed(8)} | PnL: ${market.totalNetGain >= 0 ? '+' : ''}$${market.totalNetGain.toFixed(8)} (${market.growthPct >= 0 ? '+' : ''}${market.growthPct.toFixed(2)}%)`);
-                    console.log(`   Base Volume: ${market.currentBaseVolume} contract(s) (${market.currentBaseShib.toLocaleString()} SHIB) | Risk: $${market.currentRiskAmount.toFixed(8)}`);
-                }
+            game.totalNetGain = totalBalance - game.initialBalance;
+            game.growthPct = (game.totalNetGain / game.initialBalance) * 100;
+            const elapsedHours = (Date.now() - game.startTime) / (1000 * 60 * 60);
+            game.dgr = elapsedHours > 0 ? (game.growthPct / elapsedHours) : 0;
+            
+            updateBalanceGrowth(totalBalance);
+            
+            const lastRecord = game.balanceHistory[game.balanceHistory.length - 2];
+            if (lastRecord && Math.abs(game.growthPct - lastRecord.pnlPercent) > 0.1) {
+                console.log(`💰 BALANCE: $${totalBalance.toFixed(8)} | PnL: ${game.totalNetGain >= 0 ? '+' : ''}$${game.totalNetGain.toFixed(8)} (${game.growthPct >= 0 ? '+' : ''}${game.growthPct.toFixed(2)}%)`);
+                console.log(`   Base Bet: ${game.currentBaseBet.toFixed(8)} USDT | Risk: $${game.currentRiskAmount.toFixed(8)}`);
             }
         }
         
-        if (market.status === 'Active') {
+        if (game.status === 'Active') {
             await processMartingale();
         }
     } catch (e) {
@@ -646,212 +461,116 @@ async function backgroundLoop() {
     }
 }
 
+// Express API endpoints
 app.get('/api/status', (req, res) => {
-    const s1 = accountStates[1];
-    const s2 = accountStates[2];
-    const totalEquity = (s1?.currentEquity || 0) + (s2?.currentEquity || 0);
-    const totalRealizedPnl = (s1?.realizedPnl || 0) + (s2?.realizedPnl || 0);
-    const totalFees = (s1?.totalFees || 0) + (s2?.totalFees || 0);
+    const totalBalance = game.balance;
     
-    const accountsWithInfo = Object.values(accountStates).map(state => {
-        const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
-        const expectedVol = calculateVolumeForStep(step, market.currentBaseVolume, config.multiplier);
-        const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
-        
+    const accountsWithInfo = Object.values(gameStates).map(state => {
+        const step = calculateStepFromBet(state.currentBet, game.currentBaseBet, config.multiplier);
         return {
             direction: state.direction,
+            targetNumber: state.targetNumber,
             roi: state.roi,
-            volume: state.volume,
+            currentBet: state.currentBet,
             step: step,
-            expectedVolumeForStep: expectedVol,
-            unrealizedUsdt: state.unrealizedUsdt,
-            entryPrice: state.entryPrice,
+            unrealizedProfit: state.unrealizedProfit,
             lastAction: state.lastAction,
             startTime: state.startTime,
-            targetPrice: state.targetPrice,
-            requiredPriceMoveForTP: `${requiredPriceMovePct}%`,
-            currentEquity: state.currentEquity,
-            initialEquity: state.initialEquity,
             realizedPnl: state.realizedPnl,
             totalFees: state.totalFees,
-            roiLatencyHistory: state.roiLatencyHistory.slice(0, 5)
+            sequenceWins: state.sequenceWins,
+            sequenceLosses: state.sequenceLosses
         };
     });
     
     res.json({
-        market: {
-            ...market,
-            totalEquity: totalEquity,
-            totalRealizedPnl: totalRealizedPnl,
-            totalFeesPaid: totalFees,
-            totalNetGain: market.totalNetGain,
-            growthPct: market.growthPct,
-            dgr: market.dgr,
-            peakEquity: market.peakEquity,
-            maxDrawdown: market.maxDrawdown,
-            totalTrades: market.totalTrades,
-            winningTrades: market.winningTrades,
-            losingTrades: market.losingTrades,
-            winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0,
-            walletHistory: market.walletHistory.slice(-20),
+        game: {
+            ...game,
+            balance: totalBalance,
+            totalNetGain: game.totalNetGain,
+            growthPct: game.growthPct,
+            peakBalance: game.peakBalance,
+            maxDrawdown: game.maxDrawdown,
+            totalBets: game.totalBets,
+            winningBets: game.winningBets,
+            losingBets: game.losingBets,
+            winRate: game.totalBets > 0 ? (game.winningBets / game.totalBets * 100).toFixed(1) : 0,
+            balanceHistory: game.balanceHistory.slice(-20),
             autoCompound: config.autoCompound,
             riskPercent: config.riskPercent,
-            currentBaseVolume: market.currentBaseVolume,
-            currentBaseShib: market.currentBaseShib,
-            currentRiskAmount: market.currentRiskAmount,
-            shibPerContract: config.shibPerContract,
-            walletPerContract: config.walletPerContract
+            currentBaseBet: game.currentBaseBet,
+            currentRiskAmount: game.currentRiskAmount
         },
         accounts: accountsWithInfo,
-        tradeHistory,
+        betHistory: betHistory.slice(0, 20),
         config: {
-            maxStartSpread: config.maxStartSpread,
+            winChance: config.winChance,
+            payoutMultiplier: config.payoutMultiplier,
             takeProfitPct: config.takeProfitPct,
-            leverage: config.leverage,
-            requiredPriceMovePct: (config.takeProfitPct / config.leverage).toFixed(3) + '%',
-            pollInterval: config.pollInterval,
-            baseVolume: market.currentBaseVolume,
+            stepDistancePct: config.stepDistancePct,
+            maxSteps: config.maxSteps,
+            baseBet: game.currentBaseBet,
             multiplier: config.multiplier,
             autoCompound: config.autoCompound,
-            riskPercent: config.riskPercent,
-            walletPerContract: config.walletPerContract
+            riskPercent: config.riskPercent
         }
     });
 });
 
-app.post('/api/close', async (req, res) => {
-    console.log("🔴 EMERGENCY CLOSE INITIATED");
-    market.status = "LIQUIDATING";
-    
-    for (const acc of config.accounts) {
-        const s = accountStates[acc.accountId];
-        if (s.volume > 0) {
-            const step = calculateStepFromVolume(s.volume, market.currentBaseVolume, config.multiplier);
-            console.log(`Closing ${s.direction} position (Step ${step}, Vol: ${s.volume})...`);
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol,
-                volume: s.volume,
-                direction: s.direction === 'buy' ? 'sell' : 'buy',
-                offset: 'close',
-                lever_rate: config.leverage,
-                order_price_type: 'optimal_20'
-            });
-        }
+app.post('/api/bet', async (req, res) => {
+    const { direction, amount } = req.body;
+    const account = gameAccounts.find(a => a.direction === direction);
+    if (!account) {
+        return res.status(400).json({ error: 'Invalid direction' });
     }
     
-    setTimeout(() => market.status = "Active", 5000);
+    const state = gameStates[account.id];
+    if (state.isLocked) {
+        return res.status(400).json({ error: 'Game is locked' });
+    }
+    
+    const result = await placeBet(account, state, amount || game.currentBaseBet);
+    res.json(result);
+});
+
+app.post('/api/reset', async (req, res) => {
+    console.log("🔄 Resetting game state...");
+    game.balance = game.initialBalance;
+    game.totalBets = 0;
+    game.winningBets = 0;
+    game.losingBets = 0;
+    
+    for (const state of Object.values(gameStates)) {
+        state.currentBet = 0;
+        state.roi = 0;
+        state.unrealizedProfit = 0;
+        state.stepCount = 0;
+        state.sequenceWins = 0;
+        state.sequenceLosses = 0;
+        state.realizedPnl = 0;
+    }
+    
     res.json({ status: 'ok' });
 });
 
-app.post('/api/force-sync', async (req, res) => {
-    console.log("🔄 Force syncing all positions...");
-    for (const acc of config.accounts) {
-        const state = accountStates[acc.accountId];
-        await syncAccount(acc, state);
+app.post('/api/set-balance', async (req, res) => {
+    const { balance } = req.body;
+    game.balance = parseFloat(balance);
+    if (game.initialBalance === 0) {
+        game.initialBalance = game.balance;
     }
-    res.json({ status: 'ok', message: 'Force sync completed' });
+    res.json({ status: 'ok', balance: game.balance });
 });
 
-app.get('/api/wallet-history', (req, res) => {
-    const s1 = accountStates[1];
-    const s2 = accountStates[2];
-    
-    res.json({
-        currentWallet: {
-            totalEquity: (s1?.currentEquity || 0) + (s2?.currentEquity || 0),
-            totalRealizedPnl: (s1?.realizedPnl || 0) + (s2?.realizedPnl || 0),
-            totalFees: (s1?.totalFees || 0) + (s2?.totalFees || 0),
-            growthPct: market.growthPct,
-            peakEquity: market.peakEquity,
-            maxDrawdown: market.maxDrawdown,
-            totalTrades: market.totalTrades,
-            winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0,
-            autoCompound: {
-                enabled: config.autoCompound,
-                riskPercent: config.riskPercent,
-                currentBaseVolume: market.currentBaseVolume,
-                currentBaseShib: market.currentBaseShib,
-                currentRiskAmount: market.currentRiskAmount,
-                shibPerContract: config.shibPerContract,
-                walletPerContract: config.walletPerContract
-            }
-        },
-        history: market.walletHistory,
-        trades: tradeHistory.slice(0, 20)
-    });
-});
-
-app.get('/api/verify', async (req, res) => {
-    const requiredPriceMovePct = config.takeProfitPct / config.leverage;
-    
-    const verification = [];
-    
-    for (const acc of config.accounts) {
-        const state = accountStates[acc.accountId];
-        const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', {
-            contract_code: config.symbol
-        });
-        
-        if (posRes?.status === 'ok' && posRes.data) {
-            const pos = posRes.data.find(p => p.direction === state.direction);
-            if (pos) {
-                verification.push({
-                    account: acc.accountId,
-                    direction: state.direction,
-                    exchange_profit_rate: parseFloat(pos.profit_rate),
-                    exchange_profit_rate_percent: (parseFloat(pos.profit_rate) * 100).toFixed(2) + '%',
-                    bot_display_roi: state.roi.toFixed(2) + '%',
-                    target_price: state.targetPrice,
-                    entry_price: state.entryPrice,
-                    current_ask: market.ask,
-                    current_bid: market.bid,
-                    required_price_move_for_tp: requiredPriceMovePct.toFixed(3) + '%',
-                    leverage: config.leverage,
-                    realized_pnl: state.realizedPnl,
-                    total_fees: state.totalFees
-                });
-            }
-        }
-    }
-    
-    res.json({
-        verified: verification,
-        wallet: {
-            initialEquity: market.initialTotalEquity,
-            currentEquity: (accountStates[1]?.currentEquity || 0) + (accountStates[2]?.currentEquity || 0),
-            totalPnL: market.totalNetGain,
-            totalPnLPercent: market.growthPct,
-            totalRealizedPnL: (accountStates[1]?.realizedPnl || 0) + (accountStates[2]?.realizedPnl || 0),
-            totalFees: (accountStates[1]?.totalFees || 0) + (accountStates[2]?.totalFees || 0),
-            peakEquity: market.peakEquity,
-            maxDrawdown: market.maxDrawdown,
-            totalTrades: market.totalTrades,
-            winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0,
-            autoCompound: {
-                enabled: config.autoCompound,
-                riskPercent: config.riskPercent,
-                currentBaseVolume: market.currentBaseVolume,
-                currentBaseShib: market.currentBaseShib,
-                currentRiskAmount: market.currentRiskAmount,
-                shibPerContract: config.shibPerContract,
-                walletPerContract: config.walletPerContract,
-                formula: "Volume = Total Wallet ÷ 0.0066135"
-            }
-        },
-        message: `Auto-compounding: ${config.riskPercent}% of wallet. $${config.walletPerContract.toFixed(8)} wallet = 1 contract at ${config.leverage}x leverage.`
-    });
-});
-
+// HTML Dashboard
 app.get('/', (req, res) => {
-    const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
-    
     res.send(`
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Martingale Pro - Auto-Compounding</title>
+    <title>Dice Martingale Pro - Auto-Compounding</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
@@ -861,249 +580,99 @@ app.get('/', (req, res) => {
         .stat-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #6B7A8F; }
         .value-positive { color: #00D1B2; }
         .value-negative { color: #FF4D6D; }
-        .mono { font-family: monospace; font-size: 12px; }
-        .tp-target { background: #00D1B220; color: #00D1B2; padding: 2px 8px; border-radius: 4px; font-size: 10px; }
-        button { background: #FF4D6D20; border: 1px solid #FF4D6D; color: #FF4D6D; padding: 8px 16px; border-radius: 6px; cursor: pointer; }
-        button:hover { background: #FF4D6D40; }
-        .sync-btn { background: #00D1B220; border-color: #00D1B2; color: #00D1B2; margin-left: 10px; }
-        .step-badge { background: #6366F120; color: #6366F1; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }
-        .wallet-card { background: linear-gradient(135deg, #1A212E 0%, #131824 100%); border: 1px solid #00D1B240; }
         .stat-number { font-size: 28px; font-weight: 900; }
-        .chart-container { position: relative; height: 280px; width: 100%; }
-        .compound-info { background: #00D1B210; border: 1px solid #00D1B230; border-radius: 8px; padding: 12px; margin-top: 10px; }
+        .dice { font-size: 48px; font-weight: bold; }
+        .win { color: #00D1B2; }
+        .loss { color: #FF4D6D; }
     </style>
 </head>
 <body class="p-6">
     <div class="max-w-7xl mx-auto">
         <div class="flex justify-between items-center mb-8">
             <div>
-                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">AUTO-COMPOUND</span></h1>
+                <h1 class="text-3xl font-black">🎲 DICE MARTINGALE <span class="text-indigo-500">PRO</span></h1>
                 <div class="flex items-center gap-3 mt-2">
                     <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
                     <span class="text-[10px] font-bold text-emerald-400">LIVE</span>
-                    <span class="text-[10px] text-slate-500">${config.symbol}</span>
-                    <span class="text-[10px] text-slate-500">${config.leverage}x LEVERAGE</span>
-                    <span class="tp-target">🎯 TP: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price move</span>
+                    <span class="text-[10px] text-slate-500">49.5% Win Chance</span>
+                    <span class="text-[10px] text-slate-500">2x Payout</span>
                 </div>
             </div>
             <div>
-                <button onclick="forceSync()" class="sync-btn">🔄 FORCE SYNC</button>
-                <button onclick="emergencyClose()">⚠️ EMERGENCY CLOSE</button>
+                <button onclick="resetGame()" class="bg-yellow-500/20 border border-yellow-500 text-yellow-500 px-4 py-2 rounded">🔄 RESET</button>
             </div>
         </div>
 
-        <div class="wallet-card rounded-2xl p-6 mb-8">
-            <div class="grid grid-cols-1 md:grid-cols-5 gap-6">
-                <div>
-                    <p class="stat-label">TOTAL WALLET</p>
-                    <p id="totalWallet" class="stat-number value-positive">$0.00000000</p>
-                    <p id="walletChange" class="text-xs"></p>
-                </div>
-                <div>
-                    <p class="stat-label">TOTAL P&L</p>
-                    <p id="totalPnl" class="stat-number">$0.00000000</p>
-                    <p id="pnlPercent" class="text-xs"></p>
-                </div>
-                <div>
-                    <p class="stat-label">REALIZED P&L</p>
-                    <p id="realizedPnl" class="stat-number">$0.00000000</p>
-                    <p id="feesPaid" class="text-xs text-slate-500">Fees: $0.00</p>
-                </div>
-                <div>
-                    <p class="stat-label">PERFORMANCE</p>
-                    <p id="peakEquity" class="text-sm">Peak: $0.00</p>
-                    <p id="maxDrawdown" class="text-sm text-red-400">DD: 0%</p>
-                </div>
-                <div>
-                    <p class="stat-label">STATISTICS</p>
-                    <p id="tradeStats" class="text-sm">Trades: 0</p>
-                    <p id="winRate" class="text-sm text-green-400">Win Rate: 0%</p>
-                </div>
-            </div>
-            
-            <div class="compound-info mt-4">
-                <div class="flex justify-between items-center">
-                    <div>
-                        <p class="text-xs text-slate-400">📈 AUTO-COMPOUNDING (${config.riskPercent}% of Wallet)</p>
-                        <p class="text-sm font-bold text-green-400" id="baseVolumeDisplay">Base Volume: 0 contracts</p>
-                        <p class="text-xs text-slate-400" id="shibDisplay">0 SHIB per trade</p>
-                        <p class="text-xs text-slate-400" id="formulaDisplay">Formula: $${config.walletPerContract.toFixed(8)} wallet = 1 contract at ${config.leverage}x leverage</p>
-                    </div>
-                    <div class="text-right">
-                        <p class="text-xs text-slate-400">Risk Amount (2%)</p>
-                        <p class="text-sm font-bold" id="riskAmount">$0.00</p>
-                        <p class="text-xs text-slate-400" id="compoundStatus">🟢 Active</p>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <div class="card mb-8">
-            <h3 class="font-bold mb-4">📈 WALLET GROWTH CHART (Compounding Effect)</h3>
-            <div class="chart-container">
-                <canvas id="walletChart" style="max-height: 280px; width: 100%;"></canvas>
-            </div>
-        </div>
-
-        <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
             <div class="card">
-                <p class="stat-label mb-2">CONFIG</p>
-                <p class="text-sm">Base Vol: <span id="configBaseVol">${config.baseVolume}</span></p>
-                <p class="text-sm">Multiplier: ${config.multiplier}x</p>
-                <p class="text-sm">Step Trigger: <span class="text-red-400">-${config.stepDistancePct}% ROI</span></p>
+                <p class="stat-label">BALANCE</p>
+                <p id="balance" class="stat-number value-positive">$0.00</p>
+                <div class="mt-4">
+                    <input type="number" id="setBalance" placeholder="Set balance" class="bg-black/30 p-2 rounded">
+                    <button onclick="setBalance()" class="ml-2 bg-indigo-500/20 border border-indigo-500 px-4 py-2 rounded">SET</button>
+                </div>
             </div>
             <div class="card">
-                <p class="stat-label mb-2">MARKET</p>
-                <p id="spread" class="text-2xl font-black">0.000%</p>
-                <p class="text-[10px] text-slate-500 mt-1">Max Start: ${config.maxStartSpread}%</p>
-                <p class="text-[10px] text-slate-500">BID: <span id="bidPrice">0.00000000</span> | ASK: <span id="askPrice">0.00000000</span></p>
-            </div>
-            <div class="card">
-                <p class="stat-label mb-2">LONG</p>
-                <p id="lRoi" class="text-2xl font-black">0.00%</p>
-                <p id="lPnl" class="text-sm mono mt-1">$0.00000000</p>
-                <p id="lStep" class="text-[10px] text-slate-500 mt-2"></p>
-                <p id="lAction" class="text-[9px] text-indigo-400 mt-1"></p>
-                <p id="lTarget" class="text-[9px] text-green-400 mt-1"></p>
-                <p id="lRealized" class="text-[8px] text-slate-500 mt-1">Realized: $0.00</p>
-            </div>
-            <div class="card">
-                <p class="stat-label mb-2">SHORT</p>
-                <p id="sRoi" class="text-2xl font-black">0.00%</p>
-                <p id="sPnl" class="text-sm mono mt-1">$0.00000000</p>
-                <p id="sStep" class="text-[10px] text-slate-500 mt-2"></p>
-                <p id="sAction" class="text-[9px] text-indigo-400 mt-1"></p>
-                <p id="sTarget" class="text-[9px] text-green-400 mt-1"></p>
-                <p id="sRealized" class="text-[8px] text-slate-500 mt-1">Realized: $0.00</p>
+                <p class="stat-label">PERFORMANCE</p>
+                <p id="pnl" class="stat-number">$0.00</p>
+                <p id="winRate" class="text-sm text-green-400 mt-2">Win Rate: 0%</p>
+                <p id="totalBets" class="text-xs text-slate-400">Total Bets: 0</p>
             </div>
         </div>
 
         <div class="card">
-            <h3 class="font-bold mb-4">📋 CLOSED TRADES</h3>
+            <h3 class="font-bold mb-4">🎯 ACTIVE SEQUENCES</h3>
+            <div class="grid grid-cols-2 gap-4">
+                <div id="overStatus" class="p-4 bg-black/20 rounded">
+                    <p class="text-xl font-bold text-green-400">OVER (50.5+)</p>
+                    <p id="overRoi" class="text-2xl font-black mt-2">0%</p>
+                    <p id="overBet" class="text-sm">Bet: $0.00</p>
+                    <p id="overStep" class="text-xs text-slate-400">Step 0</p>
+                </div>
+                <div id="underStatus" class="p-4 bg-black/20 rounded">
+                    <p class="text-xl font-bold text-red-400">UNDER (49.5-)</p>
+                    <p id="underRoi" class="text-2xl font-black mt-2">0%</p>
+                    <p id="underBet" class="text-sm">Bet: $0.00</p>
+                    <p id="underStep" class="text-xs text-slate-400">Step 0</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3 class="font-bold mb-4">📊 BET HISTORY</h3>
             <div class="overflow-x-auto max-h-96 overflow-y-auto">
-                <table class="w-full border-collapse">
+                <table class="w-full">
                     <thead class="bg-[#0F141C] sticky top-0">
                         <tr>
-                            <th class="text-left p-3 text-xs text-slate-500">SIDE</th>
-                            <th class="text-left p-3 text-xs text-slate-500">OPEN</th>
-                            <th class="text-left p-3 text-xs text-slate-500">CLOSE</th>
-                            <th class="text-right p-3 text-xs text-slate-500">STEP</th>
-                            <th class="text-right p-3 text-xs text-slate-500">VOL</th>
-                            <th class="text-right p-3 text-xs text-slate-500">ENTRY</th>
-                            <th class="text-right p-3 text-xs text-slate-500">EXIT</th>
-                            <th class="text-right p-3 text-xs text-slate-500">ROI</th>
-                            <th class="text-right p-3 text-xs text-slate-500">PNL</th>
-                            <th class="text-right p-3 text-xs text-slate-500">FEE</th>
+                            <th class="text-left p-3">DIR</th>
+                            <th class="text-left p-3">ROLL</th>
+                            <th class="text-right p-3">BET</th>
+                            <th class="text-right p-3">RESULT</th>
+                            <th class="text-right p-3">PROFIT</th>
+                            <th class="text-right p-3">STEP</th>
+                            <th class="text-right p-3">ROI</th>
                         </tr>
                     </thead>
-                    <tbody id="tradesBody">
-                        <tr><td colspan="10" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>
-                    </tbody>
+                    <tbody id="betsBody"></tbody>
                 </table>
             </div>
         </div>
     </div>
 
     <script>
-        let walletChart = null;
-        
-        async function forceSync() {
-            const btn = event.target;
-            btn.textContent = '🔄 SYNCING...';
-            await fetch('/api/force-sync', {method: 'POST'});
-            setTimeout(() => btn.textContent = '🔄 FORCE SYNC', 1000);
-        }
-        
-        async function emergencyClose() {
-            if(confirm('Close ALL positions?')) {
-                await fetch('/api/close', {method: 'POST'});
-                alert('Emergency liquidation initiated');
-            }
-        }
-        
-        function formatNumber(num) {
-            return parseFloat(num).toFixed(8);
-        }
-        
-        function updateChart(walletHistory) {
-            if (!walletHistory || walletHistory.length === 0) return;
-            
-            const labels = walletHistory.map(h => {
-                const date = new Date(h.timestamp);
-                return date.toLocaleTimeString();
+        async function setBalance() {
+            const balance = document.getElementById('setBalance').value;
+            await fetch('/api/set-balance', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ balance: parseFloat(balance) })
             });
-            const equity = walletHistory.map(h => h.equity);
-            const pnlPercent = walletHistory.map(h => h.pnlPercent);
-            
-            if (walletChart) {
-                walletChart.destroy();
+        }
+        
+        async function resetGame() {
+            if(confirm('Reset all stats?')) {
+                await fetch('/api/reset', {method: 'POST'});
             }
-            
-            const ctx = document.getElementById('walletChart').getContext('2d');
-            walletChart = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels: labels,
-                    datasets: [
-                        {
-                            label: 'Wallet Equity (USDT)',
-                            data: equity,
-                            borderColor: '#00D1B2',
-                            backgroundColor: 'rgba(0, 209, 178, 0.1)',
-                            fill: true,
-                            tension: 0.4,
-                            yAxisID: 'y',
-                            pointRadius: 2,
-                            pointHoverRadius: 5
-                        },
-                        {
-                            label: 'PnL %',
-                            data: pnlPercent,
-                            borderColor: '#6366F1',
-                            backgroundColor: 'rgba(99, 102, 241, 0.1)',
-                            fill: true,
-                            tension: 0.4,
-                            yAxisID: 'y1',
-                            pointRadius: 2,
-                            pointHoverRadius: 5
-                        }
-                    ]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: true,
-                    interaction: { mode: 'index', intersect: false },
-                    plugins: {
-                        legend: { position: 'top', labels: { color: '#E8EDF2', font: { size: 10 } } },
-                        tooltip: { 
-                            callbacks: { 
-                                label: function(context) { 
-                                    return context.dataset.label + ': ' + context.raw.toFixed(8); 
-                                } 
-                            },
-                            bodyColor: '#E8EDF2',
-                            backgroundColor: '#131824'
-                        }
-                    },
-                    scales: {
-                        y: { 
-                            title: { display: true, text: 'USDT', color: '#00D1B2', font: { size: 10 } }, 
-                            grid: { color: '#1F2A3E' }, 
-                            ticks: { color: '#E8EDF2', font: { size: 9 } }
-                        },
-                        y1: { 
-                            position: 'right', 
-                            title: { display: true, text: 'PnL %', color: '#6366F1', font: { size: 10 } }, 
-                            grid: { drawOnChartArea: false }, 
-                            ticks: { color: '#E8EDF2', font: { size: 9 }, callback: function(v) { return v.toFixed(1) + '%'; } }
-                        },
-                        x: { 
-                            ticks: { color: '#E8EDF2', font: { size: 8 }, maxRotation: 45, minRotation: 45 },
-                            grid: { color: '#1F2A3E' }
-                        }
-                    }
-                }
-            });
         }
         
         setInterval(async () => {
@@ -1111,99 +680,43 @@ app.get('/', (req, res) => {
                 const res = await fetch('/api/status');
                 const data = await res.json();
                 
-                const totalEquity = data.market.totalEquity || 0;
-                const totalPnl = data.market.totalNetGain || 0;
-                const pnlPercent = data.market.growthPct || 0;
+                document.getElementById('balance').textContent = '$' + (data.game.balance || 0).toFixed(8);
+                document.getElementById('pnl').textContent = (data.game.totalNetGain >= 0 ? '+' : '') + '$' + (data.game.totalNetGain || 0).toFixed(8);
+                document.getElementById('winRate').textContent = 'Win Rate: ' + (data.game.winRate || 0) + '%';
+                document.getElementById('totalBets').textContent = 'Total Bets: ' + (data.game.totalBets || 0);
                 
-                document.getElementById('totalWallet').textContent = '$' + formatNumber(totalEquity);
-                document.getElementById('totalWallet').className = 'stat-number ' + (totalPnl >= 0 ? 'value-positive' : 'value-negative');
-                document.getElementById('walletChange').innerHTML = (totalPnl >= 0 ? '↑' : '↓') + ' $' + formatNumber(Math.abs(totalPnl)) + ' (' + (pnlPercent >= 0 ? '+' : '') + pnlPercent.toFixed(2) + '%)';
-                document.getElementById('walletChange').className = 'text-xs ' + (totalPnl >= 0 ? 'value-positive' : 'value-negative');
+                const over = data.accounts.find(a => a.direction === 'over');
+                const under = data.accounts.find(a => a.direction === 'under');
                 
-                document.getElementById('totalPnl').textContent = (totalPnl >= 0 ? '+' : '') + '$' + formatNumber(totalPnl);
-                document.getElementById('totalPnl').className = 'stat-number ' + (totalPnl >= 0 ? 'value-positive' : 'value-negative');
-                document.getElementById('pnlPercent').innerHTML = (pnlPercent >= 0 ? '+' : '') + pnlPercent.toFixed(2) + '%';
-                document.getElementById('pnlPercent').className = 'text-xs ' + (pnlPercent >= 0 ? 'value-positive' : 'value-negative');
-                
-                document.getElementById('realizedPnl').textContent = (data.market.totalRealizedPnl >= 0 ? '+' : '') + '$' + formatNumber(data.market.totalRealizedPnl || 0);
-                document.getElementById('realizedPnl').className = 'stat-number ' + (data.market.totalRealizedPnl >= 0 ? 'value-positive' : 'value-negative');
-                document.getElementById('feesPaid').innerHTML = 'Fees: $' + formatNumber(data.market.totalFeesPaid || 0);
-                
-                document.getElementById('peakEquity').innerHTML = 'Peak: $' + formatNumber(data.market.peakEquity || 0);
-                document.getElementById('maxDrawdown').innerHTML = 'DD: ' + (data.market.maxDrawdown || 0).toFixed(2) + '%';
-                document.getElementById('tradeStats').innerHTML = 'Trades: ' + (data.market.totalTrades || 0);
-                document.getElementById('winRate').innerHTML = 'Win Rate: ' + (data.market.winRate || 0) + '%';
-                
-                document.getElementById('baseVolumeDisplay').innerHTML = 'Base Volume: ' + (data.market.currentBaseVolume || 0).toLocaleString() + ' contract(s)';
-                document.getElementById('shibDisplay').innerHTML = (data.market.currentBaseShib || 0).toLocaleString() + ' SHIB per trade';
-                document.getElementById('riskAmount').innerHTML = '$' + formatNumber(data.market.currentRiskAmount || 0);
-                document.getElementById('configBaseVol').innerHTML = data.market.currentBaseVolume || 0;
-                
-                if (data.market.walletHistory && data.market.walletHistory.length > 0) {
-                    updateChart(data.market.walletHistory);
+                if (over) {
+                    document.getElementById('overRoi').textContent = (over.roi || 0).toFixed(2) + '%';
+                    document.getElementById('overRoi').className = 'text-2xl font-black ' + (over.roi >= 0 ? 'value-positive' : 'value-negative');
+                    document.getElementById('overBet').textContent = 'Bet: $' + (over.currentBet || 0).toFixed(8);
+                    document.getElementById('overStep').textContent = 'Step ' + (over.step || 0) + ' | ' + (over.lastAction || 'Idle');
                 }
                 
-                document.getElementById('spread').textContent = (data.market.spread || 0).toFixed(3) + '%';
-                document.getElementById('bidPrice').textContent = (data.market.bid || 0).toFixed(8);
-                document.getElementById('askPrice').textContent = (data.market.ask || 0).toFixed(8);
-                
-                const long = data.accounts.find(a => a.direction === 'buy');
-                const short = data.accounts.find(a => a.direction === 'sell');
-                
-                if (long) {
-                    const roi = parseFloat(long.roi);
-                    const roiElem = document.getElementById('lRoi');
-                    roiElem.textContent = (roi >= 0 ? '+' : '') + roi.toFixed(2) + '%';
-                    roiElem.className = 'text-2xl font-black ' + (roi >= 0 ? 'value-positive' : 'value-negative');
-                    
-                    document.getElementById('lPnl').textContent = (long.unrealizedUsdt >= 0 ? '+' : '') + (long.unrealizedUsdt || 0).toFixed(8);
-                    document.getElementById('lStep').innerHTML = '<span class="step-badge">STEP ' + (long.step || 0) + '</span> | VOL ' + (long.volume || 0);
-                    document.getElementById('lAction').textContent = long.lastAction || 'Idle';
-                    document.getElementById('lRealized').innerHTML = 'Realized: ' + (long.realizedPnl >= 0 ? '+' : '') + '$' + (long.realizedPnl || 0).toFixed(8);
-                    
-                    if (long.targetPrice > 0) {
-                        document.getElementById('lTarget').innerHTML = '🎯 TP: ' + long.targetPrice.toFixed(8);
-                    }
+                if (under) {
+                    document.getElementById('underRoi').textContent = (under.roi || 0).toFixed(2) + '%';
+                    document.getElementById('underRoi').className = 'text-2xl font-black ' + (under.roi >= 0 ? 'value-positive' : 'value-negative');
+                    document.getElementById('underBet').textContent = 'Bet: $' + (under.currentBet || 0).toFixed(8);
+                    document.getElementById('underStep').textContent = 'Step ' + (under.step || 0) + ' | ' + (under.lastAction || 'Idle');
                 }
                 
-                if (short) {
-                    const roi = parseFloat(short.roi);
-                    const roiElem = document.getElementById('sRoi');
-                    roiElem.textContent = (roi >= 0 ? '+' : '') + roi.toFixed(2) + '%';
-                    roiElem.className = 'text-2xl font-black ' + (roi >= 0 ? 'value-positive' : 'value-negative');
-                    
-                    document.getElementById('sPnl').textContent = (short.unrealizedUsdt >= 0 ? '+' : '') + (short.unrealizedUsdt || 0).toFixed(8);
-                    document.getElementById('sStep').innerHTML = '<span class="step-badge">STEP ' + (short.step || 0) + '</span> | VOL ' + (short.volume || 0);
-                    document.getElementById('sAction').textContent = short.lastAction || 'Idle';
-                    document.getElementById('sRealized').innerHTML = 'Realized: ' + (short.realizedPnl >= 0 ? '+' : '') + '$' + (short.realizedPnl || 0).toFixed(8);
-                    
-                    if (short.targetPrice > 0) {
-                        document.getElementById('sTarget').innerHTML = '🎯 TP: ' + short.targetPrice.toFixed(8);
-                    }
-                }
-                
-                let tradesHtml = '';
-                if (data.tradeHistory && data.tradeHistory.length > 0) {
-                    data.tradeHistory.slice(0, 20).forEach(t => {
-                        const roiVal = parseFloat(t.roi);
-                        tradesHtml += '<tr class="border-b border-[#1A212E]">' +
-                            '<td class="p-3"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + ' font-bold">' + t.side + '</span><tr>' +
-                            '<td class="p-3 text-xs">' + (t.openTime || '--') + '</td>' +
-                            '<td class="p-3 text-xs">' + (t.closeTime || '--') + '</td>' +
-                            '<td class="p-3 text-right">' + (t.step || 0) + '</td>' +
-                            '<td class="p-3 text-right">' + t.volume + '</td>' +
-                            '<td class="p-3 text-right mono">' + t.entryPrice + '</td>' +
-                            '<td class="p-3 text-right mono">' + t.exitPrice + '</td>' +
-                            '<td class="p-3 text-right ' + (roiVal >= 0 ? 'value-positive' : 'value-negative') + '">' + (roiVal >= 0 ? '+' : '') + t.roi + '</td>' +
-                            '<td class="p-3 text-right mono ' + (parseFloat(t.netPnlUsdt) >= 0 ? 'value-positive' : 'value-negative') + '">' + (parseFloat(t.netPnlUsdt) >= 0 ? '+' : '') + t.netPnlUsdt + '</td>' +
-                            '<td class="p-3 text-right mono text-slate-500">' + t.estimatedFee + '</td>' +
+                let betsHtml = '';
+                if (data.betHistory && data.betHistory.length > 0) {
+                    data.betHistory.forEach(b => {
+                        betsHtml += '<tr class="border-b border-[#1A212E]">' +
+                            '<td class="p-3"><span class="' + (b.direction === 'OVER' ? 'text-green-400' : 'text-red-400') + ' font-bold">' + b.direction + '</span></td>' +
+                            '<td class="p-3 font-mono">' + b.rollNumber + '</td>' +
+                            '<td class="p-3 text-right">$' + b.betAmount + '</td>' +
+                            '<td class="p-3 text-right"><span class="' + (b.result === 'WIN' ? 'text-green-400' : 'text-red-400') + '">' + b.result + '</span></td>' +
+                            '<td class="p-3 text-right ' + (parseFloat(b.profit) >= 0 ? 'value-positive' : 'value-negative') + '">' + (parseFloat(b.profit) >= 0 ? '+' : '') + '$' + b.profit + '</td>' +
+                            '<td class="p-3 text-right">' + b.step + '</td>' +
+                            '<td class="p-3 text-right ' + (parseFloat(b.roi) >= 0 ? 'value-positive' : 'value-negative') + '">' + b.roi + '</td>' +
                         '</tr>';
                     });
-                } else {
-                    tradesHtml = '<tr><td colspan="10" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>';
                 }
-                document.getElementById('tradesBody').innerHTML = tradesHtml;
-                
+                document.getElementById('betsBody').innerHTML = betsHtml || '<tr><td colspan="7" class="text-center text-slate-500 p-12">No bets yet</td></tr>';
             } catch(e) { console.error(e); }
         }, 1000);
     </script>
@@ -1212,21 +725,19 @@ app.get('/', (req, res) => {
     `);
 });
 
-startWS();
+// Initialize with starting balance
+game.balance = parseFloat(process.env.STARTING_BALANCE) || 1000;
+game.initialBalance = game.balance;
+game.peakBalance = game.balance;
+
+// Start the bot
 setInterval(backgroundLoop, config.pollInterval);
 app.listen(config.port, '0.0.0.0', () => {
-    const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
-    
-    console.log(`\n✅ Martingale Pro Started (AUTO-COMPOUNDING CORRECTED)`);
-    console.log(`📊 Symbol: ${config.symbol}`);
-    console.log(`🔧 Leverage: ${config.leverage}x`);
-    console.log(`🎯 Take Profit: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price movement`);
-    console.log(`💰 Auto-Compounding: ${config.riskPercent}% of wallet`);
-    console.log(`📐 Formula: $${config.walletPerContract.toFixed(8)} wallet = 1 contract`);
-    console.log(`📈 Step Trigger: -${config.stepDistancePct}% ROI (adds martingale when losing)`);
+    console.log(`\n🎲 DICE MARTINGALE PRO STARTED`);
+    console.log(`🎯 Win Chance: ${config.winChance}% (2x payout)`);
+    console.log(`📈 Martingale Step Trigger: -${config.stepDistancePct}% loss`);
+    console.log(`💰 Take Profit: ${config.takeProfitPct}% ROI`);
+    console.log(`🎲 Auto-Compounding: ${config.riskPercent}% of balance`);
     console.log(`🌐 Dashboard: http://localhost:${config.port}`);
-    console.log(`\n📊 AUTO-COMPOUNDING EXAMPLES:`);
-    console.log(`   Wallet $${config.walletPerContract.toFixed(8)} → 1 contract → Risk $${(config.walletPerContract * 0.02).toFixed(8)}`);
-    console.log(`   Wallet $${(config.walletPerContract * 2).toFixed(8)} → 2 contracts → Risk $${(config.walletPerContract * 2 * 0.02).toFixed(8)}`);
-    console.log(`   Wallet $${(config.walletPerContract * 3).toFixed(8)} → 3 contracts → Risk $${(config.walletPerContract * 3 * 0.02).toFixed(8)}\n`);
+    console.log(`💰 Starting Balance: $${game.balance}\n`);
 });
