@@ -20,7 +20,7 @@ try {
 }
 
 // IMPORTANT: Get token from environment
-const GITHUB_TOKEN = "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";
+const GITHUB_TOKEN = "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";
 
 // Test token validity immediately
 async function testTokenValidity() {
