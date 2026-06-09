@@ -20,7 +20,7 @@ const config = {
     multiplier: parseFloat(process.env.MULTIPLIER) || 1.2,
     stepDistancePct: parseFloat(process.env.STEP_DISTANCE_PCT) || 10,
     takeProfitPct: parseFloat(process.env.TAKE_PROFIT_PCT) || 15,
-    maxSteps: parseInt(process.env.MAX_STEPS) || 10,
+    maxSteps: parseInt(process.env.MAX_STEPS) || 100,
     
     // Game settings (for crypto.games dice)
     winChance: parseFloat(process.env.WIN_CHANCE) || 49.5,
