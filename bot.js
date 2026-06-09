@@ -5,7 +5,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION (SMALL BALANCE OPTIMIZED) ============
-const API_KEY = process.env.API_KEY || "YOUR_API_KEY_HERE";
+const API_KEY = process.env.API_KEY || "FrRtbXf3294xXJJyiK9RYWhiqmj6f471xYBghxZE2cgW4Ddc3p";
 const BASE_URL = "https://api.crypto.games/v1";
 
 const PLINKO_CONFIG = {
