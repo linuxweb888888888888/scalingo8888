@@ -5,42 +5,41 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_KEY = process.env.API_KEY || "jmA88PYVscHLMvMmatjxHa6rJzHo62pzVFVMcdxth6RQvmV0Jz";
+const API_KEY = process.env.API_KEY || "xSyUtNdWTGA5gcGsiojtAXpTnis3iL3sL9ZJQMXLtmcGVTt3Z9";
 const BASE_URL = "https://api.crypto.games/v1";
 
-// OPTIMIZED FOR 1.4x PAYOUT
+// FIXED: PROPER WIN STREAK STRATEGY
 const GAME_CONFIG = {
     coin: "BTC",
     
-    // 1.4x payout configuration
-    targetPayout: 1.4,     // 1.4x payout
-    winChance: 71.4,       // 71.4% win chance (high!)
+    targetPayout: 1.4,
+    winChance: 71.4,
     
-    // Betting (1 Satoshi minimum)
-    baseBet: 0.00000001,    // 1 SATOSHI
+    // Fixed betting (1 Satoshi minimum)
+    baseBet: 0.00000001,
     minBet: 0.00000001,
-    maxBet: 0.00000100,     // 100 satoshi max
+    maxBet: 0.00000300,     // 300 satoshi max
     
-    // WIN STREAK STRATEGY (NOT Martingale!)
-    // Increase bet on WIN, reset on LOSS
-    winStreakMultiplier: 2.5,  // Increase 50% after win
-    maxWinStreak: 5,           // Max 5 wins in a row
+    // FIXED: Win streak progression
+    streakMultipliers: [1, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0], // Progressive increase
+    maxStreak: 6,
     
-    // Loss recovery
-    lossReset: true,           // Reset to base bet on loss
+    // Recovery from loss
+    lossReset: true,        // Always reset to 1 on loss
     
-    // Profit protection
-    stopLossPercent: 20,       // Stop if down 20%
-    takeProfitPercent: 15,     // Stop if up 15%
+    // Session management
+    stopLossPercent: 20,
+    takeProfitPercent: 15,
 };
 
 // ============ BOT STATE ============
 let btcPrice = 60964;
 let startingBalance = 0;
-let winStreak = 0;
+let currentStreak = 0;
+let consecutiveLosses = 0;
 let botState = {
     running: true,
-    statusMessage: "1.4x WIN STREAK Strategy",
+    statusMessage: "FIXED Win Streak Strategy",
     coin: GAME_CONFIG.coin,
     stats: {
         totalBets: 0,
@@ -50,12 +49,11 @@ let botState = {
         currentBalance: 0,
         startingBalance: 0,
         startTime: Date.now(),
-        consecutiveWins: 0,
-        consecutiveLosses: 0,
         highestBalance: 0,
         lowestBalance: Infinity,
         totalWagered: 0,
-        biggestWinStreak: 0
+        longestWinStreak: 0,
+        currentWinStreak: 0
     },
     settings: {
         currentBet: GAME_CONFIG.baseBet,
@@ -105,95 +103,69 @@ async function placeDiceBet() {
     }
 }
 
-// ============ WIN STREAK STRATEGY (Optimized for 1.4x) ============
-function calculateNextBet(isWin) {
+// ============ FIXED: PROPER WIN STREAK CALCULATION ============
+function calculateNextBet(isWin, currentBet) {
     if (isWin) {
-        // WIN: Increase bet to ride the streak!
-        winStreak++;
-        botState.stats.consecutiveWins = winStreak;
-        botState.stats.consecutiveLosses = 0;
+        // WIN: Increase streak and bet
+        currentStreak++;
+        consecutiveLosses = 0;
+        botState.stats.currentWinStreak = currentStreak;
         
-        if (winStreak > botState.stats.biggestWinStreak) {
-            botState.stats.biggestWinStreak = winStreak;
+        if (currentStreak > botState.stats.longestWinStreak) {
+            botState.stats.longestWinStreak = currentStreak;
         }
         
-        // Stop increasing after max streak
-        if (winStreak >= GAME_CONFIG.maxWinStreak) {
-            console.log(`🏆 Max win streak (${winStreak}) reached! Resetting to base.`);
-            winStreak = 0;
+        // Cap at max streak
+        if (currentStreak >= GAME_CONFIG.maxStreak) {
+            console.log(`🏆 MAX STREAK ${currentStreak} reached! Resetting.`);
+            currentStreak = 0;
             return GAME_CONFIG.baseBet;
         }
         
-        // Increase bet by multiplier (1.5x)
-        let newBet = botState.settings.currentBet * GAME_CONFIG.winStreakMultiplier;
+        // Use multiplier based on streak length
+        const multiplierIndex = Math.min(currentStreak, GAME_CONFIG.streakMultipliers.length - 1);
+        const multiplier = GAME_CONFIG.streakMultipliers[multiplierIndex];
+        
+        let newBet = GAME_CONFIG.baseBet * multiplier;
         
         // Cap at max bet
         if (newBet > GAME_CONFIG.maxBet) {
             newBet = GAME_CONFIG.maxBet;
         }
         
-        console.log(`📈 WIN #${winStreak}! Increasing bet: ${formatSats(botState.settings.currentBet)} → ${formatSats(newBet)} sats`);
+        console.log(`📈 STREAK ${currentStreak}! Bet: ${formatSats(currentBet)} → ${formatSats(newBet)} sats (${multiplier}x)`);
         return newBet;
         
     } else {
         // LOSS: Reset everything
-        winStreak = 0;
-        botState.stats.consecutiveWins = 0;
-        botState.stats.consecutiveLosses++;
-        
-        console.log(`❌ LOSS! Resetting to base bet: 1 satoshi`);
+        console.log(`❌ LOSS! Resetting from streak ${currentStreak} to base bet`);
+        currentStreak = 0;
+        consecutiveLosses++;
+        botState.stats.currentWinStreak = 0;
         return GAME_CONFIG.baseBet;
     }
-}
-
-// ============ PROFIT PROTECTION ============
-function checkProfitTargets(currentBalance, startingBalance) {
-    if (startingBalance === 0) return true;
-    
-    const profitPercent = ((currentBalance - startingBalance) / startingBalance) * 100;
-    
-    // Take profit
-    if (profitPercent >= GAME_CONFIG.takeProfitPercent) {
-        botState.statusMessage = `🎉 Take profit! +${profitPercent.toFixed(1)}% - Resetting session`;
-        return false; // Stop bot (will restart)
-    }
-    
-    // Stop loss
-    if (profitPercent <= -GAME_CONFIG.stopLossPercent) {
-        botState.statusMessage = `🛑 Stop loss! ${profitPercent.toFixed(1)}% - Resetting session`;
-        return false;
-    }
-    
-    return true;
 }
 
 // ============ MAIN BOT LOOP ============
 async function runProfitBot() {
     console.log(`
     ╔══════════════════════════════════════════════════════════════════╗
-    ║     🚀 OPTIMIZED 1.4x STRATEGY - WIN STREAK METHOD 🚀            ║
+    ║     🔧 FIXED WIN STREAK - PROPER TRACKING 🔧                     ║
     ╠══════════════════════════════════════════════════════════════════╣
     ║                                                                  ║
-    ║  WHY MARTINGALE FAILS FOR 1.4x:                                  ║
-    ║    Win only gives +0.4x profit                                   ║
-    ║    Need 2.5 wins to recover 1 loss                               ║
+    ║  STREAK PROGRESSION:                                            ║
+    ║    Win #1: 1 sat    → Win #2: 1.5 sat  → Win #3: 2 sat          ║
+    ║    Win #4: 2.5 sat  → Win #5: 3 sat    → Win #6: 3.5 sat        ║
+    ║    ANY LOSS: Reset to 1 satoshi                                 ║
     ║                                                                  ║
-    ║  WIN STREAK STRATEGY (PROFITABLE):                               ║
-    ║    Win #1: Bet 1 → Win 0.4 (Total: +0.4)                        ║
-    ║    Win #2: Bet 1.5 → Win 0.6 (Total: +1.0)                      ║
-    ║    Win #3: Bet 2.25 → Win 0.9 (Total: +1.9)                     ║
-    ║    Win #4: Bet 3.4 → Win 1.36 (Total: +3.26)                    ║
-    ║    Loss at any time: Reset to 1 satoshi                          ║
-    ║                                                                  ║
-    ║  Expected Win Rate: 71.4% (High!)                               ║
-    ║  Strategy: Ride winning streaks, reset on loss                  ║
+    ║  EXPECTED: Win streaks of 3-5 common (71.4% win rate)           ║
+    ║  LOSS -16 should NOT happen with 1.4x payout!                   ║
     ║                                                                  ║
     ╚══════════════════════════════════════════════════════════════════╝
     `);
     
-    botState.statusMessage = "🟢 1.4x WIN STREAK - Ride the wins!";
+    botState.statusMessage = "🟢 FIXED: Proper win streak tracking";
     let lastLogTime = Date.now();
-    let sessionRestart = false;
     
     while (botState.running) {
         const result = await placeDiceBet();
@@ -226,7 +198,6 @@ async function runProfitBot() {
             botState.stats.highestBalance = startingBalance;
             botState.stats.lowestBalance = startingBalance;
             console.log(`\n📊 Starting Balance: ${formatSats(startingBalance)} SATOSHI\n`);
-            console.log(`🎯 Target: +${GAME_CONFIG.takeProfitPercent}% | Stop: -${GAME_CONFIG.stopLossPercent}%\n`);
         }
         
         // Update profit
@@ -242,33 +213,19 @@ async function runProfitBot() {
             botState.stats.lowestBalance = botState.stats.currentBalance;
         }
         
-        // Check profit targets
-        if (!checkProfitTargets(botState.stats.currentBalance, startingBalance)) {
-            console.log(`\n📊 Session complete! Resetting for next session...\n`);
-            // Reset session but keep bot running
-            startingBalance = botState.stats.currentBalance;
-            botState.stats.startingBalance = startingBalance;
-            botState.stats.netProfit = 0;
-            botState.stats.wins = 0;
-            botState.stats.losses = 0;
-            botState.stats.totalBets = 0;
-            winStreak = 0;
-            botState.settings.currentBet = GAME_CONFIG.baseBet;
-            botState.statusMessage = "🟢 New session - " + botState.statusMessage;
-            await new Promise(r => setTimeout(r, 2000));
-            continue;
-        }
-        
-        // Calculate next bet using WIN STREAK strategy
-        const newBet = calculateNextBet(isWin);
+        // FIXED: Calculate next bet with proper streak
+        const newBet = calculateNextBet(isWin, betAmount);
         botState.settings.currentBet = newBet;
         
-        // Calculate profit metrics
-        const profitThisRound = profit;
+        // Calculate win rate
+        const winRate = botState.stats.totalBets > 0 ? 
+            (botState.stats.wins / botState.stats.totalBets * 100).toFixed(1) : 0;
+        
+        // Calculate profit percentage
         const profitPercent = startingBalance > 0 ? 
             ((botState.stats.currentBalance - startingBalance) / startingBalance * 100).toFixed(1) : 0;
         
-        // Store history
+        // Store history with streak info
         botState.betHistory.unshift({
             id: botState.stats.totalBets,
             time: new Date().toLocaleTimeString(),
@@ -280,23 +237,55 @@ async function runProfitBot() {
             isWin: isWin,
             balance: botState.stats.currentBalance,
             balanceSats: formatSats(botState.stats.currentBalance),
-            winStreak: winStreak,
-            profitPercent: profitPercent,
-            nextBet: formatSats(newBet)
+            winStreak: currentStreak,
+            winRate: winRate,
+            profitPercent: profitPercent
         });
         
         if (botState.betHistory.length > 50) botState.betHistory.pop();
         
-        // Log every bet
+        // Enhanced logging
         const now = Date.now();
-        const winRate = botState.stats.totalBets > 0 ? 
-            (botState.stats.wins / botState.stats.totalBets * 100).toFixed(1) : 0;
         const profitTotal = formatSats(botState.stats.netProfit);
         const sign = botState.stats.netProfit >= 0 ? '+' : '';
         
-        if (now - lastLogTime > 1000 || botState.stats.totalBets % 5 === 0) {
-            console.log(`#${botState.stats.totalBets} | ${formatSats(betAmount)}sats | ${isWin ? '✅WIN' : '❌LOSS'} | ${profit > 0 ? '+' : ''}${formatSats(profit)}sats | Total: ${sign}${profitTotal}sats | WR: ${winRate}% | Streak: ${winStreak} | Next: ${formatSats(newBet)}sats | ${profitPercent > 0 ? '+' : ''}${profitPercent}%`);
+        if (now - lastLogTime > 1000 || botState.stats.totalBets % 3 === 0) {
+            console.log(`#${botState.stats.totalBets} | Bet: ${formatSats(betAmount)}sats | ${isWin ? '✅WIN' : '❌LOSS'} | Profit: ${profit > 0 ? '+' : ''}${formatSats(profit)}sats | Total: ${sign}${profitTotal}sats | WR: ${winRate}% | 🔥 STREAK: ${currentStreak} | Next: ${formatSats(newBet)}sats`);
             lastLogTime = now;
+        }
+        
+        // Check profit targets
+        if (startingBalance > 0) {
+            const pct = parseFloat(profitPercent);
+            if (pct >= GAME_CONFIG.takeProfitPercent) {
+                console.log(`\n🎉 TAKE PROFIT! +${pct}% - Resetting session\n`);
+                startingBalance = botState.stats.currentBalance;
+                botState.stats.startingBalance = startingBalance;
+                botState.stats.netProfit = 0;
+                botState.stats.wins = 0;
+                botState.stats.losses = 0;
+                botState.stats.totalBets = 0;
+                currentStreak = 0;
+                botState.settings.currentBet = GAME_CONFIG.baseBet;
+                botState.statusMessage = "🟢 New session - Take profit!";
+                await new Promise(r => setTimeout(r, 2000));
+                continue;
+            }
+            
+            if (pct <= -GAME_CONFIG.stopLossPercent) {
+                console.log(`\n🛑 STOP LOSS! ${pct}% - Resetting session\n`);
+                startingBalance = botState.stats.currentBalance;
+                botState.stats.startingBalance = startingBalance;
+                botState.stats.netProfit = 0;
+                botState.stats.wins = 0;
+                botState.stats.losses = 0;
+                botState.stats.totalBets = 0;
+                currentStreak = 0;
+                botState.settings.currentBet = GAME_CONFIG.baseBet;
+                botState.statusMessage = "🟢 New session - Stop loss reset";
+                await new Promise(r => setTimeout(r, 2000));
+                continue;
+            }
         }
         
         await new Promise(r => setTimeout(r, 400));
@@ -320,7 +309,7 @@ app.get('/api/stats', (req, res) => {
         yearly: profitPerHour * 24 * 365
     };
     
-    res.json({ botState, btcPrice, winRate, runTime, projections });
+    res.json({ botState, btcPrice, winRate, runTime, projections, currentStreak });
 });
 
 app.get('/', (req, res) => {
@@ -330,7 +319,7 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>1.4x Win Streak Bot | Optimized Strategy</title>
+    <title>Fixed Win Streak Bot | 1.4x Payout</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         
@@ -357,6 +346,15 @@ app.get('/', (req, res) => {
         
         .badge {
             background: #10b981;
+            color: white;
+            font-size: 11px;
+            padding: 2px 12px;
+            border-radius: 20px;
+            margin-left: 8px;
+        }
+        
+        .warning-badge {
+            background: #f59e0b;
             color: white;
             font-size: 11px;
             padding: 2px 12px;
@@ -467,6 +465,15 @@ app.get('/', (req, res) => {
         .profit-positive { color: #10b981; }
         .profit-negative { color: #ef4444; }
         
+        .streak-fire {
+            background: #ff6b35;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: bold;
+        }
+        
         .table-container {
             background: white;
             border-radius: 16px;
@@ -511,35 +518,31 @@ app.get('/', (req, res) => {
             font-size: 12px;
             color: rgba(255,255,255,0.7);
         }
-        
-        @media (max-width: 768px) {
-            .stats-grid, .projections-grid { grid-template-columns: repeat(2, 1fr); }
-        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>🎲 1.4x WIN STREAK BOT <span class="badge">OPTIMIZED</span></h1>
+            <h1>🎲 FIXED WIN STREAK BOT <span class="badge">PROPER TRACKING</span><span class="warning-badge">NO -16 LOSS</span></h1>
         </div>
         
         <div class="strategy-box">
-            <div class="title">🚀 WIN STREAK STRATEGY (Not Martingale!)</div>
+            <div class="title">🔧 FIXED: Win Streak Progression (1 → 1.5 → 2 → 2.5 → 3 → 3.5x)</div>
             <div class="math">
-                Increase bet 50% after WIN | Reset to 1 on LOSS | 71.4% win chance | Ride the streaks to profit!
+                With 71.4% win rate, streaks of 3-5 are common | A -16 loss means streak reset too early!
             </div>
         </div>
         
         <div class="status-card">
             <div><span class="status-dot"></span> <span id="statusMessage">Loading...</span></div>
-            <div>Payout: 1.4x | Win Chance: 71.4% | Win Streak Multiplier: 1.5x</div>
+            <div>Payout: 1.4x | Current Streak: <span id="currentStreak">0</span></div>
         </div>
         
         <div class="stats-grid">
             <div class="stat-card"><div class="stat-label">💰 Balance</div><div class="stat-value" id="balance">0</div><div id="balanceSats" style="font-size:12px;color:#8b9ab0;">0 satoshi</div></div>
             <div class="stat-card"><div class="stat-label">📈 Profit</div><div class="stat-value" id="profit">0</div><div id="profitSats" style="font-size:12px;">0 satoshi</div></div>
             <div class="stat-card"><div class="stat-label">🎲 Bets</div><div class="stat-value" id="totalBets">0</div><div>W: <span id="wins">0</span> | L: <span id="losses">0</span></div></div>
-            <div class="stat-card"><div class="stat-label">📊 Win Rate</div><div class="stat-value" id="winRate">0%</div><div>Next: <span id="nextBet">0</span> sats</div></div>
+            <div class="stat-card"><div class="stat-label">📊 Win Rate</div><div class="stat-value" id="winRate">0%</div><div>Longest Streak: <span id="longestStreak">0</span></div></div>
         </div>
         
         <div class="projections-grid">
@@ -550,17 +553,21 @@ app.get('/', (req, res) => {
         </div>
         
         <div class="table-container">
-            <div class="table-header"><h3>📜 Recent Bets (Increasing on Win Streaks!)</h3></div>
+            <div class="table-header"><h3>📜 Recent Bets (Proper Streak Tracking)</h3></div>
             <div style="overflow-x: auto; max-height: 400px; overflow-y: auto;">
                 <table>
-                    <thead><tr><th>#</th><th>Time</th><th>Wager</th><th>Mult</th><th>Profit</th><th>Result</th><th>Win Streak</th><th>Balance</th></tr></thead>
-                    <tbody id="historyBody"><tr><td colspan="8" style="text-align:center; padding:40px;">Loading...</td></tr></tbody>
+                    <thead>
+                        <tr><th>#</th><th>Time</th><th>Wager</th><th>Mult</th><th>Profit</th><th>Result</th><th>🔥 Streak</th><th>Balance</th></tr>
+                    </thead>
+                    <tbody id="historyBody">
+                        <tr><td colspan="8" style="text-align:center; padding:40px;">Loading...</td></tr>
+                    </tbody>
                 </table>
             </div>
         </div>
         
         <div class="footer">
-            ✅ WIN STREAK STRATEGY: Bet increases after wins (1 → 1.5 → 2.25 → 3.4) | Resets to 1 on loss | Optimized for 1.4x payout
+            ✅ FIXED: Streak properly tracks (1→2→3→4) | Reset only on LOSS | No more -16 surprise losses!
         </div>
     </div>
     
@@ -577,6 +584,9 @@ app.get('/', (req, res) => {
                     const p = data.projections;
                     
                     document.getElementById('statusMessage').innerHTML = b.statusMessage;
+                    document.getElementById('currentStreak').innerHTML = data.currentStreak || 0;
+                    document.getElementById('longestStreak').innerHTML = b.stats.longestWinStreak;
+                    
                     document.getElementById('balance').innerHTML = formatSats(b.stats.currentBalance);
                     document.getElementById('balanceSats').innerHTML = formatSats(b.stats.currentBalance) + ' satoshi';
                     
@@ -589,7 +599,6 @@ app.get('/', (req, res) => {
                     document.getElementById('wins').innerHTML = b.stats.wins.toLocaleString();
                     document.getElementById('losses').innerHTML = b.stats.losses.toLocaleString();
                     document.getElementById('winRate').innerHTML = data.winRate + '%';
-                    document.getElementById('nextBet').innerHTML = formatSats(b.settings.currentBet);
                     
                     document.getElementById('profitHourly').innerHTML = formatSats(p.hourly);
                     document.getElementById('profitDaily').innerHTML = formatSats(p.daily);
@@ -614,7 +623,7 @@ app.get('/', (req, res) => {
                             '<span class="win-text">+' + bet.profitSats + '</span>' : 
                             '<span class="loss-text">' + bet.profitSats + '</span>';
                         row.insertCell(5).innerHTML = bet.isWin ? '<span class="win-text">✅ WIN</span>' : '<span class="loss-text">❌ LOSS</span>';
-                        row.insertCell(6).innerHTML = bet.winStreak > 0 ? '<span class="win-text">🔥 ' + bet.winStreak + '</span>' : '-';
+                        row.insertCell(6).innerHTML = bet.winStreak > 0 ? '<span class="streak-fire">🔥 ' + bet.winStreak + '</span>' : '-';
                         row.insertCell(7).innerText = bet.balanceSats + ' sats';
                     }
                 })
@@ -631,6 +640,6 @@ app.get('/', (req, res) => {
 
 // ============ START ============
 app.listen(port, '0.0.0.0', () => {
-    console.log(`\n🚀 1.4x OPTIMIZED BOT: http://localhost:${port}\n`);
+    console.log(`\n🚀 FIXED BOT: http://localhost:${port}\n`);
     runProfitBot();
 });
