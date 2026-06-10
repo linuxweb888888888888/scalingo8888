@@ -39,7 +39,8 @@ const config = {
     autoCompound: true,
     riskPercent: 0.25,
     dogePerContract: 100,  // 1 contract = 100 DOGE
-    walletPerContract: 0.0066135  // Base reference: $0.0066135 wallet = 1 contract at 75x leverage (this will be recalculated dynamically)
+    walletPerContract: 0.0066135,  // Base reference: $0.0066135 wallet = 1 contract at 75x leverage (this will be recalculated dynamically)
+    stepCooldownMs: 5 * 60 * 1000  // 5 minutes cooldown between martingale steps
 };
 
 let market = {
@@ -64,6 +65,7 @@ let tradeHistory = [];
 let accountStates = {};
 let lastPositionFetch = {};
 let lastBalanceFetch = {};
+let lastStepTime = {};  // Track last step time for each account
 
 function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
     if (!config.autoCompound || totalEquity <= 0) {
@@ -204,6 +206,7 @@ config.accounts.forEach((account, idx) => {
         realizedPnl: 0,
         totalFees: 0
     };
+    lastStepTime[account.accountId] = 0;  // Initialize last step time
 });
 
 function getSignature(account, method, path, params = {}) {
@@ -563,7 +566,11 @@ async function processMartingale() {
         const currentStep = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
         
         // Trigger martingale step when ROI reaches -10% or lower (negative)
-        if (state.roi <= -10 && state.volume > 0) {
+        // Check cooldown: only allow step if 5 minutes have passed since last step
+        const now = Date.now();
+        const timeSinceLastStep = now - (lastStepTime[acc.accountId] || 0);
+        
+        if (state.roi <= -10 && state.volume > 0 && timeSinceLastStep >= config.stepCooldownMs) {
             const nextStepNumber = currentStep + 1;
             let nextVol;
             
@@ -574,6 +581,7 @@ async function processMartingale() {
             }
             
             console.log(`📈 MARTINGALE STEP ${nextStepNumber} for ${state.direction} - ROI: ${state.roi.toFixed(2)}% (LOSS) | Current Vol: ${state.volume} (${state.volume * config.dogePerContract} DOGE) | Adding: ${nextVol} contracts (${nextVol * config.dogePerContract} DOGE)`);
+            console.log(`   ⏱️  Cooldown check: ${(timeSinceLastStep / 1000).toFixed(0)}s since last step (required: ${config.stepCooldownMs/1000}s) - PROCEEDING`);
             state.isLocked = true;
             
             const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
@@ -590,10 +598,16 @@ async function processMartingale() {
                 state.lastStepPrice = currentPrice;
                 state.lastAddedVolume = nextVol;
                 state.lastAction = `Martingale Step ${nextStepNumber} (-${Math.abs(state.roi).toFixed(1)}% loss, Added: ${nextVol} contracts, ${nextVol * config.dogePerContract} DOGE)`;
+                lastStepTime[acc.accountId] = now;  // Update last step time
             } else {
                 state.isLocked = false;
                 state.lastAction = "Step Failed";
             }
+        } else if (state.roi <= -10 && state.volume > 0 && timeSinceLastStep < config.stepCooldownMs) {
+            // Cooldown active - skip step
+            const remainingCooldown = ((config.stepCooldownMs - timeSinceLastStep) / 1000).toFixed(0);
+            state.lastAction = `Step Cooldown (${remainingCooldown}s remaining) - ROI: ${state.roi.toFixed(2)}%`;
+            console.log(`⏸️  [${state.direction.toUpperCase()}] Martingale step blocked - cooldown active (${remainingCooldown}s remaining until next step)`);
         } else {
             const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
             const requiredMove = (config.takeProfitPct / config.leverage).toFixed(3);
@@ -1206,7 +1220,7 @@ app.get('/', (req, res) => {
                         const roiVal = parseFloat(t.roi);
                         const dogeAmount = t.volume * 100;
                         tradesHtml += '<tr class="border-b border-[#1A212E]">' +
-                            '<td class="p-3"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + ' font-bold">' + t.side + '</span></td>' +
+                            '<td class="p-3"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + ' font-bold">' + t.side + '</span>' +
                             '<td class="p-3 text-xs">' + (t.openTime || '--') + '</td>' +
                             '<td class="p-3 text-xs">' + (t.closeTime || '--') + '</td>' +
                             '<td class="p-3 text-right">' + (t.step || 0) + '</td>' +
@@ -1245,6 +1259,7 @@ app.listen(config.port, '0.0.0.0', () => {
     console.log(`💰 Auto-Compounding: ${config.riskPercent}% of wallet (risk-based sizing)`);
     console.log(`📐 Formula: Volume = (Wallet × ${config.riskPercent}%) ÷ ((100 DOGE × Current Price) ÷ ${config.leverage})`);
     console.log(`📈 Step Trigger: -${config.stepDistancePct}% ROI (adds martingale when losing)`);
+    console.log(`⏱️  Step Cooldown: 5 minutes between martingale steps`);
     console.log(`🌐 Dashboard: http://localhost:${config.port}`);
     console.log(`\n📊 AUTO-COMPOUNDING EXAMPLES (at $0.10 DOGE price):`);
     console.log(`   $10 wallet → 1 contract → 100 DOGE → Risk: $0.025`);
