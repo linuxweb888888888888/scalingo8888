@@ -8,7 +8,24 @@ const zlib = require('zlib');
 const app = express();
 app.use(express.json());
 
-// ==================== CONFIGURATION ====================
+// ==================== PAPER TRADING CONFIGURATION ====================
+const PAPER_BALANCE = 1000; // $1000 USDT starting balance
+const PAPER_MODE = true; // Paper trading flag
+
+// Paper trading state
+let paperState = {
+    initialBalance: PAPER_BALANCE,
+    currentBalance: PAPER_BALANCE,
+    positions: {
+        buy: { volume: 0, entryPrice: 0, totalCost: 0, realizedPnl: 0, totalFees: 0 },
+        sell: { volume: 0, entryPrice: 0, totalCost: 0, realizedPnl: 0, totalFees: 0 }
+    },
+    marginUsed: 0,
+    unrealizedPnl: 0,
+    totalFees: 0,
+    trades: []
+};
+
 const apiAccounts = [];
 let accountIndex = 1;
 while (process.env[`HTX_API_KEY_${accountIndex}`]) {
@@ -45,10 +62,11 @@ const config = {
 let market = {
     status: 'Active', bid: 0, ask: 0, spread: 0,
     totalNetGain: 0, growthPct: 0, dgr: 0,
-    initialTotalEquity: 0, startTime: Date.now(),
+    initialTotalEquity: PAPER_BALANCE,
+    startTime: Date.now(),
     lastPriceUpdate: 0,
     walletHistory: [],
-    peakEquity: 0,
+    peakEquity: PAPER_BALANCE,
     maxDrawdown: 0,
     totalTrades: 0,
     winningTrades: 0,
@@ -90,7 +108,7 @@ function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
     market.currentRiskAmount = riskAmount;
     market.currentBaseShib = shibAmount;
     
-    console.log(`\n💰 AUTO-COMPOUNDING CALCULATION:`);
+    console.log(`\n💰 AUTO-COMPOUNDING CALCULATION (PAPER):`);
     console.log(`   Wallet: $${totalEquity.toFixed(8)}`);
     console.log(`   ${config.riskPercent}% Risk: $${riskAmount.toFixed(8)}`);
     console.log(`   @ ${config.leverage}x → $${positionUsdt.toFixed(8)} position`);
@@ -129,7 +147,7 @@ function calculateVolumeForStep(step, baseVolume, multiplier) {
     return totalVolume;
 }
 
-function calculateTargetPrice(state) {
+function calculateTargetPrice(state, currentPrice) {
     const requiredPriceMovePct = config.takeProfitPct / config.leverage;
     
     if (state.direction === 'buy') {
@@ -141,6 +159,15 @@ function calculateTargetPrice(state) {
         const feeAdjustedTarget = targetPrice * (1 - config.takerFeeRate);
         return feeAdjustedTarget;
     }
+}
+
+function calculateUnrealizedPnl(direction, volume, entryPrice, currentPrice, leverage) {
+    const positionValue = volume * entryPrice;
+    const currentValue = volume * currentPrice;
+    const rawPnl = direction === 'buy' ? currentValue - positionValue : positionValue - currentValue;
+    // Apply leverage to PnL
+    const leveragedPnl = rawPnl * leverage;
+    return leveragedPnl;
 }
 
 function updateWalletGrowth(totalEquity) {
@@ -174,43 +201,185 @@ function updateWalletGrowth(totalEquity) {
     }
 }
 
-config.accounts.forEach((account, idx) => {
-    accountStates[account.accountId] = {
-        direction: idx === 0 ? 'buy' : 'sell',
-        roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
-        currentEquity: 0, availableMargin: 0, initialEquity: null,
-        isLocked: false,
-        pendingOrderId: null,
-        lastAction: 'Idle',
-        lastStepPrice: 0, lastAddedVolume: 0, startTime: null,
-        lastExchangeRoi: 0,
-        roiLatencyMs: 0,
-        roiLatencyHistory: [],
-        lastRoiUpdateTime: Date.now(),
-        targetPrice: 0,
-        realizedPnl: 0,
-        totalFees: 0
-    };
-});
-
-function getSignature(account, method, path, params = {}) {
-    const timestamp = new Date().toISOString().split('.')[0];
-    const allParams = {
-        AccessKeyId: account.apiKey,
-        SignatureMethod: 'HmacSHA256',
-        SignatureVersion: '2',
-        Timestamp: timestamp,
-        ...params
-    };
+// PAPER TRADING: Simulated order execution
+async function executePaperOrder(account, orderType, volume, direction, offset, currentPrice) {
+    const fee = volume * currentPrice * config.takerFeeRate;
+    const positionValue = volume * currentPrice;
+    const requiredMargin = (positionValue / config.leverage);
     
-    const sortedParams = Object.keys(allParams).sort().map(key => `${key}=${encodeURIComponent(allParams[key])}`).join('&');
-    const payload = [method.toUpperCase(), config.restHost, path, sortedParams].join('\n');
-    const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
+    const state = accountStates[account.accountId];
     
-    return { timestamp, signature, sortedParams };
+    if (offset === 'open') {
+        // Check if we have enough balance for margin
+        if (requiredMargin > paperState.currentBalance) {
+            console.log(`❌ PAPER: Insufficient balance! Required: $${requiredMargin.toFixed(8)}, Available: $${paperState.currentBalance.toFixed(8)}`);
+            return { status: 'error', msg: 'insufficient balance' };
+        }
+        
+        // Update paper trading state
+        const existingPos = paperState.positions[direction];
+        const oldVolume = existingPos.volume;
+        const oldEntryPrice = existingPos.entryPrice;
+        
+        // Calculate new average entry price
+        let newEntryPrice;
+        if (oldVolume === 0) {
+            newEntryPrice = currentPrice;
+        } else {
+            const oldTotalCost = oldVolume * oldEntryPrice;
+            const newTotalCost = volume * currentPrice;
+            newEntryPrice = (oldTotalCost + newTotalCost) / (oldVolume + volume);
+        }
+        
+        existingPos.volume += volume;
+        existingPos.entryPrice = newEntryPrice;
+        existingPos.totalCost = existingPos.volume * newEntryPrice;
+        
+        paperState.marginUsed += requiredMargin;
+        paperState.currentBalance -= requiredMargin;
+        paperState.totalFees += fee;
+        
+        console.log(`✅ PAPER OPEN: ${direction.toUpperCase()} ${volume} contracts @ $${currentPrice.toFixed(8)}`);
+        console.log(`   Margin used: $${requiredMargin.toFixed(8)} | Fee: $${fee.toFixed(8)}`);
+        console.log(`   New avg price: $${newEntryPrice.toFixed(8)} | Total volume: ${existingPos.volume}`);
+        
+        return { 
+            status: 'ok', 
+            data: { 
+                order_id_str: `PAPER_${Date.now()}_${Math.random()}`,
+                price_avg: currentPrice
+            } 
+        };
+    } else if (offset === 'close') {
+        const existingPos = paperState.positions[direction === 'buy' ? 'sell' : 'buy'];
+        
+        if (existingPos.volume < volume) {
+            console.log(`❌ PAPER: Cannot close ${volume} contracts, only ${existingPos.volume} available`);
+            return { status: 'error', msg: 'insufficient position' };
+        }
+        
+        // Calculate PnL
+        const pnl = calculateUnrealizedPnl(
+            direction === 'buy' ? 'sell' : 'buy', 
+            volume, 
+            existingPos.entryPrice, 
+            currentPrice, 
+            config.leverage
+        );
+        
+        const marginReleased = (volume * existingPos.entryPrice) / config.leverage;
+        
+        existingPos.volume -= volume;
+        existingPos.realizedPnl += pnl;
+        existingPos.totalFees += fee;
+        
+        paperState.currentBalance += marginReleased + pnl;
+        paperState.marginUsed -= marginReleased;
+        paperState.totalFees += fee;
+        
+        if (existingPos.volume === 0) {
+            existingPos.entryPrice = 0;
+            existingPos.totalCost = 0;
+        }
+        
+        console.log(`✅ PAPER CLOSE: ${direction === 'buy' ? 'SELL' : 'BUY'} ${volume} contracts @ $${currentPrice.toFixed(8)}`);
+        console.log(`   PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(8)} | Fee: $${fee.toFixed(8)}`);
+        console.log(`   Balance: $${paperState.currentBalance.toFixed(8)}`);
+        
+        // Record trade
+        const roi = (pnl / (marginReleased + Math.abs(pnl))) * 100;
+        paperState.trades.unshift({
+            side: direction === 'buy' ? 'LONG' : 'SHORT',
+            volume: volume,
+            entryPrice: existingPos.entryPrice,
+            exitPrice: currentPrice,
+            pnl: pnl,
+            roi: roi,
+            fee: fee,
+            timestamp: new Date().toLocaleString()
+        });
+        
+        return { 
+            status: 'ok', 
+            data: { 
+                order_id_str: `PAPER_${Date.now()}_${Math.random()}`,
+                profit: pnl
+            } 
+        };
+    }
 }
 
+// Intercepted HTX request for paper trading
 async function htxRequest(account, method, path, data = {}) {
+    if (PAPER_MODE) {
+        // Intercept order requests
+        if (path === '/linear-swap-api/v1/swap_cross_order' && method === 'POST') {
+            const currentPrice = data.direction === 'buy' ? market.ask : market.bid;
+            if (currentPrice === 0) {
+                return { status: 'error', msg: 'No price available' };
+            }
+            
+            return await executePaperOrder(account, 'order', data.volume, data.direction, data.offset, currentPrice);
+        }
+        
+        // Intercept position info requests
+        if (path === '/linear-swap-api/v1/swap_cross_position_info') {
+            const state = accountStates[account.accountId];
+            const position = paperState.positions[state.direction];
+            
+            if (position.volume > 0) {
+                const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
+                const unrealizedPnl = calculateUnrealizedPnl(
+                    state.direction, 
+                    position.volume, 
+                    position.entryPrice, 
+                    currentPrice, 
+                    config.leverage
+                );
+                const profitRate = unrealizedPnl / ((position.volume * position.entryPrice) / config.leverage);
+                
+                return {
+                    status: 'ok',
+                    data: [{
+                        direction: state.direction,
+                        volume: position.volume.toString(),
+                        cost_open: position.entryPrice.toString(),
+                        profit: unrealizedPnl.toString(),
+                        profit_rate: profitRate.toString()
+                    }]
+                };
+            }
+            
+            return { status: 'ok', data: [] };
+        }
+        
+        // Intercept account info requests
+        if (path === '/linear-swap-api/v1/swap_cross_account_info') {
+            return {
+                status: 'ok',
+                data: [{
+                    margin_balance: paperState.currentBalance.toString(),
+                    withdraw_available: paperState.currentBalance.toString()
+                }]
+            };
+        }
+        
+        // Intercept order info requests
+        if (path === '/linear-swap-api/v1/swap_cross_order_info') {
+            return {
+                status: 'ok',
+                data: [{
+                    status: 6, // Filled
+                    price_avg: market.bid.toString()
+                }]
+            };
+        }
+        
+        // Default response for other requests
+        return { status: 'ok', data: {} };
+    }
+    
+    // Real trading mode (original code)
     try {
         const { timestamp, signature, sortedParams } = getSignature(account, method, path, method === 'GET' ? data : {});
         const url = `https://${config.restHost}${path}?${sortedParams}&Signature=${encodeURIComponent(signature)}`;
@@ -235,6 +404,23 @@ async function htxRequest(account, method, path, data = {}) {
         console.error(`API Error: ${e.message}`);
         return { status: 'error', msg: e.message };
     }
+}
+
+function getSignature(account, method, path, params = {}) {
+    const timestamp = new Date().toISOString().split('.')[0];
+    const allParams = {
+        AccessKeyId: account.apiKey,
+        SignatureMethod: 'HmacSHA256',
+        SignatureVersion: '2',
+        Timestamp: timestamp,
+        ...params
+    };
+    
+    const sortedParams = Object.keys(allParams).sort().map(key => `${key}=${encodeURIComponent(allParams[key])}`).join('&');
+    const payload = [method.toUpperCase(), config.restHost, path, sortedParams].join('\n');
+    const signature = crypto.createHmac('sha256', account.secretKey).update(payload).digest('base64');
+    
+    return { timestamp, signature, sortedParams };
 }
 
 async function fetchPriceRest() {
@@ -320,7 +506,7 @@ async function syncAccount(acc, state) {
                 state.lastRoiUpdateTime = now;
             }
             
-            state.targetPrice = calculateTargetPrice(state);
+            state.targetPrice = calculateTargetPrice(state, market.bid);
             
             if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
             if (!state.startTime) state.startTime = new Date().toLocaleString();
@@ -477,7 +663,7 @@ async function processMartingale() {
                     
                     if (orderInfo?.data?.[0]?.status === 6) {
                         state.entryPrice = parseFloat(orderInfo.data[0].price_avg);
-                        state.targetPrice = calculateTargetPrice(state);
+                        state.targetPrice = calculateTargetPrice(state, currentPrice);
                         console.log(`✅ Position opened at ${state.entryPrice.toFixed(8)}, TP target: ${state.targetPrice.toFixed(8)}`);
                         state.isLocked = false;
                     }
@@ -606,7 +792,7 @@ async function backgroundLoop() {
             if (market.initialTotalEquity === 0 && s1.initialEquity !== null && s2.initialEquity !== null) {
                 market.initialTotalEquity = s1.initialEquity + s2.initialEquity;
                 market.peakEquity = market.initialTotalEquity;
-                console.log(`\n💰 INITIAL TOTAL EQUITY: $${market.initialTotalEquity.toFixed(8)} USDT\n`);
+                console.log(`\n💰 INITIAL TOTAL EQUITY: $${market.initialTotalEquity.toFixed(8)} USDT (PAPER TRADING)\n`);
             }
             
             if (market.initialTotalEquity > 0) {
@@ -632,7 +818,7 @@ async function backgroundLoop() {
                 
                 const lastRecord = market.walletHistory[market.walletHistory.length - 2];
                 if (lastRecord && Math.abs(market.growthPct - lastRecord.pnlPercent) > 0.1) {
-                    console.log(`💰 WALLET: $${totalEquity.toFixed(8)} | PnL: ${market.totalNetGain >= 0 ? '+' : ''}$${market.totalNetGain.toFixed(8)} (${market.growthPct >= 0 ? '+' : ''}${market.growthPct.toFixed(2)}%)`);
+                    console.log(`💰 PAPER WALLET: $${totalEquity.toFixed(8)} | PnL: ${market.totalNetGain >= 0 ? '+' : ''}$${market.totalNetGain.toFixed(8)} (${market.growthPct >= 0 ? '+' : ''}${market.growthPct.toFixed(2)}%)`);
                     console.log(`   Base Volume: ${market.currentBaseVolume} contract(s) (${market.currentBaseShib.toLocaleString()} SHIB) | Risk: $${market.currentRiskAmount.toFixed(8)}`);
                 }
             }
@@ -646,6 +832,28 @@ async function backgroundLoop() {
     }
 }
 
+config.accounts.forEach((account, idx) => {
+    accountStates[account.accountId] = {
+        direction: idx === 0 ? 'buy' : 'sell',
+        roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
+        currentEquity: PAPER_BALANCE / 2, // Split between both accounts
+        availableMargin: PAPER_BALANCE / 2,
+        initialEquity: PAPER_BALANCE / 2,
+        isLocked: false,
+        pendingOrderId: null,
+        lastAction: 'Idle',
+        lastStepPrice: 0, lastAddedVolume: 0, startTime: null,
+        lastExchangeRoi: 0,
+        roiLatencyMs: 0,
+        roiLatencyHistory: [],
+        lastRoiUpdateTime: Date.now(),
+        targetPrice: 0,
+        realizedPnl: 0,
+        totalFees: 0
+    };
+});
+
+// API Routes
 app.get('/api/status', (req, res) => {
     const s1 = accountStates[1];
     const s2 = accountStates[2];
@@ -679,6 +887,9 @@ app.get('/api/status', (req, res) => {
     });
     
     res.json({
+        paperMode: true,
+        paperBalance: paperState.currentBalance,
+        paperInitialBalance: paperState.initialBalance,
         market: {
             ...market,
             totalEquity: totalEquity,
@@ -720,14 +931,17 @@ app.get('/api/status', (req, res) => {
 });
 
 app.post('/api/close', async (req, res) => {
-    console.log("🔴 EMERGENCY CLOSE INITIATED");
+    console.log("🔴 EMERGENCY CLOSE INITIATED (PAPER MODE)");
     market.status = "LIQUIDATING";
     
     for (const acc of config.accounts) {
         const s = accountStates[acc.accountId];
         if (s.volume > 0) {
+            const currentPrice = s.direction === 'buy' ? market.bid : market.ask;
             const step = calculateStepFromVolume(s.volume, market.currentBaseVolume, config.multiplier);
             console.log(`Closing ${s.direction} position (Step ${step}, Vol: ${s.volume})...`);
+            
+            // Execute paper close
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol,
                 volume: s.volume,
@@ -740,7 +954,7 @@ app.post('/api/close', async (req, res) => {
     }
     
     setTimeout(() => market.status = "Active", 5000);
-    res.json({ status: 'ok' });
+    res.json({ status: 'ok', message: 'Emergency close executed in paper mode' });
 });
 
 app.post('/api/force-sync', async (req, res) => {
@@ -757,6 +971,7 @@ app.get('/api/wallet-history', (req, res) => {
     const s2 = accountStates[2];
     
     res.json({
+        paperMode: true,
         currentWallet: {
             totalEquity: (s1?.currentEquity || 0) + (s2?.currentEquity || 0),
             totalRealizedPnl: (s1?.realizedPnl || 0) + (s2?.realizedPnl || 0),
@@ -815,6 +1030,7 @@ app.get('/api/verify', async (req, res) => {
     }
     
     res.json({
+        paperMode: true,
         verified: verification,
         wallet: {
             initialEquity: market.initialTotalEquity,
@@ -838,10 +1054,11 @@ app.get('/api/verify', async (req, res) => {
                 formula: "Volume = Total Wallet ÷ 0.0066135"
             }
         },
-        message: `Auto-compounding: ${config.riskPercent}% of wallet. $${config.walletPerContract.toFixed(8)} wallet = 1 contract at ${config.leverage}x leverage.`
+        message: `⚠️ PAPER TRADING MODE - Virtual Balance: $${paperState.currentBalance.toFixed(2)} USDT | Auto-compounding: ${config.riskPercent}% of wallet. $${config.walletPerContract.toFixed(8)} wallet = 1 contract at ${config.leverage}x leverage.`
     });
 });
 
+// Dashboard HTML (simplified with paper trading indicator)
 app.get('/', (req, res) => {
     const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
     
@@ -851,7 +1068,7 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Martingale Pro - Auto-Compounding</title>
+    <title>Martingale Pro - PAPER TRADING MODE</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
@@ -871,16 +1088,17 @@ app.get('/', (req, res) => {
         .stat-number { font-size: 28px; font-weight: 900; }
         .chart-container { position: relative; height: 280px; width: 100%; }
         .compound-info { background: #00D1B210; border: 1px solid #00D1B230; border-radius: 8px; padding: 12px; margin-top: 10px; }
+        .paper-badge { background: #FFA50020; border: 1px solid #FFA500; color: #FFA500; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: bold; }
     </style>
 </head>
 <body class="p-6">
     <div class="max-w-7xl mx-auto">
         <div class="flex justify-between items-center mb-8">
             <div>
-                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">AUTO-COMPOUND</span></h1>
+                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO</span> <span class="paper-badge">📝 PAPER TRADING</span></h1>
                 <div class="flex items-center gap-3 mt-2">
-                    <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
-                    <span class="text-[10px] font-bold text-emerald-400">LIVE</span>
+                    <div class="w-2 h-2 rounded-full bg-orange-500 animate-pulse"></div>
+                    <span class="text-[10px] font-bold text-orange-400">SIMULATION MODE</span>
                     <span class="text-[10px] text-slate-500">${config.symbol}</span>
                     <span class="text-[10px] text-slate-500">${config.leverage}x LEVERAGE</span>
                     <span class="tp-target">🎯 TP: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price move</span>
@@ -895,8 +1113,8 @@ app.get('/', (req, res) => {
         <div class="wallet-card rounded-2xl p-6 mb-8">
             <div class="grid grid-cols-1 md:grid-cols-5 gap-6">
                 <div>
-                    <p class="stat-label">TOTAL WALLET</p>
-                    <p id="totalWallet" class="stat-number value-positive">$0.00000000</p>
+                    <p class="stat-label">PAPER WALLET</p>
+                    <p id="totalWallet" class="stat-number value-positive">$1000.00000000</p>
                     <p id="walletChange" class="text-xs"></p>
                 </div>
                 <div>
@@ -1015,9 +1233,9 @@ app.get('/', (req, res) => {
         }
         
         async function emergencyClose() {
-            if(confirm('Close ALL positions?')) {
+            if(confirm('Close ALL positions? (Paper Trading Mode)')) {
                 await fetch('/api/close', {method: 'POST'});
-                alert('Emergency liquidation initiated');
+                alert('Emergency liquidation initiated in paper mode');
             }
         }
         
@@ -1046,7 +1264,7 @@ app.get('/', (req, res) => {
                     labels: labels,
                     datasets: [
                         {
-                            label: 'Wallet Equity (USDT)',
+                            label: 'Paper Wallet Equity (USDT)',
                             data: equity,
                             borderColor: '#00D1B2',
                             backgroundColor: 'rgba(0, 209, 178, 0.1)',
@@ -1187,7 +1405,7 @@ app.get('/', (req, res) => {
                     data.tradeHistory.slice(0, 20).forEach(t => {
                         const roiVal = parseFloat(t.roi);
                         tradesHtml += '<tr class="border-b border-[#1A212E]">' +
-                            '<td class="p-3"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + ' font-bold">' + t.side + '</span><tr>' +
+                            '<td class="p-3"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + ' font-bold">' + t.side + '</span></td>' +
                             '<td class="p-3 text-xs">' + (t.openTime || '--') + '</td>' +
                             '<td class="p-3 text-xs">' + (t.closeTime || '--') + '</td>' +
                             '<td class="p-3 text-right">' + (t.step || 0) + '</td>' +
@@ -1217,7 +1435,8 @@ setInterval(backgroundLoop, config.pollInterval);
 app.listen(config.port, '0.0.0.0', () => {
     const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
     
-    console.log(`\n✅ Martingale Pro Started (AUTO-COMPOUNDING CORRECTED)`);
+    console.log(`\n✅ Martingale Pro Started - PAPER TRADING MODE`);
+    console.log(`📝 PAPER BALANCE: $${PAPER_BALANCE} USDT`);
     console.log(`📊 Symbol: ${config.symbol}`);
     console.log(`🔧 Leverage: ${config.leverage}x`);
     console.log(`🎯 Take Profit: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price movement`);
@@ -1225,7 +1444,8 @@ app.listen(config.port, '0.0.0.0', () => {
     console.log(`📐 Formula: $${config.walletPerContract.toFixed(8)} wallet = 1 contract`);
     console.log(`📈 Step Trigger: -${config.stepDistancePct}% ROI (adds martingale when losing)`);
     console.log(`🌐 Dashboard: http://localhost:${config.port}`);
-    console.log(`\n📊 AUTO-COMPOUNDING EXAMPLES:`);
+    console.log(`\n⚠️ PAPER TRADING MODE ACTIVE - No real funds are being traded`);
+    console.log(`📊 AUTO-COMPOUNDING EXAMPLES:`);
     console.log(`   Wallet $${config.walletPerContract.toFixed(8)} → 1 contract → Risk $${(config.walletPerContract * 0.02).toFixed(8)}`);
     console.log(`   Wallet $${(config.walletPerContract * 2).toFixed(8)} → 2 contracts → Risk $${(config.walletPerContract * 2 * 0.02).toFixed(8)}`);
     console.log(`   Wallet $${(config.walletPerContract * 3).toFixed(8)} → 3 contracts → Risk $${(config.walletPerContract * 3 * 0.02).toFixed(8)}\n`);
