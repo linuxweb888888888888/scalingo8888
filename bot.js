@@ -1,665 +1,796 @@
-require('dotenv').config();
 const express = require('express');
-const crypto = require('crypto');
-const axios = require('axios');
-const WebSocket = require('ws');
-const zlib = require('zlib');
+const fs = require('fs');
+const os = require('os');
+const { execSync, spawn } = require('child_process');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const https = require('https');
+const { createWriteStream } = require('fs');
+const { MongoClient } = require('mongodb');
+
+// Apply stealth plugin
+puppeteer.use(StealthPlugin());
 
 const app = express();
 app.use(express.json());
+const port = process.env.PORT || 3000;
 
-// ==================== CONFIGURATION ====================
-// Changed to Static Paper Accounts to match original logic flow
-const apiAccounts = [
-    { apiKey: 'PAPER_1', secretKey: 'PAPER_1', accountId: 1 },
-    { apiKey: 'PAPER_2', secretKey: 'PAPER_2', accountId: 2 }
-];
+// ============ MONGODB CONNECTION ============
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888';
+let dbClient = null;
+let db = null;
 
-const config = {
-    symbol: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase(),
-    symbolClean: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase().replace('-', ''),
-    leverage: parseInt(process.env.LEVERAGE) || 75,
-    port: process.env.PORT || 3000,
-    restHost: 'api.hbdm.com',
-    wsHost: 'wss://api.hbdm.com/linear-swap-ws',
-    accounts: apiAccounts,
-    baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
-    multiplier: 1.2,
-    stepDistancePct: 10, // Triggers at -10% ROI
-    takeProfitPct: 15,
-    maxStartSpread: parseFloat(process.env.MAX_START_SPREAD) || 0.1,
-    takerFeeRate: 0.0005,
-    pollInterval: 500,
-    contractMultiplier: 0.001,
-    autoCompound: true,
-    riskPercent: 2,
-    shibPerContract: 1000,
-    walletPerContract: 0.0066135  // $0.0066135 wallet = 1 contract at 75x leverage
-};
-
-// ==================== PAPER ENGINE STORAGE ====================
-let paperBalances = { 1: 50.0, 2: 50.0 }; // Total $100 starting equity
-let paperPositions = { 1: null, 2: null };
-
-let market = {
-    status: 'Active', bid: 0, ask: 0, spread: 0,
-    totalNetGain: 0, growthPct: 0, dgr: 0,
-    initialTotalEquity: 0, startTime: Date.now(),
-    lastPriceUpdate: 0,
-    walletHistory: [],
-    peakEquity: 0,
-    maxDrawdown: 0,
-    totalTrades: 0,
-    winningTrades: 0,
-    losingTrades: 0,
-    totalFeesPaid: 0,
-    currentBaseVolume: parseInt(process.env.BASE_VOLUME) || 1,
-    currentBaseShib: 0,
-    currentRiskAmount: 0,
-    lastBaseUpdate: Date.now()
-};
-
-let tradeHistory = [];
-let accountStates = {};
-let lastPositionFetch = {};
-let lastBalanceFetch = {};
-
-function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
-    if (!config.autoCompound || totalEquity <= 0) {
-        return config.baseVolume;
-    }
-    let volume = Math.floor(totalEquity / config.walletPerContract);
-    volume = Math.max(1, volume);
-    const MAX_VOLUME = 1000000;
-    if (volume > MAX_VOLUME) {
-        volume = MAX_VOLUME;
-    }
-    const riskAmount = totalEquity * (config.riskPercent / 100);
-    const positionUsdt = riskAmount * config.leverage;
-    const shibAmount = volume * config.shibPerContract;
-    market.currentRiskAmount = riskAmount;
-    market.currentBaseShib = shibAmount;
-    return volume;
-}
-
-function calculateStepFromVolume(volume, baseVolume, multiplier) {
-    if (volume === 0) return 0;
-    let totalVolume = 0;
-    let step = 0;
-    while (totalVolume < volume) {
-        const stepVolume = step === 0 ? baseVolume : Math.ceil(baseVolume * Math.pow(multiplier, step));
-        totalVolume += stepVolume;
-        if (totalVolume <= volume) {
-            step++;
-        } else {
-            break;
-        }
-    }
-    return step;
-}
-
-function calculateVolumeForStep(step, baseVolume, multiplier) {
-    let totalVolume = 0;
-    for (let i = 0; i <= step; i++) {
-        const stepVolume = i === 0 ? baseVolume : Math.ceil(baseVolume * Math.pow(multiplier, i));
-        totalVolume += stepVolume;
-    }
-    return totalVolume;
-}
-
-function calculateTargetPrice(state) {
-    const requiredPriceMovePct = config.takeProfitPct / config.leverage;
-    if (state.direction === 'buy') {
-        const targetPrice = state.entryPrice * (1 + (requiredPriceMovePct / 100));
-        const feeAdjustedTarget = targetPrice * (1 + config.takerFeeRate);
-        return feeAdjustedTarget;
-    } else {
-        const targetPrice = state.entryPrice * (1 - (requiredPriceMovePct / 100));
-        const feeAdjustedTarget = targetPrice * (1 - config.takerFeeRate);
-        return feeAdjustedTarget;
-    }
-}
-
-function updateWalletGrowth(totalEquity) {
-    const now = Date.now();
-    const lastRecord = market.walletHistory[market.walletHistory.length - 1];
-    if (!lastRecord || (now - lastRecord.timestamp) > 60000 || Math.abs(lastRecord.equity - totalEquity) > 0.000001) {
-        market.walletHistory.push({
-            timestamp: now,
-            time: new Date().toLocaleString(),
-            equity: totalEquity,
-            pnl: totalEquity - market.initialTotalEquity,
-            pnlPercent: market.initialTotalEquity > 0 ? ((totalEquity - market.initialTotalEquity) / market.initialTotalEquity) * 100 : 0,
-            baseVolume: market.currentBaseVolume,
-            baseShib: market.currentBaseShib,
-            riskAmount: market.currentRiskAmount
-        });
-        if (market.walletHistory.length > 100) market.walletHistory.shift();
-    }
-    if (totalEquity > market.peakEquity) {
-        market.peakEquity = totalEquity;
-    }
-    if (market.peakEquity > 0) {
-        const currentDrawdown = ((market.peakEquity - totalEquity) / market.peakEquity) * 100;
-        if (currentDrawdown > market.maxDrawdown) {
-            market.maxDrawdown = currentDrawdown;
-        }
-    }
-}
-
-config.accounts.forEach((account, idx) => {
-    accountStates[account.accountId] = {
-        direction: idx === 0 ? 'buy' : 'sell',
-        roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
-        currentEquity: 0, availableMargin: 0, initialEquity: null,
-        isLocked: false,
-        pendingOrderId: null,
-        lastAction: 'Idle',
-        lastStepPrice: 0, lastAddedVolume: 0, startTime: null,
-        lastExchangeRoi: 0,
-        roiLatencyMs: 0,
-        roiLatencyHistory: [],
-        lastRoiUpdateTime: Date.now(),
-        targetPrice: 0,
-        realizedPnl: 0,
-        totalFees: 0
-    };
-});
-
-// ==================== MOCKED HTX REQUEST (PAPER ENGINE) ====================
-async function htxRequest(account, method, path, data = {}) {
-    const accId = account.accountId;
-    const price = market.bid || 0;
-
-    // Simulate Account Balance
-    if (path.includes('swap_cross_account_info')) {
-        let unrealized = 0;
-        const pos = paperPositions[accId];
-        if (pos) {
-            const sideMult = pos.direction === 'buy' ? 1 : -1;
-            unrealized = pos.volume * config.shibPerContract * config.contractMultiplier * (price - pos.entryPrice) * sideMult;
-        }
-        return { status: 'ok', data: [{ margin_balance: paperBalances[accId] + unrealized, withdraw_available: paperBalances[accId] }] };
-    }
-
-    // Simulate Position Data
-    if (path.includes('swap_cross_position_info')) {
-        const pos = paperPositions[accId];
-        if (!pos) return { status: 'ok', data: [] };
-        const sideMult = pos.direction === 'buy' ? 1 : -1;
-        const pnl = pos.volume * config.shibPerContract * config.contractMultiplier * (price - pos.entryPrice) * sideMult;
-        const margin = (pos.volume * config.shibPerContract * config.contractMultiplier * pos.entryPrice) / config.leverage;
-        return { status: 'ok', data: [{ direction: pos.direction, volume: pos.volume, cost_open: pos.entryPrice, profit: pnl, profit_rate: pnl/margin }] };
-    }
-
-    // Simulate Order Info
-    if (path.includes('swap_cross_order_info')) {
-        return { status: 'ok', data: [{ status: 6, price_avg: price }] };
-    }
-
-    // Simulate Order Execution
-    if (path.includes('swap_cross_order')) {
-        if (price === 0) return { status: 'error' };
-        const fee = data.volume * config.shibPerContract * config.contractMultiplier * price * config.takerFeeRate;
-        paperBalances[accId] -= fee;
-        if (data.offset === 'open') {
-            const current = paperPositions[accId];
-            if (current) {
-                const totalVol = current.volume + data.volume;
-                const newEntry = ((current.entryPrice * current.volume) + (price * data.volume)) / totalVol;
-                paperPositions[accId] = { direction: data.direction, volume: totalVol, entryPrice: newEntry };
-            } else {
-                paperPositions[accId] = { direction: data.direction, volume: data.volume, entryPrice: price };
-            }
-        } else {
-            const pos = paperPositions[accId];
-            const sideMult = pos.direction === 'buy' ? 1 : -1;
-            const pnl = pos.volume * config.shibPerContract * config.contractMultiplier * (price - pos.entryPrice) * sideMult;
-            paperBalances[accId] += pnl;
-            paperPositions[accId] = null;
-        }
-        return { status: 'ok', data: { order_id_str: 'PAPER-' + Date.now() } };
-    }
-    return { status: 'ok' };
-}
-
-async function fetchPriceRest() {
+async function connectMongoDB() {
     try {
-        const url = `https://${config.restHost}/linear-swap-ex/market/detail/merged?contract_code=${config.symbol}`;
-        const res = await axios.get(url, { timeout: 3000 });
-        if (res.data?.tick) {
-            market.bid = parseFloat(res.data.tick.bid[0]);
-            market.ask = parseFloat(res.data.tick.ask[0]);
-            market.spread = ((market.ask - market.bid) / market.bid) * 100;
-            market.lastPriceUpdate = Date.now();
-        }
-    } catch (e) {}
-}
-
-async function syncAccount(acc, state) {
-    const now = Date.now();
-    
-    if (state.pendingOrderId) {
-        const orderRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order_info', {
-            contract_code: config.symbol,
-            order_id: state.pendingOrderId
-        });
-        if (orderRes?.data?.[0]?.status === 6 || orderRes?.data?.[0]?.status === 7) {
-            state.pendingOrderId = null;
-            state.isLocked = false;
-        } else if (orderRes?.data?.[0]?.status === 4 || orderRes?.data?.[0]?.status === 5) {
-            state.pendingOrderId = null;
-            state.isLocked = false;
-        } else {
-            return;
-        }
-    }
-
-    if (state.isLocked) return;
-
-    if (lastPositionFetch[acc.accountId] && (now - lastPositionFetch[acc.accountId]) < config.pollInterval) {
-        return;
-    }
-    lastPositionFetch[acc.accountId] = now;
-
-    const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', {
-        contract_code: config.symbol
-    });
-
-    if (posRes?.status === 'ok' && posRes.data) {
-        const positions = posRes.data;
-        const pos = positions.find(p => p.direction === state.direction);
+        dbClient = new MongoClient(MONGODB_URI);
+        await dbClient.connect();
+        db = dbClient.db('botdb');
+        console.log('[MongoDB] Connected successfully');
         
-        if (pos && parseFloat(pos.volume) > 0) {
-            const newVolume = parseFloat(pos.volume);
-            const newEntryPrice = parseFloat(pos.cost_open);
-            const rawProfitRate = parseFloat(pos.profit_rate);
-            const newExchangeRoi = rawProfitRate * 100;
-            const newUnrealizedUsdt = parseFloat(pos.profit);
-            
-            state.volume = newVolume;
-            state.entryPrice = newEntryPrice;
-            state.unrealizedUsdt = newUnrealizedUsdt;
-            
-            const calculatedStep = calculateStepFromVolume(newVolume, market.currentBaseVolume, config.multiplier);
-            
-            if (Math.abs(newExchangeRoi - state.roi) > 0.01) {
-                const timeSinceLastUpdate = now - state.lastRoiUpdateTime;
-                state.roiLatencyMs = timeSinceLastUpdate;
-                state.roiLatencyHistory.unshift({
-                    timestamp: now, exchangeRoi: newExchangeRoi, botRoi: state.roi, latencyMs: timeSinceLastUpdate,
-                    difference: Math.abs(newExchangeRoi - state.roi).toFixed(2), volume: newVolume, step: calculatedStep
-                });
-                if (state.roiLatencyHistory.length > 10) state.roiLatencyHistory.pop();
-                state.roi = newExchangeRoi;
-                state.lastExchangeRoi = newExchangeRoi;
-                state.lastRoiUpdateTime = now;
+        await db.createCollection('accounts', { capped: false });
+        await db.createCollection('metrics', { capped: false });
+        await db.collection('accounts').createIndex({ createdAt: -1 });
+        
+        return true;
+    } catch (error) {
+        console.error('[MongoDB] Connection failed:', error.message);
+        return false;
+    }
+}
+
+// ============ ENVIRONMENT VARIABLES ============
+const ENV = {
+    BOT_PASSWORD: process.env.BOT_PASSWORD || 'Linuxdistro&84',
+    BOT_START_DELAY: parseInt(process.env.BOT_START_DELAY) || 10,
+    HEADLESS_MODE: process.env.HEADLESS_MODE !== 'false',
+    CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/app/chrome-linux64/chrome',
+    CLEVER_TOKEN: process.env.CLEVER_TOKEN || '',
+    SCALINGO_API_TOKEN: process.env.SCALINGO_API_TOKEN || '',
+    SCALINGO_APP_NAME: process.env.SCALINGO_APP_NAME || ''
+};
+
+console.log('\n========================================');
+console.log('  BOT CONFIGURATION');
+console.log('========================================');
+console.log(`Bot Mode: Creates ONE account, then CLI RESTART for NEW IP`);
+console.log(`MongoDB: ${MONGODB_URI ? 'Connected' : 'Not configured'}`);
+console.log(`Clever Token: ${ENV.CLEVER_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
+console.log(`Scalingo App: ${ENV.SCALINGO_APP_NAME || 'Not set'}`);
+console.log(`Scalingo API Token: ${ENV.SCALINGO_API_TOKEN ? '✓ Configured' : '✗ Not configured'}`);
+console.log('========================================\n');
+
+// ============ STATE VARIABLES ============
+let botStatus = {
+    state: 'starting',
+    accountCreated: false,
+    accountEmail: null,
+    startTime: new Date(),
+    completionTime: null,
+    restartCount: 0
+};
+
+// ============ HELPER FUNCTIONS ============
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function log(step, message, type = 'info', instanceId = 'MAIN') {
+    const timestamp = new Date().toLocaleTimeString();
+    console.log(`[${timestamp}] [${instanceId}] [${step}] ${message}`);
+}
+
+async function downloadFile(url, destPath) {
+    return new Promise((resolve, reject) => {
+        const file = createWriteStream(destPath);
+        https.get(url, (response) => {
+            if (response.statusCode !== 200) {
+                reject(new Error(`Failed to download: ${response.statusCode}`));
+                return;
             }
-            state.targetPrice = calculateTargetPrice(state);
-            if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
-            if (!state.startTime) state.startTime = new Date().toLocaleString();
-        } else {
-            if (state.volume !== 0) {
-                state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.entryPrice = 0;
-                state.lastStepPrice = 0; state.startTime = null; state.lastAddedVolume = 0;
-                state.lastExchangeRoi = 0; state.targetPrice = 0;
-            }
+            response.pipe(file);
+            file.on('finish', () => {
+                file.close();
+                resolve();
+            });
+        }).on('error', reject);
+    });
+}
+
+async function installChromiumRuntime() {
+    const chromePath = ENV.CHROMIUM_PATH;
+    
+    if (fs.existsSync(chromePath)) {
+        const stats = fs.statSync(chromePath);
+        if (stats.size > 50000000) {
+            return chromePath;
         }
     }
-
-    if (lastBalanceFetch[acc.accountId] && (now - lastBalanceFetch[acc.accountId]) < 10000) return;
-    lastBalanceFetch[acc.accountId] = now;
-
-    const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', { margin_asset: 'USDT' });
-    if (accRes?.status === 'ok' && accRes.data?.[0]) {
-        state.currentEquity = parseFloat(accRes.data[0].margin_balance);
-        state.availableMargin = parseFloat(accRes.data[0].withdraw_available);
-        if (state.initialEquity === null) state.initialEquity = state.currentEquity;
+    
+    log('SYSTEM', 'Installing Chromium...', 'info', 'MAIN');
+    
+    try {
+        const chromeUrl = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
+        const zipPath = '/tmp/chromium.zip';
+        
+        await downloadFile(chromeUrl, zipPath);
+        execSync(`unzip -q ${zipPath} -d /app/`, { stdio: 'inherit' });
+        
+        if (fs.existsSync(chromePath)) {
+            fs.chmodSync(chromePath, 0o755);
+            fs.unlinkSync(zipPath);
+            return chromePath;
+        }
+        throw new Error('Chrome binary not found');
+    } catch (error) {
+        log('SYSTEM', `Failed: ${error.message}`, 'error', 'MAIN');
+        return null;
     }
 }
 
-function logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl) {
-    const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
-    const estimatedFee = Math.abs(finalPnl) * config.takerFeeRate;
-    market.totalTrades++;
-    if (finalPnl >= 0) market.winningTrades++; else market.losingTrades++;
-    market.totalFeesPaid += estimatedFee;
-    tradeHistory.unshift({
-        symbol: config.symbolClean + 'Perpetual', side: state.direction === 'buy' ? 'LONG' : 'SHORT',
-        openTime: state.startTime, closeTime: exitTime, volume: state.volume, step: step,
-        entryPrice: state.entryPrice.toFixed(8), exitPrice: exitPrice.toFixed(8), roi: finalRoi.toFixed(2) + '%',
-        netPnlUsdt: finalPnl.toFixed(8), estimatedFee: estimatedFee.toFixed(8)
-    });
-    if (tradeHistory.length > 20) tradeHistory.pop();
-    state.realizedPnl += finalPnl;
-    state.totalFees += estimatedFee;
+// ============ INSTALL SCALINGO CLI AT RUNTIME ============
+function installScalingoCLI() {
+    const cliPath = '/app/bin/scalingo';
+    
+    if (fs.existsSync(cliPath)) {
+        console.log('[CLI] Scalingo CLI already installed');
+        return true;
+    }
+    
+    console.log('[CLI] Installing Scalingo CLI...');
+    
+    try {
+        if (!fs.existsSync('/app/bin')) {
+            fs.mkdirSync('/app/bin', { recursive: true });
+        }
+        
+        console.log('[CLI] Downloading...');
+        execSync('curl -L -o /tmp/scalingo.tar.gz https://github.com/Scalingo/cli/releases/download/1.44.1/scalingo_1.44.1_linux_amd64.tar.gz', { stdio: 'inherit' });
+        
+        console.log('[CLI] Extracting...');
+        execSync('cd /tmp && tar -xzf scalingo.tar.gz', { stdio: 'inherit' });
+        
+        console.log('[CLI] Copying binary...');
+        execSync('cp /tmp/scalingo_1.44.1_linux_amd64/scalingo /app/bin/scalingo', { stdio: 'inherit' });
+        
+        execSync('chmod +x /app/bin/scalingo', { stdio: 'inherit' });
+        execSync('rm -rf /tmp/scalingo_1.44.1_linux_amd64 /tmp/scalingo.tar.gz', { stdio: 'inherit' });
+        
+        console.log('[CLI] ✅ Scalingo CLI installed successfully');
+        return true;
+        
+    } catch (error) {
+        console.error('[CLI] Failed to install:', error.message);
+        return false;
+    }
 }
 
-function startWS() {
-    const ws = new WebSocket(config.wsHost);
-    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
-    ws.on('message', (data) => {
-        zlib.gunzip(data, (err, dec) => {
-            if (err) return;
-            try {
-                const msg = JSON.parse(dec.toString());
-                if (msg.tick && msg.ch && msg.ch.includes('bbo')) {
-                    market.bid = msg.tick.bid[0]; market.ask = msg.tick.ask[0];
-                    market.spread = ((market.ask - market.bid) / market.bid) * 100;
-                    market.lastPriceUpdate = Date.now();
-                }
-                if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
-            } catch (e) {}
+// ============ RESTART VIA CLI ============
+async function restartWithCLI() {
+    const cliPath = '/app/bin/scalingo';
+    const appName = ENV.SCALINGO_APP_NAME;
+    const apiToken = ENV.SCALINGO_API_TOKEN;
+    
+    if (!fs.existsSync(cliPath)) {
+        log('RESTART', 'Scalingo CLI not found', 'error', 'MAIN');
+        return false;
+    }
+    
+    if (!appName) {
+        log('RESTART', 'SCALINGO_APP_NAME not set', 'error', 'MAIN');
+        return false;
+    }
+    
+    if (!apiToken) {
+        log('RESTART', 'SCALINGO_API_TOKEN not set', 'error', 'MAIN');
+        return false;
+    }
+    
+    log('RESTART', `Restarting ${appName} via CLI...`, 'info', 'MAIN');
+    
+    return new Promise((resolve) => {
+        const cmd = `${cliPath} login --api-token "${apiToken}" && ${cliPath} --app ${appName} restart`;
+        
+        const child = spawn('bash', ['-c', cmd]);
+        
+        child.stdout.on('data', (data) => {
+            console.log(`[CLI] ${data.toString().trim()}`);
+        });
+        
+        child.stderr.on('data', (data) => {
+            console.log(`[CLI ERR] ${data.toString().trim()}`);
+        });
+        
+        child.on('close', (code) => {
+            if (code === 0) {
+                log('RESTART', '✅ CLI restart initiated successfully!', 'success', 'MAIN');
+                resolve(true);
+            } else {
+                log('RESTART', `CLI restart failed with code ${code}`, 'error', 'MAIN');
+                resolve(false);
+            }
         });
     });
-    ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-async function processMartingale() {
-    for (const acc of config.accounts) {
-        const state = accountStates[acc.accountId];
-        if (state.isLocked || market.bid === 0 || market.ask === 0) continue;
-        const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
-        if (currentPrice === 0) continue;
-
-        if (state.volume === 0) {
-            if (market.spread > config.maxStartSpread && market.spread > 0) {
-                state.lastAction = `Wait Spread (${market.spread.toFixed(2)}% > ${config.maxStartSpread}%)`;
-                continue;
-            }
-            state.isLocked = true;
-            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: market.currentBaseVolume, direction: state.direction, offset: 'open',
-                lever_rate: config.leverage, order_price_type: 'optimal_20'
-            });
-            if (res?.status === 'ok') {
-                state.pendingOrderId = res.data.order_id_str;
-                setTimeout(async () => {
-                    const orderInfo = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order_info', {
-                        contract_code: config.symbol, order_id: res.data.order_id_str
-                    });
-                    if (orderInfo?.data?.[0]?.status === 6) {
-                        state.entryPrice = parseFloat(orderInfo.data[0].price_avg);
-                        state.targetPrice = calculateTargetPrice(state);
-                        state.isLocked = false;
-                    }
-                }, 2000);
-            } else { state.isLocked = false; }
-            continue;
+// ============ TEST SCALINGO CLI ============
+function testScalingoCLI() {
+    const cliPath = '/app/bin/scalingo';
+    
+    console.log('\n========================================');
+    console.log('  TESTING SCALINGO CLI');
+    console.log('========================================');
+    
+    if (fs.existsSync(cliPath)) {
+        console.log(`✅ Scalingo CLI found at: ${cliPath}`);
+        try {
+            const version = execSync(`${cliPath} version`, { encoding: 'utf8' });
+            console.log(`✅ Version: ${version.trim()}`);
+        } catch(e) {
+            console.log(`❌ Failed to get version: ${e.message}`);
         }
-
-        let shouldTakeProfit = state.direction === 'buy' ? (market.ask >= state.targetPrice) : (market.bid <= state.targetPrice);
-        if (shouldTakeProfit && state.targetPrice > 0) {
-            const finalRoi = config.takeProfitPct;
-            const finalPnl = state.unrealizedUsdt;
-            state.isLocked = true;
-            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy',
-                offset: 'close', lever_rate: config.leverage, order_price_type: 'optimal_20'
-            });
-            if (res?.status === 'ok') {
-                state.pendingOrderId = res.data.order_id_str;
-                logTradeExchangeStyle(state, currentPrice, new Date().toLocaleString(), finalRoi, finalPnl);
-                state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0; state.entryPrice = 0;
-                state.lastStepPrice = 0; state.startTime = null; state.targetPrice = 0;
-            } else { state.isLocked = false; }
-            continue;
-        }
-
-        const currentStep = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
-        if (state.roi <= -10 && state.volume > 0) {
-            const nextStepNumber = currentStep + 1;
-            const nextVol = Math.ceil(market.currentBaseVolume * Math.pow(config.multiplier, nextStepNumber));
-            state.isLocked = true;
-            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: nextVol, direction: state.direction, offset: 'open',
-                lever_rate: config.leverage, order_price_type: 'optimal_20'
-            });
-            if (res?.status === 'ok') {
-                state.pendingOrderId = res.data.order_id_str;
-                state.lastAction = `Martingale Step ${nextStepNumber} (-${Math.abs(state.roi).toFixed(1)}% loss)`;
-            } else { state.isLocked = false; }
-        } else {
-            state.lastAction = `Active - Step ${currentStep} | ROI: ${state.roi.toFixed(2)}%`;
-        }
+    } else {
+        console.log('❌ Scalingo CLI not found');
     }
+    
+    console.log('========================================\n');
 }
 
-async function backgroundLoop() {
-    try {
-        if (Date.now() - market.lastPriceUpdate > 2000) await fetchPriceRest();
-        for (const acc of config.accounts) await syncAccount(acc, accountStates[acc.accountId]);
-        const s1 = accountStates[1]; const s2 = accountStates[2];
-        if (s1 && s2) {
-            if (market.initialTotalEquity === 0 && s1.initialEquity !== null && s2.initialEquity !== null) {
-                market.initialTotalEquity = s1.initialEquity + s2.initialEquity;
-                market.peakEquity = market.initialTotalEquity;
-            }
-            if (market.initialTotalEquity > 0) {
-                const totalEquity = s1.currentEquity + s2.currentEquity;
-                market.totalNetGain = totalEquity - market.initialTotalEquity;
-                market.growthPct = (market.totalNetGain / market.initialTotalEquity) * 100;
-                const elapsedHours = (Date.now() - market.startTime) / (1000 * 60 * 60);
-                market.dgr = elapsedHours > 0 ? (market.growthPct / elapsedHours) : 0;
-                if (config.autoCompound && market.bid > 0) {
-                    market.currentBaseVolume = calculateBaseVolumeFromWallet(totalEquity, market.bid);
-                }
-                updateWalletGrowth(totalEquity);
-            }
+// ============ BOT CLASS ============
+class CleverCloudBot {
+    constructor(instanceId, password, startDelay = 0) {
+        this.instanceId = instanceId;
+        this.browser = null;
+        this.page = null;
+        this.mailPage = null;
+        this.realTempEmail = null;
+        this.password = password;
+        this.startDelay = startDelay;
+        this.chromePath = null;
+        this.oauthHandled = false;
+    }
+
+    async initBrowser() {
+        if (!this.chromePath) {
+            this.chromePath = await installChromiumRuntime();
         }
-        if (market.status === 'Active') await processMartingale();
-    } catch (e) { console.error('Background loop error:', e); }
-}
-
-app.get('/api/status', (req, res) => {
-    const s1 = accountStates[1]; const s2 = accountStates[2];
-    const totalEquity = (s1?.currentEquity || 0) + (s2?.currentEquity || 0);
-    const accountsWithInfo = Object.values(accountStates).map(state => {
-        const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
-        return {
-            direction: state.direction, roi: state.roi, volume: state.volume, step: step,
-            unrealizedUsdt: state.unrealizedUsdt, entryPrice: state.entryPrice, lastAction: state.lastAction,
-            startTime: state.startTime, targetPrice: state.targetPrice, currentEquity: state.currentEquity,
-            initialEquity: state.initialEquity, realizedPnl: state.realizedPnl, totalFees: state.totalFees
+        if (!this.chromePath) throw new Error('No Chromium found');
+        
+        const launchOptions = {
+            headless: ENV.HEADLESS_MODE,
+            executablePath: this.chromePath,
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
         };
-    });
-    res.json({
-        market: { ...market, totalEquity, totalRealizedPnl: (s1?.realizedPnl || 0) + (s2?.realizedPnl || 0), winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0 },
-        accounts: accountsWithInfo, tradeHistory, config: { ...config, baseVolume: market.currentBaseVolume }
-    });
-});
+        
+        this.browser = await puppeteer.launch(launchOptions);
+        this.page = await this.browser.newPage();
+        await this.page.setViewport({ width: 1280, height: 800 });
+    }
 
-app.post('/api/force-sync', async (req, res) => {
-    for (const acc of config.accounts) await syncAccount(acc, accountStates[acc.accountId]);
-    res.json({ status: 'ok' });
-});
+    async fetchTempEmail() {
+        log('EMAIL', 'Getting temp email...', 'info', this.instanceId);
+        this.mailPage = await this.browser.newPage();
+        await this.mailPage.goto('https://10minutemail.net/', { waitUntil: 'domcontentloaded' });
+        await sleep(5000);
+        
+        this.realTempEmail = await this.mailPage.evaluate(() => {
+            const input = document.querySelector('#fe_text');
+            if (input && input.value) return input.value;
+            const span = document.querySelector('#mailAddress');
+            return span ? span.textContent : null;
+        });
+        
+        if (!this.realTempEmail) {
+            throw new Error('Could not extract email');
+        }
+        
+        log('EMAIL', this.realTempEmail, 'success', this.instanceId);
+        return this.realTempEmail;
+    }
 
-app.post('/api/close', async (req, res) => {
-    market.status = "LIQUIDATING";
-    for (const acc of config.accounts) {
-        const s = accountStates[acc.accountId];
-        if (s.volume > 0) {
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: s.volume, direction: s.direction === 'buy' ? 'sell' : 'buy', offset: 'close'
+    async handleSignup(email, password) {
+        log('SIGNUP', 'Creating account...', 'info', this.instanceId);
+        
+        await this.page.goto('https://api.clever-cloud.com/v2/sessions/signup', { waitUntil: 'networkidle2' });
+        await sleep(3000);
+        
+        await this.page.waitForSelector('input[type="email"]');
+        await this.page.type('input[type="email"]', email);
+        await this.page.type('input[type="password"]', password);
+        
+        await this.page.evaluate(() => {
+            const checkbox = document.querySelector('input[type="checkbox"]');
+            if (checkbox) checkbox.click();
+        });
+        
+        await this.page.evaluate(() => {
+            const cb = document.querySelector('#altcha_checkbox');
+            if (cb) cb.click();
+        });
+        
+        log('CAPTCHA', 'Waiting for solution...', 'info', this.instanceId);
+        let captchaSolved = false;
+        for (let i = 0; i < 60; i++) {
+            const solved = await this.page.evaluate(() => {
+                const input = document.querySelector('input[name="altcha"]');
+                return input && input.value && input.value.length > 20;
             });
+            if (solved) {
+                log('CAPTCHA', 'Solved!', 'success', this.instanceId);
+                captchaSolved = true;
+                break;
+            }
+            await sleep(1000);
+        }
+        
+        if (!captchaSolved) {
+            log('CAPTCHA', 'Warning: CAPTCHA may not have solved', 'warn', this.instanceId);
+        }
+        
+        await this.page.evaluate(() => {
+            const btn = Array.from(document.querySelectorAll('button')).find(x => x.innerText.toLowerCase().includes('sign up'));
+            if (btn) btn.click();
+        });
+        
+        await sleep(8000);
+        log('SIGNUP', 'Form submitted', 'success', this.instanceId);
+    }
+
+    async getVerificationLink() {
+        log('VERIFY', 'Waiting for verification email...', 'info', this.instanceId);
+        const startTime = Date.now();
+        let emailFound = false;
+        
+        while (Date.now() - startTime < 180000) {
+            let link = await this.mailPage.evaluate(() => {
+                const regex = /https:\/\/api\.clever-cloud\.com\/v2\/self\/validate_email\?validationKey=[a-f0-9-]+/;
+                const match = document.documentElement.innerHTML.match(regex);
+                return match ? match[0] : null;
+            });
+            
+            if (link) {
+                log('VERIFY', 'Verification link found!', 'success', this.instanceId);
+                return link;
+            }
+            
+            if (!emailFound) {
+                const clicked = await this.mailPage.evaluate(() => {
+                    const rows = Array.from(document.querySelectorAll('#maillist tr'));
+                    for (const row of rows) {
+                        const text = (row.innerText || '').toLowerCase();
+                        if (text.includes('clever cloud') || text.includes('clever-cloud')) {
+                            const a = row.querySelector('a');
+                            if (a) {
+                                a.click();
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                });
+                
+                if (clicked) {
+                    emailFound = true;
+                    log('VERIFY', 'Email found, loading content...', 'success', this.instanceId);
+                    await sleep(8000);
+                    continue;
+                }
+            }
+            
+            const elapsed = Math.floor((Date.now() - startTime) / 1000);
+            console.log(`  Waiting for email... ${elapsed}s / 180s`);
+            await sleep(5000);
+        }
+        
+        throw new Error('No verification email received after 3 minutes');
+    }
+
+    async handleOAuth(url, email, password) {
+        log('OAUTH', '========================================', 'info', this.instanceId);
+        log('OAUTH', 'Opening OAuth URL for auto-login...', 'info', this.instanceId);
+        
+        try {
+            const oauthPage = await this.browser.newPage();
+            await oauthPage.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+            log('OAUTH', 'OAuth page loaded', 'success', this.instanceId);
+            await sleep(3000);
+            
+            const credentialsFilled = await oauthPage.evaluate((email, password) => {
+                const emailField = document.querySelector('input[type="email"], input[name="email"], input[id="email"]');
+                const passwordField = document.querySelector('input[type="password"], input[name="password"], input[id="password"]');
+                
+                if (emailField && passwordField) {
+                    emailField.value = email;
+                    passwordField.value = password;
+                    emailField.dispatchEvent(new Event('input', { bubbles: true }));
+                    passwordField.dispatchEvent(new Event('input', { bubbles: true }));
+                    return true;
+                }
+                return false;
+            }, email, password);
+            
+            if (credentialsFilled) {
+                log('OAUTH', 'Credentials filled successfully', 'success', this.instanceId);
+                await sleep(2000);
+                
+                const loginClicked = await oauthPage.evaluate(() => {
+                    const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
+                    const loginButton = buttons.find(btn => {
+                        const text = (btn.innerText || btn.value || '').toLowerCase();
+                        return text.includes('login') || text.includes('sign in') || text.includes('log in');
+                    });
+                    if (loginButton) {
+                        loginButton.click();
+                        return true;
+                    }
+                    const form = document.querySelector('form');
+                    if (form) {
+                        form.submit();
+                        return true;
+                    }
+                    return false;
+                });
+                
+                if (loginClicked) {
+                    log('OAUTH', 'Login button clicked!', 'success', this.instanceId);
+                }
+            }
+            
+            await sleep(8000);
+            await oauthPage.close();
+            log('OAUTH', 'OAuth flow completed', 'success', this.instanceId);
+            log('OAUTH', '========================================', 'info', this.instanceId);
+            return true;
+        } catch (error) {
+            log('OAUTH', `OAuth error: ${error.message}`, 'error', this.instanceId);
+            return false;
         }
     }
-    setTimeout(() => market.status = "Active", 5000);
-    res.json({ status: 'ok' });
+
+    async startDockerInBackground(email, password) {
+        return new Promise((resolve, reject) => {
+            const dockerId = `${this.instanceId}_${Date.now()}`;
+            const logFile = `docker_${this.instanceId}_${dockerId}.log`;
+            
+            log('DOCKER', 'Starting Docker deployment...', 'info', this.instanceId);
+            
+            const dockerScriptPath = '/app/docker';
+            if (!fs.existsSync(dockerScriptPath)) {
+                log('DOCKER', 'Docker script not found', 'warn', this.instanceId);
+                resolve({ success: true, email, deployedApps: [] });
+                return;
+            }
+            
+            const dockerProcess = spawn('bash', [dockerScriptPath], { 
+                detached: true, 
+                stdio: ['ignore', 'pipe', 'pipe'],
+                env: { ...process.env, CLEVER_TOKEN: ENV.CLEVER_TOKEN }
+            });
+            
+            let deployedApps = [];
+            let oauthUrlDetected = false;
+            
+            const extractOAuthUrl = (output) => {
+                const match = output.match(/https:\/\/console\.clever-cloud\.com\/cli-oauth\?[^\s]+/);
+                return match ? match[0] : null;
+            };
+            
+            dockerProcess.stdout.on('data', async (data) => {
+                const output = data.toString();
+                console.log(`[DOCKER] ${output.trim()}`);
+                
+                if (!oauthUrlDetected && !this.oauthHandled) {
+                    const oauthUrl = extractOAuthUrl(output);
+                    if (oauthUrl) {
+                        oauthUrlDetected = true;
+                        this.oauthHandled = true;
+                        log('OAUTH', 'Detected OAuth URL, handling automatically...', 'success', this.instanceId);
+                        await this.handleOAuth(oauthUrl, email, password);
+                    }
+                }
+                
+                const urlMatch = output.match(/https:\/\/[a-z0-9-]+\.osc-fr1\.scalingo\.io/);
+                if (urlMatch && !deployedApps.includes(urlMatch[0])) {
+                    deployedApps.push(urlMatch[0]);
+                    log('DOCKER', `App deployed: ${urlMatch[0]}`, 'success', this.instanceId);
+                }
+                
+                if (output.includes('All 3 apps deployed')) {
+                    log('DOCKER', 'Deployment completed successfully!', 'success', this.instanceId);
+                    resolve({ success: true, email, deployedApps });
+                }
+            });
+            
+            dockerProcess.stderr.on('data', (data) => {
+                const err = data.toString();
+                console.error(`[DOCKER ERR] ${err.trim()}`);
+            });
+            
+            dockerProcess.on('close', (code) => {
+                if (deployedApps.length > 0) {
+                    resolve({ success: true, email, deployedApps });
+                } else if (code === 0) {
+                    resolve({ success: true, email, deployedApps: [] });
+                } else {
+                    reject(new Error(`Docker exited with code ${code}`));
+                }
+            });
+            
+            dockerProcess.unref();
+            
+            setTimeout(() => {
+                if (deployedApps.length > 0) {
+                    resolve({ success: true, email, deployedApps });
+                } else {
+                    reject(new Error('Docker deployment timeout'));
+                }
+            }, 600000);
+        });
+    }
+
+    async cleanup() {
+        if (this.browser) await this.browser.close();
+    }
+
+    async run() {
+        if (this.startDelay > 0) {
+            log('START', `Waiting ${this.startDelay}s...`, 'warn', this.instanceId);
+            await sleep(this.startDelay * 1000);
+        }
+        
+        log('START', '=== CREATING ONE ACCOUNT ===', 'info', this.instanceId);
+        botStatus.state = 'running';
+        
+        let accountCreated = false;
+        let accountEmail = null;
+        
+        try {
+            await this.initBrowser();
+            
+            accountEmail = await this.fetchTempEmail();
+            botStatus.accountEmail = accountEmail;
+            
+            await this.handleSignup(accountEmail, this.password);
+            const verifyLink = await this.getVerificationLink();
+            
+            log('VERIFY', 'Activating account...', 'info', this.instanceId);
+            await this.page.goto(verifyLink, { waitUntil: 'domcontentloaded' });
+            await sleep(5000);
+            
+            const result = await this.startDockerInBackground(accountEmail, this.password);
+            
+            if (db) {
+                await db.collection('accounts').insertOne({
+                    email: accountEmail,
+                    password: this.password,
+                    deployedApps: result.deployedApps || [],
+                    createdAt: new Date(),
+                    instanceId: this.instanceId
+                });
+            }
+            
+            accountCreated = true;
+            botStatus.accountCreated = true;
+            
+            log('SUCCESS', `✓ Account ${accountEmail} created successfully!`, 'success', this.instanceId);
+            
+        } catch (error) {
+            log('ERROR', `${error.message}`, 'error', this.instanceId);
+            log('FAILURE', 'Account creation failed - will restart to retry', 'warn', this.instanceId);
+        }
+        
+        await this.cleanup();
+        
+        botStatus.completionTime = new Date();
+        botStatus.state = accountCreated ? 'completed' : 'failed';
+        botStatus.restartCount++;
+        
+        log('RESTART', `========================================`, 'info', this.instanceId);
+        log('RESTART', `${accountCreated ? 'Account created' : 'Account creation failed'} - Restarting for NEW IP`, 'info', this.instanceId);
+        log('RESTART', `This was attempt #${botStatus.restartCount}`, 'info', this.instanceId);
+        log('RESTART', `========================================`, 'info', this.instanceId);
+        
+        const cliSuccess = await restartWithCLI();
+        
+        if (!cliSuccess) {
+            log('RESTART', 'CLI restart failed, using exit restart', 'warn', 'MAIN');
+        }
+        
+        await sleep(2000);
+        process.exit(0);
+    }
+}
+
+// ============ METRICS ENDPOINTS ============
+let metrics = { totalAccounts: 0, completedToday: 0 };
+
+async function updateMetrics() {
+    if (!db) return;
+    metrics.totalAccounts = await db.collection('accounts').countDocuments();
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    metrics.completedToday = await db.collection('accounts').countDocuments({
+        createdAt: { $gte: today }
+    });
+}
+
+app.get('/api/metrics', async (req, res) => {
+    await updateMetrics();
+    res.json({
+        totalAccounts: metrics.totalAccounts,
+        completedToday: metrics.completedToday,
+        botState: botStatus.state,
+        accountCreated: botStatus.accountCreated,
+        lastAccount: botStatus.accountEmail,
+        restartCount: botStatus.restartCount,
+        uptime: process.uptime()
+    });
 });
 
+app.get('/api/accounts', async (req, res) => {
+    if (!db) return res.json([]);
+    const accounts = await db.collection('accounts')
+        .find({ email: { $exists: true, $ne: null } })
+        .sort({ createdAt: -1 })
+        .limit(50)
+        .toArray();
+    res.json(accounts);
+});
+
+// ============ MATERIAL DESIGN WHITE DASHBOARD ============
 app.get('/', (req, res) => {
-    const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
-    res.send(`
-<!DOCTYPE html>
+    res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Martingale Pro - Paper Trading</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <title>Clever Cloud Bot • Material Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;14..32,400;14..32,500;14..32,600;14..32,700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0,200" />
     <style>
-        * { font-family: system-ui, -apple-system, sans-serif; }
-        body { background: #0A0E17; color: #E8EDF2; }
-        .card { background: #131824; border: 1px solid #1F2A3E; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
-        .stat-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #6B7A8F; }
-        .value-positive { color: #00D1B2; }
-        .value-negative { color: #FF4D6D; }
-        .mono { font-family: monospace; font-size: 12px; }
-        .tp-target { background: #00D1B220; color: #00D1B2; padding: 2px 8px; border-radius: 4px; font-size: 10px; }
-        button { background: #FF4D6D20; border: 1px solid #FF4D6D; color: #FF4D6D; padding: 8px 16px; border-radius: 6px; cursor: pointer; }
-        .sync-btn { background: #00D1B220; border-color: #00D1B2; color: #00D1B2; margin-left: 10px; }
-        .step-badge { background: #6366F120; color: #6366F1; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }
-        .wallet-card { background: linear-gradient(135deg, #1A212E 0%, #131824 100%); border: 1px solid #00D1B240; }
-        .stat-number { font-size: 28px; font-weight: 900; }
-        .chart-container { position: relative; height: 280px; width: 100%; }
-        .compound-info { background: #00D1B210; border: 1px solid #00D1B230; border-radius: 8px; padding: 12px; margin-top: 10px; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #f5f7fb;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            color: #1e293b;
+            line-height: 1.5;
+        }
+        .md-surface { background: #ffffff; border-radius: 28px; box-shadow: 0 1px 3px 0 rgba(0,0,0,0.05), 0 1px 2px -1px rgba(0,0,0,0.03); }
+        .container { max-width: 1280px; margin: 0 auto; padding: 32px 24px; }
+        /* header */
+        .header { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; margin-bottom: 32px; }
+        .title-section h1 { font-size: 28px; font-weight: 600; letter-spacing: -0.01em; background: linear-gradient(135deg, #1e293b 0%, #2d3a4f 100%); background-clip: text; -webkit-background-clip: text; color: transparent; margin-bottom: 6px; }
+        .subhead { color: #5b6e8c; font-size: 14px; font-weight: 400; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .status-chip { display: inline-flex; align-items: center; gap: 6px; background: #eef2ff; padding: 4px 12px; border-radius: 40px; font-size: 12px; font-weight: 500; color: #1e40af; }
+        /* metric cards */
+        .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; margin-bottom: 32px; }
+        .metric-card { background: white; border-radius: 24px; padding: 20px 20px; transition: all 0.2s ease; border: 1px solid #edf2f7; box-shadow: 0 1px 2px rgba(0,0,0,0.02); }
+        .metric-icon { background: #f8fafc; width: 44px; height: 44px; border-radius: 28px; display: flex; align-items: center; justify-content: center; margin-bottom: 16px; }
+        .metric-icon .material-symbols-outlined { font-size: 26px; color: #3b82f6; }
+        .metric-value { font-size: 34px; font-weight: 700; color: #0f172a; letter-spacing: -0.02em; line-height: 1.2; }
+        .metric-label { font-size: 13px; font-weight: 500; color: #5b6e8c; margin-top: 8px; text-transform: uppercase; letter-spacing: 0.3px; }
+        /* table card */
+        .data-card { background: white; border-radius: 28px; border: 1px solid #edf2f7; overflow: hidden; margin-bottom: 24px; box-shadow: 0 4px 6px -2px rgba(0,0,0,0.02); }
+        .card-header { padding: 20px 24px 8px 24px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #f0f2f5; }
+        .card-header h3 { font-size: 18px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+        .table-wrapper { overflow-x: auto; padding: 0 4px; }
+        table { width: 100%; border-collapse: collapse; font-size: 14px; }
+        th { text-align: left; padding: 16px 20px; background: #fefefe; font-weight: 600; color: #475569; border-bottom: 1px solid #eef2f6; }
+        td { padding: 14px 20px; border-bottom: 1px solid #f1f5f9; color: #1e293b; }
+        tr:last-child td { border-bottom: none; }
+        .email-cell { font-family: monospace; font-weight: 500; background: #f8fafc; padding: 4px 10px; border-radius: 40px; display: inline-block; font-size: 12px; }
+        .badge-pwd { font-family: monospace; background: #fef9e3; padding: 4px 10px; border-radius: 40px; font-size: 12px; color: #b45309; }
+        .info-note { background: #f8fafc; border-radius: 20px; padding: 16px 24px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; border: 1px solid #eef2ff; margin-top: 16px; }
+        .info-note .material-symbols-outlined { color: #3b82f6; }
+        .footer-text { font-size: 12px; color: #7e8aa2; text-align: center; margin-top: 32px; }
+        @keyframes pulse-ring { 0% { opacity: 0.6; } 100% { opacity: 1; } }
+        .live-dot { width: 10px; height: 10px; background: #22c55e; border-radius: 50%; display: inline-block; box-shadow: 0 0 0 0 rgba(34,197,94,0.4); animation: pulse-ring 1.2s infinite; margin-right: 6px; }
     </style>
 </head>
-<body class="p-6">
-    <div class="max-w-7xl mx-auto">
-        <div class="flex justify-between items-center mb-8">
-            <div>
-                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">PAPER MODE</span></h1>
-                <div class="flex items-center gap-3 mt-2">
-                    <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
-                    <span class="text-[10px] font-bold text-emerald-400">LIVE</span>
-                    <span class="text-[10px] text-slate-500">${config.symbol}</span>
-                    <span class="tp-target">🎯 TP: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% move</span>
-                </div>
+<body>
+<div class="container">
+    <div class="header">
+        <div class="title-section">
+            <h1>Clever Cloud Bot</h1>
+            <div class="subhead">
+                <span class="status-chip"><span class="live-dot"></span> ACTIVE · ONE ACCOUNT PER RESTART</span>
+                <span>⚡ Auto OAuth · IP rotation via CLI restart</span>
             </div>
-            <div>
-                <button onclick="forceSync()" class="sync-btn">🔄 FORCE SYNC</button>
-                <button onclick="emergencyClose()">⚠️ EMERGENCY CLOSE</button>
-            </div>
-        </div>
-
-        <div class="wallet-card rounded-2xl p-6 mb-8">
-            <div class="grid grid-cols-1 md:grid-cols-5 gap-6">
-                <div><p class="stat-label">TOTAL WALLET</p><p id="totalWallet" class="stat-number value-positive">$0.00000000</p><p id="walletChange" class="text-xs"></p></div>
-                <div><p class="stat-label">TOTAL P&L</p><p id="totalPnl" class="stat-number">$0.00000000</p><p id="pnlPercent" class="text-xs"></p></div>
-                <div><p class="stat-label">REALIZED P&L</p><p id="realizedPnl" class="stat-number">$0.00000000</p><p id="feesPaid" class="text-xs text-slate-500">Fees: $0.00</p></div>
-                <div><p class="stat-label">PERFORMANCE</p><p id="peakEquity" class="text-sm">Peak: $0.00</p><p id="maxDrawdown" class="text-sm text-red-400">DD: 0%</p></div>
-                <div><p class="stat-label">STATISTICS</p><p id="tradeStats" class="text-sm">Trades: 0</p><p id="winRate" class="text-sm text-green-400">Win Rate: 0%</p></div>
-            </div>
-            <div class="compound-info mt-4 flex justify-between items-center">
-                <div>
-                    <p class="text-xs text-slate-400">📈 AUTO-COMPOUNDING (${config.riskPercent}% of Wallet)</p>
-                    <p class="text-sm font-bold text-green-400" id="baseVolumeDisplay">Base Volume: 0 contracts</p>
-                    <p class="text-xs text-slate-400" id="shibDisplay">0 SHIB per trade</p>
-                </div>
-                <div class="text-right">
-                    <p class="text-xs text-slate-400">Risk Amount (2%)</p>
-                    <p class="text-sm font-bold" id="riskAmount">$0.00</p>
-                    <p class="text-xs text-slate-400">🟢 Active</p>
-                </div>
-            </div>
-        </div>
-
-        <div class="card mb-8">
-            <h3 class="font-bold mb-4">📈 WALLET GROWTH CHART</h3>
-            <div class="chart-container"><canvas id="walletChart"></canvas></div>
-        </div>
-
-        <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
-            <div class="card">
-                <p class="stat-label">MARKET</p>
-                <p id="spread" class="text-2xl font-black">0.000%</p>
-                <p class="text-[10px] text-slate-500">BID: <span id="bidPrice">0</span> | ASK: <span id="askPrice">0</span></p>
-            </div>
-            <div class="card">
-                <p class="stat-label">LONG ROI</p>
-                <p id="lRoi" class="text-2xl font-black">0.00%</p>
-                <p id="lPnl" class="text-sm mono">$0.00000000</p>
-                <p id="lStep" class="text-[10px] mt-1"></p>
-            </div>
-            <div class="card">
-                <p class="stat-label">SHORT ROI</p>
-                <p id="sRoi" class="text-2xl font-black">0.00%</p>
-                <p id="sPnl" class="text-sm mono">$0.00000000</p>
-                <p id="sStep" class="text-[10px] mt-1"></p>
-            </div>
-            <div class="card">
-                <p class="stat-label">ACTION</p>
-                <p id="lAction" class="text-xs text-indigo-400 mt-1">Idle</p>
-            </div>
-        </div>
-
-        <div class="card">
-            <h3 class="font-bold mb-4">📋 CLOSED TRADES</h3>
-            <div class="overflow-x-auto"><table class="w-full text-left text-xs">
-                <thead><tr class="text-slate-500"><th>SIDE</th><th>CLOSE TIME</th><th>STEP</th><th>VOL</th><th>ENTRY</th><th>EXIT</th><th>ROI</th><th>PNL</th></tr></thead>
-                <tbody id="tradesBody"></tbody>
-            </table></div>
         </div>
     </div>
 
-    <script>
-        let walletChart = null;
-        function formatNumber(num) { return parseFloat(num || 0).toFixed(8); }
-        async function forceSync() { await fetch('/api/force-sync', {method: 'POST'}); }
-        async function emergencyClose() { if(confirm('Close all?')) await fetch('/api/close', {method: 'POST'}); }
+    <div class="grid-4">
+        <div class="metric-card"><div class="metric-icon"><span class="material-symbols-outlined">group</span></div><div class="metric-value" id="totalAccounts">0</div><div class="metric-label">Total accounts</div></div>
+        <div class="metric-card"><div class="metric-icon"><span class="material-symbols-outlined">today</span></div><div class="metric-value" id="todayAccounts">0</div><div class="metric-label">Created today</div></div>
+        <div class="metric-card"><div class="metric-icon"><span class="material-symbols-outlined">autorenew</span></div><div class="metric-value" id="restartCount">0</div><div class="metric-label">Restart attempts</div></div>
+        <div class="metric-card"><div class="metric-icon"><span class="material-symbols-outlined">memory</span></div><div class="metric-value" id="botState">—</div><div class="metric-label">Bot state</div></div>
+    </div>
 
-        function updateChart(history) {
-            if (!history || history.length === 0) return;
-            const labels = history.map(h => new Date(h.timestamp).toLocaleTimeString());
-            const data = history.map(h => h.equity);
-            if (walletChart) walletChart.destroy();
-            const ctx = document.getElementById('walletChart').getContext('2d');
-            walletChart = new Chart(ctx, {
-                type: 'line',
-                data: { labels, datasets: [{ label: 'Equity', data, borderColor: '#00D1B2', backgroundColor: '#00D1B220', fill: true, tension: 0.4 }] },
-                options: { responsive: true, maintainAspectRatio: false, scales: { x: { display: false }, y: { ticks: { color: '#6B7A8F' } } }, plugins: { legend: { display: false } } }
-            });
-        }
+    <div class="data-card">
+        <div class="card-header"><h3><span class="material-symbols-outlined" style="font-size:22px">description</span> Recently created accounts</h3><span style="font-size:12px; color:#6c86a3;">⬇ last 50 records</span></div>
+        <div class="table-wrapper">
+            <table id="accountsTable">
+                <thead><tr><th>Email address</th><th>Password</th><th>Created at</th></tr></thead>
+                <tbody id="accountsBody"><tr><td colspan="3" style="text-align:center; padding:48px;">Loading secure data...</td></tr></tbody>
+            </table>
+        </div>
+    </div>
 
-        setInterval(async () => {
-            const res = await fetch('/api/status');
-            const data = await res.json();
-            const m = data.market;
-            document.getElementById('totalWallet').textContent = '$' + formatNumber(m.totalEquity);
-            document.getElementById('totalPnl').textContent = '$' + formatNumber(m.totalNetGain);
-            document.getElementById('pnlPercent').textContent = m.growthPct.toFixed(2) + '%';
-            document.getElementById('realizedPnl').textContent = '$' + formatNumber(m.totalRealizedPnl);
-            document.getElementById('peakEquity').textContent = 'Peak: $' + formatNumber(m.peakEquity);
-            document.getElementById('maxDrawdown').textContent = 'DD: ' + m.maxDrawdown.toFixed(2) + '%';
-            document.getElementById('tradeStats').textContent = 'Trades: ' + m.totalTrades;
-            document.getElementById('winRate').textContent = 'Win Rate: ' + m.winRate + '%';
-            document.getElementById('baseVolumeDisplay').textContent = 'Base Volume: ' + (m.currentBaseVolume || 0).toLocaleString() + ' contracts';
-            document.getElementById('shibDisplay').textContent = (m.currentBaseShib || 0).toLocaleString() + ' SHIB per trade';
-            document.getElementById('riskAmount').textContent = '$' + formatNumber(m.currentRiskAmount);
-            document.getElementById('spread').textContent = (m.spread || 0).toFixed(3) + '%';
-            document.getElementById('bidPrice').textContent = formatNumber(m.bid);
-            document.getElementById('askPrice').textContent = formatNumber(m.ask);
-            if(m.walletHistory) updateChart(m.walletHistory);
+    <div class="info-note">
+        <span class="material-symbols-outlined">info</span>
+        <span><strong>Material Design · White UI</strong> — Bot creates exactly ONE account, then triggers CLI restart (new IP). OAuth is auto-filled and submitted. MongoDB stores credentials & deployed apps. Dashboard updates every 5s.</span>
+    </div>
+    <div class="footer-text">Clever Cloud automation · stealth puppeteer · scalingo restart engine</div>
+</div>
+
+<script>
+    async function refreshDashboard() {
+        try {
+            const metricsRes = await fetch('/api/metrics');
+            const metrics = await metricsRes.json();
+            document.getElementById('totalAccounts').innerText = metrics.totalAccounts || 0;
+            document.getElementById('todayAccounts').innerText = metrics.completedToday || 0;
+            document.getElementById('restartCount').innerText = metrics.restartCount || 0;
+            let stateDisplay = metrics.botState || 'unknown';
+            if (metrics.botState === 'running') stateDisplay = '⚙️ running';
+            else if (metrics.botState === 'completed') stateDisplay = '✅ completed';
+            else if (metrics.botState === 'failed') stateDisplay = '⚠️ failed';
+            else if (metrics.botState === 'starting') stateDisplay = '🔄 starting';
+            document.getElementById('botState').innerHTML = stateDisplay;
             
-            const long = data.accounts.find(a => a.direction === 'buy');
-            const short = data.accounts.find(a => a.direction === 'sell');
-            if (long) {
-                document.getElementById('lRoi').textContent = long.roi.toFixed(2) + '%';
-                document.getElementById('lPnl').textContent = '$' + formatNumber(long.unrealizedUsdt);
-                document.getElementById('lStep').innerHTML = '<span class="step-badge">STEP '+long.step+'</span> VOL '+long.volume;
-                document.getElementById('lAction').textContent = long.lastAction;
+            const accountsRes = await fetch('/api/accounts');
+            const accounts = await accountsRes.json();
+            const tbody = document.getElementById('accountsBody');
+            if (accounts && accounts.length) {
+                let html = '';
+                for (let acc of accounts) {
+                    let dateStr = acc.createdAt ? new Date(acc.createdAt).toLocaleString() : 'just now';
+                    html += \`<tr><td><span class="email-cell">\${acc.email || 'N/A'}</span></td><td><span class="badge-pwd">\${acc.password || '••••••'}</span></td><td style="font-size:12px; color:#4b5563;">\${dateStr}</td></tr>\`;
+                }
+                tbody.innerHTML = html;
+            } else {
+                tbody.innerHTML = '<tr><td colspan="3" style="text-align:center; padding:32px;">✨ No accounts yet — waiting for first creation...</td></tr>';
             }
-            if (short) {
-                document.getElementById('sRoi').textContent = short.roi.toFixed(2) + '%';
-                document.getElementById('sPnl').textContent = '$' + formatNumber(short.unrealizedUsdt);
-                document.getElementById('sStep').innerHTML = '<span class="step-badge">STEP '+short.step+'</span> VOL '+short.volume;
-            }
-
-            let h = '';
-            data.tradeHistory.forEach(t => {
-                h += '<tr class="border-b border-slate-800"><td>'+t.side+'</td><td>'+t.closeTime+'</td><td>'+t.step+'</td><td>'+t.volume+'</td><td>'+t.entryPrice+'</td><td>'+t.exitPrice+'</td><td>'+t.roi+'</td><td>'+t.netPnlUsdt+'</td></tr>';
-            });
-            document.getElementById('tradesBody').innerHTML = h || '<tr><td colspan="8" class="text-center p-4">No trades yet</td></tr>';
-        }, 1000);
-    </script>
+        } catch(e) { console.warn(e); }
+    }
+    refreshDashboard();
+    setInterval(refreshDashboard, 5000);
+</script>
 </body>
-</html>
-    `);
+</html>`);
 });
 
-startWS();
-setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => console.log('✅ Paper Martingale Pro Started'));
+// ============ START ============
+async function main() {
+    console.log(`\n🚀 Clever Cloud Bot Starting...`);
+    console.log(`📊 Dashboard: http://localhost:${port}`);
+    console.log(`🔄 Mode: Creates ONE account, then CLI RESTART for NEW IP`);
+    console.log(`\n`);
+    
+    console.log('[START] Installing Scalingo CLI...');
+    installScalingoCLI();
+    
+    testScalingoCLI();
+    
+    await connectMongoDB();
+    
+    app.listen(port, '0.0.0.0', () => {
+        console.log(`✅ Dashboard server running on port ${port}`);
+    });
+    
+    await sleep(2000);
+    
+    const bot = new CleverCloudBot('INSTANCE_1', ENV.BOT_PASSWORD, ENV.BOT_START_DELAY);
+    await bot.run();
+}
+
+process.on('SIGINT', () => {
+    console.log('\n🛑 Shutting down...');
+    if (dbClient) dbClient.close();
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+    console.log('\n🛑 Shutting down...');
+    if (dbClient) dbClient.close();
+    process.exit(0);
+});
+
+main().catch(console.error);
