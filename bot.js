@@ -1,4 +1,4 @@
-// social-network.js - Complete Social Network Script for Scalingo (Single Page App)
+// social-network.js - Complete Working Social Network Script
 
 const express = require('express');
 const mongoose = require('mongoose');
@@ -8,29 +8,23 @@ const MongoStore = require('connect-mongo');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const socketIo = require('socket.io');
-const http = require('http');
 const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
-const server = http.createServer(app);
-const io = socketIo(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
-});
 
-// Middleware
-app.use(cors());
+// Middleware - IMPORTANT: Order matters
+app.use(cors({
+  origin: 'http://localhost:3000',
+  credentials: true
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
 
 // Session configuration
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'your-session-secret-key-change-this',
+  secret: process.env.SESSION_SECRET || 'your-super-secret-session-key-change-this',
   resave: false,
   saveUninitialized: false,
   store: MongoStore.create({
@@ -40,7 +34,8 @@ app.use(session({
   cookie: {
     maxAge: 1000 * 60 * 60 * 24 * 7,
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production'
+    secure: false,
+    sameSite: 'lax'
   }
 }));
 
@@ -48,7 +43,7 @@ app.use(session({
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const dir = './uploads';
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     cb(null, dir);
   },
   filename: (req, file, cb) => {
@@ -64,13 +59,9 @@ const UserSchema = new mongoose.Schema({
   password: { type: String, required: true },
   fullName: { type: String, required: true },
   bio: { type: String, default: '' },
-  avatar: { type: String, default: 'default-avatar.png' },
-  coverPhoto: { type: String, default: '' },
-  location: { type: String, default: '' },
-  website: { type: String, default: '' },
+  avatar: { type: String, default: '' },
   followers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   following: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
-  isPrivate: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now },
   lastActive: { type: Date, default: Date.now }
 });
@@ -79,46 +70,15 @@ const PostSchema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   content: { type: String, required: true },
   image: { type: String, default: '' },
-  video: { type: String, default: '' },
   likes: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   comments: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Comment' }],
-  shares: { type: Number, default: 0 },
-  createdAt: { type: Date, default: Date.now },
-  updatedAt: { type: Date, default: Date.now }
+  createdAt: { type: Date, default: Date.now }
 });
 
 const CommentSchema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   post: { type: mongoose.Schema.Types.ObjectId, ref: 'Post', required: true },
   content: { type: String, required: true },
-  likes: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
-  replies: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Comment' }],
-  createdAt: { type: Date, default: Date.now }
-});
-
-const FriendshipSchema = new mongoose.Schema({
-  requester: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  recipient: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  status: { type: String, enum: ['pending', 'accepted', 'rejected', 'blocked'], default: 'pending' },
-  createdAt: { type: Date, default: Date.now },
-  updatedAt: { type: Date, default: Date.now }
-});
-
-const NotificationSchema = new mongoose.Schema({
-  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  type: { type: String, enum: ['like', 'comment', 'friend_request', 'friend_accept', 'mention', 'share'], required: true },
-  from: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  post: { type: mongoose.Schema.Types.ObjectId, ref: 'Post' },
-  comment: { type: mongoose.Schema.Types.ObjectId, ref: 'Comment' },
-  read: { type: Boolean, default: false },
-  createdAt: { type: Date, default: Date.now }
-});
-
-const MessageSchema = new mongoose.Schema({
-  sender: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  receiver: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  message: { type: String, required: true },
-  read: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now }
 });
 
@@ -126,14 +86,11 @@ const MessageSchema = new mongoose.Schema({
 const User = mongoose.model('User', UserSchema);
 const Post = mongoose.model('Post', PostSchema);
 const Comment = mongoose.model('Comment', CommentSchema);
-const Friendship = mongoose.model('Friendship', FriendshipSchema);
-const Notification = mongoose.model('Notification', NotificationSchema);
-const Message = mongoose.model('Message', MessageSchema);
 
 // Authentication Middleware
 const authMiddleware = async (req, res, next) => {
   try {
-    if (!req.session.userId) {
+    if (!req.session || !req.session.userId) {
       return res.status(401).json({ error: 'Please login first' });
     }
     
@@ -147,55 +104,30 @@ const authMiddleware = async (req, res, next) => {
     req.userId = req.session.userId;
     next();
   } catch (error) {
+    console.error('Auth middleware error:', error);
     res.status(401).json({ error: 'Authentication failed' });
   }
 };
 
-// Socket.IO for real-time features
-io.use((socket, next) => {
-  const sessionId = socket.handshake.auth.sessionId;
-  if (!sessionId) return next(new Error('Authentication error'));
-  socket.sessionId = sessionId;
-  next();
-});
-
-io.on('connection', (socket) => {
-  console.log('Socket connected:', socket.id);
-  
-  socket.on('register_user', async (userId) => {
-    socket.userId = userId;
-    socket.join(`user_${userId}`);
-    console.log('User registered to socket:', userId);
-  });
-  
-  socket.on('send_message', async (data) => {
-    try {
-      const message = new Message({
-        sender: data.senderId,
-        receiver: data.receiverId,
-        message: data.message
-      });
-      await message.save();
-      
-      const populatedMessage = await Message.findById(message._id)
-        .populate('sender', 'username fullName avatar')
-        .populate('receiver', 'username fullName avatar');
-      
-      io.to(`user_${data.receiverId}`).emit('receive_message', populatedMessage);
-      socket.emit('message_sent', populatedMessage);
-    } catch (error) {
-      socket.emit('message_error', { error: error.message });
-    }
-  });
-  
-  socket.on('disconnect', () => {
-    console.log('Socket disconnected:', socket.id);
-  });
-});
-
 // API Routes
 
-// Auth Routes
+// Check auth status
+app.get('/api/auth/check', async (req, res) => {
+  try {
+    if (req.session && req.session.userId) {
+      const user = await User.findById(req.session.userId).select('-password');
+      if (user) {
+        return res.json({ authenticated: true, user });
+      }
+    }
+    res.json({ authenticated: false });
+  } catch (error) {
+    console.error('Auth check error:', error);
+    res.json({ authenticated: false });
+  }
+});
+
+// Register
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { username, email, password, fullName } = req.body;
@@ -216,6 +148,7 @@ app.post('/api/auth/register', async (req, res) => {
     await user.save();
     
     req.session.userId = user._id;
+    req.session.save();
     
     res.status(201).json({
       success: true,
@@ -231,10 +164,12 @@ app.post('/api/auth/register', async (req, res) => {
       }
     });
   } catch (error) {
+    console.error('Register error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
+// Login
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -250,6 +185,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
     
     req.session.userId = user._id;
+    req.session.save();
     
     user.lastActive = new Date();
     await user.save();
@@ -268,68 +204,58 @@ app.post('/api/auth/login', async (req, res) => {
       }
     });
   } catch (error) {
+    console.error('Login error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
+// Logout
 app.post('/api/auth/logout', (req, res) => {
   req.session.destroy((err) => {
     if (err) {
       return res.status(500).json({ error: 'Logout failed' });
     }
-    res.json({ success: true, message: 'Logged out successfully' });
+    res.clearCookie('connect.sid');
+    res.json({ success: true });
   });
 });
 
+// Get current user
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
   res.json(req.user);
 });
 
-app.get('/api/auth/check', async (req, res) => {
-  if (req.session.userId) {
-    const user = await User.findById(req.session.userId).select('-password');
-    res.json({ authenticated: true, user });
-  } else {
-    res.json({ authenticated: false });
-  }
-});
-
-// Post Routes
-app.get('/api/posts', authMiddleware, async (req, res) => {
+// Feed posts
+app.get('/api/feed', authMiddleware, async (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
+    const followingIds = [...req.user.following, req.userId];
     
-    const followingUsers = [...req.user.following, req.user._id];
-    
-    const posts = await Post.find({ user: { $in: followingUsers } })
+    const posts = await Post.find({ user: { $in: followingIds } })
       .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
+      .limit(20)
       .populate('user', 'username fullName avatar');
     
-    const total = await Post.countDocuments({ user: { $in: followingUsers } });
-    
-    res.json({
-      posts,
-      currentPage: page,
-      totalPages: Math.ceil(total / limit),
-      totalPosts: total
-    });
+    res.json({ posts });
   } catch (error) {
+    console.error('Feed error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
+// Create post
 app.post('/api/posts', authMiddleware, upload.single('image'), async (req, res) => {
   try {
     const { content } = req.body;
+    
+    if (!content || !content.trim()) {
+      return res.status(400).json({ error: 'Content is required' });
+    }
+    
     const image = req.file ? `/uploads/${req.file.filename}` : '';
     
     const post = new Post({
       user: req.userId,
-      content,
+      content: content.trim(),
       image
     });
     
@@ -338,27 +264,12 @@ app.post('/api/posts', authMiddleware, upload.single('image'), async (req, res) 
     
     res.status(201).json(post);
   } catch (error) {
+    console.error('Create post error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.delete('/api/posts/:postId', authMiddleware, async (req, res) => {
-  try {
-    const post = await Post.findOne({ _id: req.params.postId, user: req.userId });
-    if (!post) {
-      return res.status(404).json({ error: 'Post not found' });
-    }
-    
-    await Comment.deleteMany({ post: post._id });
-    await post.deleteOne();
-    
-    res.json({ message: 'Post deleted successfully' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Like Routes
+// Like/Unlike post
 app.post('/api/posts/:postId/like', authMiddleware, async (req, res) => {
   try {
     const post = await Post.findById(req.params.postId);
@@ -372,16 +283,6 @@ app.post('/api/posts/:postId/like', authMiddleware, async (req, res) => {
     if (likeIndex === -1) {
       post.likes.push(req.userId);
       liked = true;
-      
-      if (post.user.toString() !== req.userId) {
-        const notification = new Notification({
-          user: post.user,
-          type: 'like',
-          from: req.userId,
-          post: post._id
-        });
-        await notification.save();
-      }
     } else {
       post.likes.splice(likeIndex, 1);
     }
@@ -390,19 +291,24 @@ app.post('/api/posts/:postId/like', authMiddleware, async (req, res) => {
     
     res.json({ liked, likesCount: post.likes.length });
   } catch (error) {
+    console.error('Like error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Comment Routes
+// Add comment
 app.post('/api/posts/:postId/comments', authMiddleware, async (req, res) => {
   try {
     const { content } = req.body;
     
+    if (!content || !content.trim()) {
+      return res.status(400).json({ error: 'Comment content is required' });
+    }
+    
     const comment = new Comment({
       user: req.userId,
       post: req.params.postId,
-      content
+      content: content.trim()
     });
     
     await comment.save();
@@ -413,164 +319,59 @@ app.post('/api/posts/:postId/comments', authMiddleware, async (req, res) => {
     
     await comment.populate('user', 'username fullName avatar');
     
-    if (post.user.toString() !== req.userId) {
-      const notification = new Notification({
-        user: post.user,
-        type: 'comment',
-        from: req.userId,
-        post: post._id,
-        comment: comment._id
-      });
-      await notification.save();
-    }
-    
     res.status(201).json(comment);
   } catch (error) {
+    console.error('Comment error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.get('/api/posts/:postId/comments', authMiddleware, async (req, res) => {
-  try {
-    const comments = await Comment.find({ post: req.params.postId })
-      .sort({ createdAt: -1 })
-      .populate('user', 'username fullName avatar');
-    
-    res.json(comments);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// User Routes
+// Get user profile
 app.get('/api/users/:userId', authMiddleware, async (req, res) => {
   try {
-    const user = await User.findById(req.params.userId)
-      .select('-password');
+    const user = await User.findById(req.params.userId).select('-password');
     
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
     
-    const isFollowing = user.followers.includes(req.userId);
     const posts = await Post.find({ user: user._id })
       .sort({ createdAt: -1 })
       .populate('user', 'username fullName avatar');
     
+    const isFollowing = user.followers.includes(req.userId);
+    const isOwnProfile = req.userId === user._id.toString();
+    
     res.json({
       user,
-      isFollowing,
       posts,
+      isFollowing,
+      isOwnProfile,
       postsCount: posts.length,
       followersCount: user.followers.length,
       followingCount: user.following.length
     });
   } catch (error) {
+    console.error('Get user error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.put('/api/users/profile', authMiddleware, upload.single('avatar'), async (req, res) => {
-  try {
-    const { fullName, bio, location, website } = req.body;
-    const updateData = { fullName, bio, location, website };
-    
-    if (req.file) {
-      updateData.avatar = `/uploads/${req.file.filename}`;
-    }
-    
-    const user = await User.findByIdAndUpdate(
-      req.userId,
-      updateData,
-      { new: true }
-    ).select('-password');
-    
-    res.json(user);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Friend Routes
-app.post('/api/friends/request/:userId', authMiddleware, async (req, res) => {
-  try {
-    const recipientId = req.params.userId;
-    
-    if (recipientId === req.userId) {
-      return res.status(400).json({ error: 'Cannot send friend request to yourself' });
-    }
-    
-    const existingFriendship = await Friendship.findOne({
-      $or: [
-        { requester: req.userId, recipient: recipientId },
-        { requester: recipientId, recipient: req.userId }
-      ]
-    });
-    
-    if (existingFriendship) {
-      return res.status(400).json({ error: 'Friend request already exists' });
-    }
-    
-    const friendship = new Friendship({
-      requester: req.userId,
-      recipient: recipientId
-    });
-    
-    await friendship.save();
-    
-    const notification = new Notification({
-      user: recipientId,
-      type: 'friend_request',
-      from: req.userId
-    });
-    await notification.save();
-    
-    res.json({ message: 'Friend request sent' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.put('/api/friends/accept/:requestId', authMiddleware, async (req, res) => {
-  try {
-    const friendship = await Friendship.findById(req.params.requestId);
-    
-    if (!friendship || friendship.recipient.toString() !== req.userId) {
-      return res.status(404).json({ error: 'Friend request not found' });
-    }
-    
-    friendship.status = 'accepted';
-    await friendship.save();
-    
-    await User.findByIdAndUpdate(friendship.requester, {
-      $addToSet: { following: friendship.recipient, followers: friendship.recipient }
-    });
-    
-    await User.findByIdAndUpdate(friendship.recipient, {
-      $addToSet: { following: friendship.requester, followers: friendship.requester }
-    });
-    
-    const notification = new Notification({
-      user: friendship.requester,
-      type: 'friend_accept',
-      from: req.userId
-    });
-    await notification.save();
-    
-    res.json({ message: 'Friend request accepted' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post('/api/friends/follow/:userId', authMiddleware, async (req, res) => {
+// Follow/Unfollow user
+app.post('/api/users/:userId/follow', authMiddleware, async (req, res) => {
   try {
     const userToFollow = await User.findById(req.params.userId);
     if (!userToFollow) {
       return res.status(404).json({ error: 'User not found' });
     }
     
-    if (userToFollow.followers.includes(req.userId)) {
+    if (req.userId === req.params.userId) {
+      return res.status(400).json({ error: 'Cannot follow yourself' });
+    }
+    
+    const isFollowing = userToFollow.followers.includes(req.userId);
+    
+    if (isFollowing) {
       // Unfollow
       await User.findByIdAndUpdate(req.userId, { $pull: { following: req.params.userId } });
       await User.findByIdAndUpdate(req.params.userId, { $pull: { followers: req.userId } });
@@ -582,39 +383,12 @@ app.post('/api/friends/follow/:userId', authMiddleware, async (req, res) => {
       res.json({ following: true, message: 'Followed' });
     }
   } catch (error) {
+    console.error('Follow error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Feed Routes
-app.get('/api/feed', authMiddleware, async (req, res) => {
-  try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
-    
-    const followingIds = [...req.user.following, req.userId];
-    
-    const posts = await Post.find({ user: { $in: followingIds } })
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .populate('user', 'username fullName avatar');
-    
-    const total = await Post.countDocuments({ user: { $in: followingIds } });
-    
-    res.json({
-      posts,
-      currentPage: page,
-      totalPages: Math.ceil(total / limit),
-      hasMore: skip + limit < total
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Explore Routes
+// Explore - get trending posts and suggested users
 app.get('/api/explore', authMiddleware, async (req, res) => {
   try {
     const trendingPosts = await Post.find()
@@ -629,21 +403,19 @@ app.get('/api/explore', authMiddleware, async (req, res) => {
       .limit(10)
       .select('username fullName avatar bio');
     
-    res.json({
-      trendingPosts,
-      suggestedUsers
-    });
+    res.json({ trendingPosts, suggestedUsers });
   } catch (error) {
+    console.error('Explore error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Search Routes
+// Search users and posts
 app.get('/api/search', authMiddleware, async (req, res) => {
   try {
     const { q } = req.query;
     
-    if (!q) {
+    if (!q || q.trim() === '') {
       return res.json({ users: [], posts: [] });
     }
     
@@ -657,15 +429,39 @@ app.get('/api/search', authMiddleware, async (req, res) => {
       _id: { $ne: req.userId }
     })
       .select('username fullName avatar bio')
-      .limit(20);
+      .limit(10);
     
     const posts = await Post.find({ content: searchRegex })
       .sort({ createdAt: -1 })
-      .limit(20)
+      .limit(10)
       .populate('user', 'username fullName avatar');
     
     res.json({ users, posts });
   } catch (error) {
+    console.error('Search error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update profile
+app.put('/api/users/profile', authMiddleware, upload.single('avatar'), async (req, res) => {
+  try {
+    const { fullName, bio } = req.body;
+    const updateData = {};
+    
+    if (fullName) updateData.fullName = fullName;
+    if (bio !== undefined) updateData.bio = bio;
+    if (req.file) updateData.avatar = `/uploads/${req.file.filename}`;
+    
+    const user = await User.findByIdAndUpdate(
+      req.userId,
+      updateData,
+      { new: true }
+    ).select('-password');
+    
+    res.json(user);
+  } catch (error) {
+    console.error('Update profile error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -673,12 +469,17 @@ app.get('/api/search', authMiddleware, async (req, res) => {
 // Serve uploaded files
 app.use('/uploads', express.static('uploads'));
 
-// Create uploads directory
-if (!fs.existsSync('./uploads')) fs.mkdirSync('./uploads');
+// Serve HTML
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
-// Create public directory and single HTML file
+// Create uploads directory
+if (!fs.existsSync('./uploads')) fs.mkdirSync('./uploads', { recursive: true });
+
+// Create public directory and HTML file
 const publicDir = './public';
-if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir);
+if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
 
 const htmlContent = `<!DOCTYPE html>
 <html lang="en">
@@ -693,31 +494,29 @@ const htmlContent = `<!DOCTYPE html>
         .auth-container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
         .form-group { margin-bottom: 20px; }
         label { display: block; margin-bottom: 8px; font-weight: bold; color: #333; }
-        input, textarea { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 5px; font-size: 14px; transition: border-color 0.3s; }
+        input, textarea { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 5px; font-size: 14px; }
         input:focus, textarea:focus { outline: none; border-color: #667eea; }
-        button { background: #667eea; color: white; padding: 12px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; transition: transform 0.2s, background 0.2s; }
+        button { background: #667eea; color: white; padding: 12px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; transition: transform 0.2s; }
         button:hover { background: #5a67d8; transform: translateY(-1px); }
-        button:active { transform: translateY(0); }
         button:disabled { opacity: 0.6; cursor: not-allowed; }
-        .error { color: #e53e3e; margin-top: 10px; font-size: 14px; }
+        .error { color: #e53e3e; margin-top: 10px; font-size: 14px; text-align: center; }
         .success { color: #38a169; margin-top: 10px; }
         .hidden { display: none; }
         .navbar { background: white; padding: 15px 30px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 100; }
         .nav-links { display: flex; gap: 25px; }
-        .nav-links a { text-decoration: none; color: #4a5568; cursor: pointer; font-weight: 500; transition: color 0.2s; }
+        .nav-links a { text-decoration: none; color: #4a5568; cursor: pointer; font-weight: 500; }
         .nav-links a:hover { color: #667eea; }
         .logo { font-size: 24px; font-weight: bold; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; cursor: pointer; }
         .create-post { background: white; border-radius: 10px; padding: 25px; margin-bottom: 25px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
         .feed { display: grid; gap: 25px; }
-        .post { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); transition: transform 0.2s; }
-        .post:hover { transform: translateY(-2px); box-shadow: 0 4px 20px rgba(0,0,0,0.15); }
+        .post { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
         .post-header { display: flex; align-items: center; margin-bottom: 15px; cursor: pointer; }
-        .avatar { width: 50px; height: 50px; border-radius: 50%; margin-right: 15px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 18px; cursor: pointer; }
+        .avatar { width: 50px; height: 50px; border-radius: 50%; margin-right: 15px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 18px; }
         .post-content { margin-bottom: 15px; line-height: 1.6; color: #2d3748; }
         .post-image { max-width: 100%; border-radius: 8px; margin-top: 10px; }
         .post-actions { display: flex; gap: 15px; margin-top: 15px; padding-top: 15px; border-top: 1px solid #e2e8f0; }
         .post-actions button { width: auto; padding: 8px 20px; background: #f7fafc; color: #4a5568; }
-        .post-actions button:hover { background: #edf2f7; }
+        .post-actions button:hover { background: #edf2f7; transform: none; }
         .loading { text-align: center; padding: 40px; color: white; font-size: 18px; }
         h2, h3 { margin-bottom: 20px; color: #2d3748; }
         textarea { resize: vertical; font-family: inherit; }
@@ -725,9 +524,10 @@ const htmlContent = `<!DOCTYPE html>
         .user-card { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #e2e8f0; }
         .user-info { display: flex; align-items: center; gap: 10px; cursor: pointer; flex: 1; }
         .small-avatar { width: 40px; height: 40px; border-radius: 50%; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; }
-        .friend-button { width: auto; padding: 5px 15px; font-size: 12px; }
+        .friend-button { width: auto; padding: 5px 15px; font-size: 12px; background: #48bb78; }
+        .friend-button:hover { background: #38a169; }
         .profile-header { background: white; border-radius: 10px; overflow: hidden; margin-bottom: 25px; }
-        .profile-cover { height: 200px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+        .profile-cover { height: 150px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
         .profile-info { padding: 20px; text-align: center; margin-top: -50px; }
         .profile-avatar { width: 100px; height: 100px; border-radius: 50%; border: 4px solid white; margin: 0 auto 15px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); display: flex; align-items: center; justify-content: center; color: white; font-size: 36px; font-weight: bold; }
         .profile-stats { display: flex; justify-content: center; gap: 30px; margin: 20px 0; }
@@ -735,7 +535,7 @@ const htmlContent = `<!DOCTYPE html>
         .stat-value { font-size: 24px; font-weight: bold; color: #2d3748; }
         .stat-label { color: #718096; font-size: 14px; }
         .back-button { background: #e2e8f0; color: #4a5568; width: auto; padding: 8px 16px; margin-bottom: 20px; }
-        .back-button:hover { background: #cbd5e0; }
+        .back-button:hover { background: #cbd5e0; transform: none; }
         @media (max-width: 768px) {
             .container { padding: 10px; }
             .navbar { padding: 10px 15px; }
@@ -773,7 +573,7 @@ const htmlContent = `<!DOCTYPE html>
                     <p style="margin-top: 20px; text-align: center;">
                         <a href="#" onclick="toggleAuth()" id="toggleLink" style="color: #667eea; text-decoration: none;">Don't have an account? Register</a>
                     </p>
-                    <div id="authMessage" class="error" style="text-align: center;"></div>
+                    <div id="authMessage" class="error"></div>
                 </div>
             </div>
         </div>
@@ -790,7 +590,6 @@ const htmlContent = `<!DOCTYPE html>
                 </div>
             </div>
             <div class="container" id="mainContent">
-                <!-- Dynamic content will be loaded here -->
                 <div class="loading">Loading...</div>
             </div>
         </div>
@@ -800,14 +599,27 @@ const htmlContent = `<!DOCTYPE html>
         let currentUser = null;
         let currentView = 'feed';
         
-        // Check authentication on page load
+        // Fetch with credentials
+        async function fetchWithCredentials(url, options = {}) {
+            const response = await fetch(url, {
+                ...options,
+                credentials: 'include',
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...options.headers
+                }
+            });
+            return response;
+        }
+        
+        // Check authentication
         window.onload = async function() {
             await checkAuth();
         };
         
         async function checkAuth() {
             try {
-                const response = await fetch('/api/auth/check');
+                const response = await fetchWithCredentials('/api/auth/check');
                 const data = await response.json();
                 
                 if (data.authenticated) {
@@ -867,9 +679,8 @@ const htmlContent = `<!DOCTYPE html>
             try {
                 let response;
                 if (isLoginMode) {
-                    response = await fetch('/api/auth/login', {
+                    response = await fetchWithCredentials('/api/auth/login', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ email, password })
                     });
                 } else {
@@ -883,9 +694,8 @@ const htmlContent = `<!DOCTYPE html>
                         return;
                     }
                     
-                    response = await fetch('/api/auth/register', {
+                    response = await fetchWithCredentials('/api/auth/register', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ email, password, username, fullName })
                     });
                 }
@@ -896,7 +706,6 @@ const htmlContent = `<!DOCTYPE html>
                     currentUser = data.user;
                     showMainApp();
                     showFeed();
-                    // Clear form
                     document.getElementById('email').value = '';
                     document.getElementById('password').value = '';
                     if (!isLoginMode) {
@@ -907,8 +716,8 @@ const htmlContent = `<!DOCTYPE html>
                     document.getElementById('authMessage').innerText = data.error || 'Authentication failed';
                 }
             } catch (error) {
-                document.getElementById('authMessage').innerText = 'Network error. Please try again.';
                 console.error('Auth error:', error);
+                document.getElementById('authMessage').innerText = 'Network error. Please try again.';
             } finally {
                 button.disabled = false;
                 button.innerText = isLoginMode ? 'Login' : 'Register';
@@ -939,15 +748,17 @@ const htmlContent = `<!DOCTYPE html>
             feedContainer.innerHTML = '<div class="loading">Loading posts...</div>';
             
             try {
-                const response = await fetch('/api/feed');
+                const response = await fetchWithCredentials('/api/feed');
                 
-                if (!response.ok) throw new Error('Failed to load feed');
+                if (!response.ok) {
+                    throw new Error('Failed to load feed');
+                }
                 
                 const data = await response.json();
                 displayPosts(data.posts, feedContainer);
             } catch (error) {
                 console.error('Error loading feed:', error);
-                feedContainer.innerHTML = '<div class="loading">Error loading feed. Please refresh.</div>';
+                feedContainer.innerHTML = '<div class="loading">Error loading feed. Please <a href="#" onclick="location.reload()">refresh</a>.</div>';
             }
         }
         
@@ -957,19 +768,19 @@ const htmlContent = `<!DOCTYPE html>
             contentDiv.innerHTML = '<div class="loading">Loading explore...</div>';
             
             try {
-                const response = await fetch('/api/explore');
+                const response = await fetchWithCredentials('/api/explore');
                 
                 if (!response.ok) throw new Error('Failed to load explore');
                 
                 const data = await response.json();
                 
-                let html = '<h2>Trending Posts</h2>';
+                let html = '<h2>🔥 Trending Posts</h2>';
                 const tempDiv = document.createElement('div');
                 displayPosts(data.trendingPosts, tempDiv);
                 html += tempDiv.innerHTML;
                 
                 if (data.suggestedUsers && data.suggestedUsers.length > 0) {
-                    html += '<div class="suggested-users"><h3>Suggested Users</h3>';
+                    html += '<div class="suggested-users"><h3>👥 Suggested Users</h3>';
                     for (const user of data.suggestedUsers) {
                         html += \`
                             <div class="user-card">
@@ -977,10 +788,10 @@ const htmlContent = `<!DOCTYPE html>
                                     <div class="small-avatar">\${(user.fullName || user.username).charAt(0).toUpperCase()}</div>
                                     <div>
                                         <strong>\${escapeHtml(user.fullName || user.username)}</strong><br>
-                                        <small>@\${escapeHtml(user.username)}</small>
+                                        <small style="color: #718096;">@\${escapeHtml(user.username)}</small>
                                     </div>
                                 </div>
-                                <button class="friend-button" onclick="followUser('\${user._id}', this)">Follow</button>
+                                <button class="friend-button" onclick="event.stopPropagation(); followUser('\${user._id}', this)">Follow</button>
                             </div>
                         \`;
                     }
@@ -990,7 +801,7 @@ const htmlContent = `<!DOCTYPE html>
                 contentDiv.innerHTML = html;
             } catch (error) {
                 console.error('Error loading explore:', error);
-                contentDiv.innerHTML = '<div class="loading">Error loading explore. Please refresh.</div>';
+                contentDiv.innerHTML = '<div class="loading">Error loading explore. Please try again.</div>';
             }
         }
         
@@ -1002,13 +813,14 @@ const htmlContent = `<!DOCTYPE html>
             
             let html = '<div class="feed">';
             for (const post of posts) {
+                const user = post.user || {};
                 html += \`
                     <div class="post">
-                        <div class="post-header" onclick="viewProfile('\${post.user?._id}')">
-                            <div class="avatar">\${(post.user?.fullName || 'U').charAt(0).toUpperCase()}</div>
+                        <div class="post-header" onclick="viewProfile('\${user._id}')">
+                            <div class="avatar">\${(user.fullName || 'U').charAt(0).toUpperCase()}</div>
                             <div>
-                                <strong>\${escapeHtml(post.user?.fullName || 'Unknown')}</strong><br>
-                                <small style="color: #718096;">@\${escapeHtml(post.user?.username || 'user')}</small>
+                                <strong>\${escapeHtml(user.fullName || 'Unknown')}</strong><br>
+                                <small style="color: #718096;">@\${escapeHtml(user.username || 'user')}</small>
                             </div>
                         </div>
                         <div class="post-content">\${escapeHtml(post.content)}</div>
@@ -1036,7 +848,7 @@ const htmlContent = `<!DOCTYPE html>
             contentDiv.innerHTML = '<div class="loading">Loading profile...</div>';
             
             try {
-                const response = await fetch(\`/api/users/\${userId}\`);
+                const response = await fetchWithCredentials(\`/api/users/\${userId}\`);
                 
                 if (!response.ok) throw new Error('Failed to load profile');
                 
@@ -1065,11 +877,15 @@ const htmlContent = `<!DOCTYPE html>
                                     <div class="stat-label">Following</div>
                                 </div>
                             </div>
-                            \${userId !== currentUser?.id ? \`
-                                <button onclick="followUser('\${userId}', this)" class="friend-button" style="width: auto; margin-top: 10px;">
+                            \${!data.isOwnProfile ? \`
+                                <button onclick="followUser('\${data.user._id}', this)" class="friend-button" style="width: auto; margin-top: 10px;">
                                     \${data.isFollowing ? 'Unfollow' : 'Follow'}
                                 </button>
-                            \` : ''}
+                            \` : \`
+                                <button onclick="editProfile()" class="friend-button" style="width: auto; margin-top: 10px; background: #667eea;">
+                                    Edit Profile
+                                </button>
+                            \`}
                         </div>
                     </div>
                     <h3>Posts</h3>
@@ -1083,6 +899,33 @@ const htmlContent = `<!DOCTYPE html>
             } catch (error) {
                 console.error('Error loading profile:', error);
                 contentDiv.innerHTML = '<div class="loading">Error loading profile. Please try again.</div>';
+            }
+        }
+        
+        function editProfile() {
+            const newBio = prompt('Enter your bio:', currentUser?.bio || '');
+            if (newBio !== null) {
+                updateProfile({ bio: newBio });
+            }
+        }
+        
+        async function updateProfile(updates) {
+            try {
+                const response = await fetchWithCredentials('/api/users/profile', {
+                    method: 'PUT',
+                    body: JSON.stringify(updates)
+                });
+                
+                if (response.ok) {
+                    const updatedUser = await response.json();
+                    currentUser = updatedUser;
+                    await viewProfile(currentUser.id);
+                } else {
+                    alert('Failed to update profile');
+                }
+            } catch (error) {
+                console.error('Update profile error:', error);
+                alert('Error updating profile');
             }
         }
         
@@ -1105,7 +948,8 @@ const htmlContent = `<!DOCTYPE html>
             try {
                 const response = await fetch('/api/posts', {
                     method: 'POST',
-                    body: formData
+                    body: formData,
+                    credentials: 'include'
                 });
                 
                 if (response.ok) {
@@ -1129,9 +973,8 @@ const htmlContent = `<!DOCTYPE html>
         
         async function likePost(postId, button) {
             try {
-                const response = await fetch(\`/api/posts/\${postId}/like\`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' }
+                const response = await fetchWithCredentials(\`/api/posts/\${postId}/like\`, {
+                    method: 'POST'
                 });
                 
                 if (response.ok) {
@@ -1140,8 +983,7 @@ const htmlContent = `<!DOCTYPE html>
                     } else if (currentView === 'explore') {
                         await showExplore();
                     } else if (currentView === 'profile') {
-                        const userId = currentView === 'profile' && currentUser ? currentUser.id : null;
-                        if (userId) await viewProfile(userId);
+                        await viewProfile(currentUser.id);
                     }
                 }
             } catch (error) {
@@ -1153,9 +995,8 @@ const htmlContent = `<!DOCTYPE html>
             const comment = prompt('Enter your comment:');
             if (comment && comment.trim()) {
                 try {
-                    const response = await fetch(\`/api/posts/\${postId}/comments\`, {
+                    const response = await fetchWithCredentials(\`/api/posts/\${postId}/comments\`, {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ content: comment })
                     });
                     
@@ -1165,8 +1006,7 @@ const htmlContent = `<!DOCTYPE html>
                         } else if (currentView === 'explore') {
                             await showExplore();
                         } else if (currentView === 'profile') {
-                            const userId = currentView === 'profile' && currentUser ? currentUser.id : null;
-                            if (userId) await viewProfile(userId);
+                            await viewProfile(currentUser.id);
                         }
                     } else {
                         alert('Failed to add comment');
@@ -1180,9 +1020,8 @@ const htmlContent = `<!DOCTYPE html>
         
         async function followUser(userId, button) {
             try {
-                const response = await fetch(\`/api/friends/follow/\${userId}\`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' }
+                const response = await fetchWithCredentials(\`/api/users/\${userId}/follow\`, {
+                    method: 'POST'
                 });
                 
                 if (response.ok) {
@@ -1190,7 +1029,6 @@ const htmlContent = `<!DOCTYPE html>
                     if (button) {
                         button.innerText = data.following ? 'Unfollow' : 'Follow';
                     }
-                    // Refresh current view
                     if (currentView === 'explore') {
                         await showExplore();
                     } else if (currentView === 'profile') {
@@ -1215,7 +1053,7 @@ const htmlContent = `<!DOCTYPE html>
         
         async function logout() {
             try {
-                await fetch('/api/auth/logout', { method: 'POST' });
+                await fetchWithCredentials('/api/auth/logout', { method: 'POST' });
                 currentUser = null;
                 showAuth();
             } catch (error) {
@@ -1229,9 +1067,6 @@ const htmlContent = `<!DOCTYPE html>
 
 fs.writeFileSync(path.join(publicDir, 'index.html'), htmlContent);
 
-// Create uploads directory if not exists
-if (!fs.existsSync('./uploads')) fs.mkdirSync('./uploads');
-
 // Database connection and server start
 const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/socialnetwork';
@@ -1241,17 +1076,11 @@ mongoose.connect(MONGODB_URI, {
   useUnifiedTopology: true
 }).then(() => {
   console.log('✅ Connected to MongoDB');
-  server.listen(PORT, () => {
-    console.log(`🚀 Server running on http://localhost:${PORT}`);
-    console.log(`📝 Open your browser to http://localhost:${PORT}`);
+  app.listen(PORT, () => {
+    console.log(`\n🚀 Server running on http://localhost:${PORT}`);
+    console.log(`📝 Open your browser to http://localhost:${PORT}\n`);
   });
 }).catch(err => {
   console.error('❌ MongoDB connection error:', err.message);
-  process.exit(1);
-});
-
-// Error handling
-process.on('unhandledRejection', (err) => {
-  console.error('Unhandled rejection:', err);
   process.exit(1);
 });
