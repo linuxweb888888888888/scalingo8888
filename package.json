@@ -5,6 +5,7 @@
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
+    "postinstall": "echo 'Dependencies installed, Chromium will be downloaded at runtime'",
     "dev": "nodemon bot.js"
   },
   "keywords": [
@@ -27,6 +28,6 @@
     "nodemon": "^3.0.1"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": "20.x"
   }
 }
