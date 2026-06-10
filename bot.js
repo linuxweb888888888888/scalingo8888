@@ -82,8 +82,18 @@ const GRAPHQL_QUERIES = {
     `
 };
 
-// ============ GRAPHQL REQUEST FUNCTION ============
-async function graphqlRequest(query, variables = {}) {
+// ============ GRAPHQL REQUEST FUNCTION WITH MULTIPLE AUTH METHODS ============
+async function graphqlRequest(query, variables = {}, retryCount = 0) {
+    // Try different authentication methods
+    const authMethods = [
+        { name: 'Bearer', headers: { 'Authorization': `Bearer ${API_KEY}` } },
+        { name: 'API-Key', headers: { 'API-Key': API_KEY } },
+        { name: 'X-API-Key', headers: { 'X-API-Key': API_KEY } },
+        { name: 'Token', headers: { 'Token': API_KEY } }
+    ];
+    
+    const method = authMethods[retryCount % authMethods.length];
+    
     try {
         const response = await axios.post(API_URL, {
             query: query,
@@ -91,22 +101,64 @@ async function graphqlRequest(query, variables = {}) {
         }, {
             headers: {
                 'Content-Type': 'application/json',
-                'Authorization': `Bearer ${API_KEY}`
+                ...method.headers
             }
         });
         
         if (response.data.errors) {
+            // Check if it's an auth error
+            const isAuthError = response.data.errors.some(e => 
+                e.message?.toLowerCase().includes('unauthorized') || 
+                e.message?.toLowerCase().includes('authentication')
+            );
+            
+            if (isAuthError && retryCount < authMethods.length * 2) {
+                console.log(`Auth method "${method.name}" failed, trying next method...`);
+                return graphqlRequest(query, variables, retryCount + 1);
+            }
+            
             console.error("GraphQL Errors:", JSON.stringify(response.data.errors, null, 2));
             return null;
         }
         
+        if (retryCount > 0) {
+            console.log(`Successfully authenticated with method: ${method.name}`);
+        }
+        
         return response.data.data;
     } catch (error) {
-        console.error("Request Error:", error.message);
+        console.error(`Request Error (${method.name}):`, error.message);
         if (error.response) {
             console.error("Response status:", error.response.status);
+            console.error("Response headers:", error.response.headers);
+        }
+        
+        if (retryCount < authMethods.length * 2) {
+            return graphqlRequest(query, variables, retryCount + 1);
         }
         return null;
+    }
+}
+
+// ============ TEST AUTHENTICATION ON STARTUP ============
+async function testAuthentication() {
+    console.log("Testing authentication to Paradice.in API...");
+    const result = await graphqlRequest(GRAPHQL_QUERIES.getMe);
+    
+    if (result?.me) {
+        console.log("✅ Authentication successful!");
+        console.log(`Logged in as: ${result.me.login}`);
+        console.log(`User ID: ${result.me.id}`);
+        if (result.me.wallets) {
+            result.me.wallets.forEach(w => {
+                console.log(`${w.currency}: ${w.balance} (Bonus: ${w.bonus})`);
+            });
+        }
+        return true;
+    } else {
+        console.error("❌ Authentication failed! Please check your API key.");
+        console.error("The API key might be expired or invalid for this endpoint.");
+        return false;
     }
 }
 
@@ -184,6 +236,14 @@ async function placeBet() {
 
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
+    // First test authentication
+    const isAuthenticated = await testAuthentication();
+    if (!isAuthenticated) {
+        console.error("Cannot start bot - authentication failed!");
+        botState.statusMessage = "AUTHENTICATION FAILED - Check API Key";
+        return;
+    }
+    
     console.log("Starting bot with API URL:", API_URL);
     botState.statusMessage = "Linear Recovery Mode (80% Profit Lock) - Paradice.in";
     
@@ -377,7 +437,6 @@ app.get('/', (req, res) => {
     res.send(html);
 });
 
-// Make sure to bind to 0.0.0.0 for Scalingo
 app.listen(port, '0.0.0.0', () => {
     console.log(`Server running on port ${port}`);
     console.log(`Web dashboard available at http://localhost:${port}`);
