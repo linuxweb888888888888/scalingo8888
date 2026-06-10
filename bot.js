@@ -1,10 +1,10 @@
-// social-network.js - Complete Social Network Script for Scalingo
-// Deploy on Scalingo: single file with all features
+// social-network.js - Complete Social Network Script for Scalingo (No JWT)
 
 const express = require('express');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
+const session = require('express-session');
+const MongoStore = require('connect-mongo');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
@@ -27,6 +27,22 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
+
+// Session configuration
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'your-session-secret-key-change-this',
+  resave: false,
+  saveUninitialized: false,
+  store: MongoStore.create({
+    mongoUrl: process.env.MONGODB_URI || 'mongodb://localhost:27017/socialnetwork',
+    ttl: 14 * 24 * 60 * 60 // 14 days
+  }),
+  cookie: {
+    maxAge: 1000 * 60 * 60 * 24 * 7, // 7 days
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production'
+  }
+}));
 
 // File upload configuration
 const storage = multer.diskStorage({
@@ -117,51 +133,53 @@ const Message = mongoose.model('Message', MessageSchema);
 // Authentication Middleware
 const authMiddleware = async (req, res, next) => {
   try {
-    const token = req.header('Authorization')?.replace('Bearer ', '');
-    if (!token) throw new Error();
+    if (!req.session.userId) {
+      return res.status(401).json({ error: 'Please login first' });
+    }
     
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key-change-this');
-    const user = await User.findById(decoded.userId).select('-password');
-    
-    if (!user) throw new Error();
+    const user = await User.findById(req.session.userId).select('-password');
+    if (!user) {
+      req.session.destroy();
+      return res.status(401).json({ error: 'User not found' });
+    }
     
     req.user = user;
-    req.userId = decoded.userId;
+    req.userId = req.session.userId;
     next();
   } catch (error) {
-    res.status(401).json({ error: 'Please authenticate' });
+    res.status(401).json({ error: 'Authentication failed' });
   }
 };
 
 // Socket.IO for real-time features
 io.use((socket, next) => {
-  const token = socket.handshake.auth.token;
-  if (!token) return next(new Error('Authentication error'));
-  
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key-change-this');
-    socket.userId = decoded.userId;
-    next();
-  } catch (err) {
-    next(new Error('Authentication error'));
-  }
+  const sessionId = socket.handshake.auth.sessionId;
+  if (!sessionId) return next(new Error('Authentication error'));
+  socket.sessionId = sessionId;
+  next();
 });
 
 io.on('connection', (socket) => {
-  console.log('User connected:', socket.userId);
+  console.log('Socket connected:', socket.id);
   
-  socket.join(`user_${socket.userId}`);
+  socket.on('register_user', async (userId) => {
+    socket.userId = userId;
+    socket.join(`user_${userId}`);
+    console.log('User registered to socket:', userId);
+  });
   
   socket.on('send_message', async (data) => {
     try {
       const message = new Message({
-        sender: socket.userId,
+        sender: data.senderId,
         receiver: data.receiverId,
         message: data.message
       });
       await message.save();
       
-      const populatedMessage = await Message.findById(message._id).populate('sender', 'username fullName avatar');
+      const populatedMessage = await Message.findById(message._id)
+        .populate('sender', 'username fullName avatar')
+        .populate('receiver', 'username fullName avatar');
       
       io.to(`user_${data.receiverId}`).emit('receive_message', populatedMessage);
       socket.emit('message_sent', populatedMessage);
@@ -170,12 +188,8 @@ io.on('connection', (socket) => {
     }
   });
   
-  socket.on('typing', (data) => {
-    socket.to(`user_${data.receiverId}`).emit('user_typing', { userId: socket.userId, isTyping: data.isTyping });
-  });
-  
   socket.on('disconnect', () => {
-    console.log('User disconnected:', socket.userId);
+    console.log('Socket disconnected:', socket.id);
   });
 });
 
@@ -201,10 +215,10 @@ app.post('/api/auth/register', async (req, res) => {
     
     await user.save();
     
-    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET || 'your-secret-key-change-this', { expiresIn: '7d' });
+    req.session.userId = user._id;
     
     res.status(201).json({
-      token,
+      success: true,
       user: {
         id: user._id,
         username: user.username,
@@ -232,13 +246,13 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
     
+    req.session.userId = user._id;
+    
     user.lastActive = new Date();
     await user.save();
     
-    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET || 'your-secret-key-change-this', { expiresIn: '7d' });
-    
     res.json({
-      token,
+      success: true,
       user: {
         id: user._id,
         username: user.username,
@@ -255,8 +269,26 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+app.post('/api/auth/logout', (req, res) => {
+  req.session.destroy((err) => {
+    if (err) {
+      return res.status(500).json({ error: 'Logout failed' });
+    }
+    res.json({ success: true, message: 'Logged out successfully' });
+  });
+});
+
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
   res.json(req.user);
+});
+
+app.get('/api/auth/check', async (req, res) => {
+  if (req.session.userId) {
+    const user = await User.findById(req.session.userId).select('-password');
+    res.json({ authenticated: true, user });
+  } else {
+    res.json({ authenticated: false });
+  }
 });
 
 // Post Routes
@@ -266,7 +298,6 @@ app.get('/api/posts', authMiddleware, async (req, res) => {
     const limit = parseInt(req.query.limit) || 10;
     const skip = (page - 1) * limit;
     
-    // Get posts from user and users they follow
     const followingUsers = [...req.user.following, req.user._id];
     
     const posts = await Post.find({ user: { $in: followingUsers } })
@@ -313,25 +344,6 @@ app.post('/api/posts', authMiddleware, upload.single('image'), async (req, res) 
   }
 });
 
-app.get('/api/posts/:postId', authMiddleware, async (req, res) => {
-  try {
-    const post = await Post.findById(req.params.postId)
-      .populate('user', 'username fullName avatar bio')
-      .populate({
-        path: 'comments',
-        populate: { path: 'user', select: 'username fullName avatar' }
-      });
-    
-    if (!post) {
-      return res.status(404).json({ error: 'Post not found' });
-    }
-    
-    res.json(post);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
 app.delete('/api/posts/:postId', authMiddleware, async (req, res) => {
   try {
     const post = await Post.findOne({ _id: req.params.postId, user: req.userId });
@@ -363,7 +375,6 @@ app.post('/api/posts/:postId/like', authMiddleware, async (req, res) => {
       post.likes.push(req.userId);
       liked = true;
       
-      // Create notification
       if (post.user.toString() !== req.userId) {
         const notification = new Notification({
           user: post.user,
@@ -372,13 +383,6 @@ app.post('/api/posts/:postId/like', authMiddleware, async (req, res) => {
           post: post._id
         });
         await notification.save();
-        
-        // Emit real-time notification
-        io.to(`user_${post.user}`).emit('new_notification', {
-          type: 'like',
-          from: req.user.username,
-          postId: post._id
-        });
       }
     } else {
       post.likes.splice(likeIndex, 1);
@@ -411,7 +415,6 @@ app.post('/api/posts/:postId/comments', authMiddleware, async (req, res) => {
     
     await comment.populate('user', 'username fullName avatar');
     
-    // Create notification
     if (post.user.toString() !== req.userId) {
       const notification = new Notification({
         user: post.user,
@@ -421,12 +424,6 @@ app.post('/api/posts/:postId/comments', authMiddleware, async (req, res) => {
         comment: comment._id
       });
       await notification.save();
-      
-      io.to(`user_${post.user}`).emit('new_notification', {
-        type: 'comment',
-        from: req.user.username,
-        postId: post._id
-      });
     }
     
     res.status(201).json(comment);
@@ -448,15 +445,11 @@ app.get('/api/users/:userId', authMiddleware, async (req, res) => {
     }
     
     const isFollowing = user.followers.some(f => f._id.toString() === req.userId);
-    const isFollower = user.following.some(f => f._id.toString() === req.userId);
     
     res.json({
       ...user.toObject(),
       isFollowing,
-      isFollower,
-      postsCount: await Post.countDocuments({ user: user._id }),
-      followersCount: user.followers.length,
-      followingCount: user.following.length
+      postsCount: await Post.countDocuments({ user: user._id })
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -511,18 +504,12 @@ app.post('/api/friends/request/:userId', authMiddleware, async (req, res) => {
     
     await friendship.save();
     
-    // Create notification
     const notification = new Notification({
       user: recipientId,
       type: 'friend_request',
       from: req.userId
     });
     await notification.save();
-    
-    io.to(`user_${recipientId}`).emit('new_notification', {
-      type: 'friend_request',
-      from: req.user.username
-    });
     
     res.json({ message: 'Friend request sent' });
   } catch (error) {
@@ -541,7 +528,6 @@ app.put('/api/friends/accept/:requestId', authMiddleware, async (req, res) => {
     friendship.status = 'accepted';
     await friendship.save();
     
-    // Add to followers/following
     await User.findByIdAndUpdate(friendship.requester, {
       $addToSet: { following: friendship.recipient, followers: friendship.recipient }
     });
@@ -550,7 +536,6 @@ app.put('/api/friends/accept/:requestId', authMiddleware, async (req, res) => {
       $addToSet: { following: friendship.requester, followers: friendship.requester }
     });
     
-    // Create notification for acceptance
     const notification = new Notification({
       user: friendship.requester,
       type: 'friend_accept',
@@ -558,98 +543,13 @@ app.put('/api/friends/accept/:requestId', authMiddleware, async (req, res) => {
     });
     await notification.save();
     
-    io.to(`user_${friendship.requester}`).emit('new_notification', {
-      type: 'friend_accept',
-      from: req.user.username
-    });
-    
     res.json({ message: 'Friend request accepted' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Notification Routes
-app.get('/api/notifications', authMiddleware, async (req, res) => {
-  try {
-    const notifications = await Notification.find({ user: req.userId })
-      .sort({ createdAt: -1 })
-      .limit(50)
-      .populate('from', 'username fullName avatar')
-      .populate('post', 'content image');
-    
-    res.json(notifications);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.put('/api/notifications/:notificationId/read', authMiddleware, async (req, res) => {
-  try {
-    await Notification.findByIdAndUpdate(req.params.notificationId, { read: true });
-    res.json({ message: 'Notification marked as read' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Message Routes
-app.get('/api/messages/:userId', authMiddleware, async (req, res) => {
-  try {
-    const messages = await Message.find({
-      $or: [
-        { sender: req.userId, receiver: req.params.userId },
-        { sender: req.params.userId, receiver: req.userId }
-      ]
-    })
-      .sort({ createdAt: 1 })
-      .populate('sender', 'username fullName avatar')
-      .populate('receiver', 'username fullName avatar');
-    
-    res.json(messages);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Search Routes
-app.get('/api/search', authMiddleware, async (req, res) => {
-  try {
-    const { q, type = 'all' } = req.query;
-    
-    if (!q) {
-      return res.json({ users: [], posts: [] });
-    }
-    
-    const searchRegex = new RegExp(q, 'i');
-    let results = {};
-    
-    if (type === 'all' || type === 'users') {
-      results.users = await User.find({
-        $or: [
-          { username: searchRegex },
-          { fullName: searchRegex },
-          { email: searchRegex }
-        ]
-      })
-        .select('username fullName avatar bio followers following')
-        .limit(20);
-    }
-    
-    if (type === 'all' || type === 'posts') {
-      results.posts = await Post.find({ content: searchRegex })
-        .sort({ createdAt: -1 })
-        .limit(20)
-        .populate('user', 'username fullName avatar');
-    }
-    
-    res.json(results);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Timeline/Feed Routes
+// Feed Routes
 app.get('/api/feed', authMiddleware, async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
@@ -707,20 +607,49 @@ app.get('/api/explore', authMiddleware, async (req, res) => {
   }
 });
 
+// Search Routes
+app.get('/api/search', authMiddleware, async (req, res) => {
+  try {
+    const { q } = req.query;
+    
+    if (!q) {
+      return res.json({ users: [], posts: [] });
+    }
+    
+    const searchRegex = new RegExp(q, 'i');
+    
+    const users = await User.find({
+      $or: [
+        { username: searchRegex },
+        { fullName: searchRegex }
+      ],
+      _id: { $ne: req.userId }
+    })
+      .select('username fullName avatar bio')
+      .limit(20);
+    
+    const posts = await Post.find({ content: searchRegex })
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .populate('user', 'username fullName avatar');
+    
+    res.json({ users, posts });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Serve uploaded files
 app.use('/uploads', express.static('uploads'));
 
-// Frontend route
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
+// Create uploads directory
+if (!fs.existsSync('./uploads')) fs.mkdirSync('./uploads');
 
-// Create public directory and index.html
+// Create public directory and HTML file
 const publicDir = './public';
 if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir);
 
-const htmlContent = `
-<!DOCTYPE html>
+const htmlContent = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -730,46 +659,68 @@ const htmlContent = `
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }
         .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
-        .auth-container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 0 20px rgba(0,0,0,0.1); }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; font-weight: bold; }
-        input, textarea { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px; font-size: 14px; }
-        button { background: #667eea; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; width: 100%; }
-        button:hover { background: #5a67d8; }
-        .error { color: red; margin-top: 10px; }
-        .success { color: green; margin-top: 10px; }
-        .feed { display: grid; gap: 20px; }
-        .post { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-        .post-header { display: flex; align-items: center; margin-bottom: 15px; }
-        .avatar { width: 50px; height: 50px; border-radius: 50%; margin-right: 15px; background: #667eea; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; }
-        .post-content { margin-bottom: 15px; }
-        .post-actions { display: flex; gap: 15px; margin-top: 10px; }
-        .post-actions button { width: auto; padding: 5px 15px; }
+        .auth-container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
+        .form-group { margin-bottom: 20px; }
+        label { display: block; margin-bottom: 8px; font-weight: bold; color: #333; }
+        input, textarea { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 5px; font-size: 14px; transition: border-color 0.3s; }
+        input:focus, textarea:focus { outline: none; border-color: #667eea; }
+        button { background: #667eea; color: white; padding: 12px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; width: 100%; transition: transform 0.2s, background 0.2s; }
+        button:hover { background: #5a67d8; transform: translateY(-1px); }
+        button:active { transform: translateY(0); }
+        .error { color: #e53e3e; margin-top: 10px; font-size: 14px; }
+        .success { color: #38a169; margin-top: 10px; }
         .hidden { display: none; }
-        .navbar { background: white; padding: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); display: flex; justify-content: space-between; align-items: center; }
-        .nav-links { display: flex; gap: 20px; }
-        .nav-links a { text-decoration: none; color: #333; cursor: pointer; }
-        .create-post { background: white; border-radius: 10px; padding: 20px; margin-bottom: 20px; }
+        .navbar { background: white; padding: 15px 30px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 100; }
+        .nav-links { display: flex; gap: 25px; }
+        .nav-links a { text-decoration: none; color: #4a5568; cursor: pointer; font-weight: 500; transition: color 0.2s; }
+        .nav-links a:hover { color: #667eea; }
+        .logo { font-size: 24px; font-weight: bold; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .create-post { background: white; border-radius: 10px; padding: 25px; margin-bottom: 25px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .feed { display: grid; gap: 25px; }
+        .post { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); transition: transform 0.2s; }
+        .post:hover { transform: translateY(-2px); box-shadow: 0 4px 20px rgba(0,0,0,0.15); }
+        .post-header { display: flex; align-items: center; margin-bottom: 15px; }
+        .avatar { width: 50px; height: 50px; border-radius: 50%; margin-right: 15px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 18px; }
+        .post-content { margin-bottom: 15px; line-height: 1.6; color: #2d3748; }
+        .post-image { max-width: 100%; border-radius: 8px; margin-top: 10px; }
+        .post-actions { display: flex; gap: 15px; margin-top: 15px; padding-top: 15px; border-top: 1px solid #e2e8f0; }
+        .post-actions button { width: auto; padding: 8px 20px; background: #f7fafc; color: #4a5568; }
+        .post-actions button:hover { background: #edf2f7; }
+        .loading { text-align: center; padding: 40px; color: white; font-size: 18px; }
+        h2 { margin-bottom: 20px; color: #2d3748; }
+        textarea { resize: vertical; font-family: inherit; }
+        .suggested-users { background: white; border-radius: 10px; padding: 20px; margin-top: 20px; }
+        .user-card { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #e2e8f0; }
+        .user-info { display: flex; align-items: center; gap: 10px; }
+        .small-avatar { width: 40px; height: 40px; border-radius: 50%; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); display: flex; align-items: center; justify-content: center; color: white; }
+        .friend-button { width: auto; padding: 5px 15px; font-size: 12px; }
+        @media (max-width: 768px) {
+            .container { padding: 10px; }
+            .navbar { padding: 10px 15px; }
+            .nav-links { gap: 15px; }
+            .logo { font-size: 18px; }
+        }
     </style>
 </head>
 <body>
     <div id="app">
+        <!-- Auth Container -->
         <div class="container" id="authContainer">
             <div class="auth-container">
-                <h2 id="authTitle">Login</h2>
+                <h2 id="authTitle" style="text-align: center; margin-bottom: 25px;">Login</h2>
                 <div id="authForm">
                     <div class="form-group">
                         <label>Email</label>
-                        <input type="email" id="email" placeholder="Enter email">
+                        <input type="email" id="email" placeholder="Enter your email">
                     </div>
                     <div class="form-group">
                         <label>Password</label>
-                        <input type="password" id="password" placeholder="Enter password">
+                        <input type="password" id="password" placeholder="Enter your password">
                     </div>
                     <div id="registerFields" class="hidden">
                         <div class="form-group">
                             <label>Username</label>
-                            <input type="text" id="username" placeholder="Choose username">
+                            <input type="text" id="username" placeholder="Choose a username">
                         </div>
                         <div class="form-group">
                             <label>Full Name</label>
@@ -777,95 +728,68 @@ const htmlContent = `
                         </div>
                     </div>
                     <button onclick="handleAuth()" id="authButton">Login</button>
-                    <p style="margin-top: 15px; text-align: center;">
-                        <a href="#" onclick="toggleAuth()" id="toggleLink">Don't have an account? Register</a>
+                    <p style="margin-top: 20px; text-align: center;">
+                        <a href="#" onclick="toggleAuth()" id="toggleLink" style="color: #667eea; text-decoration: none;">Don't have an account? Register</a>
                     </p>
-                    <div id="authMessage" class="error"></div>
+                    <div id="authMessage" class="error" style="text-align: center;"></div>
                 </div>
             </div>
         </div>
         
+        <!-- Main App Container -->
         <div id="mainApp" class="hidden">
             <div class="navbar">
-                <h2>Social Network</h2>
+                <div class="logo">SocialNetwork</div>
                 <div class="nav-links">
-                    <a onclick="loadFeed()">Feed</a>
-                    <a onclick="loadExplore()">Explore</a>
-                    <a onclick="showProfile()">Profile</a>
-                    <a onclick="logout()">Logout</a>
+                    <a onclick="loadFeed()">🏠 Feed</a>
+                    <a onclick="loadExplore()">✨ Explore</a>
+                    <a onclick="showProfile()">👤 Profile</a>
+                    <a onclick="logout()">🚪 Logout</a>
                 </div>
             </div>
             <div class="container">
                 <div class="create-post">
-                    <textarea id="postContent" rows="3" placeholder="What's on your mind?" style="width: 100%;"></textarea>
-                    <input type="file" id="postImage" accept="image/*">
-                    <button onclick="createPost()" style="margin-top: 10px;">Post</button>
+                    <h3>Create Post</h3>
+                    <textarea id="postContent" rows="3" placeholder="What's on your mind?"></textarea>
+                    <input type="file" id="postImage" accept="image/*" style="margin-top: 10px;">
+                    <button onclick="createPost()" style="margin-top: 15px;">📝 Post</button>
                 </div>
-                <div id="feed"></div>
+                <div id="feed">
+                    <div class="loading">Loading posts...</div>
+                </div>
             </div>
         </div>
     </div>
     
     <script>
-        let token = localStorage.getItem('token');
         let currentUser = null;
         
-        if (token) {
-            showMainApp();
-            loadFeed();
-        }
+        // Check authentication on page load
+        window.onload = async function() {
+            await checkAuth();
+        };
         
-        function toggleAuth() {
-            const isLogin = document.getElementById('authTitle').innerText === 'Login';
-            if (isLogin) {
-                document.getElementById('authTitle').innerText = 'Register';
-                document.getElementById('authButton').innerText = 'Register';
-                document.getElementById('toggleLink').innerHTML = 'Already have an account? Login';
-                document.getElementById('registerFields').classList.remove('hidden');
-            } else {
-                document.getElementById('authTitle').innerText = 'Login';
-                document.getElementById('authButton').innerText = 'Login';
-                document.getElementById('toggleLink').innerHTML = 'Don\'t have an account? Register';
-                document.getElementById('registerFields').classList.add('hidden');
-            }
-        }
-        
-        async function handleAuth() {
-            const isRegister = document.getElementById('authTitle').innerText === 'Register';
-            const email = document.getElementById('email').value;
-            const password = document.getElementById('password').value;
-            
+        async function checkAuth() {
             try {
-                let response;
-                if (isRegister) {
-                    const username = document.getElementById('username').value;
-                    const fullName = document.getElementById('fullName').value;
-                    response = await fetch('/api/auth/register', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ email, password, username, fullName })
-                    });
-                } else {
-                    response = await fetch('/api/auth/login', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ email, password })
-                    });
-                }
-                
+                const response = await fetch('/api/auth/check');
                 const data = await response.json();
-                if (response.ok) {
-                    token = data.token;
+                
+                if (data.authenticated) {
                     currentUser = data.user;
-                    localStorage.setItem('token', token);
                     showMainApp();
                     loadFeed();
                 } else {
-                    document.getElementById('authMessage').innerText = data.error || 'Authentication failed';
+                    showAuth();
                 }
             } catch (error) {
-                document.getElementById('authMessage').innerText = 'Network error';
+                console.error('Auth check error:', error);
+                showAuth();
             }
+        }
+        
+        function showAuth() {
+            document.getElementById('authContainer').classList.remove('hidden');
+            document.getElementById('mainApp').classList.add('hidden');
         }
         
         function showMainApp() {
@@ -873,48 +797,165 @@ const htmlContent = `
             document.getElementById('mainApp').classList.remove('hidden');
         }
         
+        let isLoginMode = true;
+        
+        function toggleAuth() {
+            isLoginMode = !isLoginMode;
+            if (isLoginMode) {
+                document.getElementById('authTitle').innerText = 'Login';
+                document.getElementById('authButton').innerText = 'Login';
+                document.getElementById('toggleLink').innerHTML = "Don't have an account? Register";
+                document.getElementById('registerFields').classList.add('hidden');
+            } else {
+                document.getElementById('authTitle').innerText = 'Register';
+                document.getElementById('authButton').innerText = 'Register';
+                document.getElementById('toggleLink').innerHTML = 'Already have an account? Login';
+                document.getElementById('registerFields').classList.remove('hidden');
+            }
+            document.getElementById('authMessage').innerText = '';
+        }
+        
+        async function handleAuth() {
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            
+            if (!email || !password) {
+                document.getElementById('authMessage').innerText = 'Please fill in all fields';
+                return;
+            }
+            
+            const button = document.getElementById('authButton');
+            button.disabled = true;
+            button.innerText = 'Processing...';
+            
+            try {
+                let response;
+                if (isLoginMode) {
+                    response = await fetch('/api/auth/login', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ email, password })
+                    });
+                } else {
+                    const username = document.getElementById('username').value;
+                    const fullName = document.getElementById('fullName').value;
+                    
+                    if (!username || !fullName) {
+                        document.getElementById('authMessage').innerText = 'Please fill in all fields';
+                        button.disabled = false;
+                        button.innerText = isLoginMode ? 'Login' : 'Register';
+                        return;
+                    }
+                    
+                    response = await fetch('/api/auth/register', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ email, password, username, fullName })
+                    });
+                }
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    currentUser = data.user;
+                    showMainApp();
+                    loadFeed();
+                    // Clear form
+                    document.getElementById('email').value = '';
+                    document.getElementById('password').value = '';
+                    if (!isLoginMode) {
+                        document.getElementById('username').value = '';
+                        document.getElementById('fullName').value = '';
+                    }
+                } else {
+                    document.getElementById('authMessage').innerText = data.error || 'Authentication failed';
+                }
+            } catch (error) {
+                document.getElementById('authMessage').innerText = 'Network error. Please try again.';
+                console.error('Auth error:', error);
+            } finally {
+                button.disabled = false;
+                button.innerText = isLoginMode ? 'Login' : 'Register';
+            }
+        }
+        
         async function loadFeed() {
+            const feedDiv = document.getElementById('feed');
+            feedDiv.innerHTML = '<div class="loading">Loading posts...</div>';
+            
             try {
                 const response = await fetch('/api/feed', {
-                    headers: { 'Authorization': \`Bearer \${token}\` }
+                    headers: { 'Content-Type': 'application/json' }
                 });
+                
+                if (!response.ok) throw new Error('Failed to load feed');
+                
                 const data = await response.json();
                 displayPosts(data.posts);
             } catch (error) {
                 console.error('Error loading feed:', error);
+                feedDiv.innerHTML = '<div class="loading">Error loading feed. Please refresh.</div>';
             }
         }
         
         async function loadExplore() {
+            const feedDiv = document.getElementById('feed');
+            feedDiv.innerHTML = '<div class="loading">Loading explore...</div>';
+            
             try {
                 const response = await fetch('/api/explore', {
-                    headers: { 'Authorization': \`Bearer \${token}\` }
+                    headers: { 'Content-Type': 'application/json' }
                 });
+                
+                if (!response.ok) throw new Error('Failed to load explore');
+                
                 const data = await response.json();
-                displayPosts(data.trendingPosts);
+                
+                let html = '<h2>Trending Posts</h2>';
+                html += renderPosts(data.trendingPosts);
+                
+                if (data.suggestedUsers && data.suggestedUsers.length > 0) {
+                    html += '<div class="suggested-users"><h3>Suggested Users</h3>';
+                    for (const user of data.suggestedUsers) {
+                        html += \`
+                            <div class="user-card">
+                                <div class="user-info">
+                                    <div class="small-avatar">\${user.fullName?.charAt(0) || 'U'}</div>
+                                    <div>
+                                        <strong>\${user.fullName}</strong><br>
+                                        <small>@\${user.username}</small>
+                                    </div>
+                                </div>
+                                <button class="friend-button" onclick="sendFriendRequest('\${user._id}')">Follow</button>
+                            </div>
+                        \`;
+                    }
+                    html += '</div>';
+                }
+                
+                feedDiv.innerHTML = html;
             } catch (error) {
                 console.error('Error loading explore:', error);
+                feedDiv.innerHTML = '<div class="loading">Error loading explore. Please refresh.</div>';
             }
         }
         
-        function displayPosts(posts) {
-            const feedDiv = document.getElementById('feed');
+        function renderPosts(posts) {
             if (!posts || posts.length === 0) {
-                feedDiv.innerHTML = '<p>No posts yet. Be the first to post!</p>';
-                return;
+                return '<p style="text-align: center; color: #718096;">No posts yet. Be the first to post!</p>';
             }
             
-            feedDiv.innerHTML = posts.map(post => \`
+            return posts.map(post => \`
                 <div class="post">
                     <div class="post-header">
                         <div class="avatar">\${post.user?.fullName?.charAt(0) || 'U'}</div>
                         <div>
-                            <strong>\${post.user?.fullName || 'Unknown'}</strong><br>
-                            <small>@\${post.user?.username || 'user'}</small>
+                            <strong>\${escapeHtml(post.user?.fullName || 'Unknown')}</strong><br>
+                            <small style="color: #718096;">@\${escapeHtml(post.user?.username || 'user')}</small>
                         </div>
                     </div>
-                    <div class="post-content">\${post.content}</div>
-                    \${post.image ? \`<img src="\${post.image}" style="max-width: 100%; border-radius: 5px; margin-top: 10px;">\` : ''}
+                    <div class="post-content">\${escapeHtml(post.content)}</div>
+                    \${post.image ? \`<img src="\${post.image}" class="post-image" alt="Post image">\` : ''}
                     <div class="post-actions">
                         <button onclick="likePost('\${post._id}')">❤️ \${post.likes?.length || 0}</button>
                         <button onclick="commentOnPost('\${post._id}')">💬 \${post.comments?.length || 0}</button>
@@ -923,38 +964,66 @@ const htmlContent = `
             \`).join('');
         }
         
+        function displayPosts(posts) {
+            const feedDiv = document.getElementById('feed');
+            feedDiv.innerHTML = renderPosts(posts);
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
         async function createPost() {
             const content = document.getElementById('postContent').value;
-            const imageFile = document.getElementById('postImage').files[0];
+            if (!content.trim()) {
+                alert('Please enter some content');
+                return;
+            }
             
+            const imageFile = document.getElementById('postImage').files[0];
             const formData = new FormData();
             formData.append('content', content);
             if (imageFile) formData.append('image', imageFile);
             
+            const button = event.target;
+            button.disabled = true;
+            button.innerText = 'Posting...';
+            
             try {
                 const response = await fetch('/api/posts', {
                     method: 'POST',
-                    headers: { 'Authorization': \`Bearer \${token}\` },
                     body: formData
                 });
                 
                 if (response.ok) {
                     document.getElementById('postContent').value = '';
                     document.getElementById('postImage').value = '';
-                    loadFeed();
+                    await loadFeed();
+                } else {
+                    const error = await response.json();
+                    alert(error.error || 'Failed to create post');
                 }
             } catch (error) {
                 console.error('Error creating post:', error);
+                alert('Error creating post. Please try again.');
+            } finally {
+                button.disabled = false;
+                button.innerText = '📝 Post';
             }
         }
         
         async function likePost(postId) {
             try {
-                await fetch(\`/api/posts/\${postId}/like\`, {
+                const response = await fetch(\`/api/posts/\${postId}/like\`, {
                     method: 'POST',
-                    headers: { 'Authorization': \`Bearer \${token}\` }
+                    headers: { 'Content-Type': 'application/json' }
                 });
-                loadFeed();
+                
+                if (response.ok) {
+                    await loadFeed();
+                }
             } catch (error) {
                 console.error('Error liking post:', error);
             }
@@ -962,35 +1031,62 @@ const htmlContent = `
         
         function commentOnPost(postId) {
             const comment = prompt('Enter your comment:');
-            if (comment) {
+            if (comment && comment.trim()) {
                 fetch(\`/api/posts/\${postId}/comments\`, {
                     method: 'POST',
-                    headers: {
-                        'Authorization': \`Bearer \${token}\`,
-                        'Content-Type': 'application/json'
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ content: comment })
-                }).then(() => loadFeed());
+                })
+                .then(response => {
+                    if (response.ok) loadFeed();
+                    else alert('Failed to add comment');
+                })
+                .catch(error => console.error('Error:', error));
+            }
+        }
+        
+        async function sendFriendRequest(userId) {
+            try {
+                const response = await fetch(\`/api/friends/request/\${userId}\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                
+                if (response.ok) {
+                    alert('Friend request sent!');
+                    await loadExplore();
+                } else {
+                    const error = await response.json();
+                    alert(error.error || 'Failed to send request');
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                alert('Error sending friend request');
             }
         }
         
         function showProfile() {
-            window.location.href = '/profile.html';
+            if (currentUser) {
+                window.location.href = \`/profile.html?user=\${currentUser.id}\`;
+            }
         }
         
-        function logout() {
-            localStorage.removeItem('token');
-            window.location.reload();
+        async function logout() {
+            try {
+                await fetch('/api/auth/logout', { method: 'POST' });
+                currentUser = null;
+                showAuth();
+            } catch (error) {
+                console.error('Logout error:', error);
+                // Force logout anyway
+                showAuth();
+            }
         }
     </script>
 </body>
-</html>
-`;
+</html>`;
 
 fs.writeFileSync(path.join(publicDir, 'index.html'), htmlContent);
-
-// Create uploads directory if not exists
-if (!fs.existsSync('./uploads')) fs.mkdirSync('./uploads');
 
 // Database connection and server start
 const PORT = process.env.PORT || 3000;
@@ -1000,12 +1096,13 @@ mongoose.connect(MONGODB_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true
 }).then(() => {
-  console.log('Connected to MongoDB');
+  console.log('✅ Connected to MongoDB');
   server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`🚀 Server running on http://localhost:${PORT}`);
+    console.log(`📝 Open your browser to http://localhost:${PORT}`);
   });
 }).catch(err => {
-  console.error('MongoDB connection error:', err);
+  console.error('❌ MongoDB connection error:', err.message);
   process.exit(1);
 });
 
