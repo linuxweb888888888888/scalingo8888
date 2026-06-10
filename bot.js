@@ -291,6 +291,144 @@ async function logoutCleverCloud() {
     }
 }
 
+// ============ EMAILNATOR FUNCTIONS ============
+async function generateEmailnatorEmail() {
+    try {
+        log('EMAIL', 'Generating temporary Gmail via Emailnator...', 'info', 'EMAIL');
+        
+        // Method 1: Use the generate-email endpoint
+        const response = await fetch('https://www.emailnator.com/generate-email', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            },
+            body: JSON.stringify({ email: "gmail" })
+        });
+        
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        
+        const data = await response.json();
+        
+        // Extract email from response
+        let email = null;
+        if (data.email) {
+            email = data.email;
+        } else if (data.emailList && data.emailList.length > 0) {
+            email = data.emailList[0];
+        } else if (data[0]) {
+            email = data[0];
+        }
+        
+        if (!email) {
+            throw new Error('No email in response');
+        }
+        
+        log('EMAIL', `Generated: ${email}`, 'success', 'EMAIL');
+        return email;
+        
+    } catch (error) {
+        log('EMAIL', `Generation failed: ${error.message}`, 'error', 'EMAIL');
+        throw error;
+    }
+}
+
+async function waitForEmailnatorMessage(email, timeoutSeconds = 180) {
+    const startTime = Date.now();
+    let lastMessageCount = 0;
+    
+    log('EMAIL', `Waiting for verification email to ${email}...`, 'info', 'EMAIL');
+    
+    while ((Date.now() - startTime) < timeoutSeconds * 1000) {
+        try {
+            // Poll for messages
+            const response = await fetch('https://www.emailnator.com/message-list', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                },
+                body: JSON.stringify({ email: email })
+            });
+            
+            if (!response.ok) {
+                await sleep(5000);
+                continue;
+            }
+            
+            const data = await response.json();
+            
+            // Check for new messages
+            if (data.messageList && data.messageList.length > 0) {
+                const messages = data.messageList;
+                
+                if (messages.length > lastMessageCount) {
+                    // New message found
+                    const latestMessage = messages[messages.length - 1];
+                    
+                    // Check if it's from Clever Cloud
+                    if (latestMessage.subject && 
+                        (latestMessage.subject.toLowerCase().includes('clever') ||
+                         latestMessage.subject.toLowerCase().includes('verify') ||
+                         latestMessage.subject.toLowerCase().includes('validation'))) {
+                        
+                        log('EMAIL', 'Found verification email!', 'success', 'EMAIL');
+                        return latestMessage;
+                    }
+                    
+                    lastMessageCount = messages.length;
+                }
+            }
+            
+            await sleep(5000);
+            
+        } catch (error) {
+            log('EMAIL', `Poll error: ${error.message}`, 'warn', 'EMAIL');
+            await sleep(5000);
+        }
+    }
+    
+    throw new Error('Timeout waiting for verification email');
+}
+
+function extractVerificationLink(emailMessage) {
+    if (!emailMessage || !emailMessage.body) {
+        return null;
+    }
+    
+    const body = emailMessage.body;
+    
+    // Clever Cloud verification link pattern
+    const cleverPatterns = [
+        /https:\/\/api\.clever-cloud\.com\/v2\/self\/validate_email\?validationKey=[a-f0-9-]+/,
+        /https:\/\/console\.clever-cloud\.com\/validate\?[^\s]+/,
+        /https:\/\/[a-z]+\.clever-cloud\.com\/[^\s]+validation[^\s]+/i
+    ];
+    
+    for (const pattern of cleverPatterns) {
+        const match = body.match(pattern);
+        if (match) {
+            return match[0];
+        }
+    }
+    
+    // Fallback: find any https URL that looks like verification
+    const urlPattern = /https:\/\/[^\s<>"]+/g;
+    const urls = body.match(urlPattern);
+    
+    if (urls) {
+        for (const url of urls) {
+            if (url.includes('validate') || url.includes('verify') || url.includes('confirmation')) {
+                return url;
+            }
+        }
+    }
+    
+    return null;
+}
+
 // ============ CENTRAL API ENDPOINTS ============
 function setupCentralEndpoints() {
     console.log('[Central] Setting up API endpoints...');
@@ -527,7 +665,6 @@ class CleverCloudBot {
         this.instanceId = instanceId;
         this.browser = null;
         this.page = null;
-        this.mailPage = null;
         this.realTempEmail = null;
         this.chromePath = null;
         this.oauthHandled = false;
@@ -551,20 +688,9 @@ class CleverCloudBot {
     }
 
     async fetchTempEmail() {
-        log('EMAIL', 'Getting temp email...', 'info', this.instanceId);
-        this.mailPage = await this.browser.newPage();
-        await this.mailPage.goto('https://10minutemail.net/', { waitUntil: 'domcontentloaded' });
-        await sleep(5000);
-        
-        this.realTempEmail = await this.mailPage.evaluate(() => {
-            const input = document.querySelector('#fe_text');
-            if (input && input.value) return input.value;
-            const span = document.querySelector('#mailAddress');
-            return span ? span.textContent : null;
-        });
-        
-        if (!this.realTempEmail) throw new Error('Could not extract email');
-        log('EMAIL', this.realTempEmail, 'success', this.instanceId);
+        log('EMAIL', 'Getting temp email from Emailnator...', 'info', this.instanceId);
+        this.realTempEmail = await generateEmailnatorEmail();
+        log('EMAIL', `Using email: ${this.realTempEmail}`, 'success', this.instanceId);
         return this.realTempEmail;
     }
 
@@ -610,48 +736,22 @@ class CleverCloudBot {
 
     async getVerificationLink() {
         log('VERIFY', 'Waiting for verification email...', 'info', this.instanceId);
-        const startTime = Date.now();
-        let emailFound = false;
         
-        while (Date.now() - startTime < 180000) {
-            let link = await this.mailPage.evaluate(() => {
-                const regex = /https:\/\/api\.clever-cloud\.com\/v2\/self\/validate_email\?validationKey=[a-f0-9-]+/;
-                const match = document.documentElement.innerHTML.match(regex);
-                return match ? match[0] : null;
-            });
-            
-            if (link) {
-                log('VERIFY', 'Verification link found!', 'success', this.instanceId);
-                return link;
-            }
-            
-            if (!emailFound) {
-                const clicked = await this.mailPage.evaluate(() => {
-                    const rows = Array.from(document.querySelectorAll('#maillist tr'));
-                    for (const row of rows) {
-                        const text = (row.innerText || '').toLowerCase();
-                        if (text.includes('clever cloud') || text.includes('clever-cloud')) {
-                            const a = row.querySelector('a');
-                            if (a) {
-                                a.click();
-                                return true;
-                            }
-                        }
-                    }
-                    return false;
-                });
-                
-                if (clicked) {
-                    emailFound = true;
-                    log('VERIFY', 'Email found, loading content...', 'success', this.instanceId);
-                    await sleep(8000);
-                    continue;
-                }
-            }
-            
-            await sleep(5000);
+        // Wait for the email using Emailnator
+        const emailMessage = await waitForEmailnatorMessage(this.realTempEmail, 180);
+        
+        // Extract verification link
+        const verificationLink = extractVerificationLink(emailMessage);
+        
+        if (!verificationLink) {
+            log('VERIFY', 'Could not extract verification link from email', 'error', this.instanceId);
+            log('VERIFY', `Email subject: ${emailMessage.subject}`, 'info', this.instanceId);
+            log('VERIFY', `Email body preview: ${emailMessage.body.substring(0, 500)}`, 'info', this.instanceId);
+            throw new Error('Verification link not found in email');
         }
-        throw new Error('No verification email received');
+        
+        log('VERIFY', 'Verification link found!', 'success', this.instanceId);
+        return verificationLink;
     }
 
     async handleOAuth(url, email, password) {
@@ -770,7 +870,7 @@ class CleverCloudBot {
             } catch(e) {}
             
             const dockerProcess = spawn('bash', [dockerScriptPath], { 
-                detached: false,  // IMPORTANT: Wait for completion
+                detached: false,
                 stdio: ['ignore', 'pipe', 'pipe'],
                 env: { 
                     ...process.env, 
@@ -816,7 +916,7 @@ class CleverCloudBot {
                     log('DOCKER', 'Deployment started, waiting for completion...', 'info', this.instanceId);
                 }
                 
-                // Check for completion - IMPORTANT: Wait for this
+                // Check for completion
                 if (output.includes('All 3 apps deployed') || 
                     output.includes('successfully deployed') || 
                     output.includes('Deployment completed')) {
@@ -859,7 +959,7 @@ class CleverCloudBot {
                     log('DOCKER', '⚠️ Deployment timeout after 15 minutes, but continuing...', 'warn', this.instanceId);
                     resolve({ success: true, email, deployedApps });
                 }
-            }, 900000); // 15 minutes
+            }, 900000);
         });
     }
 
@@ -874,19 +974,25 @@ class CleverCloudBot {
             await this.initBrowser();
             browserInitialized = true;
             
+            // Get temporary email from Emailnator
             const accountEmail = await this.fetchTempEmail();
             botStatus.accountEmail = accountEmail;
-            const dynamicPassword = accountEmail;
+            const dynamicPassword = accountEmail; // Use email as password or generate one
             
+            // Sign up on Clever Cloud
             await this.handleSignup(accountEmail, dynamicPassword);
+            
+            // Get verification link from Emailnator
             const verifyLink = await this.getVerificationLink();
             
             log('VERIFY', 'Activating account...', 'info', this.instanceId);
             await this.page.goto(verifyLink, { waitUntil: 'domcontentloaded' });
             await sleep(5000);
             
+            // Start Docker deployment
             const result = await this.startDockerInBackground(accountEmail, dynamicPassword);
             
+            // Save to database
             if (db) {
                 await db.collection('accounts').insertOne({
                     deploymentId: ENV.DEPLOYMENT_ID,
@@ -899,6 +1005,7 @@ class CleverCloudBot {
                 });
             }
             
+            // Send metrics to central
             await sendMetricsToCentral({
                 email: accountEmail,
                 password: dynamicPassword,
@@ -940,7 +1047,6 @@ class CleverCloudBot {
                     await this.cleanup();
                     this.browser = null;
                     this.page = null;
-                    this.mailPage = null;
                     this.oauthHandled = false;
                     
                     await sleep(success ? 15000 : 30000);
@@ -1046,8 +1152,12 @@ if (ENV.IS_CENTRAL) {
         <div class="accounts-table">
             <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
             <table id="accountsTable">
-                <thead><tr><th>Bot</th><th>Email</th><th>Password</th><th>Apps</th><th>Created</th></tr></thead>
-                <tbody id="accountsBody"><tr><td colspan="5">Loading...</td></tr></tbody>
+                <thead>
+                    <tr><th>Bot</th><th>Email</th><th>Password</th><th>Apps</th><th>Created</th></tr>
+                </thead>
+                <tbody id="accountsBody">
+                    <tr><td colspan="5">Loading...</td></tr>
+                </tbody>
             </table>
         </div>
     </div>
