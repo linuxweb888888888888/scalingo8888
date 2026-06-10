@@ -9,10 +9,9 @@ const app = express();
 app.use(express.json());
 
 // ==================== CONFIGURATION ====================
-// Exactly the same structure, using simulated accounts
 const apiAccounts = [
-    { apiKey: 'PAPER_1', secretKey: 'PAPER_1', accountId: 1 },
-    { apiKey: 'PAPER_2', secretKey: 'PAPER_2', accountId: 2 }
+    { apiKey: 'PAPER_KEY_1', secretKey: 'PAPER_SECRET_1', accountId: 1 },
+    { apiKey: 'PAPER_KEY_2', secretKey: 'PAPER_SECRET_2', accountId: 2 }
 ];
 
 const config = {
@@ -37,7 +36,7 @@ const config = {
     walletPerContract: 0.0066135  // $0.0066135 wallet = 1 contract at 75x leverage
 };
 
-// ==================== SIMULATION ENGINE STATE ====================
+// ==================== PAPER TRADING ENGINE STORAGE ====================
 let paperBalances = { 1: 100.0, 2: 100.0 }; 
 let paperPositions = { 1: null, 2: null };
 
@@ -64,12 +63,8 @@ let accountStates = {};
 let lastPositionFetch = {};
 let lastBalanceFetch = {};
 
-// ==================== LOGIC (EXACTLY THE SAME) ====================
-
 function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
     if (!config.autoCompound || totalEquity <= 0) {
-        market.currentRiskAmount = totalEquity * (config.riskPercent / 100);
-        market.currentBaseShib = config.baseVolume * config.shibPerContract;
         return config.baseVolume;
     }
     let volume = Math.floor(totalEquity / config.walletPerContract);
@@ -112,12 +107,10 @@ function calculateTargetPrice(state) {
     const requiredPriceMovePct = config.takeProfitPct / config.leverage;
     if (state.direction === 'buy') {
         const targetPrice = state.entryPrice * (1 + (requiredPriceMovePct / 100));
-        const feeAdjustedTarget = targetPrice * (1 + config.takerFeeRate);
-        return feeAdjustedTarget;
+        return targetPrice * (1 + config.takerFeeRate);
     } else {
         const targetPrice = state.entryPrice * (1 - (requiredPriceMovePct / 100));
-        const feeAdjustedTarget = targetPrice * (1 - config.takerFeeRate);
-        return feeAdjustedTarget;
+        return targetPrice * (1 - config.takerFeeRate);
     }
 }
 
@@ -126,14 +119,9 @@ function updateWalletGrowth(totalEquity) {
     const lastRecord = market.walletHistory[market.walletHistory.length - 1];
     if (!lastRecord || (now - lastRecord.timestamp) > 60000) {
         market.walletHistory.push({
-            timestamp: now,
-            time: new Date().toLocaleString(),
-            equity: totalEquity,
+            timestamp: now, time: new Date().toLocaleString(), equity: totalEquity,
             pnl: totalEquity - market.initialTotalEquity,
-            pnlPercent: market.initialTotalEquity > 0 ? ((totalEquity - market.initialTotalEquity) / market.initialTotalEquity) * 100 : 0,
-            baseVolume: market.currentBaseVolume,
-            baseShib: market.currentBaseShib,
-            riskAmount: market.currentRiskAmount
+            pnlPercent: market.initialTotalEquity > 0 ? ((totalEquity - market.initialTotalEquity) / market.initialTotalEquity) * 100 : 0
         });
         if (market.walletHistory.length > 100) market.walletHistory.shift();
     }
@@ -151,12 +139,11 @@ config.accounts.forEach((account, idx) => {
         currentEquity: 100, availableMargin: 100, initialEquity: 100,
         isLocked: false, pendingOrderId: null, lastAction: 'Idle',
         lastStepPrice: 0, lastAddedVolume: 0, startTime: null,
-        lastExchangeRoi: 0, roiLatencyMs: 0, roiLatencyHistory: [],
-        lastRoiUpdateTime: Date.now(), targetPrice: 0, realizedPnl: 0, totalFees: 0
+        targetPrice: 0, realizedPnl: 0, totalFees: 0, roiLatencyHistory: []
     };
 });
 
-// ==================== MOCK API ENGINE (REPLACES HTX REQUEST) ====================
+// ==================== MOCK HTX API ====================
 async function htxRequest(account, method, path, data = {}) {
     const accId = account.accountId;
     const currentPrice = market.bid || 0;
@@ -189,7 +176,6 @@ async function htxRequest(account, method, path, data = {}) {
         const fee = data.volume * config.shibPerContract * config.contractMultiplier * currentPrice * config.takerFeeRate;
         paperBalances[accId] -= fee;
         market.totalFeesPaid += fee;
-
         if (data.offset === 'open') {
             const currentPos = paperPositions[accId];
             if (currentPos) {
@@ -213,8 +199,6 @@ async function htxRequest(account, method, path, data = {}) {
     return { status: 'ok' };
 }
 
-// ==================== REST OF THE ORIGINAL CODE (UNCHANGED) ====================
-
 async function fetchPriceRest() {
     try {
         const url = `https://${config.restHost}/linear-swap-ex/market/detail/merged?contract_code=${config.symbol}`;
@@ -229,7 +213,6 @@ async function fetchPriceRest() {
 }
 
 async function syncAccount(acc, state) {
-    const now = Date.now();
     const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info');
     if (posRes?.status === 'ok' && posRes.data) {
         const pos = posRes.data.find(p => p.direction === state.direction);
@@ -255,7 +238,6 @@ function logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl) {
     market.totalTrades++;
     if (finalPnl >= 0) market.winningTrades++; else market.losingTrades++;
     tradeHistory.unshift({
-        symbol: config.symbolClean + 'Perp',
         side: state.direction.toUpperCase(), openTime: state.startTime, closeTime: exitTime,
         volume: state.volume, step: step, entryPrice: state.entryPrice.toFixed(8),
         exitPrice: exitPrice.toFixed(8), roi: finalRoi.toFixed(2) + '%',
@@ -331,21 +313,17 @@ async function backgroundLoop() {
 
 app.get('/api/status', (req, res) => {
     res.json({
-        market: { ...market, winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0 },
-        accounts: Object.values(accountStates),
-        tradeHistory,
-        config: { ...config, baseVolume: market.currentBaseVolume }
+        market: { ...market, totalEquity: accountStates[1].currentEquity + accountStates[2].currentEquity, totalRealizedPnl: accountStates[1].realizedPnl + accountStates[2].realizedPnl, winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0 },
+        accounts: Object.values(accountStates), tradeHistory, config
     });
 });
 
 app.get('/', (req, res) => {
-    const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
     res.send(`
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Martingale Pro - Paper Mode</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -353,11 +331,9 @@ app.get('/', (req, res) => {
         * { font-family: system-ui, -apple-system, sans-serif; }
         body { background: #0A0E17; color: #E8EDF2; }
         .card { background: #131824; border: 1px solid #1F2A3E; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
-        .stat-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #6B7A8F; }
+        .stat-label { font-size: 11px; font-weight: 700; text-transform: uppercase; color: #6B7A8F; }
         .value-positive { color: #00D1B2; }
         .value-negative { color: #FF4D6D; }
-        .mono { font-family: monospace; font-size: 12px; }
-        .tp-target { background: #00D1B220; color: #00D1B2; padding: 2px 8px; border-radius: 4px; font-size: 10px; }
         .wallet-card { background: linear-gradient(135deg, #1A212E 0%, #131824 100%); border: 1px solid #00D1B240; }
         .stat-number { font-size: 28px; font-weight: 900; }
         .compound-info { background: #00D1B210; border: 1px solid #00D1B230; border-radius: 8px; padding: 12px; margin-top: 10px; }
@@ -365,17 +341,8 @@ app.get('/', (req, res) => {
 </head>
 <body class="p-6">
     <div class="max-w-7xl mx-auto">
-        <div class="flex justify-between items-center mb-8">
-            <div>
-                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">PAPER MODE</span></h1>
-                <div class="flex items-center gap-3 mt-2">
-                    <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
-                    <span class="text-[10px] font-bold text-emerald-400">LIVE</span>
-                    <span class="tp-target">🎯 TP: ${config.takeProfitPct}% ROI</span>
-                </div>
-            </div>
-        </div>
-
+        <h1 class="text-3xl font-black mb-8">MARTINGALE <span class="text-indigo-500">PRO</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">PAPER MODE</span></h1>
+        
         <div class="wallet-card rounded-2xl p-6 mb-8">
             <div class="grid grid-cols-1 md:grid-cols-5 gap-6">
                 <div><p class="stat-label">TOTAL WALLET</p><p id="totalWallet" class="stat-number value-positive">$0.00</p></div>
@@ -384,42 +351,38 @@ app.get('/', (req, res) => {
                 <div><p class="stat-label">PERFORMANCE</p><p id="peakEquity" class="text-sm">Peak: $0.00</p><p id="maxDrawdown" class="text-sm text-red-400">DD: 0%</p></div>
                 <div><p class="stat-label">STATISTICS</p><p id="tradeStats" class="text-sm">Trades: 0</p><p id="winRate" class="text-sm text-green-400">Win Rate: 0%</p></div>
             </div>
-            
-            <div class="compound-info mt-4">
-                <div class="flex justify-between items-center">
-                    <div>
-                        <p class="text-xs text-slate-400">📈 AUTO-COMPOUNDING (${config.riskPercent}% of Wallet)</p>
-                        <p class="text-sm font-bold text-green-400" id="baseVolumeDisplay">Base Volume: 0 contracts</p>
-                        <p class="text-xs text-slate-400" id="shibDisplay">0 SHIB per trade</p>
-                        <p class="text-xs text-slate-400">Formula: $${config.walletPerContract.toFixed(7)} wallet = 1 contract</p>
-                    </div>
-                    <div class="text-right">
-                        <p class="text-xs text-slate-400">Risk Amount (2%)</p>
-                        <p class="text-sm font-bold" id="riskAmount">$0.00</p>
-                        <p class="text-xs text-slate-400">🟢 Active</p>
-                    </div>
+            <div class="compound-info mt-4 flex justify-between items-center">
+                <div>
+                    <p class="text-xs text-slate-400">📈 AUTO-COMPOUNDING (2% Risk)</p>
+                    <p class="text-sm font-bold text-green-400" id="baseVolumeDisplay">Base Volume: 0 contracts</p>
+                    <p class="text-xs text-slate-400" id="shibDisplay">0 SHIB per trade</p>
+                </div>
+                <div class="text-right">
+                    <p class="text-xs text-slate-400">Risk Amount</p>
+                    <p class="text-sm font-bold" id="riskAmount">$0.00</p>
+                    <p class="text-xs text-slate-400">🟢 Active</p>
                 </div>
             </div>
         </div>
 
         <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
-            <div class="card"><p class="stat-label mb-2">MARKET SPREAD</p><p id="spread" class="text-2xl font-black">0.000%</p></div>
-            <div class="card"><p class="stat-label mb-2">LONG ROI</p><p id="lRoi" class="text-2xl font-black">0.00%</p><p id="lPnl" class="text-sm mono mt-1">$0.00</p></div>
-            <div class="card"><p class="stat-label mb-2">SHORT ROI</p><p id="sRoi" class="text-2xl font-black">0.00%</p><p id="sPnl" class="text-sm mono mt-1">$0.00</p></div>
-            <div class="card"><p class="stat-label mb-2">LAST ACTION</p><p id="lAction" class="text-xs text-indigo-400">Idle</p></div>
+            <div class="card"><p class="stat-label">SPREAD</p><p id="spread" class="text-2xl font-black">0.000%</p></div>
+            <div class="card"><p class="stat-label">LONG ROI</p><p id="lRoi" class="text-2xl font-black">0.00%</p><p id="lPnl" class="text-sm">$0.00</p></div>
+            <div class="card"><p class="stat-label">SHORT ROI</p><p id="sRoi" class="text-2xl font-black">0.00%</p><p id="sPnl" class="text-sm">$0.00</p></div>
+            <div class="card"><p class="stat-label">ACTION</p><p id="lAction" class="text-xs text-indigo-400">Idle</p></div>
         </div>
 
         <div class="card">
             <h3 class="font-bold mb-4">📋 CLOSED TRADES</h3>
-            <div class="overflow-x-auto"><table class="w-full text-left text-xs">
-                <thead><tr class="text-slate-500"><th>SIDE</th><th>CLOSE TIME</th><th>VOL</th><th>ROI</th><th>PNL</th></tr></thead>
+            <table class="w-full text-xs text-left">
+                <thead class="text-slate-500"><tr><th>SIDE</th><th>CLOSE</th><th>VOL</th><th>ROI</th><th>PNL</th></tr></thead>
                 <tbody id="tradesBody"></tbody>
-            </table></div>
+            </table>
         </div>
     </div>
 
     <script>
-        function formatNumber(num) { return parseFloat(num).toFixed(8); }
+        function formatNumber(num) { return parseFloat(num || 0).toFixed(8); }
         setInterval(async () => {
             try {
                 const res = await fetch('/api/status');
@@ -432,7 +395,6 @@ app.get('/', (req, res) => {
                 document.getElementById('tradeStats').textContent = 'Trades: ' + data.market.totalTrades;
                 document.getElementById('winRate').textContent = 'Win Rate: ' + data.market.winRate + '%';
                 document.getElementById('spread').textContent = (data.market.spread || 0).toFixed(3) + '%';
-                
                 document.getElementById('baseVolumeDisplay').textContent = 'Base Volume: ' + (data.market.currentBaseVolume || 0).toLocaleString() + ' contracts';
                 document.getElementById('shibDisplay').textContent = (data.market.currentBaseShib || 0).toLocaleString() + ' SHIB per trade';
                 document.getElementById('riskAmount').textContent = '$' + formatNumber(data.market.currentRiskAmount || 0);
@@ -441,19 +403,19 @@ app.get('/', (req, res) => {
                 const short = data.accounts.find(a => a.direction === 'sell');
                 if (long) {
                     document.getElementById('lRoi').textContent = (long.roi || 0).toFixed(2) + '%';
-                    document.getElementById('lPnl').textContent = '$' + formatNumber(long.unrealizedUsdt || 0);
+                    document.getElementById('lPnl').textContent = '$' + formatNumber(long.unrealizedUsdt);
                     document.getElementById('lAction').textContent = long.lastAction;
                 }
                 if (short) {
                     document.getElementById('sRoi').textContent = (short.roi || 0).toFixed(2) + '%';
-                    document.getElementById('sPnl').textContent = '$' + formatNumber(short.unrealizedUsdt || 0);
+                    document.getElementById('sPnl').textContent = '$' + formatNumber(short.unrealizedUsdt);
                 }
 
                 let html = '';
                 data.tradeHistory.forEach(t => {
                     html += '<tr class="border-b border-slate-800"><td class="p-2">' + t.side + '</td><td>' + t.closeTime + '</td><td>' + t.volume + '</td><td>' + t.roi + '</td><td>' + t.netPnlUsdt + '</td></tr>';
                 });
-                document.getElementById('tradesBody').innerHTML = html || '<tr><td colspan="5" class="text-center p-4">No trades</td></tr>';
+                document.getElementById('tradesBody').innerHTML = html || '<tr><td colspan="5" class="text-center p-4">Waiting...</td></tr>';
             } catch(e) {}
         }, 1000);
     </script>
