@@ -21,8 +21,8 @@ while (process.env[`HTX_API_KEY_${accountIndex}`]) {
 }
 
 const config = {
-    symbol: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase(),
-    symbolClean: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase().replace('-', ''),
+    symbol: (process.env.SYMBOL || 'DOGE-USDT').toUpperCase(),
+    symbolClean: (process.env.SYMBOL || 'DOGE-USDT').toUpperCase().replace('-', ''),
     leverage: parseInt(process.env.LEVERAGE) || 75,
     port: process.env.PORT || 3000,
     restHost: 'api.hbdm.com',
@@ -38,8 +38,8 @@ const config = {
     contractMultiplier: 0.001,
     autoCompound: true,
     riskPercent: 0.25,
-    shibPerContract: 1000,
-    walletPerContract: 0.0066135  // $0.0066135 wallet = 1 contract at 75x leverage
+    dogePerContract: 100,  // 1 contract = 100 DOGE
+    walletPerContract: 0.0066135  // Base reference: $0.0066135 wallet = 1 contract at 75x leverage (this will be recalculated dynamically)
 };
 
 let market = {
@@ -55,7 +55,7 @@ let market = {
     losingTrades: 0,
     totalFeesPaid: 0,
     currentBaseVolume: parseInt(process.env.BASE_VOLUME) || 1,
-    currentBaseShib: 0,
+    currentBaseDoge: 0,
     currentRiskAmount: 0,
     lastBaseUpdate: Date.now()
 };
@@ -70,9 +70,19 @@ function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
         return config.baseVolume;
     }
     
-    // Formula: $0.0066135 wallet = 1 contract at 75x leverage
-    // So: volume = totalEquity ÷ 0.0066135
-    let volume = Math.floor(totalEquity / config.walletPerContract);
+    // DYNAMIC FORMULA for DOGE: 
+    // 1 contract = 100 DOGE
+    // At current price: 1 contract value in USDT = 100 DOGE * currentPrice
+    // Required margin at 75x leverage = (100 DOGE * currentPrice) / 75
+    // Volume = totalEquity * (riskPercent/100) / requiredMargin
+    
+    const dogeAmount = config.dogePerContract; // 100 DOGE per contract
+    const contractValueUsdt = dogeAmount * currentPrice;
+    const requiredMarginPerContract = contractValueUsdt / config.leverage;
+    const riskAmount = totalEquity * (config.riskPercent / 100);
+    
+    // Calculate volume based on risk amount
+    let volume = Math.floor(riskAmount / requiredMarginPerContract);
     
     // Ensure minimum 1 contract
     volume = Math.max(1, volume);
@@ -83,19 +93,22 @@ function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
         volume = MAX_VOLUME;
     }
     
-    const riskAmount = totalEquity * (config.riskPercent / 100);
-    const positionUsdt = riskAmount * config.leverage;
-    const shibAmount = volume * config.shibPerContract;
+    const actualContractValue = volume * dogeAmount * currentPrice;
+    const actualRequiredMargin = actualContractValue / config.leverage;
+    const dogeAmountTotal = volume * config.dogePerContract;
     
     market.currentRiskAmount = riskAmount;
-    market.currentBaseShib = shibAmount;
+    market.currentBaseDoge = dogeAmountTotal;
     
-    console.log(`\n💰 AUTO-COMPOUNDING CALCULATION:`);
+    console.log(`\n💰 AUTO-COMPOUNDING CALCULATION (DOGE):`);
     console.log(`   Wallet: $${totalEquity.toFixed(8)}`);
     console.log(`   ${config.riskPercent}% Risk: $${riskAmount.toFixed(8)}`);
-    console.log(`   @ ${config.leverage}x → $${positionUsdt.toFixed(8)} position`);
-    console.log(`   Formula: $${config.walletPerContract.toFixed(8)} wallet = 1 contract`);
-    console.log(`   Volume: ${volume.toLocaleString()} contract(s) = ${shibAmount.toLocaleString()} SHIB`);
+    console.log(`   DOGE Price: $${currentPrice.toFixed(8)}`);
+    console.log(`   1 Contract = ${config.dogePerContract} DOGE = $${contractValueUsdt.toFixed(8)} at current price`);
+    console.log(`   Required margin per contract @ ${config.leverage}x: $${requiredMarginPerContract.toFixed(8)}`);
+    console.log(`   Calculated Volume: ${volume.toLocaleString()} contract(s) = ${dogeAmountTotal.toLocaleString()} DOGE`);
+    console.log(`   Actual position value: $${actualContractValue.toFixed(8)}`);
+    console.log(`   Actual margin used: $${actualRequiredMargin.toFixed(8)} (${((actualRequiredMargin/totalEquity)*100).toFixed(2)}% of wallet)`);
     console.log(`   Risk per contract: $${(riskAmount/volume).toFixed(8)}\n`);
     
     return volume;
@@ -155,7 +168,7 @@ function updateWalletGrowth(totalEquity) {
             pnl: totalEquity - market.initialTotalEquity,
             pnlPercent: market.initialTotalEquity > 0 ? ((totalEquity - market.initialTotalEquity) / market.initialTotalEquity) * 100 : 0,
             baseVolume: market.currentBaseVolume,
-            baseShib: market.currentBaseShib,
+            baseDoge: market.currentBaseDoge,
             riskAmount: market.currentRiskAmount
         });
         
@@ -452,7 +465,7 @@ async function processMartingale() {
                 continue;
             }
             
-            console.log(`🚀 Opening ${state.direction} position at ${currentPrice.toFixed(8)} with ${market.currentBaseVolume} contract(s)`);
+            console.log(`🚀 Opening ${state.direction} position at ${currentPrice.toFixed(8)} with ${market.currentBaseVolume} contract(s) (${market.currentBaseVolume * config.dogePerContract} DOGE)`);
             state.isLocked = true;
             state.lastAction = "Opening Position...";
             
@@ -513,7 +526,7 @@ async function processMartingale() {
             const exitTime = new Date().toLocaleString();
             const currentStep = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
             
-            console.log(`✅ Taking ${state.direction} profit at ${exitPrice.toFixed(8)} (Target ROI: ${finalRoi}%, Step ${currentStep}, Vol: ${state.volume})`);
+            console.log(`✅ Taking ${state.direction} profit at ${exitPrice.toFixed(8)} (Target ROI: ${finalRoi}%, Step ${currentStep}, Vol: ${state.volume}, ${state.volume * config.dogePerContract} DOGE)`);
             state.isLocked = true;
             state.lastAction = "Taking Profit...";
             
@@ -560,7 +573,7 @@ async function processMartingale() {
                 nextVol = Math.ceil(market.currentBaseVolume * Math.pow(config.multiplier, nextStepNumber));
             }
             
-            console.log(`📈 MARTINGALE STEP ${nextStepNumber} for ${state.direction} - ROI: ${state.roi.toFixed(2)}% (LOSS) | Current Vol: ${state.volume} | Adding: ${nextVol} contracts`);
+            console.log(`📈 MARTINGALE STEP ${nextStepNumber} for ${state.direction} - ROI: ${state.roi.toFixed(2)}% (LOSS) | Current Vol: ${state.volume} (${state.volume * config.dogePerContract} DOGE) | Adding: ${nextVol} contracts (${nextVol * config.dogePerContract} DOGE)`);
             state.isLocked = true;
             
             const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
@@ -576,7 +589,7 @@ async function processMartingale() {
                 state.pendingOrderId = res.data.order_id_str;
                 state.lastStepPrice = currentPrice;
                 state.lastAddedVolume = nextVol;
-                state.lastAction = `Martingale Step ${nextStepNumber} (-${Math.abs(state.roi).toFixed(1)}% loss, Added: ${nextVol})`;
+                state.lastAction = `Martingale Step ${nextStepNumber} (-${Math.abs(state.roi).toFixed(1)}% loss, Added: ${nextVol} contracts, ${nextVol * config.dogePerContract} DOGE)`;
             } else {
                 state.isLocked = false;
                 state.lastAction = "Step Failed";
@@ -584,7 +597,7 @@ async function processMartingale() {
         } else {
             const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
             const requiredMove = (config.takeProfitPct / config.leverage).toFixed(3);
-            state.lastAction = `Active - Step ${step} | Vol: ${state.volume} | ROI: ${state.roi.toFixed(2)}%`;
+            state.lastAction = `Active - Step ${step} | Vol: ${state.volume} (${state.volume * config.dogePerContract} DOGE) | ROI: ${state.roi.toFixed(2)}%`;
         }
     }
 }
@@ -622,7 +635,7 @@ async function backgroundLoop() {
                 if (config.autoCompound && market.bid > 0) {
                     const newBaseVolume = calculateBaseVolumeFromWallet(totalEquity, market.bid);
                     if (newBaseVolume !== market.currentBaseVolume) {
-                        console.log(`📈 AUTO-COMPOUND: Base volume updated: ${market.currentBaseVolume} → ${newBaseVolume} contract(s)`);
+                        console.log(`📈 AUTO-COMPOUND: Base volume updated: ${market.currentBaseVolume} → ${newBaseVolume} contract(s) (${newBaseVolume * config.dogePerContract} DOGE)`);
                         market.currentBaseVolume = newBaseVolume;
                         market.lastBaseUpdate = Date.now();
                     }
@@ -633,7 +646,7 @@ async function backgroundLoop() {
                 const lastRecord = market.walletHistory[market.walletHistory.length - 2];
                 if (lastRecord && Math.abs(market.growthPct - lastRecord.pnlPercent) > 0.1) {
                     console.log(`💰 WALLET: $${totalEquity.toFixed(8)} | PnL: ${market.totalNetGain >= 0 ? '+' : ''}$${market.totalNetGain.toFixed(8)} (${market.growthPct >= 0 ? '+' : ''}${market.growthPct.toFixed(2)}%)`);
-                    console.log(`   Base Volume: ${market.currentBaseVolume} contract(s) (${market.currentBaseShib.toLocaleString()} SHIB) | Risk: $${market.currentRiskAmount.toFixed(8)}`);
+                    console.log(`   Base Volume: ${market.currentBaseVolume} contract(s) (${market.currentBaseDoge.toLocaleString()} DOGE) | Risk: $${market.currentRiskAmount.toFixed(8)}`);
                 }
             }
         }
@@ -662,6 +675,7 @@ app.get('/api/status', (req, res) => {
             direction: state.direction,
             roi: state.roi,
             volume: state.volume,
+            dogeAmount: state.volume * config.dogePerContract,
             step: step,
             expectedVolumeForStep: expectedVol,
             unrealizedUsdt: state.unrealizedUsdt,
@@ -697,10 +711,9 @@ app.get('/api/status', (req, res) => {
             autoCompound: config.autoCompound,
             riskPercent: config.riskPercent,
             currentBaseVolume: market.currentBaseVolume,
-            currentBaseShib: market.currentBaseShib,
+            currentBaseDoge: market.currentBaseDoge,
             currentRiskAmount: market.currentRiskAmount,
-            shibPerContract: config.shibPerContract,
-            walletPerContract: config.walletPerContract
+            dogePerContract: config.dogePerContract
         },
         accounts: accountsWithInfo,
         tradeHistory,
@@ -714,7 +727,7 @@ app.get('/api/status', (req, res) => {
             multiplier: config.multiplier,
             autoCompound: config.autoCompound,
             riskPercent: config.riskPercent,
-            walletPerContract: config.walletPerContract
+            dogePerContract: config.dogePerContract
         }
     });
 });
@@ -727,7 +740,7 @@ app.post('/api/close', async (req, res) => {
         const s = accountStates[acc.accountId];
         if (s.volume > 0) {
             const step = calculateStepFromVolume(s.volume, market.currentBaseVolume, config.multiplier);
-            console.log(`Closing ${s.direction} position (Step ${step}, Vol: ${s.volume})...`);
+            console.log(`Closing ${s.direction} position (Step ${step}, Vol: ${s.volume}, ${s.volume * config.dogePerContract} DOGE)...`);
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol,
                 volume: s.volume,
@@ -770,10 +783,9 @@ app.get('/api/wallet-history', (req, res) => {
                 enabled: config.autoCompound,
                 riskPercent: config.riskPercent,
                 currentBaseVolume: market.currentBaseVolume,
-                currentBaseShib: market.currentBaseShib,
+                currentBaseDoge: market.currentBaseDoge,
                 currentRiskAmount: market.currentRiskAmount,
-                shibPerContract: config.shibPerContract,
-                walletPerContract: config.walletPerContract
+                dogePerContract: config.dogePerContract
             }
         },
         history: market.walletHistory,
@@ -831,14 +843,13 @@ app.get('/api/verify', async (req, res) => {
                 enabled: config.autoCompound,
                 riskPercent: config.riskPercent,
                 currentBaseVolume: market.currentBaseVolume,
-                currentBaseShib: market.currentBaseShib,
+                currentBaseDoge: market.currentBaseDoge,
                 currentRiskAmount: market.currentRiskAmount,
-                shibPerContract: config.shibPerContract,
-                walletPerContract: config.walletPerContract,
-                formula: "Volume = Total Wallet ÷ 0.0066135"
+                dogePerContract: config.dogePerContract,
+                formula: "1 Contract = 100 DOGE. Volume = (Total Wallet × Risk%) ÷ ((100 DOGE × Current Price) ÷ Leverage)"
             }
         },
-        message: `Auto-compounding: ${config.riskPercent}% of wallet. $${config.walletPerContract.toFixed(8)} wallet = 1 contract at ${config.leverage}x leverage.`
+        message: `Auto-compounding: ${config.riskPercent}% of wallet. 1 Contract = ${config.dogePerContract} DOGE. Volume calculation based on current DOGE price.`
     });
 });
 
@@ -851,7 +862,7 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Martingale Pro - Auto-Compounding</title>
+    <title>Martingale Pro - DOGE Auto-Compounding</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
@@ -867,23 +878,25 @@ app.get('/', (req, res) => {
         button:hover { background: #FF4D6D40; }
         .sync-btn { background: #00D1B220; border-color: #00D1B2; color: #00D1B2; margin-left: 10px; }
         .step-badge { background: #6366F120; color: #6366F1; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }
-        .wallet-card { background: linear-gradient(135deg, #1A212E 0%, #131824 100%); border: 1px solid #00D1B240; }
+        .wallet-card { background: linear-gradient(135deg, #1A212E 0%, #131824 100%); border: 1px solid #F3BA2F40; }
         .stat-number { font-size: 28px; font-weight: 900; }
         .chart-container { position: relative; height: 280px; width: 100%; }
         .compound-info { background: #00D1B210; border: 1px solid #00D1B230; border-radius: 8px; padding: 12px; margin-top: 10px; }
+        .doge-badge { background: #F3BA2F20; color: #F3BA2F; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: bold; }
     </style>
 </head>
 <body class="p-6">
     <div class="max-w-7xl mx-auto">
         <div class="flex justify-between items-center mb-8">
             <div>
-                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">AUTO-COMPOUND</span></h1>
+                <h1 class="text-3xl font-black">MARTINGALE <span class="text-amber-500">DOGE</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">AUTO-COMPOUND</span></h1>
                 <div class="flex items-center gap-3 mt-2">
                     <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
                     <span class="text-[10px] font-bold text-emerald-400">LIVE</span>
                     <span class="text-[10px] text-slate-500">${config.symbol}</span>
                     <span class="text-[10px] text-slate-500">${config.leverage}x LEVERAGE</span>
                     <span class="tp-target">🎯 TP: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price move</span>
+                    <span class="doge-badge">🐕 1 CONTRACT = ${config.dogePerContract} DOGE</span>
                 </div>
             </div>
             <div>
@@ -926,11 +939,11 @@ app.get('/', (req, res) => {
                     <div>
                         <p class="text-xs text-slate-400">📈 AUTO-COMPOUNDING (${config.riskPercent}% of Wallet)</p>
                         <p class="text-sm font-bold text-green-400" id="baseVolumeDisplay">Base Volume: 0 contracts</p>
-                        <p class="text-xs text-slate-400" id="shibDisplay">0 SHIB per trade</p>
-                        <p class="text-xs text-slate-400" id="formulaDisplay">Formula: $${config.walletPerContract.toFixed(8)} wallet = 1 contract at ${config.leverage}x leverage</p>
+                        <p class="text-xs text-slate-400" id="dogeDisplay">0 DOGE per trade</p>
+                        <p class="text-xs text-slate-400" id="formulaDisplay">Formula: 1 Contract = ${config.dogePerContract} DOGE | Risk-based sizing</p>
                     </div>
                     <div class="text-right">
-                        <p class="text-xs text-slate-400">Risk Amount (2%)</p>
+                        <p class="text-xs text-slate-400">Risk Amount (${config.riskPercent}%)</p>
                         <p class="text-sm font-bold" id="riskAmount">$0.00</p>
                         <p class="text-xs text-slate-400" id="compoundStatus">🟢 Active</p>
                     </div>
@@ -966,6 +979,7 @@ app.get('/', (req, res) => {
                 <p id="lAction" class="text-[9px] text-indigo-400 mt-1"></p>
                 <p id="lTarget" class="text-[9px] text-green-400 mt-1"></p>
                 <p id="lRealized" class="text-[8px] text-slate-500 mt-1">Realized: $0.00</p>
+                <p id="lDoge" class="text-[8px] text-amber-500 mt-1">DOGE: 0</p>
             </div>
             <div class="card">
                 <p class="stat-label mb-2">SHORT</p>
@@ -975,6 +989,7 @@ app.get('/', (req, res) => {
                 <p id="sAction" class="text-[9px] text-indigo-400 mt-1"></p>
                 <p id="sTarget" class="text-[9px] text-green-400 mt-1"></p>
                 <p id="sRealized" class="text-[8px] text-slate-500 mt-1">Realized: $0.00</p>
+                <p id="sDoge" class="text-[8px] text-amber-500 mt-1">DOGE: 0</p>
             </div>
         </div>
 
@@ -989,6 +1004,7 @@ app.get('/', (req, res) => {
                             <th class="text-left p-3 text-xs text-slate-500">CLOSE</th>
                             <th class="text-right p-3 text-xs text-slate-500">STEP</th>
                             <th class="text-right p-3 text-xs text-slate-500">VOL</th>
+                            <th class="text-right p-3 text-xs text-slate-500">DOGE</th>
                             <th class="text-right p-3 text-xs text-slate-500">ENTRY</th>
                             <th class="text-right p-3 text-xs text-slate-500">EXIT</th>
                             <th class="text-right p-3 text-xs text-slate-500">ROI</th>
@@ -997,7 +1013,7 @@ app.get('/', (req, res) => {
                         </tr>
                     </thead>
                     <tbody id="tradesBody">
-                        <tr><td colspan="10" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>
+                        <tr><td colspan="11" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -1135,7 +1151,7 @@ app.get('/', (req, res) => {
                 document.getElementById('winRate').innerHTML = 'Win Rate: ' + (data.market.winRate || 0) + '%';
                 
                 document.getElementById('baseVolumeDisplay').innerHTML = 'Base Volume: ' + (data.market.currentBaseVolume || 0).toLocaleString() + ' contract(s)';
-                document.getElementById('shibDisplay').innerHTML = (data.market.currentBaseShib || 0).toLocaleString() + ' SHIB per trade';
+                document.getElementById('dogeDisplay').innerHTML = (data.market.currentBaseDoge || 0).toLocaleString() + ' DOGE per trade';
                 document.getElementById('riskAmount').innerHTML = '$' + formatNumber(data.market.currentRiskAmount || 0);
                 document.getElementById('configBaseVol').innerHTML = data.market.currentBaseVolume || 0;
                 
@@ -1160,6 +1176,7 @@ app.get('/', (req, res) => {
                     document.getElementById('lStep').innerHTML = '<span class="step-badge">STEP ' + (long.step || 0) + '</span> | VOL ' + (long.volume || 0);
                     document.getElementById('lAction').textContent = long.lastAction || 'Idle';
                     document.getElementById('lRealized').innerHTML = 'Realized: ' + (long.realizedPnl >= 0 ? '+' : '') + '$' + (long.realizedPnl || 0).toFixed(8);
+                    document.getElementById('lDoge').innerHTML = '🐕 DOGE: ' + (long.dogeAmount || 0).toLocaleString();
                     
                     if (long.targetPrice > 0) {
                         document.getElementById('lTarget').innerHTML = '🎯 TP: ' + long.targetPrice.toFixed(8);
@@ -1176,6 +1193,7 @@ app.get('/', (req, res) => {
                     document.getElementById('sStep').innerHTML = '<span class="step-badge">STEP ' + (short.step || 0) + '</span> | VOL ' + (short.volume || 0);
                     document.getElementById('sAction').textContent = short.lastAction || 'Idle';
                     document.getElementById('sRealized').innerHTML = 'Realized: ' + (short.realizedPnl >= 0 ? '+' : '') + '$' + (short.realizedPnl || 0).toFixed(8);
+                    document.getElementById('sDoge').innerHTML = '🐕 DOGE: ' + (short.dogeAmount || 0).toLocaleString();
                     
                     if (short.targetPrice > 0) {
                         document.getElementById('sTarget').innerHTML = '🎯 TP: ' + short.targetPrice.toFixed(8);
@@ -1186,12 +1204,14 @@ app.get('/', (req, res) => {
                 if (data.tradeHistory && data.tradeHistory.length > 0) {
                     data.tradeHistory.slice(0, 20).forEach(t => {
                         const roiVal = parseFloat(t.roi);
+                        const dogeAmount = t.volume * 100;
                         tradesHtml += '<tr class="border-b border-[#1A212E]">' +
-                            '<td class="p-3"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + ' font-bold">' + t.side + '</span><tr>' +
+                            '<td class="p-3"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + ' font-bold">' + t.side + '</span></td>' +
                             '<td class="p-3 text-xs">' + (t.openTime || '--') + '</td>' +
                             '<td class="p-3 text-xs">' + (t.closeTime || '--') + '</td>' +
                             '<td class="p-3 text-right">' + (t.step || 0) + '</td>' +
                             '<td class="p-3 text-right">' + t.volume + '</td>' +
+                            '<td class="p-3 text-right">' + dogeAmount.toLocaleString() + '</td>' +
                             '<td class="p-3 text-right mono">' + t.entryPrice + '</td>' +
                             '<td class="p-3 text-right mono">' + t.exitPrice + '</td>' +
                             '<td class="p-3 text-right ' + (roiVal >= 0 ? 'value-positive' : 'value-negative') + '">' + (roiVal >= 0 ? '+' : '') + t.roi + '</td>' +
@@ -1200,7 +1220,7 @@ app.get('/', (req, res) => {
                         '</tr>';
                     });
                 } else {
-                    tradesHtml = '<tr><td colspan="10" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>';
+                    tradesHtml = '<tr><td colspan="11" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>';
                 }
                 document.getElementById('tradesBody').innerHTML = tradesHtml;
                 
@@ -1217,16 +1237,18 @@ setInterval(backgroundLoop, config.pollInterval);
 app.listen(config.port, '0.0.0.0', () => {
     const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
     
-    console.log(`\n✅ Martingale Pro Started (AUTO-COMPOUNDING CORRECTED)`);
-    console.log(`📊 Symbol: ${config.symbol}`);
+    console.log(`\n✅ Martingale Pro Started for DOGE (AUTO-COMPOUNDING CORRECTED)`);
+    console.log(`🐕 Symbol: ${config.symbol}`);
     console.log(`🔧 Leverage: ${config.leverage}x`);
+    console.log(`📦 Contract Spec: 1 Contract = ${config.dogePerContract} DOGE`);
     console.log(`🎯 Take Profit: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price movement`);
-    console.log(`💰 Auto-Compounding: ${config.riskPercent}% of wallet`);
-    console.log(`📐 Formula: $${config.walletPerContract.toFixed(8)} wallet = 1 contract`);
+    console.log(`💰 Auto-Compounding: ${config.riskPercent}% of wallet (risk-based sizing)`);
+    console.log(`📐 Formula: Volume = (Wallet × ${config.riskPercent}%) ÷ ((100 DOGE × Current Price) ÷ ${config.leverage})`);
     console.log(`📈 Step Trigger: -${config.stepDistancePct}% ROI (adds martingale when losing)`);
     console.log(`🌐 Dashboard: http://localhost:${config.port}`);
-    console.log(`\n📊 AUTO-COMPOUNDING EXAMPLES:`);
-    console.log(`   Wallet $${config.walletPerContract.toFixed(8)} → 1 contract → Risk $${(config.walletPerContract * 0.02).toFixed(8)}`);
-    console.log(`   Wallet $${(config.walletPerContract * 2).toFixed(8)} → 2 contracts → Risk $${(config.walletPerContract * 2 * 0.02).toFixed(8)}`);
-    console.log(`   Wallet $${(config.walletPerContract * 3).toFixed(8)} → 3 contracts → Risk $${(config.walletPerContract * 3 * 0.02).toFixed(8)}\n`);
+    console.log(`\n📊 AUTO-COMPOUNDING EXAMPLES (at $0.10 DOGE price):`);
+    console.log(`   $10 wallet → 1 contract → 100 DOGE → Risk: $0.025`);
+    console.log(`   $100 wallet → 10 contracts → 1,000 DOGE → Risk: $0.25`);
+    console.log(`   $1000 wallet → 100 contracts → 10,000 DOGE → Risk: $2.50`);
+    console.log(`   $10000 wallet → 1000 contracts → 100,000 DOGE → Risk: $25.00\n`);
 });
