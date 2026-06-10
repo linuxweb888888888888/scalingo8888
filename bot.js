@@ -72,19 +72,12 @@ function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
         return config.baseVolume;
     }
     
-    // DYNAMIC FORMULA for DOGE: 
-    // 1 contract = 100 DOGE
-    // At current price: 1 contract value in USDT = 100 DOGE * currentPrice
-    // Required margin at 75x leverage = (100 DOGE * currentPrice) / 75
-    // Volume = totalEquity * (riskPercent/100) / requiredMargin
-    
-    const dogeAmount = config.dogePerContract; // 100 DOGE per contract
-    const contractValueUsdt = dogeAmount * currentPrice;
-    const requiredMarginPerContract = contractValueUsdt / config.leverage;
+    // SIMPLE RULE: 1 contract per $0.005 of risk amount
+    // Risk amount = totalEquity * (riskPercent/100)
     const riskAmount = totalEquity * (config.riskPercent / 100);
     
-    // Calculate volume based on risk amount
-    let volume = Math.floor(riskAmount / requiredMarginPerContract);
+    // Calculate volume: every $0.005 risk = 1 contract
+    let volume = Math.floor(riskAmount / 0.005);
     
     // Ensure minimum 1 contract
     volume = Math.max(1, volume);
@@ -95,8 +88,6 @@ function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
         volume = MAX_VOLUME;
     }
     
-    const actualContractValue = volume * dogeAmount * currentPrice;
-    const actualRequiredMargin = actualContractValue / config.leverage;
     const dogeAmountTotal = volume * config.dogePerContract;
     
     market.currentRiskAmount = riskAmount;
@@ -105,13 +96,10 @@ function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
     console.log(`\n💰 AUTO-COMPOUNDING CALCULATION (DOGE):`);
     console.log(`   Wallet: $${totalEquity.toFixed(8)}`);
     console.log(`   ${config.riskPercent}% Risk: $${riskAmount.toFixed(8)}`);
-    console.log(`   DOGE Price: $${currentPrice.toFixed(8)}`);
-    console.log(`   1 Contract = ${config.dogePerContract} DOGE = $${contractValueUsdt.toFixed(8)} at current price`);
-    console.log(`   Required margin per contract @ ${config.leverage}x: $${requiredMarginPerContract.toFixed(8)}`);
+    console.log(`   Rule: 1 contract per $0.005 risk`);
+    console.log(`   Formula: $${riskAmount.toFixed(8)} ÷ $0.005 = ${volume} contract(s)`);
     console.log(`   Calculated Volume: ${volume.toLocaleString()} contract(s) = ${dogeAmountTotal.toLocaleString()} DOGE`);
-    console.log(`   Actual position value: $${actualContractValue.toFixed(8)}`);
-    console.log(`   Actual margin used: $${actualRequiredMargin.toFixed(8)} (${((actualRequiredMargin/totalEquity)*100).toFixed(2)}% of wallet)`);
-    console.log(`   Risk per contract: $${(riskAmount/volume).toFixed(8)}\n`);
+    console.log(`   Risk Amount: $${riskAmount.toFixed(8)} → ${volume} contract(s)\n`);
     
     return volume;
 }
@@ -860,10 +848,10 @@ app.get('/api/verify', async (req, res) => {
                 currentBaseDoge: market.currentBaseDoge,
                 currentRiskAmount: market.currentRiskAmount,
                 dogePerContract: config.dogePerContract,
-                formula: "1 Contract = 100 DOGE. Volume = (Total Wallet × Risk%) ÷ ((100 DOGE × Current Price) ÷ Leverage)"
+                formula: "1 Contract = 100 DOGE. Volume = Risk Amount ÷ $0.005 (1 contract per $0.005 risk)"
             }
         },
-        message: `Auto-compounding: ${config.riskPercent}% of wallet. 1 Contract = ${config.dogePerContract} DOGE. Volume calculation based on current DOGE price.`
+        message: `Auto-compounding: ${config.riskPercent}% of wallet. 1 Contract = ${config.dogePerContract} DOGE. Volume calculation: Risk Amount (${config.riskPercent}% of wallet) ÷ $0.005 = number of contracts.`
     });
 });
 
@@ -954,7 +942,7 @@ app.get('/', (req, res) => {
                         <p class="text-xs text-slate-400">📈 AUTO-COMPOUNDING (${config.riskPercent}% of Wallet)</p>
                         <p class="text-sm font-bold text-green-400" id="baseVolumeDisplay">Base Volume: 0 contracts</p>
                         <p class="text-xs text-slate-400" id="dogeDisplay">0 DOGE per trade</p>
-                        <p class="text-xs text-slate-400" id="formulaDisplay">Formula: 1 Contract = ${config.dogePerContract} DOGE | Risk-based sizing</p>
+                        <p class="text-xs text-slate-400" id="formulaDisplay">Formula: Risk Amount ÷ $0.005 = Contracts (1 contract per $0.005 risk)</p>
                     </div>
                     <div class="text-right">
                         <p class="text-xs text-slate-400">Risk Amount (${config.riskPercent}%)</p>
@@ -1027,7 +1015,7 @@ app.get('/', (req, res) => {
                         </tr>
                     </thead>
                     <tbody id="tradesBody">
-                        <tr><td colspan="11" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>
+                        <tr><td colspan="11" class="text-center text-slate-500 p-12">No closed trades yet</tr>
                     </tbody>
                 </table>
             </div>
@@ -1256,14 +1244,15 @@ app.listen(config.port, '0.0.0.0', () => {
     console.log(`🔧 Leverage: ${config.leverage}x`);
     console.log(`📦 Contract Spec: 1 Contract = ${config.dogePerContract} DOGE`);
     console.log(`🎯 Take Profit: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price movement`);
-    console.log(`💰 Auto-Compounding: ${config.riskPercent}% of wallet (risk-based sizing)`);
-    console.log(`📐 Formula: Volume = (Wallet × ${config.riskPercent}%) ÷ ((100 DOGE × Current Price) ÷ ${config.leverage})`);
+    console.log(`💰 Auto-Compounding: ${config.riskPercent}% of wallet (1 contract per $0.005 risk)`);
+    console.log(`📐 Formula: Volume = (Wallet × ${config.riskPercent}%) ÷ $0.005 (1 contract per $0.005 risk)`);
     console.log(`📈 Step Trigger: -${config.stepDistancePct}% ROI (adds martingale when losing)`);
     console.log(`⏱️  Step Cooldown: 5 minutes between martingale steps`);
     console.log(`🌐 Dashboard: http://localhost:${config.port}`);
-    console.log(`\n📊 AUTO-COMPOUNDING EXAMPLES (at $0.10 DOGE price):`);
-    console.log(`   $10 wallet → 1 contract → 100 DOGE → Risk: $0.025`);
-    console.log(`   $100 wallet → 10 contracts → 1,000 DOGE → Risk: $0.25`);
-    console.log(`   $1000 wallet → 100 contracts → 10,000 DOGE → Risk: $2.50`);
-    console.log(`   $10000 wallet → 1000 contracts → 100,000 DOGE → Risk: $25.00\n`);
+    console.log(`\n📊 AUTO-COMPOUNDING EXAMPLES (${config.riskPercent}% of wallet):`);
+    console.log(`   $2.00 risk amount → 1 contract → 100 DOGE`);
+    console.log(`   $4.00 risk amount → 2 contracts → 200 DOGE`);
+    console.log(`   $10.00 risk amount → 5 contracts → 500 DOGE`);
+    console.log(`   $20.00 risk amount → 10 contracts → 1,000 DOGE`);
+    console.log(`   $100.00 risk amount → 50 contracts → 5,000 DOGE\n`);
 });
