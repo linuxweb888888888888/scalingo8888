@@ -79,7 +79,6 @@ const ENV = {
 console.log('Configuration:');
 console.log(`  CLI Restart Enabled: ${ENV.CLI_RESTART_ENABLED ? 'YES (Central Server Only)' : 'NO (Workers Run Continuously)'}`);
 console.log(`  Headless Mode: ${ENV.HEADLESS_MODE}`);
-console.log(`  Chrome Path: ${ENV.CHROMIUM_PATH}`);
 console.log(`  Deployment ID: ${ENV.DEPLOYMENT_ID}`);
 if (!ENV.IS_CENTRAL) {
     console.log(`  Web Server: DISABLED (Worker mode - no HTTP server)`);
@@ -165,94 +164,44 @@ async function cleanupStaleDeployments() {
     }
 }
 
-async function findChromePath() {
-    // Check environment variables first
-    if (ENV.CHROMIUM_PATH && fs.existsSync(ENV.CHROMIUM_PATH)) {
-        return ENV.CHROMIUM_PATH;
-    }
-    
-    // Common Chrome/Chromium paths
-    const possiblePaths = [
-        '/usr/bin/google-chrome',
-        '/usr/bin/google-chrome-stable',
-        '/usr/bin/chromium-browser',
-        '/usr/bin/chromium',
-        '/app/chrome-linux64/chrome',
-        '/opt/google/chrome/chrome',
-        process.env.CHROME_PATH,
-        process.env.CHROMIUM_PATH
-    ];
-    
-    for (const path of possiblePaths) {
-        if (path && fs.existsSync(path)) {
-            console.log(`[Chrome] Found at: ${path}`);
-            return path;
-        }
-    }
-    
-    return null;
-}
-
 async function installChromiumRuntime() {
-    const chromePath = await findChromePath();
+    const chromePath = ENV.CHROMIUM_PATH;
     
-    if (chromePath && fs.existsSync(chromePath)) {
-        try {
-            const stats = fs.statSync(chromePath);
-            if (stats.size > 50000000) {
-                console.log('[Chrome] Already installed');
-                return chromePath;
-            }
-        } catch(e) {}
+    if (fs.existsSync(chromePath)) {
+        const stats = fs.statSync(chromePath);
+        if (stats.size > 50000000) {
+            return chromePath;
+        }
     }
     
     log('SYSTEM', 'Installing Chromium...', 'info', 'MAIN');
     
     try {
-        // Try to install via apt
-        execSync('apt-get update && apt-get install -y chromium-browser', { stdio: 'inherit' });
-        
-        if (fs.existsSync('/usr/bin/chromium-browser')) {
-            fs.chmodSync('/usr/bin/chromium-browser', 0o755);
-            return '/usr/bin/chromium-browser';
-        }
-        
-        // Fallback: download Chrome binary
         const chromeUrl = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
         const zipPath = '/tmp/chromium.zip';
         
         await downloadFile(chromeUrl, zipPath);
         execSync(`unzip -q ${zipPath} -d /app/`, { stdio: 'inherit' });
         
-        const newChromePath = '/app/chrome-linux64/chrome';
-        if (fs.existsSync(newChromePath)) {
-            fs.chmodSync(newChromePath, 0o755);
+        if (fs.existsSync(chromePath)) {
+            fs.chmodSync(chromePath, 0o755);
             fs.unlinkSync(zipPath);
-            return newChromePath;
+            return chromePath;
         }
         throw new Error('Chrome binary not found');
     } catch (error) {
-        log('SYSTEM', `Failed to install Chrome: ${error.message}`, 'error', 'MAIN');
+        log('SYSTEM', `Failed: ${error.message}`, 'error', 'MAIN');
         return null;
     }
 }
 
 function installCleverCLI() {
-    console.log('[CLI] Checking Clever Cloud CLI...');
+    console.log('[CLI] Installing Clever Cloud CLI...');
     
     try {
-        // Check if clever is already installed
-        try {
-            execSync('clever --version', { stdio: 'ignore' });
-            console.log('[CLI] Clever CLI already installed');
-            return true;
-        } catch (e) {
-            // Not installed, install it
-            console.log('[CLI] Installing Clever CLI...');
-            execSync('npm install -g clever-tools', { stdio: 'inherit' });
-            console.log('[CLI] ✅ Clever CLI installed');
-            return true;
-        }
+        execSync('npm install -g clever-tools', { stdio: 'inherit' });
+        console.log('[CLI] ✅ Clever CLI installed');
+        return true;
     } catch (error) {
         console.error('[CLI] Failed to install Clever CLI:', error.message);
         return false;
@@ -287,7 +236,7 @@ async function logoutCleverCloud() {
     }
 }
 
-// ============ GMAILNATOR EMAIL SERVICE ============
+// ============ GMAILNATOR EMAIL SERVICE (BROWSER-BASED) ============
 class GmailnatorService {
     constructor(instanceId) {
         this.instanceId = instanceId;
@@ -298,12 +247,14 @@ class GmailnatorService {
     }
 
     async init() {
-        log('GMAILNATOR', 'Initializing browser...', 'info', this.instanceId);
+        log('GMAILNATOR', 'Initializing browser for email...', 'info', this.instanceId);
         
         // Find Chrome path
-        this.chromePath = await findChromePath();
         if (!this.chromePath) {
-            this.chromePath = await installChromiumRuntime();
+            this.chromePath = ENV.CHROMIUM_PATH;
+            if (!fs.existsSync(this.chromePath)) {
+                this.chromePath = await installChromiumRuntime();
+            }
         }
         
         if (!this.chromePath) {
@@ -317,8 +268,7 @@ class GmailnatorService {
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled',
-                '--window-size=1280,800'
+                '--disable-blink-features=AutomationControlled'
             ]
         };
         
@@ -334,7 +284,7 @@ class GmailnatorService {
     }
 
     async getTempEmail() {
-        log('GMAILNATOR', 'Getting temporary email...', 'info', this.instanceId);
+        log('GMAILNATOR', 'Getting temporary email from Gmailnator...', 'info', this.instanceId);
         
         try {
             // Navigate to Gmailnator
@@ -345,44 +295,38 @@ class GmailnatorService {
             
             await sleep(3000);
             
-            // Wait for page to load and generate email
-            await this.page.waitForSelector('button, .btn', { timeout: 10000 });
-            
-            // Click generate button
-            const email = await this.page.evaluate(() => {
-                // Find and click generate button
+            // Wait for the generate button and click it
+            await this.page.evaluate(() => {
+                // Find and click the generate email button
                 const buttons = Array.from(document.querySelectorAll('button, a, .btn'));
                 const generateBtn = buttons.find(btn => {
                     const text = (btn.textContent || '').toLowerCase();
-                    return text.includes('generate') || text.includes('get email');
+                    return text.includes('generate') || text.includes('get email') || text.includes('create');
                 });
                 
                 if (generateBtn) {
                     generateBtn.click();
-                    return null;
+                    return true;
                 }
-                
-                // Or try to get existing email
-                const emailElement = document.querySelector('#email, .email-address, .generated-email');
-                if (emailElement) {
-                    return emailElement.textContent || emailElement.value;
-                }
-                
-                return null;
+                return false;
             });
-            
-            if (email) {
-                this.email = email;
-                log('GMAILNATOR', `Email obtained: ${this.email}`, 'success', this.instanceId);
-                return this.email;
-            }
             
             // Wait for email to be generated
             await sleep(4000);
             
-            // Extract email address
-            const extractedEmail = await this.page.evaluate(() => {
-                const selectors = ['#email', '.email-address', '.generated-email', 'input[type="email"]', 'code'];
+            // Extract the email address
+            const email = await this.page.evaluate(() => {
+                // Try multiple selectors to find the email
+                const selectors = [
+                    '#email',
+                    '.email-address',
+                    '.generated-email',
+                    'input[type="email"]',
+                    '.email-text',
+                    'code',
+                    '.email'
+                ];
+                
                 for (const selector of selectors) {
                     const element = document.querySelector(selector);
                     if (element) {
@@ -393,14 +337,14 @@ class GmailnatorService {
                     }
                 }
                 
-                // Search for email pattern in page
+                // Search for email pattern in page text
                 const bodyText = document.body.innerText;
                 const emailMatch = bodyText.match(/[a-zA-Z0-9._%+-]+@(?:gmail\.com|emailnator\.com)/);
                 return emailMatch ? emailMatch[0] : null;
             });
             
-            if (extractedEmail && extractedEmail.includes('@')) {
-                this.email = extractedEmail;
+            if (email && email.includes('@')) {
+                this.email = email;
                 log('GMAILNATOR', `Email obtained: ${this.email}`, 'success', this.instanceId);
                 return this.email;
             }
@@ -408,27 +352,37 @@ class GmailnatorService {
             throw new Error('Could not extract email address');
             
         } catch (error) {
-            log('GMAILNATOR', `Failed: ${error.message}`, 'error', this.instanceId);
+            log('GMAILNATOR', `Failed to get email: ${error.message}`, 'error', this.instanceId);
             return null;
         }
     }
 
     async waitForVerificationLink(timeoutSeconds = 180) {
         log('GMAILNATOR', `Waiting for verification email (${timeoutSeconds}s)...`, 'info', this.instanceId);
+        log('GMAILNATOR', `📧 Monitoring: ${this.email}`, 'info', this.instanceId);
         
         const startTime = Date.now();
         let lastMessageCount = 0;
         
         while ((Date.now() - startTime) < timeoutSeconds * 1000) {
             try {
-                // Check for new emails
+                // Check for new emails in the inbox
                 const result = await this.page.evaluate(() => {
-                    // Look for email items
-                    const emailItems = document.querySelectorAll('.message-item, .email-item, .inbox-item, tr');
+                    // Look for email items in the list
+                    const emailItems = document.querySelectorAll('.message-item, .email-item, .inbox-item, tr, .email-row');
                     const emailCount = emailItems.length;
                     
-                    // Check for Clever Cloud verification links
-                    const bodyText = document.body.innerText;
+                    // Get all email content
+                    let allEmailContent = '';
+                    emailItems.forEach(item => {
+                        allEmailContent += (item.textContent || '') + ' ';
+                    });
+                    
+                    // Also check the main page content
+                    const pageContent = document.body.innerText;
+                    const fullContent = allEmailContent + ' ' + pageContent;
+                    
+                    // Look for Clever Cloud verification links
                     const cleverPatterns = [
                         /https:\/\/api\.clever-cloud\.com\/v2\/self\/validate_email\?validationKey=[a-f0-9-]+/,
                         /https:\/\/api\.clever-cloud\.com\/[^\s<>"']+/,
@@ -437,39 +391,42 @@ class GmailnatorService {
                     
                     let verificationLink = null;
                     for (const pattern of cleverPatterns) {
-                        const match = bodyText.match(pattern);
+                        const match = fullContent.match(pattern);
                         if (match) {
                             verificationLink = match[0];
                             break;
                         }
                     }
                     
-                    // Also check for any verification URL
+                    // If no specific pattern, look for any verification URL
                     if (!verificationLink) {
-                        const allUrls = bodyText.match(/https?:\/\/[^\s<>"']+/g) || [];
+                        const allUrls = fullContent.match(/https?:\/\/[^\s<>"']+/g) || [];
                         verificationLink = allUrls.find(url => 
-                            url.includes('verify') || url.includes('validate') || url.includes('clever')
+                            url.includes('verify') || 
+                            url.includes('validate') || 
+                            url.includes('clever-cloud') ||
+                            url.includes('confirmation')
                         );
                     }
                     
-                    return { emailCount, verificationLink };
+                    return { emailCount, verificationLink, content: fullContent.substring(0, 500) };
                 });
                 
-                // Check for new emails
+                // Check for new messages
                 if (result.emailCount > lastMessageCount) {
-                    log('GMAILNATOR', `New email detected! Total: ${result.emailCount}`, 'info', this.instanceId);
+                    log('GMAILNATOR', `📨 New email detected! Total: ${result.emailCount}`, 'info', this.instanceId);
                     lastMessageCount = result.emailCount;
                 }
                 
-                // Check for verification link
+                // Check if we found a verification link
                 if (result.verificationLink) {
-                    log('GMAILNATOR', 'Verification link found!', 'success', this.instanceId);
+                    log('GMAILNATOR', '✅ Verification link found!', 'success', this.instanceId);
                     return result.verificationLink;
                 }
                 
-                // Refresh inbox occasionally
+                // Click refresh button if available
                 await this.page.evaluate(() => {
-                    const refreshBtn = document.querySelector('button[title*="refresh"], .refresh-btn');
+                    const refreshBtn = document.querySelector('button[title*="refresh"], .refresh-btn, [data-action="refresh"]');
                     if (refreshBtn) refreshBtn.click();
                 });
                 
@@ -484,8 +441,8 @@ class GmailnatorService {
             }
         }
         
-        console.log(); // New line
-        log('GMAILNATOR', 'Timeout waiting for verification email', 'warn', this.instanceId);
+        console.log(); // New line after progress
+        log('GMAILNATOR', '⚠️ Timeout waiting for verification email', 'warn', this.instanceId);
         return null;
     }
 
@@ -740,8 +697,8 @@ class CleverCloudBot {
 
     async initBrowser() {
         if (!this.chromePath) {
-            this.chromePath = await findChromePath();
-            if (!this.chromePath) {
+            this.chromePath = ENV.CHROMIUM_PATH;
+            if (!fs.existsSync(this.chromePath)) {
                 this.chromePath = await installChromiumRuntime();
             }
         }
