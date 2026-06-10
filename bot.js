@@ -1,4 +1,4 @@
-// social-network.js - Complete Social Network Script for Scalingo (No JWT)
+// social-network.js - Complete Social Network Script for Scalingo (Single Page App)
 
 const express = require('express');
 const mongoose = require('mongoose');
@@ -35,10 +35,10 @@ app.use(session({
   saveUninitialized: false,
   store: MongoStore.create({
     mongoUrl: process.env.MONGODB_URI || 'mongodb://localhost:27017/socialnetwork',
-    ttl: 14 * 24 * 60 * 60 // 14 days
+    ttl: 14 * 24 * 60 * 60
   }),
   cookie: {
-    maxAge: 1000 * 60 * 60 * 24 * 7, // 7 days
+    maxAge: 1000 * 60 * 60 * 24 * 7,
     httpOnly: true,
     secure: process.env.NODE_ENV === 'production'
   }
@@ -224,7 +224,10 @@ app.post('/api/auth/register', async (req, res) => {
         username: user.username,
         email: user.email,
         fullName: user.fullName,
-        avatar: user.avatar
+        avatar: user.avatar,
+        bio: user.bio,
+        followers: user.followers.length,
+        following: user.following.length
       }
     });
   } catch (error) {
@@ -304,12 +307,7 @@ app.get('/api/posts', authMiddleware, async (req, res) => {
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)
-      .populate('user', 'username fullName avatar')
-      .populate({
-        path: 'comments',
-        populate: { path: 'user', select: 'username fullName avatar' },
-        options: { limit: 3 }
-      });
+      .populate('user', 'username fullName avatar');
     
     const total = await Post.countDocuments({ user: { $in: followingUsers } });
     
@@ -432,24 +430,40 @@ app.post('/api/posts/:postId/comments', authMiddleware, async (req, res) => {
   }
 });
 
+app.get('/api/posts/:postId/comments', authMiddleware, async (req, res) => {
+  try {
+    const comments = await Comment.find({ post: req.params.postId })
+      .sort({ createdAt: -1 })
+      .populate('user', 'username fullName avatar');
+    
+    res.json(comments);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // User Routes
 app.get('/api/users/:userId', authMiddleware, async (req, res) => {
   try {
     const user = await User.findById(req.params.userId)
-      .select('-password')
-      .populate('followers', 'username fullName avatar')
-      .populate('following', 'username fullName avatar');
+      .select('-password');
     
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
     
-    const isFollowing = user.followers.some(f => f._id.toString() === req.userId);
+    const isFollowing = user.followers.includes(req.userId);
+    const posts = await Post.find({ user: user._id })
+      .sort({ createdAt: -1 })
+      .populate('user', 'username fullName avatar');
     
     res.json({
-      ...user.toObject(),
+      user,
       isFollowing,
-      postsCount: await Post.countDocuments({ user: user._id })
+      posts,
+      postsCount: posts.length,
+      followersCount: user.followers.length,
+      followingCount: user.following.length
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -549,6 +563,29 @@ app.put('/api/friends/accept/:requestId', authMiddleware, async (req, res) => {
   }
 });
 
+app.post('/api/friends/follow/:userId', authMiddleware, async (req, res) => {
+  try {
+    const userToFollow = await User.findById(req.params.userId);
+    if (!userToFollow) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    if (userToFollow.followers.includes(req.userId)) {
+      // Unfollow
+      await User.findByIdAndUpdate(req.userId, { $pull: { following: req.params.userId } });
+      await User.findByIdAndUpdate(req.params.userId, { $pull: { followers: req.userId } });
+      res.json({ following: false, message: 'Unfollowed' });
+    } else {
+      // Follow
+      await User.findByIdAndUpdate(req.userId, { $addToSet: { following: req.params.userId } });
+      await User.findByIdAndUpdate(req.params.userId, { $addToSet: { followers: req.userId } });
+      res.json({ following: true, message: 'Followed' });
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Feed Routes
 app.get('/api/feed', authMiddleware, async (req, res) => {
   try {
@@ -556,19 +593,13 @@ app.get('/api/feed', authMiddleware, async (req, res) => {
     const limit = parseInt(req.query.limit) || 10;
     const skip = (page - 1) * limit;
     
-    const followingIds = req.user.following;
-    followingIds.push(req.userId);
+    const followingIds = [...req.user.following, req.userId];
     
     const posts = await Post.find({ user: { $in: followingIds } })
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)
-      .populate('user', 'username fullName avatar')
-      .populate({
-        path: 'comments',
-        options: { limit: 5 },
-        populate: { path: 'user', select: 'username fullName avatar' }
-      });
+      .populate('user', 'username fullName avatar');
     
     const total = await Post.countDocuments({ user: { $in: followingIds } });
     
@@ -596,7 +627,7 @@ app.get('/api/explore', authMiddleware, async (req, res) => {
       followers: { $nin: [req.userId] }
     })
       .limit(10)
-      .select('username fullName avatar bio followers');
+      .select('username fullName avatar bio');
     
     res.json({
       trendingPosts,
@@ -645,7 +676,7 @@ app.use('/uploads', express.static('uploads'));
 // Create uploads directory
 if (!fs.existsSync('./uploads')) fs.mkdirSync('./uploads');
 
-// Create public directory and HTML file
+// Create public directory and single HTML file
 const publicDir = './public';
 if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir);
 
@@ -664,9 +695,10 @@ const htmlContent = `<!DOCTYPE html>
         label { display: block; margin-bottom: 8px; font-weight: bold; color: #333; }
         input, textarea { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 5px; font-size: 14px; transition: border-color 0.3s; }
         input:focus, textarea:focus { outline: none; border-color: #667eea; }
-        button { background: #667eea; color: white; padding: 12px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; width: 100%; transition: transform 0.2s, background 0.2s; }
+        button { background: #667eea; color: white; padding: 12px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; transition: transform 0.2s, background 0.2s; }
         button:hover { background: #5a67d8; transform: translateY(-1px); }
         button:active { transform: translateY(0); }
+        button:disabled { opacity: 0.6; cursor: not-allowed; }
         .error { color: #e53e3e; margin-top: 10px; font-size: 14px; }
         .success { color: #38a169; margin-top: 10px; }
         .hidden { display: none; }
@@ -674,30 +706,40 @@ const htmlContent = `<!DOCTYPE html>
         .nav-links { display: flex; gap: 25px; }
         .nav-links a { text-decoration: none; color: #4a5568; cursor: pointer; font-weight: 500; transition: color 0.2s; }
         .nav-links a:hover { color: #667eea; }
-        .logo { font-size: 24px; font-weight: bold; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .logo { font-size: 24px; font-weight: bold; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; cursor: pointer; }
         .create-post { background: white; border-radius: 10px; padding: 25px; margin-bottom: 25px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
         .feed { display: grid; gap: 25px; }
         .post { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); transition: transform 0.2s; }
         .post:hover { transform: translateY(-2px); box-shadow: 0 4px 20px rgba(0,0,0,0.15); }
-        .post-header { display: flex; align-items: center; margin-bottom: 15px; }
-        .avatar { width: 50px; height: 50px; border-radius: 50%; margin-right: 15px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 18px; }
+        .post-header { display: flex; align-items: center; margin-bottom: 15px; cursor: pointer; }
+        .avatar { width: 50px; height: 50px; border-radius: 50%; margin-right: 15px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 18px; cursor: pointer; }
         .post-content { margin-bottom: 15px; line-height: 1.6; color: #2d3748; }
         .post-image { max-width: 100%; border-radius: 8px; margin-top: 10px; }
         .post-actions { display: flex; gap: 15px; margin-top: 15px; padding-top: 15px; border-top: 1px solid #e2e8f0; }
         .post-actions button { width: auto; padding: 8px 20px; background: #f7fafc; color: #4a5568; }
         .post-actions button:hover { background: #edf2f7; }
         .loading { text-align: center; padding: 40px; color: white; font-size: 18px; }
-        h2 { margin-bottom: 20px; color: #2d3748; }
+        h2, h3 { margin-bottom: 20px; color: #2d3748; }
         textarea { resize: vertical; font-family: inherit; }
         .suggested-users { background: white; border-radius: 10px; padding: 20px; margin-top: 20px; }
         .user-card { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #e2e8f0; }
-        .user-info { display: flex; align-items: center; gap: 10px; }
-        .small-avatar { width: 40px; height: 40px; border-radius: 50%; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); display: flex; align-items: center; justify-content: center; color: white; }
+        .user-info { display: flex; align-items: center; gap: 10px; cursor: pointer; flex: 1; }
+        .small-avatar { width: 40px; height: 40px; border-radius: 50%; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; }
         .friend-button { width: auto; padding: 5px 15px; font-size: 12px; }
+        .profile-header { background: white; border-radius: 10px; overflow: hidden; margin-bottom: 25px; }
+        .profile-cover { height: 200px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+        .profile-info { padding: 20px; text-align: center; margin-top: -50px; }
+        .profile-avatar { width: 100px; height: 100px; border-radius: 50%; border: 4px solid white; margin: 0 auto 15px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); display: flex; align-items: center; justify-content: center; color: white; font-size: 36px; font-weight: bold; }
+        .profile-stats { display: flex; justify-content: center; gap: 30px; margin: 20px 0; }
+        .stat { text-align: center; }
+        .stat-value { font-size: 24px; font-weight: bold; color: #2d3748; }
+        .stat-label { color: #718096; font-size: 14px; }
+        .back-button { background: #e2e8f0; color: #4a5568; width: auto; padding: 8px 16px; margin-bottom: 20px; }
+        .back-button:hover { background: #cbd5e0; }
         @media (max-width: 768px) {
             .container { padding: 10px; }
             .navbar { padding: 10px 15px; }
-            .nav-links { gap: 15px; }
+            .nav-links { gap: 15px; font-size: 14px; }
             .logo { font-size: 18px; }
         }
     </style>
@@ -739,30 +781,24 @@ const htmlContent = `<!DOCTYPE html>
         <!-- Main App Container -->
         <div id="mainApp" class="hidden">
             <div class="navbar">
-                <div class="logo">SocialNetwork</div>
+                <div class="logo" onclick="showFeed()">SocialNetwork</div>
                 <div class="nav-links">
-                    <a onclick="loadFeed()">🏠 Feed</a>
-                    <a onclick="loadExplore()">✨ Explore</a>
-                    <a onclick="showProfile()">👤 Profile</a>
+                    <a onclick="showFeed()">🏠 Feed</a>
+                    <a onclick="showExplore()">✨ Explore</a>
+                    <a onclick="showMyProfile()">👤 Profile</a>
                     <a onclick="logout()">🚪 Logout</a>
                 </div>
             </div>
-            <div class="container">
-                <div class="create-post">
-                    <h3>Create Post</h3>
-                    <textarea id="postContent" rows="3" placeholder="What's on your mind?"></textarea>
-                    <input type="file" id="postImage" accept="image/*" style="margin-top: 10px;">
-                    <button onclick="createPost()" style="margin-top: 15px;">📝 Post</button>
-                </div>
-                <div id="feed">
-                    <div class="loading">Loading posts...</div>
-                </div>
+            <div class="container" id="mainContent">
+                <!-- Dynamic content will be loaded here -->
+                <div class="loading">Loading...</div>
             </div>
         </div>
     </div>
     
     <script>
         let currentUser = null;
+        let currentView = 'feed';
         
         // Check authentication on page load
         window.onload = async function() {
@@ -777,7 +813,7 @@ const htmlContent = `<!DOCTYPE html>
                 if (data.authenticated) {
                     currentUser = data.user;
                     showMainApp();
-                    loadFeed();
+                    showFeed();
                 } else {
                     showAuth();
                 }
@@ -859,7 +895,7 @@ const htmlContent = `<!DOCTYPE html>
                 if (response.ok) {
                     currentUser = data.user;
                     showMainApp();
-                    loadFeed();
+                    showFeed();
                     // Clear form
                     document.getElementById('email').value = '';
                     document.getElementById('password').value = '';
@@ -879,110 +915,185 @@ const htmlContent = `<!DOCTYPE html>
             }
         }
         
+        async function showFeed() {
+            currentView = 'feed';
+            const contentDiv = document.getElementById('mainContent');
+            contentDiv.innerHTML = \`
+                <div class="create-post">
+                    <h3>Create Post</h3>
+                    <textarea id="postContent" rows="3" placeholder="What's on your mind?"></textarea>
+                    <input type="file" id="postImage" accept="image/*" style="margin-top: 10px;">
+                    <button onclick="createPost()" style="margin-top: 15px;">📝 Post</button>
+                </div>
+                <div id="feedContainer">
+                    <div class="loading">Loading posts...</div>
+                </div>
+            \`;
+            await loadFeed();
+        }
+        
         async function loadFeed() {
-            const feedDiv = document.getElementById('feed');
-            feedDiv.innerHTML = '<div class="loading">Loading posts...</div>';
+            const feedContainer = document.getElementById('feedContainer');
+            if (!feedContainer) return;
+            
+            feedContainer.innerHTML = '<div class="loading">Loading posts...</div>';
             
             try {
-                const response = await fetch('/api/feed', {
-                    headers: { 'Content-Type': 'application/json' }
-                });
+                const response = await fetch('/api/feed');
                 
                 if (!response.ok) throw new Error('Failed to load feed');
                 
                 const data = await response.json();
-                displayPosts(data.posts);
+                displayPosts(data.posts, feedContainer);
             } catch (error) {
                 console.error('Error loading feed:', error);
-                feedDiv.innerHTML = '<div class="loading">Error loading feed. Please refresh.</div>';
+                feedContainer.innerHTML = '<div class="loading">Error loading feed. Please refresh.</div>';
             }
         }
         
-        async function loadExplore() {
-            const feedDiv = document.getElementById('feed');
-            feedDiv.innerHTML = '<div class="loading">Loading explore...</div>';
+        async function showExplore() {
+            currentView = 'explore';
+            const contentDiv = document.getElementById('mainContent');
+            contentDiv.innerHTML = '<div class="loading">Loading explore...</div>';
             
             try {
-                const response = await fetch('/api/explore', {
-                    headers: { 'Content-Type': 'application/json' }
-                });
+                const response = await fetch('/api/explore');
                 
                 if (!response.ok) throw new Error('Failed to load explore');
                 
                 const data = await response.json();
                 
                 let html = '<h2>Trending Posts</h2>';
-                html += renderPosts(data.trendingPosts);
+                const tempDiv = document.createElement('div');
+                displayPosts(data.trendingPosts, tempDiv);
+                html += tempDiv.innerHTML;
                 
                 if (data.suggestedUsers && data.suggestedUsers.length > 0) {
                     html += '<div class="suggested-users"><h3>Suggested Users</h3>';
                     for (const user of data.suggestedUsers) {
                         html += \`
                             <div class="user-card">
-                                <div class="user-info">
-                                    <div class="small-avatar">\${user.fullName?.charAt(0) || 'U'}</div>
+                                <div class="user-info" onclick="viewProfile('\${user._id}')">
+                                    <div class="small-avatar">\${(user.fullName || user.username).charAt(0).toUpperCase()}</div>
                                     <div>
-                                        <strong>\${user.fullName}</strong><br>
-                                        <small>@\${user.username}</small>
+                                        <strong>\${escapeHtml(user.fullName || user.username)}</strong><br>
+                                        <small>@\${escapeHtml(user.username)}</small>
                                     </div>
                                 </div>
-                                <button class="friend-button" onclick="sendFriendRequest('\${user._id}')">Follow</button>
+                                <button class="friend-button" onclick="followUser('\${user._id}', this)">Follow</button>
                             </div>
                         \`;
                     }
                     html += '</div>';
                 }
                 
-                feedDiv.innerHTML = html;
+                contentDiv.innerHTML = html;
             } catch (error) {
                 console.error('Error loading explore:', error);
-                feedDiv.innerHTML = '<div class="loading">Error loading explore. Please refresh.</div>';
+                contentDiv.innerHTML = '<div class="loading">Error loading explore. Please refresh.</div>';
             }
         }
         
-        function renderPosts(posts) {
+        function displayPosts(posts, container) {
             if (!posts || posts.length === 0) {
-                return '<p style="text-align: center; color: #718096;">No posts yet. Be the first to post!</p>';
+                container.innerHTML = '<p style="text-align: center; color: #718096;">No posts yet. Be the first to post!</p>';
+                return;
             }
             
-            return posts.map(post => \`
-                <div class="post">
-                    <div class="post-header">
-                        <div class="avatar">\${post.user?.fullName?.charAt(0) || 'U'}</div>
-                        <div>
-                            <strong>\${escapeHtml(post.user?.fullName || 'Unknown')}</strong><br>
-                            <small style="color: #718096;">@\${escapeHtml(post.user?.username || 'user')}</small>
+            let html = '<div class="feed">';
+            for (const post of posts) {
+                html += \`
+                    <div class="post">
+                        <div class="post-header" onclick="viewProfile('\${post.user?._id}')">
+                            <div class="avatar">\${(post.user?.fullName || 'U').charAt(0).toUpperCase()}</div>
+                            <div>
+                                <strong>\${escapeHtml(post.user?.fullName || 'Unknown')}</strong><br>
+                                <small style="color: #718096;">@\${escapeHtml(post.user?.username || 'user')}</small>
+                            </div>
+                        </div>
+                        <div class="post-content">\${escapeHtml(post.content)}</div>
+                        \${post.image ? \`<img src="\${post.image}" class="post-image" alt="Post image">\` : ''}
+                        <div class="post-actions">
+                            <button onclick="event.stopPropagation(); likePost('\${post._id}', this)">❤️ \${post.likes?.length || 0}</button>
+                            <button onclick="event.stopPropagation(); commentOnPost('\${post._id}')">💬 \${post.comments?.length || 0}</button>
                         </div>
                     </div>
-                    <div class="post-content">\${escapeHtml(post.content)}</div>
-                    \${post.image ? \`<img src="\${post.image}" class="post-image" alt="Post image">\` : ''}
-                    <div class="post-actions">
-                        <button onclick="likePost('\${post._id}')">❤️ \${post.likes?.length || 0}</button>
-                        <button onclick="commentOnPost('\${post._id}')">💬 \${post.comments?.length || 0}</button>
+                \`;
+            }
+            html += '</div>';
+            container.innerHTML = html;
+        }
+        
+        async function showMyProfile() {
+            if (currentUser) {
+                await viewProfile(currentUser.id);
+            }
+        }
+        
+        async function viewProfile(userId) {
+            currentView = 'profile';
+            const contentDiv = document.getElementById('mainContent');
+            contentDiv.innerHTML = '<div class="loading">Loading profile...</div>';
+            
+            try {
+                const response = await fetch(\`/api/users/\${userId}\`);
+                
+                if (!response.ok) throw new Error('Failed to load profile');
+                
+                const data = await response.json();
+                
+                let html = \`
+                    <button class="back-button" onclick="showFeed()">← Back to Feed</button>
+                    <div class="profile-header">
+                        <div class="profile-cover"></div>
+                        <div class="profile-info">
+                            <div class="profile-avatar">\${(data.user.fullName || data.user.username).charAt(0).toUpperCase()}</div>
+                            <h2>\${escapeHtml(data.user.fullName)}</h2>
+                            <p style="color: #718096;">@\${escapeHtml(data.user.username)}</p>
+                            \${data.user.bio ? \`<p style="margin-top: 10px;">\${escapeHtml(data.user.bio)}</p>\` : ''}
+                            <div class="profile-stats">
+                                <div class="stat">
+                                    <div class="stat-value">\${data.postsCount}</div>
+                                    <div class="stat-label">Posts</div>
+                                </div>
+                                <div class="stat">
+                                    <div class="stat-value">\${data.followersCount}</div>
+                                    <div class="stat-label">Followers</div>
+                                </div>
+                                <div class="stat">
+                                    <div class="stat-value">\${data.followingCount}</div>
+                                    <div class="stat-label">Following</div>
+                                </div>
+                            </div>
+                            \${userId !== currentUser?.id ? \`
+                                <button onclick="followUser('\${userId}', this)" class="friend-button" style="width: auto; margin-top: 10px;">
+                                    \${data.isFollowing ? 'Unfollow' : 'Follow'}
+                                </button>
+                            \` : ''}
+                        </div>
                     </div>
-                </div>
-            \`).join('');
-        }
-        
-        function displayPosts(posts) {
-            const feedDiv = document.getElementById('feed');
-            feedDiv.innerHTML = renderPosts(posts);
-        }
-        
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
+                    <h3>Posts</h3>
+                    <div id="profilePosts"></div>
+                \`;
+                
+                contentDiv.innerHTML = html;
+                
+                const postsContainer = document.getElementById('profilePosts');
+                displayPosts(data.posts, postsContainer);
+            } catch (error) {
+                console.error('Error loading profile:', error);
+                contentDiv.innerHTML = '<div class="loading">Error loading profile. Please try again.</div>';
+            }
         }
         
         async function createPost() {
-            const content = document.getElementById('postContent').value;
-            if (!content.trim()) {
+            const content = document.getElementById('postContent')?.value;
+            if (!content?.trim()) {
                 alert('Please enter some content');
                 return;
             }
             
-            const imageFile = document.getElementById('postImage').files[0];
+            const imageFile = document.getElementById('postImage')?.files[0];
             const formData = new FormData();
             formData.append('content', content);
             if (imageFile) formData.append('image', imageFile);
@@ -998,8 +1109,10 @@ const htmlContent = `<!DOCTYPE html>
                 });
                 
                 if (response.ok) {
-                    document.getElementById('postContent').value = '';
-                    document.getElementById('postImage').value = '';
+                    const postInput = document.getElementById('postContent');
+                    const imageInput = document.getElementById('postImage');
+                    if (postInput) postInput.value = '';
+                    if (imageInput) imageInput.value = '';
                     await loadFeed();
                 } else {
                     const error = await response.json();
@@ -1014,7 +1127,7 @@ const htmlContent = `<!DOCTYPE html>
             }
         }
         
-        async function likePost(postId) {
+        async function likePost(postId, button) {
             try {
                 const response = await fetch(\`/api/posts/\${postId}/like\`, {
                     method: 'POST',
@@ -1022,53 +1135,82 @@ const htmlContent = `<!DOCTYPE html>
                 });
                 
                 if (response.ok) {
-                    await loadFeed();
+                    if (currentView === 'feed') {
+                        await loadFeed();
+                    } else if (currentView === 'explore') {
+                        await showExplore();
+                    } else if (currentView === 'profile') {
+                        const userId = currentView === 'profile' && currentUser ? currentUser.id : null;
+                        if (userId) await viewProfile(userId);
+                    }
                 }
             } catch (error) {
                 console.error('Error liking post:', error);
             }
         }
         
-        function commentOnPost(postId) {
+        async function commentOnPost(postId) {
             const comment = prompt('Enter your comment:');
             if (comment && comment.trim()) {
-                fetch(\`/api/posts/\${postId}/comments\`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ content: comment })
-                })
-                .then(response => {
-                    if (response.ok) loadFeed();
-                    else alert('Failed to add comment');
-                })
-                .catch(error => console.error('Error:', error));
+                try {
+                    const response = await fetch(\`/api/posts/\${postId}/comments\`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ content: comment })
+                    });
+                    
+                    if (response.ok) {
+                        if (currentView === 'feed') {
+                            await loadFeed();
+                        } else if (currentView === 'explore') {
+                            await showExplore();
+                        } else if (currentView === 'profile') {
+                            const userId = currentView === 'profile' && currentUser ? currentUser.id : null;
+                            if (userId) await viewProfile(userId);
+                        }
+                    } else {
+                        alert('Failed to add comment');
+                    }
+                } catch (error) {
+                    console.error('Error:', error);
+                    alert('Error adding comment');
+                }
             }
         }
         
-        async function sendFriendRequest(userId) {
+        async function followUser(userId, button) {
             try {
-                const response = await fetch(\`/api/friends/request/\${userId}\`, {
+                const response = await fetch(\`/api/friends/follow/\${userId}\`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' }
                 });
                 
                 if (response.ok) {
-                    alert('Friend request sent!');
-                    await loadExplore();
+                    const data = await response.json();
+                    if (button) {
+                        button.innerText = data.following ? 'Unfollow' : 'Follow';
+                    }
+                    // Refresh current view
+                    if (currentView === 'explore') {
+                        await showExplore();
+                    } else if (currentView === 'profile') {
+                        await viewProfile(userId);
+                    }
                 } else {
                     const error = await response.json();
-                    alert(error.error || 'Failed to send request');
+                    alert(error.error || 'Failed to follow user');
                 }
             } catch (error) {
                 console.error('Error:', error);
-                alert('Error sending friend request');
+                alert('Error following user');
             }
         }
         
-        function showProfile() {
-            if (currentUser) {
-                window.location.href = \`/profile.html?user=\${currentUser.id}\`;
-            }
+        function escapeHtml(text) {
+            if (!text) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
         }
         
         async function logout() {
@@ -1078,7 +1220,6 @@ const htmlContent = `<!DOCTYPE html>
                 showAuth();
             } catch (error) {
                 console.error('Logout error:', error);
-                // Force logout anyway
                 showAuth();
             }
         }
@@ -1087,6 +1228,9 @@ const htmlContent = `<!DOCTYPE html>
 </html>`;
 
 fs.writeFileSync(path.join(publicDir, 'index.html'), htmlContent);
+
+// Create uploads directory if not exists
+if (!fs.existsSync('./uploads')) fs.mkdirSync('./uploads');
 
 // Database connection and server start
 const PORT = process.env.PORT || 3000;
