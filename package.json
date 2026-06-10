@@ -1,24 +1,29 @@
 {
-  "name": "social-network",
+  "name": "martingale-pro-bot",
   "version": "1.0.0",
-  "description": "Complete social network application with session-based auth",
-  "main": "bot.js",
+  "description": "Advanced Martingale trading bot with auto-compounding for HTX futures",
+  "main": "index.js",
   "scripts": {
-    "start": "node bot.js",
-    "dev": "nodemon bot.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
+  "keywords": [
+    "trading-bot",
+    "martingale",
+    "htx",
+    "crypto",
+    "futures",
+    "auto-compounding"
+  ],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
+    "axios": "^1.6.2",
+    "dotenv": "^16.3.1",
     "express": "^4.18.2",
-    "mongoose": "^7.5.0",
-    "bcryptjs": "^2.4.3",
-    "express-session": "^1.17.3",
-    "connect-mongo": "^4.6.0",
-    "multer": "^1.4.5-lts.1",
-    "socket.io": "^4.7.2",
-    "cors": "^2.8.5",
-    "dotenv": "^16.3.1"
+    "ws": "^8.14.2",
   },
   "devDependencies": {
-    "nodemon": "^3.0.1"
+    "nodemon": "^3.0.2"
   }
 }
