@@ -9,11 +9,10 @@ const app = express();
 app.use(express.json());
 
 // ==================== CONFIGURATION ====================
-const apiAccounts = [];
-let accountIndex = 1;
-// Using dummy keys for paper trading mode
-apiAccounts.push({ apiKey: 'PAPER_1', secretKey: 'PAPER_1', accountId: 1 });
-apiAccounts.push({ apiKey: 'PAPER_2', secretKey: 'PAPER_2', accountId: 2 });
+const apiAccounts = [
+    { apiKey: 'PAPER_1', secretKey: 'PAPER_1', accountId: 1 },
+    { apiKey: 'PAPER_2', secretKey: 'PAPER_2', accountId: 2 }
+];
 
 const config = {
     symbol: (process.env.SYMBOL || 'SHIB-USDT').toUpperCase(),
@@ -25,7 +24,7 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
     multiplier: 1.2,
-    stepDistancePct: 10, // Triggers at -10% ROI
+    stepDistancePct: 10, 
     takeProfitPct: 15,
     maxStartSpread: parseFloat(process.env.MAX_START_SPREAD) || 0.1,
     takerFeeRate: 0.0005,
@@ -34,11 +33,11 @@ const config = {
     autoCompound: true,
     riskPercent: 2,
     shibPerContract: 1000,
-    walletPerContract: 0.0066135  // $0.0066135 wallet = 1 contract at 75x leverage
+    walletPerContract: 0.0066135  
 };
 
 // ==================== PAPER TRADING ENGINE STORAGE ====================
-let paperBalances = { 1: 100.0, 2: 100.0 }; // Start with $100 per account
+let paperBalances = { 1: 100.0, 2: 100.0 }; 
 let paperPositions = { 1: null, 2: null };
 
 let market = {
@@ -53,7 +52,7 @@ let market = {
     winningTrades: 0,
     losingTrades: 0,
     totalFeesPaid: 0,
-    currentBaseVolume: parseInt(process.env.BASE_VOLUME) || 1,
+    currentBaseVolume: config.baseVolume,
     currentBaseShib: 0,
     currentRiskAmount: 0,
     lastBaseUpdate: Date.now()
@@ -64,36 +63,35 @@ let accountStates = {};
 let lastPositionFetch = {};
 let lastBalanceFetch = {};
 
+// Ensure initial calculation runs
 function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
     if (!config.autoCompound || totalEquity <= 0) {
+        market.currentRiskAmount = totalEquity * (config.riskPercent / 100);
+        market.currentBaseShib = config.baseVolume * config.shibPerContract;
         return config.baseVolume;
     }
+    
     let volume = Math.floor(totalEquity / config.walletPerContract);
     volume = Math.max(1, volume);
-    const MAX_VOLUME = 1000000;
-    if (volume > MAX_VOLUME) {
-        volume = MAX_VOLUME;
-    }
+    
     const riskAmount = totalEquity * (config.riskPercent / 100);
-    const positionUsdt = riskAmount * config.leverage;
     const shibAmount = volume * config.shibPerContract;
+    
+    // UPDATE MARKET OBJECT (This fixed your 0 SHIB / 0 Risk issue)
     market.currentRiskAmount = riskAmount;
     market.currentBaseShib = shibAmount;
+    market.currentBaseVolume = volume;
+    
     return volume;
 }
 
 function calculateStepFromVolume(volume, baseVolume, multiplier) {
     if (volume === 0) return 0;
-    let totalVolume = 0;
-    let step = 0;
+    let totalVolume = 0; let step = 0;
     while (totalVolume < volume) {
         const stepVolume = step === 0 ? baseVolume : Math.ceil(baseVolume * Math.pow(multiplier, step));
         totalVolume += stepVolume;
-        if (totalVolume <= volume) {
-            step++;
-        } else {
-            break;
-        }
+        if (totalVolume <= volume) step++; else break;
     }
     return step;
 }
@@ -110,40 +108,30 @@ function calculateVolumeForStep(step, baseVolume, multiplier) {
 function calculateTargetPrice(state) {
     const requiredPriceMovePct = config.takeProfitPct / config.leverage;
     if (state.direction === 'buy') {
-        const targetPrice = state.entryPrice * (1 + (requiredPriceMovePct / 100));
-        const feeAdjustedTarget = targetPrice * (1 + config.takerFeeRate);
-        return feeAdjustedTarget;
+        return state.entryPrice * (1 + (requiredPriceMovePct / 100)) * (1 + config.takerFeeRate);
     } else {
-        const targetPrice = state.entryPrice * (1 - (requiredPriceMovePct / 100));
-        const feeAdjustedTarget = targetPrice * (1 - config.takerFeeRate);
-        return feeAdjustedTarget;
+        return state.entryPrice * (1 - (requiredPriceMovePct / 100)) * (1 - config.takerFeeRate);
     }
 }
 
 function updateWalletGrowth(totalEquity) {
     const now = Date.now();
     const lastRecord = market.walletHistory[market.walletHistory.length - 1];
-    if (!lastRecord || (now - lastRecord.timestamp) > 60000 || Math.abs(lastRecord.equity - totalEquity) > 0.000001) {
+    if (!lastRecord || (now - lastRecord.timestamp) > 60000) {
         market.walletHistory.push({
-            timestamp: now,
-            time: new Date().toLocaleString(),
-            equity: totalEquity,
+            timestamp: now, time: new Date().toLocaleString(), equity: totalEquity,
             pnl: totalEquity - market.initialTotalEquity,
-            pnlPercent: market.initialTotalEquity > 0 ? ((totalEquity - market.initialTotalEquity) / market.initialTotalEquity) * 100 : 0,
+            pnlPercent: ((totalEquity - market.initialTotalEquity) / market.initialTotalEquity) * 100,
             baseVolume: market.currentBaseVolume,
             baseShib: market.currentBaseShib,
             riskAmount: market.currentRiskAmount
         });
         if (market.walletHistory.length > 100) market.walletHistory.shift();
     }
-    if (totalEquity > market.peakEquity) {
-        market.peakEquity = totalEquity;
-    }
+    if (totalEquity > market.peakEquity) market.peakEquity = totalEquity;
     if (market.peakEquity > 0) {
         const currentDrawdown = ((market.peakEquity - totalEquity) / market.peakEquity) * 100;
-        if (currentDrawdown > market.maxDrawdown) {
-            market.maxDrawdown = currentDrawdown;
-        }
+        if (currentDrawdown > market.maxDrawdown) market.maxDrawdown = currentDrawdown;
     }
 }
 
@@ -152,30 +140,17 @@ config.accounts.forEach((account, idx) => {
         direction: idx === 0 ? 'buy' : 'sell',
         roi: 0, volume: 0, unrealizedUsdt: 0, entryPrice: 0,
         currentEquity: 100, availableMargin: 100, initialEquity: 100,
-        isLocked: false,
-        pendingOrderId: null,
-        lastAction: 'Idle',
+        isLocked: false, pendingOrderId: null, lastAction: 'Idle',
         lastStepPrice: 0, lastAddedVolume: 0, startTime: null,
-        lastExchangeRoi: 0,
-        roiLatencyMs: 0,
-        roiLatencyHistory: [],
-        lastRoiUpdateTime: Date.now(),
-        targetPrice: 0,
-        realizedPnl: 0,
-        totalFees: 0
+        targetPrice: 0, realizedPnl: 0, totalFees: 0, roiLatencyHistory: []
     };
 });
 
-function getSignature(account, method, path, params = {}) {
-    return { timestamp: '', signature: '', sortedParams: '' };
-}
-
-// ==================== REWRITTEN FOR PAPER TRADING ====================
+// ==================== MOCK API ENGINE ====================
 async function htxRequest(account, method, path, data = {}) {
     const accId = account.accountId;
     const currentPrice = market.bid || 0;
 
-    // Simulate Account Info
     if (path.includes('swap_cross_account_info')) {
         let unrealized = 0;
         const pos = paperPositions[accId];
@@ -186,7 +161,6 @@ async function htxRequest(account, method, path, data = {}) {
         return { status: 'ok', data: [{ margin_balance: paperBalances[accId] + unrealized, withdraw_available: paperBalances[accId] }] };
     }
 
-    // Simulate Position Info
     if (path.includes('swap_cross_position_info')) {
         const pos = paperPositions[accId];
         if (!pos) return { status: 'ok', data: [] };
@@ -196,17 +170,14 @@ async function htxRequest(account, method, path, data = {}) {
         return { status: 'ok', data: [{ direction: pos.direction, volume: pos.volume, cost_open: pos.entryPrice, profit: pnl, profit_rate: pnl/margin }] };
     }
 
-    // Simulate Order info (Always filled)
     if (path.includes('swap_cross_order_info')) {
         return { status: 'ok', data: [{ status: 6, price_avg: currentPrice }] };
     }
 
-    // Simulate Order Placement
     if (path.includes('swap_cross_order')) {
+        if (currentPrice === 0) return { status: 'error' };
         const fee = data.volume * config.shibPerContract * config.contractMultiplier * currentPrice * config.takerFeeRate;
         paperBalances[accId] -= fee;
-        market.totalFeesPaid += fee;
-
         if (data.offset === 'open') {
             const currentPos = paperPositions[accId];
             if (currentPos) {
@@ -218,10 +189,12 @@ async function htxRequest(account, method, path, data = {}) {
             }
         } else {
             const pos = paperPositions[accId];
-            const side = pos.direction === 'buy' ? 1 : -1;
-            const pnl = pos.volume * config.shibPerContract * config.contractMultiplier * (currentPrice - pos.entryPrice) * side;
-            paperBalances[accId] += pnl;
-            paperPositions[accId] = null;
+            if (pos) {
+                const side = pos.direction === 'buy' ? 1 : -1;
+                const pnl = pos.volume * config.shibPerContract * config.contractMultiplier * (currentPrice - pos.entryPrice) * side;
+                paperBalances[accId] += pnl;
+                paperPositions[accId] = null;
+            }
         }
         return { status: 'ok', data: { order_id_str: 'PAPER-' + Date.now() } };
     }
@@ -243,448 +216,114 @@ async function fetchPriceRest() {
 
 async function syncAccount(acc, state) {
     const now = Date.now();
-    
-    if (state.pendingOrderId) {
-        const orderRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order_info', {
-            contract_code: config.symbol,
-            order_id: state.pendingOrderId
-        });
-        if (orderRes?.data?.[0]?.status === 6 || orderRes?.data?.[0]?.status === 7) {
-            state.pendingOrderId = null;
-            state.isLocked = false;
-        } else if (orderRes?.data?.[0]?.status === 4 || orderRes?.data?.[0]?.status === 5) {
-            state.pendingOrderId = null;
-            state.isLocked = false;
-        } else {
-            return;
-        }
-    }
-
-    if (state.isLocked) return;
-
-    if (lastPositionFetch[acc.accountId] && (now - lastPositionFetch[acc.accountId]) < config.pollInterval) {
-        return;
-    }
-    lastPositionFetch[acc.accountId] = now;
-
-    const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', {
-        contract_code: config.symbol
-    });
-
+    const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info');
     if (posRes?.status === 'ok' && posRes.data) {
-        const positions = posRes.data;
-        const pos = positions.find(p => p.direction === state.direction);
-        
-        if (pos && parseFloat(pos.volume) > 0) {
-            const newVolume = parseFloat(pos.volume);
-            const newEntryPrice = parseFloat(pos.cost_open);
-            const rawProfitRate = parseFloat(pos.profit_rate);
-            const newExchangeRoi = rawProfitRate * 100;
-            const newUnrealizedUsdt = parseFloat(pos.profit);
-            
-            state.volume = newVolume;
-            state.entryPrice = newEntryPrice;
-            state.unrealizedUsdt = newUnrealizedUsdt;
-            
-            const calculatedStep = calculateStepFromVolume(newVolume, market.currentBaseVolume, config.multiplier);
-            
-            if (Math.abs(newExchangeRoi - state.roi) > 0.01) {
-                const timeSinceLastUpdate = now - state.lastRoiUpdateTime;
-                
-                state.roiLatencyMs = timeSinceLastUpdate;
-                state.roiLatencyHistory.unshift({
-                    timestamp: now,
-                    exchangeRoi: newExchangeRoi,
-                    botRoi: state.roi,
-                    latencyMs: timeSinceLastUpdate,
-                    difference: Math.abs(newExchangeRoi - state.roi).toFixed(2),
-                    volume: newVolume,
-                    step: calculatedStep
-                });
-                
-                if (state.roiLatencyHistory.length > 10) state.roiLatencyHistory.pop();
-                
-                console.log(`[${state.direction.toUpperCase()}] ROI: ${newExchangeRoi.toFixed(2)}% | Vol: ${newVolume} | Step: ${calculatedStep} (delay: ${timeSinceLastUpdate}ms)`);
-                
-                state.roi = newExchangeRoi;
-                state.lastExchangeRoi = newExchangeRoi;
-                state.lastRoiUpdateTime = now;
-            }
-            
+        const pos = posRes.data.find(p => p.direction === state.direction);
+        if (pos) {
+            state.volume = pos.volume;
+            state.entryPrice = pos.cost_open;
+            state.roi = pos.profit_rate * 100;
+            state.unrealizedUsdt = pos.profit;
             state.targetPrice = calculateTargetPrice(state);
-            
-            if (state.lastStepPrice === 0) state.lastStepPrice = state.entryPrice;
             if (!state.startTime) state.startTime = new Date().toLocaleString();
         } else {
-            if (state.volume !== 0) {
-                console.log(`✅ [${state.direction.toUpperCase()}] Position closed at ${new Date().toLocaleTimeString()}`);
-                state.volume = 0;
-                state.roi = 0;
-                state.unrealizedUsdt = 0;
-                state.entryPrice = 0;
-                state.lastStepPrice = 0;
-                state.startTime = null;
-                state.lastAddedVolume = 0;
-                state.lastExchangeRoi = 0;
-                state.targetPrice = 0;
-            }
+            state.volume = 0; state.roi = 0; state.unrealizedUsdt = 0;
         }
     }
-
-    if (lastBalanceFetch[acc.accountId] && (now - lastBalanceFetch[acc.accountId]) < 10000) {
-        return;
-    }
-    lastBalanceFetch[acc.accountId] = now;
-
-    const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info', {
-        margin_asset: 'USDT'
-    });
-
-    if (accRes?.status === 'ok' && accRes.data?.[0]) {
-        const oldEquity = state.currentEquity;
-        state.currentEquity = parseFloat(accRes.data[0].margin_balance);
-        state.availableMargin = parseFloat(accRes.data[0].withdraw_available);
-        
-        if (state.initialEquity === null) {
-            state.initialEquity = state.currentEquity;
-        }
-        
-        if (oldEquity > 0 && Math.abs(state.currentEquity - oldEquity) > 0.000001) {
-            const change = state.currentEquity - oldEquity;
-            if (Math.abs(change) > 0.0001) {
-                console.log(`[${state.direction.toUpperCase()}] Equity: $${oldEquity.toFixed(8)} → $${state.currentEquity.toFixed(8)} (${change >= 0 ? '+' : ''}$${change.toFixed(8)})`);
-            }
-        }
+    const accRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_account_info');
+    if (accRes?.status === 'ok') {
+        state.currentEquity = accRes.data[0].margin_balance;
     }
 }
 
 function logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl) {
     const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
-    const estimatedFee = Math.abs(finalPnl) * config.takerFeeRate;
-    
-    market.totalTrades++;
-    if (finalPnl >= 0) {
-        market.winningTrades++;
-    } else {
-        market.losingTrades++;
-    }
-    
     tradeHistory.unshift({
-        symbol: config.symbol.replace('-', '') + 'Perpetual',
-        side: state.direction === 'buy' ? 'LONG' : 'SHORT',
-        openTime: state.startTime,
-        closeTime: exitTime,
-        volume: state.volume,
-        step: step,
-        entryPrice: state.entryPrice.toFixed(8),
-        exitPrice: exitPrice.toFixed(8),
-        roi: finalRoi.toFixed(2) + '%',
-        netPnlUsdt: finalPnl.toFixed(8),
-        estimatedFee: estimatedFee.toFixed(8)
+        side: state.direction.toUpperCase(), closeTime: exitTime, volume: state.volume, step: step,
+        entryPrice: state.entryPrice.toFixed(8), exitPrice: exitPrice.toFixed(8),
+        roi: finalRoi.toFixed(2) + '%', netPnlUsdt: finalPnl.toFixed(8), estimatedFee: (Math.abs(finalPnl) * 0.01).toFixed(8)
     });
-    
-    if (tradeHistory.length > 20) tradeHistory.pop();
-    
     state.realizedPnl += finalPnl;
-    state.totalFees += estimatedFee;
-    
-    console.log(`📊 TRADE CLOSED: ${state.direction.toUpperCase()} | ROI: ${finalRoi.toFixed(2)}% | PnL: ${finalPnl >= 0 ? '+' : ''}$${finalPnl.toFixed(8)} | Fee: $${estimatedFee.toFixed(8)}`);
-}
-
-function startWS() {
-    const ws = new WebSocket(config.wsHost);
-    
-    ws.on('open', () => {
-        console.log('✅ WebSocket connected (Paper Mode)');
-        ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' }));
-    });
-    
-    ws.on('message', (data) => {
-        zlib.gunzip(data, (err, dec) => {
-            if (err) return;
-            try {
-                const msg = JSON.parse(dec.toString());
-                if (msg.tick && msg.ch && msg.ch.includes('bbo')) {
-                    market.bid = msg.tick.bid[0];
-                    market.ask = msg.tick.ask[0];
-                    market.spread = ((market.ask - market.bid) / market.bid) * 100;
-                    market.lastPriceUpdate = Date.now();
-                }
-                if (msg.ping) {
-                    ws.send(JSON.stringify({ pong: msg.ping }));
-                }
-            } catch (e) {}
-        });
-    });
-    
-    ws.on('error', (err) => {
-        console.error('WebSocket error:', err.message);
-    });
-    
-    ws.on('close', () => {
-        console.log('WebSocket disconnected, reconnecting in 5s...');
-        setTimeout(startWS, 5000);
-    });
+    market.totalTrades++;
+    if (finalPnl > 0) market.winningTrades++; else market.losingTrades++;
 }
 
 async function processMartingale() {
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
-        if (state.isLocked || market.bid === 0 || market.ask === 0) continue;
-        
+        if (state.isLocked || market.bid === 0) continue;
         const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
-        
-        if (currentPrice === 0) continue;
 
         if (state.volume === 0) {
-            if (market.spread > config.maxStartSpread && market.spread > 0) {
-                state.lastAction = `Wait Spread (${market.spread.toFixed(2)}% > ${config.maxStartSpread}%)`;
-                continue;
-            }
-            
-            console.log(`🚀 Opening ${state.direction} position at ${currentPrice.toFixed(8)} with ${market.currentBaseVolume} contract(s)`);
+            if (market.spread > config.maxStartSpread) continue;
             state.isLocked = true;
-            state.lastAction = "Opening Position...";
-            
-            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol,
-                volume: market.currentBaseVolume,
-                direction: state.direction,
-                offset: 'open',
-                lever_rate: config.leverage,
-                order_price_type: 'optimal_20'
+            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                volume: market.currentBaseVolume, direction: state.direction, offset: 'open'
             });
-            
-            if (res?.status === 'ok') {
-                state.pendingOrderId = res.data.order_id_str;
-                state.lastAction = "Position Opening";
-                
-                setTimeout(async () => {
-                    const orderInfo = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order_info', {
-                        contract_code: config.symbol,
-                        order_id: state.pendingOrderId
-                    });
-                    
-                    if (orderInfo?.data?.[0]?.status === 6) {
-                        state.entryPrice = parseFloat(orderInfo.data[0].price_avg);
-                        state.targetPrice = calculateTargetPrice(state);
-                        console.log(`✅ Position opened at ${state.entryPrice.toFixed(8)}, TP target: ${state.targetPrice.toFixed(8)}`);
-                        state.isLocked = false;
-                    }
-                }, 2000);
-            } else {
-                state.isLocked = false;
-                state.lastAction = "Open Failed";
-            }
-            continue;
-        }
-
-        let shouldTakeProfit = false;
-        let exitPrice = 0;
-        
-        if (state.direction === 'buy') {
-            if (market.ask >= state.targetPrice && state.targetPrice > 0) {
-                shouldTakeProfit = true;
-                exitPrice = market.ask;
-                console.log(`🎯 LONG TP triggered! ASK: ${market.ask.toFixed(8)} >= Target: ${state.targetPrice.toFixed(8)}`);
-            }
+            state.isLocked = false;
         } else {
-            if (market.bid <= state.targetPrice && state.targetPrice > 0) {
-                shouldTakeProfit = true;
-                exitPrice = market.bid;
-                console.log(`🎯 SHORT TP triggered! BID: ${market.bid.toFixed(8)} <= Target: ${state.targetPrice.toFixed(8)}`);
-            }
-        }
-        
-        if (shouldTakeProfit) {
-            const finalRoi = config.takeProfitPct;
-            const finalPnl = state.unrealizedUsdt;
-            const exitTime = new Date().toLocaleString();
-            
-            console.log(`✅ Taking ${state.direction} profit at ${exitPrice.toFixed(8)} (Target ROI: ${finalRoi}%)`);
-            state.isLocked = true;
-            state.lastAction = "Taking Profit...";
-            
-            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol,
-                volume: state.volume,
-                direction: state.direction === 'buy' ? 'sell' : 'buy',
-                offset: 'close',
-                lever_rate: config.leverage,
-                order_price_type: 'optimal_20'
-            });
-            
-            if (res?.status === 'ok') {
-                state.pendingOrderId = res.data.order_id_str;
-                state.lastAction = "Take Profit Close";
-                logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl);
-                
-                state.volume = 0;
-                state.roi = 0;
-                state.unrealizedUsdt = 0;
-                state.entryPrice = 0;
-                state.lastStepPrice = 0;
-                state.startTime = null;
-                state.lastAddedVolume = 0;
-                state.targetPrice = 0;
-            } else {
+            const tpTrigger = state.direction === 'buy' ? market.ask >= state.targetPrice : market.bid <= state.targetPrice;
+            if (tpTrigger && state.targetPrice > 0) {
+                const pnl = state.unrealizedUsdt;
+                await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                    volume: state.volume, direction: state.direction === 'buy' ? 'sell' : 'buy', offset: 'close'
+                });
+                logTradeExchangeStyle(state, currentPrice, new Date().toLocaleString(), config.takeProfitPct, pnl);
+            } else if (state.roi <= -10) {
+                const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier) + 1;
+                const nextVol = Math.ceil(market.currentBaseVolume * Math.pow(config.multiplier, step));
+                state.isLocked = true;
+                await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                    volume: nextVol, direction: state.direction, offset: 'open'
+                });
                 state.isLocked = false;
-                state.lastAction = "TP Failed";
             }
-            continue;
-        }
-
-        const currentStep = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
-        
-        if (state.roi <= -10 && state.volume > 0) {
-            const nextStepNumber = currentStep + 1;
-            let nextVol;
-            
-            if (nextStepNumber === 1) {
-                nextVol = Math.ceil(market.currentBaseVolume * config.multiplier);
-            } else {
-                nextVol = Math.ceil(market.currentBaseVolume * Math.pow(config.multiplier, nextStepNumber));
-            }
-            
-            console.log(`📈 MARTINGALE STEP ${nextStepNumber} for ${state.direction} - ROI: ${state.roi.toFixed(2)}% (LOSS) | Current Vol: ${state.volume} | Adding: ${nextVol} contracts`);
-            state.isLocked = true;
-            
-            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol,
-                volume: nextVol,
-                direction: state.direction,
-                offset: 'open',
-                lever_rate: config.leverage,
-                order_price_type: 'optimal_20'
-            });
-            
-            if (res?.status === 'ok') {
-                state.pendingOrderId = res.data.order_id_str;
-                state.lastStepPrice = currentPrice;
-                state.lastAddedVolume = nextVol;
-                state.lastAction = `Martingale Step ${nextStepNumber} (-${Math.abs(state.roi).toFixed(1)}% loss, Added: ${nextVol})`;
-            } else {
-                state.isLocked = false;
-                state.lastAction = "Step Failed";
-            }
-        } else {
-            const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
-            state.lastAction = `Active - Step ${step} | Vol: ${state.volume} | ROI: ${state.roi.toFixed(2)}%`;
         }
     }
 }
 
 async function backgroundLoop() {
-    try {
-        if (Date.now() - market.lastPriceUpdate > 2000) {
-            await fetchPriceRest();
-        }
-        
-        for (const acc of config.accounts) {
-            await syncAccount(acc, accountStates[acc.accountId]);
-        }
-        
-        const s1 = accountStates[1];
-        const s2 = accountStates[2];
-        
-        if (s1 && s2) {
-            const totalEquity = s1.currentEquity + s2.currentEquity;
-            market.totalNetGain = totalEquity - market.initialTotalEquity;
-            market.growthPct = (market.totalNetGain / market.initialTotalEquity) * 100;
-            const elapsedHours = (Date.now() - market.startTime) / (1000 * 60 * 60);
-            market.dgr = elapsedHours > 0 ? (market.growthPct / elapsedHours) : 0;
-            
-            if (config.autoCompound && market.bid > 0) {
-                const newBaseVolume = calculateBaseVolumeFromWallet(totalEquity, market.bid);
-                if (newBaseVolume !== market.currentBaseVolume) {
-                    market.currentBaseVolume = newBaseVolume;
-                    market.lastBaseUpdate = Date.now();
-                }
-            }
-            updateWalletGrowth(totalEquity);
-        }
-        
-        if (market.status === 'Active') {
-            await processMartingale();
-        }
-    } catch (e) {
-        console.error('Background loop error:', e);
-    }
+    if (Date.now() - market.lastPriceUpdate > 2000) await fetchPriceRest();
+    for (const acc of config.accounts) await syncAccount(acc, accountStates[acc.accountId]);
+    
+    const totalEquity = accountStates[1].currentEquity + accountStates[2].currentEquity;
+    market.totalNetGain = totalEquity - market.initialTotalEquity;
+    market.growthPct = (market.totalNetGain / market.initialTotalEquity) * 100;
+    
+    // This updates the dashboard counters
+    calculateBaseVolumeFromWallet(totalEquity, market.bid);
+    updateWalletGrowth(totalEquity);
+    await processMartingale();
 }
 
-// ==================== ALL API ROUTES & UI (REMAINS 100% IDENTICAL) ====================
+function startWS() {
+    const ws = new WebSocket(config.wsHost);
+    ws.on('open', () => ws.send(JSON.stringify({ sub: `market.${config.symbol}.bbo`, id: 'bbo' })));
+    ws.on('message', (data) => {
+        zlib.gunzip(data, (err, dec) => {
+            if (err) return;
+            const msg = JSON.parse(dec.toString());
+            if (msg.tick) {
+                market.bid = msg.tick.bid[0]; market.ask = msg.tick.ask[0];
+                market.spread = ((market.ask - market.bid) / market.bid) * 100;
+                market.lastPriceUpdate = Date.now();
+            }
+            if (msg.ping) ws.send(JSON.stringify({ pong: msg.ping }));
+        });
+    });
+    ws.on('close', () => setTimeout(startWS, 5000));
+}
 
 app.get('/api/status', (req, res) => {
-    const s1 = accountStates[1];
-    const s2 = accountStates[2];
-    const totalEquity = (s1?.currentEquity || 0) + (s2?.currentEquity || 0);
-    const totalRealizedPnl = (s1?.realizedPnl || 0) + (s2?.realizedPnl || 0);
-    const totalFees = (s1?.totalFees || 0) + (s2?.totalFees || 0);
-    
-    const accountsWithInfo = Object.values(accountStates).map(state => {
-        const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
-        const expectedVol = calculateVolumeForStep(step, market.currentBaseVolume, config.multiplier);
-        const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
-        
-        return {
-            direction: state.direction,
-            roi: state.roi,
-            volume: state.volume,
-            step: step,
-            expectedVolumeForStep: expectedVol,
-            unrealizedUsdt: state.unrealizedUsdt,
-            entryPrice: state.entryPrice,
-            lastAction: state.lastAction,
-            startTime: state.startTime,
-            targetPrice: state.targetPrice,
-            requiredPriceMoveForTP: `${requiredPriceMovePct}%`,
-            currentEquity: state.currentEquity,
-            initialEquity: state.initialEquity,
-            realizedPnl: state.realizedPnl,
-            totalFees: state.totalFees,
-            roiLatencyHistory: state.roiLatencyHistory.slice(0, 5)
-        };
-    });
-    
     res.json({
-        market: {
-            ...market,
-            totalEquity: totalEquity,
-            totalRealizedPnl: totalRealizedPnl,
-            totalFeesPaid: totalFees,
-            winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0,
-            walletHistory: market.walletHistory.slice(-20)
-        },
-        accounts: accountsWithInfo,
+        market: { ...market, winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0 },
+        accounts: Object.values(accountStates),
         tradeHistory,
         config: { ...config, baseVolume: market.currentBaseVolume }
     });
 });
 
-app.post('/api/force-sync', async (req, res) => {
-    for (const acc of config.accounts) {
-        await syncAccount(acc, accountStates[acc.accountId]);
-    }
-    res.json({ status: 'ok' });
-});
-
-app.post('/api/close', async (req, res) => {
-    market.status = "LIQUIDATING";
-    for (const acc of config.accounts) {
-        const s = accountStates[acc.accountId];
-        if (s.volume > 0) {
-            await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol, volume: s.volume,
-                direction: s.direction === 'buy' ? 'sell' : 'buy', offset: 'close'
-            });
-        }
-    }
-    setTimeout(() => market.status = "Active", 5000);
-    res.json({ status: 'ok' });
-});
-
 app.get('/', (req, res) => {
-    const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
     res.send(`
 <!DOCTYPE html>
 <html lang="en">
@@ -704,223 +343,96 @@ app.get('/', (req, res) => {
         .mono { font-family: monospace; font-size: 12px; }
         .tp-target { background: #00D1B220; color: #00D1B2; padding: 2px 8px; border-radius: 4px; font-size: 10px; }
         button { background: #FF4D6D20; border: 1px solid #FF4D6D; color: #FF4D6D; padding: 8px 16px; border-radius: 6px; cursor: pointer; }
-        button:hover { background: #FF4D6D40; }
         .sync-btn { background: #00D1B220; border-color: #00D1B2; color: #00D1B2; margin-left: 10px; }
         .step-badge { background: #6366F120; color: #6366F1; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }
         .wallet-card { background: linear-gradient(135deg, #1A212E 0%, #131824 100%); border: 1px solid #00D1B240; }
         .stat-number { font-size: 28px; font-weight: 900; }
-        .chart-container { position: relative; height: 280px; width: 100%; }
         .compound-info { background: #00D1B210; border: 1px solid #00D1B230; border-radius: 8px; padding: 12px; margin-top: 10px; }
     </style>
 </head>
 <body class="p-6">
     <div class="max-w-7xl mx-auto">
         <div class="flex justify-between items-center mb-8">
-            <div>
-                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO</span> <span class="text-xs bg-yellow-500/20 px-2 py-1 rounded">PAPER MODE</span></h1>
-                <div class="flex items-center gap-3 mt-2">
-                    <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
-                    <span class="text-[10px] font-bold text-emerald-400">LIVE</span>
-                    <span class="text-[10px] text-slate-500">${config.symbol}</span>
-                    <span class="text-[10px] text-slate-500">${config.leverage}x LEVERAGE</span>
-                    <span class="tp-target">🎯 TP: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price move</span>
-                </div>
-            </div>
-            <div>
-                <button onclick="forceSync()" class="sync-btn">🔄 FORCE SYNC</button>
-                <button onclick="emergencyClose()">⚠️ EMERGENCY CLOSE</button>
-            </div>
+            <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">PAPER MODE</span></h1>
         </div>
 
         <div class="wallet-card rounded-2xl p-6 mb-8">
             <div class="grid grid-cols-1 md:grid-cols-5 gap-6">
-                <div>
-                    <p class="stat-label">TOTAL WALLET</p>
-                    <p id="totalWallet" class="stat-number value-positive">$0.00000000</p>
-                    <p id="walletChange" class="text-xs"></p>
-                </div>
-                <div>
-                    <p class="stat-label">TOTAL P&L</p>
-                    <p id="totalPnl" class="stat-number">$0.00000000</p>
-                    <p id="pnlPercent" class="text-xs"></p>
-                </div>
-                <div>
-                    <p class="stat-label">REALIZED P&L</p>
-                    <p id="realizedPnl" class="stat-number">$0.00000000</p>
-                    <p id="feesPaid" class="text-xs text-slate-500">Fees: $0.00</p>
-                </div>
-                <div>
-                    <p class="stat-label">PERFORMANCE</p>
-                    <p id="peakEquity" class="text-sm">Peak: $0.00</p>
-                    <p id="maxDrawdown" class="text-sm text-red-400">DD: 0%</p>
-                </div>
-                <div>
-                    <p class="stat-label">STATISTICS</p>
-                    <p id="tradeStats" class="text-sm">Trades: 0</p>
-                    <p id="winRate" class="text-sm text-green-400">Win Rate: 0%</p>
-                </div>
+                <div><p class="stat-label">TOTAL WALLET</p><p id="totalWallet" class="stat-number value-positive">$0.00</p></div>
+                <div><p class="stat-label">TOTAL P&L</p><p id="totalPnl" class="stat-number">$0.00</p></div>
+                <div><p class="stat-label">REALIZED P&L</p><p id="realizedPnl" class="stat-number">$0.00</p></div>
+                <div><p class="stat-label">PERFORMANCE</p><p id="peakEquity" class="text-sm">Peak: $0.00</p><p id="maxDrawdown" class="text-sm text-red-400">DD: 0%</p></div>
+                <div><p class="stat-label">STATISTICS</p><p id="tradeStats" class="text-sm">Trades: 0</p><p id="winRate" class="text-sm text-green-400">Win Rate: 0%</p></div>
             </div>
             
             <div class="compound-info mt-4">
                 <div class="flex justify-between items-center">
                     <div>
-                        <p class="text-xs text-slate-400">📈 AUTO-COMPOUNDING (${config.riskPercent}% of Wallet)</p>
+                        <p class="text-xs text-slate-400">📈 AUTO-COMPOUNDING (2% Risk)</p>
                         <p class="text-sm font-bold text-green-400" id="baseVolumeDisplay">Base Volume: 0 contracts</p>
                         <p class="text-xs text-slate-400" id="shibDisplay">0 SHIB per trade</p>
-                        <p class="text-xs text-slate-400" id="formulaDisplay">Formula: $${config.walletPerContract.toFixed(8)} wallet = 1 contract at ${config.leverage}x leverage</p>
                     </div>
                     <div class="text-right">
-                        <p class="text-xs text-slate-400">Risk Amount (2%)</p>
+                        <p class="text-xs text-slate-400">Risk Amount</p>
                         <p class="text-sm font-bold" id="riskAmount">$0.00</p>
-                        <p class="text-xs text-slate-400" id="compoundStatus">🟢 Active</p>
+                        <p class="text-xs text-slate-400">🟢 Active</p>
                     </div>
                 </div>
             </div>
         </div>
 
-        <div class="card mb-8">
-            <h3 class="font-bold mb-4">📈 WALLET GROWTH CHART (Compounding Effect)</h3>
-            <div class="chart-container">
-                <canvas id="walletChart" style="max-height: 280px; width: 100%;"></canvas>
-            </div>
-        </div>
-
         <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
-            <div class="card">
-                <p class="stat-label mb-2">CONFIG</p>
-                <p class="text-sm">Base Vol: <span id="configBaseVol">${config.baseVolume}</span></p>
-                <p class="text-sm">Multiplier: ${config.multiplier}x</p>
-                <p class="text-sm">Step Trigger: <span class="text-red-400">-${config.stepDistancePct}% ROI</span></p>
-            </div>
-            <div class="card">
-                <p class="stat-label mb-2">MARKET</p>
-                <p id="spread" class="text-2xl font-black">0.000%</p>
-                <p class="text-[10px] text-slate-500 mt-1">Max Start: ${config.maxStartSpread}%</p>
-                <p class="text-[10px] text-slate-500">BID: <span id="bidPrice">0.00000000</span> | ASK: <span id="askPrice">0.00000000</span></p>
-            </div>
-            <div class="card">
-                <p class="stat-label mb-2">LONG</p>
-                <p id="lRoi" class="text-2xl font-black">0.00%</p>
-                <p id="lPnl" class="text-sm mono mt-1">$0.00000000</p>
-                <p id="lStep" class="text-[10px] text-slate-500 mt-2"></p>
-                <p id="lAction" class="text-[9px] text-indigo-400 mt-1"></p>
-                <p id="lTarget" class="text-[9px] text-green-400 mt-1"></p>
-                <p id="lRealized" class="text-[8px] text-slate-500 mt-1">Realized: $0.00</p>
-            </div>
-            <div class="card">
-                <p class="stat-label mb-2">SHORT</p>
-                <p id="sRoi" class="text-2xl font-black">0.00%</p>
-                <p id="sPnl" class="text-sm mono mt-1">$0.00000000</p>
-                <p id="sStep" class="text-[10px] text-slate-500 mt-2"></p>
-                <p id="sAction" class="text-[9px] text-indigo-400 mt-1"></p>
-                <p id="sTarget" class="text-[9px] text-green-400 mt-1"></p>
-                <p id="sRealized" class="text-[8px] text-slate-500 mt-1">Realized: $0.00</p>
-            </div>
+            <div class="card"><p class="stat-label mb-2">MARKET SPREAD</p><p id="spread" class="text-2xl font-black">0.000%</p></div>
+            <div class="card"><p class="stat-label mb-2">LONG ROI</p><p id="lRoi" class="text-2xl font-black">0.00%</p><p id="lPnl" class="text-sm mt-1">$0.00</p></div>
+            <div class="card"><p class="stat-label mb-2">SHORT ROI</p><p id="sRoi" class="text-2xl font-black">0.00%</p><p id="sPnl" class="text-sm mt-1">$0.00</p></div>
+            <div class="card"><p class="stat-label mb-2">STATUS</p><p id="lAction" class="text-sm text-indigo-400">Idle</p></div>
         </div>
 
         <div class="card">
             <h3 class="font-bold mb-4">📋 CLOSED TRADES</h3>
-            <div class="overflow-x-auto max-h-96 overflow-y-auto">
-                <table class="w-full border-collapse">
-                    <thead class="bg-[#0F141C] sticky top-0">
-                        <tr>
-                            <th class="text-left p-3 text-xs text-slate-500">SIDE</th>
-                            <th class="text-left p-3 text-xs text-slate-500">OPEN</th>
-                            <th class="text-left p-3 text-xs text-slate-500">CLOSE</th>
-                            <th class="text-right p-3 text-xs text-slate-500">STEP</th>
-                            <th class="text-right p-3 text-xs text-slate-500">VOL</th>
-                            <th class="text-right p-3 text-xs text-slate-500">ENTRY</th>
-                            <th class="text-right p-3 text-xs text-slate-500">EXIT</th>
-                            <th class="text-right p-3 text-xs text-slate-500">ROI</th>
-                            <th class="text-right p-3 text-xs text-slate-500">PNL</th>
-                            <th class="text-right p-3 text-xs text-slate-500">FEE</th>
-                        </tr>
-                    </thead>
-                    <tbody id="tradesBody">
-                        <tr><td colspan="10" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>
-                    </tbody>
-                </table>
-            </div>
+            <table class="w-full text-xs">
+                <thead><tr class="text-slate-500"><th class="text-left">SIDE</th><th>CLOSE</th><th>VOL</th><th>ROI</th><th>PNL</th></tr></thead>
+                <tbody id="tradesBody"></tbody>
+            </table>
         </div>
     </div>
 
     <script>
-        let walletChart = null;
-        async function forceSync() {
-            await fetch('/api/force-sync', {method: 'POST'});
-        }
-        async function emergencyClose() {
-            if(confirm('Close ALL positions?')) {
-                await fetch('/api/close', {method: 'POST'});
-            }
-        }
         function formatNumber(num) { return parseFloat(num).toFixed(8); }
-        function updateChart(walletHistory) {
-            if (!walletHistory || walletHistory.length === 0) return;
-            const labels = walletHistory.map(h => new Date(h.timestamp).toLocaleTimeString());
-            const equity = walletHistory.map(h => h.equity);
-            if (walletChart) walletChart.destroy();
-            const ctx = document.getElementById('walletChart').getContext('2d');
-            walletChart = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels: labels,
-                    datasets: [{
-                        label: 'Wallet Equity (USDT)',
-                        data: equity,
-                        borderColor: '#00D1B2',
-                        backgroundColor: 'rgba(0, 209, 178, 0.1)',
-                        fill: true, tension: 0.4, pointRadius: 2
-                    }]
-                },
-                options: {
-                    responsive: true, maintainAspectRatio: true,
-                    scales: {
-                        y: { grid: { color: '#1F2A3E' }, ticks: { color: '#E8EDF2', font: { size: 9 } } },
-                        x: { ticks: { color: '#E8EDF2', font: { size: 8 } }, grid: { color: '#1F2A3E' } }
-                    },
-                    plugins: { legend: { display: false } }
-                }
-            });
-        }
         setInterval(async () => {
-            try {
-                const res = await fetch('/api/status');
-                const data = await res.json();
-                document.getElementById('totalWallet').textContent = '$' + formatNumber(data.market.totalEquity);
-                document.getElementById('totalPnl').textContent = '$' + formatNumber(data.market.totalNetGain);
-                document.getElementById('pnlPercent').textContent = data.market.growthPct.toFixed(2) + '%';
-                document.getElementById('realizedPnl').textContent = '$' + formatNumber(data.market.totalRealizedPnl);
-                document.getElementById('feesPaid').textContent = 'Fees: $' + formatNumber(data.market.totalFeesPaid);
-                document.getElementById('peakEquity').textContent = 'Peak: $' + formatNumber(data.market.peakEquity);
-                document.getElementById('maxDrawdown').textContent = 'DD: ' + data.market.maxDrawdown.toFixed(2) + '%';
-                document.getElementById('tradeStats').textContent = 'Trades: ' + data.market.totalTrades;
-                document.getElementById('winRate').textContent = 'Win Rate: ' + data.market.winRate + '%';
-                document.getElementById('baseVolumeDisplay').textContent = 'Base Volume: ' + data.market.currentBaseVolume + ' contracts';
-                document.getElementById('spread').textContent = (data.market.spread || 0).toFixed(3) + '%';
-                document.getElementById('bidPrice').textContent = (data.market.bid || 0).toFixed(8);
-                document.getElementById('askPrice').textContent = (data.market.ask || 0).toFixed(8);
-                if (data.market.walletHistory) updateChart(data.market.walletHistory);
-                const long = data.accounts.find(a => a.direction === 'buy');
-                const short = data.accounts.find(a => a.direction === 'sell');
-                if (long) {
-                    document.getElementById('lRoi').textContent = long.roi.toFixed(2) + '%';
-                    document.getElementById('lPnl').textContent = '$' + formatNumber(long.unrealizedUsdt);
-                    document.getElementById('lAction').textContent = long.lastAction;
-                    document.getElementById('lStep').textContent = 'Step ' + long.step + ' | Vol ' + long.volume;
-                }
-                if (short) {
-                    document.getElementById('sRoi').textContent = short.roi.toFixed(2) + '%';
-                    document.getElementById('sPnl').textContent = '$' + formatNumber(short.unrealizedUsdt);
-                    document.getElementById('sAction').textContent = short.lastAction;
-                    document.getElementById('sStep').textContent = 'Step ' + short.step + ' | Vol ' + short.volume;
-                }
-                let tradesHtml = '';
-                data.tradeHistory.forEach(t => {
-                    tradesHtml += '<tr class="border-b border-[#1A212E]"><td class="p-3">' + t.side + '</td><td class="p-3">' + t.openTime + '</td><td class="p-3">' + t.closeTime + '</td><td class="text-right p-3">' + t.step + '</td><td class="text-right p-3">' + t.volume + '</td><td class="text-right p-3">' + t.entryPrice + '</td><td class="text-right p-3">' + t.exitPrice + '</td><td class="text-right p-3">' + t.roi + '</td><td class="text-right p-3">' + t.netPnlUsdt + '</td><td class="text-right p-3">' + t.estimatedFee + '</td></tr>';
-                });
-                document.getElementById('tradesBody').innerHTML = tradesHtml || '<tr><td colspan="10" class="text-center p-10">No trades</td></tr>';
-            } catch(e) {}
+            const res = await fetch('/api/status');
+            const data = await res.json();
+            document.getElementById('totalWallet').textContent = '$' + formatNumber(data.market.totalEquity);
+            document.getElementById('totalPnl').textContent = '$' + formatNumber(data.market.totalNetGain);
+            document.getElementById('realizedPnl').textContent = '$' + formatNumber(data.market.totalRealizedPnl);
+            document.getElementById('peakEquity').textContent = 'Peak: $' + formatNumber(data.market.peakEquity);
+            document.getElementById('maxDrawdown').textContent = 'DD: ' + data.market.maxDrawdown.toFixed(2) + '%';
+            document.getElementById('tradeStats').textContent = 'Trades: ' + data.market.totalTrades;
+            document.getElementById('winRate').textContent = 'Win Rate: ' + data.market.winRate + '%';
+            document.getElementById('spread').textContent = data.market.spread.toFixed(3) + '%';
+            
+            // Dashboard values
+            document.getElementById('baseVolumeDisplay').textContent = 'Base Volume: ' + (data.market.currentBaseVolume || 0).toLocaleString() + ' contracts';
+            document.getElementById('shibDisplay').textContent = (data.market.currentBaseShib || 0).toLocaleString() + ' SHIB per trade';
+            document.getElementById('riskAmount').textContent = '$' + formatNumber(data.market.currentRiskAmount || 0);
+
+            const long = data.accounts.find(a => a.direction === 'buy');
+            const short = data.accounts.find(a => a.direction === 'sell');
+            if (long) {
+                document.getElementById('lRoi').textContent = long.roi.toFixed(2) + '%';
+                document.getElementById('lPnl').textContent = '$' + formatNumber(long.unrealizedUsdt);
+                document.getElementById('lAction').textContent = long.lastAction;
+            }
+            if (short) {
+                document.getElementById('sRoi').textContent = short.roi.toFixed(2) + '%';
+                document.getElementById('sPnl').textContent = '$' + formatNumber(short.unrealizedUsdt);
+            }
+
+            let html = '';
+            data.tradeHistory.forEach(t => {
+                html += '<tr class="border-b border-slate-800"><td class="p-2">' + t.side + '</td><td>' + t.closeTime + '</td><td>' + t.volume + '</td><td>' + t.roi + '</td><td>' + t.netPnlUsdt + '</td></tr>';
+            });
+            document.getElementById('tradesBody').innerHTML = html;
         }, 1000);
     </script>
 </body>
@@ -930,6 +442,4 @@ app.get('/', (req, res) => {
 
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => {
-    console.log(`✅ Paper Martingale Pro Started`);
-});
+app.listen(config.port, '0.0.0.0', () => console.log('✅ Corrected Paper Mode running'));
