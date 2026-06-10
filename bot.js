@@ -40,7 +40,7 @@ const config = {
     riskPercent: 0.25,
     dogePerContract: 100,  // 1 contract = 100 DOGE
     walletPerContract: 0.0066135,  // Base reference: $0.0066135 wallet = 1 contract at 75x leverage (this will be recalculated dynamically)
-    stepCooldownMs: 5 * 60 * 1000  // 5 minutes cooldown between martingale steps
+    stepCooldownMs: 10 * 60 * 1000  // 5 minutes cooldown between martingale steps
 };
 
 let market = {
