@@ -37,7 +37,7 @@ const config = {
     pollInterval: 500,
     contractMultiplier: 0.001,
     autoCompound: true,
-    riskPercent: 2,
+    riskPercent: 0.25,
     shibPerContract: 1000,
     walletPerContract: 0.0066135  // $0.0066135 wallet = 1 contract at 75x leverage
 };
