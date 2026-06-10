@@ -1,1294 +1,1016 @@
-const express = require('express');
-const fs = require('fs');
-const os = require('os');
-const { execSync, spawn } = require('child_process');
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const https = require('https');
-const { createWriteStream } = require('fs');
-const { MongoClient } = require('mongodb');
+// social-network.js - Complete Social Network Script for Scalingo
+// Deploy on Scalingo: single file with all features
 
-// Apply stealth plugin
-puppeteer.use(StealthPlugin());
+const express = require('express');
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const socketIo = require('socket.io');
+const http = require('http');
+const cors = require('cors');
+require('dotenv').config();
 
 const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
+// Middleware
+app.use(cors());
 app.use(express.json());
-const port = process.env.PORT || 3000;
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static('public'));
 
-// ============ AUTO-DETECT CENTRAL MODE ============
-const CENTRAL_DOMAIN = 'business-app.osc-fr1.scalingo.io';
-const CURRENT_HOSTNAME = os.hostname();
-const IS_CENTRAL_SERVER = CURRENT_HOSTNAME.includes('business-app') || 
-                           process.env.IS_CENTRAL === 'true' ||
-                           (process.env.DOMAIN && process.env.DOMAIN.includes('business-app'));
+// File upload configuration
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const dir = './uploads';
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => {
+    cb(null, Date.now() + path.extname(file.originalname));
+  }
+});
+const upload = multer({ storage, limits: { fileSize: 5000000 } });
 
-console.log('\n========================================');
-console.log('  BOT SYSTEM DEPLOYMENT');
-console.log('========================================');
-console.log(`Current Hostname: ${CURRENT_HOSTNAME}`);
-console.log(`Central Domain: ${CENTRAL_DOMAIN}`);
-console.log(`Mode: ${IS_CENTRAL_SERVER ? '🔵 CENTRAL SERVER (Dashboard + Bot Worker)' : '🟢 BOT WORKER (Account Creator Only)'}`);
-console.log('========================================\n');
+// MongoDB Schema Definitions
+const UserSchema = new mongoose.Schema({
+  username: { type: String, required: true, unique: true },
+  email: { type: String, required: true, unique: true },
+  password: { type: String, required: true },
+  fullName: { type: String, required: true },
+  bio: { type: String, default: '' },
+  avatar: { type: String, default: 'default-avatar.png' },
+  coverPhoto: { type: String, default: '' },
+  location: { type: String, default: '' },
+  website: { type: String, default: '' },
+  followers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  following: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  isPrivate: { type: Boolean, default: false },
+  createdAt: { type: Date, default: Date.now },
+  lastActive: { type: Date, default: Date.now }
+});
 
-// ============ PERSISTENT DEPLOYMENT ID ============
-const PERSISTENT_ID_FILE = '/app/.deployment_id';
-let persistentDeploymentId = `bot-${CURRENT_HOSTNAME}-${Date.now()}`;
+const PostSchema = new mongoose.Schema({
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  content: { type: String, required: true },
+  image: { type: String, default: '' },
+  video: { type: String, default: '' },
+  likes: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  comments: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Comment' }],
+  shares: { type: Number, default: 0 },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+});
 
-if (!IS_CENTRAL_SERVER) {
-    try {
-        if (fs.existsSync(PERSISTENT_ID_FILE)) {
-            persistentDeploymentId = fs.readFileSync(PERSISTENT_ID_FILE, 'utf8').trim();
-            console.log(`[ID] Using existing deployment ID: ${persistentDeploymentId}`);
-        } else {
-            persistentDeploymentId = `worker-${CURRENT_HOSTNAME}`;
-            fs.writeFileSync(PERSISTENT_ID_FILE, persistentDeploymentId);
-            console.log(`[ID] Created new persistent deployment ID: ${persistentDeploymentId}`);
-        }
-    } catch (error) {
-        console.log(`[ID] Could not persist ID, using: ${persistentDeploymentId}`);
-    }
-} else {
-    persistentDeploymentId = `central-${CURRENT_HOSTNAME}`;
-    console.log(`[ID] Central server ID: ${persistentDeploymentId}`);
-}
+const CommentSchema = new mongoose.Schema({
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  post: { type: mongoose.Schema.Types.ObjectId, ref: 'Post', required: true },
+  content: { type: String, required: true },
+  likes: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  replies: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Comment' }],
+  createdAt: { type: Date, default: Date.now }
+});
 
-// ============ ENVIRONMENT VARIABLES ============
-const ENV = {
-    IS_CENTRAL: IS_CENTRAL_SERVER,
+const FriendshipSchema = new mongoose.Schema({
+  requester: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  recipient: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  status: { type: String, enum: ['pending', 'accepted', 'rejected', 'blocked'], default: 'pending' },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+});
+
+const NotificationSchema = new mongoose.Schema({
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  type: { type: String, enum: ['like', 'comment', 'friend_request', 'friend_accept', 'mention', 'share'], required: true },
+  from: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  post: { type: mongoose.Schema.Types.ObjectId, ref: 'Post' },
+  comment: { type: mongoose.Schema.Types.ObjectId, ref: 'Comment' },
+  read: { type: Boolean, default: false },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const MessageSchema = new mongoose.Schema({
+  sender: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  receiver: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  message: { type: String, required: true },
+  read: { type: Boolean, default: false },
+  createdAt: { type: Date, default: Date.now }
+});
+
+// Models
+const User = mongoose.model('User', UserSchema);
+const Post = mongoose.model('Post', PostSchema);
+const Comment = mongoose.model('Comment', CommentSchema);
+const Friendship = mongoose.model('Friendship', FriendshipSchema);
+const Notification = mongoose.model('Notification', NotificationSchema);
+const Message = mongoose.model('Message', MessageSchema);
+
+// Authentication Middleware
+const authMiddleware = async (req, res, next) => {
+  try {
+    const token = req.header('Authorization')?.replace('Bearer ', '');
+    if (!token) throw new Error();
     
-    BOT_PASSWORD: process.env.BOT_PASSWORD || 'Linuxdistro&84',
-    BOT_START_DELAY: parseInt(process.env.BOT_START_DELAY) || 10,
-    HEADLESS_MODE: process.env.HEADLESS_MODE !== 'false' ? 'new' : false,
-    CHROMIUM_PATH: process.env.CHROMIUM_PATH || '/usr/bin/google-chrome',
-    CLEVER_TOKEN: process.env.CLEVER_TOKEN || '',
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key-change-this');
+    const user = await User.findById(decoded.userId).select('-password');
     
-    CLI_RESTART_ENABLED: IS_CENTRAL_SERVER && process.env.CLI_RESTART_ENABLED === 'true',
-    SCALINGO_API_TOKEN: process.env.SCALINGO_API_TOKEN || '',
-    SCALINGO_APP_NAME: process.env.SCALINGO_APP_NAME || '',
+    if (!user) throw new Error();
     
-    DEPLOYMENT_ID: persistentDeploymentId,
-    DEPLOYMENT_NAME: process.env.DEPLOYMENT_NAME || CURRENT_HOSTNAME,
-    DEPLOYMENT_REGION: process.env.DEPLOYMENT_REGION || 'osc-fr1',
-    
-    CENTRAL_API_URL: process.env.CENTRAL_API_URL || `https://${CENTRAL_DOMAIN}`,
-    CENTRAL_API_KEY: process.env.CENTRAL_API_KEY || 'change-this-secret-key-12345',
-    
-    MONGODB_URI: process.env.MONGODB_URI || 'mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/botdb?appName=Clusterweb8888'
+    req.user = user;
+    req.userId = decoded.userId;
+    next();
+  } catch (error) {
+    res.status(401).json({ error: 'Please authenticate' });
+  }
 };
 
-console.log('Configuration:');
-console.log(`  CLI Restart Enabled: ${ENV.CLI_RESTART_ENABLED ? 'YES (Central Server Only)' : 'NO (Workers Run Continuously)'}`);
-console.log(`  Headless Mode: ${ENV.HEADLESS_MODE}`);
-console.log(`  Deployment ID: ${ENV.DEPLOYMENT_ID}`);
-if (!ENV.IS_CENTRAL) {
-    console.log(`  Web Server: DISABLED (Worker mode - no HTTP server)`);
-}
-console.log('========================================\n');
+// Socket.IO for real-time features
+io.use((socket, next) => {
+  const token = socket.handshake.auth.token;
+  if (!token) return next(new Error('Authentication error'));
+  
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key-change-this');
+    socket.userId = decoded.userId;
+    next();
+  } catch (err) {
+    next(new Error('Authentication error'));
+  }
+});
 
-// ============ MONGODB CONNECTION ============
-let dbClient = null;
-let db = null;
-
-async function connectMongoDB() {
+io.on('connection', (socket) => {
+  console.log('User connected:', socket.userId);
+  
+  socket.join(`user_${socket.userId}`);
+  
+  socket.on('send_message', async (data) => {
     try {
-        dbClient = new MongoClient(ENV.MONGODB_URI);
-        await dbClient.connect();
-        db = dbClient.db('botdb');
-        console.log('[MongoDB] Connected successfully');
-        
-        await db.createCollection('accounts', { capped: false });
-        await db.createCollection('metrics', { capped: false });
-        await db.createCollection('deployments', { capped: false });
-        await db.collection('accounts').createIndex({ createdAt: -1 });
-        await db.collection('accounts').createIndex({ deploymentId: 1 });
-        await db.collection('deployments').createIndex({ lastHeartbeat: -1 });
-        await db.collection('deployments').createIndex({ deploymentId: 1 });
-        
-        return true;
+      const message = new Message({
+        sender: socket.userId,
+        receiver: data.receiverId,
+        message: data.message
+      });
+      await message.save();
+      
+      const populatedMessage = await Message.findById(message._id).populate('sender', 'username fullName avatar');
+      
+      io.to(`user_${data.receiverId}`).emit('receive_message', populatedMessage);
+      socket.emit('message_sent', populatedMessage);
     } catch (error) {
-        console.error('[MongoDB] Connection failed:', error.message);
-        return false;
+      socket.emit('message_error', { error: error.message });
     }
-}
+  });
+  
+  socket.on('typing', (data) => {
+    socket.to(`user_${data.receiverId}`).emit('user_typing', { userId: socket.userId, isTyping: data.isTyping });
+  });
+  
+  socket.on('disconnect', () => {
+    console.log('User disconnected:', socket.userId);
+  });
+});
 
-// ============ STATE VARIABLES ============
-let botStatus = {
-    state: 'running',
-    accountCreated: false,
-    accountEmail: null,
-    startTime: new Date(),
-    completionTime: null,
-    totalAccounts: 0,
-    deploymentId: ENV.DEPLOYMENT_ID,
-    deploymentName: ENV.DEPLOYMENT_NAME,
-    region: ENV.DEPLOYMENT_REGION,
-    isCentral: ENV.IS_CENTRAL
-};
+// API Routes
 
-// ============ HELPER FUNCTIONS ============
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-function log(step, message, type = 'info', instanceId = 'MAIN') {
-    const timestamp = new Date().toLocaleTimeString();
-    console.log(`[${timestamp}] [${instanceId}] [${step}] ${message}`);
-}
-
-async function downloadFile(url, destPath) {
-    return new Promise((resolve, reject) => {
-        const file = createWriteStream(destPath);
-        https.get(url, (response) => {
-            if (response.statusCode !== 200) {
-                reject(new Error(`Failed to download: ${response.statusCode}`));
-                return;
-            }
-            response.pipe(file);
-            file.on('finish', () => {
-                file.close();
-                resolve();
-            });
-        }).on('error', reject);
-    });
-}
-
-async function cleanupStaleDeployments() {
-    try {
-        const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-        const result = await db.collection('deployments').deleteMany({
-            lastHeartbeat: { $lt: fiveMinutesAgo }
-        });
-        if (result.deletedCount > 0) {
-            console.log(`[Cleanup] Removed ${result.deletedCount} stale deployment(s)`);
-        }
-    } catch (error) {
-        console.error('[Cleanup] Failed to clean stale deployments:', error.message);
-    }
-}
-
-async function installChromiumRuntime() {
-    const chromePath = ENV.CHROMIUM_PATH;
+// Auth Routes
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { username, email, password, fullName } = req.body;
     
-    if (fs.existsSync(chromePath)) {
-        const stats = fs.statSync(chromePath);
-        if (stats.size > 50000000) {
-            return chromePath;
-        }
+    const existingUser = await User.findOne({ $or: [{ email }, { username }] });
+    if (existingUser) {
+      return res.status(400).json({ error: 'User already exists' });
     }
     
-    log('SYSTEM', 'Installing Chromium...', 'info', 'MAIN');
-    
-    try {
-        const chromeUrl = 'https://storage.googleapis.com/chrome-for-testing-public/121.0.6167.85/linux64/chrome-linux64.zip';
-        const zipPath = '/tmp/chromium.zip';
-        
-        await downloadFile(chromeUrl, zipPath);
-        execSync(`unzip -q ${zipPath} -d /app/`, { stdio: 'inherit' });
-        
-        if (fs.existsSync(chromePath)) {
-            fs.chmodSync(chromePath, 0o755);
-            fs.unlinkSync(zipPath);
-            return chromePath;
-        }
-        throw new Error('Chrome binary not found');
-    } catch (error) {
-        log('SYSTEM', `Failed: ${error.message}`, 'error', 'MAIN');
-        return null;
-    }
-}
-
-function installCleverCLI() {
-    console.log('[CLI] Installing Clever Cloud CLI...');
-    
-    try {
-        execSync('npm install -g clever-tools', { stdio: 'inherit' });
-        console.log('[CLI] ✅ Clever CLI installed');
-        return true;
-    } catch (error) {
-        console.error('[CLI] Failed to install Clever CLI:', error.message);
-        return false;
-    }
-}
-
-async function logoutCleverCloud() {
-    log('CLI', 'Logging out of Clever Cloud...', 'info', 'MAIN');
-    try {
-        execSync('clever logout', { stdio: 'inherit' });
-        log('CLI', '✅ Logged out successfully', 'success', 'MAIN');
-    } catch (error) {
-        log('CLI', 'No active session to logout', 'info', 'MAIN');
-    }
-    
-    try {
-        const homeDir = process.env.HOME || '/app';
-        const tokenFiles = [
-            `${homeDir}/.config/clever-cloud/credentials.json`,
-            `${homeDir}/.clever.json`,
-            `/.clever.json`
-        ];
-        
-        for (const tokenFile of tokenFiles) {
-            if (fs.existsSync(tokenFile)) {
-                fs.unlinkSync(tokenFile);
-                log('CLI', `Removed ${tokenFile}`, 'info', 'MAIN');
-            }
-        }
-    } catch (error) {
-        // Ignore errors
-    }
-}
-
-// ============ GMAILNATOR EMAIL SERVICE (BROWSER-BASED) ============
-class GmailnatorService {
-    constructor(instanceId) {
-        this.instanceId = instanceId;
-        this.browser = null;
-        this.page = null;
-        this.email = null;
-        this.chromePath = null;
-    }
-
-    async init() {
-        log('GMAILNATOR', 'Initializing browser for email...', 'info', this.instanceId);
-        
-        // Find Chrome path
-        if (!this.chromePath) {
-            this.chromePath = ENV.CHROMIUM_PATH;
-            if (!fs.existsSync(this.chromePath)) {
-                this.chromePath = await installChromiumRuntime();
-            }
-        }
-        
-        if (!this.chromePath) {
-            throw new Error('No Chrome/Chromium found');
-        }
-        
-        const launchOptions = {
-            headless: ENV.HEADLESS_MODE,
-            executablePath: this.chromePath,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled'
-            ]
-        };
-        
-        this.browser = await puppeteer.launch(launchOptions);
-        this.page = await this.browser.newPage();
-        await this.page.setViewport({ width: 1280, height: 800 });
-        
-        // Set realistic user agent
-        await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-        
-        log('GMAILNATOR', 'Browser initialized', 'success', this.instanceId);
-        return true;
-    }
-
-    async getTempEmail() {
-        log('GMAILNATOR', 'Getting temporary email from Gmailnator...', 'info', this.instanceId);
-        
-        try {
-            // Navigate to Gmailnator
-            await this.page.goto('https://www.emailnator.com/', {
-                waitUntil: 'networkidle2',
-                timeout: 30000
-            });
-            
-            await sleep(3000);
-            
-            // Wait for the generate button and click it
-            await this.page.evaluate(() => {
-                // Find and click the generate email button
-                const buttons = Array.from(document.querySelectorAll('button, a, .btn'));
-                const generateBtn = buttons.find(btn => {
-                    const text = (btn.textContent || '').toLowerCase();
-                    return text.includes('generate') || text.includes('get email') || text.includes('create');
-                });
-                
-                if (generateBtn) {
-                    generateBtn.click();
-                    return true;
-                }
-                return false;
-            });
-            
-            // Wait for email to be generated
-            await sleep(4000);
-            
-            // Extract the email address
-            const email = await this.page.evaluate(() => {
-                // Try multiple selectors to find the email
-                const selectors = [
-                    '#email',
-                    '.email-address',
-                    '.generated-email',
-                    'input[type="email"]',
-                    '.email-text',
-                    'code',
-                    '.email'
-                ];
-                
-                for (const selector of selectors) {
-                    const element = document.querySelector(selector);
-                    if (element) {
-                        const text = element.value || element.textContent || element.innerText;
-                        if (text && text.includes('@')) {
-                            return text.trim();
-                        }
-                    }
-                }
-                
-                // Search for email pattern in page text
-                const bodyText = document.body.innerText;
-                const emailMatch = bodyText.match(/[a-zA-Z0-9._%+-]+@(?:gmail\.com|emailnator\.com)/);
-                return emailMatch ? emailMatch[0] : null;
-            });
-            
-            if (email && email.includes('@')) {
-                this.email = email;
-                log('GMAILNATOR', `Email obtained: ${this.email}`, 'success', this.instanceId);
-                return this.email;
-            }
-            
-            throw new Error('Could not extract email address');
-            
-        } catch (error) {
-            log('GMAILNATOR', `Failed to get email: ${error.message}`, 'error', this.instanceId);
-            return null;
-        }
-    }
-
-    async waitForVerificationLink(timeoutSeconds = 180) {
-        log('GMAILNATOR', `Waiting for verification email (${timeoutSeconds}s)...`, 'info', this.instanceId);
-        log('GMAILNATOR', `📧 Monitoring: ${this.email}`, 'info', this.instanceId);
-        
-        const startTime = Date.now();
-        let lastMessageCount = 0;
-        
-        while ((Date.now() - startTime) < timeoutSeconds * 1000) {
-            try {
-                // Check for new emails in the inbox
-                const result = await this.page.evaluate(() => {
-                    // Look for email items in the list
-                    const emailItems = document.querySelectorAll('.message-item, .email-item, .inbox-item, tr, .email-row');
-                    const emailCount = emailItems.length;
-                    
-                    // Get all email content
-                    let allEmailContent = '';
-                    emailItems.forEach(item => {
-                        allEmailContent += (item.textContent || '') + ' ';
-                    });
-                    
-                    // Also check the main page content
-                    const pageContent = document.body.innerText;
-                    const fullContent = allEmailContent + ' ' + pageContent;
-                    
-                    // Look for Clever Cloud verification links
-                    const cleverPatterns = [
-                        /https:\/\/api\.clever-cloud\.com\/v2\/self\/validate_email\?validationKey=[a-f0-9-]+/,
-                        /https:\/\/api\.clever-cloud\.com\/[^\s<>"']+/,
-                        /https:\/\/console\.clever-cloud\.com\/[^\s<>"']+/
-                    ];
-                    
-                    let verificationLink = null;
-                    for (const pattern of cleverPatterns) {
-                        const match = fullContent.match(pattern);
-                        if (match) {
-                            verificationLink = match[0];
-                            break;
-                        }
-                    }
-                    
-                    // If no specific pattern, look for any verification URL
-                    if (!verificationLink) {
-                        const allUrls = fullContent.match(/https?:\/\/[^\s<>"']+/g) || [];
-                        verificationLink = allUrls.find(url => 
-                            url.includes('verify') || 
-                            url.includes('validate') || 
-                            url.includes('clever-cloud') ||
-                            url.includes('confirmation')
-                        );
-                    }
-                    
-                    return { emailCount, verificationLink, content: fullContent.substring(0, 500) };
-                });
-                
-                // Check for new messages
-                if (result.emailCount > lastMessageCount) {
-                    log('GMAILNATOR', `📨 New email detected! Total: ${result.emailCount}`, 'info', this.instanceId);
-                    lastMessageCount = result.emailCount;
-                }
-                
-                // Check if we found a verification link
-                if (result.verificationLink) {
-                    log('GMAILNATOR', '✅ Verification link found!', 'success', this.instanceId);
-                    return result.verificationLink;
-                }
-                
-                // Click refresh button if available
-                await this.page.evaluate(() => {
-                    const refreshBtn = document.querySelector('button[title*="refresh"], .refresh-btn, [data-action="refresh"]');
-                    if (refreshBtn) refreshBtn.click();
-                });
-                
-                const elapsed = Math.floor((Date.now() - startTime) / 1000);
-                process.stdout.write(`\r⏳ Waiting... ${elapsed}s elapsed, ${result.emailCount} emails found`);
-                
-                await sleep(5000);
-                
-            } catch (error) {
-                log('GMAILNATOR', `Check error: ${error.message}`, 'warn', this.instanceId);
-                await sleep(5000);
-            }
-        }
-        
-        console.log(); // New line after progress
-        log('GMAILNATOR', '⚠️ Timeout waiting for verification email', 'warn', this.instanceId);
-        return null;
-    }
-
-    async cleanup() {
-        if (this.browser) {
-            await this.browser.close();
-        }
-    }
-}
-
-// ============ CENTRAL API ENDPOINTS ============
-function setupCentralEndpoints() {
-    console.log('[Central] Setting up API endpoints...');
-    
-    const validateApiKey = (req, res, next) => {
-        const key = req.headers['x-api-key'];
-        if (key !== ENV.CENTRAL_API_KEY) {
-            return res.status(401).json({ error: 'Invalid API key' });
-        }
-        next();
-    };
-    
-    app.post('/api/register-bot', validateApiKey, async (req, res) => {
-        try {
-            const { deploymentId, deploymentName, region, startTime, version } = req.body;
-            
-            await db.collection('deployments').updateOne(
-                { deploymentId: deploymentId },
-                { 
-                    $set: {
-                        deploymentId: deploymentId,
-                        deploymentName: deploymentName,
-                        region: region,
-                        version: version,
-                        status: 'active',
-                        startTime: new Date(startTime),
-                        lastHeartbeat: new Date(),
-                        updatedAt: new Date()
-                    },
-                    $setOnInsert: {
-                        createdAt: new Date(),
-                        totalAccounts: 0
-                    }
-                },
-                { upsert: true }
-            );
-            
-            res.json({ success: true, message: 'Bot registered' });
-        } catch (error) {
-            res.status(500).json({ error: error.message });
-        }
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const user = new User({
+      username,
+      email,
+      password: hashedPassword,
+      fullName
     });
     
-    app.post('/api/heartbeat', validateApiKey, async (req, res) => {
-        try {
-            const { deploymentId, deploymentName, region, status, accountsCreated, lastAccount } = req.body;
-            
-            await db.collection('deployments').updateOne(
-                { deploymentId: deploymentId },
-                { 
-                    $set: {
-                        deploymentName: deploymentName,
-                        region: region,
-                        status: status,
-                        accountsCreated: accountsCreated,
-                        lastAccount: lastAccount,
-                        lastHeartbeat: new Date()
-                    }
-                }
-            );
-            
-            res.json({ success: true });
-        } catch (error) {
-            res.status(500).json({ error: error.message });
-        }
+    await user.save();
+    
+    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET || 'your-secret-key-change-this', { expiresIn: '7d' });
+    
+    res.status(201).json({
+      token,
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        fullName: user.fullName,
+        avatar: user.avatar
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    const isValidPassword = await bcrypt.compare(password, user.password);
+    if (!isValidPassword) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    user.lastActive = new Date();
+    await user.save();
+    
+    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET || 'your-secret-key-change-this', { expiresIn: '7d' });
+    
+    res.json({
+      token,
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        fullName: user.fullName,
+        avatar: user.avatar,
+        bio: user.bio,
+        followers: user.followers.length,
+        following: user.following.length
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/auth/me', authMiddleware, async (req, res) => {
+  res.json(req.user);
+});
+
+// Post Routes
+app.get('/api/posts', authMiddleware, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
+    
+    // Get posts from user and users they follow
+    const followingUsers = [...req.user.following, req.user._id];
+    
+    const posts = await Post.find({ user: { $in: followingUsers } })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .populate('user', 'username fullName avatar')
+      .populate({
+        path: 'comments',
+        populate: { path: 'user', select: 'username fullName avatar' },
+        options: { limit: 3 }
+      });
+    
+    const total = await Post.countDocuments({ user: { $in: followingUsers } });
+    
+    res.json({
+      posts,
+      currentPage: page,
+      totalPages: Math.ceil(total / limit),
+      totalPosts: total
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/posts', authMiddleware, upload.single('image'), async (req, res) => {
+  try {
+    const { content } = req.body;
+    const image = req.file ? `/uploads/${req.file.filename}` : '';
+    
+    const post = new Post({
+      user: req.userId,
+      content,
+      image
     });
     
-    app.post('/api/metrics/add', validateApiKey, async (req, res) => {
-        try {
-            const { deploymentId, deploymentName, email, password, deployedApps, createdAt, restartCount } = req.body;
-            
-            await db.collection('accounts').insertOne({
-                deploymentId: deploymentId,
-                deploymentName: deploymentName,
-                email: email,
-                password: password,
-                deployedApps: deployedApps,
-                createdAt: new Date(createdAt),
-                restartCount: restartCount
-            });
-            
-            await db.collection('deployments').updateOne(
-                { deploymentId: deploymentId },
-                { 
-                    $inc: { totalAccounts: 1 },
-                    $set: { lastAccount: email, lastAccountTime: new Date() }
-                }
-            );
-            
-            res.json({ success: true, message: 'Metrics recorded' });
-        } catch (error) {
-            res.status(500).json({ error: error.message });
-        }
+    await post.save();
+    await post.populate('user', 'username fullName avatar');
+    
+    res.status(201).json(post);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/posts/:postId', authMiddleware, async (req, res) => {
+  try {
+    const post = await Post.findById(req.params.postId)
+      .populate('user', 'username fullName avatar bio')
+      .populate({
+        path: 'comments',
+        populate: { path: 'user', select: 'username fullName avatar' }
+      });
+    
+    if (!post) {
+      return res.status(404).json({ error: 'Post not found' });
+    }
+    
+    res.json(post);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/posts/:postId', authMiddleware, async (req, res) => {
+  try {
+    const post = await Post.findOne({ _id: req.params.postId, user: req.userId });
+    if (!post) {
+      return res.status(404).json({ error: 'Post not found' });
+    }
+    
+    await Comment.deleteMany({ post: post._id });
+    await post.deleteOne();
+    
+    res.json({ message: 'Post deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Like Routes
+app.post('/api/posts/:postId/like', authMiddleware, async (req, res) => {
+  try {
+    const post = await Post.findById(req.params.postId);
+    if (!post) {
+      return res.status(404).json({ error: 'Post not found' });
+    }
+    
+    const likeIndex = post.likes.indexOf(req.userId);
+    let liked = false;
+    
+    if (likeIndex === -1) {
+      post.likes.push(req.userId);
+      liked = true;
+      
+      // Create notification
+      if (post.user.toString() !== req.userId) {
+        const notification = new Notification({
+          user: post.user,
+          type: 'like',
+          from: req.userId,
+          post: post._id
+        });
+        await notification.save();
+        
+        // Emit real-time notification
+        io.to(`user_${post.user}`).emit('new_notification', {
+          type: 'like',
+          from: req.user.username,
+          postId: post._id
+        });
+      }
+    } else {
+      post.likes.splice(likeIndex, 1);
+    }
+    
+    await post.save();
+    
+    res.json({ liked, likesCount: post.likes.length });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Comment Routes
+app.post('/api/posts/:postId/comments', authMiddleware, async (req, res) => {
+  try {
+    const { content } = req.body;
+    
+    const comment = new Comment({
+      user: req.userId,
+      post: req.params.postId,
+      content
     });
     
-    app.get('/api/connected-bots', async (req, res) => {
-        try {
-            const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-            const bots = await db.collection('deployments')
-                .find({ lastHeartbeat: { $gt: fiveMinutesAgo } })
-                .sort({ lastHeartbeat: -1 })
-                .toArray();
-            
-            const uniqueBots = [];
-            const seenIds = new Set();
-            for (const bot of bots) {
-                if (!seenIds.has(bot.deploymentId)) {
-                    seenIds.add(bot.deploymentId);
-                    uniqueBots.push(bot);
-                }
-            }
-            
-            res.json(uniqueBots);
-        } catch (error) {
-            res.status(500).json({ error: error.message });
-        }
+    await comment.save();
+    
+    const post = await Post.findById(req.params.postId);
+    post.comments.push(comment._id);
+    await post.save();
+    
+    await comment.populate('user', 'username fullName avatar');
+    
+    // Create notification
+    if (post.user.toString() !== req.userId) {
+      const notification = new Notification({
+        user: post.user,
+        type: 'comment',
+        from: req.userId,
+        post: post._id,
+        comment: comment._id
+      });
+      await notification.save();
+      
+      io.to(`user_${post.user}`).emit('new_notification', {
+        type: 'comment',
+        from: req.user.username,
+        postId: post._id
+      });
+    }
+    
+    res.status(201).json(comment);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// User Routes
+app.get('/api/users/:userId', authMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.userId)
+      .select('-password')
+      .populate('followers', 'username fullName avatar')
+      .populate('following', 'username fullName avatar');
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const isFollowing = user.followers.some(f => f._id.toString() === req.userId);
+    const isFollower = user.following.some(f => f._id.toString() === req.userId);
+    
+    res.json({
+      ...user.toObject(),
+      isFollowing,
+      isFollower,
+      postsCount: await Post.countDocuments({ user: user._id }),
+      followersCount: user.followers.length,
+      followingCount: user.following.length
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/users/profile', authMiddleware, upload.single('avatar'), async (req, res) => {
+  try {
+    const { fullName, bio, location, website } = req.body;
+    const updateData = { fullName, bio, location, website };
+    
+    if (req.file) {
+      updateData.avatar = `/uploads/${req.file.filename}`;
+    }
+    
+    const user = await User.findByIdAndUpdate(
+      req.userId,
+      updateData,
+      { new: true }
+    ).select('-password');
+    
+    res.json(user);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Friend Routes
+app.post('/api/friends/request/:userId', authMiddleware, async (req, res) => {
+  try {
+    const recipientId = req.params.userId;
+    
+    if (recipientId === req.userId) {
+      return res.status(400).json({ error: 'Cannot send friend request to yourself' });
+    }
+    
+    const existingFriendship = await Friendship.findOne({
+      $or: [
+        { requester: req.userId, recipient: recipientId },
+        { requester: recipientId, recipient: req.userId }
+      ]
     });
     
-    app.get('/api/all-accounts', async (req, res) => {
-        try {
-            const accounts = await db.collection('accounts').find({}).sort({ createdAt: -1 }).limit(100).toArray();
-            res.json(accounts);
-        } catch (error) {
-            res.status(500).json({ error: error.message });
-        }
+    if (existingFriendship) {
+      return res.status(400).json({ error: 'Friend request already exists' });
+    }
+    
+    const friendship = new Friendship({
+      requester: req.userId,
+      recipient: recipientId
     });
     
-    app.get('/api/aggregated-metrics', async (req, res) => {
-        try {
-            const totalAccounts = await db.collection('accounts').countDocuments();
-            const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-            const totalDeployments = await db.collection('deployments').countDocuments({ lastHeartbeat: { $gt: fiveMinutesAgo } });
-            const accountsByBot = await db.collection('accounts').aggregate([
-                { $group: { _id: '$deploymentId', count: { $sum: 1 } } },
-                { $sort: { count: -1 } }
-            ]).toArray();
-            
-            res.json({ totalAccounts, totalDeployments, activeDeployments: totalDeployments, accountsByBot, timestamp: new Date() });
-        } catch (error) {
-            res.status(500).json({ error: error.message });
-        }
+    await friendship.save();
+    
+    // Create notification
+    const notification = new Notification({
+      user: recipientId,
+      type: 'friend_request',
+      from: req.userId
+    });
+    await notification.save();
+    
+    io.to(`user_${recipientId}`).emit('new_notification', {
+      type: 'friend_request',
+      from: req.user.username
     });
     
-    console.log('[Central] ✅ API endpoints ready');
-}
+    res.json({ message: 'Friend request sent' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
-// ============ BOT FUNCTIONS ============
-async function sendHeartbeat() {
-    const apiUrl = `${ENV.CENTRAL_API_URL}/api/heartbeat`;
+app.put('/api/friends/accept/:requestId', authMiddleware, async (req, res) => {
+  try {
+    const friendship = await Friendship.findById(req.params.requestId);
     
-    try {
-        const response = await fetch(apiUrl, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-API-Key': ENV.CENTRAL_API_KEY
-            },
-            body: JSON.stringify({
-                deploymentId: ENV.DEPLOYMENT_ID,
-                deploymentName: ENV.DEPLOYMENT_NAME,
-                region: ENV.DEPLOYMENT_REGION,
-                status: botStatus.state,
-                accountsCreated: botStatus.totalAccounts,
-                lastAccount: botStatus.accountEmail,
-                timestamp: new Date()
-            })
-        });
-        
-        if (response.ok) console.log('[Heartbeat] ✅ Sent');
-    } catch (error) {
-        console.log('[Heartbeat] ❌ Failed:', error.message);
+    if (!friendship || friendship.recipient.toString() !== req.userId) {
+      return res.status(404).json({ error: 'Friend request not found' });
     }
-}
-
-async function sendMetricsToCentral(accountData) {
-    const apiUrl = `${ENV.CENTRAL_API_URL}/api/metrics/add`;
     
-    try {
-        const response = await fetch(apiUrl, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-API-Key': ENV.CENTRAL_API_KEY
-            },
-            body: JSON.stringify({
-                deploymentId: ENV.DEPLOYMENT_ID,
-                deploymentName: ENV.DEPLOYMENT_NAME,
-                email: accountData.email,
-                password: accountData.password,
-                deployedApps: accountData.deployedApps || [],
-                createdAt: accountData.createdAt,
-                restartCount: botStatus.totalAccounts
-            })
-        });
-        
-        if (response.ok) log('CENTRAL', `✅ Metrics sent for ${accountData.email}`, 'success');
-    } catch (error) {
-        log('CENTRAL', `❌ Failed: ${error.message}`, 'error');
-    }
-}
-
-async function registerWithCentral() {
-    const apiUrl = `${ENV.CENTRAL_API_URL}/api/register-bot`;
+    friendship.status = 'accepted';
+    await friendship.save();
     
-    try {
-        const response = await fetch(apiUrl, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-API-Key': ENV.CENTRAL_API_KEY
-            },
-            body: JSON.stringify({
-                deploymentId: ENV.DEPLOYMENT_ID,
-                deploymentName: ENV.DEPLOYMENT_NAME,
-                region: ENV.DEPLOYMENT_REGION,
-                startTime: botStatus.startTime,
-                version: '1.0.0'
-            })
-        });
-        
-        if (response.ok) log('CENTRAL', '✅ Registered with central server', 'success');
-    } catch (error) {
-        log('CENTRAL', `⚠️ Registration failed: ${error.message}`, 'warn');
+    // Add to followers/following
+    await User.findByIdAndUpdate(friendship.requester, {
+      $addToSet: { following: friendship.recipient, followers: friendship.recipient }
+    });
+    
+    await User.findByIdAndUpdate(friendship.recipient, {
+      $addToSet: { following: friendship.requester, followers: friendship.requester }
+    });
+    
+    // Create notification for acceptance
+    const notification = new Notification({
+      user: friendship.requester,
+      type: 'friend_accept',
+      from: req.userId
+    });
+    await notification.save();
+    
+    io.to(`user_${friendship.requester}`).emit('new_notification', {
+      type: 'friend_accept',
+      from: req.user.username
+    });
+    
+    res.json({ message: 'Friend request accepted' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Notification Routes
+app.get('/api/notifications', authMiddleware, async (req, res) => {
+  try {
+    const notifications = await Notification.find({ user: req.userId })
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .populate('from', 'username fullName avatar')
+      .populate('post', 'content image');
+    
+    res.json(notifications);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/notifications/:notificationId/read', authMiddleware, async (req, res) => {
+  try {
+    await Notification.findByIdAndUpdate(req.params.notificationId, { read: true });
+    res.json({ message: 'Notification marked as read' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Message Routes
+app.get('/api/messages/:userId', authMiddleware, async (req, res) => {
+  try {
+    const messages = await Message.find({
+      $or: [
+        { sender: req.userId, receiver: req.params.userId },
+        { sender: req.params.userId, receiver: req.userId }
+      ]
+    })
+      .sort({ createdAt: 1 })
+      .populate('sender', 'username fullName avatar')
+      .populate('receiver', 'username fullName avatar');
+    
+    res.json(messages);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Search Routes
+app.get('/api/search', authMiddleware, async (req, res) => {
+  try {
+    const { q, type = 'all' } = req.query;
+    
+    if (!q) {
+      return res.json({ users: [], posts: [] });
     }
-}
-
-function startHeartbeat() {
-    setInterval(async () => await sendHeartbeat(), 30000);
-}
-
-// ============ BOT CLASS ============
-class CleverCloudBot {
-    constructor(instanceId) {
-        this.instanceId = instanceId;
-        this.browser = null;
-        this.page = null;
-        this.emailService = null;
-        this.realTempEmail = null;
-        this.chromePath = null;
-        this.oauthHandled = false;
+    
+    const searchRegex = new RegExp(q, 'i');
+    let results = {};
+    
+    if (type === 'all' || type === 'users') {
+      results.users = await User.find({
+        $or: [
+          { username: searchRegex },
+          { fullName: searchRegex },
+          { email: searchRegex }
+        ]
+      })
+        .select('username fullName avatar bio followers following')
+        .limit(20);
     }
-
-    async initBrowser() {
-        if (!this.chromePath) {
-            this.chromePath = ENV.CHROMIUM_PATH;
-            if (!fs.existsSync(this.chromePath)) {
-                this.chromePath = await installChromiumRuntime();
-            }
-        }
-        if (!this.chromePath) throw new Error('No Chromium found');
-        
-        const launchOptions = {
-            headless: ENV.HEADLESS_MODE,
-            executablePath: this.chromePath,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-        };
-        
-        this.browser = await puppeteer.launch(launchOptions);
-        this.page = await this.browser.newPage();
-        await this.page.setViewport({ width: 1280, height: 800 });
+    
+    if (type === 'all' || type === 'posts') {
+      results.posts = await Post.find({ content: searchRegex })
+        .sort({ createdAt: -1 })
+        .limit(20)
+        .populate('user', 'username fullName avatar');
     }
+    
+    res.json(results);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
-    async fetchTempEmail() {
-        log('EMAIL', 'Getting temp email from Gmailnator...', 'info', this.instanceId);
-        
-        // Initialize email service
-        this.emailService = new GmailnatorService(this.instanceId);
-        await this.emailService.init();
-        
-        const email = await this.emailService.getTempEmail();
-        if (!email) {
-            throw new Error('Could not get temporary email');
-        }
-        
-        this.realTempEmail = email;
-        log('EMAIL', `Using email: ${email}`, 'success', this.instanceId);
-        return email;
-    }
+// Timeline/Feed Routes
+app.get('/api/feed', authMiddleware, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
+    
+    const followingIds = req.user.following;
+    followingIds.push(req.userId);
+    
+    const posts = await Post.find({ user: { $in: followingIds } })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .populate('user', 'username fullName avatar')
+      .populate({
+        path: 'comments',
+        options: { limit: 5 },
+        populate: { path: 'user', select: 'username fullName avatar' }
+      });
+    
+    const total = await Post.countDocuments({ user: { $in: followingIds } });
+    
+    res.json({
+      posts,
+      currentPage: page,
+      totalPages: Math.ceil(total / limit),
+      hasMore: skip + limit < total
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
-    async handleSignup(email, password) {
-        log('SIGNUP', 'Creating account...', 'info', this.instanceId);
-        await this.page.goto('https://api.clever-cloud.com/v2/sessions/signup', { waitUntil: 'networkidle2' });
-        await sleep(3000);
-        await this.page.waitForSelector('input[type="email"]');
-        await this.page.type('input[type="email"]', email);
-        await this.page.type('input[type="password"]', password);
-        await this.page.evaluate(() => {
-            const checkbox = document.querySelector('input[type="checkbox"]');
-            if (checkbox) checkbox.click();
-        });
-        await this.page.evaluate(() => {
-            const cb = document.querySelector('#altcha_checkbox');
-            if (cb) cb.click();
-        });
-        
-        log('CAPTCHA', 'Waiting for solution...', 'info', this.instanceId);
-        let captchaSolved = false;
-        for (let i = 0; i < 60; i++) {
-            const solved = await this.page.evaluate(() => {
-                const input = document.querySelector('input[name="altcha"]');
-                return input && input.value && input.value.length > 20;
-            });
-            if (solved) {
-                log('CAPTCHA', 'Solved!', 'success', this.instanceId);
-                captchaSolved = true;
-                break;
-            }
-            await sleep(1000);
-        }
-        
-        await this.page.evaluate(() => {
-            const btn = Array.from(document.querySelectorAll('button')).find(x => x.innerText.toLowerCase().includes('sign up'));
-            if (btn) btn.click();
-        });
-        
-        await sleep(8000);
-        log('SIGNUP', 'Form submitted', 'success', this.instanceId);
-    }
+// Explore Routes
+app.get('/api/explore', authMiddleware, async (req, res) => {
+  try {
+    const trendingPosts = await Post.find()
+      .sort({ likes: -1, createdAt: -1 })
+      .limit(20)
+      .populate('user', 'username fullName avatar');
+    
+    const suggestedUsers = await User.find({
+      _id: { $ne: req.userId },
+      followers: { $nin: [req.userId] }
+    })
+      .limit(10)
+      .select('username fullName avatar bio followers');
+    
+    res.json({
+      trendingPosts,
+      suggestedUsers
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
-    async getVerificationLink() {
-        log('VERIFY', 'Waiting for verification email...', 'info', this.instanceId);
-        
-        // Use Gmailnator service to wait for verification link
-        const verificationLink = await this.emailService.waitForVerificationLink(180);
-        
-        if (!verificationLink) {
-            throw new Error('No verification link received');
-        }
-        
-        log('VERIFY', 'Verification link found!', 'success', this.instanceId);
-        return verificationLink;
-    }
+// Serve uploaded files
+app.use('/uploads', express.static('uploads'));
 
-    async handleOAuth(url, email, password) {
-        log('OAUTH', 'Auto-login in progress...', 'info', this.instanceId);
-        let oauthPage = null;
-        
-        try {
-            oauthPage = await this.browser.newPage();
-            await oauthPage.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
-            log('OAUTH', 'Page loaded', 'info', this.instanceId);
-            await sleep(3000);
-            
-            const alreadyLoggedIn = await oauthPage.evaluate(() => {
-                const body = document.body.innerText || '';
-                return body.includes('already logged in') || body.includes('redirecting');
-            });
-            
-            if (alreadyLoggedIn) {
-                log('OAUTH', 'Already logged in, waiting for redirect...', 'success', this.instanceId);
-                await sleep(5000);
-                await oauthPage.close();
-                return true;
-            }
-            
-            const emailSelectors = ['input[type="email"]', 'input[name="email"]', 'input[id="email"]', '#username', '#login_email'];
-            let emailField = null;
-            for (const selector of emailSelectors) {
-                emailField = await oauthPage.$(selector);
-                if (emailField) break;
-            }
-            
-            const passwordSelectors = ['input[type="password"]', 'input[name="password"]', 'input[id="password"]', '#password', '#login_password'];
-            let passwordField = null;
-            for (const selector of passwordSelectors) {
-                passwordField = await oauthPage.$(selector);
-                if (passwordField) break;
-            }
-            
-            if (emailField && passwordField) {
-                await emailField.click({ clickCount: 3 });
-                await emailField.type(email, { delay: 100 });
-                await passwordField.click({ clickCount: 3 });
-                await passwordField.type(password, { delay: 100 });
-                log('OAUTH', 'Credentials filled for: ' + email, 'success', this.instanceId);
-                await sleep(1000);
-                
-                const loginClicked = await oauthPage.evaluate(() => {
-                    const btns = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-                    for (const btn of btns) {
-                        const text = (btn.innerText || btn.value || '').toLowerCase();
-                        if (text.includes('login') || text.includes('sign in')) {
-                            btn.click();
-                            return true;
-                        }
-                    }
-                    const form = document.querySelector('form');
-                    if (form) {
-                        form.submit();
-                        return true;
-                    }
-                    return false;
-                });
-                
-                if (loginClicked) {
-                    log('OAUTH', 'Login submitted, waiting for redirect...', 'success', this.instanceId);
-                    await sleep(10000);
-                }
-            }
-            
-            let redirected = false;
-            for (let i = 0; i < 30; i++) {
-                const currentUrl = oauthPage.url();
-                if (!currentUrl.includes('cli-oauth')) {
-                    redirected = true;
-                    log('OAUTH', 'Redirect detected, login successful', 'success', this.instanceId);
-                    break;
-                }
-                await sleep(1000);
-            }
-            
-            await oauthPage.close();
-            return true;
-            
-        } catch (error) {
-            log('OAUTH', `Error: ${error.message}`, 'error', this.instanceId);
-            if (oauthPage && !oauthPage.isClosed()) await oauthPage.close().catch(() => {});
-            return false;
-        }
-    }
+// Frontend route
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
-    async startDockerInBackground(email, password) {
-        return new Promise(async (resolve) => {
-            log('DOCKER', 'Starting Docker deployment...', 'info', this.instanceId);
-            
-            await logoutCleverCloud();
-            
-            const deployDir = `/tmp/deployments_${Date.now()}`;
-            try {
-                if (!fs.existsSync(deployDir)) {
-                    fs.mkdirSync(deployDir, { recursive: true });
-                }
-            } catch (error) {
-                log('DOCKER', `Cannot create dir: ${error.message}`, 'warn', this.instanceId);
-            }
-            
-            const dockerScriptPath = '/app/docker';
-            if (!fs.existsSync(dockerScriptPath)) {
-                log('DOCKER', 'Docker script not found', 'warn', this.instanceId);
-                resolve({ success: true, email, deployedApps: [] });
-                return;
-            }
-            
-            try {
-                fs.chmodSync(dockerScriptPath, 0o755);
-            } catch(e) {}
-            
-            const dockerProcess = spawn('bash', [dockerScriptPath], { 
-                detached: false,
-                stdio: ['ignore', 'pipe', 'pipe'],
-                env: { 
-                    ...process.env, 
-                    CLEVER_TOKEN: '',
-                    EMAIL: email,
-                    PASSWORD: password,
-                    DEPLOY_DIR: deployDir
-                }
-            });
-            
-            let deployedApps = [];
-            let oauthUrlDetected = false;
-            let deploymentCompleted = false;
-            let deploymentStarted = false;
-            
-            dockerProcess.stdout.on('data', async (data) => {
-                const output = data.toString();
-                console.log(`[DOCKER] ${output.trim()}`);
-                
-                if (!oauthUrlDetected && !this.oauthHandled) {
-                    const oauthMatch = output.match(/https:\/\/console\.clever-cloud\.com\/cli-oauth\?[^\s]+/);
-                    if (oauthMatch) {
-                        oauthUrlDetected = true;
-                        this.oauthHandled = true;
-                        log('OAUTH', 'OAuth URL detected, handling...', 'info', this.instanceId);
-                        await this.handleOAuth(oauthMatch[0], email, password);
-                    }
-                }
-                
-                const urlMatch = output.match(/https:\/\/[a-z0-9-]+\.osc-fr1\.scalingo\.io/);
-                if (urlMatch && !deployedApps.includes(urlMatch[0])) {
-                    deployedApps.push(urlMatch[0]);
-                    log('DOCKER', `App deployed: ${urlMatch[0]}`, 'success', this.instanceId);
-                }
-                
-                if (output.includes('Deploying') || output.includes('deployment started')) {
-                    deploymentStarted = true;
-                    log('DOCKER', 'Deployment started, waiting for completion...', 'info', this.instanceId);
-                }
-                
-                if (output.includes('All 3 apps deployed') || 
-                    output.includes('successfully deployed') || 
-                    output.includes('Deployment completed')) {
-                    deploymentCompleted = true;
-                    log('DOCKER', '✅ Deployment completed successfully!', 'success', this.instanceId);
-                    resolve({ success: true, email, deployedApps });
-                }
-                
-                if (output.includes('ERROR') && output.includes('Deployment failed')) {
-                    log('DOCKER', '❌ Deployment failed!', 'error', this.instanceId);
-                    resolve({ success: false, email, deployedApps });
-                }
-            });
-            
-            dockerProcess.stderr.on('data', (data) => {
-                const err = data.toString();
-                console.error(`[DOCKER ERR] ${err.trim()}`);
-            });
-            
-            dockerProcess.on('close', (code) => {
-                console.log(`[DOCKER] Process closed with code: ${code}`);
-                if (!deploymentCompleted) {
-                    if (deployedApps.length > 0) {
-                        log('DOCKER', `Deployment had ${deployedApps.length} apps, considering successful`, 'success', this.instanceId);
-                        resolve({ success: true, email, deployedApps });
-                    } else if (code === 0 && deploymentStarted) {
-                        log('DOCKER', 'Deployment process completed', 'success', this.instanceId);
-                        resolve({ success: true, email, deployedApps: [] });
-                    } else {
-                        log('DOCKER', 'Deployment may have issues, but continuing', 'warn', this.instanceId);
-                        resolve({ success: true, email, deployedApps: [] });
-                    }
-                }
-            });
-            
-            setTimeout(() => {
-                if (!deploymentCompleted) {
-                    log('DOCKER', '⚠️ Deployment timeout after 15 minutes, but continuing...', 'warn', this.instanceId);
-                    resolve({ success: true, email, deployedApps });
-                }
-            }, 900000);
-        });
-    }
+// Create public directory and index.html
+const publicDir = './public';
+if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir);
 
-    async cleanup() {
-        if (this.emailService) {
-            await this.emailService.cleanup();
-        }
-        if (this.browser) {
-            await this.browser.close();
-        }
-    }
-
-    async createSingleAccount() {
-        let browserInitialized = false;
-        
-        try {
-            await this.initBrowser();
-            browserInitialized = true;
-            
-            const accountEmail = await this.fetchTempEmail();
-            botStatus.accountEmail = accountEmail;
-            const dynamicPassword = accountEmail;
-            
-            await this.handleSignup(accountEmail, dynamicPassword);
-            const verifyLink = await this.getVerificationLink();
-            
-            log('VERIFY', 'Activating account...', 'info', this.instanceId);
-            await this.page.goto(verifyLink, { waitUntil: 'domcontentloaded' });
-            await sleep(5000);
-            
-            const result = await this.startDockerInBackground(accountEmail, dynamicPassword);
-            
-            if (db) {
-                await db.collection('accounts').insertOne({
-                    deploymentId: ENV.DEPLOYMENT_ID,
-                    deploymentName: ENV.DEPLOYMENT_NAME,
-                    email: accountEmail,
-                    password: dynamicPassword,
-                    deployedApps: result.deployedApps || [],
-                    createdAt: new Date(),
-                    instanceId: this.instanceId
-                });
-            }
-            
-            await sendMetricsToCentral({
-                email: accountEmail,
-                password: dynamicPassword,
-                deployedApps: result.deployedApps || [],
-                createdAt: new Date()
-            });
-            
-            botStatus.totalAccounts++;
-            log('SUCCESS', `✓ Account #${botStatus.totalAccounts}: ${accountEmail} created!`, 'success', this.instanceId);
-            
-            await this.cleanup();
-            return true;
-            
-        } catch (error) {
-            log('ERROR', `${error.message}`, 'error', this.instanceId);
-            if (browserInitialized) await this.cleanup();
-            return false;
-        }
-    }
-
-    async runLoop() {
-        log('START', '=== BOT STARTING ===', 'info', this.instanceId);
-        log('START', `Mode: ${ENV.CLI_RESTART_ENABLED ? 'Central Server (restart after each account)' : 'Worker (continuous creation)'}`, 'info', this.instanceId);
-        
-        if (ENV.CLI_RESTART_ENABLED) {
-            while (true) {
-                const success = await this.createSingleAccount();
-                log('RESTART', success ? 'Account created, restarting...' : 'Creation failed, restarting...', 'info', this.instanceId);
-                await sleep(2000);
-                process.exit(0);
-            }
-        } else {
-            while (true) {
-                try {
-                    log('LOOP', `Starting account #${botStatus.totalAccounts + 1}...`, 'info', this.instanceId);
-                    const success = await this.createSingleAccount();
-                    
-                    await logoutCleverCloud();
-                    await this.cleanup();
-                    this.browser = null;
-                    this.page = null;
-                    this.emailService = null;
-                    this.oauthHandled = false;
-                    
-                    await sleep(success ? 15000 : 30000);
-                } catch (error) {
-                    log('LOOP', `Error: ${error.message}`, 'error', this.instanceId);
-                    await sleep(30000);
-                }
-            }
-        }
-    }
-}
-
-// ============ DASHBOARD (Only on central server) ============
-if (ENV.IS_CENTRAL) {
-    app.get('/', async (req, res) => {
-        try {
-            await cleanupStaleDeployments();
-            
-            const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-            const bots = await db.collection('deployments')
-                .find({ lastHeartbeat: { $gt: fiveMinutesAgo } })
-                .sort({ lastHeartbeat: -1 })
-                .toArray();
-            
-            const uniqueBots = [];
-            const seenIds = new Set();
-            for (const bot of bots) {
-                if (!seenIds.has(bot.deploymentId)) {
-                    seenIds.add(bot.deploymentId);
-                    uniqueBots.push(bot);
-                }
-            }
-            
-            const totalAccounts = await db.collection('accounts').countDocuments();
-            
-            let botsHtml = '';
-            if (uniqueBots.length === 0) {
-                botsHtml = '<div class="bot-card" style="text-align:center; grid-column:1/-1;"><p>🤖 No active bots connected yet.</p></div>';
-            } else {
-                for (const bot of uniqueBots) {
-                    const botId = bot.deploymentId || 'unknown';
-                    const botName = bot.deploymentName || botId;
-                    const botAccounts = bot.totalAccounts || 0;
-                    const botLastAccount = bot.lastAccount || 'None';
-                    const botLastSeen = bot.lastHeartbeat ? new Date(bot.lastHeartbeat).toLocaleString() : 'Never';
-                    
-                    botsHtml += '<div class="bot-card">' +
-                        '<div><span class="bot-status status-active"></span><strong class="bot-name">' + escapeHtml(botName) + '</strong>' +
-                        (bot.deploymentId === ENV.DEPLOYMENT_ID ? '<span style="background:#667eea; color:white; padding:2px 8px; border-radius:12px; font-size:10px; margin-left:8px;">THIS SERVER</span>' : '') +
-                        '</div>' +
-                        '<div class="bot-detail">🆔 ID: ' + escapeHtml(botId.substring(0, 30)) + '...</div>' +
-                        '<div class="bot-detail">📊 Accounts: ' + botAccounts + '</div>' +
-                        '<div class="bot-detail">📧 Last: ' + escapeHtml(botLastAccount) + '</div>' +
-                        '<div class="bot-detail">⏱️ Last seen: ' + botLastSeen + '</div>' +
-                        '</div>';
-                }
-            }
-            
-            const html = `<!DOCTYPE html>
+const htmlContent = `
+<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Central Bot Dashboard</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <title>Social Network</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); font-family: 'Inter', sans-serif; padding: 40px 20px; }
-        .container { max-width: 1400px; margin: 0 auto; }
-        .header { text-align: center; margin-bottom: 40px; }
-        .header h1 { color: white; font-size: 2.5rem; margin-bottom: 10px; }
-        .header p { color: rgba(255,255,255,0.9); }
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 40px; }
-        .stat-card { background: white; border-radius: 15px; padding: 25px; }
-        .stat-value { font-size: 2.5rem; font-weight: bold; color: #667eea; }
-        .stat-label { color: #666; margin-top: 5px; }
-        .bots-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 20px; margin-bottom: 40px; }
-        .bot-card { background: white; border-radius: 15px; padding: 20px; }
-        .bot-status { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; background: #10b981; }
-        .bot-name { font-weight: 600; font-size: 1.1rem; }
-        .bot-detail { color: #666; font-size: 0.9rem; margin: 5px 0; }
-        .accounts-table { background: white; border-radius: 15px; padding: 20px; overflow-x: auto; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #eee; }
-        th { background: #f8f9fa; font-weight: 600; }
-        .refresh-btn { background: #667eea; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; margin-bottom: 20px; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .auth-container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 0 20px rgba(0,0,0,0.1); }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        input, textarea { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px; font-size: 14px; }
+        button { background: #667eea; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; width: 100%; }
+        button:hover { background: #5a67d8; }
+        .error { color: red; margin-top: 10px; }
+        .success { color: green; margin-top: 10px; }
+        .feed { display: grid; gap: 20px; }
+        .post { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .post-header { display: flex; align-items: center; margin-bottom: 15px; }
+        .avatar { width: 50px; height: 50px; border-radius: 50%; margin-right: 15px; background: #667eea; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; }
+        .post-content { margin-bottom: 15px; }
+        .post-actions { display: flex; gap: 15px; margin-top: 10px; }
+        .post-actions button { width: auto; padding: 5px 15px; }
+        .hidden { display: none; }
+        .navbar { background: white; padding: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); display: flex; justify-content: space-between; align-items: center; }
+        .nav-links { display: flex; gap: 20px; }
+        .nav-links a { text-decoration: none; color: #333; cursor: pointer; }
+        .create-post { background: white; border-radius: 10px; padding: 20px; margin-bottom: 20px; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>🤖 Central Bot Command Center</h1>
-            <p>Monitoring ${uniqueBots.length} active bot deployments • ${totalAccounts} total accounts created</p>
+    <div id="app">
+        <div class="container" id="authContainer">
+            <div class="auth-container">
+                <h2 id="authTitle">Login</h2>
+                <div id="authForm">
+                    <div class="form-group">
+                        <label>Email</label>
+                        <input type="email" id="email" placeholder="Enter email">
+                    </div>
+                    <div class="form-group">
+                        <label>Password</label>
+                        <input type="password" id="password" placeholder="Enter password">
+                    </div>
+                    <div id="registerFields" class="hidden">
+                        <div class="form-group">
+                            <label>Username</label>
+                            <input type="text" id="username" placeholder="Choose username">
+                        </div>
+                        <div class="form-group">
+                            <label>Full Name</label>
+                            <input type="text" id="fullName" placeholder="Your full name">
+                        </div>
+                    </div>
+                    <button onclick="handleAuth()" id="authButton">Login</button>
+                    <p style="margin-top: 15px; text-align: center;">
+                        <a href="#" onclick="toggleAuth()" id="toggleLink">Don't have an account? Register</a>
+                    </p>
+                    <div id="authMessage" class="error"></div>
+                </div>
+            </div>
         </div>
-        <div class="stats-grid">
-            <div class="stat-card"><div class="stat-value">${totalAccounts}</div><div class="stat-label">Total Accounts</div></div>
-            <div class="stat-card"><div class="stat-value">${uniqueBots.length}</div><div class="stat-label">Active Bots</div></div>
-            <div class="stat-card"><div class="stat-value">👑</div><div class="stat-label">Central Server</div></div>
-        </div>
-        <h2 style="color: white; margin-bottom: 20px;">📡 Connected Bot Deployments</h2>
-        <div class="bots-grid">${botsHtml}</div>
-        <h2 style="color: white; margin-bottom: 20px;">📝 Recent Accounts</h2>
-        <div class="accounts-table">
-            <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
-            <table id="accountsTable">
-                <thead>
-                    <tr><th>Bot</th><th>Email</th><th>Password</th><th>Apps</th><th>Created</th></tr>
-                </thead>
-                <tbody id="accountsBody">
-                    <tr><td colspan="5">Loading...</td></tr>
-                </tbody>
-            </table>
+        
+        <div id="mainApp" class="hidden">
+            <div class="navbar">
+                <h2>Social Network</h2>
+                <div class="nav-links">
+                    <a onclick="loadFeed()">Feed</a>
+                    <a onclick="loadExplore()">Explore</a>
+                    <a onclick="showProfile()">Profile</a>
+                    <a onclick="logout()">Logout</a>
+                </div>
+            </div>
+            <div class="container">
+                <div class="create-post">
+                    <textarea id="postContent" rows="3" placeholder="What's on your mind?" style="width: 100%;"></textarea>
+                    <input type="file" id="postImage" accept="image/*">
+                    <button onclick="createPost()" style="margin-top: 10px;">Post</button>
+                </div>
+                <div id="feed"></div>
+            </div>
         </div>
     </div>
+    
     <script>
-        async function loadAccounts() {
+        let token = localStorage.getItem('token');
+        let currentUser = null;
+        
+        if (token) {
+            showMainApp();
+            loadFeed();
+        }
+        
+        function toggleAuth() {
+            const isLogin = document.getElementById('authTitle').innerText === 'Login';
+            if (isLogin) {
+                document.getElementById('authTitle').innerText = 'Register';
+                document.getElementById('authButton').innerText = 'Register';
+                document.getElementById('toggleLink').innerHTML = 'Already have an account? Login';
+                document.getElementById('registerFields').classList.remove('hidden');
+            } else {
+                document.getElementById('authTitle').innerText = 'Login';
+                document.getElementById('authButton').innerText = 'Login';
+                document.getElementById('toggleLink').innerHTML = 'Don\'t have an account? Register';
+                document.getElementById('registerFields').classList.add('hidden');
+            }
+        }
+        
+        async function handleAuth() {
+            const isRegister = document.getElementById('authTitle').innerText === 'Register';
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            
             try {
-                const res = await fetch('/api/all-accounts');
-                const accounts = await res.json();
-                const tbody = document.getElementById('accountsBody');
-                if(!accounts || accounts.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="5">No accounts yet</td></tr>';
-                    return;
+                let response;
+                if (isRegister) {
+                    const username = document.getElementById('username').value;
+                    const fullName = document.getElementById('fullName').value;
+                    response = await fetch('/api/auth/register', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ email, password, username, fullName })
+                    });
+                } else {
+                    response = await fetch('/api/auth/login', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ email, password })
+                    });
                 }
-                let html = '';
-                for(let acc of accounts.slice(0, 50)) {
-                    html += '<tr>' +
-                        '<td>' + escapeHtml(acc.deploymentName || (acc.deploymentId ? acc.deploymentId.substring(0, 15) : 'Unknown')) + '</td>' +
-                        '<td>' + escapeHtml(acc.email) + '</td>' +
-                        '<td><code>' + escapeHtml(acc.password) + '</code></td>' +
-                        '<td>' + (acc.deployedApps ? acc.deployedApps.length : 0) + '</td>' +
-                        '<td>' + new Date(acc.createdAt).toLocaleString() + '</td>' +
-                    '</tr>';
+                
+                const data = await response.json();
+                if (response.ok) {
+                    token = data.token;
+                    currentUser = data.user;
+                    localStorage.setItem('token', token);
+                    showMainApp();
+                    loadFeed();
+                } else {
+                    document.getElementById('authMessage').innerText = data.error || 'Authentication failed';
                 }
-                tbody.innerHTML = html;
-            } catch(e) { console.error(e); }
+            } catch (error) {
+                document.getElementById('authMessage').innerText = 'Network error';
+            }
         }
-        function escapeHtml(text) {
-            if (!text) return '';
-            return String(text).replace(/[&<>]/g, function(m) {
-                if (m === '&') return '&amp;';
-                if (m === '<') return '&lt;';
-                if (m === '>') return '&gt;';
-                return m;
-            });
+        
+        function showMainApp() {
+            document.getElementById('authContainer').classList.add('hidden');
+            document.getElementById('mainApp').classList.remove('hidden');
         }
-        loadAccounts();
-        setInterval(loadAccounts, 10000);
-        setInterval(function() { location.reload(); }, 30000);
+        
+        async function loadFeed() {
+            try {
+                const response = await fetch('/api/feed', {
+                    headers: { 'Authorization': \`Bearer \${token}\` }
+                });
+                const data = await response.json();
+                displayPosts(data.posts);
+            } catch (error) {
+                console.error('Error loading feed:', error);
+            }
+        }
+        
+        async function loadExplore() {
+            try {
+                const response = await fetch('/api/explore', {
+                    headers: { 'Authorization': \`Bearer \${token}\` }
+                });
+                const data = await response.json();
+                displayPosts(data.trendingPosts);
+            } catch (error) {
+                console.error('Error loading explore:', error);
+            }
+        }
+        
+        function displayPosts(posts) {
+            const feedDiv = document.getElementById('feed');
+            if (!posts || posts.length === 0) {
+                feedDiv.innerHTML = '<p>No posts yet. Be the first to post!</p>';
+                return;
+            }
+            
+            feedDiv.innerHTML = posts.map(post => \`
+                <div class="post">
+                    <div class="post-header">
+                        <div class="avatar">\${post.user?.fullName?.charAt(0) || 'U'}</div>
+                        <div>
+                            <strong>\${post.user?.fullName || 'Unknown'}</strong><br>
+                            <small>@\${post.user?.username || 'user'}</small>
+                        </div>
+                    </div>
+                    <div class="post-content">\${post.content}</div>
+                    \${post.image ? \`<img src="\${post.image}" style="max-width: 100%; border-radius: 5px; margin-top: 10px;">\` : ''}
+                    <div class="post-actions">
+                        <button onclick="likePost('\${post._id}')">❤️ \${post.likes?.length || 0}</button>
+                        <button onclick="commentOnPost('\${post._id}')">💬 \${post.comments?.length || 0}</button>
+                    </div>
+                </div>
+            \`).join('');
+        }
+        
+        async function createPost() {
+            const content = document.getElementById('postContent').value;
+            const imageFile = document.getElementById('postImage').files[0];
+            
+            const formData = new FormData();
+            formData.append('content', content);
+            if (imageFile) formData.append('image', imageFile);
+            
+            try {
+                const response = await fetch('/api/posts', {
+                    method: 'POST',
+                    headers: { 'Authorization': \`Bearer \${token}\` },
+                    body: formData
+                });
+                
+                if (response.ok) {
+                    document.getElementById('postContent').value = '';
+                    document.getElementById('postImage').value = '';
+                    loadFeed();
+                }
+            } catch (error) {
+                console.error('Error creating post:', error);
+            }
+        }
+        
+        async function likePost(postId) {
+            try {
+                await fetch(\`/api/posts/\${postId}/like\`, {
+                    method: 'POST',
+                    headers: { 'Authorization': \`Bearer \${token}\` }
+                });
+                loadFeed();
+            } catch (error) {
+                console.error('Error liking post:', error);
+            }
+        }
+        
+        function commentOnPost(postId) {
+            const comment = prompt('Enter your comment:');
+            if (comment) {
+                fetch(\`/api/posts/\${postId}/comments\`, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': \`Bearer \${token}\`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ content: comment })
+                }).then(() => loadFeed());
+            }
+        }
+        
+        function showProfile() {
+            window.location.href = '/profile.html';
+        }
+        
+        function logout() {
+            localStorage.removeItem('token');
+            window.location.reload();
+        }
     </script>
 </body>
-</html>`;
-            
-            res.send(html);
-        } catch (error) {
-            console.error('Dashboard error:', error);
-            res.status(500).send('Dashboard error: ' + error.message);
-        }
-    });
-}
+</html>
+`;
 
-function escapeHtml(text) {
-    if (!text) return '';
-    return String(text).replace(/[&<>]/g, function(m) {
-        if (m === '&') return '&amp;';
-        if (m === '<') return '&lt;';
-        if (m === '>') return '&gt;';
-        return m;
-    });
-}
+fs.writeFileSync(path.join(publicDir, 'index.html'), htmlContent);
 
-// ============ START APPLICATION ============
-async function main() {
-    console.log(`\n🚀 Starting application...`);
-    
-    if (ENV.IS_CENTRAL) {
-        console.log(`📊 Dashboard: http://localhost:${port}`);
-        console.log(`🎯 Mode: CENTRAL SERVER (Dashboard + Bot Worker)`);
-        console.log(`   - Web server: ENABLED`);
-        console.log(`   - Account creation: ENABLED`);
-        console.log(`   - CLI Restart: ${ENV.CLI_RESTART_ENABLED ? 'ENABLED' : 'DISABLED'}`);
-    } else {
-        console.log(`🎯 Mode: BOT WORKER (Account Creator Only)`);
-        console.log(`   - Web server: DISABLED`);
-        console.log(`   - Account creation: ENABLED`);
-        console.log(`   - Running continuously: YES`);
-    }
-    console.log('');
-    
-    await connectMongoDB();
-    installCleverCLI();
-    
-    if (ENV.IS_CENTRAL) {
-        setupCentralEndpoints();
-        app.listen(port, '0.0.0.0', () => {
-            console.log(`✅ Central dashboard running on port ${port}`);
-        });
-    } else {
-        console.log(`✅ Bot worker started - no web server`);
-    }
-    
-    await registerWithCentral();
-    startHeartbeat();
-    
-    await sleep(2000);
-    
-    const bot = new CleverCloudBot(ENV.DEPLOYMENT_ID);
-    await bot.runLoop();
-}
+// Create uploads directory if not exists
+if (!fs.existsSync('./uploads')) fs.mkdirSync('./uploads');
 
-process.on('SIGINT', () => {
-    console.log('\n🛑 Shutting down...');
-    if (dbClient) dbClient.close();
-    process.exit(0);
+// Database connection and server start
+const PORT = process.env.PORT || 3000;
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/socialnetwork';
+
+mongoose.connect(MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+}).then(() => {
+  console.log('Connected to MongoDB');
+  server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}).catch(err => {
+  console.error('MongoDB connection error:', err);
+  process.exit(1);
 });
 
-process.on('SIGTERM', () => {
-    console.log('\n🛑 Shutting down...');
-    if (dbClient) dbClient.close();
-    process.exit(0);
+// Error handling
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err);
+  process.exit(1);
 });
-
-main().catch(console.error);
