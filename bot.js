@@ -5,7 +5,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ============ CONFIGURATION ============
-const API_URL = "https://api.paradice.in/api.php";  // This IS a GraphQL endpoint!
+const API_URL = "https://api.paradice.in/api.php";
 const API_KEY = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJwYXJhZGljZS5pbiIsImF1ZCI6InBhcmFkaWNlLmluIiwiaWF0IjoxNzgxMDc0MTk3LCJuYmYiOjE3ODEwNzQxOTcsImRhdGEiOnsiaWQiOiIzMjc1NzIiLCJsb2dpbiI6IndlYndlYjg4ODgiLCJrZXkiOiJQZ0Z4WUhnMkk2bFpRVVM2aU1MUVRjaWxTaTFqMjR6TyJ9fQ.xX9ZnJlxNF8PIPFuhUHasX7LM9EyIClBzqO0sTN_2RljA6plqjVGG0dwkkxv88NlrvVY4t1guKUuLHGH8rPDCpZiX6RfpBRx_5dqBijcQBi0HY_ZmfR_oNH8wSs9Fft6iABBVbpUWc2vmpTvxeu47rFEZDidXDFcMKrXsNPSWGbigGpVmxfxqWKd9iDINhIpi_fV7RJeGiSyDpd-dwZaagMXZhyrAYX7erTM93h91eogyNaGmPI_4HkDeZf_2HRLhOQqM4DC29pe-oQBiRM4aRNpoz59MOi6_HNNtd1K0m4Um4IEJPLLHj4sespPRdQjc9l8K44pkejkALsOxve0NA";
 
 const DEFAULTS = {
@@ -105,7 +105,6 @@ async function graphqlRequest(query, variables = {}) {
         console.error("Request Error:", error.message);
         if (error.response) {
             console.error("Response status:", error.response.status);
-            console.error("Response data:", error.response.data);
         }
         return null;
     }
@@ -186,7 +185,7 @@ async function placeBet() {
 // ============ MAIN STRATEGY ============
 async function runStrategy() {
     console.log("Starting bot with API URL:", API_URL);
-    botState.statusMessage = "Linear Recovery Mode (80% Profit Lock) - api.php GraphQL";
+    botState.statusMessage = "Linear Recovery Mode (80% Profit Lock) - Paradice.in";
     
     // Initial balance fetch
     botState.stats.currentBalance = await getCurrentBalance();
@@ -283,11 +282,12 @@ app.get('/api/stats', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    res.send(`
+    const html = `
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Dice Bot | Paradice.in</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -327,7 +327,9 @@ app.get('/', (req, res) => {
         </div>
         <h3>Recent Bets</h3>
         <table>
-            <thead><tr><th>#</th><th>Wager</th><th>Roll</th><th>Profit</th><th>Pot</th></tr></thead>
+            <thead>
+                <tr><th>#</th><th>Wager</th><th>Roll</th><th>Profit</th><th>Pot</th></tr>
+            </thead>
             <tbody id="betTable"></tbody>
         </table>
     </div>
@@ -351,19 +353,33 @@ app.get('/', (req, res) => {
                 document.getElementById('totalBets').innerHTML = s.stats.totalBets;
                 document.getElementById('uptime').innerHTML = data.hoursPassed + 'h';
                 
-                document.getElementById('betTable').innerHTML = s.betHistory.map(b => 
-                    `<tr><td>#${b.id}</td><td>${b.bet.toFixed(8)}</td><td>${b.roll}</td><td class="${b.isWin?'win':'loss'}">${b.profit > 0 ? '+' : ''}${b.profit.toFixed(8)}</td><td>${b.pot}</td></tr>`
-                ).join('');
+                let tableHtml = '';
+                for (let i = 0; i < s.betHistory.length; i++) {
+                    const b = s.betHistory[i];
+                    const profitClass = b.isWin ? 'win' : 'loss';
+                    const profitSign = b.profit > 0 ? '+' : '';
+                    tableHtml += '<tr>' +
+                        '<td>#' + b.id + '</td>' +
+                        '<td>' + b.bet.toFixed(8) + '</td>' +
+                        '<td>' + b.roll + '</td>' +
+                        '<td class="' + profitClass + '">' + profitSign + b.profit.toFixed(8) + '</td>' +
+                        '<td>' + b.pot + '</td>' +
+                        '</tr>';
+                }
+                document.getElementById('betTable').innerHTML = tableHtml;
             } catch(e) { console.error(e); }
         }
         setInterval(update, 1000);
     </script>
 </body>
 </html>
-    `);
+    `;
+    res.send(html);
 });
 
+// Make sure to bind to 0.0.0.0 for Scalingo
 app.listen(port, '0.0.0.0', () => {
-    console.log(`Web dashboard: http://localhost:${port}`);
+    console.log(`Server running on port ${port}`);
+    console.log(`Web dashboard available at http://localhost:${port}`);
     runStrategy();
 });
