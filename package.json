@@ -1,23 +1,35 @@
 {
-  "name": "martingale-doge-bot",
+  "name": "pancakeswap-arbitrage-bot",
   "version": "1.0.0",
-  "description": "Martingale DOGE trading bot with AI advisor",
+  "description": "Automated arbitrage bot for PancakeSwap on BNB Smart Chain",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "dev": "nodemon bot.js"
+    "dev": "nodemon bot.js",
+    "test": "node test.js"
   },
-  "keywords": ["trading", "martingale", "crypto", "doge", "htx"],
-  "author": "",
+  "keywords": [
+    "pancakeswap",
+    "arbitrage",
+    "defi",
+    "bsc",
+    "trading-bot",
+    "flash-loan",
+    "mev"
+  ],
+  "author": "Your Name",
   "license": "MIT",
   "dependencies": {
-    "dotenv": "^16.3.1",
-    "express": "^4.18.2",
     "axios": "^1.6.2",
-    "ws": "^8.14.2",
-    "socket.io": "^4.5.4"
+    "dotenv": "^16.3.1",
+    "ethers": "^5.7.2",
+    "winston": "^3.11.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=16.0.0",
+    "npm": ">=8.0.0"
   }
 }
