@@ -4,7 +4,6 @@ const crypto = require('crypto');
 const axios = require('axios');
 const WebSocket = require('ws');
 const zlib = require('zlib');
-const talib = require('talib-binding');
 
 const app = express();
 app.use(express.json());
@@ -76,7 +75,14 @@ let market = {
         volume: 0,
         trend: 'NEUTRAL',
         support: 0,
-        resistance: 0
+        resistance: 0,
+        atr: 0,
+        stochK: 50,
+        stochD: 50,
+        mfi: 50,
+        adx: 20,
+        willr: 0,
+        cci: 0
     }
 };
 
@@ -89,7 +95,7 @@ let aiRecommendations = {
     short: { recommendation: 'HOLD: Waiting for AI analysis...', confidence: 0, lastUpdate: null, action: 'HOLD', indicators: {} }
 };
 
-// ==================== TA-LIB INDICATORS ====================
+// ==================== CUSTOM TECHNICAL INDICATORS (No TA-Lib required) ====================
 
 async function fetchOHLCV() {
     try {
@@ -114,6 +120,152 @@ async function fetchOHLCV() {
     }
 }
 
+function calculateEMA(data, period) {
+    const k = 2 / (period + 1);
+    let ema = data[0];
+    for (let i = 1; i < data.length; i++) {
+        ema = data[i] * k + ema * (1 - k);
+    }
+    return ema;
+}
+
+function calculateRSI(closes, period = 14) {
+    let gains = 0;
+    let losses = 0;
+    
+    for (let i = 1; i <= period; i++) {
+        const change = closes[closes.length - i] - closes[closes.length - i - 1];
+        if (change >= 0) {
+            gains += change;
+        } else {
+            losses -= change;
+        }
+    }
+    
+    const avgGain = gains / period;
+    const avgLoss = losses / period;
+    
+    if (avgLoss === 0) return 100;
+    const rs = avgGain / avgLoss;
+    return 100 - (100 / (1 + rs));
+}
+
+function calculateMACD(closes) {
+    const ema12 = calculateEMA(closes.slice(-26), 12);
+    const ema26 = calculateEMA(closes.slice(-26), 26);
+    const macdLine = ema12 - ema26;
+    
+    const macdHistory = [];
+    for (let i = 0; i < closes.length - 26; i++) {
+        const e12 = calculateEMA(closes.slice(i, i + 26), 12);
+        const e26 = calculateEMA(closes.slice(i, i + 26), 26);
+        macdHistory.push(e12 - e26);
+    }
+    
+    const signalLine = calculateEMA(macdHistory, 9);
+    const histogram = macdLine - signalLine;
+    
+    return { macd: macdLine, signal: signalLine, histogram: histogram };
+}
+
+function calculateBB(closes, period = 20, stdDev = 2) {
+    const lastCloses = closes.slice(-period);
+    const sma = lastCloses.reduce((a, b) => a + b, 0) / period;
+    
+    const squaredDiffs = lastCloses.map(price => Math.pow(price - sma, 2));
+    const variance = squaredDiffs.reduce((a, b) => a + b, 0) / period;
+    const std = Math.sqrt(variance);
+    
+    return {
+        upper: sma + (stdDev * std),
+        middle: sma,
+        lower: sma - (stdDev * std)
+    };
+}
+
+function calculateStochastic(highs, lows, closes, period = 14, smoothK = 3, smoothD = 3) {
+    const lastHighs = highs.slice(-period);
+    const lastLows = lows.slice(-period);
+    const lastClose = closes[closes.length - 1];
+    
+    const highestHigh = Math.max(...lastHighs);
+    const lowestLow = Math.min(...lastLows);
+    
+    const k = ((lastClose - lowestLow) / (highestHigh - lowestLow)) * 100;
+    return { k, d: k };
+}
+
+function calculateATR(highs, lows, closes, period = 14) {
+    const trValues = [];
+    for (let i = 1; i < highs.length; i++) {
+        const hl = highs[i] - lows[i];
+        const hc = Math.abs(highs[i] - closes[i - 1]);
+        const lc = Math.abs(lows[i] - closes[i - 1]);
+        trValues.push(Math.max(hl, hc, lc));
+    }
+    
+    const recentTR = trValues.slice(-period);
+    return recentTR.reduce((a, b) => a + b, 0) / period;
+}
+
+function calculateMFI(highs, lows, closes, volumes, period = 14) {
+    let positiveFlow = 0;
+    let negativeFlow = 0;
+    
+    for (let i = 1; i <= period; i++) {
+        const typicalPrice = (highs[highs.length - i] + lows[highs.length - i] + closes[closes.length - i]) / 3;
+        const prevTypicalPrice = (highs[highs.length - i - 1] + lows[highs.length - i - 1] + closes[closes.length - i - 1]) / 3;
+        const rawMoneyFlow = typicalPrice * volumes[volumes.length - i];
+        
+        if (typicalPrice > prevTypicalPrice) {
+            positiveFlow += rawMoneyFlow;
+        } else {
+            negativeFlow += rawMoneyFlow;
+        }
+    }
+    
+    const moneyRatio = positiveFlow / negativeFlow;
+    return 100 - (100 / (1 + moneyRatio));
+}
+
+function calculateADX(highs, lows, closes, period = 14) {
+    const plusDM = [];
+    const minusDM = [];
+    const tr = [];
+    
+    for (let i = 1; i < highs.length; i++) {
+        const highDiff = highs[i] - highs[i - 1];
+        const lowDiff = lows[i - 1] - lows[i];
+        
+        plusDM.push(highDiff > lowDiff && highDiff > 0 ? highDiff : 0);
+        minusDM.push(lowDiff > highDiff && lowDiff > 0 ? lowDiff : 0);
+        
+        const hl = highs[i] - lows[i];
+        const hc = Math.abs(highs[i] - closes[i - 1]);
+        const lc = Math.abs(lows[i] - closes[i - 1]);
+        tr.push(Math.max(hl, hc, lc));
+    }
+    
+    const atr = tr.slice(-period).reduce((a, b) => a + b, 0) / period;
+    const plusDI = (plusDM.slice(-period).reduce((a, b) => a + b, 0) / period) / atr * 100;
+    const minusDI = (minusDM.slice(-period).reduce((a, b) => a + b, 0) / period) / atr * 100;
+    const dx = Math.abs(plusDI - minusDI) / (plusDI + minusDI) * 100;
+    
+    return dx;
+}
+
+function calculateCCI(highs, lows, closes, period = 14) {
+    const tp = [];
+    for (let i = 0; i < highs.length; i++) {
+        tp.push((highs[i] + lows[i] + closes[i]) / 3);
+    }
+    
+    const sma = tp.slice(-period).reduce((a, b) => a + b, 0) / period;
+    const meanDev = tp.slice(-period).reduce((a, b) => a + Math.abs(b - sma), 0) / period;
+    
+    return (tp[tp.length - 1] - sma) / (0.015 * meanDev);
+}
+
 function calculateIndicators() {
     if (market.ohlcv.length < 50) return;
     
@@ -124,35 +276,52 @@ function calculateIndicators() {
     
     try {
         // RSI
-        const rsi = talib.RSI(closes, 14);
-        market.indicators.rsi = rsi[rsi.length - 1];
+        market.indicators.rsi = calculateRSI(closes, 14);
         
         // MACD
-        const macd = talib.MACD(closes, 12, 26, 9);
-        market.indicators.macd = {
-            macd: macd.macd[macd.macd.length - 1],
-            signal: macd.macdSignal[macd.macdSignal.length - 1],
-            histogram: macd.macdHist[macd.macdHist.length - 1]
-        };
+        const macd = calculateMACD(closes);
+        market.indicators.macd = macd;
         
         // Bollinger Bands
-        const bb = talib.BBANDS(closes, 20, 2, 2);
-        market.indicators.bb = {
-            upper: bb.upperBand[bb.upperBand.length - 1],
-            middle: bb.middleBand[bb.middleBand.length - 1],
-            lower: bb.lowerBand[bb.lowerBand.length - 1]
-        };
+        const bb = calculateBB(closes, 20, 2);
+        market.indicators.bb = bb;
         
         // EMAs
-        const ema20 = talib.EMA(closes, 20);
-        const ema50 = talib.EMA(closes, 50);
-        market.indicators.ema20 = ema20[ema20.length - 1];
-        market.indicators.ema50 = ema50[ema50.length - 1];
+        market.indicators.ema20 = calculateEMA(closes.slice(-20), 20);
+        market.indicators.ema50 = calculateEMA(closes.slice(-50), 50);
         
         // Volume
         market.indicators.volume = volumes[volumes.length - 1];
         const avgVolume = volumes.slice(-20).reduce((a, b) => a + b, 0) / 20;
         market.indicators.volumeRatio = market.indicators.volume / avgVolume;
+        
+        // Support and Resistance
+        const recentHighs = highs.slice(-20);
+        const recentLows = lows.slice(-20);
+        market.indicators.resistance = Math.max(...recentHighs);
+        market.indicators.support = Math.min(...recentLows);
+        
+        // ATR
+        market.indicators.atr = calculateATR(highs, lows, closes, 14);
+        
+        // Stochastic
+        const stoch = calculateStochastic(highs, lows, closes, 14, 3, 3);
+        market.indicators.stochK = stoch.k;
+        market.indicators.stochD = stoch.d;
+        
+        // MFI
+        market.indicators.mfi = calculateMFI(highs, lows, closes, volumes, 14);
+        
+        // ADX
+        market.indicators.adx = calculateADX(highs, lows, closes, 14);
+        
+        // Williams %R
+        const highestHigh = Math.max(...highs.slice(-14));
+        const lowestLow = Math.min(...lows.slice(-14));
+        market.indicators.willr = ((highestHigh - closes[closes.length - 1]) / (highestHigh - lowestLow)) * -100;
+        
+        // CCI
+        market.indicators.cci = calculateCCI(highs, lows, closes, 14);
         
         // Trend detection
         if (market.indicators.ema20 > market.indicators.ema50 && 
@@ -167,37 +336,6 @@ function calculateIndicators() {
             market.indicators.trend = 'NEUTRAL';
         }
         
-        // Support and Resistance (using pivot points)
-        const recentHighs = highs.slice(-20);
-        const recentLows = lows.slice(-20);
-        market.indicators.resistance = Math.max(...recentHighs);
-        market.indicators.support = Math.min(...recentLows);
-        
-        // ATR for volatility
-        const atr = talib.ATR(highs, lows, closes, 14);
-        market.indicators.atr = atr[atr.length - 1];
-        
-        // Stochastic
-        const stoch = talib.STOCH(highs, lows, closes, 14, 3, 3);
-        market.indicators.stochK = stoch.slowK[stoch.slowK.length - 1];
-        market.indicators.stochD = stoch.slowD[stoch.slowD.length - 1];
-        
-        // MFI
-        const mfi = talib.MFI(highs, lows, closes, volumes, 14);
-        market.indicators.mfi = mfi[mfi.length - 1];
-        
-        // ADX for trend strength
-        const adx = talib.ADX(highs, lows, closes, 14);
-        market.indicators.adx = adx[adx.length - 1];
-        
-        // Williams %R
-        const willr = talib.WILLR(highs, lows, closes, 14);
-        market.indicators.willr = willr[willr.length - 1];
-        
-        // CCI
-        const cci = talib.CCI(highs, lows, closes, 14);
-        market.indicators.cci = cci[cci.length - 1];
-        
     } catch (error) {
         console.error('Indicator calculation error:', error.message);
     }
@@ -207,7 +345,7 @@ function getIndicatorSummary() {
     const ind = market.indicators;
     return {
         rsi: ind.rsi.toFixed(1),
-        rsi_status: ind.rsi > 70 ? 'OVERSOLD' : (ind.rsi < 30 ? 'OVERBOUGHT' : 'NEUTRAL'),
+        rsi_status: ind.rsi > 70 ? 'OVERBOUGHT' : (ind.rsi < 30 ? 'OVERSOLD' : 'NEUTRAL'),
         macd: ind.macd.macd.toFixed(4),
         macd_signal: ind.macd.signal.toFixed(4),
         macd_histogram: ind.macd.histogram.toFixed(4),
@@ -217,21 +355,21 @@ function getIndicatorSummary() {
         ema20: ind.ema20.toFixed(8),
         ema50: ind.ema50.toFixed(8),
         ema_trend: ind.ema20 > ind.ema50 ? 'BULLISH' : 'BEARISH',
-        volume_ratio: ind.volumeRatio.toFixed(2),
+        volume_ratio: (ind.volumeRatio || 1).toFixed(2),
         trend: ind.trend,
         support: ind.support.toFixed(8),
         resistance: ind.resistance.toFixed(8),
         atr: ind.atr.toFixed(8),
         atr_percent: ((ind.atr / market.bid) * 100).toFixed(2),
-        stoch_k: ind.stochK.toFixed(1),
-        stoch_d: ind.stochD.toFixed(1),
+        stoch_k: (ind.stochK || 50).toFixed(1),
+        stoch_d: (ind.stochD || 50).toFixed(1),
         stoch_status: ind.stochK > 80 ? 'OVERBOUGHT' : (ind.stochK < 20 ? 'OVERSOLD' : 'NEUTRAL'),
-        mfi: ind.mfi.toFixed(1),
+        mfi: (ind.mfi || 50).toFixed(1),
         mfi_status: ind.mfi > 80 ? 'OVERBOUGHT' : (ind.mfi < 20 ? 'OVERSOLD' : 'NEUTRAL'),
-        adx: ind.adx.toFixed(1),
+        adx: (ind.adx || 20).toFixed(1),
         adx_status: ind.adx > 25 ? 'STRONG_TREND' : (ind.adx > 20 ? 'WEAK_TREND' : 'RANGING'),
-        willr: ind.willr.toFixed(1),
-        cci: ind.cci.toFixed(1)
+        willr: (ind.willr || 0).toFixed(1),
+        cci: (ind.cci || 0).toFixed(1)
     };
 }
 
@@ -292,15 +430,6 @@ function calculateStepFromVolume(volume, baseVolume, multiplier) {
     }
     
     return step;
-}
-
-function calculateVolumeForStep(step, baseVolume, multiplier) {
-    let totalVolume = 0;
-    for (let i = 0; i <= step; i++) {
-        const stepVolume = i === 0 ? baseVolume : Math.ceil(baseVolume * Math.pow(multiplier, i));
-        totalVolume += stepVolume;
-    }
-    return totalVolume;
 }
 
 function calculateTargetPrice(state) {
@@ -492,6 +621,8 @@ async function syncAccount(acc, state) {
                 
                 if (state.roiLatencyHistory.length > 10) state.roiLatencyHistory.pop();
                 
+                console.log(`[${state.direction.toUpperCase()}] ROI: ${newExchangeRoi.toFixed(2)}% | Vol: ${newVolume} | Step: ${calculatedStep}`);
+                
                 state.roi = newExchangeRoi;
                 state.lastExchangeRoi = newExchangeRoi;
                 state.lastRoiUpdateTime = now;
@@ -535,13 +666,6 @@ async function syncAccount(acc, state) {
         if (state.initialEquity === null) {
             state.initialEquity = state.currentEquity;
         }
-        
-        if (oldEquity > 0 && Math.abs(state.currentEquity - oldEquity) > 0.000001) {
-            const change = state.currentEquity - oldEquity;
-            if (Math.abs(change) > 0.0001) {
-                console.log(`[${state.direction.toUpperCase()}] Equity: $${oldEquity.toFixed(8)} → $${state.currentEquity.toFixed(8)}`);
-            }
-        }
     }
 }
 
@@ -560,18 +684,15 @@ async function getAIRecommendation(direction, state, marketData) {
 TECHNICAL INDICATORS:
 - RSI(14): ${indicators.rsi} (${indicators.rsi_status})
 - MACD: ${indicators.macd_histogram} (${indicators.macd_status})
-- EMA Trend: 20=${indicators.ema20.toFixed(6)} | 50=${indicators.ema50.toFixed(6)} (${indicators.ema_trend})
+- EMA Trend: 20 EMA ${indicators.ema_trend} vs 50 EMA
 - Bollinger Bands: Price is ${indicators.price_vs_bb}
 - Volume Ratio: ${indicators.volume_ratio}x average
 - Overall Trend: ${indicators.trend}
 - Trend Strength: ${trendStrength}/10
 - Support: ${indicators.support} | Resistance: ${indicators.resistance}
 - ATR (Volatility): ${indicators.atr_percent}%
-- Stochastic: K=${indicators.stoch_k} | D=${indicators.stoch_d} (${indicators.stoch_status})
-- MFI: ${indicators.mfi} (${indicators.mfi_status})
+- Stochastic: K=${indicators.stoch_k} (${indicators.stoch_status})
 - ADX: ${indicators.adx} (${indicators.adx_status})
-- Williams %R: ${indicators.willr}
-- CCI: ${indicators.cci}
 
 POSITION DATA:
 - Current ROI: ${state.roi.toFixed(2)}%
@@ -579,29 +700,13 @@ POSITION DATA:
 - Entry Price: ${state.entryPrice.toFixed(8)}
 - Current Price: $${direction === 'buy' ? market.bid : market.ask}
 
-RULES FOR RECOMMENDATION:
-1. OPEN POSITION (if volume = 0 AND spread < ${config.maxStartSpread}%):
-   - Strong trend (ADX > 25) AND momentum agrees (MACD positive for long, negative for short)
-   - RSI not extreme (>70 or <30)
-   - Volume above average (>1x)
+RULES - Respond with EXACTLY ONE of these:
+- "OPEN POSITION: Start new ${direction} position with ${market.currentBaseVolume} contracts"
+- "STEP UP: Add ${nextStepVolume} contracts (martingale)"
+- "CLOSE POSITION: Take profit/loss now"
+- "HOLD: No action needed"
 
-2. STEP UP (if ROI <= -${config.stepDistancePct}%):
-   - Only if trend supports reversal (ADX > 20)
-   - Not recommended if ADX > 40 (trend too strong against you)
-
-3. CLOSE POSITION (if ROI >= ${config.takeProfitPct}% OR indicators show reversal):
-   - Take profit at target OR
-   - Indicators turning against position (RSI extreme, MACD crossover, BB breach)
-
-4. HOLD: All other cases
-
-Respond with EXACTLY ONE of these formats:
-- "OPEN POSITION: Start new ${direction} position with ${market.currentBaseVolume} contracts [reason: brief]"
-- "STEP UP: Add ${nextStepVolume} contracts [reason: brief]"
-- "CLOSE POSITION: Take profit/loss now [reason: brief]"
-- "HOLD: No action needed [reason: brief]"
-
-Keep reason very short (max 10 words).`;
+Keep response short and only use these exact formats.`;
 
         const response = await axios.post(`${config.ollamaUrl}/api/generate`, {
             model: config.ollamaModel,
@@ -610,13 +715,12 @@ Keep reason very short (max 10 words).`;
             options: {
                 temperature: 0.2,
                 top_p: 0.9,
-                num_predict: 100
+                num_predict: 80
             }
         });
 
         let recommendation = response.data.response.trim();
         
-        // Extract main action
         let action = 'HOLD';
         if (recommendation.includes('OPEN POSITION')) action = 'OPEN POSITION';
         else if (recommendation.includes('STEP UP')) action = 'STEP UP';
@@ -632,7 +736,6 @@ Keep reason very short (max 10 words).`;
 
 async function updateAIRecommendations() {
     try {
-        // Fetch latest OHLCV and indicators
         await fetchOHLCV();
         
         const longState = accountStates[1];
@@ -642,14 +745,11 @@ async function updateAIRecommendations() {
         
         const marketData = {
             totalEquity: totalEquity,
-            longRoi: longState?.roi || 0,
-            shortRoi: shortState?.roi || 0,
             spread: market.spread,
             bid: market.bid,
             ask: market.ask
         };
         
-        // Get recommendations for both positions
         const [longResult, shortResult] = await Promise.all([
             getAIRecommendation('long', longState, marketData),
             getAIRecommendation('short', shortState, marketData)
@@ -672,11 +772,10 @@ async function updateAIRecommendations() {
         };
         
         console.log(`\n🤖 AI RECOMMENDATIONS (${new Date().toLocaleTimeString()}):`);
-        console.log(`   📊 Indicators: RSI=${market.indicators.rsi.toFixed(1)} | Trend=${market.indicators.trend} | ADX=${market.indicators.adx.toFixed(1)}`);
+        console.log(`   📊 RSI=${market.indicators.rsi.toFixed(1)} | Trend=${market.indicators.trend} | ADX=${market.indicators.adx.toFixed(1)}`);
         console.log(`   LONG: ${longResult.full}`);
         console.log(`   SHORT: ${shortResult.full}\n`);
         
-        // Execute AI recommendations
         await executeAIRecommendation('long', longResult.action, longState, 1);
         await executeAIRecommendation('short', shortResult.action, shortState, 2);
         
@@ -689,7 +788,6 @@ async function executeAIRecommendation(direction, action, state, accountId) {
     const acc = config.accounts.find(a => a.accountId === accountId);
     if (!acc || state.isLocked) return;
     
-    // STEP UP action
     if (action === 'STEP UP') {
         if (state.volume > 0 && state.roi <= -config.stepDistancePct) {
             const currentStep = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
@@ -710,18 +808,14 @@ async function executeAIRecommendation(direction, action, state, accountId) {
             
             if (res?.status === 'ok') {
                 state.pendingOrderId = res.data?.order_id_str;
-                console.log(`✅ AI STEP UP executed for ${direction}`);
-            } else {
-                console.error(`❌ AI STEP UP failed`);
-                state.lastAction = `❌ AI STEP UP Failed`;
+                console.log(`✅ AI STEP UP executed`);
             }
             setTimeout(() => { state.isLocked = false; }, 2000);
         }
     }
-    // CLOSE POSITION action
     else if (action === 'CLOSE POSITION') {
         if (state.volume > 0) {
-            console.log(`🤖 AI EXECUTING CLOSE POSITION: Closing ${state.volume} contracts ${direction}`);
+            console.log(`🤖 AI EXECUTING CLOSE POSITION`);
             state.isLocked = true;
             state.lastAction = `🤖 AI: CLOSE POSITION`;
             
@@ -736,7 +830,7 @@ async function executeAIRecommendation(direction, action, state, accountId) {
             
             if (res?.status === 'ok') {
                 state.pendingOrderId = res.data?.order_id_str;
-                console.log(`✅ AI CLOSE POSITION executed for ${direction}`);
+                console.log(`✅ AI CLOSE POSITION executed`);
                 
                 const finalRoi = state.roi;
                 const finalPnl = state.unrealizedUsdt;
@@ -747,22 +841,15 @@ async function executeAIRecommendation(direction, action, state, accountId) {
                 state.roi = 0;
                 state.unrealizedUsdt = 0;
                 state.entryPrice = 0;
-                state.lastStepPrice = 0;
                 state.startTime = null;
-                state.lastAddedVolume = 0;
                 state.targetPrice = 0;
-                state.aiActionTaken = false;
-            } else {
-                console.error(`❌ AI CLOSE POSITION failed`);
-                state.lastAction = `❌ AI CLOSE Failed`;
             }
             setTimeout(() => { state.isLocked = false; }, 2000);
         }
     }
-    // OPEN POSITION action
     else if (action === 'OPEN POSITION') {
         if (state.volume === 0 && market.spread <= config.maxStartSpread) {
-            console.log(`🤖 AI EXECUTING OPEN POSITION: Opening ${market.currentBaseVolume} contracts ${direction}`);
+            console.log(`🤖 AI EXECUTING OPEN POSITION`);
             state.isLocked = true;
             state.lastAction = `🤖 AI: OPEN POSITION`;
             
@@ -777,7 +864,7 @@ async function executeAIRecommendation(direction, action, state, accountId) {
             
             if (res?.status === 'ok' && res.data?.order_id_str) {
                 state.pendingOrderId = res.data.order_id_str;
-                console.log(`✅ AI OPEN POSITION executed for ${direction}`);
+                console.log(`✅ AI OPEN POSITION executed`);
                 
                 setTimeout(async () => {
                     const orderInfo = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order_info', {
@@ -788,14 +875,11 @@ async function executeAIRecommendation(direction, action, state, accountId) {
                     if (orderInfo?.data?.[0]?.status === 6) {
                         state.entryPrice = parseFloat(orderInfo.data[0].price_avg);
                         state.targetPrice = calculateTargetPrice(state);
-                        console.log(`✅ Position opened at ${state.entryPrice.toFixed(8)}`);
                         state.isLocked = false;
                     }
                 }, 2000);
             } else {
                 state.isLocked = false;
-                state.lastAction = `❌ AI OPEN Failed`;
-                console.error(`❌ AI OPEN POSITION failed`);
             }
         }
     }
@@ -814,7 +898,7 @@ function logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl) {
     market.totalFeesPaid += estimatedFee;
     
     tradeHistory.unshift({
-        symbol: config.symbol.replace('-', '') + 'Perpetual',
+        symbol: config.symbol,
         side: state.direction === 'buy' ? 'LONG' : 'SHORT',
         openTime: state.startTime,
         closeTime: exitTime,
@@ -825,8 +909,7 @@ function logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl) {
         roi: finalRoi.toFixed(2) + '%',
         netPnlUsdt: finalPnl.toFixed(8),
         estimatedFee: estimatedFee.toFixed(8),
-        aiRecommendation: state.direction === 'buy' ? aiRecommendations.long.recommendation : aiRecommendations.short.recommendation,
-        indicatorsAtClose: getIndicatorSummary()
+        aiRecommendation: state.direction === 'buy' ? aiRecommendations.long.recommendation : aiRecommendations.short.recommendation
     });
     
     if (tradeHistory.length > 20) tradeHistory.pop();
@@ -883,7 +966,7 @@ async function processMartingale() {
             state.lastAction = `🤖 ${aiRec.action} | ROI: ${state.roi.toFixed(2)}% | Step ${currentStep}`;
         } else {
             const aiRec = state.direction === 'buy' ? aiRecommendations.long : aiRecommendations.short;
-            state.lastAction = `🤖 ${aiRec.action} | No position | RSI: ${market.indicators.rsi.toFixed(1)}`;
+            state.lastAction = `🤖 ${aiRec.action} | RSI: ${market.indicators.rsi.toFixed(1)}`;
         }
     }
 }
@@ -913,15 +996,12 @@ async function backgroundLoop() {
                 
                 market.totalNetGain = totalEquity - market.initialTotalEquity;
                 market.growthPct = (market.totalNetGain / market.initialTotalEquity) * 100;
-                const elapsedHours = (Date.now() - market.startTime) / (1000 * 60 * 60);
-                market.dgr = elapsedHours > 0 ? (market.growthPct / elapsedHours) : 0;
                 
                 if (config.autoCompound && market.bid > 0) {
                     const newBaseVolume = calculateBaseVolumeFromWallet(totalEquity, market.bid);
                     if (newBaseVolume !== market.currentBaseVolume) {
                         console.log(`📈 AUTO-COMPOUND: ${market.currentBaseVolume} → ${newBaseVolume} contracts`);
                         market.currentBaseVolume = newBaseVolume;
-                        market.lastBaseUpdate = Date.now();
                     }
                 }
                 
@@ -929,7 +1009,6 @@ async function backgroundLoop() {
             }
         }
         
-        // Update AI recommendations and indicators every 15 seconds
         if (Date.now() - market.lastAiCheck > 15000) {
             market.lastAiCheck = Date.now();
             await updateAIRecommendations();
@@ -964,8 +1043,6 @@ app.get('/api/status', (req, res) => {
             winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0,
             walletHistory: market.walletHistory.slice(-20),
             currentBaseVolume: market.currentBaseVolume,
-            currentBaseShib: market.currentBaseShib,
-            currentRiskAmount: market.currentRiskAmount,
             indicators: getIndicatorSummary(),
             trendStrength: calculateTrendStrength()
         },
@@ -989,8 +1066,7 @@ app.get('/api/status', (req, res) => {
             multiplier: config.multiplier,
             autoCompound: config.autoCompound,
             riskPercent: config.riskPercent,
-            ollamaModel: config.ollamaModel,
-            klineInterval: config.klineInterval
+            ollamaModel: config.ollamaModel
         }
     });
 });
@@ -1034,395 +1110,63 @@ app.post('/api/force-sync', async (req, res) => {
 app.get('/api/indicators', (req, res) => {
     res.json({
         current: getIndicatorSummary(),
-        raw: {
-            rsi: market.indicators.rsi,
-            macd: market.indicators.macd,
-            bb: market.indicators.bb,
-            ema20: market.indicators.ema20,
-            ema50: market.indicators.ema50,
-            trend: market.indicators.trend,
-            support: market.indicators.support,
-            resistance: market.indicators.resistance,
-            atr: market.indicators.atr,
-            stochK: market.indicators.stochK,
-            stochD: market.indicators.stochD,
-            mfi: market.indicators.mfi,
-            adx: market.indicators.adx,
-            willr: market.indicators.willr,
-            cci: market.indicators.cci
-        },
+        raw: market.indicators,
         ohlcv_count: market.ohlcv.length,
         last_price: market.bid
     });
 });
 
-// ==================== HTML DASHBOARD ====================
-
+// Simple HTML dashboard
 app.get('/', (req, res) => {
-    const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
-    
-    res.send(`<!DOCTYPE html>
-<html lang="en">
+    res.send(`
+<!DOCTYPE html>
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Martingale Pro AI - TA-Lib Technical Analysis</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <title>Martingale Pro AI</title>
     <style>
-        * { font-family: system-ui, -apple-system, sans-serif; }
-        body { background: #0A0E17; color: #E8EDF2; }
-        .card { background: #131824; border: 1px solid #1F2A3E; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
-        .stat-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #6B7A8F; }
-        .value-positive { color: #00D1B2; }
-        .value-negative { color: #FF4D6D; }
-        .mono { font-family: monospace; font-size: 12px; }
-        .tp-target { background: #00D1B220; color: #00D1B2; padding: 2px 8px; border-radius: 4px; font-size: 10px; }
-        button { background: #FF4D6D20; border: 1px solid #FF4D6D; color: #FF4D6D; padding: 8px 16px; border-radius: 6px; cursor: pointer; transition: all 0.2s; }
-        button:hover { background: #FF4D6D40; transform: scale(1.02); }
-        .sync-btn { background: #00D1B220; border-color: #00D1B2; color: #00D1B2; margin-left: 10px; }
-        .ai-btn { background: #6366F120; border-color: #6366F1; color: #6366F1; margin-left: 10px; }
-        .step-badge { background: #6366F120; color: #6366F1; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }
-        .wallet-card { background: linear-gradient(135deg, #1A212E 0%, #131824 100%); border: 1px solid #00D1B240; }
-        .stat-number { font-size: 28px; font-weight: 900; }
-        .chart-container { position: relative; height: 280px; width: 100%; }
-        .compound-info { background: #00D1B210; border: 1px solid #00D1B230; border-radius: 8px; padding: 12px; margin-top: 10px; }
-        .ai-card { background: linear-gradient(135deg, #6366F120 0%, #131824 100%); border: 2px solid #6366F1; border-radius: 12px; padding: 15px; margin-bottom: 20px; }
-        .ai-recommendation { font-size: 14px; font-weight: bold; padding: 10px; border-radius: 8px; margin-top: 8px; }
-        .step-up { background: #FF4D6D20; color: #FF4D6D; border-left: 3px solid #FF4D6D; }
-        .close-position { background: #FF000020; color: #FF0000; border-left: 3px solid #FF0000; }
-        .open-position { background: #00D1B220; color: #00D1B2; border-left: 3px solid #00D1B2; }
-        .hold { background: #6366F120; color: #6366F1; border-left: 3px solid #6366F1; }
-        .ai-badge { background: #6366F1; color: white; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; margin-left: 8px; }
-        .indicator-card { background: #0F141C; border-radius: 8px; padding: 10px; margin: 5px; }
-        .bullish { color: #00D1B2; }
-        .bearish { color: #FF4D6D; }
-        .neutral { color: #FFB347; }
+        body { font-family: monospace; background: #0a0a0a; color: #0f0; padding: 20px; }
+        .card { background: #111; border: 1px solid #0f0; padding: 15px; margin: 10px 0; border-radius: 5px; }
+        .value-positive { color: #0f0; }
+        .value-negative { color: #f00; }
+        .stat-number { font-size: 24px; font-weight: bold; }
+        button { background: #0f0; color: #000; border: none; padding: 10px 20px; cursor: pointer; margin: 5px; }
+        button:hover { background: #0a0; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
     </style>
 </head>
-<body class="p-6">
-    <div class="max-w-7xl mx-auto">
-        <!-- Header -->
-        <div class="flex justify-between items-center mb-8">
-            <div>
-                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO AI</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">TA-LIB POWERED</span></h1>
-                <div class="flex items-center gap-3 mt-2">
-                    <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
-                    <span class="text-[10px] font-bold text-emerald-400">LIVE</span>
-                    <span class="text-[10px] text-slate-500">${config.symbol}</span>
-                    <span class="text-[10px] text-slate-500">${config.leverage}x LEVERAGE</span>
-                    <span class="tp-target">🎯 TP: ${config.takeProfitPct}% ROI</span>
-                    <span class="ai-badge">🤖 ${config.ollamaModel}</span>
-                </div>
-            </div>
-            <div>
-                <button onclick="forceAICheck()" class="ai-btn">🤖 FORCE AI CHECK</button>
-                <button onclick="forceSync()" class="sync-btn">🔄 SYNC</button>
-                <button onclick="emergencyClose()">⚠️ CLOSE ALL</button>
-            </div>
-        </div>
-
-        <!-- Technical Indicators Panel -->
-        <div class="card mb-4">
-            <h3 class="font-bold mb-3">📊 TECHNICAL INDICATORS (TA-Lib)</h3>
-            <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3">
-                <div class="indicator-card text-center">
-                    <div class="text-[10px] text-slate-500">RSI (14)</div>
-                    <div class="text-xl font-bold" id="rsiValue">--</div>
-                    <div class="text-[8px]" id="rsiStatus">--</div>
-                </div>
-                <div class="indicator-card text-center">
-                    <div class="text-[10px] text-slate-500">MACD</div>
-                    <div class="text-sm font-bold" id="macdValue">--</div>
-                    <div class="text-[8px]" id="macdStatus">--</div>
-                </div>
-                <div class="indicator-card text-center">
-                    <div class="text-[10px] text-slate-500">ADX</div>
-                    <div class="text-xl font-bold" id="adxValue">--</div>
-                    <div class="text-[8px]" id="adxStatus">--</div>
-                </div>
-                <div class="indicator-card text-center">
-                    <div class="text-[10px] text-slate-500">STOCH</div>
-                    <div class="text-sm font-bold" id="stochValue">--</div>
-                    <div class="text-[8px]" id="stochStatus">--</div>
-                </div>
-                <div class="indicator-card text-center">
-                    <div class="text-[10px] text-slate-500">MFI</div>
-                    <div class="text-xl font-bold" id="mfiValue">--</div>
-                    <div class="text-[8px]" id="mfiStatus">--</div>
-                </div>
-                <div class="indicator-card text-center">
-                    <div class="text-[10px] text-slate-500">BB %</div>
-                    <div class="text-xl font-bold" id="bbValue">--</div>
-                    <div class="text-[8px]" id="bbStatus">--</div>
-                </div>
-                <div class="indicator-card text-center">
-                    <div class="text-[10px] text-slate-500">VOL RATIO</div>
-                    <div class="text-xl font-bold" id="volumeValue">--</div>
-                    <div class="text-[8px]" id="volumeStatus">--</div>
-                </div>
-                <div class="indicator-card text-center">
-                    <div class="text-[10px] text-slate-500">TREND</div>
-                    <div class="text-xl font-bold" id="trendValue">--</div>
-                    <div class="text-[8px]" id="trendStrength">--</div>
-                </div>
-            </div>
-        </div>
-
-        <!-- AI Recommendations -->
-        <div class="ai-card">
-            <div class="flex items-center justify-between mb-3">
-                <h3 class="font-bold text-indigo-400">🤖 OLLAMA AI RECOMMENDATIONS</h3>
-                <span class="text-[10px] text-slate-500" id="aiLastUpdate">Updating...</span>
-            </div>
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                    <div class="flex items-center gap-2 mb-2">
-                        <span class="text-emerald-400 font-bold">LONG POSITION</span>
-                    </div>
-                    <div id="longRecommendation" class="ai-recommendation hold">🤖 Analyzing...</div>
-                </div>
-                <div>
-                    <div class="flex items-center gap-2 mb-2">
-                        <span class="text-red-400 font-bold">SHORT POSITION</span>
-                    </div>
-                    <div id="shortRecommendation" class="ai-recommendation hold">🤖 Analyzing...</div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Wallet Card -->
-        <div class="wallet-card rounded-2xl p-6 mb-8">
-            <div class="grid grid-cols-2 md:grid-cols-5 gap-6">
-                <div>
-                    <p class="stat-label">TOTAL WALLET</p>
-                    <p id="totalWallet" class="stat-number">$0.00</p>
-                    <p id="walletChange" class="text-xs"></p>
-                </div>
-                <div>
-                    <p class="stat-label">TOTAL P&L</p>
-                    <p id="totalPnl" class="stat-number">$0.00</p>
-                    <p id="pnlPercent" class="text-xs"></p>
-                </div>
-                <div>
-                    <p class="stat-label">REALIZED P&L</p>
-                    <p id="realizedPnl" class="stat-number">$0.00</p>
-                    <p id="feesPaid" class="text-xs">Fees: $0.00</p>
-                </div>
-                <div>
-                    <p class="stat-label">PERFORMANCE</p>
-                    <p id="peakEquity" class="text-sm">Peak: $0.00</p>
-                    <p id="maxDrawdown" class="text-sm">DD: 0%</p>
-                </div>
-                <div>
-                    <p class="stat-label">STATISTICS</p>
-                    <p id="tradeStats" class="text-sm">Trades: 0</p>
-                    <p id="winRate" class="text-sm">Win Rate: 0%</p>
-                </div>
-            </div>
-            <div class="compound-info mt-4">
-                <div class="flex justify-between">
-                    <div>
-                        <p class="text-xs text-slate-400">📈 AUTO-COMPOUNDING (${config.riskPercent}% of Wallet)</p>
-                        <p class="text-sm font-bold text-green-400" id="baseVolumeDisplay">Base Volume: 0 contracts</p>
-                    </div>
-                    <div class="text-right">
-                        <p class="text-xs text-slate-400">Risk Amount</p>
-                        <p class="text-sm font-bold" id="riskAmount">$0.00</p>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Position Cards -->
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
-            <div class="card">
-                <p class="stat-label mb-2">LONG POSITION</p>
-                <p id="lRoi" class="text-3xl font-black">0.00%</p>
-                <p id="lPnl" class="text-sm">$0.00</p>
-                <p id="lStep" class="text-xs text-slate-500 mt-2">Step 0 | Vol 0</p>
-                <p id="lAction" class="text-xs text-indigo-400 mt-1"></p>
-                <p id="lTarget" class="text-xs text-green-400"></p>
-            </div>
-            <div class="card">
-                <p class="stat-label mb-2">SHORT POSITION</p>
-                <p id="sRoi" class="text-3xl font-black">0.00%</p>
-                <p id="sPnl" class="text-sm">$0.00</p>
-                <p id="sStep" class="text-xs text-slate-500 mt-2">Step 0 | Vol 0</p>
-                <p id="sAction" class="text-xs text-indigo-400 mt-1"></p>
-                <p id="sTarget" class="text-xs text-green-400"></p>
-            </div>
-        </div>
-
-        <!-- Market Info -->
-        <div class="card mb-8">
-            <div class="grid grid-cols-3 gap-4">
-                <div>
-                    <p class="stat-label">BID</p>
-                    <p id="bidPrice" class="text-xl font-mono">0.00000000</p>
-                </div>
-                <div>
-                    <p class="stat-label">ASK</p>
-                    <p id="askPrice" class="text-xl font-mono">0.00000000</p>
-                </div>
-                <div>
-                    <p class="stat-label">SPREAD</p>
-                    <p id="spread" class="text-xl font-mono">0.000%</p>
-                </div>
-            </div>
-        </div>
-
-        <!-- Trade History -->
-        <div class="card">
-            <h3 class="font-bold mb-4">📋 CLOSED TRADES</h3>
-            <div class="overflow-x-auto max-h-96 overflow-y-auto">
-                <table class="w-full">
-                    <thead class="sticky top-0 bg-[#131824]">
-                        <tr class="text-xs text-slate-500">
-                            <th class="p-2">SIDE</th>
-                            <th class="p-2">VOL</th>
-                            <th class="p-2">ENTRY</th>
-                            <th class="p-2">EXIT</th>
-                            <th class="p-2">ROI</th>
-                            <th class="p-2">PNL</th>
-                        </tr>
-                    </thead>
-                    <tbody id="tradesBody">
-                        <tr><td colspan="6" class="text-center p-8 text-slate-500">No trades yet</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </div>
-    </div>
-
+<body>
+    <h1>🤖 Martingale Pro AI</h1>
+    <div id="status">Loading...</div>
+    
     <script>
-        async function forceSync() {
-            await fetch('/api/force-sync', {method: 'POST'});
-        }
-        
-        async function forceAICheck() {
-            const btn = event.target;
-            btn.textContent = '🤖 AI CHECK...';
-            await fetch('/api/force-ai-check', {method: 'POST'});
-            setTimeout(() => btn.textContent = '🤖 FORCE AI CHECK', 1000);
-        }
-        
-        async function emergencyClose() {
-            if(confirm('EMERGENCY CLOSE ALL POSITIONS?')) {
-                await fetch('/api/close', {method: 'POST'});
-                alert('Emergency close initiated');
-            }
-        }
-        
         setInterval(async () => {
-            try {
-                const res = await fetch('/api/status');
-                const data = await res.json();
-                
-                // Update wallet
-                document.getElementById('totalWallet').textContent = '$' + (data.market.totalEquity || 0).toFixed(8);
-                document.getElementById('totalPnl').textContent = (data.market.totalNetGain >= 0 ? '+' : '') + '$' + (data.market.totalNetGain || 0).toFixed(8);
-                document.getElementById('pnlPercent').innerHTML = (data.market.growthPct || 0).toFixed(2) + '%';
-                document.getElementById('realizedPnl').textContent = (data.market.totalRealizedPnl || 0).toFixed(8);
-                document.getElementById('peakEquity').innerHTML = 'Peak: $' + (data.market.peakEquity || 0).toFixed(8);
-                document.getElementById('maxDrawdown').innerHTML = 'DD: ' + (data.market.maxDrawdown || 0).toFixed(2) + '%';
-                document.getElementById('tradeStats').innerHTML = 'Trades: ' + (data.market.totalTrades || 0);
-                document.getElementById('winRate').innerHTML = 'Win Rate: ' + (data.market.winRate || 0) + '%';
-                document.getElementById('baseVolumeDisplay').innerHTML = 'Base Volume: ' + (data.market.currentBaseVolume || 0) + ' contracts';
-                document.getElementById('riskAmount').innerHTML = '$' + (data.market.currentRiskAmount || 0).toFixed(8);
-                
-                // Update indicators
-                if (data.market.indicators) {
-                    const ind = data.market.indicators;
-                    document.getElementById('rsiValue').innerHTML = ind.rsi;
-                    document.getElementById('rsiStatus').innerHTML = ind.rsi_status;
-                    document.getElementById('macdValue').innerHTML = ind.macd_histogram;
-                    document.getElementById('macdStatus').innerHTML = ind.macd_status;
-                    document.getElementById('adxValue').innerHTML = ind.adx;
-                    document.getElementById('adxStatus').innerHTML = ind.adx_status;
-                    document.getElementById('stochValue').innerHTML = ind.stoch_k + '/' + ind.stoch_d;
-                    document.getElementById('stochStatus').innerHTML = ind.stoch_status;
-                    document.getElementById('mfiValue').innerHTML = ind.mfi;
-                    document.getElementById('mfiStatus').innerHTML = ind.mfi_status;
-                    document.getElementById('bbValue').innerHTML = ind.price_vs_bb;
-                    document.getElementById('volumeValue').innerHTML = ind.volume_ratio + 'x';
-                    document.getElementById('trendValue').innerHTML = ind.trend;
-                    document.getElementById('trendStrength').innerHTML = 'Strength: ' + (data.market.trendStrength || 0) + '/10';
-                    
-                    // Color coding
-                    document.getElementById('rsiValue').className = 'text-xl font-bold ' + (ind.rsi > 70 ? 'bearish' : (ind.rsi < 30 ? 'bullish' : 'neutral'));
-                    document.getElementById('macdValue').className = 'text-sm font-bold ' + (ind.macd_status === 'BULLISH' ? 'bullish' : 'bearish');
-                }
-                
-                // Update market prices
-                document.getElementById('bidPrice').textContent = (data.market.bid || 0).toFixed(8);
-                document.getElementById('askPrice').textContent = (data.market.ask || 0).toFixed(8);
-                document.getElementById('spread').textContent = (data.market.spread || 0).toFixed(3) + '%';
-                
-                // Update AI recommendations
-                if (data.aiRecommendations) {
-                    const longDiv = document.getElementById('longRecommendation');
-                    longDiv.textContent = data.aiRecommendations.long.recommendation;
-                    longDiv.className = 'ai-recommendation ' + (data.aiRecommendations.long.action === 'STEP UP' ? 'step-up' : 
-                        (data.aiRecommendations.long.action === 'CLOSE POSITION' ? 'close-position' :
-                        (data.aiRecommendations.long.action === 'OPEN POSITION' ? 'open-position' : 'hold')));
-                    
-                    const shortDiv = document.getElementById('shortRecommendation');
-                    shortDiv.textContent = data.aiRecommendations.short.recommendation;
-                    shortDiv.className = 'ai-recommendation ' + (data.aiRecommendations.short.action === 'STEP UP' ? 'step-up' : 
-                        (data.aiRecommendations.short.action === 'CLOSE POSITION' ? 'close-position' :
-                        (data.aiRecommendations.short.action === 'OPEN POSITION' ? 'open-position' : 'hold')));
-                    
-                    if (data.aiRecommendations.long.lastUpdate) {
-                        document.getElementById('aiLastUpdate').textContent = 'Updated: ' + new Date(data.aiRecommendations.long.lastUpdate).toLocaleTimeString();
-                    }
-                }
-                
-                // Update positions
-                const long = data.accounts.find(a => a.direction === 'buy');
-                const short = data.accounts.find(a => a.direction === 'sell');
-                
-                if (long) {
-                    document.getElementById('lRoi').innerHTML = (long.roi >= 0 ? '+' : '') + long.roi.toFixed(2) + '%';
-                    document.getElementById('lRoi').className = 'text-3xl font-black ' + (long.roi >= 0 ? 'value-positive' : 'value-negative');
-                    document.getElementById('lPnl').innerHTML = (long.unrealizedUsdt >= 0 ? '+' : '') + '$' + long.unrealizedUsdt.toFixed(8);
-                    document.getElementById('lStep').innerHTML = 'Step ' + long.step + ' | Vol ' + long.volume;
-                    document.getElementById('lAction').innerHTML = long.lastAction;
-                    if (long.targetPrice) document.getElementById('lTarget').innerHTML = '🎯 TP: ' + long.targetPrice.toFixed(8);
-                }
-                
-                if (short) {
-                    document.getElementById('sRoi').innerHTML = (short.roi >= 0 ? '+' : '') + short.roi.toFixed(2) + '%';
-                    document.getElementById('sRoi').className = 'text-3xl font-black ' + (short.roi >= 0 ? 'value-positive' : 'value-negative');
-                    document.getElementById('sPnl').innerHTML = (short.unrealizedUsdt >= 0 ? '+' : '') + '$' + short.unrealizedUsdt.toFixed(8);
-                    document.getElementById('sStep').innerHTML = 'Step ' + short.step + ' | Vol ' + short.volume;
-                    document.getElementById('sAction').innerHTML = short.lastAction;
-                    if (short.targetPrice) document.getElementById('sTarget').innerHTML = '🎯 TP: ' + short.targetPrice.toFixed(8);
-                }
-                
-                // Update trade history
-                let tradesHtml = '';
-                if (data.tradeHistory && data.tradeHistory.length > 0) {
-                    data.tradeHistory.forEach(t => {
-                        tradesHtml += '<tr class="border-b border-[#1F2A3E]">' +
-                            '<td class="p-2"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + '">' + t.side + '</span></td>' +
-                            '<td class="p-2">' + t.volume + '</td>' +
-                            '<td class="p-2 font-mono text-xs">' + t.entryPrice + '</td>' +
-                            '<td class="p-2 font-mono text-xs">' + t.exitPrice + '</td>' +
-                            '<td class="p-2 ' + (parseFloat(t.roi) >= 0 ? 'value-positive' : 'value-negative') + '">' + t.roi + '</td>' +
-                            '<td class="p-2 font-mono">' + (parseFloat(t.netPnlUsdt) >= 0 ? '+' : '') + t.netPnlUsdt + '</td>' +
-                        '</tr>';
-                    });
-                } else {
-                    tradesHtml = '<tr><td colspan="6" class="text-center p-8 text-slate-500">No trades yet</td></tr>';
-                }
-                document.getElementById('tradesBody').innerHTML = tradesHtml;
-                
-            } catch(e) { console.error(e); }
+            const res = await fetch('/api/status');
+            const data = await res.json();
+            document.getElementById('status').innerHTML = \`
+                <div class="card">
+                    <h2>💰 Wallet: $\${data.market.totalEquity?.toFixed(8)}</h2>
+                    <p>PnL: \${data.market.growthPct?.toFixed(2)}% | Trades: \${data.market.totalTrades}</p>
+                    <p>📊 RSI: \${data.market.indicators?.rsi} | Trend: \${data.market.indicators?.trend}</p>
+                </div>
+                <div class="card">
+                    <h3>🤖 AI Recommendations</h3>
+                    <p><span style="color:#0f0">LONG:</span> \${data.aiRecommendations?.long?.recommendation}</p>
+                    <p><span style="color:#f00">SHORT:</span> \${data.aiRecommendations?.short?.recommendation}</p>
+                </div>
+                <div class="card">
+                    <div class="grid">
+                        <div>📈 RSI: \${data.market.indicators?.rsi}</div>
+                        <div>📊 MACD: \${data.market.indicators?.macd_histogram}</div>
+                        <div>🎯 ADX: \${data.market.indicators?.adx}</div>
+                        <div>📉 ATR: \${data.market.indicators?.atr_percent}%</div>
+                    </div>
+                </div>
+            \`;
         }, 1000);
     </script>
 </body>
-</html>`);
+</html>
+    `);
 });
 
 // ==================== START ====================
@@ -1431,11 +1175,10 @@ startWS();
 setInterval(backgroundLoop, config.pollInterval);
 
 app.listen(config.port, '0.0.0.0', () => {
-    console.log(`\n✅ Martingale Pro AI Started (TA-Lib Technical Analysis)`);
+    console.log(`\n✅ Martingale Pro AI Started (Custom TA-Lib Implementation)`);
     console.log(`📊 Symbol: ${config.symbol}`);
     console.log(`🔧 Leverage: ${config.leverage}x`);
     console.log(`🤖 Ollama AI: ${config.ollamaModel}`);
-    console.log(`📈 TA-Lib Indicators: RSI, MACD, BB, ADX, Stochastic, MFI, ATR, CCI, WillR`);
-    console.log(`🎮 AI Control: All trading decisions based on technical analysis`);
+    console.log(`📈 Technical Indicators: RSI, MACD, BB, ADX, Stochastic, MFI, ATR, CCI, WillR`);
     console.log(`🌐 Dashboard: http://localhost:${config.port}\n`);
 });
