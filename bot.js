@@ -973,12 +973,28 @@ app.post('/api/ai-refresh', async (req, res) => {
     res.json({ recommendation: market.aiRecommendation });
 });
 
-// CLEAN WHITE DASHBOARD - NO CHART
-app.get('/', (req, res) => {
-    const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
+app.post('/api/set-leverage', async (req, res) => {
+    const { leverage } = req.body;
+    if (!config.allowedLeverages.includes(leverage)) {
+        return res.json({ error: `Leverage must be one of: ${config.allowedLeverages.join(', ')}` });
+    }
     
-    res.send(`
-<!DOCTYPE html>
+    config.leverage = leverage;
+    config.takeProfitPct = config.leverageTPMapping[leverage];
+    
+    for (const acc of config.accounts) {
+        const state = accountStates[acc.accountId];
+        if (state.volume > 0 && state.entryPrice > 0) {
+            state.targetPrice = calculateTargetPrice(state);
+        }
+    }
+    
+    res.json({ status: 'ok', leverage: config.leverage, takeProfit: config.takeProfitPct });
+});
+
+// CLEAN WHITE DASHBOARD
+app.get('/', (req, res) => {
+    const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -987,10 +1003,7 @@ app.get('/', (req, res) => {
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
         body { background: #f5f7fa; padding: 24px; }
-        
         .container { max-width: 1400px; margin: 0 auto; }
-        
-        /* Header */
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; flex-wrap: wrap; gap: 16px; }
         .title h1 { font-size: 28px; font-weight: 700; color: #1a1a2e; }
         .title p { font-size: 13px; color: #666; margin-top: 4px; }
@@ -1003,13 +1016,9 @@ app.get('/', (req, res) => {
         .btn-danger:hover { background: #b91c1c; }
         .btn-outline { background: white; border: 1px solid #ddd; color: #333; }
         .btn-outline:hover { background: #f0f0f0; }
-        
-        /* Cards */
         .card { background: white; border-radius: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 20px; overflow: hidden; }
         .card-header { padding: 16px 20px; border-bottom: 1px solid #eee; font-weight: 600; font-size: 16px; color: #1a1a2e; display: flex; justify-content: space-between; align-items: center; }
         .card-body { padding: 20px; }
-        
-        /* Stats Grid */
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 20px; }
         .stat-card { background: white; border-radius: 16px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
         .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: #888; margin-bottom: 8px; }
@@ -1017,24 +1026,18 @@ app.get('/', (req, res) => {
         .stat-change { font-size: 13px; margin-top: 4px; }
         .positive { color: #10b981; }
         .negative { color: #ef4444; }
-        
-        /* AI Card */
         .ai-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 16px; padding: 20px; margin-bottom: 20px; color: white; }
         .ai-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 12px; }
         .ai-title { font-size: 18px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
         .ai-badge { background: rgba(255,255,255,0.2); padding: 4px 12px; border-radius: 20px; font-size: 11px; font-weight: 500; }
         .ai-content { font-size: 14px; line-height: 1.5; opacity: 0.95; white-space: pre-line; }
         .ai-time { font-size: 11px; opacity: 0.7; margin-top: 12px; }
-        
-        /* Config Grid */
         .config-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
         .config-item { background: #f8f9fa; border-radius: 12px; padding: 12px 16px; }
         .config-label { font-size: 11px; color: #888; margin-bottom: 4px; }
         .config-value { font-size: 20px; font-weight: 600; color: #1a1a2e; }
         .config-unit { font-size: 12px; color: #666; margin-left: 4px; }
-        
-        /* Positions Grid */
-        .positions-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .positions-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
         .position-card { background: #f8f9fa; border-radius: 12px; padding: 16px; }
         .position-title { font-size: 14px; font-weight: 600; margin-bottom: 12px; }
         .position-title.long { color: #10b981; }
@@ -1042,18 +1045,13 @@ app.get('/', (req, res) => {
         .position-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 13px; }
         .position-label { color: #666; }
         .position-value { font-weight: 500; color: #1a1a2e; }
-        
-        /* Table */
         .table-wrapper { overflow-x: auto; }
         table { width: 100%; border-collapse: collapse; font-size: 13px; }
         th { text-align: left; padding: 12px; background: #f8f9fa; color: #666; font-weight: 500; border-bottom: 1px solid #eee; }
         td { padding: 12px; border-bottom: 1px solid #eee; color: #333; }
         .trade-long { color: #10b981; font-weight: 500; }
         .trade-short { color: #ef4444; font-weight: 500; }
-        
-        /* Select Dropdown */
         .leverage-select { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 6px 12px; font-size: 13px; cursor: pointer; }
-        
         @media (max-width: 768px) {
             body { padding: 16px; }
             .stats-grid { grid-template-columns: repeat(2, 1fr); }
@@ -1063,11 +1061,10 @@ app.get('/', (req, res) => {
 </head>
 <body>
     <div class="container">
-        <!-- Header -->
         <div class="header">
             <div class="title">
                 <h1>MARTINGALE DOGE <span class="badge">AI CONTROLLED</span></h1>
-                <p>${config.symbol} • ${config.leverage}x Leverage • TP: ${config.takeProfitPct}% (${requiredPriceMovePct}% move)</p>
+                <p>${config.symbol} • ${config.leverage}x Leverage • TP: ${config.takeProfitPct}% (${(config.takeProfitPct / config.leverage).toFixed(3)}% move)</p>
             </div>
             <div class="button-group">
                 <select id="leverageSelect" class="leverage-select" onchange="setLeverage(this.value)">
@@ -1081,100 +1078,42 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- AI Card -->
         <div class="ai-card">
             <div class="ai-header">
-                <div class="ai-title">
-                    <span>🧠</span> AI Controller Active
-                </div>
+                <div class="ai-title"><span>🧠</span> AI Controller Active</div>
                 <button class="btn" style="background: rgba(255,255,255,0.2); color: white; padding: 4px 12px;" onclick="refreshAI()">🔄 Force AI Reconfig</button>
             </div>
             <div id="aiRecommendation" class="ai-content">AI Controller initializing...</div>
             <div id="aiTimestamp" class="ai-time"></div>
         </div>
 
-        <!-- Stats Grid -->
         <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-label">TOTAL WALLET</div>
-                <div class="stat-value" id="totalWallet">$0.00</div>
-                <div class="stat-change" id="walletChange"></div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">TOTAL P&L</div>
-                <div class="stat-value" id="totalPnl">$0.00</div>
-                <div class="stat-change" id="pnlPercent"></div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">REALIZED P&L</div>
-                <div class="stat-value" id="realizedPnl">$0.00</div>
-                <div class="stat-change" id="feesPaid">Fees: $0.00</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">PERFORMANCE</div>
-                <div class="stat-value" id="peakEquity">$0.00</div>
-                <div class="stat-change" id="maxDrawdown">DD: 0%</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">STATISTICS</div>
-                <div class="stat-value" id="tradeStats">0</div>
-                <div class="stat-change" id="winRate">Win Rate: 0%</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">MARKET</div>
-                <div class="stat-value" id="spread">0.000%</div>
-                <div class="stat-change" id="marketPrice">BID: 0 | ASK: 0</div>
-            </div>
+            <div class="stat-card"><div class="stat-label">TOTAL WALLET</div><div class="stat-value" id="totalWallet">$0.00</div><div class="stat-change" id="walletChange"></div></div>
+            <div class="stat-card"><div class="stat-label">TOTAL P&L</div><div class="stat-value" id="totalPnl">$0.00</div><div class="stat-change" id="pnlPercent"></div></div>
+            <div class="stat-card"><div class="stat-label">REALIZED P&L</div><div class="stat-value" id="realizedPnl">$0.00</div><div class="stat-change" id="feesPaid">Fees: $0.00</div></div>
+            <div class="stat-card"><div class="stat-label">PERFORMANCE</div><div class="stat-value" id="peakEquity">$0.00</div><div class="stat-change" id="maxDrawdown">DD: 0%</div></div>
+            <div class="stat-card"><div class="stat-label">STATISTICS</div><div class="stat-value" id="tradeStats">0</div><div class="stat-change" id="winRate">Win Rate: 0%</div></div>
+            <div class="stat-card"><div class="stat-label">MARKET</div><div class="stat-value" id="spread">0.000%</div><div class="stat-change" id="marketPrice">BID: 0 | ASK: 0</div></div>
         </div>
 
-        <!-- AI Controlled Config -->
         <div class="card">
-            <div class="card-header">
-                <span>⚙️ AI CONTROLLED CONFIGURATION</span>
-                <span style="font-size: 12px; color: #888;">Auto-adjusts every 60 seconds</span>
-            </div>
+            <div class="card-header"><span>⚙️ AI CONTROLLED CONFIGURATION</span><span style="font-size: 12px; color: #888;">Auto-adjusts every 60 seconds</span></div>
             <div class="card-body">
                 <div class="config-grid">
-                    <div class="config-item">
-                        <div class="config-label">LEVERAGE</div>
-                        <div class="config-value"><span id="cfgLeverage">${config.leverage}</span><span class="config-unit">x</span></div>
-                    </div>
-                    <div class="config-item">
-                        <div class="config-label">TAKE PROFIT</div>
-                        <div class="config-value"><span id="cfgTP">${config.takeProfitPct}</span><span class="config-unit">%</span></div>
-                    </div>
-                    <div class="config-item">
-                        <div class="config-label">BASE VOLUME</div>
-                        <div class="config-value"><span id="cfgVolume">${config.baseVolume}</span><span class="config-unit">contracts</span></div>
-                    </div>
-                    <div class="config-item">
-                        <div class="config-label">MARTINGALE MULTIPLIER</div>
-                        <div class="config-value"><span id="cfgMultiplier">${config.multiplier}</span><span class="config-unit">x</span></div>
-                    </div>
-                    <div class="config-item">
-                        <div class="config-label">STEP TRIGGER</div>
-                        <div class="config-value">-<span id="cfgStep">${config.stepDistancePct}</span><span class="config-unit">%</span></div>
-                    </div>
-                    <div class="config-item">
-                        <div class="config-label">RISK PERCENT</div>
-                        <div class="config-value"><span id="cfgRisk">${config.riskPercent}</span><span class="config-unit">%</span></div>
-                    </div>
-                    <div class="config-item">
-                        <div class="config-label">MAX START SPREAD</div>
-                        <div class="config-value"><span id="cfgSpread">${config.maxStartSpread}</span><span class="config-unit">%</span></div>
-                    </div>
-                    <div class="config-item">
-                        <div class="config-label">AUTO-COMPOUND</div>
-                        <div class="config-value"><span id="cfgCompound">${config.autoCompound ? 'ON' : 'OFF'}</span></div>
-                    </div>
+                    <div class="config-item"><div class="config-label">LEVERAGE</div><div class="config-value"><span id="cfgLeverage">${config.leverage}</span><span class="config-unit">x</span></div></div>
+                    <div class="config-item"><div class="config-label">TAKE PROFIT</div><div class="config-value"><span id="cfgTP">${config.takeProfitPct}</span><span class="config-unit">%</span></div></div>
+                    <div class="config-item"><div class="config-label">BASE VOLUME</div><div class="config-value"><span id="cfgVolume">${config.baseVolume}</span><span class="config-unit">contracts</span></div></div>
+                    <div class="config-item"><div class="config-label">MARTINGALE MULTIPLIER</div><div class="config-value"><span id="cfgMultiplier">${config.multiplier}</span><span class="config-unit">x</span></div></div>
+                    <div class="config-item"><div class="config-label">STEP TRIGGER</div><div class="config-value">-<span id="cfgStep">${config.stepDistancePct}</span><span class="config-unit">%</span></div></div>
+                    <div class="config-item"><div class="config-label">RISK PERCENT</div><div class="config-value"><span id="cfgRisk">${config.riskPercent}</span><span class="config-unit">%</span></div></div>
+                    <div class="config-item"><div class="config-label">MAX START SPREAD</div><div class="config-value"><span id="cfgSpread">${config.maxStartSpread}</span><span class="config-unit">%</span></div></div>
+                    <div class="config-item"><div class="config-label">AUTO-COMPOUND</div><div class="config-value"><span id="cfgCompound">${config.autoCompound ? 'ON' : 'OFF'}</span></div></div>
                 </div>
             </div>
         </div>
 
-        <!-- Positions -->
-        <div class="positions-grid" style="margin-bottom: 20px;">
-            <div class="position-card">
-                <div class="position-title long">📈 LONG POSITION</div>
+        <div class="positions-grid">
+            <div class="position-card"><div class="position-title long">📈 LONG POSITION</div>
                 <div class="position-row"><span class="position-label">ROI:</span><span class="position-value" id="lRoi">0.00%</span></div>
                 <div class="position-row"><span class="position-label">Unrealized PnL:</span><span class="position-value" id="lPnl">$0.00</span></div>
                 <div class="position-row"><span class="position-label">Volume:</span><span class="position-value" id="lVol">0 contracts</span></div>
@@ -1183,8 +1122,7 @@ app.get('/', (req, res) => {
                 <div class="position-row"><span class="position-label">Target Price:</span><span class="position-value" id="lTarget">0.00000000</span></div>
                 <div class="position-row"><span class="position-label">Status:</span><span class="position-value" id="lAction">Idle</span></div>
             </div>
-            <div class="position-card">
-                <div class="position-title short">📉 SHORT POSITION</div>
+            <div class="position-card"><div class="position-title short">📉 SHORT POSITION</div>
                 <div class="position-row"><span class="position-label">ROI:</span><span class="position-value" id="sRoi">0.00%</span></div>
                 <div class="position-row"><span class="position-label">Unrealized PnL:</span><span class="position-value" id="sPnl">$0.00</span></div>
                 <div class="position-row"><span class="position-label">Volume:</span><span class="position-value" id="sVol">0 contracts</span></div>
@@ -1195,19 +1133,12 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- Trade History -->
         <div class="card">
             <div class="card-header">📋 CLOSED TRADES</div>
             <div class="card-body">
                 <div class="table-wrapper">
-                    <table>
-                        <thead>
-                            <tr><th>SIDE</th><th>OPEN TIME</th><th>CLOSE TIME</th><th>STEP</th><th>VOL</th><th>DOGE</th><th>ENTRY</th><th>EXIT</th><th>ROI</th><th>PNL</th></tr>
-                        </thead>
-                        <tbody id="tradesBody">
-                            <tr><td colspan="10" style="text-align: center; color: #888;">No closed trades</td></tr>
-                        </tbody>
-                    </table>
+                    <table><thead><tr><th>SIDE</th><th>OPEN TIME</th><th>CLOSE TIME</th><th>STEP</th><th>VOL</th><th>DOGE</th><th>ENTRY</th><th>EXIT</th><th>ROI</th><th>PNL</th></tr></thead>
+                    <tbody id="tradesBody"><tr><td colspan="10" style="text-align: center; color: #888;">No closed trades</td></tr></tbody></table>
                 </div>
             </div>
         </div>
@@ -1215,39 +1146,14 @@ app.get('/', (req, res) => {
 
     <script>
         async function setLeverage(leverage) {
-            const res = await fetch('/api/set-leverage', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ leverage: parseInt(leverage) })
-            });
+            const res = await fetch('/api/set-leverage', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ leverage: parseInt(leverage) }) });
             const data = await res.json();
-            if (data.status === 'ok') {
-                location.reload();
-            } else {
-                alert('Failed: ' + (data.error || 'Unknown error'));
-            }
+            if (data.status === 'ok') location.reload();
+            else alert('Failed: ' + (data.error || 'Unknown error'));
         }
-        
-        async function forceSync() {
-            const btn = event.target;
-            btn.textContent = '🔄 Syncing...';
-            await fetch('/api/force-sync', {method: 'POST'});
-            setTimeout(() => btn.textContent = '🔄 Force Sync', 1000);
-        }
-        
-        async function emergencyClose() {
-            if(confirm('⚠️ Close ALL positions?')) {
-                await fetch('/api/close', {method: 'POST'});
-                alert('Emergency liquidation initiated');
-            }
-        }
-        
-        async function refreshAI() {
-            const btn = event.target;
-            btn.textContent = '⟳ Forcing...';
-            await fetch('/api/ai-refresh', {method: 'POST'});
-            setTimeout(() => btn.textContent = '🔄 Force AI Reconfig', 1000);
-        }
+        async function forceSync() { const btn = event.target; btn.textContent = '🔄 Syncing...'; await fetch('/api/force-sync', {method: 'POST'}); setTimeout(() => btn.textContent = '🔄 Force Sync', 1000); }
+        async function emergencyClose() { if(confirm('⚠️ Close ALL positions?')) { await fetch('/api/close', {method: 'POST'}); alert('Emergency liquidation initiated'); } }
+        async function refreshAI() { const btn = event.target; btn.textContent = '⟳ Forcing...'; await fetch('/api/ai-refresh', {method: 'POST'}); setTimeout(() => btn.textContent = '🔄 Force AI Reconfig', 1000); }
         
         function formatNumber(num) { return parseFloat(num).toFixed(4); }
         
@@ -1255,8 +1161,6 @@ app.get('/', (req, res) => {
             try {
                 const res = await fetch('/api/status');
                 const data = await res.json();
-                
-                // Stats
                 document.getElementById('totalWallet').textContent = '$' + formatNumber(data.market.totalEquity);
                 document.getElementById('totalPnl').textContent = (data.market.totalNetGain >= 0 ? '+' : '') + '$' + formatNumber(data.market.totalNetGain);
                 document.getElementById('realizedPnl').textContent = (data.market.totalRealizedPnl >= 0 ? '+' : '') + '$' + formatNumber(data.market.totalRealizedPnl);
@@ -1267,15 +1171,11 @@ app.get('/', (req, res) => {
                 document.getElementById('winRate').innerHTML = 'Win Rate: ' + (data.market.winRate || 0) + '%';
                 document.getElementById('spread').innerHTML = (data.market.spread || 0).toFixed(3) + '%';
                 document.getElementById('marketPrice').innerHTML = 'BID: ' + (data.market.bid || 0).toFixed(6) + ' | ASK: ' + (data.market.ask || 0).toFixed(6);
-                
-                // Wallet Change
                 const change = data.market.totalNetGain || 0;
                 document.getElementById('walletChange').innerHTML = (change >= 0 ? '↑' : '↓') + ' $' + Math.abs(change).toFixed(4);
                 document.getElementById('walletChange').className = 'stat-change ' + (change >= 0 ? 'positive' : 'negative');
                 document.getElementById('pnlPercent').innerHTML = (data.market.growthPct >= 0 ? '+' : '') + data.market.growthPct.toFixed(2) + '%';
                 document.getElementById('pnlPercent').className = 'stat-change ' + (data.market.growthPct >= 0 ? 'positive' : 'negative');
-                
-                // Config
                 if (data.market.currentConfig) {
                     document.getElementById('cfgLeverage').innerHTML = data.market.currentConfig.leverage;
                     document.getElementById('cfgTP').innerHTML = data.market.currentConfig.takeProfitPct;
@@ -1285,17 +1185,12 @@ app.get('/', (req, res) => {
                     document.getElementById('cfgRisk').innerHTML = data.market.currentConfig.riskPercent;
                     document.getElementById('cfgSpread').innerHTML = data.market.currentConfig.maxStartSpread;
                 }
-                
-                // AI Recommendation
                 if (data.market.aiRecommendation) {
                     document.getElementById('aiRecommendation').innerHTML = data.market.aiRecommendation.text.replace(/\\n/g, '<br>');
                     document.getElementById('aiTimestamp').innerHTML = 'Last updated: ' + data.market.aiRecommendation.time;
                 }
-                
-                // Positions
                 const long = data.accounts?.find(a => a.direction === 'buy');
                 const short = data.accounts?.find(a => a.direction === 'sell');
-                
                 if (long) {
                     document.getElementById('lRoi').innerHTML = (long.roi >= 0 ? '+' : '') + long.roi.toFixed(2) + '%';
                     document.getElementById('lPnl').innerHTML = (long.unrealizedUsdt >= 0 ? '+' : '') + '$' + long.unrealizedUsdt.toFixed(6);
@@ -1306,7 +1201,6 @@ app.get('/', (req, res) => {
                     document.getElementById('lAction').innerHTML = long.lastAction || 'Idle';
                     document.getElementById('lRoi').className = 'position-value ' + (long.roi >= 0 ? 'positive' : 'negative');
                 }
-                
                 if (short) {
                     document.getElementById('sRoi').innerHTML = (short.roi >= 0 ? '+' : '') + short.roi.toFixed(2) + '%';
                     document.getElementById('sPnl').innerHTML = (short.unrealizedUsdt >= 0 ? '+' : '') + '$' + short.unrealizedUsdt.toFixed(6);
@@ -1317,43 +1211,30 @@ app.get('/', (req, res) => {
                     document.getElementById('sAction').innerHTML = short.lastAction || 'Idle';
                     document.getElementById('sRoi').className = 'position-value ' + (short.roi >= 0 ? 'positive' : 'negative');
                 }
-                
-                // Trades Table
                 let tradesHtml = '';
                 if (data.tradeHistory && data.tradeHistory.length > 0) {
                     data.tradeHistory.slice(0, 20).forEach(t => {
                         const roiVal = parseFloat(t.roi);
-                        tradesHtml += `<tr>
-                            <td class="${t.side === 'LONG' ? 'trade-long' : 'trade-short'}">${t.side}</td>
-                            <td>${t.openTime || '--'}</td>
-                            <td>${t.closeTime || '--'}</td>
-                            <td>${t.step || 0}</td>
-                            <td>${t.volume}</td>
-                            <td>${(t.volume * 100).toLocaleString()}</td>
-                            <td>${t.entryPrice}</td>
-                            <td>${t.exitPrice}</td>
-                            <td class="${roiVal >= 0 ? 'positive' : 'negative'}">${roiVal >= 0 ? '+' : ''}${t.roi}</td>
-                            <td class="${parseFloat(t.netPnlUsdt) >= 0 ? 'positive' : 'negative'}">${parseFloat(t.netPnlUsdt) >= 0 ? '+' : ''}$${t.netPnlUsdt}</td>
-                        </tr>`;
+                        tradesHtml += '<tr><td class="' + (t.side === 'LONG' ? 'trade-long' : 'trade-short') + '">' + t.side + '</td><td>' + (t.openTime || '--') + '</td><td>' + (t.closeTime || '--') + '</td><td>' + (t.step || 0) + '</td><td>' + t.volume + '</td><td>' + (t.volume * 100).toLocaleString() + '</td><td>' + t.entryPrice + '</td><td>' + t.exitPrice + '</td><td class="' + (roiVal >= 0 ? 'positive' : 'negative') + '">' + (roiVal >= 0 ? '+' : '') + t.roi + '</td><td class="' + (parseFloat(t.netPnlUsdt) >= 0 ? 'positive' : 'negative') + '">' + (parseFloat(t.netPnlUsdt) >= 0 ? '+' : '') + '$' + t.netPnlUsdt + '</td></tr>';
                     });
                 } else {
                     tradesHtml = '<tr><td colspan="10" style="text-align: center; color: #888;">No closed trades</td></tr>';
                 }
                 document.getElementById('tradesBody').innerHTML = tradesHtml;
-                
             } catch(e) { console.error(e); }
         }, 2000);
     </script>
 </body>
-</html>
-    `);
+</html>`;
+    
+    res.send(html);
 });
 
 // ==================== START BOT ====================
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
 
-app.listen(config.port, '0.0.0.0', async () => {
+app.listen(config.port, '0.0.0.0', () => {
     const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
     
     console.log(`\n✅ Martingale DOGE Bot Started`);
