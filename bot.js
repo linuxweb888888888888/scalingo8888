@@ -25,7 +25,7 @@ while (process.env[`HTX_API_KEY_${accountIndex}`]) {
 let config = {
     symbol: (process.env.SYMBOL || 'DOGE-USDT').toUpperCase(),
     symbolClean: (process.env.SYMBOL || 'DOGE-USDT').toUpperCase().replace('-', ''),
-    leverage: parseInt(process.env.LEVERAGE) || 75,
+    leverage: parseInt(process.env.LEVERAGE) || 75,  // This is the ACTUAL leverage used on exchange
     port: process.env.PORT || 3000,
     restHost: 'api.hbdm.com',
     wsHost: 'wss://api.hbdm.com/linear-swap-ws',
@@ -88,7 +88,8 @@ let market = {
     aiLastUpdate: 0,
     aiConfigChanges: [],
     dogeVolatility: 0,
-    ollamaAvailable: false
+    ollamaAvailable: false,
+    exchangeLeverage: parseInt(process.env.LEVERAGE) || 75  // Track actual exchange leverage
 };
 
 let tradeHistory = [];
@@ -96,6 +97,30 @@ let accountStates = {};
 let lastPositionFetch = {};
 let lastBalanceFetch = {};
 let lastStepTime = {};
+
+// ==================== UPDATE LEVERAGE ON EXCHANGE ====================
+async function updateExchangeLeverage(account, newLeverage) {
+    try {
+        console.log(`🔄 Updating leverage on HTX to ${newLeverage}x for account ${account.accountId}...`);
+        
+        const res = await htxRequest(account, 'POST', '/linear-swap-api/v1/swap_cross_level_switch', {
+            contract_code: config.symbol,
+            lever_rate: newLeverage
+        });
+        
+        if (res?.status === 'ok') {
+            console.log(`✅ Leverage successfully updated to ${newLeverage}x on exchange`);
+            market.exchangeLeverage = newLeverage;
+            return true;
+        } else {
+            console.error(`❌ Failed to update leverage:`, res);
+            return false;
+        }
+    } catch (error) {
+        console.error(`❌ Error updating leverage:`, error.message);
+        return false;
+    }
+}
 
 // ==================== CHECK OLLAMA ====================
 async function checkOllama() {
@@ -115,8 +140,8 @@ async function checkOllama() {
     }
 }
 
-// ==================== LOCAL INTELLIGENT AI CONTROLLER (FALLBACK) ====================
-function localAIController() {
+// ==================== LOCAL INTELLIGENT AI CONTROLLER ====================
+async function localAIController() {
     const s1 = accountStates[1];
     const s2 = accountStates[2];
     const totalEquity = (s1?.currentEquity || 0) + (s2?.currentEquity || 0);
@@ -190,17 +215,36 @@ function localAIController() {
     const priceMove = (newTakeProfit / newLeverage).toFixed(3);
     
     let changes = [];
+    let leverageUpdated = false;
     
+    // Update leverage on exchange if changed
     if (newLeverage !== config.leverage) {
-        changes.push(`Leverage: ${config.leverage}x → ${newLeverage}x (TP: ${newTakeProfit}%, move: ${priceMove}%)`);
-        config.leverage = newLeverage;
-        config.takeProfitPct = newTakeProfit;
+        console.log(`\n🔧 AI wants to change leverage from ${config.leverage}x to ${newLeverage}x`);
+        console.log(`📡 Sending update to HTX exchange...`);
         
+        // Update leverage for each account
+        let allSuccess = true;
         for (const acc of config.accounts) {
-            const state = accountStates[acc.accountId];
-            if (state.volume > 0 && state.entryPrice > 0) {
-                state.targetPrice = calculateTargetPrice(state);
+            const success = await updateExchangeLeverage(acc, newLeverage);
+            if (!success) allSuccess = false;
+        }
+        
+        if (allSuccess) {
+            changes.push(`Leverage: ${config.leverage}x → ${newLeverage}x (TP: ${newTakeProfit}%, move: ${priceMove}%)`);
+            config.leverage = newLeverage;
+            config.takeProfitPct = newTakeProfit;
+            leverageUpdated = true;
+            
+            // Update target prices for active positions
+            for (const acc of config.accounts) {
+                const state = accountStates[acc.accountId];
+                if (state.volume > 0 && state.entryPrice > 0) {
+                    state.targetPrice = calculateTargetPrice(state);
+                    console.log(`🔄 Updated ${state.direction} TP to ${state.targetPrice.toFixed(8)}`);
+                }
             }
+        } else {
+            console.log(`⚠️ Failed to update leverage on exchange, keeping current ${config.leverage}x`);
         }
     }
     
@@ -227,12 +271,13 @@ function localAIController() {
             time: new Date().toLocaleString(),
             changes: changes,
             reason: reason,
-            type: 'local'
+            type: 'local',
+            exchangeLeverage: config.leverage
         });
         if (market.aiConfigChanges.length > 20) market.aiConfigChanges.pop();
     }
     
-    const recommendationText = `🧠 LOCAL AI CONTROLLER ACTIVE\n\n📊 Current Settings:\n• Leverage: ${config.leverage}x (TP: ${config.takeProfitPct}%)\n• Required Price Move: ${priceMove}%\n• Risk: ${config.riskPercent}% | Volume: ${config.baseVolume}\n\n${changes.length > 0 ? '✅ Changes Made:\n' + changes.map(c => '• ' + c).join('\n') : '⚙️ Settings optimized'}\n\n📈 Reason: ${reason}`;
+    const recommendationText = `🧠 LOCAL AI CONTROLLER ACTIVE\n\n📊 Current Exchange Settings:\n• Leverage: ${config.leverage}x (TP: ${config.takeProfitPct}%)\n• Required Price Move: ${priceMove}%\n• Risk: ${config.riskPercent}% | Volume: ${config.baseVolume}\n\n${changes.length > 0 ? '✅ Changes Made:\n' + changes.map(c => '• ' + c).join('\n') : '⚙️ Settings optimized'}\n\n📈 Reason: ${reason}`;
     
     market.aiRecommendation = {
         text: recommendationText,
@@ -260,7 +305,10 @@ async function ollamaAIController() {
         const winRate = market.totalTrades > 0 ? ((market.winningTrades / market.totalTrades) * 100).toFixed(1) : 0;
         const volatility = market.dogeVolatility || 2;
         
-        // Use curl command to call Ollama (more reliable than node package sometimes)
+        const { exec } = require('child_process');
+        const util = require('util');
+        const execPromise = util.promisify(exec);
+        
         const prompt = `Analyze this DOGE trading data and output NEW CONFIGURATION values ONLY:
 
 DATA:
@@ -284,11 +332,6 @@ BASE_VOLUME: [number]
 
 No explanation, just values.`;
 
-        const { exec } = require('child_process');
-        const util = require('util');
-        const execPromise = util.promisify(exec);
-        
-        // Call Ollama via command line
         const { stdout } = await execPromise(`ollama run ${config.ollamaModel} "${prompt.replace(/"/g, '\\"')}"`, { timeout: 30000 });
         
         console.log('🤖 Ollama Response:', stdout);
@@ -320,16 +363,30 @@ No explanation, just values.`;
         
         let changes = [];
         
+        // Update leverage on exchange if changed
         if (newLeverage !== config.leverage) {
-            changes.push(`Leverage: ${config.leverage}x → ${newLeverage}x (TP: ${newTakeProfit}%)`);
-            config.leverage = newLeverage;
-            config.takeProfitPct = newTakeProfit;
+            console.log(`\n🔧 Ollama AI wants to change leverage from ${config.leverage}x to ${newLeverage}x`);
+            console.log(`📡 Sending update to HTX exchange...`);
             
+            let allSuccess = true;
             for (const acc of config.accounts) {
-                const state = accountStates[acc.accountId];
-                if (state.volume > 0 && state.entryPrice > 0) {
-                    state.targetPrice = calculateTargetPrice(state);
+                const success = await updateExchangeLeverage(acc, newLeverage);
+                if (!success) allSuccess = false;
+            }
+            
+            if (allSuccess) {
+                changes.push(`Leverage: ${config.leverage}x → ${newLeverage}x (TP: ${newTakeProfit}%)`);
+                config.leverage = newLeverage;
+                config.takeProfitPct = newTakeProfit;
+                
+                for (const acc of config.accounts) {
+                    const state = accountStates[acc.accountId];
+                    if (state.volume > 0 && state.entryPrice > 0) {
+                        state.targetPrice = calculateTargetPrice(state);
+                    }
                 }
+            } else {
+                console.log(`⚠️ Failed to update leverage on exchange, keeping current ${config.leverage}x`);
             }
         }
         
@@ -354,12 +411,13 @@ No explanation, just values.`;
                 timestamp: Date.now(),
                 time: new Date().toLocaleString(),
                 changes: changes,
-                type: 'ollama'
+                type: 'ollama',
+                exchangeLeverage: config.leverage
             });
             if (market.aiConfigChanges.length > 20) market.aiConfigChanges.pop();
         }
         
-        const recommendationText = `🧠 OLLAMA AI CONTROLLER ACTIVE\n\n📊 Current Settings:\n• Leverage: ${config.leverage}x (TP: ${config.takeProfitPct}%)\n• Required Price Move: ${priceMove}%\n• Risk: ${config.riskPercent}% | Volume: ${config.baseVolume}\n\n${changes.length > 0 ? '✅ Changes Made:\n' + changes.map(c => '• ' + c).join('\n') : '⚙️ Settings optimized for current conditions'}\n\n📈 Market: Spread ${market.spread.toFixed(3)}% | Volatility ${volatility.toFixed(1)}%`;
+        const recommendationText = `🧠 OLLAMA AI CONTROLLER ACTIVE\n\n📊 Current Exchange Settings:\n• Leverage: ${config.leverage}x (TP: ${config.takeProfitPct}%)\n• Required Price Move: ${priceMove}%\n• Risk: ${config.riskPercent}% | Volume: ${config.baseVolume}\n\n${changes.length > 0 ? '✅ Changes Made:\n' + changes.map(c => '• ' + c).join('\n') : '⚙️ Settings optimized'}\n\n📈 Market: Spread ${market.spread.toFixed(3)}% | Volatility ${volatility.toFixed(1)}%`;
         
         market.aiRecommendation = {
             text: recommendationText,
@@ -387,18 +445,18 @@ async function aiController() {
     if (!config.aiEnabled) return;
     
     console.log('\n🤖 AI CONTROLLER running...');
+    console.log(`   Current exchange leverage: ${config.leverage}x`);
+    console.log(`   Current TP: ${config.takeProfitPct}%`);
     
-    // Calculate current metrics
     calculateDogeVolatility();
     
-    // Try Ollama first, fallback to local
     let success = false;
     if (market.ollamaAvailable) {
         success = await ollamaAIController();
     }
     
     if (!success) {
-        localAIController();
+        await localAIController();
     }
     
     market.aiLastUpdate = Date.now();
@@ -428,7 +486,7 @@ function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
     market.currentRiskAmount = riskAmount;
     market.currentBaseDoge = dogeAmountTotal;
     
-    console.log(`\n💰 AUTO-COMPOUNDING: ${volume} contracts = ${dogeAmountTotal.toLocaleString()} DOGE`);
+    console.log(`\n💰 AUTO-COMPOUNDING: ${volume} contracts = ${dogeAmountTotal.toLocaleString()} DOGE (${config.leverage}x leverage)`);
     
     return volume;
 }
@@ -813,7 +871,7 @@ async function processMartingale() {
                 continue;
             }
             
-            console.log(`🚀 Opening ${state.direction} position at ${currentPrice.toFixed(8)} with ${market.currentBaseVolume} contract(s)`);
+            console.log(`🚀 Opening ${state.direction} position at ${currentPrice.toFixed(8)} with ${market.currentBaseVolume} contract(s) at ${config.leverage}x leverage`);
             state.isLocked = true;
             state.lastAction = "Opening Position...";
             
@@ -822,7 +880,7 @@ async function processMartingale() {
                 volume: market.currentBaseVolume,
                 direction: state.direction,
                 offset: 'open',
-                lever_rate: config.leverage,
+                lever_rate: config.leverage,  // USING CURRENT CONFIG LEVERAGE
                 order_price_type: 'optimal_20'
             });
             
@@ -839,7 +897,7 @@ async function processMartingale() {
                     if (orderInfo?.data?.[0]?.status === 6) {
                         state.entryPrice = parseFloat(orderInfo.data[0].price_avg);
                         state.targetPrice = calculateTargetPrice(state);
-                        console.log(`✅ Position opened at ${state.entryPrice.toFixed(8)}, TP: ${state.targetPrice.toFixed(8)} (${config.takeProfitPct}% @ ${config.leverage}x)`);
+                        console.log(`✅ Position opened at ${state.entryPrice.toFixed(8)} with ${config.leverage}x leverage, TP: ${state.targetPrice.toFixed(8)} (${config.takeProfitPct}%)`);
                         state.isLocked = false;
                     }
                 }, 2000);
@@ -858,13 +916,13 @@ async function processMartingale() {
             if (market.ask >= state.targetPrice && state.targetPrice > 0) {
                 shouldTakeProfit = true;
                 exitPrice = market.ask;
-                console.log(`🎯 LONG TP triggered! Target: ${config.takeProfitPct}%`);
+                console.log(`🎯 LONG TP triggered! Target: ${config.takeProfitPct}% @ ${config.leverage}x`);
             }
         } else {
             if (market.bid <= state.targetPrice && state.targetPrice > 0) {
                 shouldTakeProfit = true;
                 exitPrice = market.bid;
-                console.log(`🎯 SHORT TP triggered! Target: ${config.takeProfitPct}%`);
+                console.log(`🎯 SHORT TP triggered! Target: ${config.takeProfitPct}% @ ${config.leverage}x`);
             }
         }
         
@@ -882,7 +940,7 @@ async function processMartingale() {
                 volume: state.volume,
                 direction: state.direction === 'buy' ? 'sell' : 'buy',
                 offset: 'close',
-                lever_rate: config.leverage,
+                lever_rate: config.leverage,  // USING CURRENT CONFIG LEVERAGE
                 order_price_type: 'optimal_20'
             });
             
@@ -921,7 +979,7 @@ async function processMartingale() {
                 nextVol = Math.ceil(market.currentBaseVolume * Math.pow(config.multiplier, nextStepNumber));
             }
             
-            console.log(`📈 MARTINGALE STEP ${nextStepNumber} - ROI: ${state.roi.toFixed(2)}% | Adding: ${nextVol} contracts`);
+            console.log(`📈 MARTINGALE STEP ${nextStepNumber} - ROI: ${state.roi.toFixed(2)}% | Adding: ${nextVol} contracts at ${config.leverage}x`);
             state.isLocked = true;
             
             const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
@@ -929,7 +987,7 @@ async function processMartingale() {
                 volume: nextVol,
                 direction: state.direction,
                 offset: 'open',
-                lever_rate: config.leverage,
+                lever_rate: config.leverage,  // USING CURRENT CONFIG LEVERAGE
                 order_price_type: 'optimal_20'
             });
             
@@ -944,7 +1002,7 @@ async function processMartingale() {
                 state.lastAction = "Step Failed";
             }
         } else {
-            state.lastAction = `Active - Step ${currentStep} | ROI: ${state.roi.toFixed(2)}% | TP: ${config.takeProfitPct}% @ ${config.leverage}x`;
+            state.lastAction = `Active - Step ${currentStep} | ROI: ${state.roi.toFixed(2)}% | ${config.leverage}x TP: ${config.takeProfitPct}%`;
         }
     }
 }
@@ -1112,6 +1170,37 @@ app.post('/api/ai-refresh', async (req, res) => {
     res.json({ recommendation: market.aiRecommendation });
 });
 
+app.post('/api/set-leverage', async (req, res) => {
+    const { leverage } = req.body;
+    if (!config.allowedLeverages.includes(leverage)) {
+        return res.json({ error: `Leverage must be one of: ${config.allowedLeverages.join(', ')}` });
+    }
+    
+    console.log(`🔧 Manual leverage change request to ${leverage}x`);
+    
+    let allSuccess = true;
+    for (const acc of config.accounts) {
+        const success = await updateExchangeLeverage(acc, leverage);
+        if (!success) allSuccess = false;
+    }
+    
+    if (allSuccess) {
+        config.leverage = leverage;
+        config.takeProfitPct = config.leverageTPMapping[leverage];
+        
+        for (const acc of config.accounts) {
+            const state = accountStates[acc.accountId];
+            if (state.volume > 0 && state.entryPrice > 0) {
+                state.targetPrice = calculateTargetPrice(state);
+            }
+        }
+        
+        res.json({ status: 'ok', leverage: config.leverage, takeProfit: config.takeProfitPct });
+    } else {
+        res.json({ error: 'Failed to update leverage on exchange' });
+    }
+});
+
 app.get('/api/wallet-history', (req, res) => {
     const s1 = accountStates[1];
     const s2 = accountStates[2];
@@ -1162,6 +1251,7 @@ app.get('/', (req, res) => {
         .sync-btn { background: #00D1B220; border-color: #00D1B2; color: #00D1B2; margin-left: 10px; }
         .tp-badge { background: #00D1B220; color: #00D1B2; padding: 2px 8px; border-radius: 4px; font-size: 10px; }
         .chart-container { position: relative; height: 280px; width: 100%; }
+        .leverage-select { background: #1F2A3E; border: 1px solid #6366F1; color: white; padding: 4px 8px; border-radius: 6px; margin-left: 10px; }
     </style>
 </head>
 <body class="p-6">
@@ -1173,7 +1263,13 @@ app.get('/', (req, res) => {
                     <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
                     <span class="text-[10px] font-bold text-emerald-400">LIVE</span>
                     <span class="text-[10px] text-slate-500">${config.symbol}</span>
-                    <span class="tp-badge">🎯 ${config.leverage}x = ${config.takeProfitPct}% TP (${requiredPriceMovePct}% move)</span>
+                    <span class="tp-badge">🎯 EXCHANGE: ${config.leverage}x = ${config.takeProfitPct}% TP (${requiredPriceMovePct}% move)</span>
+                    <select id="leverageSelect" class="leverage-select" onchange="setLeverage(this.value)">
+                        <option value="75" ${config.leverage === 75 ? 'selected' : ''}>75x (15% TP)</option>
+                        <option value="50" ${config.leverage === 50 ? 'selected' : ''}>50x (10% TP)</option>
+                        <option value="25" ${config.leverage === 25 ? 'selected' : ''}>25x (5% TP)</option>
+                        <option value="10" ${config.leverage === 10 ? 'selected' : ''}>10x (1.5% TP)</option>
+                    </select>
                 </div>
             </div>
             <div>
@@ -1188,7 +1284,7 @@ app.get('/', (req, res) => {
                 <div class="flex items-center gap-2">
                     <span class="text-xl">🧠</span>
                     <h3 class="font-bold text-indigo-400">AI Controller Active</h3>
-                    <span class="text-[9px] bg-indigo-500/30 px-2 py-0.5 rounded" id="aiTypeBadge">CONFIGURES ALL SETTINGS</span>
+                    <span class="text-[9px] bg-indigo-500/30 px-2 py-0.5 rounded" id="aiTypeBadge">CONFIGURES EXCHANGE LEVERAGE</span>
                 </div>
                 <button onclick="refreshAI()" class="refresh-ai rounded">🔄 Force AI Reconfig</button>
             </div>
@@ -1213,7 +1309,7 @@ app.get('/', (req, res) => {
                 <div class="flex justify-between">
                     <div><p class="text-xs text-slate-400">📈 AUTO-COMPOUNDING</p><p id="baseVolumeDisplay" class="text-sm font-bold text-green-400">Volume: 0 contracts</p></div>
                     <div><p class="text-xs text-slate-400">Risk Amount</p><p id="riskAmount" class="text-sm font-bold">$0.00</p></div>
-                    <div><p class="text-xs text-slate-400">Current Config</p><p id="currentConfig" class="text-sm">${config.leverage}x | TP ${config.takeProfitPct}%</p></div>
+                    <div><p class="text-xs text-slate-400">Exchange Leverage</p><p id="exchangeLeverage" class="text-sm font-bold text-indigo-400">${config.leverage}x</p></div>
                 </div>
             </div>
         </div>
@@ -1231,6 +1327,21 @@ app.get('/', (req, res) => {
     <script>
         let walletChart = null;
         
+        async function setLeverage(leverage) {
+            const res = await fetch('/api/set-leverage', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ leverage: parseInt(leverage) })
+            });
+            const data = await res.json();
+            if (data.status === 'ok') {
+                alert(`Leverage updated to ${data.leverage}x with ${data.takeProfit}% TP`);
+                location.reload();
+            } else {
+                alert('Failed to update leverage: ' + data.error);
+            }
+        }
+        
         async function forceSync() { const btn = event.target; btn.textContent = '🔄 SYNCING...'; await fetch('/api/force-sync', {method: 'POST'}); setTimeout(() => btn.textContent = '🔄 FORCE SYNC', 1000); }
         async function emergencyClose() { if(confirm('Close ALL positions?')) { await fetch('/api/close', {method: 'POST'}); alert('Emergency liquidation initiated'); } }
         async function refreshAI() { const btn = event.target; btn.textContent = '⟳ FORCING AI...'; await fetch('/api/ai-refresh', {method: 'POST'}); setTimeout(() => btn.textContent = '🔄 Force AI Reconfig', 1000); }
@@ -1240,7 +1351,7 @@ app.get('/', (req, res) => {
                 const res = await fetch('/api/status');
                 const data = await res.json();
                 
-                document.getElementById('totalWallet').textContent = '$' + data.market.totalEquity?.toFixed(4) || '$0.00';
+                document.getElementById('totalWallet').textContent = '$' + (data.market.totalEquity?.toFixed(4) || '0.00');
                 document.getElementById('totalPnl').textContent = (data.market.totalNetGain >= 0 ? '+' : '') + '$' + (data.market.totalNetGain?.toFixed(4) || '0.00');
                 document.getElementById('realizedPnl').textContent = (data.market.totalRealizedPnl >= 0 ? '+' : '') + '$' + (data.market.totalRealizedPnl?.toFixed(4) || '0.00');
                 document.getElementById('peakEquity').innerHTML = 'Peak: $' + (data.market.peakEquity?.toFixed(4) || '0.00');
@@ -1249,7 +1360,7 @@ app.get('/', (req, res) => {
                 document.getElementById('winRate').innerHTML = 'Win Rate: ' + (data.market.winRate || 0) + '%';
                 document.getElementById('baseVolumeDisplay').innerHTML = 'Volume: ' + (data.market.currentBaseVolume || 0) + ' contracts (' + (data.market.currentBaseDoge?.toLocaleString() || 0) + ' DOGE)';
                 document.getElementById('riskAmount').innerHTML = '$' + (data.market.currentRiskAmount?.toFixed(8) || '0.00');
-                document.getElementById('currentConfig').innerHTML = (data.market.currentConfig?.leverage || 75) + 'x | TP ' + (data.market.currentConfig?.takeProfitPct || 15) + '%';
+                document.getElementById('exchangeLeverage').innerHTML = (data.market.currentConfig?.leverage || 75) + 'x';
                 document.getElementById('aiConfigDisplay').innerHTML = 'Leverage: ' + (data.market.currentConfig?.leverage || 75) + 'x<br>TP: ' + (data.market.currentConfig?.takeProfitPct || 15) + '%<br>Risk: ' + (data.market.currentConfig?.riskPercent || 0.25) + '%';
                 
                 if (data.market.aiRecommendation) {
@@ -1298,9 +1409,11 @@ async function start() {
     app.listen(config.port, '0.0.0.0', async () => {
         console.log(`\n✅ Martingale DOGE Bot Started`);
         console.log(`🎯 Leverage-TP Mapping: 75x=15%, 50x=10%, 25x=5%, 10x=1.5%`);
-        console.log(`📊 Current: ${config.leverage}x = ${config.takeProfitPct}% TP`);
+        console.log(`📊 Current Exchange Leverage: ${config.leverage}x = ${config.takeProfitPct}% TP`);
+        console.log(`📊 Required Price Move: ${(config.takeProfitPct / config.leverage).toFixed(3)}%`);
         console.log(`🌐 Dashboard: http://localhost:${config.port}`);
-        console.log(`🤖 AI Controller: ${market.ollamaAvailable ? 'OLLAMA ACTIVE' : 'LOCAL MODE'}\n`);
+        console.log(`🤖 AI Controller: ${market.ollamaAvailable ? 'OLLAMA ACTIVE' : 'LOCAL MODE'}`);
+        console.log(`\n⚠️  IMPORTANT: AI will automatically adjust leverage on HTX exchange!\n`);
         
         // Run initial AI configuration after 5 seconds
         setTimeout(async () => {
