@@ -30,18 +30,19 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
     multiplier: 1.2,
-    stepDistancePct: 10, // Triggers at -10% ROI
+    stepDistancePct: 10,
     takeProfitPct: 15,
     maxStartSpread: parseFloat(process.env.MAX_START_SPREAD) || 0.1,
     takerFeeRate: 0.0005,
     pollInterval: 500,
     contractMultiplier: 0.001,
     autoCompound: true,
-    riskPercent: 0.1,
+    riskPercent: 2,
     shibPerContract: 1000,
-    walletPerContract: 0.0066135,  // $0.0066135 wallet = 1 contract at 75x leverage
+    walletPerContract: 0.0066135,
     ollamaUrl: process.env.OLLAMA_URL || 'http://localhost:11434',
-    ollamaModel: process.env.OLLAMA_MODEL || 'llama3.2'
+    ollamaModel: process.env.OLLAMA_MODEL || 'llama3.2',
+    aiControlEnabled: true  // AI controls all actions - NO automatic steps
 };
 
 let market = {
@@ -59,7 +60,9 @@ let market = {
     currentBaseVolume: parseInt(process.env.BASE_VOLUME) || 1,
     currentBaseShib: 0,
     currentRiskAmount: 0,
-    lastBaseUpdate: Date.now()
+    lastBaseUpdate: Date.now(),
+    aiModeEnabled: true,
+    lastAiCheck: 0
 };
 
 let tradeHistory = [];
@@ -67,8 +70,8 @@ let accountStates = {};
 let lastPositionFetch = {};
 let lastBalanceFetch = {};
 let aiRecommendations = {
-    long: { recommendation: 'Waiting for data...', confidence: 0, lastUpdate: null },
-    short: { recommendation: 'Waiting for data...', confidence: 0, lastUpdate: null }
+    long: { recommendation: 'HOLD: Waiting for AI analysis...', confidence: 0, lastUpdate: null, action: 'HOLD' },
+    short: { recommendation: 'HOLD: Waiting for AI analysis...', confidence: 0, lastUpdate: null, action: 'HOLD' }
 };
 
 function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
@@ -183,7 +186,7 @@ config.accounts.forEach((account, idx) => {
         currentEquity: 0, availableMargin: 0, initialEquity: null,
         isLocked: false,
         pendingOrderId: null,
-        lastAction: 'Idle',
+        lastAction: '🤖 Waiting for AI recommendation...',
         lastStepPrice: 0, lastAddedVolume: 0, startTime: null,
         lastExchangeRoi: 0,
         roiLatencyMs: 0,
@@ -191,7 +194,9 @@ config.accounts.forEach((account, idx) => {
         lastRoiUpdateTime: Date.now(),
         targetPrice: 0,
         realizedPnl: 0,
-        totalFees: 0
+        totalFees: 0,
+        lastAiRecommendation: null,
+        aiActionTaken: false
     };
 });
 
@@ -338,6 +343,7 @@ async function syncAccount(acc, state) {
                 state.lastAddedVolume = 0;
                 state.lastExchangeRoi = 0;
                 state.targetPrice = 0;
+                state.aiActionTaken = false;
             }
         }
     }
@@ -375,11 +381,12 @@ async function getAIRecommendation(direction, state, marketData) {
         const nextStepVolume = currentStep === 0 ? market.currentBaseVolume : Math.ceil(market.currentBaseVolume * Math.pow(config.multiplier, currentStep + 1));
         
         const prompt = `You are a crypto futures trading advisor for HTX. Analyze this ${direction.toUpperCase()} position and give ONLY ONE of these exact recommendations:
-- "STEP UP: Add ${nextStepVolume} contracts (martingale)"
-- "STEP DOWN: Reduce position by 50%"
-- "CLOSE POSITION: Take profit/loss now"
-- "OPEN POSITION: Start new ${direction} position with ${market.currentBaseVolume} contracts"
-- "HOLD: No action needed"
+
+RULES:
+- If NO position exists (volume = 0) and spread < ${config.maxStartSpread}%: Recommend "OPEN POSITION"
+- If position exists and ROI <= -${config.stepDistancePct}%: Recommend "STEP UP: Add ${nextStepVolume} contracts"
+- If position exists and ROI >= ${config.takeProfitPct}%: Recommend "CLOSE POSITION"
+- Otherwise: Recommend "HOLD"
 
 Position Data:
 - Current ROI: ${state.roi.toFixed(2)}%
@@ -389,20 +396,19 @@ Position Data:
 - Target Price: ${state.targetPrice.toFixed(8)}
 - Unrealized PnL: $${state.unrealizedUsdt.toFixed(8)}
 - Current Price: $${direction === 'buy' ? market.bid : market.ask}
-- Max Step Trigger: -${config.stepDistancePct}% ROI
 
 Market Conditions:
 - Spread: ${market.spread.toFixed(3)}%
+- Max Start Spread: ${config.maxStartSpread}%
 - Total Wallet: $${marketData.totalEquity.toFixed(8)}
-- Market Trend: ${market.bid > market.ask ? 'BULLISH' : 'BEARISH'}
 
-Rules:
-- STEP UP only if ROI <= -${config.stepDistancePct}% AND position is active
-- CLOSE POSITION only if ROI >= ${config.takeProfitPct}% OR emergency conditions
-- OPEN POSITION only if no position exists AND spread < ${config.maxStartSpread}%
-- HOLD for all other cases
+Respond with EXACTLY ONE of these formats:
+- "OPEN POSITION: Start new ${direction} position with ${market.currentBaseVolume} contracts"
+- "STEP UP: Add ${nextStepVolume} contracts (martingale)"
+- "CLOSE POSITION: Take profit/loss now"
+- "HOLD: No action needed"
 
-Respond with ONLY the recommendation text, nothing else.`;
+DO NOT add any other text or explanation.`;
 
         const response = await axios.post(`${config.ollamaUrl}/api/generate`, {
             model: config.ollamaModel,
@@ -411,23 +417,20 @@ Respond with ONLY the recommendation text, nothing else.`;
             options: {
                 temperature: 0.1,
                 top_p: 0.9,
-                num_predict: 50
+                num_predict: 60
             }
         });
 
         let recommendation = response.data.response.trim();
         
-        // Validate recommendation is one of the allowed types
-        const validRecommendations = ['STEP UP', 'STEP DOWN', 'CLOSE POSITION', 'OPEN POSITION', 'HOLD'];
-        let isValid = false;
-        for (const valid of validRecommendations) {
-            if (recommendation.startsWith(valid)) {
-                isValid = true;
-                break;
-            }
-        }
-        
-        if (!isValid) {
+        // Validate and clean recommendation
+        if (recommendation.includes('OPEN POSITION')) {
+            recommendation = `OPEN POSITION: Start new ${direction} position with ${market.currentBaseVolume} contracts`;
+        } else if (recommendation.includes('STEP UP')) {
+            recommendation = `STEP UP: Add ${nextStepVolume} contracts (martingale)`;
+        } else if (recommendation.includes('CLOSE POSITION')) {
+            recommendation = 'CLOSE POSITION: Take profit/loss now';
+        } else {
             recommendation = 'HOLD: No action needed';
         }
         
@@ -435,18 +438,7 @@ Respond with ONLY the recommendation text, nothing else.`;
         
     } catch (error) {
         console.error(`AI Error for ${direction}:`, error.message);
-        // Fallback logic based on rules
-        if (state.volume === 0) {
-            if (market.spread <= config.maxStartSpread) {
-                return `OPEN POSITION: Start new ${direction} position with ${market.currentBaseVolume} contracts`;
-            }
-            return 'HOLD: Spread too high';
-        } else if (state.roi <= -config.stepDistancePct) {
-            const nextStepVolume = currentStep === 0 ? market.currentBaseVolume : Math.ceil(market.currentBaseVolume * Math.pow(config.multiplier, currentStep + 1));
-            return `STEP UP: Add ${nextStepVolume} contracts (martingale)`;
-        } else if (state.roi >= config.takeProfitPct) {
-            return 'CLOSE POSITION: Take profit now';
-        }
+        // Fallback - only HOLD, no automatic actions
         return 'HOLD: No action needed';
     }
 }
@@ -475,40 +467,46 @@ async function updateAIRecommendations() {
         
         aiRecommendations.long = {
             recommendation: longRec,
-            confidence: 85,
-            lastUpdate: new Date().toISOString()
+            confidence: 90,
+            lastUpdate: new Date().toISOString(),
+            action: longRec.split(':')[0]
         };
         
         aiRecommendations.short = {
             recommendation: shortRec,
-            confidence: 85,
-            lastUpdate: new Date().toISOString()
+            confidence: 90,
+            lastUpdate: new Date().toISOString(),
+            action: shortRec.split(':')[0]
         };
         
-        console.log(`\n🤖 AI RECOMMENDATIONS:`);
+        console.log(`\n🤖 AI RECOMMENDATIONS (${new Date().toLocaleTimeString()}):`);
         console.log(`   LONG: ${longRec}`);
         console.log(`   SHORT: ${shortRec}\n`);
         
-        // Execute AI recommendations (optional)
-        await executeAIRecommendation('long', longRec, longState);
-        await executeAIRecommendation('short', shortRec, shortState);
+        // Execute AI recommendations
+        await executeAIRecommendation('long', longRec, longState, 1);
+        await executeAIRecommendation('short', shortRec, shortState, 2);
         
     } catch (error) {
         console.error('AI recommendation error:', error);
     }
 }
 
-async function executeAIRecommendation(direction, recommendation, state) {
-    const acc = config.accounts.find(a => a.accountId === (direction === 'long' ? 1 : 2));
+async function executeAIRecommendation(direction, recommendation, state, accountId) {
+    const acc = config.accounts.find(a => a.accountId === accountId);
     if (!acc || state.isLocked) return;
     
-    if (recommendation.startsWith('STEP UP')) {
-        if (state.volume > 0 && state.roi <= -config.stepDistancePct) {
+    const action = recommendation.split(':')[0];
+    
+    // STEP UP action
+    if (action === 'STEP UP') {
+        if (state.volume > 0) {
             const match = recommendation.match(/(\d+)/);
             const volumeToAdd = match ? parseInt(match[0]) : Math.ceil(market.currentBaseVolume * config.multiplier);
             
-            console.log(`🤖 AI EXECUTING: ${recommendation}`);
+            console.log(`🤖 AI EXECUTING STEP UP: Adding ${volumeToAdd} contracts to ${direction} position`);
             state.isLocked = true;
+            state.lastAction = `🤖 AI: STEP UP +${volumeToAdd}`;
             
             const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol,
@@ -521,32 +519,63 @@ async function executeAIRecommendation(direction, recommendation, state) {
             
             if (res?.status === 'ok') {
                 state.pendingOrderId = res.data?.order_id_str;
-                state.lastAction = `AI: ${recommendation}`;
+                console.log(`✅ AI STEP UP executed for ${direction}`);
+            } else {
+                console.error(`❌ AI STEP UP failed:`, res);
+                state.lastAction = `❌ AI STEP UP Failed`;
             }
             setTimeout(() => { state.isLocked = false; }, 2000);
         }
-    } else if (recommendation.startsWith('CLOSE POSITION') && state.volume > 0) {
-        console.log(`🤖 AI EXECUTING: ${recommendation}`);
-        state.isLocked = true;
-        
-        const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-            contract_code: config.symbol,
-            volume: state.volume,
-            direction: state.direction === 'buy' ? 'sell' : 'buy',
-            offset: 'close',
-            lever_rate: config.leverage,
-            order_price_type: 'optimal_20'
-        });
-        
-        if (res?.status === 'ok') {
-            state.pendingOrderId = res.data?.order_id_str;
-            state.lastAction = `AI: ${recommendation}`;
-        }
-        setTimeout(() => { state.isLocked = false; }, 2000);
-    } else if (recommendation.startsWith('OPEN POSITION') && state.volume === 0) {
-        if (market.spread <= config.maxStartSpread) {
-            console.log(`🤖 AI EXECUTING: ${recommendation}`);
+    }
+    // CLOSE POSITION action
+    else if (action === 'CLOSE POSITION') {
+        if (state.volume > 0) {
+            console.log(`🤖 AI EXECUTING CLOSE POSITION: Closing ${state.volume} contracts ${direction}`);
             state.isLocked = true;
+            state.lastAction = `🤖 AI: CLOSE POSITION`;
+            
+            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
+                contract_code: config.symbol,
+                volume: state.volume,
+                direction: state.direction === 'buy' ? 'sell' : 'buy',
+                offset: 'close',
+                lever_rate: config.leverage,
+                order_price_type: 'optimal_20'
+            });
+            
+            if (res?.status === 'ok') {
+                state.pendingOrderId = res.data?.order_id_str;
+                console.log(`✅ AI CLOSE POSITION executed for ${direction}`);
+                
+                // Log trade
+                const finalRoi = state.roi;
+                const finalPnl = state.unrealizedUsdt;
+                const exitTime = new Date().toLocaleString();
+                logTradeExchangeStyle(state, state.direction === 'buy' ? market.bid : market.ask, exitTime, finalRoi, finalPnl);
+                
+                // Reset position
+                state.volume = 0;
+                state.roi = 0;
+                state.unrealizedUsdt = 0;
+                state.entryPrice = 0;
+                state.lastStepPrice = 0;
+                state.startTime = null;
+                state.lastAddedVolume = 0;
+                state.targetPrice = 0;
+                state.aiActionTaken = false;
+            } else {
+                console.error(`❌ AI CLOSE POSITION failed:`, res);
+                state.lastAction = `❌ AI CLOSE Failed`;
+            }
+            setTimeout(() => { state.isLocked = false; }, 2000);
+        }
+    }
+    // OPEN POSITION action
+    else if (action === 'OPEN POSITION') {
+        if (state.volume === 0 && market.spread <= config.maxStartSpread) {
+            console.log(`🤖 AI EXECUTING OPEN POSITION: Opening ${market.currentBaseVolume} contracts ${direction} at ${state.direction === 'buy' ? market.bid : market.ask}`);
+            state.isLocked = true;
+            state.lastAction = `🤖 AI: OPEN POSITION`;
             
             const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol,
@@ -557,11 +586,38 @@ async function executeAIRecommendation(direction, recommendation, state) {
                 order_price_type: 'optimal_20'
             });
             
-            if (res?.status === 'ok') {
-                state.pendingOrderId = res.data?.order_id_str;
-                state.lastAction = `AI: ${recommendation}`;
+            if (res?.status === 'ok' && res.data?.order_id_str) {
+                state.pendingOrderId = res.data.order_id_str;
+                console.log(`✅ AI OPEN POSITION executed for ${direction}`);
+                
+                setTimeout(async () => {
+                    const orderInfo = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order_info', {
+                        contract_code: config.symbol,
+                        order_id: res.data.order_id_str
+                    });
+                    
+                    if (orderInfo?.data?.[0]?.status === 6) {
+                        state.entryPrice = parseFloat(orderInfo.data[0].price_avg);
+                        state.targetPrice = calculateTargetPrice(state);
+                        console.log(`✅ Position opened at ${state.entryPrice.toFixed(8)}, TP: ${state.targetPrice.toFixed(8)}`);
+                        state.isLocked = false;
+                    }
+                }, 2000);
+            } else {
+                state.isLocked = false;
+                state.lastAction = `❌ AI OPEN Failed`;
+                console.error(`❌ AI OPEN POSITION failed:`, res);
             }
-            setTimeout(() => { state.isLocked = false; }, 2000);
+        } else if (state.volume > 0) {
+            console.log(`⚠️ AI recommended OPEN but position already exists for ${direction}`);
+        } else if (market.spread > config.maxStartSpread) {
+            console.log(`⚠️ AI recommended OPEN but spread too high: ${market.spread.toFixed(2)}% > ${config.maxStartSpread}%`);
+        }
+    }
+    // HOLD action
+    else {
+        if (state.lastAction !== `🤖 AI: HOLD`) {
+            state.lastAction = `🤖 AI: HOLD - No action needed`;
         }
     }
 }
@@ -638,155 +694,26 @@ function startWS() {
 }
 
 async function processMartingale() {
+    // AI CONTROLLED ONLY - No automatic actions
+    // This function only updates status, no automatic trading
+    
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
-        if (state.isLocked || market.bid === 0 || market.ask === 0) continue;
+        if (state.isLocked) continue;
         
-        const currentPrice = state.direction === 'buy' ? market.bid : market.ask;
-        
-        if (currentPrice === 0) continue;
-
-        if (state.volume === 0) {
-            if (market.spread > config.maxStartSpread && market.spread > 0) {
-                state.lastAction = `Wait Spread (${market.spread.toFixed(2)}% > ${config.maxStartSpread}%)`;
-                continue;
-            }
-            
-            // Check AI recommendation before opening
-            if (aiRecommendations[state.direction === 'buy' ? 'long' : 'short'].recommendation.includes('OPEN POSITION')) {
-                console.log(`🤖 AI approved ${state.direction} position at ${currentPrice.toFixed(8)} with ${market.currentBaseVolume} contract(s)`);
-                state.isLocked = true;
-                state.lastAction = "AI: Opening Position...";
-                
-                const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                    contract_code: config.symbol,
-                    volume: market.currentBaseVolume,
-                    direction: state.direction,
-                    offset: 'open',
-                    lever_rate: config.leverage,
-                    order_price_type: 'optimal_20'
-                });
-                
-                if (res?.status === 'ok' && res.data?.order_id_str) {
-                    state.pendingOrderId = res.data.order_id_str;
-                    state.lastAction = "AI: Position Opening";
-                    
-                    setTimeout(async () => {
-                        const orderInfo = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order_info', {
-                            contract_code: config.symbol,
-                            order_id: res.data.order_id_str
-                        });
-                        
-                        if (orderInfo?.data?.[0]?.status === 6) {
-                            state.entryPrice = parseFloat(orderInfo.data[0].price_avg);
-                            state.targetPrice = calculateTargetPrice(state);
-                            console.log(`✅ Position opened at ${state.entryPrice.toFixed(8)}, TP target: ${state.targetPrice.toFixed(8)}`);
-                            state.isLocked = false;
-                        }
-                    }, 2000);
-                } else {
-                    state.isLocked = false;
-                    state.lastAction = "AI: Open Failed";
-                    console.error(`Open order failed:`, res);
-                }
-            }
-            continue;
-        }
-
-        let shouldTakeProfit = false;
-        let exitPrice = 0;
-        
-        if (state.direction === 'buy') {
-            if (market.ask >= state.targetPrice && state.targetPrice > 0) {
-                shouldTakeProfit = true;
-                exitPrice = market.ask;
-                console.log(`🎯 LONG TP triggered! ASK: ${market.ask.toFixed(8)} >= Target: ${state.targetPrice.toFixed(8)}`);
-            }
-        } else {
-            if (market.bid <= state.targetPrice && state.targetPrice > 0) {
-                shouldTakeProfit = true;
-                exitPrice = market.bid;
-                console.log(`🎯 SHORT TP triggered! BID: ${market.bid.toFixed(8)} <= Target: ${state.targetPrice.toFixed(8)}`);
-            }
-        }
-        
-        if (shouldTakeProfit || aiRecommendations[state.direction === 'buy' ? 'long' : 'short'].recommendation.includes('CLOSE POSITION')) {
-            const finalRoi = config.takeProfitPct;
-            const finalPnl = state.unrealizedUsdt;
-            const exitTime = new Date().toLocaleString();
-            const currentStep = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
-            
-            console.log(`✅ Taking ${state.direction} profit at ${exitPrice.toFixed(8)} (Target ROI: ${finalRoi}%, Step ${currentStep}, Vol: ${state.volume})`);
-            state.isLocked = true;
-            state.lastAction = "AI: Taking Profit...";
-            
-            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol,
-                volume: state.volume,
-                direction: state.direction === 'buy' ? 'sell' : 'buy',
-                offset: 'close',
-                lever_rate: config.leverage,
-                order_price_type: 'optimal_20'
-            });
-            
-            if (res?.status === 'ok' && res.data?.order_id_str) {
-                state.pendingOrderId = res.data.order_id_str;
-                state.lastAction = "AI: Take Profit Close";
-                logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl);
-                
-                state.volume = 0;
-                state.roi = 0;
-                state.unrealizedUsdt = 0;
-                state.entryPrice = 0;
-                state.lastStepPrice = 0;
-                state.startTime = null;
-                state.lastAddedVolume = 0;
-                state.targetPrice = 0;
-            } else {
-                state.isLocked = false;
-                state.lastAction = "AI: TP Failed";
-                console.error(`Take profit failed:`, res);
-            }
-            continue;
-        }
-
         const currentStep = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
         
-        // Check AI for martingale step
-        if ((state.roi <= -10 && state.volume > 0) || aiRecommendations[state.direction === 'buy' ? 'long' : 'short'].recommendation.includes('STEP UP')) {
-            const nextStepNumber = currentStep + 1;
-            let nextVol;
-            
-            if (nextStepNumber === 1) {
-                nextVol = Math.ceil(market.currentBaseVolume * config.multiplier);
-            } else {
-                nextVol = Math.ceil(market.currentBaseVolume * Math.pow(config.multiplier, nextStepNumber));
-            }
-            
-            console.log(`📈 MARTINGALE STEP ${nextStepNumber} for ${state.direction} - ROI: ${state.roi.toFixed(2)}% | Adding: ${nextVol} contracts`);
-            state.isLocked = true;
-            
-            const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
-                contract_code: config.symbol,
-                volume: nextVol,
-                direction: state.direction,
-                offset: 'open',
-                lever_rate: config.leverage,
-                order_price_type: 'optimal_20'
-            });
-            
-            if (res?.status === 'ok' && res.data?.order_id_str) {
-                state.pendingOrderId = res.data.order_id_str;
-                state.lastStepPrice = currentPrice;
-                state.lastAddedVolume = nextVol;
-                state.lastAction = `AI: Martingale Step ${nextStepNumber} (Added: ${nextVol})`;
-            } else {
-                state.isLocked = false;
-                state.lastAction = "AI: Step Failed";
-            }
+        // Just update status display with AI recommendation
+        if (state.volume > 0) {
+            const aiRec = state.direction === 'buy' ? aiRecommendations.long.recommendation : aiRecommendations.short.recommendation;
+            state.lastAction = `🤖 AI: ${aiRec} | ROI: ${state.roi.toFixed(2)}% | Step ${currentStep}`;
         } else {
-            const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
-            state.lastAction = `Active - Step ${step} | Vol: ${state.volume} | ROI: ${state.roi.toFixed(2)}% | AI: ${aiRecommendations[state.direction === 'buy' ? 'long' : 'short'].recommendation}`;
+            const aiRec = state.direction === 'buy' ? aiRecommendations.long.recommendation : aiRecommendations.short.recommendation;
+            if (aiRec.includes('OPEN')) {
+                state.lastAction = `🤖 AI: ${aiRec}`;
+            } else {
+                state.lastAction = `🤖 AI: ${aiRec} | No position`;
+            }
         }
     }
 }
@@ -840,8 +767,9 @@ async function backgroundLoop() {
             }
         }
         
-        // Update AI recommendations every 30 seconds
-        if (Date.now() % 30000 < config.pollInterval) {
+        // Update AI recommendations every 15 seconds
+        if (Date.now() - market.lastAiCheck > 15000) {
+            market.lastAiCheck = Date.now();
             await updateAIRecommendations();
         }
         
@@ -852,6 +780,8 @@ async function backgroundLoop() {
         console.error('Background loop error:', e);
     }
 }
+
+// ==================== API ENDPOINTS ====================
 
 app.get('/api/status', (req, res) => {
     const s1 = accountStates[1];
@@ -907,7 +837,9 @@ app.get('/api/status', (req, res) => {
             currentBaseShib: market.currentBaseShib,
             currentRiskAmount: market.currentRiskAmount,
             shibPerContract: config.shibPerContract,
-            walletPerContract: config.walletPerContract
+            walletPerContract: config.walletPerContract,
+            aiControlEnabled: config.aiControlEnabled,
+            aiModel: config.ollamaModel
         },
         accounts: accountsWithInfo,
         tradeHistory,
@@ -923,7 +855,8 @@ app.get('/api/status', (req, res) => {
             autoCompound: config.autoCompound,
             riskPercent: config.riskPercent,
             walletPerContract: config.walletPerContract,
-            ollamaModel: config.ollamaModel
+            ollamaModel: config.ollamaModel,
+            aiControlEnabled: config.aiControlEnabled
         }
     });
 });
@@ -959,6 +892,12 @@ app.post('/api/force-sync', async (req, res) => {
         await syncAccount(acc, state);
     }
     res.json({ status: 'ok', message: 'Force sync completed' });
+});
+
+app.post('/api/force-ai-check', async (req, res) => {
+    console.log("🤖 Force AI check initiated...");
+    await updateAIRecommendations();
+    res.json({ status: 'ok', message: 'AI check completed', recommendations: aiRecommendations });
 });
 
 app.get('/api/wallet-history', (req, res) => {
@@ -1050,9 +989,17 @@ app.get('/api/verify', async (req, res) => {
             }
         },
         aiRecommendations: aiRecommendations,
-        message: `Auto-compounding: ${config.riskPercent}% of wallet. $${config.walletPerContract.toFixed(8)} wallet = 1 contract at ${config.leverage}x leverage. AI Model: ${config.ollamaModel}`
+        aiControl: {
+            enabled: config.aiControlEnabled,
+            model: config.ollamaModel,
+            checkInterval: '15 seconds',
+            message: 'All actions controlled by AI - no automatic steps'
+        },
+        message: `🤖 AI CONTROL ACTIVE: All trading decisions (OPEN, STEP UP, CLOSE) are made by Ollama AI (${config.ollamaModel}). No automatic martingale steps.`
     });
 });
+
+// ==================== HTML DASHBOARD ====================
 
 app.get('/', (req, res) => {
     const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
@@ -1063,7 +1010,7 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Martingale Pro AI - Auto-Compounding with Ollama</title>
+    <title>Martingale Pro AI - AI Controlled Trading</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
@@ -1075,15 +1022,16 @@ app.get('/', (req, res) => {
         .value-negative { color: #FF4D6D; }
         .mono { font-family: monospace; font-size: 12px; }
         .tp-target { background: #00D1B220; color: #00D1B2; padding: 2px 8px; border-radius: 4px; font-size: 10px; }
-        button { background: #FF4D6D20; border: 1px solid #FF4D6D; color: #FF4D6D; padding: 8px 16px; border-radius: 6px; cursor: pointer; }
-        button:hover { background: #FF4D6D40; }
+        button { background: #FF4D6D20; border: 1px solid #FF4D6D; color: #FF4D6D; padding: 8px 16px; border-radius: 6px; cursor: pointer; transition: all 0.2s; }
+        button:hover { background: #FF4D6D40; transform: scale(1.02); }
         .sync-btn { background: #00D1B220; border-color: #00D1B2; color: #00D1B2; margin-left: 10px; }
+        .ai-btn { background: #6366F120; border-color: #6366F1; color: #6366F1; margin-left: 10px; }
         .step-badge { background: #6366F120; color: #6366F1; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }
         .wallet-card { background: linear-gradient(135deg, #1A212E 0%, #131824 100%); border: 1px solid #00D1B240; }
         .stat-number { font-size: 28px; font-weight: 900; }
         .chart-container { position: relative; height: 280px; width: 100%; }
         .compound-info { background: #00D1B210; border: 1px solid #00D1B230; border-radius: 8px; padding: 12px; margin-top: 10px; }
-        .ai-card { background: linear-gradient(135deg, #6366F120 0%, #131824 100%); border: 1px solid #6366F1; border-radius: 12px; padding: 15px; margin-bottom: 20px; }
+        .ai-card { background: linear-gradient(135deg, #6366F120 0%, #131824 100%); border: 2px solid #6366F1; border-radius: 12px; padding: 15px; margin-bottom: 20px; }
         .ai-recommendation { font-size: 14px; font-weight: bold; padding: 10px; border-radius: 8px; margin-top: 8px; }
         .step-up { background: #FF4D6D20; color: #FF4D6D; border-left: 3px solid #FF4D6D; }
         .step-down { background: #FFB34720; color: #FFB347; border-left: 3px solid #FFB347; }
@@ -1091,13 +1039,16 @@ app.get('/', (req, res) => {
         .open-position { background: #00D1B220; color: #00D1B2; border-left: 3px solid #00D1B2; }
         .hold { background: #6366F120; color: #6366F1; border-left: 3px solid #6366F1; }
         .ai-badge { background: #6366F1; color: white; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; margin-left: 8px; }
+        .control-badge { background: #FF4D6D; color: white; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; margin-left: 8px; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .ai-pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
     </style>
 </head>
 <body class="p-6">
     <div class="max-w-7xl mx-auto">
         <div class="flex justify-between items-center mb-8">
             <div>
-                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO AI</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">OLLAMA POWERED</span></h1>
+                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO AI</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">AI CONTROLLED</span></h1>
                 <div class="flex items-center gap-3 mt-2">
                     <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
                     <span class="text-[10px] font-bold text-emerald-400">LIVE</span>
@@ -1105,12 +1056,21 @@ app.get('/', (req, res) => {
                     <span class="text-[10px] text-slate-500">${config.leverage}x LEVERAGE</span>
                     <span class="tp-target">🎯 TP: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price move</span>
                     <span class="ai-badge">🤖 AI: ${config.ollamaModel}</span>
+                    <span class="control-badge">🎮 AI CONTROLLED</span>
                 </div>
             </div>
             <div>
+                <button onclick="forceAICheck()" class="ai-btn">🤖 FORCE AI CHECK</button>
                 <button onclick="forceSync()" class="sync-btn">🔄 FORCE SYNC</button>
                 <button onclick="emergencyClose()">⚠️ EMERGENCY CLOSE</button>
             </div>
+        </div>
+
+        <!-- AI Control Status -->
+        <div class="bg-indigo-500/10 border border-indigo-500/30 rounded-lg p-3 mb-4 text-center">
+            <span class="text-indigo-400 font-bold">🤖 AI CONTROL MODE ACTIVE</span>
+            <span class="text-slate-400 text-sm ml-3">All trading decisions (OPEN, STEP UP, CLOSE) are made by Ollama AI every 15 seconds</span>
+            <span class="ai-pulse inline-block ml-2 w-2 h-2 rounded-full bg-indigo-500"></span>
         </div>
 
         <!-- AI Recommendations Panel -->
@@ -1138,7 +1098,7 @@ app.get('/', (req, res) => {
                 </div>
             </div>
             <div class="text-[10px] text-slate-500 mt-3 text-center">
-                💡 AI analyzes ROI, market conditions, spread, and wallet equity to provide recommendations
+                💡 AI analyzes ROI, market conditions, spread, and wallet equity. Bot ONLY acts on AI recommendations.
             </div>
         </div>
 
@@ -1200,7 +1160,7 @@ app.get('/', (req, res) => {
                 <p class="stat-label mb-2">CONFIG</p>
                 <p class="text-sm">Base Vol: <span id="configBaseVol">${config.baseVolume}</span></p>
                 <p class="text-sm">Multiplier: ${config.multiplier}x</p>
-                <p class="text-sm">Step Trigger: <span class="text-red-400">-${config.stepDistancePct}% ROI</span></p>
+                <p class="text-sm">Step Trigger: <span class="text-red-400">-${config.stepDistancePct}% ROI (AI controlled)</span></p>
                 <p class="text-sm">AI Model: ${config.ollamaModel}</p>
             </div>
             <div class="card">
@@ -1274,8 +1234,15 @@ app.get('/', (req, res) => {
             setTimeout(() => btn.textContent = '🔄 FORCE SYNC', 1000);
         }
         
+        async function forceAICheck() {
+            const btn = event.target;
+            btn.textContent = '🤖 AI CHECK...';
+            await fetch('/api/force-ai-check', {method: 'POST'});
+            setTimeout(() => btn.textContent = '🤖 FORCE AI CHECK', 1000);
+        }
+        
         async function emergencyClose() {
-            if(confirm('Close ALL positions?')) {
+            if(confirm('⚠️ EMERGENCY: Close ALL positions? This cannot be undone.')) {
                 await fetch('/api/close', {method: 'POST'});
                 alert('Emergency liquidation initiated');
             }
@@ -1494,27 +1461,35 @@ app.get('/', (req, res) => {
     `);
 });
 
+// ==================== START SERVER ====================
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
 app.listen(config.port, '0.0.0.0', () => {
     const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
     
-    console.log(`\n✅ Martingale Pro AI Started (Ollama Integration)`);
+    console.log(`\n✅ Martingale Pro AI Started (AI CONTROLLED MODE)`);
     console.log(`📊 Symbol: ${config.symbol}`);
     console.log(`🔧 Leverage: ${config.leverage}x`);
     console.log(`🎯 Take Profit: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price movement`);
     console.log(`💰 Auto-Compounding: ${config.riskPercent}% of wallet`);
     console.log(`📐 Formula: $${config.walletPerContract.toFixed(8)} wallet = 1 contract`);
-    console.log(`📈 Step Trigger: -${config.stepDistancePct}% ROI (adds martingale when losing)`);
+    console.log(`📈 Step Trigger: -${config.stepDistancePct}% ROI (AI CONTROLLED - no automatic steps)`);
     console.log(`🤖 Ollama AI: ${config.ollamaModel} @ ${config.ollamaUrl}`);
     console.log(`🌐 Dashboard: http://localhost:${config.port}`);
-    console.log(`\n📊 AUTO-COMPOUNDING EXAMPLES:`);
+    console.log(`\n🎮 AI CONTROL MODE ACTIVE:`);
+    console.log(`   • OPEN POSITION: Only when AI recommends`);
+    console.log(`   • STEP UP: Only when AI recommends (no automatic martingale)`);
+    console.log(`   • CLOSE POSITION: Only when AI recommends`);
+    console.log(`   • HOLD: AI recommends no action`);
+    console.log(`   • AI checks every 15 seconds\n`);
+    console.log(`📊 AUTO-COMPOUNDING EXAMPLES:`);
     console.log(`   Wallet $${config.walletPerContract.toFixed(8)} → 1 contract → Risk $${(config.walletPerContract * 0.02).toFixed(8)}`);
     console.log(`   Wallet $${(config.walletPerContract * 2).toFixed(8)} → 2 contracts → Risk $${(config.walletPerContract * 2 * 0.02).toFixed(8)}`);
     console.log(`   Wallet $${(config.walletPerContract * 3).toFixed(8)} → 3 contracts → Risk $${(config.walletPerContract * 3 * 0.02).toFixed(8)}\n`);
-    console.log(`🤖 AI RECOMMENDATION TYPES:`);
-    console.log(`   • STEP UP: Add more contracts (martingale on loss)`);
-    console.log(`   • CLOSE POSITION: Take profit/loss now`);
-    console.log(`   • OPEN POSITION: Start new position`);
-    console.log(`   • HOLD: No action needed\n`);
+    console.log(`🤖 API Endpoints:`);
+    console.log(`   GET  /               - Dashboard`);
+    console.log(`   GET  /api/status     - Trading status`);
+    console.log(`   POST /api/force-ai-check - Force AI analysis`);
+    console.log(`   POST /api/close      - Emergency close`);
+    console.log(`   POST /api/force-sync - Force sync positions\n`);
 });
