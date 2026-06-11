@@ -18,10 +18,12 @@ const CONFIG = {
     // Profit thresholds
     minProfitUSD: 0.50,
     minProfitPercent: 0.1,
+    maxProfitPercent: 10,  // Cap at 10% to filter unrealistic opportunities
     
     // Scan settings
-    scanIntervalMs: 30000,  // Scan every 30 seconds
-    maxTokensToScan: 200,   // Max tokens to scan per cycle
+    scanIntervalMs: 30000,
+    maxTokensToScan: 200,
+    opportunityCooldownMs: 5 * 60 * 1000, // Don't repeat same opportunity for 5 minutes
     
     // Flash loan amounts
     flashLoanAmounts: [100, 500, 1000, 5000, 10000],
@@ -41,7 +43,7 @@ const CONFIG = {
         apeswap: { name: 'ApeSwap', router: '0xcF0feBd3f17CEf5b47b0cD257aCf6025c5BFf3b7' }
     },
     
-    // Reference tokens (for price quotes)
+    // Reference tokens
     referenceTokens: {
         'BUSD': '0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56',
         'USDT': '0x55d398326f99059fF775485246999027B3197955',
@@ -51,19 +53,16 @@ const CONFIG = {
 
 const FACTORY_ABI = [
     'function allPairs(uint256) external view returns (address)',
-    'function allPairsLength() external view returns (uint256)',
-    'function getPair(address tokenA, address tokenB) external view returns (address)'
+    'function allPairsLength() external view returns (uint256)'
 ];
 
 const PAIR_ABI = [
     'function token0() external view returns (address)',
-    'function token1() external view returns (address)',
-    'function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)'
+    'function token1() external view returns (address)'
 ];
 
 const TOKEN_ABI = [
     'function symbol() external view returns (string)',
-    'function name() external view returns (string)',
     'function decimals() external view returns (uint8)'
 ];
 
@@ -93,6 +92,9 @@ let state = {
     scannedTokens: 0,
     totalPairs: 0,
     
+    // Track seen opportunities to prevent duplicates
+    seenOpportunityKeys: new Map(), // key -> timestamp
+    
     isRunning: true,
     lastScanTime: Date.now(),
     logs: [],
@@ -113,6 +115,54 @@ function calculateGasCostUSD() {
     return { bnb: gasCostBNB, usd: gasCostBNB * state.bnbPriceUSD };
 }
 
+function canAffordTransaction() {
+    const gasCost = calculateGasCostUSD();
+    return state.walletBalanceUSD > gasCost.usd * 1.1;
+}
+
+// Check if an opportunity was recently seen (prevents duplicates)
+function isOpportunityDuplicate(token, buyDex, sellDex, loanAmount) {
+    const key = `${token}|${buyDex}|${sellDex}|${loanAmount}`;
+    const lastSeen = state.seenOpportunityKeys.get(key);
+    
+    if (lastSeen && (Date.now() - lastSeen) < CONFIG.opportunityCooldownMs) {
+        return true; // Still in cooldown
+    }
+    
+    // Update the timestamp
+    state.seenOpportunityKeys.set(key, Date.now());
+    
+    // Clean up old keys (older than 1 hour)
+    for (const [k, timestamp] of state.seenOpportunityKeys.entries()) {
+        if (Date.now() - timestamp > 60 * 60 * 1000) {
+            state.seenOpportunityKeys.delete(k);
+        }
+    }
+    
+    return false;
+}
+
+// Validate if profit percentage is realistic
+function isRealisticProfit(profitPercent, tokenSymbol) {
+    // Major tokens have tighter spreads
+    const majorTokens = ['WBNB', 'BUSD', 'USDT', 'USDC', 'ETH', 'BTCB'];
+    const isMajor = majorTokens.includes(tokenSymbol);
+    
+    if (isMajor && profitPercent > 2) {
+        return false; // Major tokens shouldn't have >2% arbitrage
+    }
+    
+    if (profitPercent > CONFIG.maxProfitPercent) {
+        return false; // Cap at configured maximum
+    }
+    
+    if (profitPercent < CONFIG.minProfitPercent) {
+        return false; // Below minimum threshold
+    }
+    
+    return true;
+}
+
 // ==================== BLOCKCHAIN CONNECTION ====================
 let provider = null;
 let factory = null;
@@ -125,21 +175,18 @@ async function initBlockchain() {
         factory = new ethers.Contract(CONFIG.pancakeswap.factory, FACTORY_ABI, provider);
         router = new ethers.Contract(CONFIG.pancakeswap.router, ROUTER_ABI, provider);
         
-        // Initialize other DEX routers
         for (const [key, dex] of Object.entries(CONFIG.otherDexes)) {
             otherRouters[key] = new ethers.Contract(dex.router, ROUTER_ABI, provider);
         }
         
-        // Get total number of pairs
         const totalPairs = await factory.allPairsLength();
         state.totalPairs = totalPairs.toNumber();
-        addLog(`✅ Connected to BSC. Total pairs on PancakeSwap: ${state.totalPairs.toLocaleString()}`, 'success');
+        addLog(`✅ Connected to BSC. Total pairs: ${state.totalPairs.toLocaleString()}`, 'success');
         
-        // Get BNB price
         await updateBNBPrice();
-        
         addLog(`💰 BNB Price: $${state.bnbPriceUSD.toFixed(2)}`, 'info');
-        addLog(`💸 Wallet: ${state.walletBalanceBNB.toFixed(6)} BNB ($${state.walletBalanceUSD.toFixed(2)})`, 'info');
+        addLog(`💸 Wallet: $${state.walletBalanceUSD.toFixed(2)} (simulated)`, 'info');
+        addLog(`⛽ Gas: ~$${calculateGasCostUSD().usd.toFixed(4)}/tx`, 'info');
         
         return true;
     } catch (error) {
@@ -155,23 +202,17 @@ async function updateBNBPrice() {
         const amountIn = ethers.utils.parseEther('1');
         const amounts = await router.getAmountsOut(amountIn, [wbnbAddress, busdAddress]);
         state.bnbPriceUSD = parseFloat(ethers.utils.formatEther(amounts[1]));
-    } catch (error) {
-        // Keep existing price
-    }
+    } catch (error) {}
 }
 
-// ==================== GET ALL TOKENS FROM PANCAKESWAP ====================
+// ==================== GET ALL TOKENS ====================
 async function getAllTokens() {
-    const tokens = new Map(); // Use Map to avoid duplicates
-    const batchSize = 50;
-    let scanned = 0;
-    
-    addLog(`🔍 Scanning PancakeSwap for all tokens...`, 'info');
-    
-    // Limit to max tokens for performance
+    const tokens = new Map();
     const maxPairs = Math.min(state.totalPairs, CONFIG.maxTokensToScan * 2);
     
-    for (let i = 0; i < maxPairs && scanned < CONFIG.maxTokensToScan; i++) {
+    addLog(`🔍 Scanning PancakeSwap for tokens...`, 'info');
+    
+    for (let i = 0; i < maxPairs && tokens.size < CONFIG.maxTokensToScan; i++) {
         try {
             const pairAddress = await factory.allPairs(i);
             const pair = new ethers.Contract(pairAddress, PAIR_ABI, provider);
@@ -179,7 +220,6 @@ async function getAllTokens() {
             const token0Address = await pair.token0();
             const token1Address = await pair.token1();
             
-            // Only include pairs with BUSD, USDT, or WBNB as one side (for pricing)
             const isBUSD = token0Address === CONFIG.referenceTokens.BUSD || token1Address === CONFIG.referenceTokens.BUSD;
             const isUSDT = token0Address === CONFIG.referenceTokens.USDT || token1Address === CONFIG.referenceTokens.USDT;
             const isWBNB = token0Address === CONFIG.referenceTokens.WBNB || token1Address === CONFIG.referenceTokens.WBNB;
@@ -199,28 +239,17 @@ async function getAllTokens() {
                         decimals = await tokenContract.decimals();
                     } catch (e) {}
                     
-                    // Skip if symbol is too short or looks like a scam
-                    if (symbol && symbol.length > 1 && symbol.length < 20 && !symbol.includes('???') && !symbol.includes('...')) {
+                    if (symbol && symbol.length > 1 && symbol.length < 20 && !symbol.includes('?') && !symbol.includes('...')) {
                         tokens.set(tokenAddress, { address: tokenAddress, symbol: symbol, decimals: decimals });
-                        scanned++;
                     }
                 }
             }
-        } catch (error) {
-            // Silent fail for individual pairs
-        }
-        
-        // Progress update every 50 pairs
-        if (i % 50 === 0 && i > 0) {
-            addLog(`   Scanned ${i}/${maxPairs} pairs, found ${tokens.size} unique tokens...`, 'info');
-        }
+        } catch (error) {}
     }
     
-    const tokenList = Array.from(tokens.values());
-    state.allTokens = tokenList;
-    addLog(`✅ Found ${tokenList.length} tradable tokens on PancakeSwap`, 'success');
-    
-    return tokenList;
+    state.allTokens = Array.from(tokens.values());
+    addLog(`✅ Found ${state.allTokens.length} tradable tokens`, 'success');
+    return state.allTokens;
 }
 
 // ==================== GET TOKEN PRICE ====================
@@ -229,12 +258,12 @@ async function getTokenPrice(tokenAddress, decimals, quoteToken = 'BUSD') {
         const quoteAddress = CONFIG.referenceTokens[quoteToken];
         if (!quoteAddress) return null;
         
-        const amountIn = ethers.utils.parseUnits('100', 18); // $100 worth
+        const amountIn = ethers.utils.parseUnits('100', 18);
         const amounts = await router.getAmountsOut(amountIn, [quoteAddress, tokenAddress]);
         const amountOut = parseFloat(ethers.utils.formatUnits(amounts[1], decimals));
         
-        if (amountOut > 0) {
-            return 100 / amountOut; // Price in USD
+        if (amountOut > 0 && amountOut < 1000000) {
+            return 100 / amountOut;
         }
         return null;
     } catch (error) {
@@ -242,17 +271,12 @@ async function getTokenPrice(tokenAddress, decimals, quoteToken = 'BUSD') {
     }
 }
 
-// ==================== FIND ARBITRAGE OPPORTUNITIES ACROSS ALL TOKENS ====================
+// ==================== FIND ARBITRAGE OPPORTUNITIES ====================
 async function findAllArbitrageOpportunities() {
     const opportunities = [];
     const tokensToCheck = state.allTokens.slice(0, CONFIG.maxTokensToScan);
     
-    addLog(`🔍 Scanning ${tokensToCheck.length} tokens for arbitrage opportunities...`, 'info');
-    
-    let checked = 0;
     for (const token of tokensToCheck) {
-        checked++;
-        
         // Get price on PancakeSwap
         let pancakePrice = null;
         try {
@@ -264,6 +288,8 @@ async function findAllArbitrageOpportunities() {
                 };
             }
         } catch (e) {}
+        
+        if (!pancakePrice || pancakePrice <= 0) continue;
         
         // Compare with other DEXes
         for (const [dexKey, dex] of Object.entries(CONFIG.otherDexes)) {
@@ -277,80 +303,88 @@ async function findAllArbitrageOpportunities() {
                 const amountOut = parseFloat(ethers.utils.formatUnits(amounts[1], token.decimals));
                 const otherPrice = 100 / amountOut;
                 
-                if (pancakePrice && otherPrice && pancakePrice > 0 && otherPrice > 0) {
+                if (otherPrice && otherPrice > 0 && otherPrice < 100000) {
                     const priceDiff = Math.abs((pancakePrice - otherPrice) / otherPrice) * 100;
                     
-                    if (priceDiff > CONFIG.minProfitPercent && priceDiff < 100) { // Sanity check: less than 100% diff
+                    // Validate realistic profit
+                    if (isRealisticProfit(priceDiff, token.symbol) && priceDiff < 10) { // Cap at 10%
                         for (const loanAmount of CONFIG.flashLoanAmounts) {
                             const grossProfit = loanAmount * (priceDiff / 100);
                             const flashLoanFee = loanAmount * 0.0009;
                             const gasCost = calculateGasCostUSD();
                             const netProfit = grossProfit - flashLoanFee - gasCost.usd;
                             
-                            if (netProfit > CONFIG.minProfitUSD && netProfit < loanAmount * 0.5) { // Sanity check
-                                opportunities.push({
-                                    token: token.symbol,
-                                    buyDex: pancakePrice < otherPrice ? 'PancakeSwap' : dex.name,
-                                    sellDex: pancakePrice < otherPrice ? dex.name : 'PancakeSwap',
-                                    buyPrice: Math.min(pancakePrice, otherPrice),
-                                    sellPrice: Math.max(pancakePrice, otherPrice),
-                                    priceDiffPercent: priceDiff,
-                                    loanAmount: loanAmount,
-                                    grossProfit: grossProfit,
-                                    flashLoanFee: flashLoanFee,
-                                    gasCostUSD: gasCost.usd,
-                                    netProfit: netProfit,
-                                    timestamp: Date.now()
-                                });
+                            if (netProfit > CONFIG.minProfitUSD && netProfit < loanAmount * 0.1) { // Cap profit at 10% of loan
+                                const buyDex = pancakePrice < otherPrice ? 'PancakeSwap' : dex.name;
+                                const sellDex = pancakePrice < otherPrice ? dex.name : 'PancakeSwap';
+                                
+                                // Check for duplicates before adding
+                                if (!isOpportunityDuplicate(token.symbol, buyDex, sellDex, loanAmount)) {
+                                    opportunities.push({
+                                        token: token.symbol,
+                                        buyDex: buyDex,
+                                        sellDex: sellDex,
+                                        buyPrice: Math.min(pancakePrice, otherPrice),
+                                        sellPrice: Math.max(pancakePrice, otherPrice),
+                                        priceDiffPercent: priceDiff,
+                                        loanAmount: loanAmount,
+                                        grossProfit: grossProfit,
+                                        flashLoanFee: flashLoanFee,
+                                        gasCostUSD: gasCost.usd,
+                                        netProfit: netProfit,
+                                        timestamp: Date.now()
+                                    });
+                                }
                             }
                         }
                     }
                 }
             } catch (error) {}
         }
-        
-        // Progress update
-        if (checked % 20 === 0) {
-            addLog(`   Scanned ${checked}/${tokensToCheck.length} tokens...`, 'info');
+    }
+    
+    // Sort by net profit and remove duplicates by key
+    opportunities.sort((a, b) => b.netProfit - a.netProfit);
+    
+    // Final deduplication by token + buyDex + sellDex
+    const uniqueByToken = new Map();
+    for (const opp of opportunities) {
+        const key = `${opp.token}|${opp.buyDex}|${opp.sellDex}`;
+        if (!uniqueByToken.has(key) || uniqueByToken.get(key).netProfit < opp.netProfit) {
+            uniqueByToken.set(key, opp);
         }
     }
     
-    opportunities.sort((a, b) => b.netProfit - a.netProfit);
-    return opportunities.slice(0, 10); // Return top 10
+    return Array.from(uniqueByToken.values()).slice(0, 10);
 }
 
-// ==================== SIMULATE FLASH LOAN EXECUTION ====================
+// ==================== SIMULATE FLASH LOAN ====================
 async function executeSimulatedFlashLoan(opportunity) {
     const { token, buyDex, sellDex, loanAmount, grossProfit, flashLoanFee, gasCostUSD, netProfit, priceDiffPercent } = opportunity;
     
     addLog(`🔷 FLASH LOAN SIMULATION`, 'flashloan');
-    addLog(`   Token: ${token}`, 'info');
-    addLog(`   Loan Amount: $${loanAmount.toFixed(2)} (0% collateral)`, 'info');
-    addLog(`   Buy on: ${buyDex} → Sell on: ${sellDex}`, 'info');
-    addLog(`   Price Difference: ${priceDiffPercent.toFixed(3)}%`, 'info');
-    addLog(`   Gross Profit: $${grossProfit.toFixed(2)}`, 'info');
-    addLog(`   Flash Loan Fee (0.09%): $${flashLoanFee.toFixed(2)}`, 'info');
-    addLog(`   Gas Cost: $${gasCostUSD.toFixed(4)}`, 'info');
+    addLog(`   Token: ${token} | Loan: $${loanAmount.toFixed(0)}`, 'info');
+    addLog(`   ${buyDex} → ${sellDex} | Diff: ${priceDiffPercent.toFixed(2)}%`, 'info');
+    addLog(`   Gross: $${grossProfit.toFixed(2)} | Fee: $${flashLoanFee.toFixed(2)} | Gas: $${gasCostUSD.toFixed(4)}`, 'info');
     addLog(`   Net Profit: $${netProfit.toFixed(2)}`, 'profit');
     
     if (!canAffordTransaction()) {
-        addLog(`❌ INSUFFICIENT BALANCE for gas!`, 'error');
+        addLog(`❌ Insufficient balance for gas!`, 'error');
         return false;
     }
     
     state.totalTransactions++;
     state.totalGasSpentUSD += gasCostUSD;
     
-    // 70% success rate for simulation
-    const success = Math.random() < 0.7;
+    // 75% success rate for realistic simulation
+    const success = Math.random() < 0.75;
     
     if (success && netProfit > 0) {
         state.walletBalanceUSD += netProfit;
         state.totalProfitUSD += netProfit;
         state.successfulTransactions++;
         
-        addLog(`✅ FLASH LOAN SUCCESSFUL! Net Profit: $${netProfit.toFixed(2)}`, 'success');
-        addLog(`   New Balance: $${state.walletBalanceUSD.toFixed(2)}`, 'info');
+        addLog(`✅ SUCCESS! New Balance: $${state.walletBalanceUSD.toFixed(2)}`, 'success');
         
         state.tradeHistory.unshift({
             timestamp: new Date().toISOString(),
@@ -362,7 +396,7 @@ async function executeSimulatedFlashLoan(opportunity) {
         return true;
     } else {
         state.failedTransactions++;
-        addLog(`❌ FLASH LOAN FAILED! Lost gas: $${gasCostUSD.toFixed(4)}`, 'error');
+        addLog(`❌ FAILED! Lost gas: $${gasCostUSD.toFixed(4)}`, 'error');
         
         state.tradeHistory.unshift({
             timestamp: new Date().toISOString(),
@@ -374,18 +408,12 @@ async function executeSimulatedFlashLoan(opportunity) {
     }
 }
 
-function canAffordTransaction() {
-    const gasCost = calculateGasCostUSD();
-    return state.walletBalanceUSD > gasCost.usd * 1.1;
-}
-
-// ==================== MAIN SIMULATION LOOP ====================
+// ==================== MAIN LOOP ====================
 async function simulationLoop() {
-    // First, get all tokens from PancakeSwap
     await getAllTokens();
     
-    addLog(`🚀 Starting arbitrage scanning with ${state.walletBalanceUSD.toFixed(2)} balance`, 'success');
-    addLog(`⚡ Scanning ${state.allTokens.length} tokens for opportunities...`, 'info');
+    addLog(`🚀 Starting arbitrage scanning`, 'success');
+    addLog(`⚡ Scanning ${state.allTokens.length} tokens | Cooldown: ${CONFIG.opportunityCooldownMs/1000}s`, 'info');
     
     while (state.isRunning) {
         try {
@@ -395,19 +423,19 @@ async function simulationLoop() {
             const opportunities = await findAllArbitrageOpportunities();
             
             if (opportunities.length > 0) {
-                const best = opportunities[0];
-                state.opportunities.unshift(best);
+                // Add to state with timestamp
+                for (const opp of opportunities) {
+                    state.opportunities.unshift(opp);
+                }
+                // Keep only last 20
                 if (state.opportunities.length > 20) state.opportunities.pop();
                 
-                addLog(`📈 OPPORTUNITY: ${best.token} - ${best.priceDiffPercent.toFixed(2)}% profit potential`, 'opportunity');
-                addLog(`   Loan $${best.loanAmount.toFixed(0)} → Net Profit $${best.netProfit.toFixed(2)}`, 'profit');
+                const best = opportunities[0];
+                addLog(`📈 OPPORTUNITY: ${best.token} - ${best.priceDiffPercent.toFixed(2)}% profit`, 'opportunity');
+                addLog(`   Loan $${best.loanAmount.toFixed(0)} → Net $${best.netProfit.toFixed(2)}`, 'profit');
                 
                 if (best.netProfit > CONFIG.minProfitUSD && canAffordTransaction()) {
                     await executeSimulatedFlashLoan(best);
-                }
-            } else {
-                if (Math.random() < 0.1) {
-                    addLog(`⏳ Scanning ${state.allTokens.length} tokens... No opportunities found`, 'info');
                 }
             }
             
@@ -423,6 +451,17 @@ async function simulationLoop() {
 app.get('/api/state', (req, res) => {
     const profitLoss = state.walletBalanceUSD - state.startingBalanceUSD;
     const profitPercent = (profitLoss / state.startingBalanceUSD) * 100;
+    
+    // Get unique opportunities for display
+    const uniqueOpps = [];
+    const seen = new Set();
+    for (const opp of state.opportunities) {
+        const key = `${opp.token}|${opp.buyDex}|${opp.sellDex}`;
+        if (!seen.has(key)) {
+            seen.add(key);
+            uniqueOpps.push(opp);
+        }
+    }
     
     res.json({
         wallet: {
@@ -440,10 +479,9 @@ app.get('/api/state', (req, res) => {
         },
         scanning: {
             totalTokens: state.allTokens.length,
-            scannedTokens: state.scannedTokens,
             totalPairs: state.totalPairs
         },
-        opportunities: state.opportunities.slice(0, 8),
+        opportunities: uniqueOpps.slice(0, 8),
         tradeHistory: state.tradeHistory.slice(0, 20),
         logs: state.logs.slice(0, 30),
         tokenCount: state.allTokens.length
@@ -460,9 +498,10 @@ app.post('/api/reset', (req, res) => {
     state.totalProfitUSD = 0;
     state.opportunities = [];
     state.tradeHistory = [];
+    state.seenOpportunityKeys.clear();
     state.isRunning = true;
     
-    addLog(`🔄 Bot reset. Balance restored to $${CONFIG.walletBalanceUSD.toFixed(2)}`, 'info');
+    addLog(`🔄 Bot reset. Balance: $${CONFIG.walletBalanceUSD.toFixed(2)}`, 'info');
     res.json({ status: 'reset' });
 });
 
@@ -473,7 +512,7 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Flash Loan Bot - ALL PancakeSwap Coins</title>
+    <title>Flash Loan Bot - No Duplicates</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
         body { background: linear-gradient(135deg, #0a0f1e 0%, #0d1525 100%); min-height: 100vh; padding: 20px; color: #e2e8f0; }
@@ -491,7 +530,7 @@ app.get('/', (req, res) => {
         .scrollable { max-height: 300px; overflow-y: auto; }
         table { width: 100%; border-collapse: collapse; font-size: 0.7rem; }
         th, td { padding: 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.08); }
-        button { background: linear-gradient(135deg, #f0b90b, #ffd700); border: none; padding: 8px 20px; border-radius: 8px; font-weight: bold; cursor: pointer; margin: 5px; color: #0a0f1e; }
+        button { background: linear-gradient(135deg, #f0b90b, #ffd700); border: none; padding: 8px 20px; border-radius: 8px; font-weight: bold; cursor: pointer; color: #0a0f1e; }
         .text-center { text-align: center; }
         .mt-20 { margin-top: 20px; }
         .text-small { font-size: 0.7rem; }
@@ -500,8 +539,8 @@ app.get('/', (req, res) => {
 <body>
 <div class="container">
     <div class="header">
-        <h1>Flash Loan Arbitrage Bot <span class="badge">ALL PANCAKESWAP TOKENS</span></h1>
-        <p class="text-small">Scanning ALL tokens on PancakeSwap | Real data | Simulated execution</p>
+        <h1>Flash Loan Arbitrage Bot <span class="badge">NO DUPLICATES</span></h1>
+        <p class="text-small">Each opportunity appears once | 10% profit cap | 5-minute cooldown</p>
     </div>
 
     <div class="grid">
@@ -518,22 +557,27 @@ app.get('/', (req, res) => {
         <div class="card">
             <div class="card-title">🔍 SCANNING</div>
             <div>Tokens: <span id="tokenCount">0</span></div>
-            <div>Pairs: <span id="pairCount">0</span></div>
             <div>Status: <span id="status" class="profit">🟢 RUNNING</span></div>
         </div>
     </div>
 
     <div class="grid">
         <div class="card">
-            <div class="card-title">🏆 TOP OPPORTUNITIES</div>
+            <div class="card-title">🏆 UNIQUE OPPORTUNITIES</div>
             <div class="scrollable">
-                <table id="oppTable"><tbody><tr><td class="text-center">Scanning...</td></tr></tbody></table>
+                <table id="oppTable">
+                    <thead><tr><th>Token</th><th>Profit</th><th>Diff%</th><th>DEX</th></tr></thead>
+                    <tbody><tr><td class="text-center">Scanning...</td></tr></tbody>
+                </table>
             </div>
         </div>
         <div class="card">
             <div class="card-title">📋 TRADE HISTORY</div>
             <div class="scrollable">
-                <table id="tradesTable"><tbody><tr><td class="text-center">No trades yet</td></tr></tbody></table>
+                <table id="tradesTable">
+                    <thead><tr><th>Time</th><th>Token</th><th>Result</th></tr></thead>
+                    <tbody><tr><td class="text-center">No trades yet</td></tr></tbody>
+                </table>
             </div>
         </div>
     </div>
@@ -563,13 +607,12 @@ app.get('/', (req, res) => {
             document.getElementById('gasSpent').innerHTML = data.stats.totalGasSpentUSD.toFixed(4);
             document.getElementById('totalProfit').innerHTML = data.stats.totalProfitUSD.toFixed(2);
             document.getElementById('tokenCount').innerHTML = data.scanning.totalTokens || 0;
-            document.getElementById('pairCount').innerHTML = data.scanning.totalPairs || 0;
             
             if (data.opportunities && data.opportunities.length > 0) {
-                let oppHtml = '<tr><th>Token</th><th>Profit</th><th>Diff%</th></tr>';
+                let oppHtml = '<tr><th>Token</th><th>Profit</th><th>Diff%</th><th>DEX</th></tr>';
                 for (let i = 0; i < Math.min(8, data.opportunities.length); i++) {
                     const o = data.opportunities[i];
-                    oppHtml += '<tr><td>' + o.token + '</td><td class="profit">+$' + o.netProfit?.toFixed(2) + '</td><td>' + o.priceDiffPercent?.toFixed(2) + '%</td></tr>';
+                    oppHtml += '<tr><td>' + o.token + '</td><td class="profit">+$' + o.netProfit?.toFixed(2) + '</td><td>' + o.priceDiffPercent?.toFixed(2) + '%</td><td>' + (o.buyDex?.substring(0,8) || 'DEX') + '</td></tr>';
                 }
                 document.getElementById('oppTable').querySelector('tbody').innerHTML = oppHtml;
             }
@@ -615,10 +658,10 @@ app.get('/', (req, res) => {
 // ==================== START BOT ====================
 async function start() {
     console.log('\n' + '='.repeat(60));
-    console.log('⚡ FLASH LOAN ARBITRAGE BOT - ALL PANCAKESWAP TOKENS');
+    console.log('⚡ FLASH LOAN ARBITRAGE BOT - FIXED (No Duplicates)');
     console.log('='.repeat(60));
-    console.log(`\n💰 Starting Balance: $${CONFIG.walletBalanceUSD.toFixed(2)}`);
-    console.log(`🔍 Scanning ALL tokens on PancakeSwap...`);
+    console.log(`\n💰 Starting Balance: $${CONFIG.walletBalanceUSD.toFixed(2)} (simulated)`);
+    console.log(`🔍 Max profit: ${CONFIG.maxProfitPercent}% | Cooldown: ${CONFIG.opportunityCooldownMs/1000}s`);
     console.log(`🌐 Dashboard: http://localhost:${PORT}\n`);
     
     await initBlockchain();
