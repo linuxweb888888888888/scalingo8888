@@ -5,57 +5,45 @@ const { ethers } = require('ethers');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ==================== CONFIGURATION ====================
+// ==================== REALISTIC CONFIGURATION ====================
+// With only $4 balance - just enough for gas fees!
 const CONFIG = {
-    startingBalance: parseFloat(process.env.SIM_BALANCE || 100.00),
-    scanIntervalMs: 10000,
-    minProfitPercent: 0.3,
-    minProfitUSD: 5.00,
-    gasPriceGwei: 3,
+    // Your actual wallet balance (enough for ~8-10 transactions)
+    walletBalanceBNB: 0.0065,  // ~$4 at $615/BNB
+    walletBalanceUSD: 4.00,
     
-    // Flash Loan Providers
-    flashLoanProviders: {
-        balancer: {
-            name: 'Balancer',
-            vault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
-            fee: 0.0005, // 0.05% fee
-            availableOnBSC: true
-        },
-        aave: {
-            name: 'Aave V3',
-            pool: '0x6807dc923806fE8Fd134338EABCA509979a7e0cB',
-            fee: 0.0009, // 0.09% fee
-            availableOnBSC: false
-        },
-        pancakeswap: {
-            name: 'PancakeSwap Flash Swaps',
-            router: '0x10ED43C718714eb63d5aA57B78B54704E256024E',
-            fee: 0.0025, // 0.25% fee
-            availableOnBSC: true
-        }
-    },
+    // Gas settings (realistic BSC costs)
+    gasPriceGwei: 3,           // Current BSC gas price
+    estimatedGasPerTx: 350000, // Average flash loan transaction gas
+    
+    // Profit thresholds
+    minProfitUSD: 0.50,        // Minimum profit to attempt trade
+    minProfitPercent: 0.1,     // Minimum 0.1% profit
+    
+    // Scan settings
+    scanIntervalMs: 15000,     // Scan every 15 seconds
+    
+    // Flash loan amounts to test (realistic for small capital)
+    flashLoanAmounts: [100, 500, 1000, 5000, 10000],
     
     // BSC Configuration
     bscRpc: 'https://bsc-dataseed.binance.org/',
     
-    // DEX Routers for Arbitrage
+    // DEXes
     dexes: {
         pancakeswap: {
             name: 'PancakeSwap',
             router: '0x10ED43C718714eb63d5aA57B78B54704E256024E',
-            factory: '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73',
             fee: 0.0025
         },
         biswap: {
             name: 'BiSwap',
             router: '0x3a6d8cA21D1CF76F653A67577FA0D27453350dD8',
-            factory: '0x858E3312ed3A876947EA49d572A7C42DE08af7EE',
             fee: 0.001
         },
         apeswap: {
             name: 'ApeSwap',
             router: '0xcF0feBd3f17CEf5b47b0cD257aCf6025c5BFf3b7',
-            factory: '0x0841BD0B734E4F5853f0dD8d7Ea041c241fb0Da6',
             fee: 0.002
         }
     },
@@ -65,41 +53,47 @@ const CONFIG = {
         'WBNB': '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
         'BUSD': '0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56',
         'USDT': '0x55d398326f99059fF775485246999027B3197955',
-        'USDC': '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d',
         'CAKE': '0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82',
         'DOGE': '0xbA2aE424d960c26247Dd6c32edC70B295c744C43',
         'SHIB': '0x2859e4544C4bB03966803b044A93563Bd2D0DD4D',
-        'PEPE': '0x25d887Ce7a35172C62FeBFD67a1856F20FaEbB00',
-        'FLOKI': '0xfb5B838b6cfEEdC2873aB27866079AC55363D37E'
-    },
-    
-    // Flash Loan amounts to test (in USD)
-    flashLoanAmounts: [1000, 5000, 10000, 50000, 100000]
+        'PEPE': '0x25d887Ce7a35172C62FeBFD67a1856F20FaEbB00'
+    }
 };
 
-// ==================== ROUTER ABI ====================
 const ROUTER_ABI = [
-    'function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory amounts)',
-    'function getAmountsIn(uint amountOut, address[] memory path) public view returns (uint[] memory amounts)'
+    'function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory amounts)'
 ];
 
 // ==================== STATE ====================
 let state = {
-    isRunning: true,
-    simulationBalance: CONFIG.startingBalance,
-    startingBalance: CONFIG.startingBalance,
-    totalSimulatedTrades: 0,
-    successfulSimulatedTrades: 0,
-    failedSimulatedTrades: 0,
-    totalSimulatedGasSpent: 0,
-    totalSimulatedProfit: 0,
+    // Real wallet state (simulated but realistic)
+    walletBalanceBNB: CONFIG.walletBalanceBNB,
+    walletBalanceUSD: CONFIG.walletBalanceUSD,
+    startingBalanceBNB: CONFIG.walletBalanceBNB,
+    startingBalanceUSD: CONFIG.walletBalanceUSD,
+    
+    // Performance stats
+    totalTransactions: 0,
+    successfulTransactions: 0,
+    failedTransactions: 0,
+    totalGasSpentBNB: 0,
+    totalGasSpentUSD: 0,
+    totalProfitBNB: 0,
+    totalProfitUSD: 0,
+    
+    // Opportunity tracking
+    opportunities: [],
     tradeHistory: [],
-    flashLoanOpportunities: [],
     allPrices: {},
-    tokenList: Object.keys(CONFIG.tokens),
+    
+    // Status
+    isRunning: true,
     lastScanTime: Date.now(),
     logs: [],
-    bestOpportunity: null
+    
+    // Real-time data
+    bnbPriceUSD: 615,
+    currentGasPriceGwei: CONFIG.gasPriceGwei
 };
 
 // ==================== HELPER FUNCTIONS ====================
@@ -110,11 +104,18 @@ function addLog(message, type = 'info') {
     console.log(`[${timestamp}] ${message}`);
 }
 
-// Calculate estimated gas cost in USD
-function calculateGasCostUSD(gasLimit = 500000) {
-    const gasCostBNB = (gasLimit * CONFIG.gasPriceGwei) / 1e9;
-    const bnbPriceUSD = state.allPrices['WBNB']?.priceUSD || 580;
-    return gasCostBNB * bnbPriceUSD;
+function calculateGasCostUSD(gasLimit = CONFIG.estimatedGasPerTx) {
+    const gasCostBNB = (gasLimit * state.currentGasPriceGwei) / 1e9;
+    const bnbPriceUSD = state.bnbPriceUSD;
+    return {
+        bnb: gasCostBNB,
+        usd: gasCostBNB * bnbPriceUSD
+    };
+}
+
+function canAffordTransaction() {
+    const gasCost = calculateGasCostUSD();
+    return state.walletBalanceBNB > gasCost.bnb * 1.1; // 10% buffer
 }
 
 // ==================== BLOCKCHAIN CONNECTION ====================
@@ -125,13 +126,25 @@ async function initBlockchain() {
     try {
         provider = new ethers.providers.JsonRpcProvider(CONFIG.bscRpc);
         
-        // Initialize routers
         for (const [key, dex] of Object.entries(CONFIG.dexes)) {
             routers[key] = new ethers.Contract(dex.router, ROUTER_ABI, provider);
         }
         
         const blockNumber = await provider.getBlockNumber();
+        
+        // Get real BNB price
+        try {
+            const busdPrice = await getPriceFromDEX('pancakeswap', 'WBNB', 'BUSD', 1);
+            if (busdPrice) {
+                state.bnbPriceUSD = busdPrice.price;
+            }
+        } catch (e) {}
+        
         addLog(`✅ Connected to BSC. Block: ${blockNumber}`, 'success');
+        addLog(`💰 BNB Price: $${state.bnbPriceUSD.toFixed(2)}`, 'info');
+        addLog(`💸 Wallet: ${state.walletBalanceBNB.toFixed(6)} BNB ($${state.walletBalanceUSD.toFixed(2)})`, 'info');
+        addLog(`⛽ Gas Price: ${state.currentGasPriceGwei} Gwei ($${calculateGasCostUSD().usd.toFixed(4)}/tx)`, 'info');
+        
         return true;
     } catch (error) {
         addLog(`❌ BSC connection failed: ${error.message}`, 'error');
@@ -139,7 +152,6 @@ async function initBlockchain() {
     }
 }
 
-// Get real price from a specific DEX
 async function getPriceFromDEX(dexKey, tokenIn, tokenOut, amountInUSD = 100) {
     try {
         const router = routers[dexKey];
@@ -147,15 +159,12 @@ async function getPriceFromDEX(dexKey, tokenIn, tokenOut, amountInUSD = 100) {
         
         const tokenInAddress = CONFIG.tokens[tokenIn];
         const tokenOutAddress = CONFIG.tokens[tokenOut];
-        
         if (!tokenInAddress || !tokenOutAddress) return null;
         
-        // Assume stablecoin price is $1 for BUSD/USDT
         let amountIn;
         if (tokenIn === 'BUSD' || tokenIn === 'USDT') {
             amountIn = ethers.utils.parseEther(amountInUSD.toString());
         } else {
-            // For non-stablecoins, use the current price
             const currentPrice = state.allPrices[tokenIn]?.priceUSD || 1;
             amountIn = ethers.utils.parseEther((amountInUSD / currentPrice).toString());
         }
@@ -165,7 +174,6 @@ async function getPriceFromDEX(dexKey, tokenIn, tokenOut, amountInUSD = 100) {
         
         return {
             dex: CONFIG.dexes[dexKey].name,
-            amountIn: amountInUSD,
             amountOut: amountOut,
             price: tokenOut === 'BUSD' || tokenOut === 'USDT' ? amountOut / amountInUSD : amountInUSD / amountOut,
             timestamp: Date.now()
@@ -175,58 +183,42 @@ async function getPriceFromDEX(dexKey, tokenIn, tokenOut, amountInUSD = 100) {
     }
 }
 
-// Update all token prices from PancakeSwap
 async function updateAllPrices() {
-    for (const token of state.tokenList) {
+    const tokens = Object.keys(CONFIG.tokens);
+    
+    for (const token of tokens) {
         if (token === 'WBNB') {
-            // Get BNB price in BUSD
             const price = await getPriceFromDEX('pancakeswap', 'WBNB', 'BUSD', 1);
             if (price) {
-                state.allPrices[token] = {
-                    priceUSD: price.price,
-                    lastUpdate: new Date().toISOString()
-                };
+                state.allPrices[token] = { priceUSD: price.price, lastUpdate: new Date().toISOString() };
+                state.bnbPriceUSD = price.price;
             }
         } else if (token !== 'BUSD' && token !== 'USDT') {
             const price = await getPriceFromDEX('pancakeswap', token, 'BUSD', 100);
             if (price) {
-                state.allPrices[token] = {
-                    priceUSD: price.price,
-                    lastUpdate: new Date().toISOString()
-                };
+                state.allPrices[token] = { priceUSD: price.price, lastUpdate: new Date().toISOString() };
             }
         } else {
-            state.allPrices[token] = {
-                priceUSD: 1.00,
-                lastUpdate: new Date().toISOString()
-            };
+            state.allPrices[token] = { priceUSD: 1.00, lastUpdate: new Date().toISOString() };
         }
     }
 }
 
-// Find flash loan arbitrage opportunities
-async function findFlashLoanOpportunities() {
+async function findArbitrageOpportunities() {
     const opportunities = [];
     
-    // Check each token for arbitrage between different DEXes
-    for (const token of state.tokenList) {
+    for (const token of Object.keys(CONFIG.tokens)) {
         if (token === 'BUSD' || token === 'USDT' || token === 'WBNB') continue;
         
         const dexPrices = [];
         
-        // Get price from each DEX
         for (const [dexKey, dex] of Object.entries(CONFIG.dexes)) {
             const price = await getPriceFromDEX(dexKey, token, 'BUSD', 100);
             if (price) {
-                dexPrices.push({
-                    dex: dex.name,
-                    price: price.price,
-                    amountOut: price.amountOut
-                });
+                dexPrices.push({ dex: dex.name, price: price.price, dexKey: dexKey });
             }
         }
         
-        // Find highest and lowest prices
         if (dexPrices.length >= 2) {
             const sorted = [...dexPrices].sort((a, b) => b.price - a.price);
             const highest = sorted[0];
@@ -234,19 +226,14 @@ async function findFlashLoanOpportunities() {
             const priceDiff = ((highest.price - lowest.price) / lowest.price) * 100;
             
             if (priceDiff > CONFIG.minProfitPercent) {
-                // Calculate profit for different flash loan amounts
                 for (const loanAmount of CONFIG.flashLoanAmounts) {
-                    const flashLoanFee = 0.0005; // 0.05% typical flash loan fee
-                    const buyAmount = loanAmount;
-                    const sellAmount = (loanAmount / lowest.price) * highest.price;
-                    const grossProfit = sellAmount - buyAmount;
-                    const flashFee = buyAmount * flashLoanFee;
+                    const flashLoanFee = loanAmount * 0.0009; // 0.09% fee
+                    const grossProfit = loanAmount * (priceDiff / 100);
                     const gasCost = calculateGasCostUSD();
-                    const netProfit = grossProfit - flashFee - gasCost;
+                    const netProfit = grossProfit - flashLoanFee - gasCost.usd;
                     
                     if (netProfit > CONFIG.minProfitUSD) {
                         opportunities.push({
-                            type: 'CROSS_DEX',
                             token: token,
                             buyDex: lowest.dex,
                             sellDex: highest.dex,
@@ -255,8 +242,9 @@ async function findFlashLoanOpportunities() {
                             priceDiffPercent: priceDiff,
                             loanAmount: loanAmount,
                             grossProfit: grossProfit,
-                            flashLoanFee: flashFee,
-                            gasCost: gasCost,
+                            flashLoanFee: flashLoanFee,
+                            gasCostUSD: gasCost.usd,
+                            gasCostBNB: gasCost.bnb,
                             netProfit: netProfit,
                             timestamp: Date.now()
                         });
@@ -266,139 +254,123 @@ async function findFlashLoanOpportunities() {
         }
     }
     
-    // Check triangular arbitrage (BNB -> Token -> BNB)
-    for (const token of state.tokenList) {
-        if (token === 'BUSD' || token === 'USDT' || token === 'WBNB') continue;
-        
-        const bnbPrice = await getPriceFromDEX('pancakeswap', 'WBNB', 'BUSD', 100);
-        const tokenPrice = await getPriceFromDEX('pancakeswap', token, 'BUSD', 100);
-        const tokenToBnb = await getPriceFromDEX('pancakeswap', token, 'WBNB', 100);
-        
-        if (bnbPrice && tokenPrice && tokenToBnb) {
-            // Path: BNB -> BUSD -> Token -> BNB
-            const bnbToBusd = 100; // Start with $100 worth of BNB
-            const busdToToken = bnbToBusd;
-            const tokenAmount = busdToToken / tokenPrice.price;
-            const bnbBack = tokenAmount * (tokenToBnb.price || (1 / bnbPrice.price));
-            const grossProfit = bnbBack - 1;
-            const profitPercent = grossProfit * 100;
-            
-            if (profitPercent > CONFIG.minProfitPercent) {
-                for (const loanAmount of CONFIG.flashLoanAmounts) {
-                    const scaledGrossProfit = (loanAmount / 100) * grossProfit;
-                    const flashFee = loanAmount * 0.0005;
-                    const gasCost = calculateGasCostUSD();
-                    const netProfit = scaledGrossProfit - flashFee - gasCost;
-                    
-                    if (netProfit > CONFIG.minProfitUSD) {
-                        opportunities.push({
-                            type: 'TRIANGULAR',
-                            token: token,
-                            path: 'WBNB → BUSD → ' + token + ' → WBNB',
-                            profitPercent: profitPercent,
-                            loanAmount: loanAmount,
-                            grossProfit: scaledGrossProfit,
-                            flashLoanFee: flashFee,
-                            gasCost: gasCost,
-                            netProfit: netProfit,
-                            timestamp: Date.now()
-                        });
-                    }
-                }
-            }
-        }
-    }
-    
-    // Sort by net profit
     opportunities.sort((a, b) => b.netProfit - a.netProfit);
     return opportunities;
 }
 
-// Simulate flash loan execution
-async function simulateFlashLoanExecution(opportunity) {
-    const { type, token, buyDex, sellDex, loanAmount, grossProfit, flashLoanFee, gasCost, netProfit } = opportunity;
+async function executeSimulatedFlashLoan(opportunity) {
+    const { token, buyDex, sellDex, loanAmount, grossProfit, flashLoanFee, gasCostUSD, gasCostBNB, netProfit, priceDiffPercent } = opportunity;
     
     addLog(`🔷 FLASH LOAN SIMULATION`, 'flashloan');
-    addLog(`   Type: ${type}`, 'info');
     addLog(`   Token: ${token}`, 'info');
-    addLog(`   Borrow Amount: $${loanAmount.toFixed(2)} (0% collateral)`, 'info');
-    addLog(`   Buy on: ${buyDex || 'PancakeSwap'}`, 'info');
-    addLog(`   Sell on: ${sellDex || 'PancakeSwap'}`, 'info');
+    addLog(`   Loan Amount: $${loanAmount.toFixed(2)} (0% collateral)`, 'info');
+    addLog(`   Buy: ${buyDex} @ $${opportunity.buyPrice.toFixed(8)} → Sell: ${sellDex} @ $${opportunity.sellPrice.toFixed(8)}`, 'info');
+    addLog(`   Price Difference: ${priceDiffPercent.toFixed(3)}%`, 'info');
     addLog(`   Gross Profit: $${grossProfit.toFixed(2)}`, 'info');
-    addLog(`   Flash Loan Fee (0.05%): $${flashLoanFee.toFixed(2)}`, 'info');
-    addLog(`   Estimated Gas Cost: $${gasCost.toFixed(2)}`, 'info');
+    addLog(`   Flash Loan Fee (0.09%): $${flashLoanFee.toFixed(2)}`, 'info');
+    addLog(`   Gas Cost: ${gasCostBNB.toFixed(6)} BNB ($${gasCostUSD.toFixed(4)})`, 'info');
     addLog(`   Net Profit: $${netProfit.toFixed(2)}`, 'profit');
     
-    state.totalSimulatedGasSpent += gasCost;
-    state.totalSimulatedTrades++;
-    
-    // Simulate success (randomized but realistic - 70% success rate for flash loans)
-    const success = Math.random() < 0.7;
-    
-    if (success && netProfit > 0) {
-        state.simulationBalance += netProfit;
-        state.totalSimulatedProfit += netProfit;
-        state.successfulSimulatedTrades++;
-        addLog(`✅ SIMULATED SUCCESS! Profit: $${netProfit.toFixed(2)}`, 'success');
-        addLog(`   New Simulated Balance: $${state.simulationBalance.toFixed(2)}`, 'info');
-        
-        state.tradeHistory.unshift({
-            timestamp: new Date().toISOString(),
-            type: type,
-            token: token,
-            loanAmount: loanAmount,
-            profit: netProfit,
-            grossProfit: grossProfit,
-            gasCost: gasCost,
-            success: true
-        });
-    } else {
-        state.failedSimulatedTrades++;
-        addLog(`❌ SIMULATED FAILURE! Lost gas: $${gasCost.toFixed(2)}`, 'error');
-        
-        state.tradeHistory.unshift({
-            timestamp: new Date().toISOString(),
-            type: type,
-            token: token,
-            loanAmount: loanAmount,
-            loss: gasCost,
-            success: false
-        });
+    // Check if wallet has enough BNB for gas
+    if (!canAffordTransaction()) {
+        addLog(`❌ INSUFFICIENT BALANCE for gas! Need ${calculateGasCostUSD().bnb.toFixed(6)} BNB`, 'error');
+        addLog(`   Current balance: ${state.walletBalanceBNB.toFixed(6)} BNB`, 'error');
+        return false;
     }
     
-    if (state.tradeHistory.length > 50) state.tradeHistory.pop();
+    state.totalTransactions++;
+    state.totalGasSpentBNB += gasCostBNB;
+    state.totalGasSpentUSD += gasCostUSD;
+    
+    // Realistic success rate (65-80% depending on competition)
+    const successRate = 0.70;
+    const success = Math.random() < successRate;
+    
+    if (success && netProfit > 0) {
+        // Convert profit to BNB
+        const profitBNB = netProfit / state.bnbPriceUSD;
+        
+        state.walletBalanceBNB += profitBNB;
+        state.walletBalanceUSD += netProfit;
+        state.totalProfitBNB += profitBNB;
+        state.totalProfitUSD += netProfit;
+        state.successfulTransactions++;
+        
+        addLog(`✅ FLASH LOAN SUCCESSFUL!`, 'success');
+        addLog(`   Net Profit: $${netProfit.toFixed(2)} (${profitBNB.toFixed(6)} BNB)`, 'profit');
+        addLog(`   New Balance: ${state.walletBalanceBNB.toFixed(6)} BNB ($${state.walletBalanceUSD.toFixed(2)})`, 'info');
+        
+        state.tradeHistory.unshift({
+            timestamp: new Date().toISOString(),
+            type: 'FLASH_LOAN',
+            token: token,
+            loanAmount: loanAmount,
+            grossProfit: grossProfit,
+            gasCost: gasCostUSD,
+            netProfit: netProfit,
+            success: true
+        });
+        
+        return true;
+    } else {
+        state.failedTransactions++;
+        addLog(`❌ FLASH LOAN FAILED! Lost gas: $${gasCostUSD.toFixed(4)}`, 'error');
+        addLog(`   Balance: ${state.walletBalanceBNB.toFixed(6)} BNB ($${state.walletBalanceUSD.toFixed(2)})`, 'info');
+        
+        state.tradeHistory.unshift({
+            timestamp: new Date().toISOString(),
+            type: 'FLASH_LOAN',
+            token: token,
+            loanAmount: loanAmount,
+            loss: gasCostUSD,
+            success: false
+        });
+        
+        return false;
+    }
 }
 
-// ==================== MAIN SIMULATION LOOP ====================
 async function simulationLoop() {
+    addLog(`🚀 Starting flash loan arbitrage bot with $${state.walletBalanceUSD.toFixed(2)} balance`, 'success');
+    addLog(`⚡ This is SIMULATED - no real transactions will be executed`, 'info');
+    addLog(`💡 With $4, you can make ~8-10 attempts before needing more BNB for gas\n`, 'info');
+    
     while (state.isRunning) {
         try {
             state.lastScanTime = Date.now();
-            addLog(`🔍 Scanning for flash loan arbitrage opportunities...`, 'info');
             
-            // Update real prices
+            // Update prices
             await updateAllPrices();
             
             // Find opportunities
-            const opportunities = await findFlashLoanOpportunities();
+            const opportunities = await findArbitrageOpportunities();
             
             if (opportunities.length > 0) {
                 const best = opportunities[0];
-                state.bestOpportunity = best;
-                state.flashLoanOpportunities.unshift(best);
-                if (state.flashLoanOpportunities.length > 20) state.flashLoanOpportunities.pop();
+                state.opportunities.unshift(best);
+                if (state.opportunities.length > 20) state.opportunities.pop();
                 
-                addLog(`📈 FLASH LOAN OPPORTUNITY FOUND!`, 'opportunity');
-                addLog(`   Token: ${best.token}`, 'opportunity');
-                addLog(`   Loan Amount: $${best.loanAmount.toFixed(2)}`, 'opportunity');
-                addLog(`   Expected Net Profit: $${best.netProfit.toFixed(2)}`, 'profit');
+                addLog(`📈 OPPORTUNITY: ${best.token} - ${best.priceDiffPercent.toFixed(2)}% profit potential`, 'opportunity');
+                addLog(`   Loan $${best.loanAmount.toFixed(0)} → Net Profit $${best.netProfit.toFixed(2)}`, 'profit');
                 
-                // Execute simulation if profitable
-                if (best.netProfit > CONFIG.minProfitUSD) {
-                    await simulateFlashLoanExecution(best);
+                // Check if profitable and we can afford gas
+                if (best.netProfit > CONFIG.minProfitUSD && canAffordTransaction()) {
+                    await executeSimulatedFlashLoan(best);
+                } else if (!canAffordTransaction()) {
+                    addLog(`⚠️ Cannot afford gas. Need ~${calculateGasCostUSD().bnb.toFixed(6)} BNB`, 'warning');
+                    addLog(`   Current balance: ${state.walletBalanceBNB.toFixed(6)} BNB`, 'warning');
+                    
+                    if (state.walletBalanceBNB < 0.001) {
+                        addLog(`🛑 Bot paused: Insufficient BNB for gas. Add ~0.005 BNB (~$3) to continue.`, 'error');
+                        state.isRunning = false;
+                        break;
+                    }
                 }
             } else {
-                addLog(`   No profitable flash loan opportunities found`, 'info');
+                // Brief status update every 2 minutes
+                if (Math.random() < 0.05) {
+                    addLog(`⏳ Scanning... Balance: ${state.walletBalanceBNB.toFixed(6)} BNB ($${state.walletBalanceUSD.toFixed(2)})`, 'info');
+                }
             }
             
             await new Promise(resolve => setTimeout(resolve, CONFIG.scanIntervalMs));
@@ -411,58 +383,65 @@ async function simulationLoop() {
 
 // ==================== EXPRESS API ====================
 app.get('/api/state', (req, res) => {
-    const profitLoss = state.simulationBalance - state.startingBalance;
-    const profitPercent = (profitLoss / state.startingBalance) * 100;
-    
-    const topTokens = Object.entries(state.allPrices)
-        .filter(([_, v]) => v?.priceUSD)
-        .sort((a, b) => (b[1]?.priceUSD || 0) - (a[1]?.priceUSD || 0))
-        .slice(0, 10);
+    const profitLoss = state.walletBalanceUSD - state.startingBalanceUSD;
+    const profitPercent = (profitLoss / state.startingBalanceUSD) * 100;
+    const remainingAttempts = Math.floor(state.walletBalanceBNB / calculateGasCostUSD().bnb);
     
     res.json({
-        isRunning: state.isRunning,
-        simulationBalance: state.simulationBalance,
-        startingBalance: state.startingBalance,
-        profitLoss: profitLoss,
-        profitPercent: profitPercent,
-        totalSimulatedTrades: state.totalSimulatedTrades,
-        successfulSimulatedTrades: state.successfulSimulatedTrades,
-        failedSimulatedTrades: state.failedSimulatedTrades,
-        totalSimulatedGasSpent: state.totalSimulatedGasSpent,
-        totalSimulatedProfit: state.totalSimulatedProfit,
-        flashLoanOpportunities: state.flashLoanOpportunities.slice(0, 5),
-        bestOpportunity: state.bestOpportunity,
-        allPrices: Object.fromEntries(topTokens),
-        tokenCount: state.tokenList.length,
+        wallet: {
+            balanceBNB: state.walletBalanceBNB,
+            balanceUSD: state.walletBalanceUSD,
+            startingBalanceBNB: state.startingBalanceBNB,
+            startingBalanceUSD: state.startingBalanceUSD,
+            profitLoss: profitLoss,
+            profitPercent: profitPercent,
+            remainingAttempts: remainingAttempts
+        },
+        stats: {
+            totalTransactions: state.totalTransactions,
+            successfulTransactions: state.successfulTransactions,
+            failedTransactions: state.failedTransactions,
+            totalGasSpentBNB: state.totalGasSpentBNB,
+            totalGasSpentUSD: state.totalGasSpentUSD,
+            totalProfitBNB: state.totalProfitBNB,
+            totalProfitUSD: state.totalProfitUSD
+        },
+        current: {
+            bnbPriceUSD: state.bnbPriceUSD,
+            gasPriceGwei: state.currentGasPriceGwei,
+            gasCostPerTxUSD: calculateGasCostUSD().usd,
+            isRunning: state.isRunning
+        },
+        opportunities: state.opportunities.slice(0, 8),
         tradeHistory: state.tradeHistory.slice(0, 20),
         logs: state.logs.slice(0, 30),
-        config: {
-            gasPriceGwei: CONFIG.gasPriceGwei,
-            minProfitUSD: CONFIG.minProfitUSD,
-            flashLoanAmounts: CONFIG.flashLoanAmounts
-        }
+        tokenPrices: Object.entries(state.allPrices).slice(0, 10)
     });
 });
 
 app.post('/api/reset', (req, res) => {
     state = {
-        isRunning: true,
-        simulationBalance: CONFIG.startingBalance,
-        startingBalance: CONFIG.startingBalance,
-        totalSimulatedTrades: 0,
-        successfulSimulatedTrades: 0,
-        failedSimulatedTrades: 0,
-        totalSimulatedGasSpent: 0,
-        totalSimulatedProfit: 0,
+        walletBalanceBNB: CONFIG.walletBalanceBNB,
+        walletBalanceUSD: CONFIG.walletBalanceUSD,
+        startingBalanceBNB: CONFIG.walletBalanceBNB,
+        startingBalanceUSD: CONFIG.walletBalanceUSD,
+        totalTransactions: 0,
+        successfulTransactions: 0,
+        failedTransactions: 0,
+        totalGasSpentBNB: 0,
+        totalGasSpentUSD: 0,
+        totalProfitBNB: 0,
+        totalProfitUSD: 0,
+        opportunities: [],
         tradeHistory: [],
-        flashLoanOpportunities: [],
         allPrices: {},
-        tokenList: Object.keys(CONFIG.tokens),
+        isRunning: true,
         lastScanTime: Date.now(),
         logs: [],
-        bestOpportunity: null
+        bnbPriceUSD: 615,
+        currentGasPriceGwei: CONFIG.gasPriceGwei
     };
-    addLog(`🔄 Simulation reset. Balance: $${CONFIG.startingBalance}`, 'info');
+    addLog(`🔄 Bot reset. Balance restored to $${CONFIG.walletBalanceUSD.toFixed(2)}`, 'info');
     res.json({ status: 'reset' });
 });
 
@@ -473,31 +452,29 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Flash Loan Arbitrage Bot - Real Data Simulation</title>
+    <title>Flash Loan Bot - $4 Realistic Simulation</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
         body { background: linear-gradient(135deg, #0a0f1e 0%, #0d1525 100%); min-height: 100vh; padding: 20px; color: #e2e8f0; }
         .container { max-width: 1600px; margin: 0 auto; }
         .header { text-align: center; margin-bottom: 30px; }
-        h1 { font-size: 1.8rem; background: linear-gradient(135deg, #00d4ff, #0099ff); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-        .badge { display: inline-block; background: #10b981; color: white; padding: 2px 8px; border-radius: 20px; font-size: 0.7rem; margin-left: 10px; }
-        .flash-badge { background: #8b5cf6; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px; margin-bottom: 20px; }
+        h1 { font-size: 2rem; background: linear-gradient(135deg, #f0b90b, #ffd700); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .badge { display: inline-block; background: #10b981; padding: 2px 12px; border-radius: 20px; font-size: 0.7rem; margin-left: 10px; }
+        .warning-badge { background: #f59e0b; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; margin-bottom: 20px; }
         .card { background: rgba(255,255,255,0.05); backdrop-filter: blur(10px); border-radius: 16px; padding: 20px; border: 1px solid rgba(255,255,255,0.08); }
-        .card-title { font-size: 0.85rem; font-weight: 600; margin-bottom: 15px; color: #00d4ff; text-transform: uppercase; letter-spacing: 1px; }
-        .stat-value { font-size: 1.8rem; font-weight: bold; margin: 10px 0; }
+        .card-title { font-size: 0.8rem; font-weight: 600; margin-bottom: 15px; color: #f0b90b; text-transform: uppercase; letter-spacing: 1px; }
+        .stat-value { font-size: 1.8rem; font-weight: bold; }
         .positive { color: #10b981; }
         .negative { color: #ef4444; }
         .profit { color: #f0b90b; }
-        .token-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; max-height: 320px; overflow-y: auto; }
-        .token-item { background: rgba(255,255,255,0.05); border-radius: 10px; padding: 10px; text-align: center; font-size: 0.7rem; }
-        .token-price { color: #00d4ff; font-weight: bold; font-size: 0.9rem; }
+        .warning { color: #f59e0b; }
         table { width: 100%; border-collapse: collapse; font-size: 0.7rem; }
-        th, td { padding: 10px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.08); }
-        .scrollable { max-height: 350px; overflow-y: auto; }
-        button { background: linear-gradient(135deg, #00d4ff, #0099ff); border: none; padding: 8px 20px; border-radius: 8px; font-weight: bold; cursor: pointer; margin: 5px; color: white; }
+        th, td { padding: 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.08); }
+        .scrollable { max-height: 300px; overflow-y: auto; }
+        button { background: linear-gradient(135deg, #f0b90b, #ffd700); border: none; padding: 8px 20px; border-radius: 8px; font-weight: bold; cursor: pointer; margin: 5px; color: #0a0f1e; }
         button:hover { transform: translateY(-1px); }
-        .opportunity-card { background: rgba(139, 92, 246, 0.1); border: 1px solid #8b5cf6; border-radius: 12px; padding: 15px; margin-bottom: 15px; }
+        .balance-card { background: linear-gradient(135deg, rgba(16, 185, 129, 0.1), rgba(16, 185, 129, 0.05)); border: 1px solid #10b981; }
         .text-small { font-size: 0.7rem; }
         .text-center { text-align: center; }
         .mt-20 { margin-top: 20px; }
@@ -506,42 +483,40 @@ app.get('/', (req, res) => {
 <body>
     <div class="container">
         <div class="header">
-            <h1>Flash Loan Arbitrage Bot <span class="badge">REAL DATA</span><span class="badge flash-badge">FLASH LOAN</span></h1>
-            <p class="text-small">Real PancakeSwap prices | Simulated flash loans | Zero capital needed (except gas)</p>
+            <h1>Flash Loan Arbitrage Bot <span class="badge">REAL DATA</span><span class="badge warning-badge">$4 BALANCE</span></h1>
+            <p class="text-small">Real PancakeSwap prices | Simulated flash loans | Realistic gas costs</p>
         </div>
 
         <div class="grid">
-            <div class="card">
-                <div class="card-title">💰 SIMULATED BALANCE</div>
-                <div class="stat-value" id="balance">$0.00</div>
+            <div class="card balance-card">
+                <div class="card-title">💰 WALLET BALANCE</div>
+                <div class="stat-value" id="balanceUSD">$0.00</div>
+                <div id="balanceBNB" class="text-small">0.0000 BNB</div>
                 <div>P&L: <span id="pnl">$0.00</span> (<span id="pnlPercent">0.00%</span>)</div>
-                <div class="text-small" style="margin-top: 10px;">Starting balance is SIMULATED - no real money used</div>
+                <div class="text-small" style="margin-top: 8px;">Attempts left: <span id="attemptsLeft">0</span></div>
             </div>
             <div class="card">
                 <div class="card-title">⚡ FLASH LOAN STATS</div>
-                <div>Total Loans: <span id="totalTrades">0</span></div>
-                <div>✅ Successful: <span id="successTrades">0</span> | ❌ Failed: <span id="failedTrades">0</span></div>
-                <div>Total Gas Spent: $<span id="gasSpent">0.00</span></div>
+                <div>Txs: <span id="totalTxs">0</span> | ✅ Success: <span id="successTxs">0</span> | ❌ Failed: <span id="failedTxs">0</span></div>
+                <div>Gas Spent: $<span id="gasSpent">0.00</span></div>
+                <div>Total Profit: $<span id="totalProfit">0.00</span></div>
             </div>
             <div class="card">
-                <div class="card-title">⛽ GAS & FEES</div>
-                <div>Gas Price: <span id="gasPrice">3</span> Gwei</div>
-                <div>Min Profit Target: $<span id="minProfit">5.00</span></div>
-                <div>Status: <span id="status" class="profit">🟢 ACTIVE</span></div>
+                <div class="card-title">⛽ NETWORK</div>
+                <div>BNB Price: $<span id="bnbPrice">615</span></div>
+                <div>Gas Price: <span id="gasPrice">3</span> Gwei (~$<span id="gasCost">0.00</span>/tx)</div>
+                <div>Status: <span id="status" class="profit">🟢 RUNNING</span></div>
             </div>
         </div>
 
         <div class="grid">
             <div class="card">
-                <div class="card-title">🏆 BEST FLASH LOAN OPPORTUNITY</div>
-                <div id="bestOpportunity" class="opportunity-card text-center">
-                    <div class="text-small">Scanning for opportunities...</div>
-                </div>
+                <div class="card-title">🏆 BEST OPPORTUNITY</div>
+                <div id="bestOpportunity" class="text-center text-small" style="padding: 15px;">Scanning...</div>
             </div>
             <div class="card">
-                <div class="card-title">📈 TOKEN PRICES (Real from PancakeSwap)</div>
-                <div class="token-grid" id="pricesContainer">Loading real prices...</div>
-                <div class="text-small" style="margin-top: 10px; color: #10b981;">✓ Live data from BSC blockchain</div>
+                <div class="card-title">📈 TOKEN PRICES (Real)</div>
+                <div class="scrollable" id="pricesContainer">Loading...</div>
             </div>
         </div>
 
@@ -549,36 +524,29 @@ app.get('/', (req, res) => {
             <div class="card">
                 <div class="card-title">🔄 RECENT OPPORTUNITIES</div>
                 <div class="scrollable">
-                    <table id="opportunitiesTable">
-                        <thead><tr><th>Token</th><th>Loan Amt</th><th>Net Profit</th><th>Status</th></tr></thead>
-                        <tbody><tr><td colspan="4" class="text-center">Scanning...</td></tr></tbody>
-                    </table>
+                    <table id="oppTable"><tbody><tr><td class="text-center">Scanning...</td></tr></tbody></table>
                 </div>
             </div>
             <div class="card">
                 <div class="card-title">📋 TRADE HISTORY</div>
                 <div class="scrollable">
-                    <table id="tradesTable">
-                        <thead><tr><th>Time</th><th>Token</th><th>Profit/Loss</th></tr></thead>
-                        <tbody><tr><td colspan="3" class="text-center">No trades yet</td></tr></tbody>
-                    </table>
+                    <table id="tradesTable"><tbody><tr><td class="text-center">No trades yet</td></tr></tbody></table>
                 </div>
             </div>
         </div>
 
         <div class="card">
             <div class="card-title">📝 LIVE LOGS</div>
-            <div class="scrollable" id="logsContainer" style="font-family: monospace; font-size: 0.65rem; max-height: 200px;">Initializing...</div>
+            <div class="scrollable" id="logsContainer" style="max-height: 200px; font-family: monospace; font-size: 0.65rem;">Initializing...</div>
         </div>
 
         <div class="text-center mt-20">
             <button onclick="resetSimulation()">🔄 Reset Simulation</button>
         </div>
 
-        <div class="text-center mt-20 text-small" style="opacity: 0.6;">
-            <p>✅ REAL DATA: Prices fetched live from PancakeSwap, BiSwap, and ApeSwap on BNB Smart Chain</p>
-            <p>⚡ FLASH LOANS: Simulated - No actual loans taken, no real money at risk</p>
-            <p>💡 In production, this bot would use Balancer/Aave flash loans requiring only ~0.05 BNB for gas</p>
+        <div class="text-center mt-20 text-small" style="opacity: 0.5;">
+            <p>✅ REAL DATA from PancakeSwap, BiSwap, ApeSwap | ⚡ Flash loans simulated | 💰 Starting balance: $4 (0.0065 BNB)</p>
+            <p>💡 Real flash loans require 0% capital - only ~0.005 BNB ($3) for gas per attempt!</p>
         </div>
     </div>
 
@@ -588,65 +556,63 @@ app.get('/', (req, res) => {
                 const res = await fetch('/api/state');
                 const data = await res.json();
                 
-                document.getElementById('balance').innerHTML = '$' + data.simulationBalance.toFixed(2);
-                const pnl = data.profitLoss;
-                document.getElementById('pnl').innerHTML = (pnl >= 0 ? '+' : '') + '$' + Math.abs(pnl).toFixed(2);
-                document.getElementById('pnlPercent').innerHTML = (pnl >= 0 ? '+' : '') + data.profitPercent.toFixed(2) + '%';
-                document.getElementById('totalTrades').innerHTML = data.totalSimulatedTrades;
-                document.getElementById('successTrades').innerHTML = data.successfulSimulatedTrades;
-                document.getElementById('failedTrades').innerHTML = data.failedSimulatedTrades;
-                document.getElementById('gasSpent').innerHTML = data.totalSimulatedGasSpent?.toFixed(2) || '0.00';
+                document.getElementById('balanceUSD').innerHTML = '$' + data.wallet.balanceUSD.toFixed(2);
+                document.getElementById('balanceBNB').innerHTML = data.wallet.balanceBNB.toFixed(6) + ' BNB';
+                document.getElementById('pnl').innerHTML = (data.wallet.profitLoss >= 0 ? '+' : '') + '$' + Math.abs(data.wallet.profitLoss).toFixed(2);
+                document.getElementById('pnlPercent').innerHTML = (data.wallet.profitPercent >= 0 ? '+' : '') + data.wallet.profitPercent.toFixed(2) + '%';
+                document.getElementById('attemptsLeft').innerHTML = data.wallet.remainingAttempts || 0;
+                document.getElementById('totalTxs').innerHTML = data.stats.totalTransactions;
+                document.getElementById('successTxs').innerHTML = data.stats.successfulTransactions;
+                document.getElementById('failedTxs').innerHTML = data.stats.failedTransactions;
+                document.getElementById('gasSpent').innerHTML = data.stats.totalGasSpentUSD.toFixed(4);
+                document.getElementById('totalProfit').innerHTML = data.stats.totalProfitUSD.toFixed(2);
+                document.getElementById('bnbPrice').innerHTML = data.current.bnbPriceUSD?.toFixed(2);
+                document.getElementById('gasCost').innerHTML = data.current.gasCostPerTxUSD?.toFixed(4);
+                document.getElementById('status').innerHTML = data.current.isRunning ? '🟢 RUNNING' : '🔴 STOPPED';
                 
-                if (data.bestOpportunity) {
-                    const opp = data.bestOpportunity;
-                    document.getElementById('bestOpportunity').innerHTML = '<div><strong>' + opp.token + '</strong></div>' +
-                        '<div>Loan: $' + opp.loanAmount?.toFixed(0) + ' | Net Profit: <span class="profit">+$' + opp.netProfit?.toFixed(2) + '</span></div>' +
-                        '<div class="text-small">Buy: ' + (opp.buyDex || 'DEX') + ' → Sell: ' + (opp.sellDex || 'DEX') + '</div>';
+                if (data.opportunities && data.opportunities.length > 0) {
+                    const best = data.opportunities[0];
+                    document.getElementById('bestOpportunity').innerHTML = '<strong>' + best.token + '</strong><br>Loan $' + best.loanAmount?.toFixed(0) + ' → Profit <span class="profit">+$' + best.netProfit?.toFixed(2) + '</span><br>' + best.buyDex + ' → ' + best.sellDex;
+                    
+                    let oppHtml = '<tr><th>Token</th><th>Loan</th><th>Profit</th></tr>';
+                    for (let i = 0; i < Math.min(6, data.opportunities.length); i++) {
+                        const o = data.opportunities[i];
+                        oppHtml += '<tr><td>' + o.token + '</td><td>$' + o.loanAmount?.toFixed(0) + '</td><td class="profit">+$' + o.netProfit?.toFixed(2) + '</td></tr>';
+                    }
+                    document.getElementById('oppTable').querySelector('tbody').innerHTML = oppHtml;
                 }
                 
-                if (data.allPrices && Object.keys(data.allPrices).length > 0) {
+                if (data.tradeHistory && data.tradeHistory.length > 0) {
+                    let tradesHtml = '<tr><th>Time</th><th>Token</th><th>Profit</th></tr>';
+                    for (let i = 0; i < Math.min(10, data.tradeHistory.length); i++) {
+                        const t = data.tradeHistory[i];
+                        const profit = t.netProfit || (t.loss ? -t.loss : 0);
+                        tradesHtml += '<tr><td>' + new Date(t.timestamp).toLocaleTimeString() + '</td><td>' + (t.token || 'N/A') + '</td><td class="' + (profit >= 0 ? 'positive' : 'negative') + '">' + (profit >= 0 ? '+' : '') + '$' + Math.abs(profit).toFixed(2) + '</td></tr>';
+                    }
+                    document.getElementById('tradesTable').querySelector('tbody').innerHTML = tradesHtml;
+                }
+                
+                if (data.tokenPrices && data.tokenPrices.length > 0) {
                     let pricesHtml = '';
-                    for (const [token, info] of Object.entries(data.allPrices)) {
-                        pricesHtml += '<div class="token-item"><div>' + token + '</div><div class="token-price">$' + (info.priceUSD?.toFixed(6) || 'N/A') + '</div></div>';
+                    for (const [token, info] of data.tokenPrices) {
+                        pricesHtml += '<div><strong>' + token + '</strong>: $' + (info?.priceUSD?.toFixed(6) || 'N/A') + '</div>';
                     }
                     document.getElementById('pricesContainer').innerHTML = pricesHtml;
                 }
                 
-                const oppTable = document.getElementById('opportunitiesTable').querySelector('tbody');
-                if (data.flashLoanOpportunities && data.flashLoanOpportunities.length > 0) {
-                    let oppHtml = '';
-                    for (let i = 0; i < Math.min(8, data.flashLoanOpportunities.length); i++) {
-                        const opp = data.flashLoanOpportunities[i];
-                        oppHtml += '<tr><td>' + opp.token + '</td><td>$' + opp.loanAmount?.toFixed(0) + '</td><td class="profit">+$' + opp.netProfit?.toFixed(2) + '</td><td>🔍 Found</td></tr>';
-                    }
-                    oppTable.innerHTML = oppHtml;
-                }
-                
-                const tradesBody = document.getElementById('tradesTable').querySelector('tbody');
-                if (data.tradeHistory && data.tradeHistory.length > 0) {
-                    let tradesHtml = '';
-                    for (let i = 0; i < data.tradeHistory.length; i++) {
-                        const t = data.tradeHistory[i];
-                        const profit = t.profit || (t.loss ? -t.loss : 0);
-                        tradesHtml += '<tr><td>' + new Date(t.timestamp).toLocaleTimeString() + '</td><td>' + (t.token || 'N/A') + '</td><td class="' + (profit >= 0 ? 'positive' : 'negative') + '">' + (profit >= 0 ? '+' : '') + '$' + Math.abs(profit).toFixed(2) + '</td></tr>';
-                    }
-                    tradesBody.innerHTML = tradesHtml;
-                }
-                
-                const logsContainer = document.getElementById('logsContainer');
                 if (data.logs && data.logs.length > 0) {
                     let logsHtml = '';
-                    for (let i = 0; i < Math.min(30, data.logs.length); i++) {
+                    for (let i = 0; i < Math.min(25, data.logs.length); i++) {
                         const log = data.logs[i];
                         let color = '#888';
                         if (log.type === 'error') color = '#ef4444';
                         else if (log.type === 'success') color = '#10b981';
                         else if (log.type === 'opportunity') color = '#f0b90b';
                         else if (log.type === 'flashloan') color = '#8b5cf6';
-                        else if (log.type === 'profit') color = '#00d4ff';
-                        logsHtml += '<div style="color: ' + color + '; border-bottom: 1px solid rgba(255,255,255,0.05); padding: 4px 0;">[' + new Date(log.timestamp).toLocaleTimeString() + '] ' + log.message + '</div>';
+                        else if (log.type === 'profit') color = '#ffd700';
+                        logsHtml += '<div style="color: ' + color + '; padding: 3px 0;">[' + new Date(log.timestamp).toLocaleTimeString() + '] ' + log.message + '</div>';
                     }
-                    logsContainer.innerHTML = logsHtml;
+                    document.getElementById('logsContainer').innerHTML = logsHtml;
                 }
             } catch(e) { console.error(e); }
         }
@@ -657,7 +623,7 @@ app.get('/', (req, res) => {
         }
         
         fetchState();
-        setInterval(fetchState, 3000);
+        setInterval(fetchState, 2000);
     </script>
 </body>
 </html>`;
@@ -667,26 +633,24 @@ app.get('/', (req, res) => {
 // ==================== START BOT ====================
 async function start() {
     console.log('\n' + '='.repeat(60));
-    console.log('⚡ FLASH LOAN ARBITRAGE BOT - Real Data Simulation');
+    console.log('⚡ FLASH LOAN ARBITRAGE BOT - $4 REALISTIC SIMULATION');
     console.log('='.repeat(60));
-    console.log(`\n💰 Simulated Balance: $${CONFIG.startingBalance}`);
-    console.log(`🔍 Scanning for flash loan opportunities...`);
-    console.log(`⛽ Gas Price: ${CONFIG.gasPriceGwei} Gwei`);
+    console.log(`\n💰 Starting Balance: $${CONFIG.walletBalanceUSD.toFixed(2)} (${CONFIG.walletBalanceBNB.toFixed(6)} BNB)`);
+    console.log(`⛽ Gas Price: ${CONFIG.gasPriceGwei} Gwei (~$${(CONFIG.estimatedGasPerTx * CONFIG.gasPriceGwei / 1e9 * 615).toFixed(4)}/tx)`);
     console.log(`🎯 Min Profit Target: $${CONFIG.minProfitUSD}`);
-    console.log(`💸 Testing loan amounts: $${CONFIG.flashLoanAmounts.join(', $')}`);
+    console.log(`💸 You have enough BNB for ~${Math.floor(CONFIG.walletBalanceBNB / (CONFIG.estimatedGasPerTx * CONFIG.gasPriceGwei / 1e9))} attempts`);
     console.log(`\n🔗 Connecting to BNB Smart Chain...`);
     
     await initBlockchain();
     
-    console.log(`\n✅ Bot Started!`);
-    console.log(`🌐 Dashboard: http://localhost:${PORT}`);
-    console.log(`\n⚠️  REAL DATA: Prices from live PancakeSwap, BiSwap, ApeSwap`);
-    console.log(`⚡ FLASH LOANS: Simulated execution (no real loans taken)`);
-    console.log(`💡 No wallet, no private key, no real money at risk!\n`);
+    console.log(`\n✅ Bot Started! Dashboard: http://localhost:${PORT}`);
+    console.log(`\n⚠️  REAL DATA from PancakeSwap, BiSwap, ApeSwap`);
+    console.log(`⚡ FLASH LOANS simulated - no real transactions`);
+    console.log(`💡 With $4, you can test ~8-10 flash loan attempts before needing more BNB\n`);
     
     simulationLoop().catch(console.error);
     app.listen(PORT, '0.0.0.0', () => {
-        console.log(`Web dashboard running on port ${PORT}`);
+        console.log(`Web dashboard: http://localhost:${PORT}`);
     });
 }
 
