@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const axios = require('axios');
 const WebSocket = require('ws');
 const zlib = require('zlib');
+const talib = require('talib-binding');
 
 const app = express();
 app.use(express.json());
@@ -42,7 +43,9 @@ const config = {
     walletPerContract: 0.0066135,
     ollamaUrl: process.env.OLLAMA_URL || 'http://localhost:11434',
     ollamaModel: process.env.OLLAMA_MODEL || 'llama3.2',
-    aiControlEnabled: true  // AI controls all actions - NO automatic steps
+    aiControlEnabled: true,
+    klineInterval: '1min',
+    klinesToFetch: 100
 };
 
 let market = {
@@ -62,7 +65,19 @@ let market = {
     currentRiskAmount: 0,
     lastBaseUpdate: Date.now(),
     aiModeEnabled: true,
-    lastAiCheck: 0
+    lastAiCheck: 0,
+    ohlcv: [],
+    indicators: {
+        rsi: 50,
+        macd: { macd: 0, signal: 0, histogram: 0 },
+        bb: { upper: 0, middle: 0, lower: 0 },
+        ema20: 0,
+        ema50: 0,
+        volume: 0,
+        trend: 'NEUTRAL',
+        support: 0,
+        resistance: 0
+    }
 };
 
 let tradeHistory = [];
@@ -70,9 +85,172 @@ let accountStates = {};
 let lastPositionFetch = {};
 let lastBalanceFetch = {};
 let aiRecommendations = {
-    long: { recommendation: 'HOLD: Waiting for AI analysis...', confidence: 0, lastUpdate: null, action: 'HOLD' },
-    short: { recommendation: 'HOLD: Waiting for AI analysis...', confidence: 0, lastUpdate: null, action: 'HOLD' }
+    long: { recommendation: 'HOLD: Waiting for AI analysis...', confidence: 0, lastUpdate: null, action: 'HOLD', indicators: {} },
+    short: { recommendation: 'HOLD: Waiting for AI analysis...', confidence: 0, lastUpdate: null, action: 'HOLD', indicators: {} }
 };
+
+// ==================== TA-LIB INDICATORS ====================
+
+async function fetchOHLCV() {
+    try {
+        const url = `https://${config.restHost}/linear-swap-ex/market/history/kline?contract_code=${config.symbol}&period=${config.klineInterval}&size=${config.klinesToFetch}`;
+        const res = await axios.get(url, { timeout: 5000 });
+        
+        if (res.data?.data) {
+            const klines = res.data.data;
+            market.ohlcv = klines.map(k => ({
+                time: k.id,
+                open: parseFloat(k.open),
+                high: parseFloat(k.high),
+                low: parseFloat(k.low),
+                close: parseFloat(k.close),
+                volume: parseFloat(k.vol)
+            }));
+            
+            calculateIndicators();
+        }
+    } catch (error) {
+        console.error('Failed to fetch OHLCV:', error.message);
+    }
+}
+
+function calculateIndicators() {
+    if (market.ohlcv.length < 50) return;
+    
+    const closes = market.ohlcv.map(c => c.close);
+    const highs = market.ohlcv.map(c => c.high);
+    const lows = market.ohlcv.map(c => c.low);
+    const volumes = market.ohlcv.map(c => c.volume);
+    
+    try {
+        // RSI
+        const rsi = talib.RSI(closes, 14);
+        market.indicators.rsi = rsi[rsi.length - 1];
+        
+        // MACD
+        const macd = talib.MACD(closes, 12, 26, 9);
+        market.indicators.macd = {
+            macd: macd.macd[macd.macd.length - 1],
+            signal: macd.macdSignal[macd.macdSignal.length - 1],
+            histogram: macd.macdHist[macd.macdHist.length - 1]
+        };
+        
+        // Bollinger Bands
+        const bb = talib.BBANDS(closes, 20, 2, 2);
+        market.indicators.bb = {
+            upper: bb.upperBand[bb.upperBand.length - 1],
+            middle: bb.middleBand[bb.middleBand.length - 1],
+            lower: bb.lowerBand[bb.lowerBand.length - 1]
+        };
+        
+        // EMAs
+        const ema20 = talib.EMA(closes, 20);
+        const ema50 = talib.EMA(closes, 50);
+        market.indicators.ema20 = ema20[ema20.length - 1];
+        market.indicators.ema50 = ema50[ema50.length - 1];
+        
+        // Volume
+        market.indicators.volume = volumes[volumes.length - 1];
+        const avgVolume = volumes.slice(-20).reduce((a, b) => a + b, 0) / 20;
+        market.indicators.volumeRatio = market.indicators.volume / avgVolume;
+        
+        // Trend detection
+        if (market.indicators.ema20 > market.indicators.ema50 && 
+            market.indicators.rsi > 50 && 
+            market.indicators.macd.histogram > 0) {
+            market.indicators.trend = 'BULLISH';
+        } else if (market.indicators.ema20 < market.indicators.ema50 && 
+                   market.indicators.rsi < 50 && 
+                   market.indicators.macd.histogram < 0) {
+            market.indicators.trend = 'BEARISH';
+        } else {
+            market.indicators.trend = 'NEUTRAL';
+        }
+        
+        // Support and Resistance (using pivot points)
+        const recentHighs = highs.slice(-20);
+        const recentLows = lows.slice(-20);
+        market.indicators.resistance = Math.max(...recentHighs);
+        market.indicators.support = Math.min(...recentLows);
+        
+        // ATR for volatility
+        const atr = talib.ATR(highs, lows, closes, 14);
+        market.indicators.atr = atr[atr.length - 1];
+        
+        // Stochastic
+        const stoch = talib.STOCH(highs, lows, closes, 14, 3, 3);
+        market.indicators.stochK = stoch.slowK[stoch.slowK.length - 1];
+        market.indicators.stochD = stoch.slowD[stoch.slowD.length - 1];
+        
+        // MFI
+        const mfi = talib.MFI(highs, lows, closes, volumes, 14);
+        market.indicators.mfi = mfi[mfi.length - 1];
+        
+        // ADX for trend strength
+        const adx = talib.ADX(highs, lows, closes, 14);
+        market.indicators.adx = adx[adx.length - 1];
+        
+        // Williams %R
+        const willr = talib.WILLR(highs, lows, closes, 14);
+        market.indicators.willr = willr[willr.length - 1];
+        
+        // CCI
+        const cci = talib.CCI(highs, lows, closes, 14);
+        market.indicators.cci = cci[cci.length - 1];
+        
+    } catch (error) {
+        console.error('Indicator calculation error:', error.message);
+    }
+}
+
+function getIndicatorSummary() {
+    const ind = market.indicators;
+    return {
+        rsi: ind.rsi.toFixed(1),
+        rsi_status: ind.rsi > 70 ? 'OVERSOLD' : (ind.rsi < 30 ? 'OVERBOUGHT' : 'NEUTRAL'),
+        macd: ind.macd.macd.toFixed(4),
+        macd_signal: ind.macd.signal.toFixed(4),
+        macd_histogram: ind.macd.histogram.toFixed(4),
+        macd_status: ind.macd.histogram > 0 ? 'BULLISH' : 'BEARISH',
+        bb_position: ind.bb.middle > 0 ? ((ind.bb.upper - ind.bb.lower) / ind.bb.middle * 100).toFixed(1) : 0,
+        price_vs_bb: market.bid > ind.bb.upper ? 'ABOVE_UPPER' : (market.bid < ind.bb.lower ? 'BELOW_LOWER' : 'IN_RANGE'),
+        ema20: ind.ema20.toFixed(8),
+        ema50: ind.ema50.toFixed(8),
+        ema_trend: ind.ema20 > ind.ema50 ? 'BULLISH' : 'BEARISH',
+        volume_ratio: ind.volumeRatio.toFixed(2),
+        trend: ind.trend,
+        support: ind.support.toFixed(8),
+        resistance: ind.resistance.toFixed(8),
+        atr: ind.atr.toFixed(8),
+        atr_percent: ((ind.atr / market.bid) * 100).toFixed(2),
+        stoch_k: ind.stochK.toFixed(1),
+        stoch_d: ind.stochD.toFixed(1),
+        stoch_status: ind.stochK > 80 ? 'OVERBOUGHT' : (ind.stochK < 20 ? 'OVERSOLD' : 'NEUTRAL'),
+        mfi: ind.mfi.toFixed(1),
+        mfi_status: ind.mfi > 80 ? 'OVERBOUGHT' : (ind.mfi < 20 ? 'OVERSOLD' : 'NEUTRAL'),
+        adx: ind.adx.toFixed(1),
+        adx_status: ind.adx > 25 ? 'STRONG_TREND' : (ind.adx > 20 ? 'WEAK_TREND' : 'RANGING'),
+        willr: ind.willr.toFixed(1),
+        cci: ind.cci.toFixed(1)
+    };
+}
+
+function calculateTrendStrength() {
+    const ind = market.indicators;
+    let strength = 0;
+    
+    if (ind.trend === 'BULLISH') strength += 2;
+    if (ind.macd.histogram > 0) strength += 1.5;
+    if (ind.rsi > 50 && ind.rsi < 70) strength += 1;
+    if (ind.ema20 > ind.ema50) strength += 1.5;
+    if (ind.adx > 25) strength += 1;
+    if (ind.stochK > 20 && ind.stochK < 80) strength += 0.5;
+    if (ind.mfi > 40 && ind.mfi < 60) strength += 0.5;
+    
+    return Math.min(10, strength);
+}
+
+// ==================== EXISTING TRADING FUNCTIONS ====================
 
 function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
     if (!config.autoCompound || totalEquity <= 0) {
@@ -93,13 +271,6 @@ function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
     
     market.currentRiskAmount = riskAmount;
     market.currentBaseShib = shibAmount;
-    
-    console.log(`\n💰 AUTO-COMPOUNDING CALCULATION:`);
-    console.log(`   Wallet: $${totalEquity.toFixed(8)}`);
-    console.log(`   ${config.riskPercent}% Risk: $${riskAmount.toFixed(8)}`);
-    console.log(`   @ ${config.leverage}x → $${positionUsdt.toFixed(8)} position`);
-    console.log(`   Volume: ${volume.toLocaleString()} contract(s) = ${shibAmount.toLocaleString()} ${config.symbol.split('-')[0]}`);
-    console.log(`   Risk per contract: $${(riskAmount/volume).toFixed(8)}\n`);
     
     return volume;
 }
@@ -161,7 +332,8 @@ function updateWalletGrowth(totalEquity) {
             baseShib: market.currentBaseShib,
             riskAmount: market.currentRiskAmount,
             longRec: aiRecommendations.long.recommendation,
-            shortRec: aiRecommendations.short.recommendation
+            shortRec: aiRecommendations.short.recommendation,
+            indicators: getIndicatorSummary()
         });
         
         if (market.walletHistory.length > 100) market.walletHistory.shift();
@@ -186,7 +358,7 @@ config.accounts.forEach((account, idx) => {
         currentEquity: 0, availableMargin: 0, initialEquity: null,
         isLocked: false,
         pendingOrderId: null,
-        lastAction: '🤖 Waiting for AI recommendation...',
+        lastAction: '🤖 Waiting for AI analysis...',
         lastStepPrice: 0, lastAddedVolume: 0, startTime: null,
         lastExchangeRoi: 0,
         roiLatencyMs: 0,
@@ -320,8 +492,6 @@ async function syncAccount(acc, state) {
                 
                 if (state.roiLatencyHistory.length > 10) state.roiLatencyHistory.pop();
                 
-                console.log(`[${state.direction.toUpperCase()}] ROI: ${newExchangeRoi.toFixed(2)}% | Vol: ${newVolume} | Step: ${calculatedStep} (delay: ${timeSinceLastUpdate}ms)`);
-                
                 state.roi = newExchangeRoi;
                 state.lastExchangeRoi = newExchangeRoi;
                 state.lastRoiUpdateTime = now;
@@ -333,7 +503,7 @@ async function syncAccount(acc, state) {
             if (!state.startTime) state.startTime = new Date().toLocaleString();
         } else {
             if (state.volume !== 0) {
-                console.log(`✅ [${state.direction.toUpperCase()}] Position closed at ${new Date().toLocaleTimeString()}`);
+                console.log(`✅ [${state.direction.toUpperCase()}] Position closed`);
                 state.volume = 0;
                 state.roi = 0;
                 state.unrealizedUsdt = 0;
@@ -369,82 +539,102 @@ async function syncAccount(acc, state) {
         if (oldEquity > 0 && Math.abs(state.currentEquity - oldEquity) > 0.000001) {
             const change = state.currentEquity - oldEquity;
             if (Math.abs(change) > 0.0001) {
-                console.log(`[${state.direction.toUpperCase()}] Equity: $${oldEquity.toFixed(8)} → $${state.currentEquity.toFixed(8)} (${change >= 0 ? '+' : ''}$${change.toFixed(8)})`);
+                console.log(`[${state.direction.toUpperCase()}] Equity: $${oldEquity.toFixed(8)} → $${state.currentEquity.toFixed(8)}`);
             }
         }
     }
 }
+
+// ==================== AI WITH TECHNICAL INDICATORS ====================
 
 async function getAIRecommendation(direction, state, marketData) {
     try {
         const currentStep = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
         const nextStepVolume = currentStep === 0 ? market.currentBaseVolume : Math.ceil(market.currentBaseVolume * Math.pow(config.multiplier, currentStep + 1));
         
-        const prompt = `You are a crypto futures trading advisor for HTX. Analyze this ${direction.toUpperCase()} position and give ONLY ONE of these exact recommendations:
+        const indicators = getIndicatorSummary();
+        const trendStrength = calculateTrendStrength();
+        
+        const prompt = `You are a professional crypto futures trading advisor. Analyze this ${direction.toUpperCase()} position using technical indicators and give ONLY ONE recommendation.
 
-RULES:
-- If NO position exists (volume = 0) and spread < ${config.maxStartSpread}%: Recommend "OPEN POSITION"
-- If position exists and ROI <= -${config.stepDistancePct}%: Recommend "STEP UP: Add ${nextStepVolume} contracts"
-- If position exists and ROI >= ${config.takeProfitPct}%: Recommend "CLOSE POSITION"
-- Otherwise: Recommend "HOLD"
+TECHNICAL INDICATORS:
+- RSI(14): ${indicators.rsi} (${indicators.rsi_status})
+- MACD: ${indicators.macd_histogram} (${indicators.macd_status})
+- EMA Trend: 20=${indicators.ema20.toFixed(6)} | 50=${indicators.ema50.toFixed(6)} (${indicators.ema_trend})
+- Bollinger Bands: Price is ${indicators.price_vs_bb}
+- Volume Ratio: ${indicators.volume_ratio}x average
+- Overall Trend: ${indicators.trend}
+- Trend Strength: ${trendStrength}/10
+- Support: ${indicators.support} | Resistance: ${indicators.resistance}
+- ATR (Volatility): ${indicators.atr_percent}%
+- Stochastic: K=${indicators.stoch_k} | D=${indicators.stoch_d} (${indicators.stoch_status})
+- MFI: ${indicators.mfi} (${indicators.mfi_status})
+- ADX: ${indicators.adx} (${indicators.adx_status})
+- Williams %R: ${indicators.willr}
+- CCI: ${indicators.cci}
 
-Position Data:
+POSITION DATA:
 - Current ROI: ${state.roi.toFixed(2)}%
 - Volume: ${state.volume} contracts
-- Current Step: ${currentStep}
 - Entry Price: ${state.entryPrice.toFixed(8)}
-- Target Price: ${state.targetPrice.toFixed(8)}
-- Unrealized PnL: $${state.unrealizedUsdt.toFixed(8)}
 - Current Price: $${direction === 'buy' ? market.bid : market.ask}
 
-Market Conditions:
-- Spread: ${market.spread.toFixed(3)}%
-- Max Start Spread: ${config.maxStartSpread}%
-- Total Wallet: $${marketData.totalEquity.toFixed(8)}
+RULES FOR RECOMMENDATION:
+1. OPEN POSITION (if volume = 0 AND spread < ${config.maxStartSpread}%):
+   - Strong trend (ADX > 25) AND momentum agrees (MACD positive for long, negative for short)
+   - RSI not extreme (>70 or <30)
+   - Volume above average (>1x)
+
+2. STEP UP (if ROI <= -${config.stepDistancePct}%):
+   - Only if trend supports reversal (ADX > 20)
+   - Not recommended if ADX > 40 (trend too strong against you)
+
+3. CLOSE POSITION (if ROI >= ${config.takeProfitPct}% OR indicators show reversal):
+   - Take profit at target OR
+   - Indicators turning against position (RSI extreme, MACD crossover, BB breach)
+
+4. HOLD: All other cases
 
 Respond with EXACTLY ONE of these formats:
-- "OPEN POSITION: Start new ${direction} position with ${market.currentBaseVolume} contracts"
-- "STEP UP: Add ${nextStepVolume} contracts (martingale)"
-- "CLOSE POSITION: Take profit/loss now"
-- "HOLD: No action needed"
+- "OPEN POSITION: Start new ${direction} position with ${market.currentBaseVolume} contracts [reason: brief]"
+- "STEP UP: Add ${nextStepVolume} contracts [reason: brief]"
+- "CLOSE POSITION: Take profit/loss now [reason: brief]"
+- "HOLD: No action needed [reason: brief]"
 
-DO NOT add any other text or explanation.`;
+Keep reason very short (max 10 words).`;
 
         const response = await axios.post(`${config.ollamaUrl}/api/generate`, {
             model: config.ollamaModel,
             prompt: prompt,
             stream: false,
             options: {
-                temperature: 0.1,
+                temperature: 0.2,
                 top_p: 0.9,
-                num_predict: 60
+                num_predict: 100
             }
         });
 
         let recommendation = response.data.response.trim();
         
-        // Validate and clean recommendation
-        if (recommendation.includes('OPEN POSITION')) {
-            recommendation = `OPEN POSITION: Start new ${direction} position with ${market.currentBaseVolume} contracts`;
-        } else if (recommendation.includes('STEP UP')) {
-            recommendation = `STEP UP: Add ${nextStepVolume} contracts (martingale)`;
-        } else if (recommendation.includes('CLOSE POSITION')) {
-            recommendation = 'CLOSE POSITION: Take profit/loss now';
-        } else {
-            recommendation = 'HOLD: No action needed';
-        }
+        // Extract main action
+        let action = 'HOLD';
+        if (recommendation.includes('OPEN POSITION')) action = 'OPEN POSITION';
+        else if (recommendation.includes('STEP UP')) action = 'STEP UP';
+        else if (recommendation.includes('CLOSE POSITION')) action = 'CLOSE POSITION';
         
-        return recommendation;
+        return { action, full: recommendation };
         
     } catch (error) {
         console.error(`AI Error for ${direction}:`, error.message);
-        // Fallback - only HOLD, no automatic actions
-        return 'HOLD: No action needed';
+        return { action: 'HOLD', full: 'HOLD: AI unavailable, manual review needed' };
     }
 }
 
 async function updateAIRecommendations() {
     try {
+        // Fetch latest OHLCV and indicators
+        await fetchOHLCV();
+        
         const longState = accountStates[1];
         const shortState = accountStates[2];
         
@@ -460,51 +650,52 @@ async function updateAIRecommendations() {
         };
         
         // Get recommendations for both positions
-        const [longRec, shortRec] = await Promise.all([
+        const [longResult, shortResult] = await Promise.all([
             getAIRecommendation('long', longState, marketData),
             getAIRecommendation('short', shortState, marketData)
         ]);
         
         aiRecommendations.long = {
-            recommendation: longRec,
+            recommendation: longResult.full,
             confidence: 90,
             lastUpdate: new Date().toISOString(),
-            action: longRec.split(':')[0]
+            action: longResult.action,
+            indicators: getIndicatorSummary()
         };
         
         aiRecommendations.short = {
-            recommendation: shortRec,
+            recommendation: shortResult.full,
             confidence: 90,
             lastUpdate: new Date().toISOString(),
-            action: shortRec.split(':')[0]
+            action: shortResult.action,
+            indicators: getIndicatorSummary()
         };
         
         console.log(`\n🤖 AI RECOMMENDATIONS (${new Date().toLocaleTimeString()}):`);
-        console.log(`   LONG: ${longRec}`);
-        console.log(`   SHORT: ${shortRec}\n`);
+        console.log(`   📊 Indicators: RSI=${market.indicators.rsi.toFixed(1)} | Trend=${market.indicators.trend} | ADX=${market.indicators.adx.toFixed(1)}`);
+        console.log(`   LONG: ${longResult.full}`);
+        console.log(`   SHORT: ${shortResult.full}\n`);
         
         // Execute AI recommendations
-        await executeAIRecommendation('long', longRec, longState, 1);
-        await executeAIRecommendation('short', shortRec, shortState, 2);
+        await executeAIRecommendation('long', longResult.action, longState, 1);
+        await executeAIRecommendation('short', shortResult.action, shortState, 2);
         
     } catch (error) {
         console.error('AI recommendation error:', error);
     }
 }
 
-async function executeAIRecommendation(direction, recommendation, state, accountId) {
+async function executeAIRecommendation(direction, action, state, accountId) {
     const acc = config.accounts.find(a => a.accountId === accountId);
     if (!acc || state.isLocked) return;
     
-    const action = recommendation.split(':')[0];
-    
     // STEP UP action
     if (action === 'STEP UP') {
-        if (state.volume > 0) {
-            const match = recommendation.match(/(\d+)/);
-            const volumeToAdd = match ? parseInt(match[0]) : Math.ceil(market.currentBaseVolume * config.multiplier);
+        if (state.volume > 0 && state.roi <= -config.stepDistancePct) {
+            const currentStep = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
+            const volumeToAdd = currentStep === 0 ? market.currentBaseVolume : Math.ceil(market.currentBaseVolume * Math.pow(config.multiplier, currentStep + 1));
             
-            console.log(`🤖 AI EXECUTING STEP UP: Adding ${volumeToAdd} contracts to ${direction} position`);
+            console.log(`🤖 AI EXECUTING STEP UP: Adding ${volumeToAdd} contracts to ${direction}`);
             state.isLocked = true;
             state.lastAction = `🤖 AI: STEP UP +${volumeToAdd}`;
             
@@ -521,7 +712,7 @@ async function executeAIRecommendation(direction, recommendation, state, account
                 state.pendingOrderId = res.data?.order_id_str;
                 console.log(`✅ AI STEP UP executed for ${direction}`);
             } else {
-                console.error(`❌ AI STEP UP failed:`, res);
+                console.error(`❌ AI STEP UP failed`);
                 state.lastAction = `❌ AI STEP UP Failed`;
             }
             setTimeout(() => { state.isLocked = false; }, 2000);
@@ -547,13 +738,11 @@ async function executeAIRecommendation(direction, recommendation, state, account
                 state.pendingOrderId = res.data?.order_id_str;
                 console.log(`✅ AI CLOSE POSITION executed for ${direction}`);
                 
-                // Log trade
                 const finalRoi = state.roi;
                 const finalPnl = state.unrealizedUsdt;
                 const exitTime = new Date().toLocaleString();
                 logTradeExchangeStyle(state, state.direction === 'buy' ? market.bid : market.ask, exitTime, finalRoi, finalPnl);
                 
-                // Reset position
                 state.volume = 0;
                 state.roi = 0;
                 state.unrealizedUsdt = 0;
@@ -564,7 +753,7 @@ async function executeAIRecommendation(direction, recommendation, state, account
                 state.targetPrice = 0;
                 state.aiActionTaken = false;
             } else {
-                console.error(`❌ AI CLOSE POSITION failed:`, res);
+                console.error(`❌ AI CLOSE POSITION failed`);
                 state.lastAction = `❌ AI CLOSE Failed`;
             }
             setTimeout(() => { state.isLocked = false; }, 2000);
@@ -573,7 +762,7 @@ async function executeAIRecommendation(direction, recommendation, state, account
     // OPEN POSITION action
     else if (action === 'OPEN POSITION') {
         if (state.volume === 0 && market.spread <= config.maxStartSpread) {
-            console.log(`🤖 AI EXECUTING OPEN POSITION: Opening ${market.currentBaseVolume} contracts ${direction} at ${state.direction === 'buy' ? market.bid : market.ask}`);
+            console.log(`🤖 AI EXECUTING OPEN POSITION: Opening ${market.currentBaseVolume} contracts ${direction}`);
             state.isLocked = true;
             state.lastAction = `🤖 AI: OPEN POSITION`;
             
@@ -599,25 +788,15 @@ async function executeAIRecommendation(direction, recommendation, state, account
                     if (orderInfo?.data?.[0]?.status === 6) {
                         state.entryPrice = parseFloat(orderInfo.data[0].price_avg);
                         state.targetPrice = calculateTargetPrice(state);
-                        console.log(`✅ Position opened at ${state.entryPrice.toFixed(8)}, TP: ${state.targetPrice.toFixed(8)}`);
+                        console.log(`✅ Position opened at ${state.entryPrice.toFixed(8)}`);
                         state.isLocked = false;
                     }
                 }, 2000);
             } else {
                 state.isLocked = false;
                 state.lastAction = `❌ AI OPEN Failed`;
-                console.error(`❌ AI OPEN POSITION failed:`, res);
+                console.error(`❌ AI OPEN POSITION failed`);
             }
-        } else if (state.volume > 0) {
-            console.log(`⚠️ AI recommended OPEN but position already exists for ${direction}`);
-        } else if (market.spread > config.maxStartSpread) {
-            console.log(`⚠️ AI recommended OPEN but spread too high: ${market.spread.toFixed(2)}% > ${config.maxStartSpread}%`);
-        }
-    }
-    // HOLD action
-    else {
-        if (state.lastAction !== `🤖 AI: HOLD`) {
-            state.lastAction = `🤖 AI: HOLD - No action needed`;
         }
     }
 }
@@ -646,15 +825,14 @@ function logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl) {
         roi: finalRoi.toFixed(2) + '%',
         netPnlUsdt: finalPnl.toFixed(8),
         estimatedFee: estimatedFee.toFixed(8),
-        aiRecommendation: state.direction === 'buy' ? aiRecommendations.long.recommendation : aiRecommendations.short.recommendation
+        aiRecommendation: state.direction === 'buy' ? aiRecommendations.long.recommendation : aiRecommendations.short.recommendation,
+        indicatorsAtClose: getIndicatorSummary()
     });
     
     if (tradeHistory.length > 20) tradeHistory.pop();
     
     state.realizedPnl += finalPnl;
     state.totalFees += estimatedFee;
-    
-    console.log(`📊 TRADE CLOSED: ${state.direction.toUpperCase()} | ROI: ${finalRoi.toFixed(2)}% | PnL: ${finalPnl >= 0 ? '+' : ''}$${finalPnl.toFixed(8)} | Fee: $${estimatedFee.toFixed(8)}`);
 }
 
 function startWS() {
@@ -694,26 +872,18 @@ function startWS() {
 }
 
 async function processMartingale() {
-    // AI CONTROLLED ONLY - No automatic actions
-    // This function only updates status, no automatic trading
-    
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
         if (state.isLocked) continue;
         
         const currentStep = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
         
-        // Just update status display with AI recommendation
         if (state.volume > 0) {
-            const aiRec = state.direction === 'buy' ? aiRecommendations.long.recommendation : aiRecommendations.short.recommendation;
-            state.lastAction = `🤖 AI: ${aiRec} | ROI: ${state.roi.toFixed(2)}% | Step ${currentStep}`;
+            const aiRec = state.direction === 'buy' ? aiRecommendations.long : aiRecommendations.short;
+            state.lastAction = `🤖 ${aiRec.action} | ROI: ${state.roi.toFixed(2)}% | Step ${currentStep}`;
         } else {
-            const aiRec = state.direction === 'buy' ? aiRecommendations.long.recommendation : aiRecommendations.short.recommendation;
-            if (aiRec.includes('OPEN')) {
-                state.lastAction = `🤖 AI: ${aiRec}`;
-            } else {
-                state.lastAction = `🤖 AI: ${aiRec} | No position`;
-            }
+            const aiRec = state.direction === 'buy' ? aiRecommendations.long : aiRecommendations.short;
+            state.lastAction = `🤖 ${aiRec.action} | No position | RSI: ${market.indicators.rsi.toFixed(1)}`;
         }
     }
 }
@@ -740,8 +910,6 @@ async function backgroundLoop() {
             
             if (market.initialTotalEquity > 0) {
                 const totalEquity = s1.currentEquity + s2.currentEquity;
-                const totalRealizedPnl = s1.realizedPnl + s2.realizedPnl;
-                const totalFees = s1.totalFees + s2.totalFees;
                 
                 market.totalNetGain = totalEquity - market.initialTotalEquity;
                 market.growthPct = (market.totalNetGain / market.initialTotalEquity) * 100;
@@ -751,23 +919,17 @@ async function backgroundLoop() {
                 if (config.autoCompound && market.bid > 0) {
                     const newBaseVolume = calculateBaseVolumeFromWallet(totalEquity, market.bid);
                     if (newBaseVolume !== market.currentBaseVolume) {
-                        console.log(`📈 AUTO-COMPOUND: Base volume updated: ${market.currentBaseVolume} → ${newBaseVolume} contract(s)`);
+                        console.log(`📈 AUTO-COMPOUND: ${market.currentBaseVolume} → ${newBaseVolume} contracts`);
                         market.currentBaseVolume = newBaseVolume;
                         market.lastBaseUpdate = Date.now();
                     }
                 }
                 
                 updateWalletGrowth(totalEquity);
-                
-                const lastRecord = market.walletHistory[market.walletHistory.length - 2];
-                if (lastRecord && Math.abs(market.growthPct - lastRecord.pnlPercent) > 0.1) {
-                    console.log(`💰 WALLET: $${totalEquity.toFixed(8)} | PnL: ${market.totalNetGain >= 0 ? '+' : ''}$${market.totalNetGain.toFixed(8)} (${market.growthPct >= 0 ? '+' : ''}${market.growthPct.toFixed(2)}%)`);
-                    console.log(`   Base Volume: ${market.currentBaseVolume} contract(s) (${market.currentBaseShib.toLocaleString()} ${config.symbol.split('-')[0]}) | Risk: $${market.currentRiskAmount.toFixed(8)}`);
-                }
             }
         }
         
-        // Update AI recommendations every 15 seconds
+        // Update AI recommendations and indicators every 15 seconds
         if (Date.now() - market.lastAiCheck > 15000) {
             market.lastAiCheck = Date.now();
             await updateAIRecommendations();
@@ -787,43 +949,13 @@ app.get('/api/status', (req, res) => {
     const s1 = accountStates[1];
     const s2 = accountStates[2];
     const totalEquity = (s1?.currentEquity || 0) + (s2?.currentEquity || 0);
-    const totalRealizedPnl = (s1?.realizedPnl || 0) + (s2?.realizedPnl || 0);
-    const totalFees = (s1?.totalFees || 0) + (s2?.totalFees || 0);
-    
-    const accountsWithInfo = Object.values(accountStates).map(state => {
-        const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
-        const expectedVol = calculateVolumeForStep(step, market.currentBaseVolume, config.multiplier);
-        const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
-        
-        return {
-            direction: state.direction,
-            roi: state.roi,
-            volume: state.volume,
-            step: step,
-            expectedVolumeForStep: expectedVol,
-            unrealizedUsdt: state.unrealizedUsdt,
-            entryPrice: state.entryPrice,
-            lastAction: state.lastAction,
-            startTime: state.startTime,
-            targetPrice: state.targetPrice,
-            requiredPriceMoveForTP: `${requiredPriceMovePct}%`,
-            currentEquity: state.currentEquity,
-            initialEquity: state.initialEquity,
-            realizedPnl: state.realizedPnl,
-            totalFees: state.totalFees,
-            roiLatencyHistory: state.roiLatencyHistory.slice(0, 5)
-        };
-    });
     
     res.json({
         market: {
             ...market,
             totalEquity: totalEquity,
-            totalRealizedPnl: totalRealizedPnl,
-            totalFeesPaid: totalFees,
             totalNetGain: market.totalNetGain,
             growthPct: market.growthPct,
-            dgr: market.dgr,
             peakEquity: market.peakEquity,
             maxDrawdown: market.maxDrawdown,
             totalTrades: market.totalTrades,
@@ -831,34 +963,42 @@ app.get('/api/status', (req, res) => {
             losingTrades: market.losingTrades,
             winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0,
             walletHistory: market.walletHistory.slice(-20),
-            autoCompound: config.autoCompound,
-            riskPercent: config.riskPercent,
             currentBaseVolume: market.currentBaseVolume,
             currentBaseShib: market.currentBaseShib,
             currentRiskAmount: market.currentRiskAmount,
-            shibPerContract: config.shibPerContract,
-            walletPerContract: config.walletPerContract,
-            aiControlEnabled: config.aiControlEnabled,
-            aiModel: config.ollamaModel
+            indicators: getIndicatorSummary(),
+            trendStrength: calculateTrendStrength()
         },
-        accounts: accountsWithInfo,
-        tradeHistory,
+        accounts: Object.values(accountStates).map(state => ({
+            direction: state.direction,
+            roi: state.roi,
+            volume: state.volume,
+            step: calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier),
+            unrealizedUsdt: state.unrealizedUsdt,
+            entryPrice: state.entryPrice,
+            lastAction: state.lastAction,
+            targetPrice: state.targetPrice,
+            realizedPnl: state.realizedPnl
+        })),
+        tradeHistory: tradeHistory.slice(0, 20),
         aiRecommendations: aiRecommendations,
         config: {
-            maxStartSpread: config.maxStartSpread,
-            takeProfitPct: config.takeProfitPct,
             leverage: config.leverage,
-            requiredPriceMovePct: (config.takeProfitPct / config.leverage).toFixed(3) + '%',
-            pollInterval: config.pollInterval,
-            baseVolume: market.currentBaseVolume,
+            takeProfitPct: config.takeProfitPct,
+            maxStartSpread: config.maxStartSpread,
             multiplier: config.multiplier,
             autoCompound: config.autoCompound,
             riskPercent: config.riskPercent,
-            walletPerContract: config.walletPerContract,
             ollamaModel: config.ollamaModel,
-            aiControlEnabled: config.aiControlEnabled
+            klineInterval: config.klineInterval
         }
     });
+});
+
+app.post('/api/force-ai-check', async (req, res) => {
+    console.log("🤖 Force AI check initiated...");
+    await updateAIRecommendations();
+    res.json({ status: 'ok', recommendations: aiRecommendations, indicators: getIndicatorSummary() });
 });
 
 app.post('/api/close', async (req, res) => {
@@ -868,8 +1008,6 @@ app.post('/api/close', async (req, res) => {
     for (const acc of config.accounts) {
         const s = accountStates[acc.accountId];
         if (s.volume > 0) {
-            const step = calculateStepFromVolume(s.volume, market.currentBaseVolume, config.multiplier);
-            console.log(`Closing ${s.direction} position (Step ${step}, Vol: ${s.volume})...`);
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol,
                 volume: s.volume,
@@ -886,116 +1024,35 @@ app.post('/api/close', async (req, res) => {
 });
 
 app.post('/api/force-sync', async (req, res) => {
-    console.log("🔄 Force syncing all positions...");
+    console.log("🔄 Force syncing...");
     for (const acc of config.accounts) {
-        const state = accountStates[acc.accountId];
-        await syncAccount(acc, state);
+        await syncAccount(acc, accountStates[acc.accountId]);
     }
-    res.json({ status: 'ok', message: 'Force sync completed' });
+    res.json({ status: 'ok' });
 });
 
-app.post('/api/force-ai-check', async (req, res) => {
-    console.log("🤖 Force AI check initiated...");
-    await updateAIRecommendations();
-    res.json({ status: 'ok', message: 'AI check completed', recommendations: aiRecommendations });
-});
-
-app.get('/api/wallet-history', (req, res) => {
-    const s1 = accountStates[1];
-    const s2 = accountStates[2];
-    
+app.get('/api/indicators', (req, res) => {
     res.json({
-        currentWallet: {
-            totalEquity: (s1?.currentEquity || 0) + (s2?.currentEquity || 0),
-            totalRealizedPnl: (s1?.realizedPnl || 0) + (s2?.realizedPnl || 0),
-            totalFees: (s1?.totalFees || 0) + (s2?.totalFees || 0),
-            growthPct: market.growthPct,
-            peakEquity: market.peakEquity,
-            maxDrawdown: market.maxDrawdown,
-            totalTrades: market.totalTrades,
-            winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0,
-            autoCompound: {
-                enabled: config.autoCompound,
-                riskPercent: config.riskPercent,
-                currentBaseVolume: market.currentBaseVolume,
-                currentBaseShib: market.currentBaseShib,
-                currentRiskAmount: market.currentRiskAmount,
-                shibPerContract: config.shibPerContract,
-                walletPerContract: config.walletPerContract
-            }
+        current: getIndicatorSummary(),
+        raw: {
+            rsi: market.indicators.rsi,
+            macd: market.indicators.macd,
+            bb: market.indicators.bb,
+            ema20: market.indicators.ema20,
+            ema50: market.indicators.ema50,
+            trend: market.indicators.trend,
+            support: market.indicators.support,
+            resistance: market.indicators.resistance,
+            atr: market.indicators.atr,
+            stochK: market.indicators.stochK,
+            stochD: market.indicators.stochD,
+            mfi: market.indicators.mfi,
+            adx: market.indicators.adx,
+            willr: market.indicators.willr,
+            cci: market.indicators.cci
         },
-        history: market.walletHistory,
-        trades: tradeHistory.slice(0, 20),
-        aiRecommendations: aiRecommendations
-    });
-});
-
-app.get('/api/verify', async (req, res) => {
-    const requiredPriceMovePct = config.takeProfitPct / config.leverage;
-    
-    const verification = [];
-    
-    for (const acc of config.accounts) {
-        const state = accountStates[acc.accountId];
-        const posRes = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_position_info', {
-            contract_code: config.symbol
-        });
-        
-        if (posRes?.status === 'ok' && posRes.data) {
-            const pos = posRes.data.find(p => p.direction === state.direction);
-            if (pos) {
-                verification.push({
-                    account: acc.accountId,
-                    direction: state.direction,
-                    exchange_profit_rate: parseFloat(pos.profit_rate),
-                    exchange_profit_rate_percent: (parseFloat(pos.profit_rate) * 100).toFixed(2) + '%',
-                    bot_display_roi: state.roi.toFixed(2) + '%',
-                    target_price: state.targetPrice,
-                    entry_price: state.entryPrice,
-                    current_ask: market.ask,
-                    current_bid: market.bid,
-                    required_price_move_for_tp: requiredPriceMovePct.toFixed(3) + '%',
-                    leverage: config.leverage,
-                    realized_pnl: state.realizedPnl,
-                    total_fees: state.totalFees,
-                    ai_recommendation: state.direction === 'buy' ? aiRecommendations.long.recommendation : aiRecommendations.short.recommendation
-                });
-            }
-        }
-    }
-    
-    res.json({
-        verified: verification,
-        wallet: {
-            initialEquity: market.initialTotalEquity,
-            currentEquity: (accountStates[1]?.currentEquity || 0) + (accountStates[2]?.currentEquity || 0),
-            totalPnL: market.totalNetGain,
-            totalPnLPercent: market.growthPct,
-            totalRealizedPnL: (accountStates[1]?.realizedPnl || 0) + (accountStates[2]?.realizedPnl || 0),
-            totalFees: (accountStates[1]?.totalFees || 0) + (accountStates[2]?.totalFees || 0),
-            peakEquity: market.peakEquity,
-            maxDrawdown: market.maxDrawdown,
-            totalTrades: market.totalTrades,
-            winRate: market.totalTrades > 0 ? (market.winningTrades / market.totalTrades * 100).toFixed(1) : 0,
-            autoCompound: {
-                enabled: config.autoCompound,
-                riskPercent: config.riskPercent,
-                currentBaseVolume: market.currentBaseVolume,
-                currentBaseShib: market.currentBaseShib,
-                currentRiskAmount: market.currentRiskAmount,
-                shibPerContract: config.shibPerContract,
-                walletPerContract: config.walletPerContract,
-                formula: "Volume = Total Wallet ÷ 0.0066135"
-            }
-        },
-        aiRecommendations: aiRecommendations,
-        aiControl: {
-            enabled: config.aiControlEnabled,
-            model: config.ollamaModel,
-            checkInterval: '15 seconds',
-            message: 'All actions controlled by AI - no automatic steps'
-        },
-        message: `🤖 AI CONTROL ACTIVE: All trading decisions (OPEN, STEP UP, CLOSE) are made by Ollama AI (${config.ollamaModel}). No automatic martingale steps.`
+        ohlcv_count: market.ohlcv.length,
+        last_price: market.bid
     });
 });
 
@@ -1004,13 +1061,12 @@ app.get('/api/verify', async (req, res) => {
 app.get('/', (req, res) => {
     const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
     
-    res.send(`
-<!DOCTYPE html>
+    res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Martingale Pro AI - AI Controlled Trading</title>
+    <title>Martingale Pro AI - TA-Lib Technical Analysis</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
@@ -1034,46 +1090,86 @@ app.get('/', (req, res) => {
         .ai-card { background: linear-gradient(135deg, #6366F120 0%, #131824 100%); border: 2px solid #6366F1; border-radius: 12px; padding: 15px; margin-bottom: 20px; }
         .ai-recommendation { font-size: 14px; font-weight: bold; padding: 10px; border-radius: 8px; margin-top: 8px; }
         .step-up { background: #FF4D6D20; color: #FF4D6D; border-left: 3px solid #FF4D6D; }
-        .step-down { background: #FFB34720; color: #FFB347; border-left: 3px solid #FFB347; }
         .close-position { background: #FF000020; color: #FF0000; border-left: 3px solid #FF0000; }
         .open-position { background: #00D1B220; color: #00D1B2; border-left: 3px solid #00D1B2; }
         .hold { background: #6366F120; color: #6366F1; border-left: 3px solid #6366F1; }
         .ai-badge { background: #6366F1; color: white; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; margin-left: 8px; }
-        .control-badge { background: #FF4D6D; color: white; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; margin-left: 8px; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-        .ai-pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+        .indicator-card { background: #0F141C; border-radius: 8px; padding: 10px; margin: 5px; }
+        .bullish { color: #00D1B2; }
+        .bearish { color: #FF4D6D; }
+        .neutral { color: #FFB347; }
     </style>
 </head>
 <body class="p-6">
     <div class="max-w-7xl mx-auto">
+        <!-- Header -->
         <div class="flex justify-between items-center mb-8">
             <div>
-                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO AI</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">AI CONTROLLED</span></h1>
+                <h1 class="text-3xl font-black">MARTINGALE <span class="text-indigo-500">PRO AI</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">TA-LIB POWERED</span></h1>
                 <div class="flex items-center gap-3 mt-2">
                     <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
                     <span class="text-[10px] font-bold text-emerald-400">LIVE</span>
                     <span class="text-[10px] text-slate-500">${config.symbol}</span>
                     <span class="text-[10px] text-slate-500">${config.leverage}x LEVERAGE</span>
-                    <span class="tp-target">🎯 TP: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price move</span>
-                    <span class="ai-badge">🤖 AI: ${config.ollamaModel}</span>
-                    <span class="control-badge">🎮 AI CONTROLLED</span>
+                    <span class="tp-target">🎯 TP: ${config.takeProfitPct}% ROI</span>
+                    <span class="ai-badge">🤖 ${config.ollamaModel}</span>
                 </div>
             </div>
             <div>
                 <button onclick="forceAICheck()" class="ai-btn">🤖 FORCE AI CHECK</button>
-                <button onclick="forceSync()" class="sync-btn">🔄 FORCE SYNC</button>
-                <button onclick="emergencyClose()">⚠️ EMERGENCY CLOSE</button>
+                <button onclick="forceSync()" class="sync-btn">🔄 SYNC</button>
+                <button onclick="emergencyClose()">⚠️ CLOSE ALL</button>
             </div>
         </div>
 
-        <!-- AI Control Status -->
-        <div class="bg-indigo-500/10 border border-indigo-500/30 rounded-lg p-3 mb-4 text-center">
-            <span class="text-indigo-400 font-bold">🤖 AI CONTROL MODE ACTIVE</span>
-            <span class="text-slate-400 text-sm ml-3">All trading decisions (OPEN, STEP UP, CLOSE) are made by Ollama AI every 15 seconds</span>
-            <span class="ai-pulse inline-block ml-2 w-2 h-2 rounded-full bg-indigo-500"></span>
+        <!-- Technical Indicators Panel -->
+        <div class="card mb-4">
+            <h3 class="font-bold mb-3">📊 TECHNICAL INDICATORS (TA-Lib)</h3>
+            <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3">
+                <div class="indicator-card text-center">
+                    <div class="text-[10px] text-slate-500">RSI (14)</div>
+                    <div class="text-xl font-bold" id="rsiValue">--</div>
+                    <div class="text-[8px]" id="rsiStatus">--</div>
+                </div>
+                <div class="indicator-card text-center">
+                    <div class="text-[10px] text-slate-500">MACD</div>
+                    <div class="text-sm font-bold" id="macdValue">--</div>
+                    <div class="text-[8px]" id="macdStatus">--</div>
+                </div>
+                <div class="indicator-card text-center">
+                    <div class="text-[10px] text-slate-500">ADX</div>
+                    <div class="text-xl font-bold" id="adxValue">--</div>
+                    <div class="text-[8px]" id="adxStatus">--</div>
+                </div>
+                <div class="indicator-card text-center">
+                    <div class="text-[10px] text-slate-500">STOCH</div>
+                    <div class="text-sm font-bold" id="stochValue">--</div>
+                    <div class="text-[8px]" id="stochStatus">--</div>
+                </div>
+                <div class="indicator-card text-center">
+                    <div class="text-[10px] text-slate-500">MFI</div>
+                    <div class="text-xl font-bold" id="mfiValue">--</div>
+                    <div class="text-[8px]" id="mfiStatus">--</div>
+                </div>
+                <div class="indicator-card text-center">
+                    <div class="text-[10px] text-slate-500">BB %</div>
+                    <div class="text-xl font-bold" id="bbValue">--</div>
+                    <div class="text-[8px]" id="bbStatus">--</div>
+                </div>
+                <div class="indicator-card text-center">
+                    <div class="text-[10px] text-slate-500">VOL RATIO</div>
+                    <div class="text-xl font-bold" id="volumeValue">--</div>
+                    <div class="text-[8px]" id="volumeStatus">--</div>
+                </div>
+                <div class="indicator-card text-center">
+                    <div class="text-[10px] text-slate-500">TREND</div>
+                    <div class="text-xl font-bold" id="trendValue">--</div>
+                    <div class="text-[8px]" id="trendStrength">--</div>
+                </div>
+            </div>
         </div>
 
-        <!-- AI Recommendations Panel -->
+        <!-- AI Recommendations -->
         <div class="ai-card">
             <div class="flex items-center justify-between mb-3">
                 <h3 class="font-bold text-indigo-400">🤖 OLLAMA AI RECOMMENDATIONS</h3>
@@ -1083,133 +1179,116 @@ app.get('/', (req, res) => {
                 <div>
                     <div class="flex items-center gap-2 mb-2">
                         <span class="text-emerald-400 font-bold">LONG POSITION</span>
-                        <span class="text-[10px] text-slate-500">AI Advisor</span>
                     </div>
-                    <div id="longRecommendation" class="ai-recommendation hold">🤖 Analyzing market data...</div>
-                    <div class="text-[10px] text-slate-500 mt-2" id="longReasoning"></div>
+                    <div id="longRecommendation" class="ai-recommendation hold">🤖 Analyzing...</div>
                 </div>
                 <div>
                     <div class="flex items-center gap-2 mb-2">
                         <span class="text-red-400 font-bold">SHORT POSITION</span>
-                        <span class="text-[10px] text-slate-500">AI Advisor</span>
                     </div>
-                    <div id="shortRecommendation" class="ai-recommendation hold">🤖 Analyzing market data...</div>
-                    <div class="text-[10px] text-slate-500 mt-2" id="shortReasoning"></div>
+                    <div id="shortRecommendation" class="ai-recommendation hold">🤖 Analyzing...</div>
                 </div>
-            </div>
-            <div class="text-[10px] text-slate-500 mt-3 text-center">
-                💡 AI analyzes ROI, market conditions, spread, and wallet equity. Bot ONLY acts on AI recommendations.
             </div>
         </div>
 
+        <!-- Wallet Card -->
         <div class="wallet-card rounded-2xl p-6 mb-8">
-            <div class="grid grid-cols-1 md:grid-cols-5 gap-6">
+            <div class="grid grid-cols-2 md:grid-cols-5 gap-6">
                 <div>
                     <p class="stat-label">TOTAL WALLET</p>
-                    <p id="totalWallet" class="stat-number value-positive">$0.00000000</p>
+                    <p id="totalWallet" class="stat-number">$0.00</p>
                     <p id="walletChange" class="text-xs"></p>
                 </div>
                 <div>
                     <p class="stat-label">TOTAL P&L</p>
-                    <p id="totalPnl" class="stat-number">$0.00000000</p>
+                    <p id="totalPnl" class="stat-number">$0.00</p>
                     <p id="pnlPercent" class="text-xs"></p>
                 </div>
                 <div>
                     <p class="stat-label">REALIZED P&L</p>
-                    <p id="realizedPnl" class="stat-number">$0.00000000</p>
-                    <p id="feesPaid" class="text-xs text-slate-500">Fees: $0.00</p>
+                    <p id="realizedPnl" class="stat-number">$0.00</p>
+                    <p id="feesPaid" class="text-xs">Fees: $0.00</p>
                 </div>
                 <div>
                     <p class="stat-label">PERFORMANCE</p>
                     <p id="peakEquity" class="text-sm">Peak: $0.00</p>
-                    <p id="maxDrawdown" class="text-sm text-red-400">DD: 0%</p>
+                    <p id="maxDrawdown" class="text-sm">DD: 0%</p>
                 </div>
                 <div>
                     <p class="stat-label">STATISTICS</p>
                     <p id="tradeStats" class="text-sm">Trades: 0</p>
-                    <p id="winRate" class="text-sm text-green-400">Win Rate: 0%</p>
+                    <p id="winRate" class="text-sm">Win Rate: 0%</p>
                 </div>
             </div>
-            
             <div class="compound-info mt-4">
-                <div class="flex justify-between items-center">
+                <div class="flex justify-between">
                     <div>
                         <p class="text-xs text-slate-400">📈 AUTO-COMPOUNDING (${config.riskPercent}% of Wallet)</p>
                         <p class="text-sm font-bold text-green-400" id="baseVolumeDisplay">Base Volume: 0 contracts</p>
-                        <p class="text-xs text-slate-400" id="shibDisplay">0 ${config.symbol.split('-')[0]} per trade</p>
-                        <p class="text-xs text-slate-400" id="formulaDisplay">Formula: $${config.walletPerContract.toFixed(8)} wallet = 1 contract at ${config.leverage}x leverage</p>
                     </div>
                     <div class="text-right">
-                        <p class="text-xs text-slate-400">Risk Amount (2%)</p>
+                        <p class="text-xs text-slate-400">Risk Amount</p>
                         <p class="text-sm font-bold" id="riskAmount">$0.00</p>
-                        <p class="text-xs text-slate-400" id="compoundStatus">🟢 Active</p>
                     </div>
                 </div>
             </div>
         </div>
 
+        <!-- Position Cards -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
+            <div class="card">
+                <p class="stat-label mb-2">LONG POSITION</p>
+                <p id="lRoi" class="text-3xl font-black">0.00%</p>
+                <p id="lPnl" class="text-sm">$0.00</p>
+                <p id="lStep" class="text-xs text-slate-500 mt-2">Step 0 | Vol 0</p>
+                <p id="lAction" class="text-xs text-indigo-400 mt-1"></p>
+                <p id="lTarget" class="text-xs text-green-400"></p>
+            </div>
+            <div class="card">
+                <p class="stat-label mb-2">SHORT POSITION</p>
+                <p id="sRoi" class="text-3xl font-black">0.00%</p>
+                <p id="sPnl" class="text-sm">$0.00</p>
+                <p id="sStep" class="text-xs text-slate-500 mt-2">Step 0 | Vol 0</p>
+                <p id="sAction" class="text-xs text-indigo-400 mt-1"></p>
+                <p id="sTarget" class="text-xs text-green-400"></p>
+            </div>
+        </div>
+
+        <!-- Market Info -->
         <div class="card mb-8">
-            <h3 class="font-bold mb-4">📈 WALLET GROWTH CHART (Compounding Effect)</h3>
-            <div class="chart-container">
-                <canvas id="walletChart" style="max-height: 280px; width: 100%;"></canvas>
+            <div class="grid grid-cols-3 gap-4">
+                <div>
+                    <p class="stat-label">BID</p>
+                    <p id="bidPrice" class="text-xl font-mono">0.00000000</p>
+                </div>
+                <div>
+                    <p class="stat-label">ASK</p>
+                    <p id="askPrice" class="text-xl font-mono">0.00000000</p>
+                </div>
+                <div>
+                    <p class="stat-label">SPREAD</p>
+                    <p id="spread" class="text-xl font-mono">0.000%</p>
+                </div>
             </div>
         </div>
 
-        <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
-            <div class="card">
-                <p class="stat-label mb-2">CONFIG</p>
-                <p class="text-sm">Base Vol: <span id="configBaseVol">${config.baseVolume}</span></p>
-                <p class="text-sm">Multiplier: ${config.multiplier}x</p>
-                <p class="text-sm">Step Trigger: <span class="text-red-400">-${config.stepDistancePct}% ROI (AI controlled)</span></p>
-                <p class="text-sm">AI Model: ${config.ollamaModel}</p>
-            </div>
-            <div class="card">
-                <p class="stat-label mb-2">MARKET</p>
-                <p id="spread" class="text-2xl font-black">0.000%</p>
-                <p class="text-[10px] text-slate-500 mt-1">Max Start: ${config.maxStartSpread}%</p>
-                <p class="text-[10px] text-slate-500">BID: <span id="bidPrice">0.00000000</span> | ASK: <span id="askPrice">0.00000000</span></p>
-            </div>
-            <div class="card">
-                <p class="stat-label mb-2">LONG</p>
-                <p id="lRoi" class="text-2xl font-black">0.00%</p>
-                <p id="lPnl" class="text-sm mono mt-1">$0.00000000</p>
-                <p id="lStep" class="text-[10px] text-slate-500 mt-2"></p>
-                <p id="lAction" class="text-[9px] text-indigo-400 mt-1"></p>
-                <p id="lTarget" class="text-[9px] text-green-400 mt-1"></p>
-                <p id="lRealized" class="text-[8px] text-slate-500 mt-1">Realized: $0.00</p>
-            </div>
-            <div class="card">
-                <p class="stat-label mb-2">SHORT</p>
-                <p id="sRoi" class="text-2xl font-black">0.00%</p>
-                <p id="sPnl" class="text-sm mono mt-1">$0.00000000</p>
-                <p id="sStep" class="text-[10px] text-slate-500 mt-2"></p>
-                <p id="sAction" class="text-[9px] text-indigo-400 mt-1"></p>
-                <p id="sTarget" class="text-[9px] text-green-400 mt-1"></p>
-                <p id="sRealized" class="text-[8px] text-slate-500 mt-1">Realized: $0.00</p>
-            </div>
-        </div>
-
+        <!-- Trade History -->
         <div class="card">
             <h3 class="font-bold mb-4">📋 CLOSED TRADES</h3>
             <div class="overflow-x-auto max-h-96 overflow-y-auto">
-                <table class="w-full border-collapse">
-                    <thead class="bg-[#0F141C] sticky top-0">
-                        <tr>
-                            <th class="text-left p-3 text-xs text-slate-500">SIDE</th>
-                            <th class="text-left p-3 text-xs text-slate-500">OPEN</th>
-                            <th class="text-left p-3 text-xs text-slate-500">CLOSE</th>
-                            <th class="text-right p-3 text-xs text-slate-500">STEP</th>
-                            <th class="text-right p-3 text-xs text-slate-500">VOL</th>
-                            <th class="text-right p-3 text-xs text-slate-500">ENTRY</th>
-                            <th class="text-right p-3 text-xs text-slate-500">EXIT</th>
-                            <th class="text-right p-3 text-xs text-slate-500">ROI</th>
-                            <th class="text-right p-3 text-xs text-slate-500">PNL</th>
-                            <th class="text-right p-3 text-xs text-slate-500">FEE</th>
-                            <th class="text-left p-3 text-xs text-slate-500">AI REC</th>
+                <table class="w-full">
+                    <thead class="sticky top-0 bg-[#131824]">
+                        <tr class="text-xs text-slate-500">
+                            <th class="p-2">SIDE</th>
+                            <th class="p-2">VOL</th>
+                            <th class="p-2">ENTRY</th>
+                            <th class="p-2">EXIT</th>
+                            <th class="p-2">ROI</th>
+                            <th class="p-2">PNL</th>
                         </tr>
                     </thead>
                     <tbody id="tradesBody">
-                        <tr><td colspan="11" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>
+                        <tr><td colspan="6" class="text-center p-8 text-slate-500">No trades yet</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -1217,21 +1296,8 @@ app.get('/', (req, res) => {
     </div>
 
     <script>
-        let walletChart = null;
-        
-        function getRecommendationClass(recommendation) {
-            if (recommendation.includes('STEP UP')) return 'step-up';
-            if (recommendation.includes('STEP DOWN')) return 'step-down';
-            if (recommendation.includes('CLOSE')) return 'close-position';
-            if (recommendation.includes('OPEN')) return 'open-position';
-            return 'hold';
-        }
-        
         async function forceSync() {
-            const btn = event.target;
-            btn.textContent = '🔄 SYNCING...';
             await fetch('/api/force-sync', {method: 'POST'});
-            setTimeout(() => btn.textContent = '🔄 FORCE SYNC', 1000);
         }
         
         async function forceAICheck() {
@@ -1242,95 +1308,10 @@ app.get('/', (req, res) => {
         }
         
         async function emergencyClose() {
-            if(confirm('⚠️ EMERGENCY: Close ALL positions? This cannot be undone.')) {
+            if(confirm('EMERGENCY CLOSE ALL POSITIONS?')) {
                 await fetch('/api/close', {method: 'POST'});
-                alert('Emergency liquidation initiated');
+                alert('Emergency close initiated');
             }
-        }
-        
-        function formatNumber(num) {
-            return parseFloat(num).toFixed(8);
-        }
-        
-        function updateChart(walletHistory) {
-            if (!walletHistory || walletHistory.length === 0) return;
-            
-            const labels = walletHistory.map(h => {
-                const date = new Date(h.timestamp);
-                return date.toLocaleTimeString();
-            });
-            const equity = walletHistory.map(h => h.equity);
-            const pnlPercent = walletHistory.map(h => h.pnlPercent);
-            
-            if (walletChart) {
-                walletChart.destroy();
-            }
-            
-            const ctx = document.getElementById('walletChart').getContext('2d');
-            walletChart = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels: labels,
-                    datasets: [
-                        {
-                            label: 'Wallet Equity (USDT)',
-                            data: equity,
-                            borderColor: '#00D1B2',
-                            backgroundColor: 'rgba(0, 209, 178, 0.1)',
-                            fill: true,
-                            tension: 0.4,
-                            yAxisID: 'y',
-                            pointRadius: 2,
-                            pointHoverRadius: 5
-                        },
-                        {
-                            label: 'PnL %',
-                            data: pnlPercent,
-                            borderColor: '#6366F1',
-                            backgroundColor: 'rgba(99, 102, 241, 0.1)',
-                            fill: true,
-                            tension: 0.4,
-                            yAxisID: 'y1',
-                            pointRadius: 2,
-                            pointHoverRadius: 5
-                        }
-                    ]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: true,
-                    interaction: { mode: 'index', intersect: false },
-                    plugins: {
-                        legend: { position: 'top', labels: { color: '#E8EDF2', font: { size: 10 } } },
-                        tooltip: { 
-                            callbacks: { 
-                                label: function(context) { 
-                                    return context.dataset.label + ': ' + context.raw.toFixed(8); 
-                                } 
-                            },
-                            bodyColor: '#E8EDF2',
-                            backgroundColor: '#131824'
-                        }
-                    },
-                    scales: {
-                        y: { 
-                            title: { display: true, text: 'USDT', color: '#00D1B2', font: { size: 10 } }, 
-                            grid: { color: '#1F2A3E' }, 
-                            ticks: { color: '#E8EDF2', font: { size: 9 } }
-                        },
-                        y1: { 
-                            position: 'right', 
-                            title: { display: true, text: 'PnL %', color: '#6366F1', font: { size: 10 } }, 
-                            grid: { drawOnChartArea: false }, 
-                            ticks: { color: '#E8EDF2', font: { size: 9 }, callback: function(v) { return v.toFixed(1) + '%'; } }
-                        },
-                        x: { 
-                            ticks: { color: '#E8EDF2', font: { size: 8 }, maxRotation: 45, minRotation: 45 },
-                            grid: { color: '#1F2A3E' }
-                        }
-                    }
-                }
-            });
         }
         
         setInterval(async () => {
@@ -1338,118 +1319,102 @@ app.get('/', (req, res) => {
                 const res = await fetch('/api/status');
                 const data = await res.json();
                 
-                const totalEquity = data.market.totalEquity || 0;
-                const totalPnl = data.market.totalNetGain || 0;
-                const pnlPercent = data.market.growthPct || 0;
-                
-                document.getElementById('totalWallet').textContent = '$' + formatNumber(totalEquity);
-                document.getElementById('totalWallet').className = 'stat-number ' + (totalPnl >= 0 ? 'value-positive' : 'value-negative');
-                document.getElementById('walletChange').innerHTML = (totalPnl >= 0 ? '↑' : '↓') + ' $' + formatNumber(Math.abs(totalPnl)) + ' (' + (pnlPercent >= 0 ? '+' : '') + pnlPercent.toFixed(2) + '%)';
-                document.getElementById('walletChange').className = 'text-xs ' + (totalPnl >= 0 ? 'value-positive' : 'value-negative');
-                
-                document.getElementById('totalPnl').textContent = (totalPnl >= 0 ? '+' : '') + '$' + formatNumber(totalPnl);
-                document.getElementById('totalPnl').className = 'stat-number ' + (totalPnl >= 0 ? 'value-positive' : 'value-negative');
-                document.getElementById('pnlPercent').innerHTML = (pnlPercent >= 0 ? '+' : '') + pnlPercent.toFixed(2) + '%';
-                document.getElementById('pnlPercent').className = 'text-xs ' + (pnlPercent >= 0 ? 'value-positive' : 'value-negative');
-                
-                document.getElementById('realizedPnl').textContent = (data.market.totalRealizedPnl >= 0 ? '+' : '') + '$' + formatNumber(data.market.totalRealizedPnl || 0);
-                document.getElementById('realizedPnl').className = 'stat-number ' + (data.market.totalRealizedPnl >= 0 ? 'value-positive' : 'value-negative');
-                document.getElementById('feesPaid').innerHTML = 'Fees: $' + formatNumber(data.market.totalFeesPaid || 0);
-                
-                document.getElementById('peakEquity').innerHTML = 'Peak: $' + formatNumber(data.market.peakEquity || 0);
+                // Update wallet
+                document.getElementById('totalWallet').textContent = '$' + (data.market.totalEquity || 0).toFixed(8);
+                document.getElementById('totalPnl').textContent = (data.market.totalNetGain >= 0 ? '+' : '') + '$' + (data.market.totalNetGain || 0).toFixed(8);
+                document.getElementById('pnlPercent').innerHTML = (data.market.growthPct || 0).toFixed(2) + '%';
+                document.getElementById('realizedPnl').textContent = (data.market.totalRealizedPnl || 0).toFixed(8);
+                document.getElementById('peakEquity').innerHTML = 'Peak: $' + (data.market.peakEquity || 0).toFixed(8);
                 document.getElementById('maxDrawdown').innerHTML = 'DD: ' + (data.market.maxDrawdown || 0).toFixed(2) + '%';
                 document.getElementById('tradeStats').innerHTML = 'Trades: ' + (data.market.totalTrades || 0);
                 document.getElementById('winRate').innerHTML = 'Win Rate: ' + (data.market.winRate || 0) + '%';
+                document.getElementById('baseVolumeDisplay').innerHTML = 'Base Volume: ' + (data.market.currentBaseVolume || 0) + ' contracts';
+                document.getElementById('riskAmount').innerHTML = '$' + (data.market.currentRiskAmount || 0).toFixed(8);
                 
-                document.getElementById('baseVolumeDisplay').innerHTML = 'Base Volume: ' + (data.market.currentBaseVolume || 0).toLocaleString() + ' contract(s)';
-                document.getElementById('shibDisplay').innerHTML = (data.market.currentBaseShib || 0).toLocaleString() + ' ${config.symbol.split('-')[0]} per trade';
-                document.getElementById('riskAmount').innerHTML = '$' + formatNumber(data.market.currentRiskAmount || 0);
-                document.getElementById('configBaseVol').innerHTML = data.market.currentBaseVolume || 0;
-                
-                if (data.market.walletHistory && data.market.walletHistory.length > 0) {
-                    updateChart(data.market.walletHistory);
+                // Update indicators
+                if (data.market.indicators) {
+                    const ind = data.market.indicators;
+                    document.getElementById('rsiValue').innerHTML = ind.rsi;
+                    document.getElementById('rsiStatus').innerHTML = ind.rsi_status;
+                    document.getElementById('macdValue').innerHTML = ind.macd_histogram;
+                    document.getElementById('macdStatus').innerHTML = ind.macd_status;
+                    document.getElementById('adxValue').innerHTML = ind.adx;
+                    document.getElementById('adxStatus').innerHTML = ind.adx_status;
+                    document.getElementById('stochValue').innerHTML = ind.stoch_k + '/' + ind.stoch_d;
+                    document.getElementById('stochStatus').innerHTML = ind.stoch_status;
+                    document.getElementById('mfiValue').innerHTML = ind.mfi;
+                    document.getElementById('mfiStatus').innerHTML = ind.mfi_status;
+                    document.getElementById('bbValue').innerHTML = ind.price_vs_bb;
+                    document.getElementById('volumeValue').innerHTML = ind.volume_ratio + 'x';
+                    document.getElementById('trendValue').innerHTML = ind.trend;
+                    document.getElementById('trendStrength').innerHTML = 'Strength: ' + (data.market.trendStrength || 0) + '/10';
+                    
+                    // Color coding
+                    document.getElementById('rsiValue').className = 'text-xl font-bold ' + (ind.rsi > 70 ? 'bearish' : (ind.rsi < 30 ? 'bullish' : 'neutral'));
+                    document.getElementById('macdValue').className = 'text-sm font-bold ' + (ind.macd_status === 'BULLISH' ? 'bullish' : 'bearish');
                 }
                 
-                document.getElementById('spread').textContent = (data.market.spread || 0).toFixed(3) + '%';
+                // Update market prices
                 document.getElementById('bidPrice').textContent = (data.market.bid || 0).toFixed(8);
                 document.getElementById('askPrice').textContent = (data.market.ask || 0).toFixed(8);
+                document.getElementById('spread').textContent = (data.market.spread || 0).toFixed(3) + '%';
                 
-                // Update AI Recommendations
+                // Update AI recommendations
                 if (data.aiRecommendations) {
-                    const longRec = data.aiRecommendations.long;
-                    const shortRec = data.aiRecommendations.short;
-                    
                     const longDiv = document.getElementById('longRecommendation');
-                    longDiv.textContent = longRec.recommendation;
-                    longDiv.className = 'ai-recommendation ' + getRecommendationClass(longRec.recommendation);
+                    longDiv.textContent = data.aiRecommendations.long.recommendation;
+                    longDiv.className = 'ai-recommendation ' + (data.aiRecommendations.long.action === 'STEP UP' ? 'step-up' : 
+                        (data.aiRecommendations.long.action === 'CLOSE POSITION' ? 'close-position' :
+                        (data.aiRecommendations.long.action === 'OPEN POSITION' ? 'open-position' : 'hold')));
                     
                     const shortDiv = document.getElementById('shortRecommendation');
-                    shortDiv.textContent = shortRec.recommendation;
-                    shortDiv.className = 'ai-recommendation ' + getRecommendationClass(shortRec.recommendation);
+                    shortDiv.textContent = data.aiRecommendations.short.recommendation;
+                    shortDiv.className = 'ai-recommendation ' + (data.aiRecommendations.short.action === 'STEP UP' ? 'step-up' : 
+                        (data.aiRecommendations.short.action === 'CLOSE POSITION' ? 'close-position' :
+                        (data.aiRecommendations.short.action === 'OPEN POSITION' ? 'open-position' : 'hold')));
                     
-                    if (longRec.lastUpdate) {
-                        document.getElementById('aiLastUpdate').textContent = 'Updated: ' + new Date(longRec.lastUpdate).toLocaleTimeString();
+                    if (data.aiRecommendations.long.lastUpdate) {
+                        document.getElementById('aiLastUpdate').textContent = 'Updated: ' + new Date(data.aiRecommendations.long.lastUpdate).toLocaleTimeString();
                     }
-                    
-                    document.getElementById('longReasoning').innerHTML = '🤖 Confidence: ' + (longRec.confidence || 85) + '% | AI Model: ${config.ollamaModel}';
-                    document.getElementById('shortReasoning').innerHTML = '🤖 Confidence: ' + (shortRec.confidence || 85) + '% | AI Model: ${config.ollamaModel}';
                 }
                 
+                // Update positions
                 const long = data.accounts.find(a => a.direction === 'buy');
                 const short = data.accounts.find(a => a.direction === 'sell');
                 
                 if (long) {
-                    const roi = parseFloat(long.roi);
-                    const roiElem = document.getElementById('lRoi');
-                    roiElem.textContent = (roi >= 0 ? '+' : '') + roi.toFixed(2) + '%';
-                    roiElem.className = 'text-2xl font-black ' + (roi >= 0 ? 'value-positive' : 'value-negative');
-                    
-                    document.getElementById('lPnl').textContent = (long.unrealizedUsdt >= 0 ? '+' : '') + (long.unrealizedUsdt || 0).toFixed(8);
-                    document.getElementById('lStep').innerHTML = '<span class="step-badge">STEP ' + (long.step || 0) + '</span> | VOL ' + (long.volume || 0);
-                    document.getElementById('lAction').textContent = long.lastAction || 'Idle';
-                    document.getElementById('lRealized').innerHTML = 'Realized: ' + (long.realizedPnl >= 0 ? '+' : '') + '$' + (long.realizedPnl || 0).toFixed(8);
-                    
-                    if (long.targetPrice > 0) {
-                        document.getElementById('lTarget').innerHTML = '🎯 TP: ' + long.targetPrice.toFixed(8);
-                    }
+                    document.getElementById('lRoi').innerHTML = (long.roi >= 0 ? '+' : '') + long.roi.toFixed(2) + '%';
+                    document.getElementById('lRoi').className = 'text-3xl font-black ' + (long.roi >= 0 ? 'value-positive' : 'value-negative');
+                    document.getElementById('lPnl').innerHTML = (long.unrealizedUsdt >= 0 ? '+' : '') + '$' + long.unrealizedUsdt.toFixed(8);
+                    document.getElementById('lStep').innerHTML = 'Step ' + long.step + ' | Vol ' + long.volume;
+                    document.getElementById('lAction').innerHTML = long.lastAction;
+                    if (long.targetPrice) document.getElementById('lTarget').innerHTML = '🎯 TP: ' + long.targetPrice.toFixed(8);
                 }
                 
                 if (short) {
-                    const roi = parseFloat(short.roi);
-                    const roiElem = document.getElementById('sRoi');
-                    roiElem.textContent = (roi >= 0 ? '+' : '') + roi.toFixed(2) + '%';
-                    roiElem.className = 'text-2xl font-black ' + (roi >= 0 ? 'value-positive' : 'value-negative');
-                    
-                    document.getElementById('sPnl').textContent = (short.unrealizedUsdt >= 0 ? '+' : '') + (short.unrealizedUsdt || 0).toFixed(8);
-                    document.getElementById('sStep').innerHTML = '<span class="step-badge">STEP ' + (short.step || 0) + '</span> | VOL ' + (short.volume || 0);
-                    document.getElementById('sAction').textContent = short.lastAction || 'Idle';
-                    document.getElementById('sRealized').innerHTML = 'Realized: ' + (short.realizedPnl >= 0 ? '+' : '') + '$' + (short.realizedPnl || 0).toFixed(8);
-                    
-                    if (short.targetPrice > 0) {
-                        document.getElementById('sTarget').innerHTML = '🎯 TP: ' + short.targetPrice.toFixed(8);
-                    }
+                    document.getElementById('sRoi').innerHTML = (short.roi >= 0 ? '+' : '') + short.roi.toFixed(2) + '%';
+                    document.getElementById('sRoi').className = 'text-3xl font-black ' + (short.roi >= 0 ? 'value-positive' : 'value-negative');
+                    document.getElementById('sPnl').innerHTML = (short.unrealizedUsdt >= 0 ? '+' : '') + '$' + short.unrealizedUsdt.toFixed(8);
+                    document.getElementById('sStep').innerHTML = 'Step ' + short.step + ' | Vol ' + short.volume;
+                    document.getElementById('sAction').innerHTML = short.lastAction;
+                    if (short.targetPrice) document.getElementById('sTarget').innerHTML = '🎯 TP: ' + short.targetPrice.toFixed(8);
                 }
                 
+                // Update trade history
                 let tradesHtml = '';
                 if (data.tradeHistory && data.tradeHistory.length > 0) {
-                    data.tradeHistory.slice(0, 20).forEach(t => {
-                        const roiVal = parseFloat(t.roi);
-                        tradesHtml += '<tr class="border-b border-[#1A212E]">' +
-                            '<td class="p-3"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + ' font-bold">' + t.side + '</span></td>' +
-                            '<td class="p-3 text-xs">' + (t.openTime || '--') + '</td>' +
-                            '<td class="p-3 text-xs">' + (t.closeTime || '--') + '</td>' +
-                            '<td class="p-3 text-right">' + (t.step || 0) + '</td>' +
-                            '<td class="p-3 text-right">' + t.volume + '</td>' +
-                            '<td class="p-3 text-right mono">' + t.entryPrice + '</td>' +
-                            '<td class="p-3 text-right mono">' + t.exitPrice + '</td>' +
-                            '<td class="p-3 text-right ' + (roiVal >= 0 ? 'value-positive' : 'value-negative') + '">' + (roiVal >= 0 ? '+' : '') + t.roi + '</td>' +
-                            '<td class="p-3 text-right mono ' + (parseFloat(t.netPnlUsdt) >= 0 ? 'value-positive' : 'value-negative') + '">' + (parseFloat(t.netPnlUsdt) >= 0 ? '+' : '') + t.netPnlUsdt + '</td>' +
-                            '<td class="p-3 text-right mono text-slate-500">' + t.estimatedFee + '</td>' +
-                            '<td class="p-3 text-left text-[10px]">' + (t.aiRecommendation || 'N/A') + '</td>' +
+                    data.tradeHistory.forEach(t => {
+                        tradesHtml += '<tr class="border-b border-[#1F2A3E]">' +
+                            '<td class="p-2"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + '">' + t.side + '</span></td>' +
+                            '<td class="p-2">' + t.volume + '</td>' +
+                            '<td class="p-2 font-mono text-xs">' + t.entryPrice + '</td>' +
+                            '<td class="p-2 font-mono text-xs">' + t.exitPrice + '</td>' +
+                            '<td class="p-2 ' + (parseFloat(t.roi) >= 0 ? 'value-positive' : 'value-negative') + '">' + t.roi + '</td>' +
+                            '<td class="p-2 font-mono">' + (parseFloat(t.netPnlUsdt) >= 0 ? '+' : '') + t.netPnlUsdt + '</td>' +
                         '</tr>';
                     });
                 } else {
-                    tradesHtml = '<tr><td colspan="11" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>';
+                    tradesHtml = '<tr><td colspan="6" class="text-center p-8 text-slate-500">No trades yet</td></tr>';
                 }
                 document.getElementById('tradesBody').innerHTML = tradesHtml;
                 
@@ -1457,39 +1422,20 @@ app.get('/', (req, res) => {
         }, 1000);
     </script>
 </body>
-</html>
-    `);
+</html>`);
 });
 
-// ==================== START SERVER ====================
+// ==================== START ====================
+
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
+
 app.listen(config.port, '0.0.0.0', () => {
-    const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
-    
-    console.log(`\n✅ Martingale Pro AI Started (AI CONTROLLED MODE)`);
+    console.log(`\n✅ Martingale Pro AI Started (TA-Lib Technical Analysis)`);
     console.log(`📊 Symbol: ${config.symbol}`);
     console.log(`🔧 Leverage: ${config.leverage}x`);
-    console.log(`🎯 Take Profit: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price movement`);
-    console.log(`💰 Auto-Compounding: ${config.riskPercent}% of wallet`);
-    console.log(`📐 Formula: $${config.walletPerContract.toFixed(8)} wallet = 1 contract`);
-    console.log(`📈 Step Trigger: -${config.stepDistancePct}% ROI (AI CONTROLLED - no automatic steps)`);
-    console.log(`🤖 Ollama AI: ${config.ollamaModel} @ ${config.ollamaUrl}`);
-    console.log(`🌐 Dashboard: http://localhost:${config.port}`);
-    console.log(`\n🎮 AI CONTROL MODE ACTIVE:`);
-    console.log(`   • OPEN POSITION: Only when AI recommends`);
-    console.log(`   • STEP UP: Only when AI recommends (no automatic martingale)`);
-    console.log(`   • CLOSE POSITION: Only when AI recommends`);
-    console.log(`   • HOLD: AI recommends no action`);
-    console.log(`   • AI checks every 15 seconds\n`);
-    console.log(`📊 AUTO-COMPOUNDING EXAMPLES:`);
-    console.log(`   Wallet $${config.walletPerContract.toFixed(8)} → 1 contract → Risk $${(config.walletPerContract * 0.02).toFixed(8)}`);
-    console.log(`   Wallet $${(config.walletPerContract * 2).toFixed(8)} → 2 contracts → Risk $${(config.walletPerContract * 2 * 0.02).toFixed(8)}`);
-    console.log(`   Wallet $${(config.walletPerContract * 3).toFixed(8)} → 3 contracts → Risk $${(config.walletPerContract * 3 * 0.02).toFixed(8)}\n`);
-    console.log(`🤖 API Endpoints:`);
-    console.log(`   GET  /               - Dashboard`);
-    console.log(`   GET  /api/status     - Trading status`);
-    console.log(`   POST /api/force-ai-check - Force AI analysis`);
-    console.log(`   POST /api/close      - Emergency close`);
-    console.log(`   POST /api/force-sync - Force sync positions\n`);
+    console.log(`🤖 Ollama AI: ${config.ollamaModel}`);
+    console.log(`📈 TA-Lib Indicators: RSI, MACD, BB, ADX, Stochastic, MFI, ATR, CCI, WillR`);
+    console.log(`🎮 AI Control: All trading decisions based on technical analysis`);
+    console.log(`🌐 Dashboard: http://localhost:${config.port}\n`);
 });
