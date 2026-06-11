@@ -10,7 +10,7 @@ const io = socketIo(server, {
     transports: ['websocket', 'polling']
 });
 
-// Configuration - FIXED for Huobi API
+// Configuration
 const config = {
     symbol: 'shibusdt',
     interval: '1min',
@@ -22,62 +22,9 @@ const config = {
 let ohlcv = [];
 let indicators = {};
 let lastUpdate = null;
-let fetchError = null;
+let updateInterval = null;
 
-// ============ FETCH DATA WITH BETTER ERROR HANDLING ============
-
-async function fetchOHLCV() {
-    try {
-        // Huobi API endpoint (correct format)
-        const url = `https://${config.restHost}/market/history/kline`;
-        const params = {
-            symbol: config.symbol,
-            period: config.interval,
-            size: config.limit
-        };
-        
-        console.log(`Fetching: ${url}?symbol=${config.symbol}&period=${config.interval}&size=${config.limit}`);
-        
-        const response = await axios.get(url, { 
-            params: params,
-            timeout: 15000,
-            headers: {
-                'User-Agent': 'Mozilla/5.0',
-                'Accept': 'application/json'
-            }
-        });
-        
-        if (response.data && response.data.status === 'ok' && response.data.data) {
-            ohlcv = response.data.data.map(k => ({
-                time: k.id * 1000,
-                open: parseFloat(k.open),
-                high: parseFloat(k.high),
-                low: parseFloat(k.low),
-                close: parseFloat(k.close),
-                volume: parseFloat(k.vol)
-            }));
-            
-            console.log(`✅ Fetched ${ohlcv.length} candles for SHIB/USDT`);
-            console.log(`Latest price: $${ohlcv[ohlcv.length-1].close.toFixed(8)}`);
-            fetchError = null;
-            return true;
-        } else {
-            console.error('API returned unexpected format:', response.data);
-            fetchError = 'API format error';
-            return false;
-        }
-    } catch (error) {
-        console.error('Error fetching OHLCV:', error.message);
-        if (error.response) {
-            console.error('Response status:', error.response.status);
-            console.error('Response data:', error.response.data);
-        }
-        fetchError = error.message;
-        return false;
-    }
-}
-
-// ============ INDICATOR FUNCTIONS (same as before) ============
+// ============ CUSTOM TECHNICAL INDICATORS ============
 
 function calculateEMA(data, period) {
     const k = 2 / (period + 1);
@@ -124,6 +71,7 @@ function calculateMACD(closes) {
     const ema26 = calculateEMA(closes.slice(-26), 26);
     const macdLine = ema12 - ema26;
     
+    // Calculate signal line (9-period EMA of MACD)
     const macdHistory = [];
     for (let i = 0; i < closes.length - 26; i++) {
         const e12 = calculateEMA(closes.slice(i, i + 26), 12);
@@ -131,7 +79,7 @@ function calculateMACD(closes) {
         macdHistory.push(e12 - e26);
     }
     
-    const signalLine = macdHistory.length > 0 ? calculateEMA(macdHistory, 9) : 0;
+    const signalLine = calculateEMA(macdHistory, 9);
     const histogram = macdLine - signalLine;
     
     return { macd: macdLine, signal: signalLine, histogram: histogram };
@@ -283,7 +231,7 @@ function calculateVWAP(highs, lows, closes, volumes) {
         volumeSum += volumes[i];
     }
     
-    return volumeSum > 0 ? typicalPriceSum / volumeSum : 0;
+    return typicalPriceSum / volumeSum;
 }
 
 // ============ CANDLESTICK PATTERNS ============
@@ -291,7 +239,7 @@ function calculateVWAP(highs, lows, closes, volumes) {
 function detectDoji(open, close, high, low) {
     const bodySize = Math.abs(close - open);
     const totalRange = high - low;
-    return totalRange > 0 && bodySize <= totalRange * 0.1;
+    return bodySize <= totalRange * 0.1;
 }
 
 function detectHammer(candle, prevCandle) {
@@ -300,7 +248,7 @@ function detectHammer(candle, prevCandle) {
     const upperShadow = candle.high - Math.max(candle.open, candle.close);
     const totalRange = candle.high - candle.low;
     
-    return totalRange > 0 && lowerShadow > bodySize * 2 && 
+    return lowerShadow > bodySize * 2 && 
            upperShadow < bodySize * 0.5 &&
            candle.close > prevCandle.close;
 }
@@ -309,9 +257,8 @@ function detectShootingStar(candle, prevCandle) {
     const bodySize = Math.abs(candle.close - candle.open);
     const upperShadow = candle.high - Math.max(candle.open, candle.close);
     const lowerShadow = Math.min(candle.open, candle.close) - candle.low;
-    const totalRange = candle.high - candle.low;
     
-    return totalRange > 0 && upperShadow > bodySize * 2 && 
+    return upperShadow > bodySize * 2 && 
            lowerShadow < bodySize * 0.5 &&
            candle.close < prevCandle.close;
 }
@@ -394,6 +341,32 @@ function detectHarami(candle, prevCandle) {
     return { bullish: isBullish, bearish: isBearish };
 }
 
+// ============ FETCH DATA ============
+
+async function fetchOHLCV() {
+    try {
+        const url = `https://${config.restHost}/market/history/kline?symbol=${config.symbol}&period=${config.interval}&size=${config.limit}`;
+        const response = await axios.get(url, { timeout: 10000 });
+        
+        if (response.data && response.data.data) {
+            ohlcv = response.data.data.map(k => ({
+                time: k.id * 1000,
+                open: parseFloat(k.open),
+                high: parseFloat(k.high),
+                low: parseFloat(k.low),
+                close: parseFloat(k.close),
+                volume: parseFloat(k.vol)
+            }));
+            
+            console.log(`✅ Fetched ${ohlcv.length} candles for SHIB/USDT`);
+            return true;
+        }
+    } catch (error) {
+        console.error('Error fetching OHLCV:', error.message);
+    }
+    return false;
+}
+
 // ============ CALCULATE ALL INDICATORS ============
 
 function calculateAllIndicators() {
@@ -432,6 +405,7 @@ function calculateAllIndicators() {
     // Detect patterns
     const lastCandle = ohlcv[ohlcv.length - 1];
     const prevCandle = ohlcv[ohlcv.length - 2];
+    const prev2Candle = ohlcv[ohlcv.length - 3];
     
     const patterns = {
         doji: detectDoji(lastCandle.open, lastCandle.close, lastCandle.high, lastCandle.low),
@@ -474,6 +448,7 @@ function calculateAllIndicators() {
         priceChangePercent,
         volume: volumes[volumes.length - 1],
         indicators: {
+            // Momentum
             rsi: { value: rsi, status: rsi > 70 ? 'OVERBOUGHT' : (rsi < 30 ? 'OVERSOLD' : 'NEUTRAL') },
             stochK: { value: stoch.k, status: stoch.k > 80 ? 'OVERBOUGHT' : (stoch.k < 20 ? 'OVERSOLD' : 'NEUTRAL') },
             stochD: stoch.d,
@@ -482,6 +457,8 @@ function calculateAllIndicators() {
             mfi: { value: mfi, status: mfi > 80 ? 'OVERBOUGHT' : (mfi < 20 ? 'OVERSOLD' : 'NEUTRAL') },
             momentum: momentum,
             roc: roc,
+            
+            // Trend
             macd: macd,
             adx: { value: adx, strength: adx > 25 ? 'STRONG' : (adx > 20 ? 'MODERATE' : 'WEAK') },
             ema9: ema9,
@@ -490,12 +467,18 @@ function calculateAllIndicators() {
             sma20: sma20,
             sma50: sma50,
             trend: trend,
+            
+            // Volatility
             bb: bb,
             atr: atr,
             atrPercent: (atr / currentPrice) * 100,
+            
+            // Volume
             obv: obv,
             vwap: vwap,
             volumeRatio: volumes[volumes.length - 1] / calculateSMA(volumes, 20),
+            
+            // Overall
             signal: signal,
             signalStrength: signalStrength
         },
@@ -504,15 +487,10 @@ function calculateAllIndicators() {
     };
 }
 
-// ============ WEBSOCKET & UPDATE ============
+// ============ WEBSOCKET REAL-TIME UPDATES ============
 
 io.on('connection', (socket) => {
     console.log('Client connected:', socket.id);
-    
-    // Send existing data if available
-    if (indicators) {
-        socket.emit('indicators', indicators);
-    }
     
     socket.on('disconnect', () => {
         console.log('Client disconnected:', socket.id);
@@ -520,20 +498,15 @@ io.on('connection', (socket) => {
 });
 
 async function updateData() {
-    console.log('Updating data...');
     const success = await fetchOHLCV();
-    if (success && ohlcv.length > 0) {
+    if (success) {
         const data = calculateAllIndicators();
         if (data) {
             indicators = data;
             lastUpdate = new Date();
             io.emit('indicators', indicators);
             console.log(`📊 Data updated: $${data.currentPrice.toFixed(8)} | RSI: ${data.indicators.rsi.value.toFixed(1)} | Signal: ${data.indicators.signal}`);
-        } else {
-            console.log('⚠️ Not enough data to calculate indicators (need at least 50 candles)');
         }
-    } else {
-        console.log('❌ Failed to fetch data');
     }
 }
 
@@ -545,7 +518,7 @@ app.get('/api/indicators', (req, res) => {
     if (indicators) {
         res.json(indicators);
     } else {
-        res.json({ error: 'No data yet', message: 'Waiting for first data fetch...', fetchError: fetchError });
+        res.json({ error: 'No data yet', message: 'Waiting for first data fetch...' });
     }
 });
 
@@ -555,17 +528,378 @@ app.get('/api/status', (req, res) => {
         lastUpdate: lastUpdate,
         candlesCount: ohlcv.length,
         symbol: config.symbol,
-        interval: config.interval,
-        fetchError: fetchError
+        interval: config.interval
     });
+});
+
+// ============ HTML DASHBOARD ============
+
+app.get('/', (req, res) => {
+    res.send(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SHIB/USDT - Real-Time Technical Analysis Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        * { font-family: 'Courier New', monospace; }
+        body { background: #0a0a0a; color: #00ff00; }
+        .signal-bullish { background: #00ff0020; border-left: 4px solid #00ff00; }
+        .signal-bearish { background: #ff000020; border-left: 4px solid #ff0000; }
+        .signal-neutral { background: #ffff0020; border-left: 4px solid #ffff00; }
+        .indicator-card { background: #111; border: 1px solid #333; border-radius: 8px; padding: 15px; margin: 10px 0; }
+        .badge { padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; }
+        .badge-bullish { background: #00ff00; color: #000; }
+        .badge-bearish { background: #ff0000; color: #fff; }
+        .badge-neutral { background: #ffff00; color: #000; }
+        .value-up { color: #00ff00; }
+        .value-down { color: #ff4444; }
+        .stat-number { font-size: 24px; font-weight: bold; }
+        .pattern-active { animation: pulse 1s infinite; background: #00ff0010; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 15px; }
+    </style>
+</head>
+<body class="p-6">
+    <div class="max-w-7xl mx-auto">
+        <!-- Header -->
+        <div class="text-center mb-8">
+            <h1 class="text-4xl font-bold">🐕 SHIB/USDT</h1>
+            <p class="text-sm text-gray-500">Real-Time TA-Lib Technical Analysis | Live Updates via WebSocket</p>
+            <div class="flex justify-center gap-4 mt-3">
+                <div class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
+                <span id="status" class="text-xs text-green-500">● LIVE</span>
+                <span id="lastUpdate" class="text-xs text-gray-500">Waiting for data...</span>
+            </div>
+        </div>
+
+        <!-- Current Price -->
+        <div class="indicator-card text-center bg-gradient-to-r from-green-900/20 to-transparent">
+            <div class="text-sm text-gray-400">SHIB / USDT</div>
+            <div class="stat-number" id="currentPrice">$0.00000000</div>
+            <div id="priceChange" class="text-sm"></div>
+            <div id="signal" class="mt-2"></div>
+        </div>
+
+        <!-- Main Grid -->
+        <div class="grid-3">
+            
+            <!-- Momentum Oscillators -->
+            <div class="indicator-card">
+                <h3 class="text-lg font-bold mb-3">📊 MOMENTUM OSCILLATORS</h3>
+                <div class="space-y-2">
+                    <div class="flex justify-between">
+                        <span>RSI (14):</span>
+                        <span id="rsi" class="font-bold">--</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>Stochastic (14,3,3):</span>
+                        <span id="stoch">-- / --</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>Williams %R:</span>
+                        <span id="willr">--</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>CCI (20):</span>
+                        <span id="cci">--</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>MFI (14):</span>
+                        <span id="mfi">--</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>Momentum (10):</span>
+                        <span id="momentum">--</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>ROC (10):</span>
+                        <span id="roc">--%</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Trend Indicators -->
+            <div class="indicator-card">
+                <h3 class="text-lg font-bold mb-3">📈 TREND INDICATORS</h3>
+                <div class="space-y-2">
+                    <div class="flex justify-between">
+                        <span>MACD:</span>
+                        <span id="macd">--</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>Signal Line:</span>
+                        <span id="signalLine">--</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>Histogram:</span>
+                        <span id="histogram">--</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>ADX:</span>
+                        <span id="adx">--</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>EMA 20:</span>
+                        <span id="ema20">--</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>EMA 50:</span>
+                        <span id="ema50">--</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>Overall Trend:</span>
+                        <span id="trend">--</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Volatility & Volume -->
+            <div class="indicator-card">
+                <h3 class="text-lg font-bold mb-3">📉 VOLATILITY & VOLUME</h3>
+                <div class="space-y-2">
+                    <div class="flex justify-between">
+                        <span>BB Upper:</span>
+                        <span id="bbUpper">--</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>BB Middle:</span>
+                        <span id="bbMiddle">--</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>BB Lower:</span>
+                        <span id="bbLower">--</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>ATR:</span>
+                        <span id="atr">--</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>ATR %:</span>
+                        <span id="atrPercent">--%</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>Volume:</span>
+                        <span id="volume">--</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>Volume Ratio:</span>
+                        <span id="volumeRatio">--x</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span>VWAP:</span>
+                        <span id="vwap">--</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Candlestick Patterns -->
+        <div class="indicator-card mt-4">
+            <h3 class="text-lg font-bold mb-3">🕯️ CANDLESTICK PATTERNS DETECTED</h3>
+            <div class="grid grid-cols-2 md:grid-cols-5 gap-3" id="patterns">
+                <div class="text-center p-2">Loading...</div>
+            </div>
+        </div>
+
+        <!-- Trading Signal -->
+        <div class="indicator-card mt-4" id="signalCard">
+            <h3 class="text-lg font-bold mb-3">🎯 TRADING SIGNAL</h3>
+            <div id="tradingSignal" class="text-center p-4 rounded-lg">
+                Waiting for data...
+            </div>
+        </div>
+
+        <!-- Recent Candles -->
+        <div class="indicator-card mt-4">
+            <h3 class="text-lg font-bold mb-3">📋 RECENT CANDLES (Last 10)</h3>
+            <div class="overflow-x-auto">
+                <table class="w-full text-xs">
+                    <thead>
+                        <tr class="text-gray-400">
+                            <th class="text-left p-2">Time</th>
+                            <th class="text-right p-2">Open</th>
+                            <th class="text-right p-2">High</th>
+                            <th class="text-right p-2">Low</th>
+                            <th class="text-right p-2">Close</th>
+                            <th class="text-right p-2">Volume</th>
+                        </tr>
+                    </thead>
+                    <tbody id="recentCandles"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const socket = io();
+        
+        function formatNumber(num, decimals = 8) {
+            if (num === undefined || num === null) return '--';
+            return num.toFixed(decimals);
+        }
+        
+        function formatPrice(num) {
+            if (num === undefined || num === null) return '--';
+            return '$' + num.toFixed(8);
+        }
+        
+        function formatVolume(num) {
+            if (num === undefined || num === null) return '--';
+            if (num > 1000000) return (num / 1000000).toFixed(2) + 'M';
+            if (num > 1000) return (num / 1000).toFixed(2) + 'K';
+            return num.toFixed(0);
+        }
+        
+        function getBadgeClass(value, thresholds) {
+            if (value > thresholds.overbought) return 'badge-bearish';
+            if (value < thresholds.oversold) return 'badge-bullish';
+            return 'badge-neutral';
+        }
+        
+        socket.on('indicators', (data) => {
+            // Update price
+            document.getElementById('currentPrice').innerHTML = formatPrice(data.currentPrice);
+            const change = data.priceChange;
+            const changePercent = data.priceChangePercent;
+            const changeEl = document.getElementById('priceChange');
+            changeEl.innerHTML = \`\${change >= 0 ? '▲' : '▼'} \${Math.abs(change).toFixed(8)} (\${changePercent >= 0 ? '+' : ''}\${changePercent.toFixed(2)}%)\`;
+            changeEl.className = 'text-sm ' + (change >= 0 ? 'value-up' : 'value-down');
+            
+            // Momentum
+            document.getElementById('rsi').innerHTML = data.indicators.rsi.value.toFixed(1);
+            document.getElementById('stoch').innerHTML = data.indicators.stochK.value.toFixed(1) + ' / ' + data.indicators.stochD.toFixed(1);
+            document.getElementById('willr').innerHTML = data.indicators.willr.toFixed(1);
+            document.getElementById('cci').innerHTML = data.indicators.cci.toFixed(1);
+            document.getElementById('mfi').innerHTML = data.indicators.mfi.value.toFixed(1);
+            document.getElementById('momentum').innerHTML = data.indicators.momentum.toFixed(8);
+            document.getElementById('roc').innerHTML = data.indicators.roc.toFixed(2) + '%';
+            
+            // Trend
+            document.getElementById('macd').innerHTML = data.indicators.macd.macd.toFixed(8);
+            document.getElementById('signalLine').innerHTML = data.indicators.macd.signal.toFixed(8);
+            document.getElementById('histogram').innerHTML = data.indicators.macd.histogram.toFixed(8);
+            document.getElementById('adx').innerHTML = data.indicators.adx.value.toFixed(1) + ' (' + data.indicators.adx.strength + ')';
+            document.getElementById('ema20').innerHTML = formatPrice(data.indicators.ema20);
+            document.getElementById('ema50').innerHTML = formatPrice(data.indicators.ema50);
+            
+            const trendEl = document.getElementById('trend');
+            trendEl.innerHTML = data.indicators.trend;
+            trendEl.className = data.indicators.trend === 'BULLISH' ? 'value-up' : (data.indicators.trend === 'BEARISH' ? 'value-down' : 'text-yellow-500');
+            
+            // Volatility
+            document.getElementById('bbUpper').innerHTML = formatPrice(data.indicators.bb.upper);
+            document.getElementById('bbMiddle').innerHTML = formatPrice(data.indicators.bb.middle);
+            document.getElementById('bbLower').innerHTML = formatPrice(data.indicators.bb.lower);
+            document.getElementById('atr').innerHTML = formatPrice(data.indicators.atr);
+            document.getElementById('atrPercent').innerHTML = data.indicators.atrPercent.toFixed(2) + '%';
+            document.getElementById('volume').innerHTML = formatVolume(data.volume);
+            document.getElementById('volumeRatio').innerHTML = data.indicators.volumeRatio.toFixed(2) + 'x';
+            document.getElementById('vwap').innerHTML = formatPrice(data.indicators.vwap);
+            
+            // Patterns
+            const patternsHtml = \`
+                <div class="text-center p-2 rounded \${data.patterns.doji ? 'pattern-active' : ''}">
+                    <div>📌 Doji</div>
+                    <div class="text-xs text-gray-500">\${data.patterns.doji ? '✓ DETECTED' : '—'}</div>
+                </div>
+                <div class="text-center p-2 rounded \${data.patterns.hammer ? 'pattern-active' : ''}">
+                    <div>🔨 Hammer</div>
+                    <div class="text-xs text-gray-500">\${data.patterns.hammer ? '✓ BULLISH' : '—'}</div>
+                </div>
+                <div class="text-center p-2 rounded \${data.patterns.shootingStar ? 'pattern-active' : ''}">
+                    <div>⭐ Shooting Star</div>
+                    <div class="text-xs text-gray-500">\${data.patterns.shootingStar ? '✓ BEARISH' : '—'}</div>
+                </div>
+                <div class="text-center p-2 rounded \${data.patterns.engulfing.bullish || data.patterns.engulfing.bearish ? 'pattern-active' : ''}">
+                    <div>🔄 Engulfing</div>
+                    <div class="text-xs text-gray-500">\${data.patterns.engulfing.bullish ? '✓ BULLISH' : (data.patterns.engulfing.bearish ? '✓ BEARISH' : '—')}</div>
+                </div>
+                <div class="text-center p-2 rounded \${data.patterns.morningStar ? 'pattern-active' : ''}">
+                    <div>🌅 Morning Star</div>
+                    <div class="text-xs text-gray-500">\${data.patterns.morningStar ? '✓ BULLISH' : '—'}</div>
+                </div>
+                <div class="text-center p-2 rounded \${data.patterns.eveningStar ? 'pattern-active' : ''}">
+                    <div>🌙 Evening Star</div>
+                    <div class="text-xs text-gray-500">\${data.patterns.eveningStar ? '✓ BEARISH' : '—'}</div>
+                </div>
+                <div class="text-center p-2 rounded \${data.patterns.threeWhiteSoldiers ? 'pattern-active' : ''}">
+                    <div>⚔️ 3 White Soldiers</div>
+                    <div class="text-xs text-gray-500">\${data.patterns.threeWhiteSoldiers ? '✓ BULLISH' : '—'}</div>
+                </div>
+                <div class="text-center p-2 rounded \${data.patterns.threeBlackCrows ? 'pattern-active' : ''}">
+                    <div>🐦‍⬛ 3 Black Crows</div>
+                    <div class="text-xs text-gray-500">\${data.patterns.threeBlackCrows ? '✓ BEARISH' : '—'}</div>
+                </div>
+            \`;
+            document.getElementById('patterns').innerHTML = patternsHtml;
+            
+            // Trading Signal
+            const signal = data.indicators.signal;
+            const strength = data.indicators.signalStrength;
+            const signalCard = document.getElementById('signalCard');
+            const signalDiv = document.getElementById('tradingSignal');
+            
+            if (signal === 'BUY') {
+                signalDiv.className = 'text-center p-4 rounded-lg bg-green-900/50';
+                signalDiv.innerHTML = \`<div class="text-2xl font-bold text-green-500">🟢 BUY SIGNAL</div>
+                                       <div class="text-sm mt-2">Signal Strength: \${strength.toFixed(1)}/10</div>
+                                       <div class="text-xs mt-1">RSI: \${data.indicators.rsi.value.toFixed(1)} | MACD: \${data.indicators.macd.histogram > 0 ? 'Bullish' : 'Bearish'}</div>\`;
+            } else if (signal === 'SELL') {
+                signalDiv.className = 'text-center p-4 rounded-lg bg-red-900/50';
+                signalDiv.innerHTML = \`<div class="text-2xl font-bold text-red-500">🔴 SELL SIGNAL</div>
+                                       <div class="text-sm mt-2">Signal Strength: \${strength.toFixed(1)}/10</div>
+                                       <div class="text-xs mt-1">RSI: \${data.indicators.rsi.value.toFixed(1)} | MACD: \${data.indicators.macd.histogram < 0 ? 'Bearish' : 'Bullish'}</div>\`;
+            } else {
+                signalDiv.className = 'text-center p-4 rounded-lg bg-yellow-900/50';
+                signalDiv.innerHTML = \`<div class="text-2xl font-bold text-yellow-500">🟡 NEUTRAL</div>
+                                       <div class="text-sm mt-2">No clear signal. Wait for confirmation.</div>\`;
+            }
+            
+            // Recent candles
+            let candlesHtml = '';
+            data.recentCandles.forEach(candle => {
+                const date = new Date(candle.time);
+                const timeStr = date.toLocaleTimeString();
+                const isBullish = candle.close > candle.open;
+                candlesHtml += \`
+                    <tr class="border-t border-gray-800">
+                        <td class="p-2 text-left text-xs">\${timeStr}</td>
+                        <td class="p-2 text-right font-mono \${isBullish ? 'value-up' : 'value-down'}">\${candle.open.toFixed(8)}</td>
+                        <td class="p-2 text-right font-mono text-green-500">\${candle.high.toFixed(8)}</td>
+                        <td class="p-2 text-right font-mono text-red-500">\${candle.low.toFixed(8)}</td>
+                        <td class="p-2 text-right font-mono \${isBullish ? 'value-up' : 'value-down'}">\${candle.close.toFixed(8)}</td>
+                        <td class="p-2 text-right">\${formatVolume(candle.volume)}</td>
+                    </tr>
+                \`;
+            });
+            document.getElementById('recentCandles').innerHTML = candlesHtml;
+            
+            // Update timestamp
+            document.getElementById('lastUpdate').innerHTML = 'Updated: ' + new Date(data.timestamp).toLocaleTimeString();
+        });
+        
+        socket.on('disconnect', () => {
+            document.getElementById('status').innerHTML = '● DISCONNECTED';
+            document.getElementById('status').className = 'text-xs text-red-500';
+        });
+        
+        socket.on('connect', () => {
+            document.getElementById('status').innerHTML = '● LIVE';
+            document.getElementById('status').className = 'text-xs text-green-500';
+        });
+    </script>
+</body>
+</html>
+    `);
 });
 
 // ============ START SERVER ============
 
 async function start() {
-    console.log('Starting SHIB/USDT Technical Analysis Server...');
-    
-    // Initial fetch
     await fetchOHLCV();
     await updateData();
     
@@ -580,7 +914,6 @@ async function start() {
 ║                                                          ║
 ║     Dashboard: http://localhost:${PORT}                    ║
 ║     API: http://localhost:${PORT}/api/indicators          ║
-║     Status: http://localhost:${PORT}/api/status           ║
 ║                                                          ║
 ║     Indicators: RSI, MACD, BB, Stochastic, ADX, MFI     ║
 ║     Patterns: Doji, Hammer, Engulfing, Morning/Evening  ║
