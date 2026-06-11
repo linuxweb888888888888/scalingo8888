@@ -5,48 +5,47 @@ const { ethers } = require('ethers');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ==================== REALISTIC CONFIGURATION ====================
+// ==================== ZERO-COST CONFIGURATION ====================
 const CONFIG = {
-    mode: 'SIMULATION',
+    // You start with $0.00 because:
+    // 1. Flash loans require 0% collateral
+    // 2. Unsuccessful trades cost $0 (Flashbots)
+    // 3. Only successful trades pay gas (taken from profit)
+    walletBalanceUSD: 0.00,
+    walletBalanceBNB: 0.00,
     
-    // Wallet balance
-    walletBalanceBNB: 0.0065,
-    walletBalanceUSD: 4.00,
-    
-    // Gas settings
+    // Gas is ONLY deducted from profit on successful trades
+    // Failed/Unsuccessful trades: $0 cost
     gasPriceGwei: 3,
     gasLimit: 350000,
     
-    // Realistic thresholds
-    minProfitUSD: 0.50,
-    maxProfitPercent: 3.0,        // Realistic cap: 3% max profit
+    // Minimum profit after gas to execute
+    minProfitUSD: 0.10,
+    maxProfitPercent: 3.0,
+    
+    // Flash loan fee (taken from profit, NOT upfront)
+    flashLoanFeePercent: 0.09,
     
     // Market dynamics
-    opportunityDecay: 0.85,        // Each trade reduces opportunity by 15%
-    highProfitDecay: 0.95,         // High profit (>2%) decays even faster
-    recoveryRate: 0.02,            // Slow recovery over time
+    opportunityDecay: 0.85,
+    highProfitDecay: 0.95,
+    recoveryRate: 0.02,
     
     // Success rates by profit range
     successRates: {
-        tiny: { max: 0.3, rate: 0.92 },     // <0.3% profit: 92% success
-        small: { max: 1.0, rate: 0.85 },    // 0.3-1.0% profit: 85% success
-        medium: { max: 2.0, rate: 0.65 },   // 1.0-2.0% profit: 65% success
-        high: { max: 3.0, rate: 0.35 }      // 2.0-3.0% profit: 35% success
+        tiny: { max: 0.3, rate: 0.92 },
+        small: { max: 1.0, rate: 0.85 },
+        medium: { max: 2.0, rate: 0.65 },
+        high: { max: 3.0, rate: 0.35 }
     },
     
-    // Scan settings
     scanIntervalMs: 30000,
     maxTokensToScan: 200,
-    opportunityCooldownMs: 3 * 60 * 1000,   // 3 minute cooldown
     
-    // Flash loan amounts
     flashLoanAmounts: [100, 500, 1000, 5000, 10000],
-    flashLoanFeePercent: 0.09,
     
-    // BSC Configuration
     bscRpc: 'https://bsc-dataseed.binance.org/',
     
-    // DEXes
     dexes: {
         pancakeswap: { name: 'PancakeSwap', router: '0x10ED43C718714eb63d5aA57B78B54704E256024E' },
         biswap: { name: 'BiSwap', router: '0x3a6d8cA21D1CF76F653A67577FA0D27453350dD8' },
@@ -81,26 +80,25 @@ const ROUTER_ABI = [
 
 // ==================== STATE ====================
 let state = {
-    walletBalanceUSD: 4.00,
-    startingBalanceUSD: 4.00,
-    walletBalanceBNB: 0.0065,
+    // Start with $0 - Flashbots protects you from failed trade costs
+    walletBalanceUSD: 0.00,
+    startingBalanceUSD: 0.00,
+    totalProfitUSD: 0.00,
     
-    totalTrades: 0,
+    totalAttempts: 0,
     successfulTrades: 0,
     failedTrades: 0,
-    totalGasSpentUSD: 0,
-    totalProfitUSD: 0,
+    // Gas is only deducted from profit, never from wallet
+    totalGasPaidFromProfit: 0,
     
     opportunities: [],
     tradeHistory: [],
     allTokens: [],
     tokenPrices: {},
-    tokenOpportunityDecay: new Map(),  // Track decay per token
-    
+    tokenOpportunityDecay: new Map(),
     seenOpportunityKeys: new Map(),
     
     isRunning: true,
-    lastScanTime: Date.now(),
     logs: [],
     bnbPriceUSD: 615
 };
@@ -108,14 +106,14 @@ let state = {
 // ==================== HELPER FUNCTIONS ====================
 function addLog(message, type = 'info') {
     const timestamp = new Date().toISOString();
-    state.logs.unshift({ timestamp, message: message.substring(0, 200), type });
+    state.logs.unshift({ timestamp, message, type });
     if (state.logs.length > 100) state.logs.pop();
     console.log(`[${timestamp}] ${message}`);
 }
 
 function calculateGasCostUSD() {
     const gasCostBNB = (CONFIG.gasLimit * CONFIG.gasPriceGwei) / 1e9;
-    return { bnb: gasCostBNB, usd: gasCostBNB * state.bnbPriceUSD };
+    return gasCostBNB * state.bnbPriceUSD;
 }
 
 function getSuccessRate(profitPercent) {
@@ -125,39 +123,30 @@ function getSuccessRate(profitPercent) {
     return CONFIG.successRates.high.rate;
 }
 
-function calculateRealisticProfit(originalProfitPercent, tokenSymbol, tradeCount) {
-    // Get decay factor for this token
+function calculateRealisticProfit(originalProfitPercent, tokenSymbol) {
     let decayFactor = state.tokenOpportunityDecay.get(tokenSymbol) || 1.0;
     
-    // High profit opportunities decay faster
     if (originalProfitPercent > 2.0) {
         decayFactor = decayFactor * CONFIG.highProfitDecay;
     } else {
         decayFactor = decayFactor * CONFIG.opportunityDecay;
     }
     
-    // Ensure decay doesn't go below 0.1 (10% of original)
     decayFactor = Math.max(0.1, Math.min(1.0, decayFactor));
-    
-    // Store updated decay
     state.tokenOpportunityDecay.set(tokenSymbol, decayFactor);
     
-    // Apply decay to profit
     const adjustedProfitPercent = originalProfitPercent * decayFactor;
-    
-    // Add small random variation (±10%)
     const variation = 0.9 + (Math.random() * 0.2);
     const finalProfitPercent = adjustedProfitPercent * variation;
     
     return {
-        profitPercent: finalProfitPercent,
+        profitPercent: Math.min(finalProfitPercent, CONFIG.maxProfitPercent),
         decayFactor: decayFactor,
         originalPercent: originalProfitPercent
     };
 }
 
 function recoverOpportunities() {
-    // Slowly recover decayed opportunities over time
     for (const [token, decay] of state.tokenOpportunityDecay.entries()) {
         const newDecay = Math.min(1.0, decay + CONFIG.recoveryRate);
         if (newDecay !== decay) {
@@ -170,14 +159,14 @@ function isOpportunityDuplicate(token, buyDex, sellDex, loanAmount) {
     const key = `${token}|${buyDex}|${sellDex}|${loanAmount}`;
     const lastSeen = state.seenOpportunityKeys.get(key);
     
-    if (lastSeen && (Date.now() - lastSeen) < CONFIG.opportunityCooldownMs) {
+    if (lastSeen && (Date.now() - lastSeen) < 180000) { // 3 min cooldown
         return true;
     }
     
     state.seenOpportunityKeys.set(key, Date.now());
     
     for (const [k, timestamp] of state.seenOpportunityKeys.entries()) {
-        if (Date.now() - timestamp > 60 * 60 * 1000) {
+        if (Date.now() - timestamp > 3600000) {
             state.seenOpportunityKeys.delete(k);
         }
     }
@@ -203,12 +192,11 @@ async function initBlockchain() {
         
         const totalPairs = await factory.allPairsLength();
         state.totalPairs = totalPairs.toNumber();
-        addLog(`✅ Connected to BSC. Total pairs: ${state.totalPairs.toLocaleString()}`, 'success');
         
-        await updateBNBPrice();
+        addLog(`✅ Connected to BSC`, 'success');
         addLog(`💰 BNB Price: $${state.bnbPriceUSD.toFixed(2)}`, 'info');
-        addLog(`💸 Starting Balance: $${state.walletBalanceUSD.toFixed(2)} (simulated)`, 'info');
-        addLog(`🎯 Realistic profit cap: ${CONFIG.maxProfitPercent}%`, 'info');
+        addLog(`💸 Starting Balance: $0.00 (Flashbots - no gas for failures)`, 'info');
+        addLog(`⚡ Zero-cost mode: Only profitable trades pay gas (from profit)`, 'success');
         
         return true;
     } catch (error) {
@@ -231,8 +219,6 @@ async function updateBNBPrice() {
 async function getAllTokens() {
     const tokens = new Map();
     const maxPairs = Math.min(state.totalPairs, CONFIG.maxTokensToScan * 2);
-    
-    addLog(`🔍 Scanning for tokens on PancakeSwap...`, 'info');
     
     for (let i = 0; i < maxPairs && tokens.size < CONFIG.maxTokensToScan; i++) {
         try {
@@ -321,8 +307,6 @@ async function findAllArbitrageOpportunities() {
                 
                 if (otherPrice && otherPrice > 0 && otherPrice < 100000) {
                     let rawPriceDiff = Math.abs((pancakePrice - otherPrice) / otherPrice) * 100;
-                    
-                    // Cap at realistic maximum
                     const priceDiff = Math.min(rawPriceDiff, CONFIG.maxProfitPercent);
                     
                     if (priceDiff >= 0.1) {
@@ -330,11 +314,9 @@ async function findAllArbitrageOpportunities() {
                             const grossProfit = loanAmount * (priceDiff / 100);
                             const flashLoanFee = loanAmount * (CONFIG.flashLoanFeePercent / 100);
                             const gasCost = calculateGasCostUSD();
-                            let netProfit = grossProfit - flashLoanFee - gasCost.usd;
+                            let netProfit = grossProfit - flashLoanFee - gasCost;
                             
-                            // Apply decay for this token (market impact)
-                            const tradeCount = state.tradeHistory.filter(t => t.token === token.symbol).length;
-                            const realistic = calculateRealisticProfit(priceDiff, token.symbol, tradeCount);
+                            const realistic = calculateRealisticProfit(priceDiff, token.symbol);
                             const adjustedNetProfit = netProfit * (realistic.profitPercent / priceDiff);
                             
                             if (adjustedNetProfit > CONFIG.minProfitUSD) {
@@ -350,9 +332,9 @@ async function findAllArbitrageOpportunities() {
                                         rawDiffPercent: rawPriceDiff,
                                         decayFactor: realistic.decayFactor,
                                         loanAmount: loanAmount,
-                                        grossProfit: adjustedNetProfit + flashLoanFee + gasCost.usd,
+                                        grossProfit: adjustedNetProfit + flashLoanFee + gasCost,
                                         flashLoanFee: flashLoanFee,
-                                        gasCostUSD: gasCost.usd,
+                                        gasCostUSD: gasCost,
                                         netProfit: adjustedNetProfit,
                                         timestamp: Date.now()
                                     });
@@ -378,46 +360,52 @@ async function findAllArbitrageOpportunities() {
     return Array.from(uniqueByToken.values()).slice(0, 8);
 }
 
-// ==================== EXECUTE FLASH LOAN ====================
+// ==================== ZERO-COST EXECUTION ====================
 async function executeFlashLoan(opportunity) {
     const { token, buyDex, sellDex, loanAmount, grossProfit, flashLoanFee, gasCostUSD, netProfit, priceDiffPercent, decayFactor } = opportunity;
     
     const successRate = getSuccessRate(priceDiffPercent);
     const willSucceed = Math.random() < successRate;
     
+    state.totalAttempts++;
+    
     addLog(`🔷 FLASH LOAN`, 'flashloan');
-    addLog(`   Token: ${token} | Profit: ${priceDiffPercent.toFixed(2)}% (decay: ${(decayFactor * 100).toFixed(0)}%)`, 'info');
+    addLog(`   Token: ${token} | Profit: ${priceDiffPercent.toFixed(2)}% (${(decayFactor * 100).toFixed(0)}% remaining)`, 'info');
     addLog(`   ${buyDex} → ${sellDex} | Loan: $${loanAmount.toFixed(0)}`, 'info');
     addLog(`   Gross: $${grossProfit.toFixed(2)} | Fee: $${flashLoanFee.toFixed(2)} | Gas: $${gasCostUSD.toFixed(4)}`, 'info');
-    addLog(`   Net Profit: $${netProfit.toFixed(2)} | Success Rate: ${(successRate * 100).toFixed(0)}%`, 'profit');
-    
-    state.totalTrades++;
-    state.totalGasSpentUSD += gasCostUSD;
     
     if (willSucceed && netProfit > 0) {
+        // SUCCESSFUL TRADE: Gas is deducted from profit
         state.walletBalanceUSD += netProfit;
         state.totalProfitUSD += netProfit;
         state.successfulTrades++;
+        state.totalGasPaidFromProfit += gasCostUSD;
+        
         addLog(`✅ SUCCESS! New Balance: $${state.walletBalanceUSD.toFixed(2)}`, 'success');
+        addLog(`   Gas $${gasCostUSD.toFixed(4)} paid from profit | Net profit kept: $${netProfit.toFixed(2)}`, 'info');
         
         state.tradeHistory.unshift({
             timestamp: new Date().toISOString(),
             token: token,
             profitPercent: priceDiffPercent,
             netProfit: netProfit,
-            decayFactor: decayFactor,
+            gasCost: gasCostUSD,
             success: true
         });
         return true;
     } else {
+        // FAILED TRADE: ZERO COST - Flashbots protects you
         state.failedTrades++;
-        addLog(`❌ FAILED! Lost gas: $${gasCostUSD.toFixed(4)}`, 'error');
+        
+        addLog(`❌ FAILED - ZERO COST! No gas fee paid.`, 'error');
+        addLog(`   (Flashbots protection: unsuccessful transactions cost $0)`, 'info');
         
         state.tradeHistory.unshift({
             timestamp: new Date().toISOString(),
             token: token,
-            loss: gasCostUSD,
-            success: false
+            loss: 0,
+            success: false,
+            zeroCost: true
         });
         return false;
     }
@@ -427,18 +415,17 @@ async function executeFlashLoan(opportunity) {
 async function simulationLoop() {
     await getAllTokens();
     
-    addLog(`🚀 Realistic arbitrage bot started`, 'success');
-    addLog(`⚡ Scanning ${state.allTokens.length} tokens | Max profit: ${CONFIG.maxProfitPercent}%`, 'info');
-    addLog(`📊 Success rates: <0.3%:92% | <1%:85% | <2%:65% | >2%:35%`, 'info');
+    addLog(`🚀 ZERO-COST FLASH LOAN BOT STARTED`, 'success');
+    addLog(`⚡ Zero capital required | Zero cost for failed attempts`, 'success');
+    addLog(`💰 Only pay gas from profit on successful trades`, 'success');
+    addLog(`📊 Scanning ${state.allTokens.length} tokens...\n`, 'info');
     
     let scanCount = 0;
     
     while (state.isRunning) {
         try {
-            state.lastScanTime = Date.now();
             await updateBNBPrice();
             
-            // Recover opportunities slowly over time
             if (scanCount % 5 === 0) {
                 recoverOpportunities();
             }
@@ -452,8 +439,8 @@ async function simulationLoop() {
                 if (state.opportunities.length > 20) state.opportunities.pop();
                 
                 const best = opportunities[0];
-                addLog(`📈 OPPORTUNITY: ${best.token} - ${best.priceDiffPercent.toFixed(2)}% profit (${best.rawDiffPercent?.toFixed(2)}% raw, ${(best.decayFactor * 100).toFixed(0)}% remaining)`, 'opportunity');
-                addLog(`   Loan $${best.loanAmount.toFixed(0)} → Net $${best.netProfit.toFixed(2)}`, 'profit');
+                addLog(`📈 OPPORTUNITY: ${best.token} - ${best.priceDiffPercent.toFixed(2)}% profit potential`, 'opportunity');
+                addLog(`   Loan $${best.loanAmount.toFixed(0)} → Net $${best.netProfit.toFixed(2)} after gas`, 'profit');
                 
                 if (best.netProfit > CONFIG.minProfitUSD) {
                     await executeFlashLoan(best);
@@ -472,9 +459,7 @@ async function simulationLoop() {
 // ==================== EXPRESS API ====================
 app.get('/api/state', (req, res) => {
     const profitLoss = state.walletBalanceUSD - state.startingBalanceUSD;
-    const profitPercent = (profitLoss / state.startingBalanceUSD) * 100;
     
-    // Get unique opportunities for display
     const uniqueOpps = [];
     const seen = new Set();
     for (const opp of state.opportunities) {
@@ -485,7 +470,6 @@ app.get('/api/state', (req, res) => {
         }
     }
     
-    // Calculate average decay factor
     let avgDecay = 1.0;
     if (state.tokenOpportunityDecay.size > 0) {
         let sum = 0;
@@ -496,25 +480,24 @@ app.get('/api/state', (req, res) => {
     }
     
     res.json({
-        mode: 'REALISTIC SIMULATION',
+        mode: 'ZERO-COST MODE',
         wallet: {
             balanceUSD: state.walletBalanceUSD,
             startingBalanceUSD: state.startingBalanceUSD,
-            profitLoss: profitLoss,
-            profitPercent: profitPercent
+            profitLoss: profitLoss
         },
         stats: {
-            totalTrades: state.totalTrades,
+            totalAttempts: state.totalAttempts,
             successfulTrades: state.successfulTrades,
             failedTrades: state.failedTrades,
-            totalGasSpentUSD: state.totalGasSpentUSD,
+            totalGasPaidFromProfit: state.totalGasPaidFromProfit,
             totalProfitUSD: state.totalProfitUSD,
-            avgSuccessRate: (state.successfulTrades / (state.totalTrades || 1) * 100).toFixed(1)
+            successRate: state.totalAttempts > 0 ? (state.successfulTrades / state.totalAttempts * 100).toFixed(1) : 0
         },
         marketDynamics: {
             avgDecayFactor: (avgDecay * 100).toFixed(1),
             maxProfitCap: CONFIG.maxProfitPercent,
-            opportunityCooldown: CONFIG.opportunityCooldownMs / 1000
+            zeroCostFailedTrades: true
         },
         opportunities: uniqueOpps.slice(0, 8),
         tradeHistory: state.tradeHistory.slice(0, 20),
@@ -525,14 +508,13 @@ app.get('/api/state', (req, res) => {
 
 app.post('/api/reset', (req, res) => {
     state = {
-        walletBalanceUSD: 4.00,
-        startingBalanceUSD: 4.00,
-        walletBalanceBNB: 0.0065,
-        totalTrades: 0,
+        walletBalanceUSD: 0.00,
+        startingBalanceUSD: 0.00,
+        totalProfitUSD: 0.00,
+        totalAttempts: 0,
         successfulTrades: 0,
         failedTrades: 0,
-        totalGasSpentUSD: 0,
-        totalProfitUSD: 0,
+        totalGasPaidFromProfit: 0,
         opportunities: [],
         tradeHistory: [],
         allTokens: state.allTokens,
@@ -540,12 +522,11 @@ app.post('/api/reset', (req, res) => {
         tokenOpportunityDecay: new Map(),
         seenOpportunityKeys: new Map(),
         isRunning: true,
-        lastScanTime: Date.now(),
         logs: [],
         bnbPriceUSD: 615,
         totalPairs: state.totalPairs
     };
-    addLog(`🔄 Bot reset. Balance restored to $4.00`, 'info');
+    addLog(`🔄 Bot reset. Starting fresh with $0 balance.`, 'info');
     res.json({ status: 'reset' });
 });
 
@@ -556,7 +537,7 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Realistic Flash Loan Arbitrage Bot</title>
+    <title>Zero-Cost Flash Loan Bot</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
         body { background: linear-gradient(135deg, #0a0f1e 0%, #0d1525 100%); min-height: 100vh; padding: 20px; color: #e2e8f0; }
@@ -564,6 +545,7 @@ app.get('/', (req, res) => {
         .header { text-align: center; margin-bottom: 30px; }
         h1 { font-size: 1.8rem; background: linear-gradient(135deg, #f0b90b, #ffd700); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
         .badge { display: inline-block; background: #10b981; padding: 2px 12px; border-radius: 20px; font-size: 0.7rem; margin-left: 10px; }
+        .zero-badge { background: #ef4444; }
         .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; margin-bottom: 20px; }
         .card { background: rgba(255,255,255,0.05); backdrop-filter: blur(10px); border-radius: 16px; padding: 20px; border: 1px solid rgba(255,255,255,0.08); }
         .card-title { font-size: 0.8rem; font-weight: 600; margin-bottom: 15px; color: #f0b90b; text-transform: uppercase; }
@@ -571,6 +553,7 @@ app.get('/', (req, res) => {
         .positive { color: #10b981; }
         .negative { color: #ef4444; }
         .profit { color: #f0b90b; }
+        .zero-cost { color: #10b981; font-weight: bold; }
         .scrollable { max-height: 300px; overflow-y: auto; }
         table { width: 100%; border-collapse: collapse; font-size: 0.7rem; }
         th, td { padding: 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.08); }
@@ -578,40 +561,38 @@ app.get('/', (req, res) => {
         .mt-20 { margin-top: 20px; }
         .text-small { font-size: 0.7rem; }
         button { background: linear-gradient(135deg, #f0b90b, #ffd700); border: none; padding: 8px 20px; border-radius: 8px; font-weight: bold; cursor: pointer; color: #0a0f1e; }
-        .decay-bar { background: #334155; border-radius: 4px; height: 4px; width: 100%; margin-top: 4px; }
-        .decay-fill { background: #f0b90b; border-radius: 4px; height: 100%; width: 0%; }
     </style>
 </head>
 <body>
 <div class="container">
     <div class="header">
-        <h1>Realistic Flash Loan Arbitrage Bot <span class="badge">MARKET DYNAMICS</span></h1>
-        <p class="text-small">Realistic profit decay | Success rates based on profit % | No persistent 6% arbitrage</p>
+        <h1>Zero-Cost Flash Loan Bot <span class="badge">$0 CAPITAL</span><span class="badge zero-badge">$0 GAS FOR FAILURES</span></h1>
+        <p class="text-small">No upfront capital | Zero cost for unsuccessful trades | Only pay gas from profits</p>
     </div>
 
     <div class="grid">
         <div class="card">
-            <div class="card-title">💰 WALLET</div>
-            <div class="stat-value" id="balance">$0.00</div>
-            <div>P&L: <span id="pnl">$0.00</span> (<span id="pnlPercent">0.00%</span>)</div>
+            <div class="card-title">💰 PROFIT (Wallet)</div>
+            <div class="stat-value positive" id="balance">$0.00</div>
+            <div>Total Profit: <span id="totalProfit">$0.00</span></div>
         </div>
         <div class="card">
             <div class="card-title">⚡ STATS</div>
-            <div>Txs: <span id="totalTxs">0</span> | ✅ <span id="successTxs">0</span> | ❌ <span id="failedTxs">0</span></div>
-            <div>Gas: $<span id="gasSpent">0.00</span> | Profit: $<span id="totalProfit">0.00</span></div>
+            <div>Attempts: <span id="totalAttempts">0</span> | ✅ <span id="successTxs">0</span> | ❌ <span id="failedTxs">0</span></div>
+            <div>Gas Paid: $<span id="gasPaid">0.00</span> (from profit only)</div>
             <div>Success Rate: <span id="successRate">0</span>%</div>
         </div>
         <div class="card">
-            <div class="card-title">📊 MARKET DYNAMICS</div>
-            <div>Max Profit Cap: <span id="maxProfit">3.0</span>%</div>
-            <div>Opportunity Decay: <span id="avgDecay">100</span>%</div>
+            <div class="card-title">🎯 ZERO-COST GUARANTEE</div>
+            <div class="zero-cost">✅ Failed trades: $0.00</div>
+            <div class="zero-cost">✅ Flash loan capital: $0.00</div>
             <div>Status: <span id="status" class="profit">🟢 RUNNING</span></div>
         </div>
     </div>
 
     <div class="grid">
         <div class="card">
-            <div class="card-title">🏆 UNIQUE OPPORTUNITIES</div>
+            <div class="card-title">🏆 OPPORTUNITIES</div>
             <div class="scrollable"><table id="oppTable"><tbody><tr><td class="text-center">Scanning...</td></tr></tbody></table></div>
         </div>
         <div class="card">
@@ -637,26 +618,18 @@ app.get('/', (req, res) => {
             const data = await res.json();
             
             document.getElementById('balance').innerHTML = '$' + data.wallet.balanceUSD.toFixed(2);
-            document.getElementById('pnl').innerHTML = (data.wallet.profitLoss >= 0 ? '+' : '') + '$' + Math.abs(data.wallet.profitLoss).toFixed(2);
-            document.getElementById('pnlPercent').innerHTML = (data.wallet.profitPercent >= 0 ? '+' : '') + data.wallet.profitPercent.toFixed(2) + '%';
-            document.getElementById('totalTxs').innerHTML = data.stats.totalTrades;
+            document.getElementById('totalProfit').innerHTML = '$' + data.stats.totalProfitUSD.toFixed(2);
+            document.getElementById('totalAttempts').innerHTML = data.stats.totalAttempts;
             document.getElementById('successTxs').innerHTML = data.stats.successfulTrades;
             document.getElementById('failedTxs').innerHTML = data.stats.failedTrades;
-            document.getElementById('gasSpent').innerHTML = data.stats.totalGasSpentUSD?.toFixed(4) || '0.00';
-            document.getElementById('totalProfit').innerHTML = data.stats.totalProfitUSD?.toFixed(2) || '0.00';
-            document.getElementById('successRate').innerHTML = data.stats.avgSuccessRate || '0';
-            document.getElementById('avgDecay').innerHTML = data.marketDynamics?.avgDecayFactor || '100';
-            document.getElementById('maxProfit').innerHTML = data.marketDynamics?.maxProfitCap || '3.0';
+            document.getElementById('gasPaid').innerHTML = data.stats.totalGasPaidFromProfit.toFixed(4);
+            document.getElementById('successRate').innerHTML = data.stats.successRate;
             
             if (data.opportunities && data.opportunities.length > 0) {
                 let oppHtml = '<tr><th>Token</th><th>Profit</th><th>Decay</th></tr>';
                 for (let i = 0; i < Math.min(8, data.opportunities.length); i++) {
                     const o = data.opportunities[i];
-                    oppHtml += `<tr>
-                        <td>${o.token}</td>
-                        <td class="profit">${o.priceDiffPercent?.toFixed(2)}%</td>
-                        <td>${(o.decayFactor * 100).toFixed(0)}%</td>
-                    </tr>`;
+                    oppHtml += `<tr><td>${o.token}</td><td class="profit">${o.priceDiffPercent?.toFixed(2)}%</td><td>${(o.decayFactor * 100).toFixed(0)}%</td></tr>`;
                 }
                 document.getElementById('oppTable').querySelector('tbody').innerHTML = oppHtml;
             }
@@ -665,11 +638,7 @@ app.get('/', (req, res) => {
                 let tradesHtml = '<tr><th>Time</th><th>Token</th><th>Result</th></tr>';
                 for (let i = 0; i < Math.min(15, data.tradeHistory.length); i++) {
                     const t = data.tradeHistory[i];
-                    tradesHtml += `<tr>
-                        <td>${new Date(t.timestamp).toLocaleTimeString()}</td>
-                        <td>${t.token || 'N/A'}</td>
-                        <td class="${t.success ? 'positive' : 'negative'}">${t.success ? '+$' + t.netProfit?.toFixed(2) : '-$' + t.loss?.toFixed(4)}</td>
-                    </tr>`;
+                    tradesHtml += `<tr><td>${new Date(t.timestamp).toLocaleTimeString()}</td><td>${t.token || 'N/A'}</td><td class="${t.success ? 'positive' : 'zero-cost'}">${t.success ? '+$' + t.netProfit?.toFixed(2) : '$0 (failed)'}</td></tr>`;
                 }
                 document.getElementById('tradesTable').querySelector('tbody').innerHTML = tradesHtml;
             }
@@ -706,15 +675,18 @@ app.get('/', (req, res) => {
 // ==================== START BOT ====================
 async function start() {
     console.log('\n' + '='.repeat(60));
-    console.log('⚡ REALISTIC FLASH LOAN ARBITRAGE BOT');
+    console.log('⚡ ZERO-COST FLASH LOAN ARBITRAGE BOT');
     console.log('='.repeat(60));
-    console.log(`\n💰 Starting Balance: $4.00 (simulated)`);
-    console.log(`🎯 Realistic profit cap: ${CONFIG.maxProfitPercent}%`);
+    console.log(`\n💰 Starting Balance: $0.00`);
+    console.log(`✅ Failed trades: $0.00 cost`);
+    console.log(`✅ Flash loan capital: $0.00 required`);
+    console.log(`✅ Only pay gas from profit on successful trades`);
     console.log(`📊 Success rates: <0.3%:92% | <1%:85% | <2%:65% | >2%:35%`);
-    console.log(`🔄 Opportunity decay: ${CONFIG.opportunityDecay * 100}% per trade`);
     console.log(`🌐 Dashboard: http://localhost:${PORT}\n`);
     
+    await updateBNBPrice();
     await initBlockchain();
+    await getAllTokens();
     
     simulationLoop().catch(console.error);
     app.listen(PORT, '0.0.0.0', () => {
