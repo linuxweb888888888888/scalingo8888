@@ -82,7 +82,8 @@ let state = {
 // ==================== HELPER FUNCTIONS ====================
 function addLog(message, type) {
     const timestamp = new Date().toISOString();
-    state.logs.unshift({ timestamp, message: message.substring(0, 200), type: type || 'info' });
+    const logEntry = { timestamp, message: message.substring(0, 200), type: type || 'info' };
+    state.logs.unshift(logEntry);
     if (state.logs.length > 100) state.logs.pop();
     console.log('[' + timestamp + '] ' + message);
 }
@@ -357,10 +358,11 @@ async function executeFlashLoan(opportunity) {
     
     state.totalAttempts++;
     
-    addLog('🔷 FLASH LOAN', 'flashloan');
-    addLog('   Token: ' + token + ' | Profit: ' + priceDiffPercent.toFixed(2) + '% (' + (decayFactor * 100).toFixed(0) + '% remaining)', 'info');
+    addLog('🔷 FLASH LOAN - ' + token, 'flashloan');
     addLog('   ' + buyDex + ' → ' + sellDex + ' | Loan: $' + loanAmount.toFixed(0), 'info');
+    addLog('   Profit: ' + priceDiffPercent.toFixed(2) + '% (' + (decayFactor * 100).toFixed(0) + '% remaining)', 'info');
     addLog('   Gross: $' + grossProfit.toFixed(2) + ' | Fee: $' + flashLoanFee.toFixed(2) + ' | Gas: $' + gasCostUSD.toFixed(4), 'info');
+    addLog('   Net Profit: $' + netProfit.toFixed(2), 'profit');
     
     if (willSucceed && netProfit > 0) {
         state.walletBalanceUSD += netProfit;
@@ -369,7 +371,6 @@ async function executeFlashLoan(opportunity) {
         state.totalGasPaidFromProfit += gasCostUSD;
         
         addLog('✅ SUCCESS! New Balance: $' + state.walletBalanceUSD.toFixed(2), 'success');
-        addLog('   Gas $' + gasCostUSD.toFixed(4) + ' paid from profit | Net profit kept: $' + netProfit.toFixed(2), 'info');
         
         state.tradeHistory.unshift({
             timestamp: new Date().toISOString(),
@@ -382,9 +383,7 @@ async function executeFlashLoan(opportunity) {
         return true;
     } else {
         state.failedTrades++;
-        
-        addLog('❌ FAILED - ZERO COST! No gas fee paid.', 'error');
-        addLog('   (Flashbots protection: unsuccessful transactions cost $0)', 'info');
+        addLog('❌ FAILED - ZERO COST! (Flashbots protection: no gas fee paid)', 'error');
         
         state.tradeHistory.unshift({
             timestamp: new Date().toISOString(),
@@ -425,8 +424,8 @@ async function simulationLoop() {
                 if (state.opportunities.length > 20) state.opportunities.pop();
                 
                 const best = opportunities[0];
-                addLog('📈 OPPORTUNITY: ' + best.token + ' - ' + best.priceDiffPercent.toFixed(2) + '% profit potential', 'opportunity');
-                addLog('   Loan $' + best.loanAmount.toFixed(0) + ' → Net $' + best.netProfit.toFixed(2) + ' after gas', 'profit');
+                addLog('📈 OPPORTUNITY: ' + best.token + ' - ' + best.priceDiffPercent.toFixed(2) + '% profit', 'opportunity');
+                addLog('   Loan $' + best.loanAmount.toFixed(0) + ' → Net $' + best.netProfit.toFixed(2), 'profit');
                 
                 if (best.netProfit > CONFIG.minProfitUSD) {
                     await executeFlashLoan(best);
@@ -494,32 +493,26 @@ app.get('/api/state', function(req, res) {
 });
 
 app.post('/api/reset', function(req, res) {
-    state = {
-        walletBalanceUSD: 0.00,
-        startingBalanceUSD: 0.00,
-        totalProfitUSD: 0.00,
-        totalAttempts: 0,
-        successfulTrades: 0,
-        failedTrades: 0,
-        totalGasPaidFromProfit: 0,
-        opportunities: [],
-        tradeHistory: [],
-        allTokens: state.allTokens,
-        tokenPrices: {},
-        tokenOpportunityDecay: new Map(),
-        seenOpportunityKeys: new Map(),
-        isRunning: true,
-        logs: [],
-        bnbPriceUSD: 615,
-        totalPairs: state.totalPairs
-    };
+    state.walletBalanceUSD = 0.00;
+    state.startingBalanceUSD = 0.00;
+    state.totalProfitUSD = 0.00;
+    state.totalAttempts = 0;
+    state.successfulTrades = 0;
+    state.failedTrades = 0;
+    state.totalGasPaidFromProfit = 0;
+    state.opportunities = [];
+    state.tradeHistory = [];
+    state.tokenOpportunityDecay.clear();
+    state.seenOpportunityKeys.clear();
+    state.isRunning = true;
+    state.logs = [];
     addLog('🔄 Bot reset. Starting fresh with $0 balance.', 'info');
     res.json({ status: 'reset' });
 });
 
 // ==================== DASHBOARD HTML ====================
 app.get('/', function(req, res) {
-    const html = '<!DOCTYPE html>\n<html lang="en">\n<head>\n    <meta charset="UTF-8">\n    <meta name="viewport" content="width=device-width, initial-scale=1.0">\n    <title>Zero-Cost Flash Loan Bot</title>\n    <style>\n        * { margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }\n        body { background: linear-gradient(135deg, #0a0f1e 0%, #0d1525 100%); min-height: 100vh; padding: 20px; color: #e2e8f0; }\n        .container { max-width: 1600px; margin: 0 auto; }\n        .header { text-align: center; margin-bottom: 30px; }\n        h1 { font-size: 1.8rem; background: linear-gradient(135deg, #f0b90b, #ffd700); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }\n        .badge { display: inline-block; background: #10b981; padding: 2px 12px; border-radius: 20px; font-size: 0.7rem; margin-left: 10px; }\n        .zero-badge { background: #ef4444; }\n        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; margin-bottom: 20px; }\n        .card { background: rgba(255,255,255,0.05); backdrop-filter: blur(10px); border-radius: 16px; padding: 20px; border: 1px solid rgba(255,255,255,0.08); }\n        .card-title { font-size: 0.8rem; font-weight: 600; margin-bottom: 15px; color: #f0b90b; text-transform: uppercase; }\n        .stat-value { font-size: 1.8rem; font-weight: bold; }\n        .positive { color: #10b981; }\n        .negative { color: #ef4444; }\n        .profit { color: #f0b90b; }\n        .zero-cost { color: #10b981; font-weight: bold; }\n        .scrollable { max-height: 300px; overflow-y: auto; }\n        table { width: 100%; border-collapse: collapse; font-size: 0.7rem; }\n        th, td { padding: 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.08); }\n        .text-center { text-align: center; }\n        .mt-20 { margin-top: 20px; }\n        .text-small { font-size: 0.7rem; }\n        button { background: linear-gradient(135deg, #f0b90b, #ffd700); border: none; padding: 8px 20px; border-radius: 8px; font-weight: bold; cursor: pointer; color: #0a0f1e; }\n    </style>\n</head>\n<body>\n<div class="container">\n    <div class="header">\n        <h1>Zero-Cost Flash Loan Bot <span class="badge">$0 CAPITAL</span><span class="badge zero-badge">$0 GAS FOR FAILURES</span></h1>\n        <p class="text-small">No upfront capital | Zero cost for unsuccessful trades | Only pay gas from profits</p>\n    </div>\n\n    <div class="grid">\n        <div class="card">\n            <div class="card-title">💰 PROFIT (Wallet)</div>\n            <div class="stat-value positive" id="balance">$0.00</div>\n            <div>Total Profit: <span id="totalProfit">$0.00</span></div>\n        </div>\n        <div class="card">\n            <div class="card-title">⚡ STATS</div>\n            <div>Attempts: <span id="totalAttempts">0</span> | ✅ <span id="successTxs">0</span> | ❌ <span id="failedTxs">0</span></div>\n            <div>Gas Paid: $<span id="gasPaid">0.00</span> (from profit only)</div>\n            <div>Success Rate: <span id="successRate">0</span>%</div>\n        </div>\n        <div class="card">\n            <div class="card-title">🎯 ZERO-COST GUARANTEE</div>\n            <div class="zero-cost">✅ Failed trades: $0.00</div>\n            <div class="zero-cost">✅ Flash loan capital: $0.00</div>\n            <div>Status: <span id="status" class="profit">🟢 RUNNING</span></div>\n        </div>\n    </div>\n\n    <div class="grid">\n        <div class="card">\n            <div class="card-title">🏆 OPPORTUNITIES</div>\n            <div class="scrollable"><table id="oppTable"><tbody><tr><td class="text-center">Scanning...</td></tr></tbody></table></div>\n        </div>\n        <div class="card">\n            <div class="card-title">📋 TRADE HISTORY</div>\n            <div class="scrollable"><table id="tradesTable"><tbody><tr><td class="text-center">No trades yet</td></tr></tbody></table></div>\n        </div>\n    </div>\n\n    <div class="card">\n        <div class="card-title">📝 LIVE LOGS</div>\n        <div class="scrollable" id="logsContainer" style="max-height: 200px; font-family: monospace; font-size: 0.65rem;">Initializing...</div>\n    </div>\n\n    <div class="text-center mt-20">\n        <button onclick="resetSimulation()">🔄 Reset</button>\n    </div>\n</div>\n\n<script>\n    async function fetchState() {\n        try {\n            const res = await fetch("/api/state");\n            const data = await res.json();\n            \n            document.getElementById("balance").innerHTML = "$" + data.wallet.balanceUSD.toFixed(2);\n            document.getElementById("totalProfit").innerHTML = "$" + data.stats.totalProfitUSD.toFixed(2);\n            document.getElementById("totalAttempts").innerHTML = data.stats.totalAttempts;\n            document.getElementById("successTxs").innerHTML = data.stats.successfulTrades;\n            document.getElementById("failedTxs").innerHTML = data.stats.failedTrades;\n            document.getElementById("gasPaid").innerHTML = data.stats.totalGasPaidFromProfit.toFixed(4);\n            document.getElementById("successRate").innerHTML = data.stats.successRate;\n            \n            if (data.opportunities && data.opportunities.length > 0) {\n                let oppHtml = "<tr><th>Token</th><th>Profit</th><th>Decay</th></tr>";\n                for (let i = 0; i < Math.min(8, data.opportunities.length); i++) {\n                    const o = data.opportunities[i];\n                    oppHtml += "<tr><td>" + o.token + "</td><td class=\"profit\">" + o.priceDiffPercent?.toFixed(2) + "%</td><td>" + (o.decayFactor * 100).toFixed(0) + "%</td></tr>";\n                }\n                document.getElementById("oppTable").querySelector("tbody").innerHTML = oppHtml;\n            }\n            \n            if (data.tradeHistory && data.tradeHistory.length > 0) {\n                let tradesHtml = "<tr><th>Time</th><th>Token</th><th>Result</th></tr>";\n                for (let i = 0; i < Math.min(15, data.tradeHistory.length); i++) {\n                    const t = data.tradeHistory[i];\n                    tradesHtml += "<tr><td>" + new Date(t.timestamp).toLocaleTimeString() + "</td><td>" + (t.token || "N/A") + "</td><td class=\"" + (t.success ? "positive" : "zero-cost") + "\">" + (t.success ? "+$" + t.netProfit?.toFixed(2) : "$0 (failed)") + "</td></tr>";\n                }\n                document.getElementById("tradesTable").querySelector("tbody").innerHTML = tradesHtml;\n            }\n            \n            if (data.logs && data.logs.length > 0) {\n                let logsHtml = "";\n                for (let i = 0; i < Math.min(30, data.logs.length); i++) {\n                    const log = data.logs[i];\n                    let color = "#888";\n                    if (log.type === "error") color = "#ef4444";\n                    else if (log.type === "success") color = "#10b981";\n                    else if (log.type === "opportunity") color = "#f0b90b";\n                    else if (log.type === "flashloan") color = "#8b5cf6";\n                    logsHtml += "<div style=\"color: " + color + "; padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.05);\">" + log.message + "</div>";\n                }\n                document.getElementById("logsContainer").innerHTML = logsHtml;\n            }\n        } catch(e) { console.error(e); }\n    }\n    \n    async function resetSimulation() {\n        await fetch("/api/reset", { method: "POST" });\n        setTimeout(fetchState, 500);\n    }\n    \n    fetchState();\n    setInterval(fetchState, 2000);\n</script>\n</body>\n</html>';
+    const html = '<!DOCTYPE html>\n<html lang="en">\n<head>\n    <meta charset="UTF-8">\n    <meta name="viewport" content="width=device-width, initial-scale=1.0">\n    <title>Zero-Cost Flash Loan Bot</title>\n    <style>\n        * { margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }\n        body { background: linear-gradient(135deg, #0a0f1e 0%, #0d1525 100%); min-height: 100vh; padding: 20px; color: #e2e8f0; }\n        .container { max-width: 1400px; margin: 0 auto; }\n        .header { text-align: center; margin-bottom: 25px; }\n        h1 { font-size: 1.6rem; background: linear-gradient(135deg, #f0b90b, #ffd700); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }\n        .badge { display: inline-block; background: #10b981; padding: 2px 10px; border-radius: 20px; font-size: 0.65rem; margin-left: 8px; }\n        .zero-badge { background: #ef4444; }\n        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 15px; margin-bottom: 20px; }\n        .card { background: rgba(255,255,255,0.05); backdrop-filter: blur(10px); border-radius: 14px; padding: 15px; border: 1px solid rgba(255,255,255,0.08); }\n        .card-title { font-size: 0.75rem; font-weight: 600; margin-bottom: 12px; color: #f0b90b; text-transform: uppercase; letter-spacing: 1px; }\n        .stat-value { font-size: 1.6rem; font-weight: bold; }\n        .positive { color: #10b981; }\n        .profit { color: #f0b90b; }\n        .zero-cost { color: #10b981; font-weight: bold; }\n        .scrollable { max-height: 280px; overflow-y: auto; }\n        table { width: 100%; border-collapse: collapse; font-size: 0.65rem; }\n        th, td { padding: 6px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.08); }\n        button { background: linear-gradient(135deg, #f0b90b, #ffd700); border: none; padding: 6px 16px; border-radius: 6px; font-weight: bold; cursor: pointer; color: #0a0f1e; margin: 5px; }\n        .text-center { text-align: center; }\n        .mt-20 { margin-top: 20px; }\n        .text-small { font-size: 0.65rem; }\n    </style>\n</head>\n<body>\n<div class="container">\n    <div class="header">\n        <h1>Zero-Cost Flash Loan Bot <span class="badge">$0 CAPITAL</span><span class="badge zero-badge">$0 GAS FOR FAILURES</span></h1>\n        <p class="text-small">No upfront capital | Zero cost for unsuccessful trades | Only pay gas from profits</p>\n    </div>\n\n    <div class="grid">\n        <div class="card">\n            <div class="card-title">💰 PROFIT (Wallet)</div>\n            <div class="stat-value positive" id="balance">$0.00</div>\n            <div>Total Profit: <span id="totalProfit">$0.00</span></div>\n        </div>\n        <div class="card">\n            <div class="card-title">⚡ STATS</div>\n            <div>Attempts: <span id="totalAttempts">0</span> | ✅ <span id="successTxs">0</span> | ❌ <span id="failedTxs">0</span></div>\n            <div>Gas Paid: $<span id="gasPaid">0.00</span> (from profit only)</div>\n            <div>Success Rate: <span id="successRate">0</span>%</div>\n        </div>\n        <div class="card">\n            <div class="card-title">🎯 ZERO-COST GUARANTEE</div>\n            <div class="zero-cost">✅ Failed trades: $0.00</div>\n            <div class="zero-cost">✅ Flash loan capital: $0.00</div>\n            <div>Status: <span id="status" class="profit">🟢 RUNNING</span></div>\n        </div>\n    </div>\n\n    <div class="grid">\n        <div class="card">\n            <div class="card-title">🏆 OPPORTUNITIES</div>\n            <div class="scrollable"><table id="oppTable"><tbody><tr><td class="text-center">Scanning...<' + '/td></tr></tbody>' + '</table></div>\n        </div>\n        <div class="card">\n            <div class="card-title">📋 TRADE HISTORY</div>\n            <div class="scrollable"><table id="tradesTable"><tbody><tr><td class="text-center">No trades yet<' + '/td></tr></tbody>' + '</table></div>\n        </div>\n    </div>\n\n    <div class="card">\n        <div class="card-title">📝 LIVE LOGS</div>\n        <div class="scrollable" id="logsContainer" style="max-height: 200px; font-family: monospace; font-size: 0.6rem;">Initializing...<' + '/div>\n    </div>\n\n    <div class="text-center mt-20">\n        <button onclick="resetSimulation()">🔄 Reset</button>\n        <button onclick="location.reload()">⟳ Refresh</button>\n    </div>\n</div>\n\n<script>\n    async function fetchState() {\n        try {\n            const res = await fetch("/api/state");\n            const data = await res.json();\n            \n            document.getElementById("balance").innerHTML = "$" + (data.wallet.balanceUSD || 0).toFixed(2);\n            document.getElementById("totalProfit").innerHTML = "$" + (data.stats.totalProfitUSD || 0).toFixed(2);\n            document.getElementById("totalAttempts").innerHTML = data.stats.totalAttempts || 0;\n            document.getElementById("successTxs").innerHTML = data.stats.successfulTrades || 0;\n            document.getElementById("failedTxs").innerHTML = data.stats.failedTrades || 0;\n            document.getElementById("gasPaid").innerHTML = (data.stats.totalGasPaidFromProfit || 0).toFixed(4);\n            document.getElementById("successRate").innerHTML = data.stats.successRate || 0;\n            \n            if (data.opportunities && data.opportunities.length > 0) {\n                let oppHtml = "<tr><th>Token</th><th>Profit</th><th>Decay</th></tr>";\n                for (let i = 0; i < Math.min(8, data.opportunities.length); i++) {\n                    const o = data.opportunities[i];\n                    oppHtml += "<tr><td>" + o.token + "</td><td class=\"profit\">" + (o.priceDiffPercent || 0).toFixed(2) + "%</td><td>" + ((o.decayFactor || 1) * 100).toFixed(0) + "%</td></tr>";\n                }\n                document.getElementById("oppTable").querySelector("tbody").innerHTML = oppHtml;\n            }\n            \n            if (data.tradeHistory && data.tradeHistory.length > 0) {\n                let tradesHtml = "<tr><th>Time</th><th>Token</th><th>Result</th></tr>";\n                for (let i = 0; i < Math.min(15, data.tradeHistory.length); i++) {\n                    const t = data.tradeHistory[i];\n                    tradesHtml += "<tr><td>" + new Date(t.timestamp).toLocaleTimeString() + "</td><td>" + (t.token || "N/A") + "</td><td class=\"" + (t.success ? "positive" : "zero-cost") + "\">" + (t.success ? "+$" + (t.netProfit || 0).toFixed(2) : "$0 (failed)") + "</td></tr>";\n                }\n                document.getElementById("tradesTable").querySelector("tbody").innerHTML = tradesHtml;\n            }\n            \n            if (data.logs && data.logs.length > 0) {\n                let logsHtml = "";\n                for (let i = 0; i < Math.min(30, data.logs.length); i++) {\n                    const log = data.logs[i];\n                    let color = "#888";\n                    if (log.type === "error") color = "#ef4444";\n                    else if (log.type === "success") color = "#10b981";\n                    else if (log.type === "opportunity") color = "#f0b90b";\n                    else if (log.type === "flashloan") color = "#8b5cf6";\n                    logsHtml += "<div style=\"color: " + color + "; padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 0.6rem;\">" + log.message + "</div>";\n                }\n                document.getElementById("logsContainer").innerHTML = logsHtml;\n            }\n        } catch(e) { console.error(e); }\n    }\n    \n    async function resetSimulation() {\n        await fetch("/api/reset", { method: "POST" });\n        setTimeout(fetchState, 500);\n    }\n    \n    fetchState();\n    setInterval(fetchState, 2000);\n</script>\n</body>\n</html>';
     res.send(html);
 });
 
@@ -531,7 +524,6 @@ async function start() {
     console.log('\n💰 Starting Balance: $0.00');
     console.log('✅ Failed trades: $0.00 cost');
     console.log('✅ Flash loan capital: $0.00 required');
-    console.log('✅ Only pay gas from profit on successful trades');
     console.log('📊 Success rates: <0.3%:92% | <1%:85% | <2%:65% | >2%:35%');
     console.log('🌐 Dashboard: http://localhost:' + PORT + '\n');
     
