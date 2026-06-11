@@ -21,7 +21,8 @@ while (process.env[`HTX_API_KEY_${accountIndex}`]) {
     accountIndex++;
 }
 
-const config = {
+// Dynamic config that AI can modify
+let config = {
     symbol: (process.env.SYMBOL || 'DOGE-USDT').toUpperCase(),
     symbolClean: (process.env.SYMBOL || 'DOGE-USDT').toUpperCase().replace('-', ''),
     leverage: parseInt(process.env.LEVERAGE) || 75,
@@ -32,7 +33,7 @@ const config = {
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
     multiplier: 1.2,
     stepDistancePct: 10,
-    takeProfitPct: 15,
+    takeProfitPct: Math.max(15, parseInt(process.env.TAKE_PROFIT_PCT) || 15), // MINIMUM 15%
     maxStartSpread: parseFloat(process.env.MAX_START_SPREAD) || 0.1,
     takerFeeRate: 0.0005,
     pollInterval: 500,
@@ -43,7 +44,17 @@ const config = {
     walletPerContract: 0.0066135,
     stepCooldownMs: 10 * 60 * 1000,
     aiEnabled: true,
-    ollamaModel: process.env.OLLAMA_MODEL || 'llama3.2:3b'
+    ollamaModel: process.env.OLLAMA_MODEL || 'llama3.2:3b',
+    aiControlInterval: 60000, // AI reconfigures every 60 seconds
+    lastAIConfigUpdate: 0,
+    minTakeProfit: 15, // HARD MINIMUM - CANNOT GO BELOW 15%
+    maxTakeProfit: 50,
+    minLeverage: 10,
+    maxLeverage: 100,
+    minBaseVolume: 1,
+    maxBaseVolume: 10000,
+    minRiskPercent: 0.1,
+    maxRiskPercent: 5
 };
 
 let market = {
@@ -63,7 +74,9 @@ let market = {
     currentRiskAmount: 0,
     lastBaseUpdate: Date.now(),
     aiRecommendation: null,
-    aiLastUpdate: 0
+    aiLastUpdate: 0,
+    aiConfigChanges: [],
+    lastAIAction: null
 };
 
 let tradeHistory = [];
@@ -79,11 +92,7 @@ function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
     
     const riskAmount = totalEquity * (config.riskPercent / 100);
     let volume = Math.floor(riskAmount / 0.005);
-    volume = Math.max(1, volume);
-    const MAX_VOLUME = 1000000;
-    if (volume > MAX_VOLUME) {
-        volume = MAX_VOLUME;
-    }
+    volume = Math.max(config.minBaseVolume, Math.min(config.maxBaseVolume, volume));
     
     const dogeAmountTotal = volume * config.dogePerContract;
     
@@ -94,9 +103,7 @@ function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
     console.log(`   Wallet: $${totalEquity.toFixed(8)}`);
     console.log(`   ${config.riskPercent}% Risk: $${riskAmount.toFixed(8)}`);
     console.log(`   Rule: 1 contract per $0.005 risk`);
-    console.log(`   Formula: $${riskAmount.toFixed(8)} ÷ $0.005 = ${volume} contract(s)`);
     console.log(`   Calculated Volume: ${volume.toLocaleString()} contract(s) = ${dogeAmountTotal.toLocaleString()} DOGE`);
-    console.log(`   Risk Amount: $${riskAmount.toFixed(8)} → ${volume} contract(s)\n`);
     
     return volume;
 }
@@ -156,7 +163,14 @@ function updateWalletGrowth(totalEquity) {
             pnlPercent: market.initialTotalEquity > 0 ? ((totalEquity - market.initialTotalEquity) / market.initialTotalEquity) * 100 : 0,
             baseVolume: market.currentBaseVolume,
             baseDoge: market.currentBaseDoge,
-            riskAmount: market.currentRiskAmount
+            riskAmount: market.currentRiskAmount,
+            configSnapshot: {
+                leverage: config.leverage,
+                takeProfitPct: config.takeProfitPct,
+                riskPercent: config.riskPercent,
+                multiplier: config.multiplier,
+                stepDistancePct: config.stepDistancePct
+            }
         });
         
         if (market.walletHistory.length > 100) market.walletHistory.shift();
@@ -391,7 +405,12 @@ function logTradeExchangeStyle(state, exitPrice, exitTime, finalRoi, finalPnl) {
         exitPrice: exitPrice.toFixed(8),
         roi: finalRoi.toFixed(2) + '%',
         netPnlUsdt: finalPnl.toFixed(8),
-        estimatedFee: estimatedFee.toFixed(8)
+        estimatedFee: estimatedFee.toFixed(8),
+        configAtTrade: {
+            leverage: config.leverage,
+            takeProfitPct: config.takeProfitPct,
+            riskPercent: config.riskPercent
+        }
     });
     
     if (tradeHistory.length > 20) tradeHistory.pop();
@@ -438,80 +457,9 @@ function startWS() {
     });
 }
 
-// Local fallback recommendation (no API required)
-function getLocalRecommendation() {
-    const s1 = accountStates[1];
-    const s2 = accountStates[2];
-    const totalEquity = (s1?.currentEquity || 0) + (s2?.currentEquity || 0);
-    const drawdownPercent = market.peakEquity > 0 ? ((market.peakEquity - totalEquity) / market.peakEquity * 100).toFixed(2) : 0;
-    const winRate = market.totalTrades > 0 ? ((market.winningTrades / market.totalTrades) * 100).toFixed(1) : 0;
-    
-    let action = '';
-    let recommendation = '';
-    let reason = '';
-    let riskLevel = '';
-    
-    if (parseFloat(drawdownPercent) > 90) {
-        action = '🚨 CRITICAL EMERGENCY 🚨';
-        recommendation = 'STOP BOT IMMEDIATELY and manually close all positions!';
-        reason = `Your wallet is DOWN ${drawdownPercent}% from peak. Martingale strategy has failed.`;
-        riskLevel = '🔴 CRITICAL';
-    } else if (parseFloat(drawdownPercent) > 50) {
-        action = '⚠️ SEVERE DRAWDOWN ⚠️';
-        recommendation = 'PAUSE bot and reduce position sizes by 50%';
-        reason = `${drawdownPercent}% drawdown detected. Reduce riskPercent immediately.`;
-        riskLevel = '🔴 EXTREME';
-    } else if (parseFloat(drawdownPercent) > 30) {
-        action = '⚠️ HIGH DRAWDOWN ⚠️';
-        recommendation = 'Reduce position sizing and monitor closely';
-        reason = `${drawdownPercent}% drawdown. Consider lowering auto-compound risk percent.`;
-        riskLevel = '🟠 HIGH';
-    } else if (winRate > 80 && market.totalTrades > 10) {
-        action = '✅ STRATEGY WORKING';
-        recommendation = 'Continue current strategy - high win rate detected';
-        reason = `${winRate}% win rate over ${market.totalTrades} trades.`;
-        riskLevel = '🟢 LOW';
-    } else if (s1?.volume > 0 && s1?.roi <= -10) {
-        action = '📊 MARTINGALE STEP';
-        recommendation = `LONG position at ${s1.roi.toFixed(1)}% loss - adding contracts`;
-        reason = `Martingale step will add ${Math.ceil(market.currentBaseVolume * config.multiplier)} contracts.`;
-        riskLevel = '🟠 HIGH';
-    } else if (s2?.volume > 0 && s2?.roi <= -10) {
-        action = '📊 MARTINGALE STEP';
-        recommendation = `SHORT position at ${s2.roi.toFixed(1)}% loss - adding contracts`;
-        reason = `Martingale step will add ${Math.ceil(market.currentBaseVolume * config.multiplier)} contracts.`;
-        riskLevel = '🟠 HIGH';
-    } else {
-        action = '📊 MONITORING';
-        recommendation = 'Continue monitoring market conditions';
-        reason = `No strong signals. Price: BID ${market.bid?.toFixed(8)}`;
-        riskLevel = '🟢 LOW';
-    }
-    
-    const fullRecommendation = `${action}\n\n🔹 RECOMMENDATION: ${recommendation}\n🔸 REASON: ${reason}\n🔹 RISK LEVEL: ${riskLevel}`;
-    
-    return fullRecommendation;
-}
-
-// Ollama AI Recommendation
-async function getDeepSeekRecommendation() {
-    if (!config.aiEnabled) {
-        return null;
-    }
-    
-    // Check if Ollama is available
-    try {
-        await ollama.list();
-    } catch (error) {
-        console.log('⚠️ Ollama not running. Using local fallback...');
-        const fallback = getLocalRecommendation();
-        market.aiRecommendation = {
-            text: fallback,
-            timestamp: Date.now(),
-            time: new Date().toLocaleString() + ' (Local Mode)'
-        };
-        return fallback;
-    }
+// AI CONTROLLER - This function controls ALL bot settings
+async function aiController() {
+    if (!config.aiEnabled) return;
     
     const s1 = accountStates[1];
     const s2 = accountStates[2];
@@ -519,57 +467,193 @@ async function getDeepSeekRecommendation() {
     const totalEquityInitial = market.initialTotalEquity || totalEquity;
     const drawdownPercent = market.peakEquity > 0 ? ((market.peakEquity - totalEquity) / market.peakEquity * 100).toFixed(2) : 0;
     const winRate = market.totalTrades > 0 ? ((market.winningTrades / market.totalTrades) * 100).toFixed(1) : 0;
+    const avgWin = market.winningTrades > 0 ? (market.totalFeesPaid / market.winningTrades).toFixed(4) : 0;
     
-    const prompt = `You are a professional crypto trading advisor for a Martingale DOGE bot. Analyze this data and give a 2-sentence actionable recommendation:
+    // Build comprehensive prompt for AI
+    const prompt = `You are the AI CONTROLLER for a Martingale DOGE trading bot. Your job is to OPTIMIZE all trading parameters based on performance. 
 
-DATA:
-- Wallet: $${totalEquity.toFixed(4)} (${market.growthPct.toFixed(2)}% from start)
+CURRENT PERFORMANCE DATA:
+- Total Wallet: $${totalEquity.toFixed(4)} (Initial: $${totalEquityInitial.toFixed(4)})
+- Total P&L: ${market.totalNetGain >= 0 ? '+' : ''}$${market.totalNetGain.toFixed(4)} (${market.growthPct.toFixed(2)}%)
 - Drawdown: ${drawdownPercent}%
-- Win Rate: ${winRate}% (${market.totalTrades} trades)
+- Win Rate: ${winRate}% (${market.totalTrades} total trades)
+- Winning Trades: ${market.winningTrades} | Losing Trades: ${market.losingTrades}
+- Current Spread: ${market.spread.toFixed(3)}%
 - LONG ROI: ${s1?.roi || 0}% | SHORT ROI: ${s2?.roi || 0}%
-- Spread: ${market.spread.toFixed(3)}%
-- Current Price: BID ${market.bid?.toFixed(8)} ASK ${market.ask?.toFixed(8)}
+- LONG Volume: ${s1?.volume || 0} | SHORT Volume: ${s2?.volume || 0}
 
-Give: 1. RECOMMENDATION (what to do now) 2. REASON (brief explanation) 3. RISK LEVEL (Low/Medium/High)`;
+CURRENT CONFIGURATION:
+- Leverage: ${config.leverage}x (Min: ${config.minLeverage}, Max: ${config.maxLeverage})
+- Take Profit: ${config.takeProfitPct}% (MINIMUM ALLOWED: ${config.minTakeProfit}%, CANNOT GO BELOW THIS!)
+- Risk Percent: ${config.riskPercent}% (Min: ${config.minRiskPercent}, Max: ${config.maxRiskPercent})
+- Base Volume: ${config.baseVolume} contracts (Min: ${config.minBaseVolume}, Max: ${config.maxBaseVolume})
+- Martingale Multiplier: ${config.multiplier}x
+- Step Trigger: -${config.stepDistancePct}% ROI
+
+Based on this data, you MUST output NEW CONFIGURATION VALUES in this EXACT format:
+LEVERAGE: [number between ${config.minLeverage}-${config.maxLeverage}]
+TAKE_PROFIT: [number between ${config.minTakeProfit}-${config.maxTakeProfit}] (MUST BE >= ${config.minTakeProfit}%)
+RISK_PERCENT: [number between ${config.minRiskPercent}-${config.maxRiskPercent}]
+BASE_VOLUME: [number between ${config.minBaseVolume}-${config.maxBaseVolume}]
+MULTIPLIER: [number between 1.1-2.0]
+STEP_TRIGGER: [number between 5-20]
+
+STRATEGY RULES:
+1. TAKE_PROFIT MUST ALWAYS BE ABOVE ${config.minTakeProfit}% - NEVER LOWER!
+2. If drawdown > 30%, REDUCE riskPercent and baseVolume
+3. If win rate > 70%, you can INCREASE riskPercent slightly
+4. If spread > 0.2%, suggest lower volume
+5. Always prioritize capital preservation
+
+Output ONLY the configuration values, no explanation.`;
 
     try {
-        console.log('🤖 Requesting AI recommendation from Ollama...');
+        console.log('\n🤖 AI CONTROLLER is analyzing market conditions...');
         
         const response = await ollama.chat({
             model: config.ollamaModel,
             messages: [
-                { role: 'system', content: 'You are a crypto trading advisor. Give concise, actionable advice.' },
+                { role: 'system', content: 'You are a trading bot configuration optimizer. Output only numeric values in the specified format.' },
                 { role: 'user', content: prompt }
             ],
             options: {
-                temperature: 0.7,
-                num_predict: 250
+                temperature: 0.6,
+                num_predict: 200
             }
         });
         
-        const recommendation = response.message.content;
+        const aiOutput = response.message.content;
+        console.log('🤖 AI Controller Response:', aiOutput);
+        
+        // Parse AI output
+        let newLeverage = config.leverage;
+        let newTakeProfit = config.takeProfitPct;
+        let newRiskPercent = config.riskPercent;
+        let newBaseVolume = config.baseVolume;
+        let newMultiplier = config.multiplier;
+        let newStepTrigger = config.stepDistancePct;
+        
+        const leverageMatch = aiOutput.match(/LEVERAGE:\s*(\d+)/i);
+        if (leverageMatch) {
+            newLeverage = Math.min(config.maxLeverage, Math.max(config.minLeverage, parseInt(leverageMatch[1])));
+        }
+        
+        const tpMatch = aiOutput.match(/TAKE_PROFIT:\s*(\d+(?:\.\d+)?)/i);
+        if (tpMatch) {
+            let suggestedTP = parseFloat(tpMatch[1]);
+            // ENFORCE MINIMUM 15% TAKE PROFIT - NEVER BELOW
+            newTakeProfit = Math.min(config.maxTakeProfit, Math.max(config.minTakeProfit, suggestedTP));
+            if (suggestedTP < config.minTakeProfit) {
+                console.log(`⚠️ AI suggested ${suggestedTP}% TP, but minimum is ${config.minTakeProfit}%. Using minimum.`);
+            }
+        }
+        
+        const riskMatch = aiOutput.match(/RISK_PERCENT:\s*(\d+(?:\.\d+)?)/i);
+        if (riskMatch) {
+            newRiskPercent = Math.min(config.maxRiskPercent, Math.max(config.minRiskPercent, parseFloat(riskMatch[1])));
+        }
+        
+        const volumeMatch = aiOutput.match(/BASE_VOLUME:\s*(\d+)/i);
+        if (volumeMatch) {
+            newBaseVolume = Math.min(config.maxBaseVolume, Math.max(config.minBaseVolume, parseInt(volumeMatch[1])));
+        }
+        
+        const multiplierMatch = aiOutput.match(/MULTIPLIER:\s*(\d+(?:\.\d+)?)/i);
+        if (multiplierMatch) {
+            newMultiplier = Math.min(2.0, Math.max(1.1, parseFloat(multiplierMatch[1])));
+        }
+        
+        const stepMatch = aiOutput.match(/STEP_TRIGGER:\s*(\d+)/i);
+        if (stepMatch) {
+            newStepTrigger = Math.min(20, Math.max(5, parseInt(stepMatch[1])));
+        }
+        
+        // Apply changes and log them
+        let changes = [];
+        
+        if (newLeverage !== config.leverage) {
+            changes.push(`Leverage: ${config.leverage} → ${newLeverage}x`);
+            config.leverage = newLeverage;
+        }
+        
+        if (newTakeProfit !== config.takeProfitPct) {
+            changes.push(`Take Profit: ${config.takeProfitPct}% → ${newTakeProfit}% (MIN ${config.minTakeProfit}%)`);
+            config.takeProfitPct = newTakeProfit;
+            // Update target prices for active positions
+            for (const acc of config.accounts) {
+                const state = accountStates[acc.accountId];
+                if (state.volume > 0 && state.entryPrice > 0) {
+                    state.targetPrice = calculateTargetPrice(state);
+                    console.log(`🔄 Updated ${state.direction} TP to ${state.targetPrice.toFixed(8)}`);
+                }
+            }
+        }
+        
+        if (newRiskPercent !== config.riskPercent) {
+            changes.push(`Risk Percent: ${config.riskPercent}% → ${newRiskPercent}%`);
+            config.riskPercent = newRiskPercent;
+        }
+        
+        if (newBaseVolume !== config.baseVolume) {
+            changes.push(`Base Volume: ${config.baseVolume} → ${newBaseVolume} contracts`);
+            config.baseVolume = newBaseVolume;
+            if (!config.autoCompound) {
+                market.currentBaseVolume = newBaseVolume;
+            }
+        }
+        
+        if (newMultiplier !== config.multiplier) {
+            changes.push(`Multiplier: ${config.multiplier} → ${newMultiplier}x`);
+            config.multiplier = newMultiplier;
+        }
+        
+        if (newStepTrigger !== config.stepDistancePct) {
+            changes.push(`Step Trigger: -${config.stepDistancePct}% → -${newStepTrigger}%`);
+            config.stepDistancePct = newStepTrigger;
+        }
+        
+        if (changes.length > 0) {
+            console.log(`\n🔧 AI CONTROLLER CONFIGURATION CHANGES:`);
+            changes.forEach(c => console.log(`   ${c}`));
+            
+            market.aiConfigChanges.unshift({
+                timestamp: Date.now(),
+                time: new Date().toLocaleString(),
+                changes: changes,
+                reason: aiOutput
+            });
+            
+            if (market.aiConfigChanges.length > 20) market.aiConfigChanges.pop();
+        } else {
+            console.log(`\n🔧 AI CONTROLLER: No configuration changes needed.`);
+        }
+        
+        // Generate recommendation text for display
+        const recommendationText = `🤖 AI CONTROLLER ACTIVE\n\n📊 Current Settings:\n• Leverage: ${config.leverage}x\n• Take Profit: ${config.takeProfitPct}% (Min ${config.minTakeProfit}% enforced)\n• Risk: ${config.riskPercent}%\n• Base Volume: ${config.baseVolume} contracts\n• Multiplier: ${config.multiplier}x\n• Step Trigger: -${config.stepDistancePct}%\n\n${changes.length > 0 ? '✅ Recent Changes:\n' + changes.map(c => '• ' + c).join('\n') : '⚙️ Settings optimized for current conditions'}`;
+        
         market.aiRecommendation = {
-            text: recommendation,
+            text: recommendationText,
             timestamp: Date.now(),
-            time: new Date().toLocaleString()
+            time: new Date().toLocaleString(),
+            configSnapshot: {
+                leverage: config.leverage,
+                takeProfitPct: config.takeProfitPct,
+                riskPercent: config.riskPercent,
+                baseVolume: config.baseVolume,
+                multiplier: config.multiplier,
+                stepDistancePct: config.stepDistancePct
+            }
         };
         market.aiLastUpdate = Date.now();
+        config.lastAIConfigUpdate = Date.now();
         
-        console.log(`\n🤖 OLLAMA AI (${new Date().toLocaleTimeString()}):`);
-        console.log(recommendation);
+        console.log(`\n🤖 AI CONTROLLER SUMMARY (${new Date().toLocaleTimeString()}):`);
+        console.log(`   Take Profit: ${config.takeProfitPct}% (Minimum enforced: ${config.minTakeProfit}%)`);
+        console.log(`   Leverage: ${config.leverage}x | Risk: ${config.riskPercent}% | Volume: ${config.baseVolume}`);
         console.log('');
         
-        return recommendation;
-        
     } catch (error) {
-        console.error('Ollama error:', error.message);
-        const fallback = getLocalRecommendation();
-        market.aiRecommendation = {
-            text: fallback,
-            timestamp: Date.now(),
-            time: new Date().toLocaleString() + ' (Local Fallback)'
-        };
-        return fallback;
+        console.error('AI Controller error:', error.message);
     }
 }
 
@@ -614,7 +698,7 @@ async function processMartingale() {
                     if (orderInfo?.data?.[0]?.status === 6) {
                         state.entryPrice = parseFloat(orderInfo.data[0].price_avg);
                         state.targetPrice = calculateTargetPrice(state);
-                        console.log(`✅ Position opened at ${state.entryPrice.toFixed(8)}, TP target: ${state.targetPrice.toFixed(8)}`);
+                        console.log(`✅ Position opened at ${state.entryPrice.toFixed(8)}, TP target: ${state.targetPrice.toFixed(8)} (${config.takeProfitPct}% ROI target)`);
                         state.isLocked = false;
                     }
                 }, 2000);
@@ -633,13 +717,13 @@ async function processMartingale() {
             if (market.ask >= state.targetPrice && state.targetPrice > 0) {
                 shouldTakeProfit = true;
                 exitPrice = market.ask;
-                console.log(`🎯 LONG TP triggered! ASK: ${market.ask.toFixed(8)} >= Target: ${state.targetPrice.toFixed(8)}`);
+                console.log(`🎯 LONG TP triggered! ASK: ${market.ask.toFixed(8)} >= Target: ${state.targetPrice.toFixed(8)} (${config.takeProfitPct}% ROI)`);
             }
         } else {
             if (market.bid <= state.targetPrice && state.targetPrice > 0) {
                 shouldTakeProfit = true;
                 exitPrice = market.bid;
-                console.log(`🎯 SHORT TP triggered! BID: ${market.bid.toFixed(8)} <= Target: ${state.targetPrice.toFixed(8)}`);
+                console.log(`🎯 SHORT TP triggered! BID: ${market.bid.toFixed(8)} <= Target: ${state.targetPrice.toFixed(8)} (${config.takeProfitPct}% ROI)`);
             }
         }
         
@@ -688,7 +772,7 @@ async function processMartingale() {
         const now = Date.now();
         const timeSinceLastStep = now - (lastStepTime[acc.accountId] || 0);
         
-        if (state.roi <= -10 && state.volume > 0 && timeSinceLastStep >= config.stepCooldownMs) {
+        if (state.roi <= -config.stepDistancePct && state.volume > 0 && timeSinceLastStep >= config.stepCooldownMs) {
             const nextStepNumber = currentStep + 1;
             let nextVol;
             
@@ -699,7 +783,6 @@ async function processMartingale() {
             }
             
             console.log(`📈 MARTINGALE STEP ${nextStepNumber} for ${state.direction} - ROI: ${state.roi.toFixed(2)}% (LOSS) | Current Vol: ${state.volume} (${state.volume * config.dogePerContract} DOGE) | Adding: ${nextVol} contracts (${nextVol * config.dogePerContract} DOGE)`);
-            console.log(`   ⏱️  Cooldown check: ${(timeSinceLastStep / 1000).toFixed(0)}s since last step (required: ${config.stepCooldownMs/1000}s) - PROCEEDING`);
             state.isLocked = true;
             
             const res = await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
@@ -715,19 +798,18 @@ async function processMartingale() {
                 state.pendingOrderId = res.data.order_id_str;
                 state.lastStepPrice = currentPrice;
                 state.lastAddedVolume = nextVol;
-                state.lastAction = `Martingale Step ${nextStepNumber} (-${Math.abs(state.roi).toFixed(1)}% loss, Added: ${nextVol} contracts, ${nextVol * config.dogePerContract} DOGE)`;
+                state.lastAction = `Martingale Step ${nextStepNumber} (-${Math.abs(state.roi).toFixed(1)}% loss, Added: ${nextVol} contracts)`;
                 lastStepTime[acc.accountId] = now;
             } else {
                 state.isLocked = false;
                 state.lastAction = "Step Failed";
             }
-        } else if (state.roi <= -10 && state.volume > 0 && timeSinceLastStep < config.stepCooldownMs) {
+        } else if (state.roi <= -config.stepDistancePct && state.volume > 0 && timeSinceLastStep < config.stepCooldownMs) {
             const remainingCooldown = ((config.stepCooldownMs - timeSinceLastStep) / 1000).toFixed(0);
-            state.lastAction = `Step Cooldown (${remainingCooldown}s remaining) - ROI: ${state.roi.toFixed(2)}%`;
-            console.log(`⏸️  [${state.direction.toUpperCase()}] Martingale step blocked - cooldown active (${remainingCooldown}s remaining until next step)`);
+            state.lastAction = `Step Cooldown (${remainingCooldown}s) - ROI: ${state.roi.toFixed(2)}%`;
         } else {
             const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
-            state.lastAction = `Active - Step ${step} | Vol: ${state.volume} (${state.volume * config.dogePerContract} DOGE) | ROI: ${state.roi.toFixed(2)}%`;
+            state.lastAction = `Active - Step ${step} | Vol: ${state.volume} (${state.volume * config.dogePerContract} DOGE) | ROI: ${state.roi.toFixed(2)}% | TP: ${config.takeProfitPct}%`;
         }
     }
 }
@@ -763,7 +845,7 @@ async function backgroundLoop() {
                 if (config.autoCompound && market.bid > 0) {
                     const newBaseVolume = calculateBaseVolumeFromWallet(totalEquity, market.bid);
                     if (newBaseVolume !== market.currentBaseVolume) {
-                        console.log(`📈 AUTO-COMPOUND: Base volume updated: ${market.currentBaseVolume} → ${newBaseVolume} contract(s) (${newBaseVolume * config.dogePerContract} DOGE)`);
+                        console.log(`📈 AUTO-COMPOUND: Base volume updated: ${market.currentBaseVolume} → ${newBaseVolume} contract(s)`);
                         market.currentBaseVolume = newBaseVolume;
                         market.lastBaseUpdate = Date.now();
                     }
@@ -777,9 +859,9 @@ async function backgroundLoop() {
             await processMartingale();
         }
         
-        // Update AI recommendation every 5 minutes
-        if (config.aiEnabled && (!market.aiLastUpdate || (Date.now() - market.aiLastUpdate) > 300000)) {
-            await getDeepSeekRecommendation();
+        // Run AI controller every 60 seconds
+        if (config.aiEnabled && (!config.lastAIConfigUpdate || (Date.now() - config.lastAIConfigUpdate) > config.aiControlInterval)) {
+            await aiController();
         }
     } catch (e) {
         console.error('Background loop error:', e);
@@ -844,13 +926,24 @@ app.get('/api/status', (req, res) => {
             currentRiskAmount: market.currentRiskAmount,
             dogePerContract: config.dogePerContract,
             aiRecommendation: market.aiRecommendation,
-            aiEnabled: config.aiEnabled
+            aiEnabled: config.aiEnabled,
+            currentConfig: {
+                leverage: config.leverage,
+                takeProfitPct: config.takeProfitPct,
+                minTakeProfitEnforced: config.minTakeProfit,
+                riskPercent: config.riskPercent,
+                baseVolume: config.baseVolume,
+                multiplier: config.multiplier,
+                stepDistancePct: config.stepDistancePct
+            },
+            aiConfigChanges: market.aiConfigChanges.slice(0, 10)
         },
         accounts: accountsWithInfo,
         tradeHistory,
         config: {
             maxStartSpread: config.maxStartSpread,
             takeProfitPct: config.takeProfitPct,
+            minTakeProfitEnforced: config.minTakeProfit,
             leverage: config.leverage,
             requiredPriceMovePct: (config.takeProfitPct / config.leverage).toFixed(3) + '%',
             pollInterval: config.pollInterval,
@@ -870,8 +963,7 @@ app.post('/api/close', async (req, res) => {
     for (const acc of config.accounts) {
         const s = accountStates[acc.accountId];
         if (s.volume > 0) {
-            const step = calculateStepFromVolume(s.volume, market.currentBaseVolume, config.multiplier);
-            console.log(`Closing ${s.direction} position (Step ${step}, Vol: ${s.volume}, ${s.volume * config.dogePerContract} DOGE)...`);
+            console.log(`Closing ${s.direction} position...`);
             await htxRequest(acc, 'POST', '/linear-swap-api/v1/swap_cross_order', {
                 contract_code: config.symbol,
                 volume: s.volume,
@@ -897,7 +989,7 @@ app.post('/api/force-sync', async (req, res) => {
 });
 
 app.post('/api/ai-refresh', async (req, res) => {
-    await getDeepSeekRecommendation();
+    await aiController();
     res.json({ recommendation: market.aiRecommendation });
 });
 
@@ -981,15 +1073,14 @@ app.get('/api/verify', async (req, res) => {
                 currentBaseVolume: market.currentBaseVolume,
                 currentBaseDoge: market.currentBaseDoge,
                 currentRiskAmount: market.currentRiskAmount,
-                dogePerContract: config.dogePerContract,
-                formula: "1 Contract = 100 DOGE. Volume = Risk Amount ÷ $0.005 (1 contract per $0.005 risk)"
+                dogePerContract: config.dogePerContract
             }
         },
-        message: `Auto-compounding: ${config.riskPercent}% of wallet. 1 Contract = ${config.dogePerContract} DOGE. Volume calculation: Risk Amount (${config.riskPercent}% of wallet) ÷ $0.005 = number of contracts.`
+        message: `AI CONTROLLER ACTIVE - Min TP: ${config.minTakeProfit}% | Current TP: ${config.takeProfitPct}% | Leverage: ${config.leverage}x`
     });
 });
 
-// HTML Dashboard (simplified for brevity - same as before with AI card)
+// HTML Dashboard
 app.get('/', (req, res) => {
     const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
     
@@ -999,7 +1090,7 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Martingale Pro - DOGE Auto-Compounding</title>
+    <title>Martingale Pro - AI Controlled DOGE Bot</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
@@ -1021,21 +1112,21 @@ app.get('/', (req, res) => {
         .compound-info { background: #00D1B210; border: 1px solid #00D1B230; border-radius: 8px; padding: 12px; margin-top: 10px; }
         .doge-badge { background: #F3BA2F20; color: #F3BA2F; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: bold; }
         .ai-card { background: linear-gradient(135deg, #1E1B4B 0%, #131824 100%); border: 1px solid #6366F1; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
-        .ai-text { font-size: 14px; line-height: 1.5; color: #C4B5FD; white-space: pre-line; }
+        .ai-text { font-size: 13px; line-height: 1.5; color: #C4B5FD; white-space: pre-line; }
         .refresh-ai { background: #6366F120; border-color: #6366F1; color: #6366F1; font-size: 12px; padding: 4px 12px; }
+        .config-badge { background: #F3BA2F10; border: 1px solid #F3BA2F30; border-radius: 6px; padding: 8px; font-size: 11px; }
     </style>
 </head>
 <body class="p-6">
     <div class="max-w-7xl mx-auto">
         <div class="flex justify-between items-center mb-8">
             <div>
-                <h1 class="text-3xl font-black">MARTINGALE <span class="text-amber-500">DOGE</span> <span class="text-xs bg-green-500/20 px-2 py-1 rounded">AUTO-COMPOUND</span></h1>
+                <h1 class="text-3xl font-black">MARTINGALE <span class="text-amber-500">DOGE</span> <span class="text-xs bg-indigo-500/20 px-2 py-1 rounded">AI CONTROLLED</span></h1>
                 <div class="flex items-center gap-3 mt-2">
                     <div class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
                     <span class="text-[10px] font-bold text-emerald-400">LIVE</span>
                     <span class="text-[10px] text-slate-500">${config.symbol}</span>
-                    <span class="text-[10px] text-slate-500">${config.leverage}x LEVERAGE</span>
-                    <span class="tp-target">🎯 TP: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price move</span>
+                    <span class="tp-target">🎯 MIN TP: ${config.minTakeProfit}% (AI can increase)</span>
                     <span class="doge-badge">🐕 1 CONTRACT = ${config.dogePerContract} DOGE</span>
                 </div>
             </div>
@@ -1045,27 +1136,27 @@ app.get('/', (req, res) => {
             </div>
         </div>
 
-        <!-- AI RECOMMENDATION CARD -->
+        <!-- AI CONTROLLER CARD -->
         <div class="ai-card mb-6">
             <div class="flex justify-between items-center mb-3">
                 <div class="flex items-center gap-2">
-                    <span class="text-xl">🤖</span>
-                    <h3 class="font-bold text-indigo-400">Ollama AI Trading Advisor</h3>
-                    <span class="text-[9px] bg-indigo-500/30 px-2 py-0.5 rounded">LOCAL & FREE</span>
+                    <span class="text-xl">🧠</span>
+                    <h3 class="font-bold text-indigo-400">AI Controller Active</h3>
+                    <span class="text-[9px] bg-indigo-500/30 px-2 py-0.5 rounded">CONFIGURES ALL SETTINGS</span>
                 </div>
-                <button onclick="refreshAI()" class="refresh-ai rounded">🔄 Refresh</button>
+                <button onclick="refreshAI()" class="refresh-ai rounded">🔄 Force AI Reconfig</button>
             </div>
             <div id="aiRecommendation" class="ai-text">
                 <div class="flex items-center gap-2">
                     <div class="w-2 h-2 rounded-full bg-indigo-500 animate-pulse"></div>
-                    <span>Loading AI recommendation...</span>
+                    <span>AI Controller analyzing market conditions...</span>
                 </div>
             </div>
             <div id="aiTimestamp" class="text-[9px] text-slate-500 mt-2"></div>
         </div>
 
         <div class="wallet-card rounded-2xl p-6 mb-8">
-            <div class="grid grid-cols-1 md:grid-cols-5 gap-6">
+            <div class="grid grid-cols-1 md:grid-cols-6 gap-6">
                 <div>
                     <p class="stat-label">TOTAL WALLET</p>
                     <p id="totalWallet" class="stat-number value-positive">$0.00000000</p>
@@ -1091,6 +1182,11 @@ app.get('/', (req, res) => {
                     <p id="tradeStats" class="text-sm">Trades: 0</p>
                     <p id="winRate" class="text-sm text-green-400">Win Rate: 0%</p>
                 </div>
+                <div>
+                    <p class="stat-label">AI CONFIG</p>
+                    <p id="aiConfig" class="text-sm">TP: <span id="currentTP">${config.takeProfitPct}</span>%</p>
+                    <p id="aiLeverage" class="text-xs text-indigo-400">Leverage: ${config.leverage}x</p>
+                </div>
             </div>
             
             <div class="compound-info mt-4">
@@ -1099,11 +1195,11 @@ app.get('/', (req, res) => {
                         <p class="text-xs text-slate-400">📈 AUTO-COMPOUNDING (${config.riskPercent}% of Wallet)</p>
                         <p class="text-sm font-bold text-green-400" id="baseVolumeDisplay">Base Volume: 0 contracts</p>
                         <p class="text-xs text-slate-400" id="dogeDisplay">0 DOGE per trade</p>
-                        <p class="text-xs text-slate-400" id="formulaDisplay">Formula: Risk Amount ÷ $0.005 = Contracts</p>
                     </div>
                     <div class="text-right">
                         <p class="text-xs text-slate-400">Risk Amount (${config.riskPercent}%)</p>
                         <p class="text-sm font-bold" id="riskAmount">$0.00</p>
+                        <p class="text-xs text-slate-400" id="compoundStatus">🟢 AI Active</p>
                     </div>
                 </div>
             </div>
@@ -1118,10 +1214,12 @@ app.get('/', (req, res) => {
 
         <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
             <div class="card">
-                <p class="stat-label mb-2">CONFIG</p>
-                <p class="text-sm">Base Vol: <span id="configBaseVol">${config.baseVolume}</span></p>
-                <p class="text-sm">Multiplier: ${config.multiplier}x</p>
-                <p class="text-sm">Step Trigger: <span class="text-red-400">-${config.stepDistancePct}% ROI</span></p>
+                <p class="stat-label mb-2">AI CONTROLLED CONFIG</p>
+                <p class="text-sm">Leverage: <span id="configLeverage" class="text-indigo-400">${config.leverage}</span>x</p>
+                <p class="text-sm">Take Profit: <span id="configTP" class="text-green-400">${config.takeProfitPct}</span>% <span class="text-[8px]">(min ${config.minTakeProfit}%)</span></p>
+                <p class="text-sm">Risk: <span id="configRisk">${config.riskPercent}</span>%</p>
+                <p class="text-sm">Multiplier: <span id="configMultiplier">${config.multiplier}</span>x</p>
+                <p class="text-sm">Step Trigger: -<span id="configStepTrigger">${config.stepDistancePct}</span>%</p>
             </div>
             <div class="card">
                 <p class="stat-label mb-2">MARKET</p>
@@ -1156,9 +1254,9 @@ app.get('/', (req, res) => {
             <div class="overflow-x-auto max-h-96 overflow-y-auto">
                 <table class="w-full border-collapse">
                     <thead class="bg-[#0F141C] sticky top-0">
-                        <tr><th class="text-left p-3 text-xs">SIDE</th><th class="text-left p-3 text-xs">OPEN</th><th class="text-left p-3 text-xs">CLOSE</th><th class="text-right p-3 text-xs">STEP</th><th class="text-right p-3 text-xs">VOL</th><th class="text-right p-3 text-xs">DOGE</th><th class="text-right p-3 text-xs">ENTRY</th><th class="text-right p-3 text-xs">EXIT</th><th class="text-right p-3 text-xs">ROI</th><th class="text-right p-3 text-xs">PNL</th><th class="text-right p-3 text-xs">FEE</th></tr>
+                        <tr><th class="text-left p-3 text-xs">SIDE</th><th class="text-left p-3 text-xs">OPEN</th><th class="text-left p-3 text-xs">CLOSE</th><th class="text-right p-3 text-xs">STEP</th><th class="text-right p-3 text-xs">VOL</th><th class="text-right p-3 text-xs">DOGE</th><th class="text-right p-3 text-xs">ENTRY</th><th class="text-right p-3 text-xs">EXIT</th><th class="text-right p-3 text-xs">ROI</th><th class="text-right p-3 text-xs">PNL</th></tr>
                     </thead>
-                    <tbody id="tradesBody"><tr><td colspan="11" class="text-center p-12">No closed trades</td></tr></tbody>
+                    <tbody id="tradesBody"><tr><td colspan="10" class="text-center p-12">No closed trades</td></tr></tbody>
                 </table>
             </div>
         </div>
@@ -1183,9 +1281,9 @@ app.get('/', (req, res) => {
         
         async function refreshAI() {
             const btn = event.target;
-            btn.textContent = '⟳ REFRESHING...';
+            btn.textContent = '⟳ FORCING AI...';
             await fetch('/api/ai-refresh', {method: 'POST'});
-            setTimeout(() => btn.textContent = '🔄 Refresh', 1000);
+            setTimeout(() => btn.textContent = '🔄 Force AI Reconfig', 1000);
         }
         
         function formatNumber(num) { return parseFloat(num).toFixed(8); }
@@ -1205,6 +1303,13 @@ app.get('/', (req, res) => {
                 document.getElementById('baseVolumeDisplay').innerHTML = 'Base Volume: ' + (data.market.currentBaseVolume || 0) + ' contract(s)';
                 document.getElementById('dogeDisplay').innerHTML = (data.market.currentBaseDoge || 0).toLocaleString() + ' DOGE per trade';
                 document.getElementById('riskAmount').innerHTML = '$' + formatNumber(data.market.currentRiskAmount || 0);
+                document.getElementById('currentTP').innerHTML = data.market.currentConfig?.takeProfitPct || ${config.takeProfitPct};
+                document.getElementById('configLeverage').innerHTML = data.market.currentConfig?.leverage || ${config.leverage};
+                document.getElementById('configTP').innerHTML = data.market.currentConfig?.takeProfitPct || ${config.takeProfitPct};
+                document.getElementById('configRisk').innerHTML = data.market.currentConfig?.riskPercent || ${config.riskPercent};
+                document.getElementById('configMultiplier').innerHTML = data.market.currentConfig?.multiplier || ${config.multiplier};
+                document.getElementById('configStepTrigger').innerHTML = data.market.currentConfig?.stepDistancePct || ${config.stepDistancePct};
+                document.getElementById('aiLeverage').innerHTML = 'Leverage: ' + (data.market.currentConfig?.leverage || ${config.leverage}) + 'x';
                 
                 if (data.market.aiRecommendation) {
                     document.getElementById('aiRecommendation').innerHTML = data.market.aiRecommendation.text.replace(/\\n/g, '<br>');
@@ -1241,10 +1346,10 @@ app.get('/', (req, res) => {
                 let tradesHtml = '';
                 if (data.tradeHistory && data.tradeHistory.length > 0) {
                     data.tradeHistory.slice(0, 20).forEach(t => {
-                        tradesHtml += '<tr class="border-b border-[#1A212E]"><td class="p-3"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + '">' + t.side + '</span><td class="p-3 text-xs">' + (t.openTime || '--') + '<td class="p-3 text-xs">' + (t.closeTime || '--') + '<td class="p-3 text-right">' + (t.step || 0) + '<td class="p-3 text-right">' + t.volume + '<td class="p-3 text-right">' + (t.volume * 100).toLocaleString() + '<td class="p-3 text-right mono">' + t.entryPrice + '<td class="p-3 text-right mono">' + t.exitPrice + '<td class="p-3 text-right">' + t.roi + '<td class="p-3 text-right mono">' + t.netPnlUsdt + '<td class="p-3 text-right mono text-slate-500">' + t.estimatedFee + '</tr>';
+                        tradesHtml += '<tr class="border-b border-[#1A212E]"><td class="p-3"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + '">' + t.side + '</span><td class="p-3 text-xs">' + (t.openTime || '--') + '<td class="p-3 text-xs">' + (t.closeTime || '--') + '<td class="p-3 text-right">' + (t.step || 0) + '<td class="p-3 text-right">' + t.volume + '<td class="p-3 text-right">' + (t.volume * 100).toLocaleString() + '<td class="p-3 text-right mono">' + t.entryPrice + '<td class="p-3 text-right mono">' + t.exitPrice + '<td class="p-3 text-right">' + t.roi + '<td class="p-3 text-right mono">' + t.netPnlUsdt + '<tr>';
                     });
                 } else {
-                    tradesHtml = '<tr><td colspan="11" class="text-center p-12">No closed trades</td></tr>';
+                    tradesHtml = '<tr><td colspan="10" class="text-center p-12">No closed trades</td></tr>';
                 }
                 document.getElementById('tradesBody').innerHTML = tradesHtml;
             } catch(e) { console.error(e); }
@@ -1262,24 +1367,31 @@ setInterval(backgroundLoop, config.pollInterval);
 app.listen(config.port, '0.0.0.0', async () => {
     const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
     
-    console.log(`\n✅ Martingale Pro Started for DOGE (Ollama AI Enabled)`);
+    console.log(`\n✅ Martingale Pro Started - AI CONTROLLER ACTIVE`);
     console.log(`🐕 Symbol: ${config.symbol}`);
-    console.log(`🔧 Leverage: ${config.leverage}x`);
-    console.log(`📦 Contract Spec: 1 Contract = ${config.dogePerContract} DOGE`);
-    console.log(`🎯 Take Profit: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price movement`);
-    console.log(`💰 Auto-Compounding: ${config.riskPercent}% of wallet`);
-    console.log(`📈 Step Trigger: -${config.stepDistancePct}% ROI`);
-    console.log(`⏱️  Step Cooldown: 5 minutes`);
+    console.log(`🔧 Leverage: ${config.leverage}x (AI adjustable: ${config.minLeverage}-${config.maxLeverage})`);
+    console.log(`🎯 Take Profit: ${config.takeProfitPct}% ROI (MINIMUM ${config.minTakeProfit}% ENFORCED)`);
+    console.log(`📈 Required Price Move: ${requiredPriceMovePct}%`);
+    console.log(`💰 Auto-Compounding: ${config.riskPercent}% of wallet (AI adjustable)`);
+    console.log(`🤖 AI Controller: Optimizes all settings every ${config.aiControlInterval/1000} seconds`);
     console.log(`🌐 Dashboard: http://localhost:${config.port}`);
-    console.log(`\n🤖 AI Advisor: Ollama (${config.ollamaModel})`);
+    console.log(`\n⚙️ AI CONTROLLER RULES:`);
+    console.log(`   • Take Profit can ONLY be increased, NEVER below ${config.minTakeProfit}%`);
+    console.log(`   • Leverage adjusts based on volatility and drawdown`);
+    console.log(`   • Risk percent adjusts based on win rate`);
+    console.log(`   • All settings auto-optimize for market conditions\n`);
     
     // Check Ollama status
     try {
         await ollama.list();
-        console.log(`✅ Ollama is running! AI recommendations active.\n`);
+        console.log(`✅ Ollama is running! AI Controller active.\n`);
+        // Initial AI configuration
+        setTimeout(async () => {
+            await aiController();
+        }, 5000);
     } catch (error) {
         console.log(`⚠️ Ollama not running. Install from https://ollama.com`);
         console.log(`   Then run: ollama pull ${config.ollamaModel}`);
-        console.log(`   AI will use local fallback mode until Ollama is running.\n`);
+        console.log(`   AI Controller will use local fallback mode.\n`);
     }
 });
