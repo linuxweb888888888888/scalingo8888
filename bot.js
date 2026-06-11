@@ -1,429 +1,401 @@
 require('dotenv').config();
-const { ethers } = require('ethers');
-const axios = require('axios');
-const fs = require('fs');
+const express = require('express');
+const path = require('path');
 
-// ==================== CONFIGURATION ====================
-const CONFIG = {
-    // BNB Chain RPC (free public endpoints)
-    rpcUrl: 'https://bsc-dataseed.binance.org/',
-    wsUrl: 'wss://bsc-ws-node.nariox.org:443',
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// ==================== SIMULATED CONFIGURATION ====================
+const SIM_CONFIG = {
+    // Simulated starting balance (you can change this to $1, $2, $100, etc.)
+    startingBalance: parseFloat(process.env.SIM_BALANCE || 2.00), // Default $2.00
     
-    // PancakeSwap Contracts
-    pancakeswap: {
-        router: '0x10ED43C718714eb63d5aA57B78B54704E256024E',
-        factory: '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73',
-        name: 'PancakeSwap'
-    },
+    // Simulation settings
+    scanIntervalMs: 3000,           // Check for opportunities every 3 seconds
+    minProfitPercent: 0.3,          // Minimum 0.3% profit to consider a trade
+    gasFeeUSD: 0.48,                // Simulated average gas fee per trade
+    slippagePercent: 0.5,           // Simulated slippage
     
-    // Token Addresses on BSC
-    tokens: {
-        WBNB: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
-        BUSD: '0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56',
-        USDT: '0x55d398326f99059fF775485246999027B3197955',
-        CAKE: '0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82',
-        DOGE: '0xbA2aE424d960c26247Dd6c32edC70B295c744C43',
-        SHIB: '0x2859e4544C4bB03966803b044A93563Bd2D0DD4D'
-    },
-    
-    // Trading pairs to monitor (path: token0 -> token1 -> token0)
+    // Simulated market pairs (realistic BSC pairs)
     pairs: [
-        { name: 'BNB-BUSD-BNB', path: ['WBNB', 'BUSD', 'WBNB'], minProfit: 0.003 },
-        { name: 'BNB-USDT-BNB', path: ['WBNB', 'USDT', 'WBNB'], minProfit: 0.003 },
-        { name: 'CAKE-BNB-CAKE', path: ['CAKE', 'WBNB', 'CAKE'], minProfit: 0.005 },
-        { name: 'DOGE-BUSD-DOGE', path: ['DOGE', 'BUSD', 'DOGE'], minProfit: 5 },
-        { name: 'SHIB-BUSD-SHIB', path: ['SHIB', 'BUSD', 'SHIB'], minProfit: 100000 }
-    ],
-    
-    // Bot Settings
-    scanIntervalMs: 2000,      // Check every 2 seconds
-    gasPriceGwei: 3,           // Gas price for transactions
-    gasLimit: 500000,          // Gas limit
-    slippageTolerance: 0.5,    // 0.5% slippage
-    minProfitBNB: 0.002,       // Minimum profit in BNB to execute (about $0.60)
-    
-    // Flash Loan Settings (Aave on BSC)
-    aavePool: '0x6807dc923806fE8Fd134338EABCA509979a7e0cB',
-    
-    // File logging
-    logFile: 'arbitrage.log'
+        { name: 'BNB/BUSD', buyDex: 'PancakeSwap', sellDex: 'BiSwap', volatility: 0.02 },
+        { name: 'CAKE/BNB', buyDex: 'ApeSwap', sellDex: 'PancakeSwap', volatility: 0.03 },
+        { name: 'BUSD/USDT', buyDex: 'PancakeSwap', sellDex: 'Bakeryswap', volatility: 0.01 },
+        { name: 'DOGE/BUSD', buyDex: 'PancakeSwap', sellDex: 'BiSwap', volatility: 0.04 },
+        { name: 'SHIB/BUSD', buyDex: 'BiSwap', sellDex: 'PancakeSwap', volatility: 0.05 }
+    ]
 };
 
-// ==================== ABIs ====================
-const ROUTER_ABI = [
-    'function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory amounts)',
-    'function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)',
-    'function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable returns (uint[] memory amounts)',
-    'function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)'
-];
-
-const TOKEN_ABI = [
-    'function decimals() view returns (uint8)',
-    'function symbol() view returns (string)',
-    'function balanceOf(address) view returns (uint)',
-    'function approve(address spender, uint amount) returns (bool)'
-];
-
-// ==================== STATE ====================
-let provider;
-let wallet;
-let router;
-let isRunning = true;
-let opportunitiesFound = 0;
-let tradesExecuted = 0;
-let totalProfitBNB = 0;
-let lastScanTime = Date.now();
-
-// ==================== INITIALIZATION ====================
-async function init() {
-    console.log('\n' + '='.repeat(60));
-    console.log('🥞 PANCAKESWAP ARBITRAGE BOT');
-    console.log('='.repeat(60));
-    
-    // Check for private key
-    if (!process.env.PRIVATE_KEY) {
-        console.error('\n❌ ERROR: Missing PRIVATE_KEY in .env file!');
-        console.error('   Create a .env file with: PRIVATE_KEY=your_wallet_private_key\n');
-        process.exit(1);
-    }
-    
-    // Connect to BSC
-    provider = new ethers.providers.JsonRpcProvider(CONFIG.rpcUrl);
-    wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
-    router = new ethers.Contract(CONFIG.pancakeswap.router, ROUTER_ABI, wallet);
-    
-    const balance = await provider.getBalance(wallet.address);
-    const balanceBNB = ethers.utils.formatEther(balance);
-    
-    console.log(`\n✅ Bot Initialized`);
-    console.log(`📡 Network: BNB Smart Chain`);
-    console.log(`👛 Wallet: ${wallet.address}`);
-    console.log(`💰 Balance: ${balanceBNB} BNB ($${(parseFloat(balanceBNB) * 580).toFixed(2)})`);
-    console.log(`⏱️  Scan Interval: ${CONFIG.scanIntervalMs}ms`);
-    console.log(`🎯 Min Profit: ${CONFIG.minProfitBNB} BNB`);
-    console.log(`\n🔍 Scanning for arbitrage opportunities...\n`);
-    
-    // Log initial balance to file
-    logToFile(`Bot started | Balance: ${balanceBNB} BNB | Wallet: ${wallet.address}`);
-    
-    return true;
-}
+// ==================== SIMULATED STATE ====================
+let state = {
+    isRunning: true,
+    balance: SIM_CONFIG.startingBalance,
+    startingBalance: SIM_CONFIG.startingBalance,
+    totalTrades: 0,
+    successfulTrades: 0,
+    failedTrades: 0,
+    totalGasSpent: 0,
+    totalProfit: 0,
+    tradeHistory: [],
+    opportunitiesFound: 0,
+    currentOpportunity: null,
+    lastScanTime: Date.now(),
+    logs: []
+};
 
 // ==================== HELPER FUNCTIONS ====================
-function logToFile(message) {
+
+function addLog(message, type = 'info') {
     const timestamp = new Date().toISOString();
-    fs.appendFileSync(CONFIG.logFile, `${timestamp} - ${message}\n`);
+    const logEntry = { timestamp, message, type };
+    state.logs.unshift(logEntry);
+    // Keep only last 100 logs
+    if (state.logs.length > 100) state.logs.pop();
+    console.log(`[${timestamp}] ${message}`);
 }
 
-async function getTokenDecimals(tokenAddress) {
-    const token = new ethers.Contract(tokenAddress, TOKEN_ABI, provider);
-    try {
-        return await token.decimals();
-    } catch (e) {
-        return 18;
-    }
-}
-
-function formatAmount(amount, decimals) {
-    return ethers.utils.formatUnits(amount, decimals);
-}
-
-// ==================== CORE ARBITRAGE LOGIC ====================
-
-async function getPriceQuote(amountIn, pathAddresses) {
-    try {
-        const amounts = await router.getAmountsOut(amountIn, pathAddresses);
-        return amounts;
-    } catch (error) {
-        return null;
-    }
-}
-
-async function checkTriangleArbitrage(path, amountInBNB = 0.01) {
-    try {
-        // Convert path names to addresses
-        const pathAddresses = path.map(token => CONFIG.tokens[token]);
+// Simulate finding an arbitrage opportunity based on market volatility
+function findArbitrageOpportunity() {
+    // Random chance to find opportunity (10% per scan)
+    const chance = Math.random();
+    if (chance < 0.1) {
+        const pair = SIM_CONFIG.pairs[Math.floor(Math.random() * SIM_CONFIG.pairs.length)];
         
-        // Amount in (in wei)
-        const amountIn = ethers.utils.parseEther(amountInBNB.toString());
+        // Simulate profit percentage based on pair volatility
+        const baseProfit = (Math.random() * pair.volatility * 100);
+        const profitPercent = Math.max(0.1, Math.min(5, baseProfit));
         
-        // Get quote for the triangle
-        const quote = await getPriceQuote(amountIn, pathAddresses);
-        
-        if (!quote || quote.length < 3) return null;
-        
-        const amountOut = quote[quote.length - 1];
-        
-        // Calculate profit
-        const profit = amountOut.sub(amountIn);
-        const profitBNB = parseFloat(ethers.utils.formatEther(profit));
-        
-        // Calculate percentage gain
-        const percentGain = (profitBNB / amountInBNB) * 100;
+        // Calculate profit amount based on current balance
+        // The bot can only trade 50% of balance to manage risk
+        const tradeAmount = state.balance * 0.5;
+        const grossProfit = tradeAmount * (profitPercent / 100);
+        const netProfit = grossProfit - SIM_CONFIG.gasFeeUSD;
         
         return {
-            profit: profit,
-            profitBNB: profitBNB,
-            percentGain: percentGain,
-            amountIn: amountIn,
-            amountOut: amountOut,
-            path: path
+            found: true,
+            pair: pair.name,
+            buyDex: pair.buyDex,
+            sellDex: pair.sellDex,
+            profitPercent: profitPercent,
+            grossProfit: grossProfit,
+            netProfit: netProfit,
+            tradeAmount: tradeAmount,
+            timestamp: Date.now()
         };
-    } catch (error) {
-        return null;
     }
+    
+    return { found: false };
 }
 
-async function executeArbitrage(opportunity) {
-    const { path, amountIn, amountOut, profitBNB } = opportunity;
+// Execute a simulated trade
+async function executeTrade(opportunity) {
+    const { pair, buyDex, sellDex, profitPercent, grossProfit, netProfit, tradeAmount } = opportunity;
     
-    console.log(`\n🚀 EXECUTING ARBITRAGE!`);
-    console.log(`   Path: ${path.join(' → ')}`);
-    console.log(`   Expected Profit: ${profitBNB.toFixed(6)} BNB ($${(profitBNB * 580).toFixed(2)})`);
+    addLog(`🚀 EXECUTING TRADE: ${pair}`, 'trade');
+    addLog(`   Buy on ${buyDex} → Sell on ${sellDex}`, 'info');
+    addLog(`   Trade Amount: $${tradeAmount.toFixed(2)}`, 'info');
+    addLog(`   Expected Profit: ${profitPercent.toFixed(2)}% ($${grossProfit.toFixed(4)})`, 'info');
+    addLog(`   Gas Fee: $${SIM_CONFIG.gasFeeUSD.toFixed(2)}`, 'info');
+    addLog(`   Net Profit: $${netProfit.toFixed(4)}`, 'info');
     
-    const pathAddresses = path.map(token => CONFIG.tokens[token]);
-    const amountOutMin = amountOut.mul(100 - CONFIG.slippageTolerance).div(100);
-    const deadline = Math.floor(Date.now() / 1000) + 120;
+    state.totalGasSpent += SIM_CONFIG.gasFeeUSD;
     
-    try {
-        // Estimate gas
-        const gasPrice = ethers.utils.parseUnits(CONFIG.gasPriceGwei.toString(), 'gwei');
+    // Simulate success/failure (90% success rate for simulation)
+    const success = Math.random() < 0.9;
+    
+    if (success && netProfit > 0) {
+        // Successful trade
+        state.balance += netProfit;
+        state.totalProfit += netProfit;
+        state.successfulTrades++;
+        addLog(`✅ TRADE SUCCESSFUL! New Balance: $${state.balance.toFixed(4)}`, 'success');
         
-        // Execute the swap
-        const tx = await router.swapExactTokensForTokens(
-            amountIn,
-            amountOutMin,
-            pathAddresses,
-            wallet.address,
-            deadline,
-            { gasPrice: gasPrice, gasLimit: CONFIG.gasLimit }
-        );
+        state.tradeHistory.unshift({
+            timestamp: new Date().toISOString(),
+            pair: pair,
+            type: 'BUY/SELL',
+            amount: tradeAmount,
+            profit: netProfit,
+            success: true
+        });
+    } else {
+        // Failed trade (still pay gas)
+        state.failedTrades++;
+        addLog(`❌ TRADE FAILED! Lost gas fee: $${SIM_CONFIG.gasFeeUSD.toFixed(2)}`, 'error');
         
-        console.log(`   📝 Transaction sent: ${tx.hash}`);
-        
-        // Wait for confirmation
-        const receipt = await tx.wait();
-        
-        if (receipt.status === 1) {
-            tradesExecuted++;
-            totalProfitBNB += profitBNB;
-            
-            console.log(`   ✅ SUCCESS! Transaction confirmed in block ${receipt.blockNumber}`);
-            console.log(`   💰 Profit: ${profitBNB.toFixed(6)} BNB`);
-            
-            logToFile(`TRADE EXECUTED | Path: ${path.join('-')} | Profit: ${profitBNB.toFixed(6)} BNB | Tx: ${tx.hash}`);
-            
-            return true;
-        } else {
-            console.log(`   ❌ Transaction failed`);
-            logToFile(`TRADE FAILED | Path: ${path.join('-')} | Tx: ${tx.hash}`);
-            return false;
-        }
-    } catch (error) {
-        console.log(`   ❌ Error: ${error.message.slice(0, 100)}`);
-        return false;
+        state.tradeHistory.unshift({
+            timestamp: new Date().toISOString(),
+            pair: pair,
+            type: 'FAILED',
+            amount: tradeAmount,
+            loss: SIM_CONFIG.gasFeeUSD,
+            success: false
+        });
     }
+    
+    state.totalTrades++;
+    
+    // Keep only last 50 trades in history
+    if (state.tradeHistory.length > 50) state.tradeHistory.pop();
 }
 
-async function checkAndExecuteFlashLoanArbitrage() {
-    // Flash loan requires a smart contract deployment
-    // This is a simplified check for triangle arbitrage without flash loans
-    
-    for (const pair of CONFIG.pairs) {
+// ==================== MAIN SIMULATION LOOP ====================
+async function simulationLoop() {
+    while (state.isRunning) {
         try {
-            // Check arbitrage with small amount first (0.01 BNB)
-            const opportunity = await checkTriangleArbitrage(pair.path, 0.01);
+            state.lastScanTime = Date.now();
             
-            if (opportunity && opportunity.profitBNB > pair.minProfit) {
-                opportunitiesFound++;
+            // Find opportunity
+            const opportunity = findArbitrageOpportunity();
+            
+            if (opportunity.found) {
+                state.opportunitiesFound++;
+                addLog(`📈 OPPORTUNITY #${state.opportunitiesFound}: ${opportunity.pair} (${opportunity.profitPercent.toFixed(2)}% profit potential)`, 'opportunity');
                 
-                console.log(`\n📈 OPPORTUNITY FOUND!`);
-                console.log(`   Pair: ${pair.name}`);
-                console.log(`   Profit: ${opportunity.profitBNB.toFixed(6)} BNB (${opportunity.percentGain.toFixed(3)}%)`);
-                
-                // Scale up to use available balance
-                const balance = await provider.getBalance(wallet.address);
-                const maxAmount = balance.div(2); // Use 50% of balance max
-                const maxAmountBNB = parseFloat(ethers.utils.formatEther(maxAmount));
-                
-                if (maxAmountBNB > 0.05) { // Minimum 0.05 BNB to trade
-                    const scaledOpportunity = await checkTriangleArbitrage(pair.path, Math.min(0.5, maxAmountBNB));
-                    
-                    if (scaledOpportunity && scaledOpportunity.profitBNB > CONFIG.minProfitBNB) {
-                        await executeArbitrage(scaledOpportunity);
-                    }
+                // Check if profitable after gas
+                if (opportunity.netProfit > 0 && state.balance >= (opportunity.tradeAmount + SIM_CONFIG.gasFeeUSD)) {
+                    await executeTrade(opportunity);
+                } else if (opportunity.netProfit <= 0) {
+                    addLog(`   ⏭️ Skipping: Net profit too low ($${opportunity.netProfit.toFixed(4)})`, 'warning');
+                } else {
+                    addLog(`   ⏭️ Skipping: Insufficient balance (Need $${(opportunity.tradeAmount + SIM_CONFIG.gasFeeUSD).toFixed(2)})`, 'warning');
                 }
             }
+            
+            // Stop simulation if balance is too low
+            if (state.balance < 0.10) {
+                addLog(`🛑 Simulation stopped: Balance below $0.10`, 'error');
+                state.isRunning = false;
+                break;
+            }
+            
+            // Wait before next scan
+            await new Promise(resolve => setTimeout(resolve, SIM_CONFIG.scanIntervalMs));
+            
         } catch (error) {
-            // Silent fail for individual pair checks
+            addLog(`Error in simulation loop: ${error.message}`, 'error');
+            await new Promise(resolve => setTimeout(resolve, 5000));
         }
     }
 }
 
-// ==================== MULTI-DEX ARBITRAGE ====================
+// ==================== EXPRESS DASHBOARD ====================
 
-async function checkCrossDEXArbitrage() {
-    // Compare prices between PancakeSwap and other DEXes
-    const amountIn = ethers.utils.parseEther('0.1'); // 0.1 BNB test amount
+// API endpoint to get current state
+app.get('/api/state', (req, res) => {
+    const profitLoss = state.balance - state.startingBalance;
+    const profitPercent = (profitLoss / state.startingBalance) * 100;
     
-    const dexes = [
-        { name: 'PancakeSwap', router: CONFIG.pancakeswap.router },
-        { name: 'BiSwap', router: '0x3a6d8cA21D1CF76F653A67577FA0D27453350dD8' },
-        { name: 'ApeSwap', router: '0xcF0feBd3f17CEf5b47b0cD257aCf6025c5BFf3b7' }
-    ];
-    
-    const tokenPairs = [
-        { base: 'WBNB', quote: 'BUSD', baseAddress: CONFIG.tokens.WBNB, quoteAddress: CONFIG.tokens.BUSD },
-        { base: 'WBNB', quote: 'USDT', baseAddress: CONFIG.tokens.WBNB, quoteAddress: CONFIG.tokens.USDT },
-        { base: 'CAKE', quote: 'WBNB', baseAddress: CONFIG.tokens.CAKE, quoteAddress: CONFIG.tokens.WBNB }
-    ];
-    
-    for (const pair of tokenPairs) {
-        const prices = {};
-        
-        for (const dex of dexes) {
-            try {
-                const tempRouter = new ethers.Contract(dex.router, ROUTER_ABI, provider);
-                const amounts = await tempRouter.getAmountsOut(amountIn, [pair.baseAddress, pair.quoteAddress]);
-                prices[dex.name] = amounts[1];
-            } catch (e) {}
+    res.json({
+        isRunning: state.isRunning,
+        balance: state.balance,
+        startingBalance: state.startingBalance,
+        profitLoss: profitLoss,
+        profitPercent: profitPercent,
+        totalTrades: state.totalTrades,
+        successfulTrades: state.successfulTrades,
+        failedTrades: state.failedTrades,
+        totalGasSpent: state.totalGasSpent,
+        totalProfit: state.totalProfit,
+        opportunitiesFound: state.opportunitiesFound,
+        tradeHistory: state.tradeHistory.slice(0, 20),
+        logs: state.logs.slice(0, 30),
+        config: {
+            startingBalance: SIM_CONFIG.startingBalance,
+            gasFeeUSD: SIM_CONFIG.gasFeeUSD,
+            scanIntervalMs: SIM_CONFIG.scanIntervalMs,
+            minProfitPercent: SIM_CONFIG.minProfitPercent
         }
-        
-        // Find price differences
-        const dexNames = Object.keys(prices);
-        for (let i = 0; i < dexNames.length; i++) {
-            for (let j = i + 1; j < dexNames.length; j++) {
-                const priceDiff = Math.abs(prices[dexNames[i]].sub(prices[dexNames[j]]).toNumber());
-                const diffPercent = (priceDiff / prices[dexNames[i]].toNumber()) * 100;
-                
-                if (diffPercent > 0.5) { // 0.5% price difference
-                    console.log(`\n📊 Cross-DEX Opportunity: ${pair.base}/${pair.quote}`);
-                    console.log(`   ${dexNames[i]}: ${ethers.utils.formatEther(prices[dexNames[i]])}`);
-                    console.log(`   ${dexNames[j]}: ${ethers.utils.formatEther(prices[dexNames[j]])}`);
-                    console.log(`   Difference: ${diffPercent.toFixed(2)}%`);
-                }
-            }
-        }
-    }
-}
-
-// ==================== REAL-TIME MEMPOOL MONITORING ====================
-
-async function monitorMempool() {
-    console.log(`\n👁️  Monitoring mempool for large swaps...`);
-    
-    // Connect via WebSocket for real-time events
-    const wsProvider = new ethers.providers.WebSocketProvider(CONFIG.wsUrl);
-    
-    wsProvider.on('pending', async (txHash) => {
-        try {
-            const tx = await wsProvider.getTransaction(txHash);
-            if (tx && tx.to === CONFIG.pancakeswap.router) {
-                // Large swap detected, check for front-running opportunity
-                const value = parseFloat(ethers.utils.formatEther(tx.value || 0));
-                if (value > 1.0) { // Swap over 1 BNB
-                    console.log(`\n🔍 Large swap detected: ${txHash.slice(0, 10)}... (${value.toFixed(2)} BNB)`);
-                    
-                    // Check if we can front-run
-                    // This would require a faster RPC and custom implementation
-                }
-            }
-        } catch (e) {}
     });
-    
-    return wsProvider;
-}
-
-// ==================== REPORTING ====================
-
-function printStatus() {
-    const runtime = Math.floor((Date.now() - lastScanTime) / 1000);
-    const hours = Math.floor(runtime / 3600);
-    const minutes = Math.floor((runtime % 3600) / 60);
-    const seconds = runtime % 60;
-    
-    console.log(`\n${'─'.repeat(60)}`);
-    console.log(`📊 BOT STATUS - ${new Date().toLocaleTimeString()}`);
-    console.log(`${'─'.repeat(60)}`);
-    console.log(`⏱️  Runtime: ${hours}h ${minutes}m ${seconds}s`);
-    console.log(`🔍 Opportunities Found: ${opportunitiesFound}`);
-    console.log(`✅ Trades Executed: ${tradesExecuted}`);
-    console.log(`💰 Total Profit: ${totalProfitBNB.toFixed(6)} BNB ($${(totalProfitBNB * 580).toFixed(2)})`);
-    console.log(`${'─'.repeat(60)}`);
-}
-
-// ==================== MAIN LOOP ====================
-
-async function mainLoop() {
-    let scanCount = 0;
-    let wsProvider = null;
-    
-    try {
-        wsProvider = await monitorMempool();
-    } catch (e) {
-        console.log(`⚠️ WebSocket not available, using polling only`);
-    }
-    
-    while (isRunning) {
-        try {
-            scanCount++;
-            
-            // Check triangle arbitrage every scan
-            await checkAndExecuteFlashLoanArbitrage();
-            
-            // Check cross-DEX arbitrage every 5 scans
-            if (scanCount % 5 === 0) {
-                await checkCrossDEXArbitrage();
-            }
-            
-            // Print status every 30 scans (~1 minute)
-            if (scanCount % 30 === 0) {
-                printStatus();
-            }
-            
-        } catch (error) {
-            console.error(`Loop error: ${error.message}`);
-        }
-        
-        await new Promise(resolve => setTimeout(resolve, CONFIG.scanIntervalMs));
-    }
-    
-    if (wsProvider) {
-        wsProvider.destroy();
-    }
-}
-
-// ==================== GRACEFUL SHUTDOWN ====================
-
-process.on('SIGINT', async () => {
-    console.log(`\n\n🛑 Shutting down bot...`);
-    console.log(`📊 Final Stats:`);
-    console.log(`   Opportunities Found: ${opportunitiesFound}`);
-    console.log(`   Trades Executed: ${tradesExecuted}`);
-    console.log(`   Total Profit: ${totalProfitBNB.toFixed(6)} BNB`);
-    
-    logToFile(`Bot shutdown | Profit: ${totalProfitBNB.toFixed(6)} BNB | Trades: ${tradesExecuted}`);
-    
-    isRunning = false;
-    process.exit(0);
 });
 
-// ==================== START BOT ====================
+// API endpoint to reset simulation
+app.post('/api/reset', (req, res) => {
+    // Reset all state
+    state = {
+        isRunning: true,
+        balance: SIM_CONFIG.startingBalance,
+        startingBalance: SIM_CONFIG.startingBalance,
+        totalTrades: 0,
+        successfulTrades: 0,
+        failedTrades: 0,
+        totalGasSpent: 0,
+        totalProfit: 0,
+        tradeHistory: [],
+        opportunitiesFound: 0,
+        currentOpportunity: null,
+        lastScanTime: Date.now(),
+        logs: []
+    };
+    addLog(`🔄 Simulation reset. Starting balance: $${SIM_CONFIG.startingBalance}`, 'info');
+    res.json({ status: 'reset', balance: SIM_CONFIG.startingBalance });
+});
 
-async function start() {
-    await init();
+// Serve the HTML dashboard
+app.get('/', (req, res) => {
+    res.send(`
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>🥞 PancakeSwap Arbitrage Simulator</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+            body { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); min-height: 100vh; padding: 20px; color: #e2e8f0; }
+            .container { max-width: 1400px; margin: 0 auto; }
+            .header { text-align: center; margin-bottom: 30px; }
+            h1 { font-size: 2.5rem; background: linear-gradient(135deg, #f0b90b, #ffd700); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+            .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; margin-bottom: 20px; }
+            .card { background: rgba(255,255,255,0.1); backdrop-filter: blur(10px); border-radius: 20px; padding: 20px; border: 1px solid rgba(255,255,255,0.2); }
+            .card-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 15px; color: #f0b90b; }
+            .stat-value { font-size: 2rem; font-weight: bold; margin: 10px 0; }
+            .positive { color: #10b981; }
+            .negative { color: #ef4444; }
+            .neutral { color: #f0b90b; }
+            table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+            th, td { padding: 10px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1); }
+            .log-entry { font-family: monospace; font-size: 0.75rem; padding: 5px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
+            button { background: #f0b90b; border: none; padding: 10px 20px; border-radius: 10px; font-weight: bold; cursor: pointer; margin: 5px; }
+            button:hover { background: #ffd700; }
+            @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
+            .running { animation: pulse 2s infinite; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🥞 PancakeSwap Arbitrage Simulator</h1>
+                <p>Realistic simulation with fake money | No crypto or wallet needed</p>
+            </div>
     
-    // Check wallet balance
-    const balance = await provider.getBalance(wallet.address);
-    const balanceBNB = parseFloat(ethers.utils.formatEther(balance));
+            <div class="grid">
+                <div class="card">
+                    <div class="card-title">💰 BALANCE</div>
+                    <div class="stat-value" id="balance">$0.00</div>
+                    <div>P&L: <span id="pnl" class="positive">$0.00</span> (<span id="pnlPercent">0.00%</span>)</div>
+                </div>
+                <div class="card">
+                    <div class="card-title">📊 TRADES</div>
+                    <div>Total: <span id="totalTrades">0</span></div>
+                    <div>Successful: <span id="successTrades">0</span> | Failed: <span id="failedTrades">0</span></div>
+                    <div>Opportunities Found: <span id="opportunities">0</span></div>
+                </div>
+                <div class="card">
+                    <div class="card-title">⛽ GAS & FEES</div>
+                    <div>Total Gas Spent: $<span id="gasSpent">0.00</span></div>
+                    <div>Gas per Trade: $<span id="gasFee">0.48</span> (simulated)</div>
+                    <div>Status: <span id="status" class="running">🟢 RUNNING</span></div>
+                </div>
+            </div>
     
-    if (balanceBNB < 0.05) {
-        console.log(`\n⚠️  WARNING: Low balance (${balanceBNB.toFixed(4)} BNB)`);
-        console.log(`   Minimum recommended: 0.1 BNB for gas fees\n`);
-    }
+            <div class="grid">
+                <div class="card">
+                    <div class="card-title">📈 RECENT TRADES</div>
+                    <div style="max-height: 300px; overflow-y: auto;">
+                        <table>
+                            <thead><tr><th>Time</th><th>Pair</th><th>Profit/Loss</th></tr></thead>
+                            <tbody id="tradesTable"></tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">📋 LIVE LOGS</div>
+                    <div style="max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 0.7rem;" id="logsContainer"></div>
+                </div>
+            </div>
     
-    // Start the main loop
-    await mainLoop();
-}
+            <div style="text-align: center; margin-top: 20px;">
+                <button onclick="resetSimulation()">🔄 Reset Simulation</button>
+                <button onclick="location.reload()">⟳ Refresh</button>
+            </div>
+    
+            <div style="text-align: center; margin-top: 20px; font-size: 0.7rem; opacity: 0.7;">
+                <p>⚠️ This is a SIMULATION. No real money is used, no blockchain transactions occur.</p>
+                <p>The bot simulates finding arbitrage opportunities and executing trades with realistic gas fees.</p>
+            </div>
+        </div>
+    
+        <script>
+            async function fetchState() {
+                try {
+                    const res = await fetch('/api/state');
+                    const data = await res.json();
+                    
+                    document.getElementById('balance').innerHTML = '$' + data.balance.toFixed(4);
+                    const pnl = data.profitLoss;
+                    const pnlPercent = data.profitPercent;
+                    document.getElementById('pnl').innerHTML = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(4);
+                    document.getElementById('pnlPercent').innerHTML = (pnlPercent >= 0 ? '+' : '') + pnlPercent.toFixed(2) + '%';
+                    document.getElementById('pnl').className = pnl >= 0 ? 'positive' : 'negative';
+                    document.getElementById('totalTrades').innerHTML = data.totalTrades;
+                    document.getElementById('successTrades').innerHTML = data.successfulTrades;
+                    document.getElementById('failedTrades').innerHTML = data.failedTrades;
+                    document.getElementById('opportunities').innerHTML = data.opportunitiesFound;
+                    document.getElementById('gasSpent').innerHTML = data.totalGasSpent.toFixed(4);
+                    document.getElementById('status').innerHTML = data.isRunning ? '🟢 RUNNING' : '🔴 STOPPED';
+                    document.getElementById('gasFee').innerHTML = data.config.gasFeeUSD;
+                    
+                    // Update trades table
+                    const tradesBody = document.getElementById('tradesTable');
+                    if (data.tradeHistory && data.tradeHistory.length > 0) {
+                        tradesBody.innerHTML = data.tradeHistory.map(t => {
+                            const profit = t.profit || (t.loss ? -t.loss : 0);
+                            return `<tr>
+                                <td>${new Date(t.timestamp).toLocaleTimeString()}</td>
+                                <td>${t.pair || 'N/A'}</td>
+                                <td class="${profit >= 0 ? 'positive' : 'negative'}">${profit >= 0 ? '+' : ''}$${Math.abs(profit).toFixed(6)}</td>
+                            </tr>`;
+                        }).join('');
+                    } else {
+                        tradesBody.innerHTML = '<tr><td colspan="3" style="text-align: center;">No trades yet</td></tr>';
+                    }
+                    
+                    // Update logs
+                    const logsContainer = document.getElementById('logsContainer');
+                    if (data.logs && data.logs.length > 0) {
+                        logsContainer.innerHTML = data.logs.map(log => 
+                            `<div class="log-entry" style="color: ${log.type === 'error' ? '#ef4444' : (log.type === 'success' ? '#10b981' : (log.type === 'opportunity' ? '#f0b90b' : '#888'))}">
+                                [${new Date(log.timestamp).toLocaleTimeString()}] ${log.message}
+                            </div>`
+                        ).join('');
+                    } else {
+                        logsContainer.innerHTML = '<div>Waiting for simulation to start...</div>';
+                    }
+                } catch(e) {
+                    console.error(e);
+                }
+            }
+            
+            async function resetSimulation() {
+                await fetch('/api/reset', { method: 'POST' });
+                setTimeout(fetchState, 500);
+            }
+            
+            fetchState();
+            setInterval(fetchState, 1000);
+        </script>
+    </body>
+    </html>
+    `);
+});
 
-start().catch(console.error);
+// ==================== START THE BOT ====================
+// Start the simulation loop
+console.log('\n' + '='.repeat(60));
+console.log('🥞 PANCAKESWAP ARBITRAGE SIMULATOR');
+console.log('='.repeat(60));
+console.log(`\n✅ Simulator Started`);
+console.log(`💰 Starting Balance: $${SIM_CONFIG.startingBalance}`);
+console.log(`⛽ Simulated Gas Fee per Trade: $${SIM_CONFIG.gasFeeUSD}`);
+console.log(`⏱️  Scan Interval: ${SIM_CONFIG.scanIntervalMs}ms`);
+console.log(`🌐 Dashboard: http://localhost:${PORT}`);
+console.log(`\n⚠️  This is a SIMULATION - No real money or blockchain transactions\n`);
+
+// Start the simulation loop
+simulationLoop().catch(console.error);
+
+// Start the web server
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Web dashboard running on port ${PORT}`);
+});
