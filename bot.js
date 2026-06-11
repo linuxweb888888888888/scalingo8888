@@ -12,7 +12,7 @@ const io = socketIo(server, {
 
 // Configuration
 const config = {
-    symbol: 'shibusdt',
+    symbol: 'dogeusdt',
     interval: '1min',
     limit: 200,
     restHost: 'api.huobi.pro'
