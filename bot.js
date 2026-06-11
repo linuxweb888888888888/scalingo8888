@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 // ==================== CONFIGURATION ====================
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const QUICKNODE_URL = process.env.QUICKNODE_URL || "https://cosmopolitan-muddy-dew.matic.quiknode.pro/45b8f7a71d2385208254951a496c78fb94b9676d/";
-const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || "0x7a6FbF380325B268db3ce314E584dB938cCC0D28";
+const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || "0xB56Bb558b7400A1b77898187AA729Ad2853B9487";
 
 // ==================== ALL TOKENS ON POLYGON ====================
 const ALL_TOKENS = [
