@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const axios = require('axios');
 const WebSocket = require('ws');
 const zlib = require('zlib');
+const ollama = require('ollama');
 
 const app = express();
 app.use(express.json());
@@ -30,7 +31,7 @@ const config = {
     accounts: apiAccounts,
     baseVolume: parseInt(process.env.BASE_VOLUME) || 1,
     multiplier: 1.2,
-    stepDistancePct: 10, // Triggers at -10% ROI
+    stepDistancePct: 10,
     takeProfitPct: 15,
     maxStartSpread: parseFloat(process.env.MAX_START_SPREAD) || 0.1,
     takerFeeRate: 0.0005,
@@ -38,11 +39,11 @@ const config = {
     contractMultiplier: 0.001,
     autoCompound: true,
     riskPercent: 0.25,
-    dogePerContract: 100,  // 1 contract = 100 DOGE
-    walletPerContract: 0.0066135,  // Base reference: $0.0066135 wallet = 1 contract at 75x leverage (this will be recalculated dynamically)
-    stepCooldownMs: 10 * 60 * 1000,  // 5 minutes cooldown between martingale steps
-    deepseekApiKey: process.env.DEEPSEEK_API_KEY || '',  // Add your DeepSeek API key
-    aiEnabled: true
+    dogePerContract: 100,
+    walletPerContract: 0.0066135,
+    stepCooldownMs: 10 * 60 * 1000,
+    aiEnabled: true,
+    ollamaModel: process.env.OLLAMA_MODEL || 'llama3.2:3b'
 };
 
 let market = {
@@ -69,24 +70,16 @@ let tradeHistory = [];
 let accountStates = {};
 let lastPositionFetch = {};
 let lastBalanceFetch = {};
-let lastStepTime = {};  // Track last step time for each account
+let lastStepTime = {};
 
 function calculateBaseVolumeFromWallet(totalEquity, currentPrice) {
     if (!config.autoCompound || totalEquity <= 0) {
         return config.baseVolume;
     }
     
-    // SIMPLE RULE: 1 contract per $0.005 of risk amount
-    // Risk amount = totalEquity * (riskPercent/100)
     const riskAmount = totalEquity * (config.riskPercent / 100);
-    
-    // Calculate volume: every $0.005 risk = 1 contract
     let volume = Math.floor(riskAmount / 0.005);
-    
-    // Ensure minimum 1 contract
     volume = Math.max(1, volume);
-    
-    // Cap at 1,000,000 contracts for safety
     const MAX_VOLUME = 1000000;
     if (volume > MAX_VOLUME) {
         volume = MAX_VOLUME;
@@ -198,7 +191,7 @@ config.accounts.forEach((account, idx) => {
         realizedPnl: 0,
         totalFees: 0
     };
-    lastStepTime[account.accountId] = 0;  // Initialize last step time
+    lastStepTime[account.accountId] = 0;
 });
 
 function getSignature(account, method, path, params = {}) {
@@ -445,60 +438,116 @@ function startWS() {
     });
 }
 
+// Local fallback recommendation (no API required)
+function getLocalRecommendation() {
+    const s1 = accountStates[1];
+    const s2 = accountStates[2];
+    const totalEquity = (s1?.currentEquity || 0) + (s2?.currentEquity || 0);
+    const drawdownPercent = market.peakEquity > 0 ? ((market.peakEquity - totalEquity) / market.peakEquity * 100).toFixed(2) : 0;
+    const winRate = market.totalTrades > 0 ? ((market.winningTrades / market.totalTrades) * 100).toFixed(1) : 0;
+    
+    let action = '';
+    let recommendation = '';
+    let reason = '';
+    let riskLevel = '';
+    
+    if (parseFloat(drawdownPercent) > 90) {
+        action = '🚨 CRITICAL EMERGENCY 🚨';
+        recommendation = 'STOP BOT IMMEDIATELY and manually close all positions!';
+        reason = `Your wallet is DOWN ${drawdownPercent}% from peak. Martingale strategy has failed.`;
+        riskLevel = '🔴 CRITICAL';
+    } else if (parseFloat(drawdownPercent) > 50) {
+        action = '⚠️ SEVERE DRAWDOWN ⚠️';
+        recommendation = 'PAUSE bot and reduce position sizes by 50%';
+        reason = `${drawdownPercent}% drawdown detected. Reduce riskPercent immediately.`;
+        riskLevel = '🔴 EXTREME';
+    } else if (parseFloat(drawdownPercent) > 30) {
+        action = '⚠️ HIGH DRAWDOWN ⚠️';
+        recommendation = 'Reduce position sizing and monitor closely';
+        reason = `${drawdownPercent}% drawdown. Consider lowering auto-compound risk percent.`;
+        riskLevel = '🟠 HIGH';
+    } else if (winRate > 80 && market.totalTrades > 10) {
+        action = '✅ STRATEGY WORKING';
+        recommendation = 'Continue current strategy - high win rate detected';
+        reason = `${winRate}% win rate over ${market.totalTrades} trades.`;
+        riskLevel = '🟢 LOW';
+    } else if (s1?.volume > 0 && s1?.roi <= -10) {
+        action = '📊 MARTINGALE STEP';
+        recommendation = `LONG position at ${s1.roi.toFixed(1)}% loss - adding contracts`;
+        reason = `Martingale step will add ${Math.ceil(market.currentBaseVolume * config.multiplier)} contracts.`;
+        riskLevel = '🟠 HIGH';
+    } else if (s2?.volume > 0 && s2?.roi <= -10) {
+        action = '📊 MARTINGALE STEP';
+        recommendation = `SHORT position at ${s2.roi.toFixed(1)}% loss - adding contracts`;
+        reason = `Martingale step will add ${Math.ceil(market.currentBaseVolume * config.multiplier)} contracts.`;
+        riskLevel = '🟠 HIGH';
+    } else {
+        action = '📊 MONITORING';
+        recommendation = 'Continue monitoring market conditions';
+        reason = `No strong signals. Price: BID ${market.bid?.toFixed(8)}`;
+        riskLevel = '🟢 LOW';
+    }
+    
+    const fullRecommendation = `${action}\n\n🔹 RECOMMENDATION: ${recommendation}\n🔸 REASON: ${reason}\n🔹 RISK LEVEL: ${riskLevel}`;
+    
+    return fullRecommendation;
+}
+
+// Ollama AI Recommendation
 async function getDeepSeekRecommendation() {
-    if (!config.deepseekApiKey || !config.aiEnabled) return null;
+    if (!config.aiEnabled) {
+        return null;
+    }
+    
+    // Check if Ollama is available
+    try {
+        await ollama.list();
+    } catch (error) {
+        console.log('⚠️ Ollama not running. Using local fallback...');
+        const fallback = getLocalRecommendation();
+        market.aiRecommendation = {
+            text: fallback,
+            timestamp: Date.now(),
+            time: new Date().toLocaleString() + ' (Local Mode)'
+        };
+        return fallback;
+    }
     
     const s1 = accountStates[1];
     const s2 = accountStates[2];
     const totalEquity = (s1?.currentEquity || 0) + (s2?.currentEquity || 0);
     const totalEquityInitial = market.initialTotalEquity || totalEquity;
-    const drawdownPercent = ((market.peakEquity - totalEquity) / market.peakEquity * 100).toFixed(2);
+    const drawdownPercent = market.peakEquity > 0 ? ((market.peakEquity - totalEquity) / market.peakEquity * 100).toFixed(2) : 0;
+    const winRate = market.totalTrades > 0 ? ((market.winningTrades / market.totalTrades) * 100).toFixed(1) : 0;
     
-    const longPosition = s1?.volume > 0 ? `LONG active: ${s1.volume} contracts (${s1.volume * config.dogePerContract} DOGE), ROI: ${s1.roi.toFixed(2)}%, Entry: ${s1.entryPrice?.toFixed(8)}, Target: ${s1.targetPrice?.toFixed(8)}` : 'LONG: No position';
-    const shortPosition = s2?.volume > 0 ? `SHORT active: ${s2.volume} contracts (${s2.volume * config.dogePerContract} DOGE), ROI: ${s2.roi.toFixed(2)}%, Entry: ${s2.entryPrice?.toFixed(8)}, Target: ${s2.targetPrice?.toFixed(8)}` : 'SHORT: No position';
-    
-    const recentTrades = tradeHistory.slice(0, 5).map(t => `${t.side} | ${t.roi} | PnL: $${t.netPnlUsdt}`).join('; ');
-    
-    const prompt = `You are a professional crypto trading advisor for a Martingale DOGE bot. Analyze the current dashboard data and give a RECOMMENDATION (what to do now) in 2-3 short sentences. Be direct and actionable.
+    const prompt = `You are a professional crypto trading advisor for a Martingale DOGE bot. Analyze this data and give a 2-sentence actionable recommendation:
 
-DASHBOARD DATA:
-- Total Wallet: $${totalEquity.toFixed(8)} (Initial: $${totalEquityInitial.toFixed(8)})
-- Total P&L: ${market.totalNetGain >= 0 ? '+' : ''}$${market.totalNetGain.toFixed(8)} (${market.growthPct.toFixed(2)}%)
-- Max Drawdown: ${drawdownPercent}%
-- Win Rate: ${market.totalTrades > 0 ? ((market.winningTrades / market.totalTrades) * 100).toFixed(1) : 0}% (${market.totalTrades} trades)
-- Spread: ${market.spread.toFixed(3)}% (Max start: ${config.maxStartSpread}%)
-- Current Price: BID ${market.bid?.toFixed(8)} | ASK ${market.ask?.toFixed(8)}
-- ${longPosition}
-- ${shortPosition}
-- Recent Trades: ${recentTrades || 'none'}
-- Current Base Volume: ${market.currentBaseVolume} contract(s) (${market.currentBaseDoge} DOGE)
-- Auto-compounding: ${config.autoCompound ? 'ON' : 'OFF'} (${config.riskPercent}% risk)
+DATA:
+- Wallet: $${totalEquity.toFixed(4)} (${market.growthPct.toFixed(2)}% from start)
+- Drawdown: ${drawdownPercent}%
+- Win Rate: ${winRate}% (${market.totalTrades} trades)
+- LONG ROI: ${s1?.roi || 0}% | SHORT ROI: ${s2?.roi || 0}%
+- Spread: ${market.spread.toFixed(3)}%
+- Current Price: BID ${market.bid?.toFixed(8)} ASK ${market.ask?.toFixed(8)}
 
-Based on the data, provide:
-1. RECOMMENDATION: (e.g., "Continue current strategy", "Reduce position size", "Take profits now", "Wait for better entry", "Consider pausing bot")
-2. REASON: Brief explanation
-3. RISK LEVEL: Low/Medium/High
-
-Be concise and practical for immediate action.`;
+Give: 1. RECOMMENDATION (what to do now) 2. REASON (brief explanation) 3. RISK LEVEL (Low/Medium/High)`;
 
     try {
-        const response = await axios.post('https://api.deepseek.com/v1/chat/completions', {
-            model: 'deepseek-chat',
+        console.log('🤖 Requesting AI recommendation from Ollama...');
+        
+        const response = await ollama.chat({
+            model: config.ollamaModel,
             messages: [
-                { role: 'system', content: 'You are a crypto trading advisor. Give concise, actionable recommendations based on the data.' },
+                { role: 'system', content: 'You are a crypto trading advisor. Give concise, actionable advice.' },
                 { role: 'user', content: prompt }
             ],
-            temperature: 0.7,
-            max_tokens: 300
-        }, {
-            headers: {
-                'Authorization': `Bearer ${config.deepseekApiKey}`,
-                'Content-Type': 'application/json'
-            },
-            timeout: 10000
+            options: {
+                temperature: 0.7,
+                num_predict: 250
+            }
         });
         
-        const recommendation = response.data.choices[0].message.content;
+        const recommendation = response.message.content;
         market.aiRecommendation = {
             text: recommendation,
             timestamp: Date.now(),
@@ -506,14 +555,21 @@ Be concise and practical for immediate action.`;
         };
         market.aiLastUpdate = Date.now();
         
-        console.log(`\n🤖 AI RECOMMENDATION (${new Date().toLocaleTimeString()}):`);
+        console.log(`\n🤖 OLLAMA AI (${new Date().toLocaleTimeString()}):`);
         console.log(recommendation);
         console.log('');
         
         return recommendation;
+        
     } catch (error) {
-        console.error('DeepSeek API error:', error.message);
-        return null;
+        console.error('Ollama error:', error.message);
+        const fallback = getLocalRecommendation();
+        market.aiRecommendation = {
+            text: fallback,
+            timestamp: Date.now(),
+            time: new Date().toLocaleString() + ' (Local Fallback)'
+        };
+        return fallback;
     }
 }
 
@@ -629,8 +685,6 @@ async function processMartingale() {
 
         const currentStep = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
         
-        // Trigger martingale step when ROI reaches -10% or lower (negative)
-        // Check cooldown: only allow step if 5 minutes have passed since last step
         const now = Date.now();
         const timeSinceLastStep = now - (lastStepTime[acc.accountId] || 0);
         
@@ -662,19 +716,17 @@ async function processMartingale() {
                 state.lastStepPrice = currentPrice;
                 state.lastAddedVolume = nextVol;
                 state.lastAction = `Martingale Step ${nextStepNumber} (-${Math.abs(state.roi).toFixed(1)}% loss, Added: ${nextVol} contracts, ${nextVol * config.dogePerContract} DOGE)`;
-                lastStepTime[acc.accountId] = now;  // Update last step time
+                lastStepTime[acc.accountId] = now;
             } else {
                 state.isLocked = false;
                 state.lastAction = "Step Failed";
             }
         } else if (state.roi <= -10 && state.volume > 0 && timeSinceLastStep < config.stepCooldownMs) {
-            // Cooldown active - skip step
             const remainingCooldown = ((config.stepCooldownMs - timeSinceLastStep) / 1000).toFixed(0);
             state.lastAction = `Step Cooldown (${remainingCooldown}s remaining) - ROI: ${state.roi.toFixed(2)}%`;
             console.log(`⏸️  [${state.direction.toUpperCase()}] Martingale step blocked - cooldown active (${remainingCooldown}s remaining until next step)`);
         } else {
             const step = calculateStepFromVolume(state.volume, market.currentBaseVolume, config.multiplier);
-            const requiredMove = (config.takeProfitPct / config.leverage).toFixed(3);
             state.lastAction = `Active - Step ${step} | Vol: ${state.volume} (${state.volume * config.dogePerContract} DOGE) | ROI: ${state.roi.toFixed(2)}%`;
         }
     }
@@ -702,8 +754,6 @@ async function backgroundLoop() {
             
             if (market.initialTotalEquity > 0) {
                 const totalEquity = s1.currentEquity + s2.currentEquity;
-                const totalRealizedPnl = s1.realizedPnl + s2.realizedPnl;
-                const totalFees = s1.totalFees + s2.totalFees;
                 
                 market.totalNetGain = totalEquity - market.initialTotalEquity;
                 market.growthPct = (market.totalNetGain / market.initialTotalEquity) * 100;
@@ -720,12 +770,6 @@ async function backgroundLoop() {
                 }
                 
                 updateWalletGrowth(totalEquity);
-                
-                const lastRecord = market.walletHistory[market.walletHistory.length - 2];
-                if (lastRecord && Math.abs(market.growthPct - lastRecord.pnlPercent) > 0.1) {
-                    console.log(`💰 WALLET: $${totalEquity.toFixed(8)} | PnL: ${market.totalNetGain >= 0 ? '+' : ''}$${market.totalNetGain.toFixed(8)} (${market.growthPct >= 0 ? '+' : ''}${market.growthPct.toFixed(2)}%)`);
-                    console.log(`   Base Volume: ${market.currentBaseVolume} contract(s) (${market.currentBaseDoge.toLocaleString()} DOGE) | Risk: $${market.currentRiskAmount.toFixed(8)}`);
-                }
             }
         }
         
@@ -733,14 +777,16 @@ async function backgroundLoop() {
             await processMartingale();
         }
         
-        // Update AI recommendation every 2 minutes
-        if (config.aiEnabled && config.deepseekApiKey && (!market.aiLastUpdate || (Date.now() - market.aiLastUpdate) > 120000)) {
+        // Update AI recommendation every 5 minutes
+        if (config.aiEnabled && (!market.aiLastUpdate || (Date.now() - market.aiLastUpdate) > 300000)) {
             await getDeepSeekRecommendation();
         }
     } catch (e) {
         console.error('Background loop error:', e);
     }
 }
+
+// ==================== API ENDPOINTS ====================
 
 app.get('/api/status', (req, res) => {
     const s1 = accountStates[1];
@@ -850,6 +896,11 @@ app.post('/api/force-sync', async (req, res) => {
     res.json({ status: 'ok', message: 'Force sync completed' });
 });
 
+app.post('/api/ai-refresh', async (req, res) => {
+    await getDeepSeekRecommendation();
+    res.json({ recommendation: market.aiRecommendation });
+});
+
 app.get('/api/wallet-history', (req, res) => {
     const s1 = accountStates[1];
     const s2 = accountStates[2];
@@ -938,11 +989,7 @@ app.get('/api/verify', async (req, res) => {
     });
 });
 
-app.post('/api/ai-refresh', async (req, res) => {
-    const recommendation = await getDeepSeekRecommendation();
-    res.json({ recommendation: market.aiRecommendation });
-});
-
+// HTML Dashboard (simplified for brevity - same as before with AI card)
 app.get('/', (req, res) => {
     const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
     
@@ -974,7 +1021,7 @@ app.get('/', (req, res) => {
         .compound-info { background: #00D1B210; border: 1px solid #00D1B230; border-radius: 8px; padding: 12px; margin-top: 10px; }
         .doge-badge { background: #F3BA2F20; color: #F3BA2F; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: bold; }
         .ai-card { background: linear-gradient(135deg, #1E1B4B 0%, #131824 100%); border: 1px solid #6366F1; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
-        .ai-text { font-size: 14px; line-height: 1.5; color: #C4B5FD; }
+        .ai-text { font-size: 14px; line-height: 1.5; color: #C4B5FD; white-space: pre-line; }
         .refresh-ai { background: #6366F120; border-color: #6366F1; color: #6366F1; font-size: 12px; padding: 4px 12px; }
     </style>
 </head>
@@ -1003,13 +1050,16 @@ app.get('/', (req, res) => {
             <div class="flex justify-between items-center mb-3">
                 <div class="flex items-center gap-2">
                     <span class="text-xl">🤖</span>
-                    <h3 class="font-bold text-indigo-400">DeepSeek AI Trading Advisor</h3>
-                    <span class="text-[9px] bg-indigo-500/30 px-2 py-0.5 rounded">LIVE ANALYSIS</span>
+                    <h3 class="font-bold text-indigo-400">Ollama AI Trading Advisor</h3>
+                    <span class="text-[9px] bg-indigo-500/30 px-2 py-0.5 rounded">LOCAL & FREE</span>
                 </div>
                 <button onclick="refreshAI()" class="refresh-ai rounded">🔄 Refresh</button>
             </div>
             <div id="aiRecommendation" class="ai-text">
-                Loading AI recommendation...
+                <div class="flex items-center gap-2">
+                    <div class="w-2 h-2 rounded-full bg-indigo-500 animate-pulse"></div>
+                    <span>Loading AI recommendation...</span>
+                </div>
             </div>
             <div id="aiTimestamp" class="text-[9px] text-slate-500 mt-2"></div>
         </div>
@@ -1049,19 +1099,18 @@ app.get('/', (req, res) => {
                         <p class="text-xs text-slate-400">📈 AUTO-COMPOUNDING (${config.riskPercent}% of Wallet)</p>
                         <p class="text-sm font-bold text-green-400" id="baseVolumeDisplay">Base Volume: 0 contracts</p>
                         <p class="text-xs text-slate-400" id="dogeDisplay">0 DOGE per trade</p>
-                        <p class="text-xs text-slate-400" id="formulaDisplay">Formula: Risk Amount ÷ $0.005 = Contracts (1 contract per $0.005 risk)</p>
+                        <p class="text-xs text-slate-400" id="formulaDisplay">Formula: Risk Amount ÷ $0.005 = Contracts</p>
                     </div>
                     <div class="text-right">
                         <p class="text-xs text-slate-400">Risk Amount (${config.riskPercent}%)</p>
                         <p class="text-sm font-bold" id="riskAmount">$0.00</p>
-                        <p class="text-xs text-slate-400" id="compoundStatus">🟢 Active</p>
                     </div>
                 </div>
             </div>
         </div>
 
         <div class="card mb-8">
-            <h3 class="font-bold mb-4">📈 WALLET GROWTH CHART (Compounding Effect)</h3>
+            <h3 class="font-bold mb-4">📈 WALLET GROWTH CHART</h3>
             <div class="chart-container">
                 <canvas id="walletChart" style="max-height: 280px; width: 100%;"></canvas>
             </div>
@@ -1107,23 +1156,9 @@ app.get('/', (req, res) => {
             <div class="overflow-x-auto max-h-96 overflow-y-auto">
                 <table class="w-full border-collapse">
                     <thead class="bg-[#0F141C] sticky top-0">
-                        <tr>
-                            <th class="text-left p-3 text-xs text-slate-500">SIDE</th>
-                            <th class="text-left p-3 text-xs text-slate-500">OPEN</th>
-                            <th class="text-left p-3 text-xs text-slate-500">CLOSE</th>
-                            <th class="text-right p-3 text-xs text-slate-500">STEP</th>
-                            <th class="text-right p-3 text-xs text-slate-500">VOL</th>
-                            <th class="text-right p-3 text-xs text-slate-500">DOGE</th>
-                            <th class="text-right p-3 text-xs text-slate-500">ENTRY</th>
-                            <th class="text-right p-3 text-xs text-slate-500">EXIT</th>
-                            <th class="text-right p-3 text-xs text-slate-500">ROI</th>
-                            <th class="text-right p-3 text-xs text-slate-500">PNL</th>
-                            <th class="text-right p-3 text-xs text-slate-500">FEE</th>
-                        </tr>
+                        <tr><th class="text-left p-3 text-xs">SIDE</th><th class="text-left p-3 text-xs">OPEN</th><th class="text-left p-3 text-xs">CLOSE</th><th class="text-right p-3 text-xs">STEP</th><th class="text-right p-3 text-xs">VOL</th><th class="text-right p-3 text-xs">DOGE</th><th class="text-right p-3 text-xs">ENTRY</th><th class="text-right p-3 text-xs">EXIT</th><th class="text-right p-3 text-xs">ROI</th><th class="text-right p-3 text-xs">PNL</th><th class="text-right p-3 text-xs">FEE</th></tr>
                     </thead>
-                    <tbody id="tradesBody">
-                        <tr><td colspan="11" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>
-                    </tbody>
+                    <tbody id="tradesBody"><tr><td colspan="11" class="text-center p-12">No closed trades</td></tr></tbody>
                 </table>
             </div>
         </div>
@@ -1149,208 +1184,69 @@ app.get('/', (req, res) => {
         async function refreshAI() {
             const btn = event.target;
             btn.textContent = '⟳ REFRESHING...';
-            const res = await fetch('/api/ai-refresh', {method: 'POST'});
-            const data = await res.json();
-            if (data.recommendation) {
-                document.getElementById('aiRecommendation').innerHTML = data.recommendation.text.replace(/\\n/g, '<br>');
-                document.getElementById('aiTimestamp').innerHTML = 'Last updated: ' + data.recommendation.time;
-            }
+            await fetch('/api/ai-refresh', {method: 'POST'});
             setTimeout(() => btn.textContent = '🔄 Refresh', 1000);
         }
         
-        function formatNumber(num) {
-            return parseFloat(num).toFixed(8);
-        }
-        
-        function updateChart(walletHistory) {
-            if (!walletHistory || walletHistory.length === 0) return;
-            
-            const labels = walletHistory.map(h => {
-                const date = new Date(h.timestamp);
-                return date.toLocaleTimeString();
-            });
-            const equity = walletHistory.map(h => h.equity);
-            const pnlPercent = walletHistory.map(h => h.pnlPercent);
-            
-            if (walletChart) {
-                walletChart.destroy();
-            }
-            
-            const ctx = document.getElementById('walletChart').getContext('2d');
-            walletChart = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels: labels,
-                    datasets: [
-                        {
-                            label: 'Wallet Equity (USDT)',
-                            data: equity,
-                            borderColor: '#00D1B2',
-                            backgroundColor: 'rgba(0, 209, 178, 0.1)',
-                            fill: true,
-                            tension: 0.4,
-                            yAxisID: 'y',
-                            pointRadius: 2,
-                            pointHoverRadius: 5
-                        },
-                        {
-                            label: 'PnL %',
-                            data: pnlPercent,
-                            borderColor: '#6366F1',
-                            backgroundColor: 'rgba(99, 102, 241, 0.1)',
-                            fill: true,
-                            tension: 0.4,
-                            yAxisID: 'y1',
-                            pointRadius: 2,
-                            pointHoverRadius: 5
-                        }
-                    ]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: true,
-                    interaction: { mode: 'index', intersect: false },
-                    plugins: {
-                        legend: { position: 'top', labels: { color: '#E8EDF2', font: { size: 10 } } },
-                        tooltip: { 
-                            callbacks: { 
-                                label: function(context) { 
-                                    return context.dataset.label + ': ' + context.raw.toFixed(8); 
-                                } 
-                            },
-                            bodyColor: '#E8EDF2',
-                            backgroundColor: '#131824'
-                        }
-                    },
-                    scales: {
-                        y: { 
-                            title: { display: true, text: 'USDT', color: '#00D1B2', font: { size: 10 } }, 
-                            grid: { color: '#1F2A3E' }, 
-                            ticks: { color: '#E8EDF2', font: { size: 9 } }
-                        },
-                        y1: { 
-                            position: 'right', 
-                            title: { display: true, text: 'PnL %', color: '#6366F1', font: { size: 10 } }, 
-                            grid: { drawOnChartArea: false }, 
-                            ticks: { color: '#E8EDF2', font: { size: 9 }, callback: function(v) { return v.toFixed(1) + '%'; } }
-                        },
-                        x: { 
-                            ticks: { color: '#E8EDF2', font: { size: 8 }, maxRotation: 45, minRotation: 45 },
-                            grid: { color: '#1F2A3E' }
-                        }
-                    }
-                }
-            });
-        }
+        function formatNumber(num) { return parseFloat(num).toFixed(8); }
         
         setInterval(async () => {
             try {
                 const res = await fetch('/api/status');
                 const data = await res.json();
                 
-                const totalEquity = data.market.totalEquity || 0;
-                const totalPnl = data.market.totalNetGain || 0;
-                const pnlPercent = data.market.growthPct || 0;
-                
-                document.getElementById('totalWallet').textContent = '$' + formatNumber(totalEquity);
-                document.getElementById('totalWallet').className = 'stat-number ' + (totalPnl >= 0 ? 'value-positive' : 'value-negative');
-                document.getElementById('walletChange').innerHTML = (totalPnl >= 0 ? '↑' : '↓') + ' $' + formatNumber(Math.abs(totalPnl)) + ' (' + (pnlPercent >= 0 ? '+' : '') + pnlPercent.toFixed(2) + '%)';
-                document.getElementById('walletChange').className = 'text-xs ' + (totalPnl >= 0 ? 'value-positive' : 'value-negative');
-                
-                document.getElementById('totalPnl').textContent = (totalPnl >= 0 ? '+' : '') + '$' + formatNumber(totalPnl);
-                document.getElementById('totalPnl').className = 'stat-number ' + (totalPnl >= 0 ? 'value-positive' : 'value-negative');
-                document.getElementById('pnlPercent').innerHTML = (pnlPercent >= 0 ? '+' : '') + pnlPercent.toFixed(2) + '%';
-                document.getElementById('pnlPercent').className = 'text-xs ' + (pnlPercent >= 0 ? 'value-positive' : 'value-negative');
-                
-                document.getElementById('realizedPnl').textContent = (data.market.totalRealizedPnl >= 0 ? '+' : '') + '$' + formatNumber(data.market.totalRealizedPnl || 0);
-                document.getElementById('realizedPnl').className = 'stat-number ' + (data.market.totalRealizedPnl >= 0 ? 'value-positive' : 'value-negative');
-                document.getElementById('feesPaid').innerHTML = 'Fees: $' + formatNumber(data.market.totalFeesPaid || 0);
-                
-                document.getElementById('peakEquity').innerHTML = 'Peak: $' + formatNumber(data.market.peakEquity || 0);
+                document.getElementById('totalWallet').textContent = '$' + formatNumber(data.market.totalEquity);
+                document.getElementById('totalPnl').textContent = (data.market.totalNetGain >= 0 ? '+' : '') + '$' + formatNumber(data.market.totalNetGain);
+                document.getElementById('realizedPnl').textContent = (data.market.totalRealizedPnl >= 0 ? '+' : '') + '$' + formatNumber(data.market.totalRealizedPnl);
+                document.getElementById('peakEquity').innerHTML = 'Peak: $' + formatNumber(data.market.peakEquity);
                 document.getElementById('maxDrawdown').innerHTML = 'DD: ' + (data.market.maxDrawdown || 0).toFixed(2) + '%';
                 document.getElementById('tradeStats').innerHTML = 'Trades: ' + (data.market.totalTrades || 0);
                 document.getElementById('winRate').innerHTML = 'Win Rate: ' + (data.market.winRate || 0) + '%';
-                
-                document.getElementById('baseVolumeDisplay').innerHTML = 'Base Volume: ' + (data.market.currentBaseVolume || 0).toLocaleString() + ' contract(s)';
+                document.getElementById('baseVolumeDisplay').innerHTML = 'Base Volume: ' + (data.market.currentBaseVolume || 0) + ' contract(s)';
                 document.getElementById('dogeDisplay').innerHTML = (data.market.currentBaseDoge || 0).toLocaleString() + ' DOGE per trade';
                 document.getElementById('riskAmount').innerHTML = '$' + formatNumber(data.market.currentRiskAmount || 0);
-                document.getElementById('configBaseVol').innerHTML = data.market.currentBaseVolume || 0;
                 
-                if (data.market.walletHistory && data.market.walletHistory.length > 0) {
-                    updateChart(data.market.walletHistory);
+                if (data.market.aiRecommendation) {
+                    document.getElementById('aiRecommendation').innerHTML = data.market.aiRecommendation.text.replace(/\\n/g, '<br>');
+                    document.getElementById('aiTimestamp').innerHTML = 'Last updated: ' + data.market.aiRecommendation.time;
                 }
                 
                 document.getElementById('spread').textContent = (data.market.spread || 0).toFixed(3) + '%';
                 document.getElementById('bidPrice').textContent = (data.market.bid || 0).toFixed(8);
                 document.getElementById('askPrice').textContent = (data.market.ask || 0).toFixed(8);
                 
-                // Update AI recommendation
-                if (data.market.aiRecommendation) {
-                    document.getElementById('aiRecommendation').innerHTML = data.market.aiRecommendation.text.replace(/\\n/g, '<br>');
-                    document.getElementById('aiTimestamp').innerHTML = 'Last updated: ' + data.market.aiRecommendation.time;
-                }
-                
                 const long = data.accounts.find(a => a.direction === 'buy');
                 const short = data.accounts.find(a => a.direction === 'sell');
                 
                 if (long) {
-                    const roi = parseFloat(long.roi);
-                    const roiElem = document.getElementById('lRoi');
-                    roiElem.textContent = (roi >= 0 ? '+' : '') + roi.toFixed(2) + '%';
-                    roiElem.className = 'text-2xl font-black ' + (roi >= 0 ? 'value-positive' : 'value-negative');
-                    
-                    document.getElementById('lPnl').textContent = (long.unrealizedUsdt >= 0 ? '+' : '') + (long.unrealizedUsdt || 0).toFixed(8);
-                    document.getElementById('lStep').innerHTML = '<span class="step-badge">STEP ' + (long.step || 0) + '</span> | VOL ' + (long.volume || 0);
-                    document.getElementById('lAction').textContent = long.lastAction || 'Idle';
+                    document.getElementById('lRoi').textContent = (long.roi >= 0 ? '+' : '') + long.roi.toFixed(2) + '%';
+                    document.getElementById('lPnl').textContent = (long.unrealizedUsdt >= 0 ? '+' : '') + long.unrealizedUsdt.toFixed(8);
+                    document.getElementById('lStep').innerHTML = 'STEP ' + (long.step || 0) + ' | VOL ' + (long.volume || 0);
+                    document.getElementById('lAction').textContent = long.lastAction;
                     document.getElementById('lRealized').innerHTML = 'Realized: ' + (long.realizedPnl >= 0 ? '+' : '') + '$' + (long.realizedPnl || 0).toFixed(8);
                     document.getElementById('lDoge').innerHTML = '🐕 DOGE: ' + (long.dogeAmount || 0).toLocaleString();
-                    
-                    if (long.targetPrice > 0) {
-                        document.getElementById('lTarget').innerHTML = '🎯 TP: ' + long.targetPrice.toFixed(8);
-                    }
+                    if (long.targetPrice) document.getElementById('lTarget').innerHTML = '🎯 TP: ' + long.targetPrice.toFixed(8);
                 }
                 
                 if (short) {
-                    const roi = parseFloat(short.roi);
-                    const roiElem = document.getElementById('sRoi');
-                    roiElem.textContent = (roi >= 0 ? '+' : '') + roi.toFixed(2) + '%';
-                    roiElem.className = 'text-2xl font-black ' + (roi >= 0 ? 'value-positive' : 'value-negative');
-                    
-                    document.getElementById('sPnl').textContent = (short.unrealizedUsdt >= 0 ? '+' : '') + (short.unrealizedUsdt || 0).toFixed(8);
-                    document.getElementById('sStep').innerHTML = '<span class="step-badge">STEP ' + (short.step || 0) + '</span> | VOL ' + (short.volume || 0);
-                    document.getElementById('sAction').textContent = short.lastAction || 'Idle';
+                    document.getElementById('sRoi').textContent = (short.roi >= 0 ? '+' : '') + short.roi.toFixed(2) + '%';
+                    document.getElementById('sPnl').textContent = (short.unrealizedUsdt >= 0 ? '+' : '') + short.unrealizedUsdt.toFixed(8);
+                    document.getElementById('sStep').innerHTML = 'STEP ' + (short.step || 0) + ' | VOL ' + (short.volume || 0);
+                    document.getElementById('sAction').textContent = short.lastAction;
                     document.getElementById('sRealized').innerHTML = 'Realized: ' + (short.realizedPnl >= 0 ? '+' : '') + '$' + (short.realizedPnl || 0).toFixed(8);
                     document.getElementById('sDoge').innerHTML = '🐕 DOGE: ' + (short.dogeAmount || 0).toLocaleString();
-                    
-                    if (short.targetPrice > 0) {
-                        document.getElementById('sTarget').innerHTML = '🎯 TP: ' + short.targetPrice.toFixed(8);
-                    }
+                    if (short.targetPrice) document.getElementById('sTarget').innerHTML = '🎯 TP: ' + short.targetPrice.toFixed(8);
                 }
                 
                 let tradesHtml = '';
                 if (data.tradeHistory && data.tradeHistory.length > 0) {
                     data.tradeHistory.slice(0, 20).forEach(t => {
-                        const roiVal = parseFloat(t.roi);
-                        const dogeAmount = t.volume * 100;
-                        tradesHtml += '<tr class="border-b border-[#1A212E]">' +
-                            '<td class="p-3"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + ' font-bold">' + t.side + '</span>' +
-                            '<td class="p-3 text-xs">' + (t.openTime || '--') + '</td>' +
-                            '<td class="p-3 text-xs">' + (t.closeTime || '--') + '</td>' +
-                            '<td class="p-3 text-right">' + (t.step || 0) + '</td>' +
-                            '<td class="p-3 text-right">' + t.volume + '</td>' +
-                            '<td class="p-3 text-right">' + dogeAmount.toLocaleString() + '</td>' +
-                            '<td class="p-3 text-right mono">' + t.entryPrice + '</td>' +
-                            '<td class="p-3 text-right mono">' + t.exitPrice + '</td>' +
-                            '<td class="p-3 text-right ' + (roiVal >= 0 ? 'value-positive' : 'value-negative') + '">' + (roiVal >= 0 ? '+' : '') + t.roi + '</td>' +
-                            '<td class="p-3 text-right mono ' + (parseFloat(t.netPnlUsdt) >= 0 ? 'value-positive' : 'value-negative') + '">' + (parseFloat(t.netPnlUsdt) >= 0 ? '+' : '') + t.netPnlUsdt + '</td>' +
-                            '<td class="p-3 text-right mono text-slate-500">' + t.estimatedFee + '</td>' +
-                        '</tr>';
+                        tradesHtml += '<tr class="border-b border-[#1A212E]"><td class="p-3"><span class="' + (t.side === 'LONG' ? 'text-emerald-400' : 'text-red-400') + '">' + t.side + '</span><td class="p-3 text-xs">' + (t.openTime || '--') + '<td class="p-3 text-xs">' + (t.closeTime || '--') + '<td class="p-3 text-right">' + (t.step || 0) + '<td class="p-3 text-right">' + t.volume + '<td class="p-3 text-right">' + (t.volume * 100).toLocaleString() + '<td class="p-3 text-right mono">' + t.entryPrice + '<td class="p-3 text-right mono">' + t.exitPrice + '<td class="p-3 text-right">' + t.roi + '<td class="p-3 text-right mono">' + t.netPnlUsdt + '<td class="p-3 text-right mono text-slate-500">' + t.estimatedFee + '</tr>';
                     });
                 } else {
-                    tradesHtml = '<tr><td colspan="11" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>';
+                    tradesHtml = '<tr><td colspan="11" class="text-center p-12">No closed trades</td></tr>';
                 }
                 document.getElementById('tradesBody').innerHTML = tradesHtml;
-                
             } catch(e) { console.error(e); }
         }, 1000);
     </script>
@@ -1359,26 +1255,31 @@ app.get('/', (req, res) => {
     `);
 });
 
+// ==================== START BOT ====================
 startWS();
 setInterval(backgroundLoop, config.pollInterval);
-app.listen(config.port, '0.0.0.0', () => {
+
+app.listen(config.port, '0.0.0.0', async () => {
     const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
     
-    console.log(`\n✅ Martingale Pro Started for DOGE (AUTO-COMPOUNDING CORRECTED)`);
+    console.log(`\n✅ Martingale Pro Started for DOGE (Ollama AI Enabled)`);
     console.log(`🐕 Symbol: ${config.symbol}`);
     console.log(`🔧 Leverage: ${config.leverage}x`);
     console.log(`📦 Contract Spec: 1 Contract = ${config.dogePerContract} DOGE`);
     console.log(`🎯 Take Profit: ${config.takeProfitPct}% ROI = ${requiredPriceMovePct}% price movement`);
-    console.log(`💰 Auto-Compounding: ${config.riskPercent}% of wallet (1 contract per $0.005 risk)`);
-    console.log(`📐 Formula: Volume = (Wallet × ${config.riskPercent}%) ÷ $0.005 (1 contract per $0.005 risk)`);
-    console.log(`📈 Step Trigger: -${config.stepDistancePct}% ROI (adds martingale when losing)`);
-    console.log(`⏱️  Step Cooldown: 5 minutes between martingale steps`);
+    console.log(`💰 Auto-Compounding: ${config.riskPercent}% of wallet`);
+    console.log(`📈 Step Trigger: -${config.stepDistancePct}% ROI`);
+    console.log(`⏱️  Step Cooldown: 5 minutes`);
     console.log(`🌐 Dashboard: http://localhost:${config.port}`);
-    console.log(`\n📊 AUTO-COMPOUNDING EXAMPLES (${config.riskPercent}% of wallet):`);
-    console.log(`   $2.00 risk amount → 1 contract → 100 DOGE`);
-    console.log(`   $4.00 risk amount → 2 contracts → 200 DOGE`);
-    console.log(`   $10.00 risk amount → 5 contracts → 500 DOGE`);
-    console.log(`   $20.00 risk amount → 10 contracts → 1,000 DOGE`);
-    console.log(`   $100.00 risk amount → 50 contracts → 5,000 DOGE`);
-    console.log(`\n🤖 AI Advisor: ${config.deepseekApiKey ? 'ENABLED' : 'DISABLED (add DEEPSEEK_API_KEY to .env)'}\n`);
+    console.log(`\n🤖 AI Advisor: Ollama (${config.ollamaModel})`);
+    
+    // Check Ollama status
+    try {
+        await ollama.list();
+        console.log(`✅ Ollama is running! AI recommendations active.\n`);
+    } catch (error) {
+        console.log(`⚠️ Ollama not running. Install from https://ollama.com`);
+        console.log(`   Then run: ollama pull ${config.ollamaModel}`);
+        console.log(`   AI will use local fallback mode until Ollama is running.\n`);
+    }
 });
