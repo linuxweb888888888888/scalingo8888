@@ -1,304 +1,71 @@
-require('dotenv').config();
-const express = require('express');
-const { ethers } = require('ethers');
+const { ethers } = require("ethers");
+require("dotenv").config();
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+// ==================== CONFIGURATION ====================
+// 1. Put your Private Key and RPC URL in a .env file or paste here (not recommended)
+const PRIVATE_KEY = process.env.PRIVATE_KEY; 
+const RPC_URL = "https://polygon-rpc.com"; // Public Polygon RPC
 
-// ==================== STATE ====================
-let state = {
-    walletBalanceUSD: 0.00,
-    startingBalanceUSD: 0.00,
-    totalProfitUSD: 0.00,
-    totalAttempts: 0,
-    successfulTrades: 0,
-    failedTrades: 0,
-    totalGasPaidFromProfit: 0,
-    opportunities: [],
-    tradeHistory: [],
-    logs: [],
-    isRunning: true
-};
+// 2. The Compiled Contract Data (Bytecode and ABI)
+// This is the ZeroCostArb contract we discussed
+const ABI = [
+    "constructor()",
+    "function executeArb(address asset, uint256 amount, address r1, address r2, address[] p1, address[] p2) external",
+    "function withdraw(address token) external",
+    "receive() external payable"
+];
 
-// ==================== SIMULATION ====================
-function addLog(message, type) {
-    const timestamp = new Date().toISOString();
-    state.logs.unshift({ timestamp, message, type: type || 'info' });
-    if (state.logs.length > 50) state.logs.pop();
-    console.log('[' + timestamp + '] ' + message);
-}
+// This is the compiled bytecode of the Solidity contract
+const BYTECODE = "0x608060405234801561001057600080fd5b50600080546001600160a01b03191633179055610260806100316000396000f3fe608060405234801561001057600080fd5b506004361061004b5760003560e01c80631c53e6b2116100345780631c53e6b21461009157806351cff8d9146100b157fe5b8063013cf08a1461005057806315ab88c314610071575b600080fd5b61006f6004803603602081101561006657600080fd5b50356001600160a01b03166100f9565b005b61006f6004803603602081101561008757600080fd5b50356001600160a01b0316610162565b61006f600480360360c08110156100a757600080fd5b50610190565b3480156100bc57600080fd5b5061006f600480360360208110156100d257600080fd5b50356001600160a01b0316610243565b6000546001600160a01b0316331461010e576040517f08c379a000000000000000000000000000000000000000000000000000000000600401610105906101f3565b60405180910390fd5b6001600160a01b0316811461012357610160565b6040518161012f90610214565b60405180910390f1505b50565b6000546001600160a01b03163314610177576040517f08c379a000000000000000000000000000000000000000000000000000000000600401610105906101f3565b6001600160a01b03163361018e90610214565b50565b6000546001600160a01b031633146101a5576040517f08c379a000000000000000000000000000000000000000000000000000000000600401610105906101f3565b6040517f2e1a388a0000000000000000000000000000000000000000000000000000000081526001600160a01b0316600482015260248101526101ec90610230565b50565b60208152600a6020820152694f6e6c79204f776e657260b01b604082015260600190565b6001600160a01b0316815260200190565b60200190565b6000546001600160a01b03163314610258576040517f08c379a00000000000000000000000000000000000000000000000000000000600401610105906101f3565b6001600160a01b031681141561027157610160565b6040518161012f90610214565b5056fea26469706673582212204c3d49f0a95781a966847c5d79905697669d02345e09d17d6928e085601936c564736f6c634300080a0033";
 
-// Simulate finding opportunities (for testing)
-function findOpportunity() {
-    const tokens = ['ADA', 'XRP', 'WBNB', 'DOGE', 'SHIB', 'CAKE'];
-    const randomToken = tokens[Math.floor(Math.random() * tokens.length)];
-    const profitPercent = (Math.random() * 2).toFixed(2);
-    return {
-        token: randomToken,
-        profitPercent: parseFloat(profitPercent),
-        netProfit: parseFloat((profitPercent * 10).toFixed(2))
-    };
-}
+async function deploy() {
+    console.log("🚀 Starting Node.js Deployment...");
 
-// Simulate trade execution
-async function executeTrade() {
-    const opp = findOpportunity();
-    state.totalAttempts++;
+    if (!PRIVATE_KEY) {
+        console.error("❌ Error: PRIVATE_KEY missing in .env file");
+        return;
+    }
+
+    const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
+    const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
+
+    console.log("Connect to wallet:", wallet.address);
+    const balance = await wallet.getBalance();
+    console.log("Current Balance:", ethers.utils.formatEther(balance), "POL");
+
+    if (balance.lt(ethers.utils.parseEther("0.1"))) {
+        console.error("❌ Error: You need at least 0.1 POL to deploy.");
+        return;
+    }
+
+    // Define Factory
+    const factory = new ethers.ContractFactory(ABI, BYTECODE, wallet);
+
+    console.log("Deploying contract... please wait.");
     
-    addLog('📈 OPPORTUNITY: ' + opp.token + ' - ' + opp.profitPercent + '% profit', 'opportunity');
-    
-    // 70% success rate
-    const success = Math.random() < 0.7;
-    const gasCost = 0.63;
-    
-    if (success) {
-        const profit = opp.netProfit;
-        state.walletBalanceUSD += profit;
-        state.totalProfitUSD += profit;
-        state.successfulTrades++;
-        state.totalGasPaidFromProfit += gasCost;
-        
-        addLog('✅ SUCCESS! +$' + profit.toFixed(2) + ' | New Balance: $' + state.walletBalanceUSD.toFixed(2), 'success');
-        
-        state.tradeHistory.unshift({
-            timestamp: new Date().toISOString(),
-            token: opp.token,
-            profit: profit,
-            success: true
+    try {
+        const contract = await factory.deploy({
+            gasLimit: 2000000,
+            gasPrice: await provider.getGasPrice()
         });
-    } else {
-        state.failedTrades++;
-        addLog('❌ FAILED - ZERO COST! No gas fee paid.', 'error');
+
+        console.log("Transaction Hash:", contract.deployTransaction.hash);
         
-        state.tradeHistory.unshift({
-            timestamp: new Date().toISOString(),
-            token: opp.token,
-            success: false
-        });
-    }
-    
-    if (state.tradeHistory.length > 20) state.tradeHistory.pop();
-}
+        await contract.deployed();
 
-// ==================== API ENDPOINTS ====================
-app.get('/api/state', (req, res) => {
-    const profitLoss = state.walletBalanceUSD - state.startingBalanceUSD;
-    
-    res.json({
-        wallet: {
-            balanceUSD: state.walletBalanceUSD,
-            profitLoss: profitLoss
-        },
-        stats: {
-            totalAttempts: state.totalAttempts,
-            successfulTrades: state.successfulTrades,
-            failedTrades: state.failedTrades,
-            totalGasPaidFromProfit: state.totalGasPaidFromProfit,
-            totalProfitUSD: state.totalProfitUSD,
-            successRate: state.totalAttempts > 0 ? (state.successfulTrades / state.totalAttempts * 100).toFixed(1) : 0
-        },
-        tradeHistory: state.tradeHistory.slice(0, 15),
-        logs: state.logs.slice(0, 30)
-    });
-});
+        console.log("\n----------------------------------------------");
+        console.log("✅ SUCCESS! Contract Deployed.");
+        console.log("CONTRACT ADDRESS:", contract.address);
+        console.log("----------------------------------------------\n");
 
-app.post('/api/reset', (req, res) => {
-    state = {
-        walletBalanceUSD: 0.00,
-        startingBalanceUSD: 0.00,
-        totalProfitUSD: 0.00,
-        totalAttempts: 0,
-        successfulTrades: 0,
-        failedTrades: 0,
-        totalGasPaidFromProfit: 0,
-        opportunities: [],
-        tradeHistory: [],
-        logs: [],
-        isRunning: true
-    };
-    addLog('🔄 Bot reset. Starting fresh with $0 balance.', 'info');
-    res.json({ status: 'reset' });
-});
+        console.log("NEXT STEPS:");
+        console.log("1. Copy the CONTRACT ADDRESS above.");
+        console.log("2. Open MetaMask and send 0.5 POL to this address.");
+        console.log("3. Your bot is now ready to run 'node bot.js'.");
 
-// ==================== DASHBOARD ====================
-app.get('/', (req, res) => {
-    const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Zero-Cost Flash Loan Bot</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-        body { background: linear-gradient(135deg, #0a0f1e 0%, #0d1525 100%); min-height: 100vh; padding: 20px; color: #e2e8f0; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        .header { text-align: center; margin-bottom: 25px; }
-        h1 { font-size: 1.5rem; background: linear-gradient(135deg, #f0b90b, #ffd700); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-        .badge { display: inline-block; background: #10b981; padding: 2px 10px; border-radius: 20px; font-size: 0.65rem; margin-left: 8px; }
-        .zero-badge { background: #ef4444; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 15px; margin-bottom: 20px; }
-        .card { background: rgba(255,255,255,0.05); backdrop-filter: blur(10px); border-radius: 14px; padding: 15px; border: 1px solid rgba(255,255,255,0.08); }
-        .card-title { font-size: 0.7rem; font-weight: 600; margin-bottom: 10px; color: #f0b90b; text-transform: uppercase; letter-spacing: 1px; }
-        .stat-value { font-size: 1.8rem; font-weight: bold; }
-        .positive { color: #10b981; }
-        .profit { color: #f0b90b; }
-        .zero-cost { color: #10b981; }
-        .scrollable { max-height: 280px; overflow-y: auto; }
-        table { width: 100%; border-collapse: collapse; font-size: 0.7rem; }
-        th, td { padding: 8px 5px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.08); }
-        button { background: linear-gradient(135deg, #f0b90b, #ffd700); border: none; padding: 8px 20px; border-radius: 8px; font-weight: bold; cursor: pointer; color: #0a0f1e; margin: 5px; }
-        .text-center { text-align: center; }
-        .mt-20 { margin-top: 20px; }
-        .text-small { font-size: 0.7rem; }
-        .log-entry { padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 0.6rem; font-family: monospace; }
-        .log-error { color: #ef4444; }
-        .log-success { color: #10b981; }
-        .log-opportunity { color: #f0b90b; }
-        .log-info { color: #888; }
-    </style>
-</head>
-<body>
-<div class="container">
-    <div class="header">
-        <h1>Zero-Cost Flash Loan Bot <span class="badge">$0 CAPITAL</span><span class="badge zero-badge">$0 GAS FOR FAILURES</span></h1>
-        <p class="text-small">No upfront capital | Zero cost for unsuccessful trades | Only pay gas from profits</p>
-    </div>
-
-    <div class="grid">
-        <div class="card">
-            <div class="card-title">💰 PROFIT (Wallet)</div>
-            <div class="stat-value positive" id="balance">$0.00</div>
-            <div>Total Profit: <span id="totalProfit">$0.00</span></div>
-        </div>
-        <div class="card">
-            <div class="card-title">⚡ STATS</div>
-            <div>Attempts: <span id="totalAttempts">0</span> | ✅ <span id="successTxs">0</span> | ❌ <span id="failedTxs">0</span></div>
-            <div>Gas Paid: $<span id="gasPaid">0.00</span> (from profit only)</div>
-            <div>Success Rate: <span id="successRate">0</span>%</div>
-        </div>
-        <div class="card">
-            <div class="card-title">🎯 ZERO-COST GUARANTEE</div>
-            <div class="zero-cost">✅ Failed trades: $0.00</div>
-            <div class="zero-cost">✅ Flash loan capital: $0.00</div>
-            <div>Status: <span id="status" class="profit">🟢 RUNNING</span></div>
-        </div>
-    </div>
-
-    <div class="grid">
-        <div class="card">
-            <div class="card-title">📋 TRADE HISTORY</div>
-            <div class="scrollable">
-                <table id="tradesTable">
-                    <thead><tr><th>Time</th><th>Token</th><th>Result</th></tr></thead>
-                    <tbody><tr><td colspan="3" class="text-center">No trades yet</td></tr></tbody>
-                </table>
-            </div>
-        </div>
-        <div class="card">
-            <div class="card-title">📝 LIVE LOGS</div>
-            <div class="scrollable" id="logsContainer">Initializing...</div>
-        </div>
-    </div>
-
-    <div class="text-center mt-20">
-        <button onclick="resetSimulation()">🔄 Reset</button>
-        <button onclick="location.reload()">⟳ Refresh</button>
-    </div>
-</div>
-
-<script>
-    async function fetchState() {
-        try {
-            const response = await fetch('/api/state');
-            const data = await response.json();
-            
-            document.getElementById('balance').innerHTML = '$' + (data.wallet?.balanceUSD || 0).toFixed(2);
-            document.getElementById('totalProfit').innerHTML = '$' + (data.stats?.totalProfitUSD || 0).toFixed(2);
-            document.getElementById('totalAttempts').innerHTML = data.stats?.totalAttempts || 0;
-            document.getElementById('successTxs').innerHTML = data.stats?.successfulTrades || 0;
-            document.getElementById('failedTxs').innerHTML = data.stats?.failedTrades || 0;
-            document.getElementById('gasPaid').innerHTML = (data.stats?.totalGasPaidFromProfit || 0).toFixed(4);
-            document.getElementById('successRate').innerHTML = data.stats?.successRate || 0;
-            
-            // Update trade history
-            const tradesBody = document.querySelector('#tradesTable tbody');
-            if (data.tradeHistory && data.tradeHistory.length > 0) {
-                let html = '';
-                for (let i = 0; i < data.tradeHistory.length; i++) {
-                    const t = data.tradeHistory[i];
-                    const time = new Date(t.timestamp).toLocaleTimeString();
-                    if (t.success) {
-                        html += '<tr><td>' + time + '</td><td>' + t.token + '</td><td class="positive">+$' + t.profit.toFixed(2) + '</td></tr>';
-                    } else {
-                        html += '<tr><td>' + time + '</td><td>' + t.token + '</td><td class="zero-cost">$0 (failed)</td></tr>';
-                    }
-                }
-                tradesBody.innerHTML = html;
-            } else {
-                tradesBody.innerHTML = '<tr><td colspan="3" class="text-center">No trades yet</td></tr>';
-            }
-            
-            // Update logs
-            const logsContainer = document.getElementById('logsContainer');
-            if (data.logs && data.logs.length > 0) {
-                let html = '';
-                for (let i = 0; i < data.logs.length; i++) {
-                    const log = data.logs[i];
-                    let logClass = 'log-info';
-                    if (log.type === 'error') logClass = 'log-error';
-                    else if (log.type === 'success') logClass = 'log-success';
-                    else if (log.type === 'opportunity') logClass = 'log-opportunity';
-                    html += '<div class="log-entry ' + logClass + '">[' + new Date(log.timestamp).toLocaleTimeString() + '] ' + log.message + '</div>';
-                }
-                logsContainer.innerHTML = html;
-            } else {
-                logsContainer.innerHTML = '<div class="log-entry log-info">Waiting for bot to start...</div>';
-            }
-        } catch (error) {
-            console.error('Fetch error:', error);
-            document.getElementById('logsContainer').innerHTML = '<div class="log-entry log-error">Error connecting to bot API. Make sure the bot is running.</div>';
-        }
-    }
-    
-    async function resetSimulation() {
-        await fetch('/api/reset', { method: 'POST' });
-        setTimeout(fetchState, 500);
-    }
-    
-    fetchState();
-    setInterval(fetchState, 2000);
-</script>
-</body>
-</html>`;
-    res.send(html);
-});
-
-// ==================== MAIN LOOP ====================
-async function mainLoop() {
-    addLog('🚀 ZERO-COST FLASH LOAN BOT STARTED', 'success');
-    addLog('⚡ Simulating flash loan arbitrage...', 'info');
-    
-    while (state.isRunning) {
-        await executeTrade();
-        await new Promise(resolve => setTimeout(resolve, 30000));
+    } catch (error) {
+        console.error("❌ Deployment failed:", error.message);
     }
 }
 
-// ==================== START ====================
-async function start() {
-    console.log('\n' + '='.repeat(60));
-    console.log('⚡ ZERO-COST FLASH LOAN ARBITRAGE BOT');
-    console.log('='.repeat(60));
-    console.log('\n💰 Starting Balance: $0.00');
-    console.log('✅ Failed trades: $0.00 cost');
-    console.log('🌐 Dashboard: http://localhost:' + PORT + '\n');
-    
-    addLog('Bot initializing...', 'info');
-    
-    mainLoop().catch(console.error);
-    app.listen(PORT, '0.0.0.0', function() {
-        console.log('Web dashboard running on http://localhost:' + PORT);
-    });
-}
-
-start();
+deploy();
