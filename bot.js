@@ -40,7 +40,9 @@ const config = {
     riskPercent: 0.25,
     dogePerContract: 100,  // 1 contract = 100 DOGE
     walletPerContract: 0.0066135,  // Base reference: $0.0066135 wallet = 1 contract at 75x leverage (this will be recalculated dynamically)
-    stepCooldownMs: 10 * 60 * 1000  // 5 minutes cooldown between martingale steps
+    stepCooldownMs: 10 * 60 * 1000,  // 5 minutes cooldown between martingale steps
+    deepseekApiKey: process.env.DEEPSEEK_API_KEY || '',  // Add your DeepSeek API key
+    aiEnabled: true
 };
 
 let market = {
@@ -58,7 +60,9 @@ let market = {
     currentBaseVolume: parseInt(process.env.BASE_VOLUME) || 1,
     currentBaseDoge: 0,
     currentRiskAmount: 0,
-    lastBaseUpdate: Date.now()
+    lastBaseUpdate: Date.now(),
+    aiRecommendation: null,
+    aiLastUpdate: 0
 };
 
 let tradeHistory = [];
@@ -441,6 +445,78 @@ function startWS() {
     });
 }
 
+async function getDeepSeekRecommendation() {
+    if (!config.deepseekApiKey || !config.aiEnabled) return null;
+    
+    const s1 = accountStates[1];
+    const s2 = accountStates[2];
+    const totalEquity = (s1?.currentEquity || 0) + (s2?.currentEquity || 0);
+    const totalEquityInitial = market.initialTotalEquity || totalEquity;
+    const drawdownPercent = ((market.peakEquity - totalEquity) / market.peakEquity * 100).toFixed(2);
+    
+    const longPosition = s1?.volume > 0 ? `LONG active: ${s1.volume} contracts (${s1.volume * config.dogePerContract} DOGE), ROI: ${s1.roi.toFixed(2)}%, Entry: ${s1.entryPrice?.toFixed(8)}, Target: ${s1.targetPrice?.toFixed(8)}` : 'LONG: No position';
+    const shortPosition = s2?.volume > 0 ? `SHORT active: ${s2.volume} contracts (${s2.volume * config.dogePerContract} DOGE), ROI: ${s2.roi.toFixed(2)}%, Entry: ${s2.entryPrice?.toFixed(8)}, Target: ${s2.targetPrice?.toFixed(8)}` : 'SHORT: No position';
+    
+    const recentTrades = tradeHistory.slice(0, 5).map(t => `${t.side} | ${t.roi} | PnL: $${t.netPnlUsdt}`).join('; ');
+    
+    const prompt = `You are a professional crypto trading advisor for a Martingale DOGE bot. Analyze the current dashboard data and give a RECOMMENDATION (what to do now) in 2-3 short sentences. Be direct and actionable.
+
+DASHBOARD DATA:
+- Total Wallet: $${totalEquity.toFixed(8)} (Initial: $${totalEquityInitial.toFixed(8)})
+- Total P&L: ${market.totalNetGain >= 0 ? '+' : ''}$${market.totalNetGain.toFixed(8)} (${market.growthPct.toFixed(2)}%)
+- Max Drawdown: ${drawdownPercent}%
+- Win Rate: ${market.totalTrades > 0 ? ((market.winningTrades / market.totalTrades) * 100).toFixed(1) : 0}% (${market.totalTrades} trades)
+- Spread: ${market.spread.toFixed(3)}% (Max start: ${config.maxStartSpread}%)
+- Current Price: BID ${market.bid?.toFixed(8)} | ASK ${market.ask?.toFixed(8)}
+- ${longPosition}
+- ${shortPosition}
+- Recent Trades: ${recentTrades || 'none'}
+- Current Base Volume: ${market.currentBaseVolume} contract(s) (${market.currentBaseDoge} DOGE)
+- Auto-compounding: ${config.autoCompound ? 'ON' : 'OFF'} (${config.riskPercent}% risk)
+
+Based on the data, provide:
+1. RECOMMENDATION: (e.g., "Continue current strategy", "Reduce position size", "Take profits now", "Wait for better entry", "Consider pausing bot")
+2. REASON: Brief explanation
+3. RISK LEVEL: Low/Medium/High
+
+Be concise and practical for immediate action.`;
+
+    try {
+        const response = await axios.post('https://api.deepseek.com/v1/chat/completions', {
+            model: 'deepseek-chat',
+            messages: [
+                { role: 'system', content: 'You are a crypto trading advisor. Give concise, actionable recommendations based on the data.' },
+                { role: 'user', content: prompt }
+            ],
+            temperature: 0.7,
+            max_tokens: 300
+        }, {
+            headers: {
+                'Authorization': `Bearer ${config.deepseekApiKey}`,
+                'Content-Type': 'application/json'
+            },
+            timeout: 10000
+        });
+        
+        const recommendation = response.data.choices[0].message.content;
+        market.aiRecommendation = {
+            text: recommendation,
+            timestamp: Date.now(),
+            time: new Date().toLocaleString()
+        };
+        market.aiLastUpdate = Date.now();
+        
+        console.log(`\n🤖 AI RECOMMENDATION (${new Date().toLocaleTimeString()}):`);
+        console.log(recommendation);
+        console.log('');
+        
+        return recommendation;
+    } catch (error) {
+        console.error('DeepSeek API error:', error.message);
+        return null;
+    }
+}
+
 async function processMartingale() {
     for (const acc of config.accounts) {
         const state = accountStates[acc.accountId];
@@ -656,6 +732,11 @@ async function backgroundLoop() {
         if (market.status === 'Active') {
             await processMartingale();
         }
+        
+        // Update AI recommendation every 2 minutes
+        if (config.aiEnabled && config.deepseekApiKey && (!market.aiLastUpdate || (Date.now() - market.aiLastUpdate) > 120000)) {
+            await getDeepSeekRecommendation();
+        }
     } catch (e) {
         console.error('Background loop error:', e);
     }
@@ -715,7 +796,9 @@ app.get('/api/status', (req, res) => {
             currentBaseVolume: market.currentBaseVolume,
             currentBaseDoge: market.currentBaseDoge,
             currentRiskAmount: market.currentRiskAmount,
-            dogePerContract: config.dogePerContract
+            dogePerContract: config.dogePerContract,
+            aiRecommendation: market.aiRecommendation,
+            aiEnabled: config.aiEnabled
         },
         accounts: accountsWithInfo,
         tradeHistory,
@@ -855,6 +938,11 @@ app.get('/api/verify', async (req, res) => {
     });
 });
 
+app.post('/api/ai-refresh', async (req, res) => {
+    const recommendation = await getDeepSeekRecommendation();
+    res.json({ recommendation: market.aiRecommendation });
+});
+
 app.get('/', (req, res) => {
     const requiredPriceMovePct = (config.takeProfitPct / config.leverage).toFixed(3);
     
@@ -885,6 +973,9 @@ app.get('/', (req, res) => {
         .chart-container { position: relative; height: 280px; width: 100%; }
         .compound-info { background: #00D1B210; border: 1px solid #00D1B230; border-radius: 8px; padding: 12px; margin-top: 10px; }
         .doge-badge { background: #F3BA2F20; color: #F3BA2F; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: bold; }
+        .ai-card { background: linear-gradient(135deg, #1E1B4B 0%, #131824 100%); border: 1px solid #6366F1; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+        .ai-text { font-size: 14px; line-height: 1.5; color: #C4B5FD; }
+        .refresh-ai { background: #6366F120; border-color: #6366F1; color: #6366F1; font-size: 12px; padding: 4px 12px; }
     </style>
 </head>
 <body class="p-6">
@@ -905,6 +996,22 @@ app.get('/', (req, res) => {
                 <button onclick="forceSync()" class="sync-btn">🔄 FORCE SYNC</button>
                 <button onclick="emergencyClose()">⚠️ EMERGENCY CLOSE</button>
             </div>
+        </div>
+
+        <!-- AI RECOMMENDATION CARD -->
+        <div class="ai-card mb-6">
+            <div class="flex justify-between items-center mb-3">
+                <div class="flex items-center gap-2">
+                    <span class="text-xl">🤖</span>
+                    <h3 class="font-bold text-indigo-400">DeepSeek AI Trading Advisor</h3>
+                    <span class="text-[9px] bg-indigo-500/30 px-2 py-0.5 rounded">LIVE ANALYSIS</span>
+                </div>
+                <button onclick="refreshAI()" class="refresh-ai rounded">🔄 Refresh</button>
+            </div>
+            <div id="aiRecommendation" class="ai-text">
+                Loading AI recommendation...
+            </div>
+            <div id="aiTimestamp" class="text-[9px] text-slate-500 mt-2"></div>
         </div>
 
         <div class="wallet-card rounded-2xl p-6 mb-8">
@@ -1015,7 +1122,7 @@ app.get('/', (req, res) => {
                         </tr>
                     </thead>
                     <tbody id="tradesBody">
-                        <tr><td colspan="11" class="text-center text-slate-500 p-12">No closed trades yet</tr>
+                        <tr><td colspan="11" class="text-center text-slate-500 p-12">No closed trades yet</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -1037,6 +1144,18 @@ app.get('/', (req, res) => {
                 await fetch('/api/close', {method: 'POST'});
                 alert('Emergency liquidation initiated');
             }
+        }
+        
+        async function refreshAI() {
+            const btn = event.target;
+            btn.textContent = '⟳ REFRESHING...';
+            const res = await fetch('/api/ai-refresh', {method: 'POST'});
+            const data = await res.json();
+            if (data.recommendation) {
+                document.getElementById('aiRecommendation').innerHTML = data.recommendation.text.replace(/\\n/g, '<br>');
+                document.getElementById('aiTimestamp').innerHTML = 'Last updated: ' + data.recommendation.time;
+            }
+            setTimeout(() => btn.textContent = '🔄 Refresh', 1000);
         }
         
         function formatNumber(num) {
@@ -1165,6 +1284,12 @@ app.get('/', (req, res) => {
                 document.getElementById('bidPrice').textContent = (data.market.bid || 0).toFixed(8);
                 document.getElementById('askPrice').textContent = (data.market.ask || 0).toFixed(8);
                 
+                // Update AI recommendation
+                if (data.market.aiRecommendation) {
+                    document.getElementById('aiRecommendation').innerHTML = data.market.aiRecommendation.text.replace(/\\n/g, '<br>');
+                    document.getElementById('aiTimestamp').innerHTML = 'Last updated: ' + data.market.aiRecommendation.time;
+                }
+                
                 const long = data.accounts.find(a => a.direction === 'buy');
                 const short = data.accounts.find(a => a.direction === 'sell');
                 
@@ -1254,5 +1379,6 @@ app.listen(config.port, '0.0.0.0', () => {
     console.log(`   $4.00 risk amount → 2 contracts → 200 DOGE`);
     console.log(`   $10.00 risk amount → 5 contracts → 500 DOGE`);
     console.log(`   $20.00 risk amount → 10 contracts → 1,000 DOGE`);
-    console.log(`   $100.00 risk amount → 50 contracts → 5,000 DOGE\n`);
+    console.log(`   $100.00 risk amount → 50 contracts → 5,000 DOGE`);
+    console.log(`\n🤖 AI Advisor: ${config.deepseekApiKey ? 'ENABLED' : 'DISABLED (add DEEPSEEK_API_KEY to .env)'}\n`);
 });
