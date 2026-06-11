@@ -299,7 +299,7 @@ function startWS() {
     ws.on('close', () => setTimeout(startWS, 5000));
 }
 
-// ==================== SMART AI CONTROLLER - AUTO ADJUSTS EVERY SETTING ====================
+// ==================== SMART AI CONTROLLER ====================
 
 async function smartAIController() {
     const long = accountStates[1];
@@ -311,8 +311,6 @@ async function smartAIController() {
     const shortRoi = short?.roi || 0;
     const longVol = long?.volume || 0;
     const shortVol = short?.volume || 0;
-    const combinedPnL = (long?.unrealizedUsdt || 0) + (short?.unrealizedUsdt || 0);
-    const efficiency = market.totalTrades > 0 ? (market.winningTrades / market.totalTrades) : 0.5;
     const isBothNegative = longRoi < 0 && shortRoi < 0;
     const isOneProfitable = (longRoi > 0 && shortRoi < 0) || (longRoi < 0 && shortRoi > 0);
     
@@ -326,8 +324,7 @@ async function smartAIController() {
     
     // ===== 1. EMERGENCY: BOTH POSITIONS LOSING =====
     if (isBothNegative && longVol > 0 && shortVol > 0 && drawdown > 8) {
-        console.log(`🚨 EMERGENCY: Both positions losing! LONG: ${longRoi.toFixed(2)}%, SHORT: ${shortRoi.toFixed(2)}%`);
-        console.log(`🔒 Closing BOTH positions to stop bleeding...`);
+        console.log(`🚨 EMERGENCY: Both positions losing! Closing both...`);
         await closePosition(config.accounts[0], long);
         await closePosition(config.accounts[1], short);
         emergencyAction = true;
@@ -336,11 +333,11 @@ async function smartAIController() {
     // ===== 2. CLOSE LOSING POSITION WHEN ONE IS PROFITABLE =====
     else if (isOneProfitable) {
         if (longRoi < 0 && shortRoi > 0 && longVol > 0) {
-            console.log(`📉 Closing losing LONG position (${longRoi.toFixed(2)}%) while SHORT is profitable`);
+            console.log(`📉 Closing losing LONG position (${longRoi.toFixed(2)}%)`);
             await closePosition(config.accounts[0], long);
             changes.push(`Closed losing LONG position to stop losses`);
         } else if (shortRoi < 0 && longRoi > 0 && shortVol > 0) {
-            console.log(`📉 Closing losing SHORT position (${shortRoi.toFixed(2)}%) while LONG is profitable`);
+            console.log(`📉 Closing losing SHORT position (${shortRoi.toFixed(2)}%)`);
             await closePosition(config.accounts[1], short);
             changes.push(`Closed losing SHORT position to stop losses`);
         }
@@ -350,16 +347,13 @@ async function smartAIController() {
     let newLeverage = config.leverage;
     if (drawdown > 12) {
         newLeverage = 25;
-        if (newLeverage !== config.leverage) changes.push(`Leverage: ${config.leverage}x → 25x (drawdown protection)`);
+        if (newLeverage !== config.leverage) changes.push(`Leverage: ${config.leverage}x → 25x`);
     } else if (drawdown > 8) {
         newLeverage = 50;
-        if (newLeverage !== config.leverage) changes.push(`Leverage: ${config.leverage}x → 50x (moderate drawdown)`);
+        if (newLeverage !== config.leverage) changes.push(`Leverage: ${config.leverage}x → 50x`);
     } else if (winRate > 70 && drawdown < 5 && totalEquity > market.initialTotalEquity) {
         newLeverage = 75;
-        if (newLeverage !== config.leverage) changes.push(`Leverage: ${config.leverage}x → 75x (high win rate ${winRate.toFixed(0)}%)`);
-    } else if (winRate < 40) {
-        newLeverage = 25;
-        if (newLeverage !== config.leverage) changes.push(`Leverage: ${config.leverage}x → 25x (low win rate)`);
+        if (newLeverage !== config.leverage) changes.push(`Leverage: ${config.leverage}x → 75x`);
     }
     
     if (newLeverage !== config.leverage) {
@@ -374,13 +368,10 @@ async function smartAIController() {
     let newRiskPercent = config.riskPercent;
     if (drawdown > 10) {
         newRiskPercent = Math.max(0.15, config.riskPercent * 0.5);
-        if (newRiskPercent !== config.riskPercent) changes.push(`Risk: ${config.riskPercent}% → ${newRiskPercent}% (drawdown protection)`);
+        if (newRiskPercent !== config.riskPercent) changes.push(`Risk: ${config.riskPercent}% → ${newRiskPercent.toFixed(2)}%`);
     } else if (winRate > 70 && drawdown < 5) {
         newRiskPercent = Math.min(1.0, config.riskPercent * 1.3);
-        if (newRiskPercent !== config.riskPercent) changes.push(`Risk: ${config.riskPercent}% → ${newRiskPercent}% (high win rate)`);
-    } else if (winRate < 40) {
-        newRiskPercent = Math.max(0.2, config.riskPercent * 0.7);
-        if (newRiskPercent !== config.riskPercent) changes.push(`Risk: ${config.riskPercent}% → ${newRiskPercent}% (conservative)`);
+        if (newRiskPercent !== config.riskPercent) changes.push(`Risk: ${config.riskPercent}% → ${newRiskPercent.toFixed(2)}%`);
     }
     if (newRiskPercent !== config.riskPercent) {
         config.riskPercent = Math.min(config.maxRiskPercent, Math.max(config.minRiskPercent, newRiskPercent));
@@ -391,13 +382,10 @@ async function smartAIController() {
     let newBaseVolume = config.baseVolume;
     if (drawdown > 10 || market.dailyFees > config.maxDailyFees) {
         newBaseVolume = Math.max(1, config.baseVolume * 0.6);
-        if (newBaseVolume !== config.baseVolume) changes.push(`Base Volume: ${config.baseVolume} → ${newBaseVolume} (reducing fees/spending)`);
+        if (newBaseVolume !== config.baseVolume) changes.push(`Base Volume: ${config.baseVolume} → ${newBaseVolume}`);
     } else if (winRate > 70 && drawdown < 5 && totalEquity > market.initialTotalEquity) {
         newBaseVolume = Math.min(10, config.baseVolume * 1.2);
-        if (newBaseVolume !== config.baseVolume) changes.push(`Base Volume: ${config.baseVolume} → ${newBaseVolume} (profitable strategy)`);
-    } else if (efficiency < config.efficiencyTarget) {
-        newBaseVolume = Math.max(1, config.baseVolume * 0.8);
-        if (newBaseVolume !== config.baseVolume) changes.push(`Base Volume: ${config.baseVolume} → ${newBaseVolume} (improving efficiency)`);
+        if (newBaseVolume !== config.baseVolume) changes.push(`Base Volume: ${config.baseVolume} → ${newBaseVolume}`);
     }
     if (newBaseVolume !== config.baseVolume) {
         config.baseVolume = Math.min(config.maxBaseVolume, Math.max(config.minBaseVolume, newBaseVolume));
@@ -409,13 +397,10 @@ async function smartAIController() {
     let newMultiplier = config.multiplier;
     if (drawdown > 8) {
         newMultiplier = 1.2;
-        if (newMultiplier !== config.multiplier) changes.push(`Multiplier: ${config.multiplier}x → 1.2x (drawdown reduction)`);
+        if (newMultiplier !== config.multiplier) changes.push(`Multiplier: ${config.multiplier}x → 1.2x`);
     } else if (winRate > 70 && drawdown < 5) {
         newMultiplier = Math.min(1.8, config.multiplier + 0.1);
-        if (newMultiplier !== config.multiplier) changes.push(`Multiplier: ${config.multiplier}x → ${newMultiplier.toFixed(1)}x (aggressive)`);
-    } else if (winRate < 45) {
-        newMultiplier = Math.max(1.1, config.multiplier - 0.1);
-        if (newMultiplier !== config.multiplier) changes.push(`Multiplier: ${config.multiplier}x → ${newMultiplier.toFixed(1)}x (conservative)`);
+        if (newMultiplier !== config.multiplier) changes.push(`Multiplier: ${config.multiplier}x → ${newMultiplier.toFixed(1)}x`);
     }
     if (newMultiplier !== config.multiplier) {
         config.multiplier = Math.min(config.maxMultiplier, Math.max(config.minMultiplier, newMultiplier));
@@ -426,13 +411,10 @@ async function smartAIController() {
     let newStepDistance = config.stepDistancePct;
     if (drawdown > 8) {
         newStepDistance = 15;
-        if (newStepDistance !== config.stepDistancePct) changes.push(`Step Trigger: -${config.stepDistancePct}% → -15% (wider trigger)`);
+        if (newStepDistance !== config.stepDistancePct) changes.push(`Step Trigger: -${config.stepDistancePct}% → -15%`);
     } else if (winRate > 70) {
         newStepDistance = 8;
-        if (newStepDistance !== config.stepDistancePct) changes.push(`Step Trigger: -${config.stepDistancePct}% → -8% (tighter trigger)`);
-    } else if (market.spread > 0.12) {
-        newStepDistance = 12;
-        if (newStepDistance !== config.stepDistancePct) changes.push(`Step Trigger: -${config.stepDistancePct}% → -12% (high spread)`);
+        if (newStepDistance !== config.stepDistancePct) changes.push(`Step Trigger: -${config.stepDistancePct}% → -8%`);
     }
     if (newStepDistance !== config.stepDistancePct) {
         config.stepDistancePct = Math.min(config.maxStepDistance, Math.max(config.minStepDistance, newStepDistance));
@@ -443,10 +425,10 @@ async function smartAIController() {
     let newMaxSpread = config.maxStartSpread;
     if (market.spread > 0.15) {
         newMaxSpread = 0.2;
-        if (newMaxSpread !== config.maxStartSpread) changes.push(`Max Spread: ${config.maxStartSpread}% → 0.2% (market spread high)`);
+        if (newMaxSpread !== config.maxStartSpread) changes.push(`Max Spread: ${config.maxStartSpread}% → 0.2%`);
     } else if (market.spread < 0.06) {
         newMaxSpread = 0.08;
-        if (newMaxSpread !== config.maxStartSpread) changes.push(`Max Spread: ${config.maxStartSpread}% → 0.08% (tight spread)`);
+        if (newMaxSpread !== config.maxStartSpread) changes.push(`Max Spread: ${config.maxStartSpread}% → 0.08%`);
     }
     if (newMaxSpread !== config.maxStartSpread) {
         config.maxStartSpread = Math.min(config.maxMaxStartSpread, Math.max(config.minMaxStartSpread, newMaxSpread));
@@ -464,13 +446,13 @@ async function smartAIController() {
         settingsChanged = true;
     }
     
-    // ===== 10. UPDATE TARGET PRICES IF LEVERAGE CHANGED =====
+    // ===== UPDATE TARGET PRICES =====
     if (settingsChanged) {
         if (long?.volume > 0) long.targetPrice = calculateTargetPrice(long);
         if (short?.volume > 0) short.targetPrice = calculateTargetPrice(short);
     }
     
-    // ===== 11. UPDATE BASE VOLUME FROM WALLET =====
+    // ===== UPDATE BASE VOLUME FROM WALLET =====
     if (config.autoCompound && totalEquity > 0 && market.bid > 0) {
         const autoVolume = calculateBaseVolumeFromWallet(totalEquity);
         if (autoVolume !== market.currentBaseVolume) {
@@ -690,195 +672,10 @@ app.post('/api/ai-refresh', async (req, res) => {
     res.json({ recommendation: market.aiRecommendation });
 });
 
-// Modern Clean Dashboard
+// ==================== DASHBOARD HTML ====================
 app.get('/', (req, res) => {
-    const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Martingale DOGE - Smart AI Control</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
-        body { background: #f5f7fa; padding: 20px; }
-        .container { max-width: 1400px; margin: 0 auto; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 15px; }
-        h1 { font-size: 24px; color: #1e293b; }
-        .badge { background: #10b981; color: white; padding: 4px 12px; border-radius: 20px; font-size: 12px; margin-left: 10px; }
-        .ai-badge { background: #8b5cf6; }
-        .btn { padding: 8px 16px; border-radius: 8px; border: none; cursor: pointer; font-weight: 500; }
-        .btn-danger { background: #ef4444; color: white; }
-        .btn-outline { background: white; border: 1px solid #e2e8f0; color: #1e293b; }
-        .btn-outline:hover { background: #f1f5f9; }
-        .card { background: white; border-radius: 16px; padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
-        .ai-card { background: linear-gradient(135deg, #667eea, #764ba2); color: white; }
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }
-        .stat-card { background: white; border-radius: 12px; padding: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
-        .stat-label { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; }
-        .stat-value { font-size: 24px; font-weight: 700; color: #1e293b; margin-top: 5px; }
-        .positive { color: #10b981; }
-        .negative { color: #ef4444; }
-        .positions-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
-        .position-card { background: #f8fafc; border-radius: 12px; padding: 16px; border: 1px solid #e2e8f0; }
-        .position-title { font-size: 14px; font-weight: 600; margin-bottom: 12px; }
-        .position-title.long { color: #10b981; }
-        .position-title.short { color: #ef4444; }
-        .pos-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 13px; }
-        .config-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-top: 15px; }
-        .config-item { background: #f8fafc; border-radius: 8px; padding: 10px; text-align: center; }
-        .config-value { font-size: 18px; font-weight: 700; color: #1e293b; }
-        table { width: 100%; border-collapse: collapse; font-size: 12px; }
-        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #e2e8f0; }
-        .update-time { font-size: 11px; color: #64748b; margin-top: 10px; }
-        @media (max-width: 768px) { .positions-grid { grid-template-columns: 1fr; } }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <div>
-                <h1>MARTINGALE DOGE <span class="badge">AI CONTROLLED</span><span class="badge ai-badge">AUTO-OPTIMIZE</span></h1>
-                <p style="color: #64748b; font-size: 13px; margin-top: 5px;">AI auto-adjusts ALL settings every 15 seconds to maximize profit & efficiency</p>
-            </div>
-            <div>
-                <button class="btn btn-outline" onclick="forceSync()">🔄 Force Sync</button>
-                <button class="btn btn-danger" onclick="emergencyClose()">⚠️ Emergency Close</button>
-            </div>
-        </div>
-
-        <div class="card ai-card">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-                <div><strong>🧠 SMART AI CONTROLLER</strong> <span style="font-size: 11px; opacity: 0.8;">Analyzes & adjusts every 15 seconds</span></div>
-                <button class="btn" style="background: rgba(255,255,255,0.2); color: white;" onclick="refreshAI()">🔄 Force AI</button>
-            </div>
-            <div id="aiRecommendation" style="margin-top: 15px; font-size: 13px; white-space: pre-line;">Initializing AI...</div>
-            <div id="aiTime" class="update-time" style="color: rgba(255,255,255,0.7);"></div>
-        </div>
-
-        <div class="stats-grid">
-            <div class="stat-card"><div class="stat-label">TOTAL WALLET</div><div class="stat-value" id="totalWallet">$0.00</div><div id="walletChange" class="stat-label"></div></div>
-            <div class="stat-card"><div class="stat-label">TOTAL P&L</div><div class="stat-value" id="totalPnl">$0.00</div><div id="pnlPercent" class="stat-label"></div></div>
-            <div class="stat-card"><div class="stat-label">DRAWDOWN</div><div class="stat-value" id="drawdown">0%</div><div class="stat-label">Peak: <span id="peakEquity">$0.00</span></div></div>
-            <div class="stat-card"><div class="stat-label">WIN RATE</div><div class="stat-value" id="winRate">0%</div><div class="stat-label">Trades: <span id="tradeCount">0</span></div></div>
-            <div class="stat-card"><div class="stat-label">DAILY FEES</div><div class="stat-value" id="dailyFees">$0.00</div><div class="stat-label">Spending limit</div></div>
-            <div class="stat-card"><div class="stat-label">MARKET</div><div class="stat-value" id="spread">0.000%</div><div class="stat-label">Spread</div></div>
-        </div>
-
-        <div class="positions-grid">
-            <div class="position-card"><div class="position-title long">📈 LONG POSITION</div>
-                <div class="pos-row"><span>ROI:</span><strong id="lRoi" class="positive">0%</strong></div>
-                <div class="pos-row"><span>PnL:</span><strong id="lPnl">$0.00</strong></div>
-                <div class="pos-row"><span>Volume:</span><span id="lVol">0</span> contracts</div>
-                <div class="pos-row"><span>DOGE:</span><span id="lDoge">0</span></div>
-                <div class="pos-row"><span>Entry/Target:</span><span id="lPrices">0 / 0</span></div>
-                <div class="pos-row"><span>Status:</span><span id="lAction">Idle</span></div>
-            </div>
-            <div class="position-card"><div class="position-title short">📉 SHORT POSITION</div>
-                <div class="pos-row"><span>ROI:</span><strong id="sRoi" class="negative">0%</strong></div>
-                <div class="pos-row"><span>PnL:</span><strong id="sPnl">$0.00</strong></div>
-                <div class="pos-row"><span>Volume:</span><span id="sVol">0</span> contracts</div>
-                <div class="pos-row"><span>DOGE:</span><span id="sDoge">0</span></div>
-                <div class="pos-row"><span>Entry/Target:</span><span id="sPrices">0 / 0</span></div>
-                <div class="pos-row"><span>Status:</span><span id="sAction">Idle</span></div>
-            </div>
-        </div>
-
-        <div class="card">
-            <div class="stat-label">⚙️ AI AUTO-OPTIMIZED CONFIGURATION</div>
-            <div class="config-grid">
-                <div class="config-item"><div class="stat-label">LEVERAGE</div><div class="config-value" id="cfgLeverage">50</div><div style="font-size:10px;">x</div></div>
-                <div class="config-item"><div class="stat-label">TAKE PROFIT</div><div class="config-value" id="cfgTP">10</div><div style="font-size:10px;">%</div></div>
-                <div class="config-item"><div class="stat-label">BASE VOLUME</div><div class="config-value" id="cfgVolume">1</div><div style="font-size:10px;">contracts</div></div>
-                <div class="config-item"><div class="stat-label">MULTIPLIER</div><div class="config-value" id="cfgMultiplier">1.5</div><div style="font-size:10px;">x</div></div>
-                <div class="config-item"><div class="stat-label">STEP TRIGGER</div><div class="config-value" id="cfgStep">10</div><div style="font-size:10px;">%</div></div>
-                <div class="config-item"><div class="stat-label">RISK</div><div class="config-value" id="cfgRisk">0.5</div><div style="font-size:10px;">%</div></div>
-                <div class="config-item"><div class="stat-label">MAX SPREAD</div><div class="config-value" id="cfgSpread">0.1</div><div style="font-size:10px;">%</div></div>
-                <div class="config-item"><div class="stat-label">AUTO-COMPOUND</div><div class="config-value" id="cfgCompound">ON</div></div>
-            </div>
-        </div>
-
-        <div class="card">
-            <div class="stat-label">📋 CLOSED TRADES</div>
-            <div style="overflow-x: auto; margin-top: 15px;">
-                <table><thead><tr><th>SIDE</th><th>TIME</th><th>VOL</th><th>ENTRY</th><th>EXIT</th><th>ROI</th><th>PNL</th></tr></thead>
-                <tbody id="tradesBody"><tr><td colspan="7" style="text-align: center;">Loading...</td></tr></tbody></table>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        async function forceSync() { await fetch('/api/force-sync', {method: 'POST'}); }
-        async function emergencyClose() { if(confirm('Close ALL positions?')) await fetch('/api/close', {method: 'POST'}); }
-        async function refreshAI() { await fetch('/api/ai-refresh', {method: 'POST'}); }
-        
-        setInterval(async () => {
-            try {
-                const res = await fetch('/api/status');
-                const data = await res.json();
-                
-                document.getElementById('totalWallet').innerHTML = '$' + (data.market.totalEquity?.toFixed(4) || '0.00');
-                document.getElementById('totalPnl').innerHTML = (data.market.totalNetGain >= 0 ? '+' : '') + '$' + (data.market.totalNetGain?.toFixed(4) || '0.00');
-                document.getElementById('drawdown').innerHTML = (data.market.maxDrawdown || 0).toFixed(2) + '%';
-                document.getElementById('peakEquity').innerHTML = '$' + (data.market.peakEquity?.toFixed(4) || '0.00');
-                document.getElementById('winRate').innerHTML = (data.market.winRate || 0) + '%';
-                document.getElementById('tradeCount').innerHTML = data.market.totalTrades || 0;
-                document.getElementById('dailyFees').innerHTML = '$' + (data.market.dailyFees?.toFixed(6) || '0.00');
-                document.getElementById('spread').innerHTML = (data.market.spread || 0).toFixed(3) + '%';
-                
-                if (data.market.aiRecommendation) {
-                    document.getElementById('aiRecommendation').innerHTML = data.market.aiRecommendation.text.replace(/\\n/g, '<br>');
-                    document.getElementById('aiTime').innerHTML = 'Last update: ' + data.market.aiRecommendation.time;
-                }
-                
-                const long = data.accounts?.[0];
-                const short = data.accounts?.[1];
-                
-                if (long) {
-                    document.getElementById('lRoi').innerHTML = (long.roi >= 0 ? '+' : '') + long.roi.toFixed(2) + '%';
-                    document.getElementById('lPnl').innerHTML = (long.unrealizedUsdt >= 0 ? '+' : '') + '$' + long.unrealizedUsdt?.toFixed(4);
-                    document.getElementById('lVol').innerHTML = long.volume || 0;
-                    document.getElementById('lDoge').innerHTML = long.dogeAmount || 0;
-                    document.getElementById('lPrices').innerHTML = (long.entryPrice?.toFixed(6) || '0') + ' / ' + (long.targetPrice?.toFixed(6) || '0');
-                    document.getElementById('lAction').innerHTML = long.lastAction || 'Idle';
-                    document.getElementById('lRoi').className = long.roi >= 0 ? 'positive' : 'negative';
-                }
-                if (short) {
-                    document.getElementById('sRoi').innerHTML = (short.roi >= 0 ? '+' : '') + short.roi.toFixed(2) + '%';
-                    document.getElementById('sPnl').innerHTML = (short.unrealizedUsdt >= 0 ? '+' : '') + '$' + short.unrealizedUsdt?.toFixed(4);
-                    document.getElementById('sVol').innerHTML = short.volume || 0;
-                    document.getElementById('sDoge').innerHTML = short.dogeAmount || 0;
-                    document.getElementById('sPrices').innerHTML = (short.entryPrice?.toFixed(6) || '0') + ' / ' + (short.targetPrice?.toFixed(6) || '0');
-                    document.getElementById('sAction').innerHTML = short.lastAction || 'Idle';
-                    document.getElementById('sRoi').className = short.roi >= 0 ? 'positive' : 'negative';
-                }
-                
-                if (data.market.currentConfig) {
-                    document.getElementById('cfgLeverage').innerHTML = data.market.currentConfig.leverage;
-                    document.getElementById('cfgTP').innerHTML = data.market.currentConfig.takeProfitPct;
-                    document.getElementById('cfgVolume').innerHTML = data.market.currentConfig.baseVolume;
-                    document.getElementById('cfgMultiplier').innerHTML = data.market.currentConfig.multiplier;
-                    document.getElementById('cfgStep').innerHTML = data.market.currentConfig.stepDistancePct;
-                    document.getElementById('cfgRisk').innerHTML = data.market.currentConfig.riskPercent;
-                    document.getElementById('cfgSpread').innerHTML = data.market.currentConfig.maxStartSpread;
-                    document.getElementById('cfgCompound').innerHTML = data.market.currentConfig.autoCompound ? 'ON' : 'OFF';
-                }
-                
-                let tradesHtml = '';
-                if (data.tradeHistory && data.tradeHistory.length > 0) {
-                    data.tradeHistory.slice(0, 15).forEach(t => {
-                        tradesHtml += `<tr><td class="${t.side === 'LONG' ? 'positive' : 'negative'}">${t.side}</td>
-                        <td>${t.closeTime?.split(',')[1] || ''}</td><td>${t.volume}</td>
-                        <td>${t.entryPrice}</td><td>${t.exitPrice}</td>
-                        <td class="${parseFloat(t.roi) >= 0 ? 'positive' : 'negative'}">${t.roi}</td>
-                        <td class="${parseFloat(t.pnl) >= 0 ? 'positive' : 'negative'}">$${t.pnl}</td></tr>`;
-                    });
-                } else { tradesHtml = '<tr><td colspan="7" style="text-align: center;">No trades</td></tr>'; }
-                document.getElementById('tradesBody').innerHTML = tradesHtml;
-            } catch(e) { console.error(e); }
-        }, 2000);
-    </script>
-</body>
-</html>`;
+    const html = '<!DOCTYPE html>\n<html lang="en">\n<head>\n    <meta charset="UTF-8">\n    <meta name="viewport" content="width=device-width, initial-scale=1.0">\n    <title>Martingale DOGE - Smart AI Control</title>\n    <style>\n        * { margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }\n        body { background: #f5f7fa; padding: 20px; }\n        .container { max-width: 1400px; margin: 0 auto; }\n        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 15px; }\n        h1 { font-size: 24px; color: #1e293b; }\n        .badge { background: #10b981; color: white; padding: 4px 12px; border-radius: 20px; font-size: 12px; margin-left: 10px; }\n        .ai-badge { background: #8b5cf6; }\n        .btn { padding: 8px 16px; border-radius: 8px; border: none; cursor: pointer; font-weight: 500; }\n        .btn-danger { background: #ef4444; color: white; }\n        .btn-outline { background: white; border: 1px solid #e2e8f0; color: #1e293b; }\n        .btn-outline:hover { background: #f1f5f9; }\n        .card { background: white; border-radius: 16px; padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }\n        .ai-card { background: linear-gradient(135deg, #667eea, #764ba2); color: white; }\n        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }\n        .stat-card { background: white; border-radius: 12px; padding: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }\n        .stat-label { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; }\n        .stat-value { font-size: 24px; font-weight: 700; color: #1e293b; margin-top: 5px; }\n        .positive { color: #10b981; }\n        .negative { color: #ef4444; }\n        .positions-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }\n        .position-card { background: #f8fafc; border-radius: 12px; padding: 16px; border: 1px solid #e2e8f0; }\n        .position-title { font-size: 14px; font-weight: 600; margin-bottom: 12px; }\n        .position-title.long { color: #10b981; }\n        .position-title.short { color: #ef4444; }\n        .pos-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 13px; }\n        .config-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-top: 15px; }\n        .config-item { background: #f8fafc; border-radius: 8px; padding: 10px; text-align: center; }\n        .config-value { font-size: 18px; font-weight: 700; color: #1e293b; }\n        table { width: 100%; border-collapse: collapse; font-size: 12px; }\n        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #e2e8f0; }\n        .update-time { font-size: 11px; color: #64748b; margin-top: 10px; }\n        @media (max-width: 768px) { .positions-grid { grid-template-columns: 1fr; } }\n    </style>\n</head>\n<body>\n<div class="container">\n    <div class="header">\n        <div>\n            <h1>MARTINGALE DOGE <span class="badge">AI CONTROLLED</span><span class="badge ai-badge">AUTO-OPTIMIZE</span></h1>\n            <p style="color: #64748b; font-size: 13px; margin-top: 5px;">AI auto-adjusts ALL settings every 15 seconds to maximize profit & efficiency</p>\n        </div>\n        <div>\n            <button class="btn btn-outline" onclick="forceSync()">🔄 Force Sync</button>\n            <button class="btn btn-danger" onclick="emergencyClose()">⚠️ Emergency Close</button>\n        </div>\n    </div>\n\n    <div class="card ai-card">\n        <div style="display: flex; justify-content: space-between; align-items: center;">\n            <div><strong>🧠 SMART AI CONTROLLER</strong> <span style="font-size: 11px; opacity: 0.8;">Analyzes & adjusts every 15 seconds</span></div>\n            <button class="btn" style="background: rgba(255,255,255,0.2); color: white;" onclick="refreshAI()">🔄 Force AI</button>\n        </div>\n        <div id="aiRecommendation" style="margin-top: 15px; font-size: 13px; white-space: pre-line;">Initializing AI...</div>\n        <div id="aiTime" class="update-time" style="color: rgba(255,255,255,0.7);"></div>\n    </div>\n\n    <div class="stats-grid">\n        <div class="stat-card"><div class="stat-label">TOTAL WALLET</div><div class="stat-value" id="totalWallet">$0.00</div><div id="walletChange" class="stat-label"></div></div>\n        <div class="stat-card"><div class="stat-label">TOTAL P&L</div><div class="stat-value" id="totalPnl">$0.00</div><div id="pnlPercent" class="stat-label"></div></div>\n        <div class="stat-card"><div class="stat-label">DRAWDOWN</div><div class="stat-value" id="drawdown">0%</div><div class="stat-label">Peak: <span id="peakEquity">$0.00</span></div></div>\n        <div class="stat-card"><div class="stat-label">WIN RATE</div><div class="stat-value" id="winRate">0%</div><div class="stat-label">Trades: <span id="tradeCount">0</span></div></div>\n        <div class="stat-card"><div class="stat-label">DAILY FEES</div><div class="stat-value" id="dailyFees">$0.00</div><div class="stat-label">Spending limit</div></div>\n        <div class="stat-card"><div class="stat-label">MARKET</div><div class="stat-value" id="spread">0.000%</div><div class="stat-label">Spread</div></div>\n    </div>\n\n    <div class="positions-grid">\n        <div class="position-card"><div class="position-title long">📈 LONG POSITION</div>\n            <div class="pos-row"><span>ROI:</span><strong id="lRoi" class="positive">0%</strong></div>\n            <div class="pos-row"><span>PnL:</span><strong id="lPnl">$0.00</strong></div>\n            <div class="pos-row"><span>Volume:</span><span id="lVol">0</span> contracts</div>\n            <div class="pos-row"><span>DOGE:</span><span id="lDoge">0</span></div>\n            <div class="pos-row"><span>Entry/Target:</span><span id="lPrices">0 / 0</span></div>\n            <div class="pos-row"><span>Status:</span><span id="lAction">Idle</span></div>\n        </div>\n        <div class="position-card"><div class="position-title short">📉 SHORT POSITION</div>\n            <div class="pos-row"><span>ROI:</span><strong id="sRoi" class="negative">0%</strong></div>\n            <div class="pos-row"><span>PnL:</span><strong id="sPnl">$0.00</strong></div>\n            <div class="pos-row"><span>Volume:</span><span id="sVol">0</span> contracts</div>\n            <div class="pos-row"><span>DOGE:</span><span id="sDoge">0</span></div>\n            <div class="pos-row"><span>Entry/Target:</span><span id="sPrices">0 / 0</span></div>\n            <div class="pos-row"><span>Status:</span><span id="sAction">Idle</span></div>\n        </div>\n    </div>\n\n    <div class="card">\n        <div class="stat-label">⚙️ AI AUTO-OPTIMIZED CONFIGURATION</div>\n        <div class="config-grid">\n            <div class="config-item"><div class="stat-label">LEVERAGE</div><div class="config-value" id="cfgLeverage">50</div><div style="font-size:10px;">x</div></div>\n            <div class="config-item"><div class="stat-label">TAKE PROFIT</div><div class="config-value" id="cfgTP">10</div><div style="font-size:10px;">%</div></div>\n            <div class="config-item"><div class="stat-label">BASE VOLUME</div><div class="config-value" id="cfgVolume">1</div><div style="font-size:10px;">contracts</div></div>\n            <div class="config-item"><div class="stat-label">MULTIPLIER</div><div class="config-value" id="cfgMultiplier">1.5</div><div style="font-size:10px;">x</div></div>\n            <div class="config-item"><div class="stat-label">STEP TRIGGER</div><div class="config-value" id="cfgStep">10</div><div style="font-size:10px;">%</div></div>\n            <div class="config-item"><div class="stat-label">RISK</div><div class="config-value" id="cfgRisk">0.5</div><div style="font-size:10px;">%</div></div>\n            <div class="config-item"><div class="stat-label">MAX SPREAD</div><div class="config-value" id="cfgSpread">0.1</div><div style="font-size:10px;">%</div></div>\n            <div class="config-item"><div class="stat-label">AUTO-COMPOUND</div><div class="config-value" id="cfgCompound">ON</div></div>\n        </div>\n    </div>\n\n    <div class="card">\n        <div class="stat-label">📋 CLOSED TRADES</div>\n        <div style="overflow-x: auto; margin-top: 15px;">\n            <table>\n                <thead><tr><th>SIDE</th><th>TIME</th><th>VOL</th><th>ENTRY</th><th>EXIT</th><th>ROI</th><th>PNL</th></tr></thead>\n                <tbody id="tradesBody"><tr><td colspan="7" style="text-align: center;">Loading...</td></tr></tbody>\n            </table>\n        </div>\n    </div>\n</div>\n\n<script>\n    async function forceSync() { await fetch("/api/force-sync", {method: "POST"}); }\n    async function emergencyClose() { if(confirm("Close ALL positions?")) await fetch("/api/close", {method: "POST"}); }\n    async function refreshAI() { await fetch("/api/ai-refresh", {method: "POST"}); }\n    \n    setInterval(async () => {\n        try {\n            const res = await fetch("/api/status");\n            const data = await res.json();\n            \n            document.getElementById("totalWallet").innerHTML = "$" + (data.market.totalEquity?.toFixed(4) || "0.00");\n            document.getElementById("totalPnl").innerHTML = (data.market.totalNetGain >= 0 ? "+" : "") + "$" + (data.market.totalNetGain?.toFixed(4) || "0.00");\n            document.getElementById("drawdown").innerHTML = (data.market.maxDrawdown || 0).toFixed(2) + "%";\n            document.getElementById("peakEquity").innerHTML = "$" + (data.market.peakEquity?.toFixed(4) || "0.00");\n            document.getElementById("winRate").innerHTML = (data.market.winRate || 0) + "%";\n            document.getElementById("tradeCount").innerHTML = data.market.totalTrades || 0;\n            document.getElementById("dailyFees").innerHTML = "$" + (data.market.dailyFees?.toFixed(6) || "0.00");\n            document.getElementById("spread").innerHTML = (data.market.spread || 0).toFixed(3) + "%";\n            \n            if (data.market.aiRecommendation) {\n                document.getElementById("aiRecommendation").innerHTML = data.market.aiRecommendation.text.replace(/\\n/g, "<br>");\n                document.getElementById("aiTime").innerHTML = "Last update: " + data.market.aiRecommendation.time;\n            }\n            \n            const long = data.accounts?.[0];\n            const short = data.accounts?.[1];\n            \n            if (long) {\n                document.getElementById("lRoi").innerHTML = (long.roi >= 0 ? "+" : "") + long.roi.toFixed(2) + "%";\n                document.getElementById("lPnl").innerHTML = (long.unrealizedUsdt >= 0 ? "+" : "") + "$" + (long.unrealizedUsdt?.toFixed(4) || "0.00");\n                document.getElementById("lVol").innerHTML = long.volume || 0;\n                document.getElementById("lDoge").innerHTML = long.dogeAmount || 0;\n                document.getElementById("lPrices").innerHTML = (long.entryPrice?.toFixed(6) || "0") + " / " + (long.targetPrice?.toFixed(6) || "0");\n                document.getElementById("lAction").innerHTML = long.lastAction || "Idle";\n                document.getElementById("lRoi").className = long.roi >= 0 ? "positive" : "negative";\n            }\n            if (short) {\n                document.getElementById("sRoi").innerHTML = (short.roi >= 0 ? "+" : "") + short.roi.toFixed(2) + "%";\n                document.getElementById("sPnl").innerHTML = (short.unrealizedUsdt >= 0 ? "+" : "") + "$" + (short.unrealizedUsdt?.toFixed(4) || "0.00");\n                document.getElementById("sVol").innerHTML = short.volume || 0;\n                document.getElementById("sDoge").innerHTML = short.dogeAmount || 0;\n                document.getElementById("sPrices").innerHTML = (short.entryPrice?.toFixed(6) || "0") + " / " + (short.targetPrice?.toFixed(6) || "0");\n                document.getElementById("sAction").innerHTML = short.lastAction || "Idle";\n                document.getElementById("sRoi").className = short.roi >= 0 ? "positive" : "negative";\n            }\n            \n            if (data.market.currentConfig) {\n                document.getElementById("cfgLeverage").innerHTML = data.market.currentConfig.leverage;\n                document.getElementById("cfgTP").innerHTML = data.market.currentConfig.takeProfitPct;\n                document.getElementById("cfgVolume").innerHTML = data.market.currentConfig.baseVolume;\n                document.getElementById("cfgMultiplier").innerHTML = data.market.currentConfig.multiplier;\n                document.getElementById("cfgStep").innerHTML = data.market.currentConfig.stepDistancePct;\n                document.getElementById("cfgRisk").innerHTML = data.market.currentConfig.riskPercent;\n                document.getElementById("cfgSpread").innerHTML = data.market.currentConfig.maxStartSpread;\n                document.getElementById("cfgCompound").innerHTML = data.market.currentConfig.autoCompound ? "ON" : "OFF";\n            }\n            \n            let tradesHtml = "";\n            if (data.tradeHistory && data.tradeHistory.length > 0) {\n                for (let i = 0; i < Math.min(15, data.tradeHistory.length); i++) {\n                    const t = data.tradeHistory[i];\n                    const roiVal = parseFloat(t.roi);\n                    tradesHtml += "<tr><td class=\\"" + (t.side === "LONG" ? "positive" : "negative") + "\\">" + t.side + "<\\/td>";\n                    tradesHtml += "<td>" + (t.closeTime ? t.closeTime.split(",")[1] : "") + "<\\/td>";\n                    tradesHtml += "<td>" + t.volume + "<\\/td>";\n                    tradesHtml += "<td>" + t.entryPrice + "<\\/td>";\n                    tradesHtml += "<td>" + t.exitPrice + "<\\/td>";\n                    tradesHtml += "<td class=\\"" + (roiVal >= 0 ? "positive" : "negative") + "\\">" + t.roi + "<\\/td>";\n                    tradesHtml += "<td class=\\"" + (parseFloat(t.pnl) >= 0 ? "positive" : "negative") + "\\">$" + t.pnl + "<\\/td><\\/tr>";\n                }\n            } else {\n                tradesHtml = "<tr><td colspan=\\"7\\" style=\\"text-align: center;\\">No trades<\\/td><\\/tr>";\n            }\n            document.getElementById("tradesBody").innerHTML = tradesHtml;\n        } catch(e) { console.error(e); }\n    }, 2000);\n<\/script>\n</body>\n</html>';
+    
     res.send(html);
 });
 
