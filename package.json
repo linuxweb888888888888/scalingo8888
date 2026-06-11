@@ -1,32 +1,21 @@
 {
-  "name": "flash-loan-arbitrage-simulator",
+  "name": "zero-cost-arb-bot",
   "version": "1.0.0",
-  "description": "Flash loan arbitrage bot - Real queries from PancakeSwap with simulated execution",
+  "description": "Flash Loan Arbitrage Bot with Zero-Gas Failure logic",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "dev": "nodemon bot.js"
+    "deploy": "node deploy.js"
   },
-  "keywords": [
-    "flash-loan",
-    "arbitrage",
-    "pancakeswap",
-    "defi",
-    "bsc",
-    "trading-bot"
-  ],
-  "author": "Your Name",
-  "license": "MIT",
   "dependencies": {
     "dotenv": "^16.3.1",
     "ethers": "^5.7.2",
-    "express": "^4.18.2"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.1"
+    "express": "^4.18.2",
+    "@flashbots/ethers-provider-bundle": "^0.6.2"
   },
   "engines": {
-    "node": ">=16.0.0",
-    "npm": ">=8.0.0"
-  }
+    "node": ">=16.0.0"
+  },
+  "author": "",
+  "license": "ISC"
 }
