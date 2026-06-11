@@ -1,21 +1,26 @@
 {
-  "name": "zero-cost-arb-bot",
+  "name": "mev-arbitrage-bot",
   "version": "1.0.0",
-  "description": "Flash Loan Arbitrage Bot with Zero-Gas Failure logic",
+  "description": "Zero-cost flash loan arbitrage bot on Polygon",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "deploy": "node bot.js"
+    "dev": "nodemon bot.js",
+    "test": "node bot.js"
+  },
+  "keywords": ["arbitrage", "flash-loan", "mev", "polygon", "defi"],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
   },
   "dependencies": {
-    "dotenv": "^16.3.1",
-    "ethers": "^5.7.2",
     "express": "^4.18.2",
-    "@flashbots/ethers-provider-bundle": "^0.6.2"
+    "ethers": "^5.7.2",
+    "dotenv": "^16.3.1"
   },
-  "engines": {
-    "node": ">=16.0.0"
-  },
-  "author": "",
-  "license": "ISC"
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
 }
