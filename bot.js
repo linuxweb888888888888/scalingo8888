@@ -49,6 +49,8 @@ const EST_GAS_LIMIT = 500000;
 const MIN_PROFIT_TRIGGER = 50;
 const SCAN_SPEED = 8000;
 
+let CONTRACT_ADDRESS = null;
+
 const TOKENS = [
     { s: "WMATIC", a: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", cg: "matic-network", decimals: 18 },
     { s: "WETH", a: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619", cg: "ethereum", decimals: 18 },
