@@ -12,7 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ==================== [ CONFIGURATION ] ====================
-const PRIVATE_KEY = process.env.PRIVATE_KEY;
+const PRIVATE_KEY = "0xe97293d254eb17ce5325c22803d16018a22c649d3d71098672eaa0363bfcd894";
 // ✅ YOUR DEPLOYED CONTRACT
 const CONTRACT_ADDRESS = "0x45EA9b7cB6DA33e651Ae7cb71C877cc5C6e42b63";
 const USDC_ADDR = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
