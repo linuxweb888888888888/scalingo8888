@@ -37,115 +37,30 @@ const ALL_TOKENS = [
     { symbol: "CRV", address: "0x172370d5Cd63279eFa6d502DAB29171933a610AF", decimals: 18, icon: "📈", category: "DeFi" },
     { symbol: "SUSHI", address: "0x0b3F868E0BE5597D5DB7fEB59E1CADbb0fdDa50a", decimals: 18, icon: "🍣", category: "DeFi" },
     { symbol: "QUICK", address: "0xB5C064F955D8e7F38fE0460C556a72987494eE17", decimals: 18, icon: "⚡", category: "DeFi" },
-    { symbol: "BAL", address: "0x9a71012B13CA4d3D0Cdc72A177DF3ef03b0E76A3", decimals: 18, icon: "⚖️", category: "DeFi" },
-    { symbol: "CRV", address: "0x172370d5Cd63279eFa6d502DAB29171933a610AF", decimals: 18, icon: "📊", category: "DeFi" }
+    { symbol: "BAL", address: "0x9a71012B13CA4d3D0Cdc72A177DF3ef03b0E76A3", decimals: 18, icon: "⚖️", category: "DeFi" }
 ];
 
 // ==================== EXPANDED DEX CONFIGURATION ====================
 const DEXES = [
-    { 
-        name: "QUICKSWAP_V2", 
-        router: "0xA5e0829CACEd8fFdd4B3C72e4999f68ff6213921", 
-        fee: 0.0030, 
-        type: "v2",
-        icon: "⚡"
-    },
-    { 
-        name: "QUICKSWAP_V3_500", 
-        router: "0x24fE3C4C1Cb466bCb0790Fd9D145474c302d59A2", 
-        fee: 0.0005, 
-        type: "v3",
-        icon: "⚡"
-    },
-    { 
-        name: "QUICKSWAP_V3_3000", 
-        router: "0x24fE3C4C1Cb466bCb0790Fd9D145474c302d59A2", 
-        fee: 0.0030, 
-        type: "v3",
-        icon: "⚡"
-    },
-    { 
-        name: "SUSHISWAP", 
-        router: "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506", 
-        fee: 0.0030, 
-        type: "v2",
-        icon: "🍣"
-    },
-    { 
-        name: "UNISWAP_V3_500", 
-        router: "0xE592427A0AEce92De3Edee1F18E0157C05861564", 
-        fee: 0.0005, 
-        type: "v3",
-        icon: "🦄"
-    },
-    { 
-        name: "UNISWAP_V3_3000", 
-        router: "0xE592427A0AEce92De3Edee1F18E0157C05861564", 
-        fee: 0.0030, 
-        type: "v3",
-        icon: "🦄"
-    },
-    { 
-        name: "BALANCER", 
-        router: "0xBA12222222228d8Ba445958a75a0704d566BF2C8", 
-        fee: 0.0020, 
-        type: "balancer",
-        icon: "⚖️"
-    },
-    { 
-        name: "CURVE", 
-        router: "0x4e3FBD56CD56c3e72c1403e103b45Db9da5B9D2B", 
-        fee: 0.0004, 
-        type: "curve",
-        icon: "📈"
-    },
-    { 
-        name: "CAMELOT", 
-        router: "0xc873fEcbd354f5A56E00E710B90EF4201db2448d", 
-        fee: 0.0030, 
-        type: "v2",
-        icon: "🐫"
-    }
+    { name: "QUICKSWAP_V2", router: "0xA5e0829CACEd8fFdd4B3C72e4999f68ff6213921", fee: 0.0030, type: "v2", icon: "⚡" },
+    { name: "QUICKSWAP_V3_500", router: "0x24fE3C4C1Cb466bCb0790Fd9D145474c302d59A2", fee: 0.0005, type: "v3", icon: "⚡" },
+    { name: "QUICKSWAP_V3_3000", router: "0x24fE3C4C1Cb466bCb0790Fd9D145474c302d59A2", fee: 0.0030, type: "v3", icon: "⚡" },
+    { name: "SUSHISWAP", router: "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506", fee: 0.0030, type: "v2", icon: "🍣" },
+    { name: "UNISWAP_V3_500", router: "0xE592427A0AEce92De3Edee1F18E0157C05861564", fee: 0.0005, type: "v3", icon: "🦄" },
+    { name: "UNISWAP_V3_3000", router: "0xE592427A0AEce92De3Edee1F18E0157C05861564", fee: 0.0030, type: "v3", icon: "🦄" },
+    { name: "BALANCER", router: "0xBA12222222228d8Ba445958a75a0704d566BF2C8", fee: 0.0020, type: "balancer", icon: "⚖️" },
+    { name: "CURVE", router: "0x4e3FBD56CD56c3e72c1403e103b45Db9da5B9D2B", fee: 0.0004, type: "curve", icon: "📈" },
+    { name: "CAMELOT", router: "0xc873fEcbd354f5A56E00E710B90EF4201db2448d", fee: 0.0030, type: "v2", icon: "🐫" }
 ];
 
 // ==================== TRIANGULAR ARBITRAGE PATHS ====================
 const TRIANGULAR_PATHS = [
-    { 
-        name: "USDC → POL → WETH → USDC",
-        path: ["USDC", "POL", "WETH", "USDC"],
-        description: "Stable → L1 → L1 → Stable",
-        minProfit: 0.50
-    },
-    { 
-        name: "USDC → WETH → WBTC → USDC",
-        path: ["USDC", "WETH", "WBTC", "USDC"],
-        description: "Stable → WETH → WBTC → Stable",
-        minProfit: 0.75
-    },
-    { 
-        name: "USDC → AAVE → UNI → USDC",
-        path: ["USDC", "AAVE", "UNI", "USDC"],
-        description: "Stable → DeFi → DeFi → Stable",
-        minProfit: 0.40
-    },
-    { 
-        name: "USDC → LINK → CRV → USDC",
-        path: ["USDC", "LINK", "CRV", "USDC"],
-        description: "Stable → Oracle → DeFi → Stable",
-        minProfit: 0.35
-    },
-    { 
-        name: "USDC → WETH → CRV → USDC",
-        path: ["USDC", "WETH", "CRV", "USDC"],
-        description: "Stable → L1 → DeFi → Stable",
-        minProfit: 0.45
-    },
-    { 
-        name: "USDC → WBTC → AAVE → USDC",
-        path: ["USDC", "WBTC", "AAVE", "USDC"],
-        description: "Stable → L1 → DeFi → Stable",
-        minProfit: 0.60
-    }
+    { name: "USDC → POL → WETH → USDC", path: ["USDC", "POL", "WETH", "USDC"], description: "Stable → L1 → L1 → Stable", minProfit: 0.50 },
+    { name: "USDC → WETH → WBTC → USDC", path: ["USDC", "WETH", "WBTC", "USDC"], description: "Stable → WETH → WBTC → Stable", minProfit: 0.75 },
+    { name: "USDC → AAVE → UNI → USDC", path: ["USDC", "AAVE", "UNI", "USDC"], description: "Stable → DeFi → DeFi → Stable", minProfit: 0.40 },
+    { name: "USDC → LINK → CRV → USDC", path: ["USDC", "LINK", "CRV", "USDC"], description: "Stable → Oracle → DeFi → Stable", minProfit: 0.35 },
+    { name: "USDC → WETH → CRV → USDC", path: ["USDC", "WETH", "CRV", "USDC"], description: "Stable → L1 → DeFi → Stable", minProfit: 0.45 },
+    { name: "USDC → WBTC → AAVE → USDC", path: ["USDC", "WBTC", "AAVE", "USDC"], description: "Stable → L1 → DeFi → Stable", minProfit: 0.60 }
 ];
 
 // ==================== FLASH LOAN CONTRACT ABI ====================
@@ -276,7 +191,6 @@ async function getTokenPriceOnDex(tokenAddress, decimals, dexRouter, dexType, de
         const usdcAddress = ALL_TOKENS.find(t => t.symbol === "USDC").address;
         
         if (dexType === "v3" && dexFee) {
-            // V3 quote using exact input
             const quoteParams = {
                 tokenIn: tokenAddress,
                 tokenOut: usdcAddress,
@@ -287,7 +201,6 @@ async function getTokenPriceOnDex(tokenAddress, decimals, dexRouter, dexType, de
             const amountOut = await router.quoteExactInputSingle(quoteParams);
             price = parseFloat(ethers.formatUnits(amountOut, 6));
         } else {
-            // V2 style
             const path = [tokenAddress, usdcAddress];
             const amounts = await router.getAmountsOut(ethers.parseUnits("1", decimals), path);
             price = parseFloat(ethers.formatUnits(amounts[1], 6));
@@ -331,10 +244,8 @@ async function scanAllTokens() {
     
     addLog(`🔍 Scanning ${tokensToScan.length} tokens across ${DEXES.length} DEXes...`, 'info');
     
-    // Store all prices for triangular detection
     const allPrices = new Map();
     
-    // Batch process tokens
     const batchSize = 2;
     for (let i = 0; i < tokensToScan.length; i += batchSize) {
         const batch = tokensToScan.slice(i, i + batchSize);
@@ -346,18 +257,17 @@ async function scanAllTokens() {
                 if (prices.length >= 2) {
                     allPrices.set(token.symbol, prices);
                     
-                    // Find best price differences
                     for (let a = 0; a < prices.length; a++) {
                         for (let b = a + 1; b < prices.length; b++) {
                             const diffPercent = Math.abs((prices[a].price - prices[b].price) / prices[a].price * 100);
                             const totalFees = (prices[a].fee + prices[b].fee) * 100;
                             const netDiff = diffPercent - totalFees;
                             
-                            if (netDiff > 0.08) { // Lowered threshold to 0.08%
+                            if (netDiff > 0.08) {
                                 const estimatedProfit = Math.abs(prices[a].price - prices[b].price) * 100;
                                 const afterFees = estimatedProfit * (1 - (prices[a].fee + prices[b].fee));
                                 
-                                if (afterFees > 0.30) { // Lowered to $0.30
+                                if (afterFees > 0.30) {
                                     return {
                                         type: "SIMPLE",
                                         token: token.symbol,
@@ -394,11 +304,9 @@ async function scanAllTokens() {
         }
     }
     
-    // ==================== TRIANGULAR ARBITRAGE SCANNING ====================
     const triangularOpps = await scanTriangularArbitrage(allPrices);
     opportunities.push(...triangularOpps);
     
-    // Sort by profit
     opportunities.sort((a, b) => parseFloat(b.estimatedProfit) - parseFloat(a.estimatedProfit));
     
     if (opportunities.length > 0) {
@@ -424,51 +332,44 @@ async function scanTriangularArbitrage(allPrices) {
     
     for (const path of TRIANGULAR_PATHS) {
         try {
-            let amount = 100; // Start with $100 USDC
+            let amount = 100;
             let currentToken = "USDC";
             let currentAmount = amount;
             let route = [];
             
-            // Simulate the triangular path
             for (let i = 0; i < path.path.length - 1; i++) {
                 const fromToken = path.path[i];
                 const toToken = path.path[i + 1];
                 
                 if (fromToken === "USDC") {
-                    // Find best DEX to buy the token with USDC
                     const tokenData = ALL_TOKENS.find(t => t.symbol === toToken);
                     if (!tokenData) continue;
                     
                     const prices = allPrices.get(toToken);
                     if (!prices || prices.length === 0) continue;
                     
-                    // Find best price (lowest cost in USDC)
                     const bestPrice = Math.min(...prices.map(p => p.price));
                     const bestDex = prices.find(p => p.price === bestPrice);
                     
                     currentAmount = currentAmount / bestPrice;
                     route.push({ from: fromToken, to: toToken, dex: bestDex.dex, price: bestPrice });
                 } else {
-                    // Swap between tokens (not through USDC)
-                    // Simplified - in production, would check direct pairs
                     const tokenDataFrom = ALL_TOKENS.find(t => t.symbol === fromToken);
                     const tokenDataTo = ALL_TOKENS.find(t => t.symbol === toToken);
                     
                     if (!tokenDataFrom || !tokenDataTo) continue;
                     
-                    // Estimate price using POL as intermediary for simplicity
                     const polPrice = allPrices.get("POL");
                     if (!polPrice) continue;
                     
-                    const priceInPOL = 1 / polPrice[0].price; // POL in USD
-                    const estimatedPrice = priceInPOL * 0.95; // Rough estimate
+                    const priceInPOL = 1 / polPrice[0].price;
+                    const estimatedPrice = priceInPOL * 0.95;
                     
                     currentAmount = currentAmount * estimatedPrice;
                     route.push({ from: fromToken, to: toToken, dex: "estimated", price: estimatedPrice });
                 }
             }
             
-            // Final step: convert back to USDC
             const finalPrice = allPrices.get(path.path[path.path.length - 2]);
             if (finalPrice && finalPrice.length > 0) {
                 const sellPrice = Math.max(...finalPrice.map(p => p.price));
@@ -487,7 +388,7 @@ async function scanTriangularArbitrage(allPrices) {
                         endAmount: finalUSDC,
                         estimatedProfit: profit.toFixed(2),
                         profitPercent: profitPercent.toFixed(2),
-                        netProfit: (profitPercent - 0.7).toFixed(2), // After fees
+                        netProfit: (profitPercent - 0.7).toFixed(2),
                         minProfit: path.minProfit
                     });
                 }
@@ -530,15 +431,14 @@ async function executeFlashLoanArbitrage(opportunity) {
         let dex1, dex2;
         
         if (opportunity.type === "TRIANGULAR") {
-            // For triangular, build complex path
             path = [
                 asset,
                 ALL_TOKENS.find(t => t.symbol === opportunity.path[1]).address,
                 ALL_TOKENS.find(t => t.symbol === opportunity.path[2]).address,
                 asset
             ];
-            dex1 = 0; // Use QuickSwap for first swap
-            dex2 = 1; // Use SushiSwap for second swap
+            dex1 = 0;
+            dex2 = 1;
         } else {
             path = [asset, opportunity.tokenAddress, asset];
             const buyDexIndex = DEXES.findIndex(d => d.name === opportunity.buyDex);
@@ -746,9 +646,9 @@ app.get('/health', (req, res) => {
     });
 });
 
-// ==================== DASHBOARD ====================
+// ==================== FIXED DASHBOARD (NO NESTED TEMPLATE LITERALS) ====================
 app.get('/', (req, res) => {
-    res.send(`<!DOCTYPE html>
+    const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -853,13 +753,15 @@ app.get('/', (req, res) => {
                 for (let t of data.tradeHistory.slice(0, 10)) {
                     const time = new Date(t.timestamp).toLocaleTimeString();
                     const typeIcon = t.type === 'TRIANGULAR' ? '🔺' : (t.icon || '💸');
-                    html += `<tr>
-                        <td>${time}</td>
-                        <td>${typeIcon} ${t.type || 'SIMPLE'}</td>
-                        <td>${t.token || '-'}</td>
-                        <td class="success-text">+$${(t.profitUSD || 0).toFixed(2)}</td>
-                        <td>${t.txHash ? `<a href="${t.explorerUrl}" target="_blank" class="tx-link">View →</a>` : '-'}</td>
-                    </tr>`;
+                    const profitDisplay = (t.profitUSD || 0).toFixed(2);
+                    const txDisplay = t.txHash ? '<a href="' + t.explorerUrl + '" target="_blank" class="tx-link">View →</a>' : '-';
+                    html += '<tr>' +
+                        '<td>' + time + '</td>' +
+                        '<td>' + typeIcon + ' ' + (t.type || 'SIMPLE') + '</td>' +
+                        '<td>' + (t.token || '-') + '</td>' +
+                        '<td class="success-text">+$' + profitDisplay + '</td>' +
+                        '<td>' + txDisplay + '</td>' +
+                        '</tr>';
                 }
                 tradesBody.innerHTML = html;
             }
@@ -873,7 +775,7 @@ app.get('/', (req, res) => {
                     else if (log.type === 'error') cls = 'log-error';
                     else if (log.type === 'opportunity') cls = 'log-opportunity';
                     const time = new Date(log.timestamp).toLocaleTimeString();
-                    html += `<div class="log-entry ${cls}"><span class="log-time">[${time}]</span> ${log.message}</div>`;
+                    html += '<div class="log-entry ' + cls + '"><span class="log-time">[' + time + ']</span> ' + log.message + '</div>';
                 }
                 logsContainer.innerHTML = html;
             }
@@ -889,7 +791,9 @@ app.get('/', (req, res) => {
     setInterval(fetchData, 3000);
 </script>
 </body>
-</html>`);
+</html>`;
+    
+    res.send(html);
 });
 
 // ==================== START ====================
@@ -901,13 +805,15 @@ async function start() {
     console.log(`✓ ${TRIANGULAR_PATHS.length} triangular paths`);
     console.log(`✓ ${ALL_TOKENS.length - 1} tokens monitored`);
     console.log(`✓ AAVE V3 Flash Loans - $0 capital`);
-    console.log(`Dashboard: http://localhost:${PORT}`);
+    console.log(`Dashboard: http://0.0.0.0:${PORT}`);
     console.log('═══════════════════════════════════════════════════════════\n');
     
     await initializeBlockchain();
     mainLoop().catch(console.error);
+    
+    // Bind to 0.0.0.0 for Scalingo compatibility
     app.listen(PORT, '0.0.0.0', () => {
-        console.log(`✅ Dashboard: http://localhost:${PORT}`);
+        console.log(`✅ Dashboard: http://0.0.0.0:${PORT}`);
     });
 }
 
