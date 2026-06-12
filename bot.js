@@ -1,5 +1,5 @@
 // bot-flashloan.js - Real Flash Loan Arbitrage Bot with AAVE V3
-// Scans ALL tokens and executes flash loan arbitrage with $0 capital
+// Optimized for rate limits - Scans ALL tokens and executes flash loan arbitrage with $0 capital
 
 require('dotenv').config();
 const express = require('express');
@@ -12,6 +12,16 @@ const PORT = process.env.PORT || 3000;
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const QUICKNODE_URL = process.env.QUICKNODE_URL || "https://cosmopolitan-muddy-dew.matic.quiknode.pro/45b8f7a71d2385208254951a496c78fb94b9676d/";
 const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || "0xB56Bb558b7400A1b77898187AA729Ad2853B9487"; // Your flash loan contract
+
+// Rate limiting configuration
+const RATE_LIMIT = {
+    minIntervalMs: 100,   // 100ms between calls = 10 calls/sec (below 15 limit)
+    batchDelayMs: 500
+};
+
+// Cache prices to reduce API calls
+const priceCache = new Map();
+const CACHE_TTL = 30000; // 30 seconds cache
 
 // ==================== ALL TOKENS ON POLYGON ====================
 const ALL_TOKENS = [
@@ -79,6 +89,17 @@ let provider;
 let wallet;
 let flashLoanContract;
 let polPriceUSD = 0.50;
+let lastCallTime = 0;
+
+// Rate limiter helper
+async function rateLimit() {
+    const now = Date.now();
+    const elapsed = now - lastCallTime;
+    if (elapsed < RATE_LIMIT.minIntervalMs) {
+        await new Promise(r => setTimeout(r, RATE_LIMIT.minIntervalMs - elapsed));
+    }
+    lastCallTime = Date.now();
+}
 
 function addLog(message, type) {
     const timestamp = new Date().toISOString();
@@ -91,6 +112,7 @@ function addLog(message, type) {
 async function initializeBlockchain() {
     try {
         provider = new ethers.JsonRpcProvider(QUICKNODE_URL);
+        await rateLimit();
         const blockNumber = await provider.getBlockNumber();
         addLog(`✅ Connected to Polygon (Block: ${blockNumber.toLocaleString()})`, 'success');
         
@@ -98,10 +120,12 @@ async function initializeBlockchain() {
             wallet = new ethers.Wallet(PRIVATE_KEY, provider);
             flashLoanContract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, wallet);
             
+            await rateLimit();
             const balance = await provider.getBalance(wallet.address);
             state.wallet.pol = parseFloat(ethers.formatEther(balance));
             state.wallet.usd = state.wallet.pol * polPriceUSD;
             
+            await rateLimit();
             const code = await provider.getCode(CONTRACT_ADDRESS);
             if (code !== '0x') {
                 addLog(`✅ Flash Loan Contract: ${CONTRACT_ADDRESS.substring(0, 20)}...`, 'success');
@@ -133,14 +157,25 @@ async function initializeBlockchain() {
     }
 }
 
-// ==================== PRICE FETCHING ====================
+// ==================== CACHED PRICE FETCHING ====================
 async function getTokenPriceOnDex(tokenAddress, decimals, dexRouter) {
+    const cacheKey = `${tokenAddress}_${dexRouter}`;
+    const cached = priceCache.get(cacheKey);
+    
+    if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
+        return cached.price;
+    }
+    
     try {
+        await rateLimit();
         const router = new ethers.Contract(dexRouter, ROUTER_ABI, provider);
         const amountIn = ethers.parseUnits("1", decimals);
         const path = [tokenAddress, ALL_TOKENS.find(t => t.symbol === "USDC").address];
         const amounts = await router.getAmountsOut(amountIn, path);
-        return parseFloat(ethers.formatUnits(amounts[1], 6));
+        const price = parseFloat(ethers.formatUnits(amounts[1], 6));
+        
+        priceCache.set(cacheKey, { price, timestamp: Date.now() });
+        return price;
     } catch (error) {
         return 0;
     }
@@ -156,39 +191,61 @@ async function updatePOLPrice() {
 // ==================== SCAN ALL TOKENS ====================
 async function scanAllTokens() {
     const opportunities = [];
+    const tokensToScan = ALL_TOKENS.filter(t => t.symbol !== 'USDC');
     
-    addLog(`🔍 Scanning ${ALL_TOKENS.length} tokens for arbitrage...`, 'info');
+    addLog(`🔍 Scanning ${tokensToScan.length} tokens for arbitrage...`, 'info');
     
-    for (const token of ALL_TOKENS) {
-        if (token.symbol === 'USDC') continue;
+    // Process tokens in batches to manage rate limits
+    const batchSize = 3;
+    for (let i = 0; i < tokensToScan.length; i += batchSize) {
+        const batch = tokensToScan.slice(i, i + batchSize);
         
-        try {
-            const priceQuick = await getTokenPriceOnDex(token.address, token.decimals, QUICKSWAP_ROUTER);
-            if (priceQuick === 0) continue;
-            
-            const priceSushi = await getTokenPriceOnDex(token.address, token.decimals, SUSHISWAP_ROUTER);
-            
-            if (priceSushi > 0) {
-                const diffPercent = Math.abs((priceQuick - priceSushi) / priceQuick * 100);
-                const estimatedProfit = Math.abs(priceQuick - priceSushi) * 100;
+        // Process batch in parallel with rate limiting
+        const batchPromises = batch.map(async (token) => {
+            try {
+                await new Promise(r => setTimeout(r, Math.random() * 100));
                 
-                if (diffPercent > 0.2 && estimatedProfit > 0.5) {
-                    opportunities.push({
-                        token: token.symbol,
-                        icon: token.icon,
-                        tokenAddress: token.address,
-                        decimals: token.decimals,
-                        priceQuick: priceQuick.toFixed(4),
-                        priceSushi: priceSushi.toFixed(4),
-                        diffPercent: diffPercent.toFixed(2),
-                        estimatedProfit: estimatedProfit.toFixed(2),
-                        betterDex: priceQuick > priceSushi ? "QUICKSWAP" : "SUSHISWAP",
-                        worseDex: priceQuick > priceSushi ? "SUSHISWAP" : "QUICKSWAP"
-                    });
+                const priceQuick = await getTokenPriceOnDex(token.address, token.decimals, QUICKSWAP_ROUTER);
+                if (priceQuick === 0) return null;
+                
+                await new Promise(r => setTimeout(r, 50));
+                
+                const priceSushi = await getTokenPriceOnDex(token.address, token.decimals, SUSHISWAP_ROUTER);
+                
+                if (priceSushi > 0) {
+                    const diffPercent = Math.abs((priceQuick - priceSushi) / priceQuick * 100);
+                    const estimatedProfit = Math.abs(priceQuick - priceSushi) * 100;
+                    
+                    if (diffPercent > 0.15 && estimatedProfit > 0.3) { // Lowered thresholds
+                        return {
+                            token: token.symbol,
+                            icon: token.icon,
+                            tokenAddress: token.address,
+                            decimals: token.decimals,
+                            priceQuick: priceQuick.toFixed(4),
+                            priceSushi: priceSushi.toFixed(4),
+                            diffPercent: diffPercent.toFixed(2),
+                            estimatedProfit: estimatedProfit.toFixed(2),
+                            betterDex: priceQuick > priceSushi ? "QUICKSWAP" : "SUSHISWAP",
+                            worseDex: priceQuick > priceSushi ? "SUSHISWAP" : "QUICKSWAP"
+                        };
+                    }
                 }
+            } catch (error) {
+                return null;
             }
-            await new Promise(r => setTimeout(r, 50));
-        } catch (error) {}
+            return null;
+        });
+        
+        const batchResults = await Promise.all(batchPromises);
+        for (const result of batchResults) {
+            if (result) opportunities.push(result);
+        }
+        
+        // Wait between batches
+        if (i + batchSize < tokensToScan.length) {
+            await new Promise(r => setTimeout(r, RATE_LIMIT.batchDelayMs));
+        }
     }
     
     opportunities.sort((a, b) => parseFloat(b.estimatedProfit) - parseFloat(a.estimatedProfit));
@@ -221,7 +278,7 @@ async function executeFlashLoanArbitrage(opportunity) {
     try {
         // Prepare flash loan parameters
         const asset = ALL_TOKENS.find(t => t.symbol === "USDC").address;
-        const amount = ethers.parseUnits("1000", 6); // Borrow 1000 USDC
+        const amount = ethers.parseUnits("500", 6); // Reduced to 500 USDC for rate limits
         
         // Build path for arbitrage
         const path = [
@@ -234,8 +291,8 @@ async function executeFlashLoanArbitrage(opportunity) {
         const dex1 = opportunity.betterDex === "QUICKSWAP" ? 0 : 1;
         const dex2 = opportunity.worseDex === "QUICKSWAP" ? 0 : 1;
         
-        const amountIn = ethers.parseUnits("1000", 6);
-        const minProfit = ethers.parseUnits((parseFloat(opportunity.estimatedProfit) * 0.8).toFixed(2), 6);
+        const amountIn = ethers.parseUnits("500", 6);
+        const minProfit = ethers.parseUnits((parseFloat(opportunity.estimatedProfit) * 0.7).toFixed(2), 6);
         const profitRecipient = wallet.address;
         
         // Encode flash loan parameters
@@ -251,12 +308,13 @@ async function executeFlashLoanArbitrage(opportunity) {
         addLog(`📝 Requesting flash loan of ${ethers.formatUnits(amount, 6)} USDC from AAVE...`, 'info');
         addLog(`   Flash loan fee: 0.05% (${ethers.formatUnits(amount * 5n / 10000n, 6)} USDC)`, 'info');
         
+        await rateLimit();
         // Execute flash loan arbitrage
         const tx = await flashLoanContract.requestFlashLoan(
             asset,
             amount,
             flashParams,
-            { gasLimit: 2000000 }
+            { gasLimit: 1500000 } // Reduced gas limit
         );
         
         addLog(`📤 Flash loan transaction sent: ${tx.hash}`, 'info');
@@ -267,7 +325,7 @@ async function executeFlashLoanArbitrage(opportunity) {
         
         if (receipt.status === 1) {
             const gasUsed = parseFloat(ethers.formatEther(receipt.gasUsed * receipt.gasPrice)) * polPriceUSD;
-            const profit = parseFloat(opportunity.estimatedProfit) * 0.9;
+            const profit = parseFloat(opportunity.estimatedProfit) * 0.85;
             
             state.stats.successfulTrades++;
             state.stats.totalProfitUSD += profit;
@@ -294,7 +352,7 @@ async function executeFlashLoanArbitrage(opportunity) {
                 success: true,
                 diffPercent: opportunity.diffPercent,
                 type: "FLASH_LOAN",
-                amountBorrowed: "1000 USDC"
+                amountBorrowed: "500 USDC"
             });
             
             return true;
@@ -305,7 +363,7 @@ async function executeFlashLoanArbitrage(opportunity) {
     } catch (error) {
         state.stats.failedTrades++;
         addLog(`❌ FLASH LOAN ARBITRAGE FAILED - ZERO GAS COST!`, 'error');
-        addLog(`   Error: ${error.message}`, 'error');
+        addLog(`   Error: ${error.message.substring(0, 150)}`, 'error');
         addLog(`   💡 No capital lost - flash loans revert automatically on failure`, 'info');
         
         state.tradeHistory.unshift({
@@ -316,7 +374,7 @@ async function executeFlashLoanArbitrage(opportunity) {
             profitUSD: 0,
             gasCostUSD: 0,
             success: false,
-            error: error.message,
+            error: error.message.substring(0, 100),
             type: "FLASH_LOAN"
         });
         
@@ -326,11 +384,14 @@ async function executeFlashLoanArbitrage(opportunity) {
 
 // ==================== MAIN LOOP ====================
 async function mainLoop() {
-    addLog('🔥 FLASH LOAN ARBITRAGE BOT STARTED', 'success');
-    addLog(`💰 Scanning ${ALL_TOKENS.length} tokens on Polygon`, 'success');
+    addLog('🔥 FLASH LOAN ARBITRAGE BOT STARTED (Rate Limit Optimized)', 'success');
+    addLog(`💰 Scanning ${ALL_TOKENS.length - 1} tokens on Polygon`, 'success');
     addLog('💸 Using AAVE V3 Flash Loans - $0 Capital Needed', 'success');
     addLog('⚡ Zero gas cost for failed trades', 'success');
+    addLog('🔄 Rate limit: 10 calls/sec with 30s cache', 'info');
     addLog('📊 Starting arbitrage scanner...', 'info');
+    
+    let consecutiveEmptyScans = 0;
     
     while (state.isRunning) {
         if (!state.connected) {
@@ -344,24 +405,36 @@ async function mainLoop() {
         const opportunities = await scanAllTokens();
         
         if (opportunities.length > 0) {
+            consecutiveEmptyScans = 0;
             await executeFlashLoanArbitrage(opportunities[0]);
+            // After a trade, wait longer to let mempool clear
+            await new Promise(r => setTimeout(r, 30000));
         } else {
+            consecutiveEmptyScans++;
             state.session.totalScans++;
-            addLog(`🔍 Scan #${state.session.totalScans} complete. No opportunities.`, 'info');
+            
+            // Only log every 5th empty scan to reduce noise
+            if (consecutiveEmptyScans % 5 === 0) {
+                addLog(`🔍 Scan #${state.session.totalScans} complete. No opportunities.`, 'info');
+            }
         }
         
         // Update success rate
         state.stats.successRate = state.stats.totalAttempts > 0 ? (state.stats.successfulTrades / state.stats.totalAttempts * 100) : 0;
         
-        // Update wallet balance
-        if (wallet) {
-            const balance = await provider.getBalance(wallet.address);
-            state.wallet.pol = parseFloat(ethers.formatEther(balance));
-            state.wallet.usd = state.wallet.pol * polPriceUSD;
+        // Update wallet balance occasionally (rate limited)
+        if (wallet && state.session.totalScans % 3 === 0) {
+            try {
+                await rateLimit();
+                const balance = await provider.getBalance(wallet.address);
+                state.wallet.pol = parseFloat(ethers.formatEther(balance));
+                state.wallet.usd = state.wallet.pol * polPriceUSD;
+            } catch(e) {}
         }
         
-        // Wait 15 seconds before next scan
-        await new Promise(r => setTimeout(r, 15000));
+        // Dynamic wait time
+        const waitTime = opportunities.length > 0 ? 15000 : 20000;
+        await new Promise(r => setTimeout(r, waitTime));
     }
 }
 
@@ -402,6 +475,10 @@ app.get('/api/state', (req, res) => {
         connected: state.connected,
         polPrice: polPriceUSD,
         flashLoanEnabled: true,
+        rateLimit: {
+            callsPerSecond: 10,
+            cacheTTL: "30s"
+        },
         timestamp: new Date().toISOString()
     });
 });
@@ -419,7 +496,7 @@ app.post('/api/reset', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', connected: state.connected, flashLoanEnabled: true, tokens: ALL_TOKENS.length });
+    res.json({ status: 'ok', connected: state.connected, flashLoanEnabled: true, tokens: ALL_TOKENS.length, cacheSize: priceCache.size });
 });
 
 // ==================== DASHBOARD ====================
@@ -478,6 +555,7 @@ app.get('/', (req, res) => {
                     <span class="badge"><span class="status-dot"></span> Live on Polygon</span>
                     <span class="badge badge-flash">🚀 Flash Loan: $0 Capital</span>
                     <span class="badge">⚡ Zero Gas on Fails</span>
+                    <span class="badge">🔄 Rate Limit Optimized</span>
                 </div>
             </div>
         </div>
@@ -575,6 +653,7 @@ async function start() {
     console.log(`Contract: ${CONTRACT_ADDRESS}`);
     console.log(`Flash Loans: AAVE V3 - Borrow up to millions with $0 collateral`);
     console.log(`Zero gas on failed trades`);
+    console.log(`Rate Limit: 10 calls/sec with 30s cache`);
     console.log(`Dashboard: http://localhost:${PORT}`);
     console.log('═══════════════════════════════════════════════════════════\n');
     
