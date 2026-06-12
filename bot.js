@@ -8,6 +8,17 @@ const { ethers } = require('ethers');
 const axios = require('axios');
 const fs = require('fs');
 
+// ==================== [ FIX: Disable network detection to prevent hanging ] ====================
+// Override the JsonRpcProvider to skip network detection for Ethers v6
+const { JsonRpcProvider } = ethers;
+class FastJsonRpcProvider extends JsonRpcProvider {
+    async _detectNetwork() {
+        return ethers.Network.from(137); 
+    }
+}
+// Apply override
+ethers.JsonRpcProvider = FastJsonRpcProvider;
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -15,7 +26,6 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ==================== [ WORKING RPC ENDPOINTS - dRPC PRIMARY + 25+ FALLBACKS ] ====================
-
 const RPC_ENDPOINTS = [
     "https://polygon-rpc.com",
     "https://rpc-mainnet.maticvigil.com",
@@ -31,6 +41,11 @@ const RPC_ENDPOINTS = [
     "https://polygon-bor.publicnode.com",
     "https://polygon.drpc.org"
 ];
+
+// ==================== [ ADD 30 SECOND DELAY FOR RPC CONNECTION ] ====================
+// Add a delay before attempting RPC connections
+const RPC_CONNECTION_DELAY = 30000; // 30 seconds
+let initialDelayDone = false; // Prevents the delay from looping on every check
 
 // ==================== [ PRECOMPILED CONTRACT BYTECODE & ABI ] ====================
 const CONTRACT_BYTECODE = "0x6080604052348015600f57600080fd5b50336000806101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055506107a68061005e6000396000f3fe608060405234801561001057600080fd5b50600436106100a35760003560e01c80638da5cb5b11610076578063c4b2d3671161005b578063c4b2d36714610177578063e1c7392a14610195578063f3fef3a3146101b3576100a3565b80638da5cb5b1461011d578063b6b55f251461013b576100a3565b80631d09fcdb146100a857806327e235e3146100c657806355cafd8e146100e45780636eab7dfc14610100575b600080fd5b6100b06101cf565b6040516100bd919061052b565b60405180910390f35b6100ce6101d5565b6040516100db9190610546565b60405180910390f35b6100fe60048036038101906100f99190610591565b6101db565b005b61011a60048036038101906101159190610591565b6102b5565b005b61012561039a565b60405161013291906105e0565b60405180910390f35b61015560048036038101906101509190610627565b6103be565b60405161016e9796959493929190610730565b60405180910390f35b61017f610548565b60405161018c919061052b565b60405180910390f35b61019d610561565b6040516101aa919061052b565b60405180910390f35b6101cd60048036038101906101c89190610591565b610567565b005b60015481565b60005481565b60005473ffffffffffffffffffffffffffffffffffffffff163314610235576040517f08c379a000000000000000000000000000000000000000000000000000000000815260040161022c906107d9565b60405180910390fd5b60008290508073ffffffffffffffffffffffffffffffffffffffff1663a9059cbb33846040518363ffffffff1660e01b8152600401610275929190610808565b6020604051808303816000875af1158015610294573d6000803e3d6000fd5b505050506040513d601f19601f820116820180604052508101906102b8919061085d565b505050565b60005473ffffffffffffffffffffffffffffffffffffffff16331461030f576040517f08c379a0000000000000000000000000000000000000000000000000000000008152600401610306906107d9565b60405180910390fd5b600073ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff166340c10f1933846040518363ffffffff1660e01b8152600401610362929190610808565b600060405180830381600087803b15801561037c57600080fd5b505af1158015610390573d6000803e3d6000fd5b505050505050565b60008054906101000a900473ffffffffffffffffffffffffffffffffffffffff1681565b600060606000806000806000600073ffffffffffffffffffffffffffffffffffffffff168c73ffffffffffffffffffffffffffffffffffffffff1663095ea7b38d8d6040518363ffffffff1660e01b815260040161041d929190610808565b6020604051808303816000875af115801561043c573d6000803e3d6000fd5b505050506040513d601f19601f82011682018060405250810190610460919061085d565b508b73ffffffffffffffffffffffffffffffffffffffff166338ed17398d8d8d8d8d6040518763ffffffff1660e01b81526004016104a3969594939291906108be565b6000604051808303816000875af11580156104c2573d6000803e3d6000fd5b505050506040513d6000823e3d601f19601f820116820180604052508101906104eb91906109e1565b508a73ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b815260040161052591906105e0565b602060405180830381865afa158015610542573d6000803e3d6000fd5b505050506040513d601f19601f8201168201806040525081019061016e9190610a2a565b60005473ffffffffffffffffffffffffffffffffffffffff1633146105c1576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004016105b8906107d9565b60405180910390fd5b600073ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff1663a9059cbb33846040518363ffffffff1660e01b8152600401610614929190610808565b6020604051808303816000875af1158015610633573d6000803e3d6000fd5b505050506040513d601f19601f82011682018060405250810190610657919061085d565b5050565b600073ffffffffffffffffffffffffffffffffffffffff169050565b6000819050919050565b600061068a82610676565b9050919050565b61069a8161067f565b81146106a557600080fd5b50565b6000813590506106b781610691565b92915050565b6000819050919050565b6106d0816106bd565b81146106db57600080fd5b50565b6000813590506106ed816106c7565b92915050565b600081519050610702816106c7565b92915050565b60008115159050919050565b61071d81610708565b811461072857600080fd5b50565b60008151905061073a81610714565b92915050565b600061012082019050610746600083018b61067f565b610753602083018a6106bd565b610760604083018961067f565b61076d60608301886106bd565b61077a608083018761067f565b61078760a08301866106bd565b61079460c083018561067f565b6107a160e08301846106bd565b6107af6101008301836106bd565b9998505050505050505050565b600082825260208201905092915050565b7f4e6f74206f776e65720000000000000000000000000000000000000000000000600082015250565b60006107c36009836107bc565b91506107ce826107cd565b602082019050919050565b600060208201905081810360008301526107f2816107b6565b9050919050565b6108028161067f565b82525050565b600060408201905061081d60008301856107f9565b61082a60208301846106bd565b9392505050565b61083a81610708565b811461084557600080fd5b50565b60008151905061085781610831565b92915050565b6000602082840312156108735761087261065b565b5b600061088184828501610848565b91505092915050565b6000819050919050565b600061089f8261088a565b9050919050565b6108af81610894565b82525050565b6108b8816106bd565b82525050565b600060c0820190506108d360008301896106bd565b6108e060208301886106bd565b6108ed60408301876107f9565b6108fa60608301866107f9565b61090760808301856107f9565b61091460a08301846106bd565b979650505050505050565b6000601f19601f8301169050919050565b7f4e487b7100000000000000000000000000000000000000000000000000000000600052604160045260246000fd5b6109688261091f565b810181811067ffffffffffffffff8211171561098757610986610930565b5b80604052505050565b600061099a61095f565b90506109a6828261095f565b919050565b600067ffffffffffffffff8211156109c6576109c5610930565b5b6109cf8261091f565b9050602081019050919050565b6000815190506109ed816106c7565b92915050565b6000610a06610a01846109ab565b610990565b90508083825260208201905082810185811115610a2657610a25610656565b5b505b81811015610a455780610a3988826109dc565b845260208401935050810190506109f3565b5050509392505050565b600060208284031215610a6557610a6461065b565b5b6000610a73848285016109dc565b9150509291505056fea2646970667358221220123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef64736f6c63430008120033";
@@ -114,15 +129,24 @@ function addLog(message) {
     console.log(`[${new Date().toLocaleTimeString()}] ${message}`);
 }
 
-// ==================== [ RPC MANAGEMENT WITH RETRY ] ====================
+// ==================== [ RPC MANAGEMENT WITH SINGLE INITIAL DELAY ] ====================
 async function getWorkingProvider(retryCount = 0) {
+    // Fixed logic: Delay once at startup, not on every provider request
+    if (!initialDelayDone && retryCount === 0) {
+        addLog(`⏳ Waiting ${RPC_CONNECTION_DELAY / 1000} seconds before connecting to RPC...`);
+        initialDelayDone = true;
+        await new Promise(resolve => setTimeout(resolve, RPC_CONNECTION_DELAY));
+    }
+    
     for (const rpc of RPC_ENDPOINTS) {
         try {
-            const testProvider = new ethers.JsonRpcProvider(rpc);
+            // Updated to use the FastJsonRpcProvider with the correct _detectNetwork override
+            const testProvider = new FastJsonRpcProvider(rpc, 137);
+            
             // Set a timeout for the request
             const blockNumber = await Promise.race([
                 testProvider.getBlockNumber(),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000))
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 10000))
             ]);
             if (blockNumber) {
                 addLog(`✅ Connected to RPC: ${rpc.substring(0, 50)}...`);
@@ -133,8 +157,8 @@ async function getWorkingProvider(retryCount = 0) {
         }
     }
     if (retryCount < 3) {
-        addLog(`⚠️ No working RPC found, retrying (${retryCount + 1}/3)...`);
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        addLog(`⚠️ No working RPC found, retrying (${retryCount + 1}/3) in 10 seconds...`);
+        await new Promise(resolve => setTimeout(resolve, 10000));
         return getWorkingProvider(retryCount + 1);
     }
     throw new Error("No working RPC endpoint found after retries");
@@ -175,15 +199,15 @@ async function importWallet(privateKey) {
 async function checkWalletBalance() {
     if (!deploymentInfo.privateKey) return "0";
     try {
-        const provider = await getWorkingProvider();
-        const wallet = new ethers.Wallet(deploymentInfo.privateKey, provider);
-        const balance = await provider.getBalance(wallet.address);
+        // Use a cached provider if available to avoid repeating 30s delay
+        const p = provider || await getWorkingProvider();
+        const balance = await p.getBalance(deploymentInfo.wallet);
         const maticBalance = parseFloat(ethers.formatEther(balance)).toFixed(4);
         deploymentInfo.walletBalance = maticBalance;
         state.walletBal = maticBalance;
         return maticBalance;
     } catch (error) {
-        addLog(`⚠️ Balance check failed: ${error.message}`);
+        // addLog(`⚠️ Balance check failed: ${error.message}`);
         return deploymentInfo.walletBalance || "0";
     }
 }
@@ -907,7 +931,7 @@ const dashboardHTML = `
         <div class="table-container">
             <h3 style="margin-bottom: 16px;">🔥 LIVE ARBITRAGE OPPORTUNITIES</h3>
             <table id="opportunitiesTable">
-                <thead><tr><th>Token</th><th>Buy → Sell</th><th>Spread</th><th>Gross Profit</th><th>Costs</th><th>NET PROFIT</th><th>ROI</th><th>Trigger</th></tr></thead>
+                <thead><tr><th>Token</th><th>Buy → Sell</th><th>Spread</th><th>Gross Profit</th><th>Costs</th><th>NET PROFIT</th><th>ROI</th><th>Trigger</th></td></thead>
                 <tbody id="opportunitiesBody"></tbody>
             </table>
         </div>
@@ -981,7 +1005,7 @@ const dashboardHTML = `
                     </tr>\`;
                 }).join('');
             } else {
-                oppBody.innerHTML = '<td><td colspan="8" style="text-align: center;">🔍 Scanning for opportunities...<\/td><\/tr>';
+                oppBody.innerHTML = '<tr><td colspan="8" style="text-align: center;">🔍 Scanning for opportunities...<\/td><\/tr>';
             }
             
             const historyBody = document.getElementById('historyBody');
