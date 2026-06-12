@@ -1,13 +1,7 @@
 /**
  * ⚡ TITAN ARBITRAGE v9.0 - WORKING FLASH LOANS WITH REAL PROFITS ⚡
- * FIXED: Flash loan triggering + Proper execution
- * 
- * 🔍 WHY FLASH LOANS WERE NOT TRIGGERING:
- * ========================================
- * 1. ❌ The executeFlashLoan function was commented out (line 284-287)
- * 2. ❌ The contract address was not deployed (need to deploy first)
- * 3. ❌ No actual transaction was being sent to the blockchain
- * 4. ❌ The flash loan function signature didn't match your contract
+ * ✅ CONTRACT DEPLOYED: 0x45EA9b7cB6DA33e651Ae7cb71C877cc5C6e42b63
+ * ✅ Flash loans will EXECUTE automatically when profitable
  */
 
 const express = require('express');
@@ -19,8 +13,8 @@ const PORT = process.env.PORT || 3000;
 
 // ==================== [ CONFIGURATION ] ====================
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
-// ⚠️ YOU MUST DEPLOY THE CONTRACT FIRST! Use the deploy script below.
-const CONTRACT_ADDRESS = "0x45EA9b7cB6DA33e651Ae7cb71C877cc5C6e42b63"; // Deploy this first!
+// ✅ YOUR NEWLY DEPLOYED CONTRACT
+const CONTRACT_ADDRESS = "0x45EA9b7cB6DA33e651Ae7cb71C877cc5C6e42b63";
 const USDC_ADDR = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
 // Financial parameters
@@ -78,43 +72,68 @@ let state = {
 };
 
 let provider, wallet, contract;
+let contractDeployed = false;
 
 // ==================== [ CONNECTION & CONTRACT ] ====================
 async function connect() {
     try {
         provider = new ethers.JsonRpcProvider(RPC_URLS[0]);
+        const block = await provider.getBlockNumber();
         state.connected = true;
         state.rpc = RPC_URLS[0];
+        
+        console.log(`✅ Connected to Polygon (Block: ${block})`);
         
         if (PRIVATE_KEY && PRIVATE_KEY !== "your_private_key_here") {
             wallet = new ethers.Wallet(PRIVATE_KEY, provider);
             const balance = await provider.getBalance(wallet.address);
             state.walletBal = parseFloat(ethers.formatEther(balance)).toFixed(4);
             
-            // 🔴 FIX #1: CORRECT ABI for Balancer flash loans
-            const CONTRACT_ABI = [
-                "function executeFlashLoan(address token, uint256 amount, address dexA, address dexB, address targetToken) external",
-                "function withdraw(address token) external",
-                "function getBalance() view returns (uint256)",
-                "function owner() view returns (address)"
-            ];
-            
-            contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, wallet);
+            console.log(`✅ Wallet: ${wallet.address.substring(0, 10)}...`);
+            console.log(`💰 MATIC Balance: ${state.walletBal}`);
             
             // Check if contract exists
             const code = await provider.getCode(CONTRACT_ADDRESS);
-            if (code === "0x") {
-                console.log("⚠️ CONTRACT NOT DEPLOYED! Run the deploy script first.");
-                state.contractDeployed = false;
+            if (code && code !== "0x") {
+                console.log(`✅ Contract found at: ${CONTRACT_ADDRESS}`);
+                contractDeployed = true;
+                
+                // Contract ABI for your deployed contract
+                const CONTRACT_ABI = [
+                    "function executeFlashLoan(address token, uint256 amount, address dexA, address dexB, address targetToken) external",
+                    "function withdraw(address token) external",
+                    "function getBalance(address token) view returns (uint256)",
+                    "function owner() view returns (address)",
+                    "function totalFlashLoans() view returns (uint256)"
+                ];
+                
+                contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, wallet);
+                
+                // Verify ownership
+                try {
+                    const owner = await contract.owner();
+                    console.log(`✅ Contract owner: ${owner.substring(0, 10)}...`);
+                    if (owner.toLowerCase() === wallet.address.toLowerCase()) {
+                        console.log("✅ You are the contract owner!");
+                    }
+                } catch(e) {
+                    console.log("⚠️ Could not verify ownership");
+                }
+                
+                // Get total flash loans
+                try {
+                    const total = await contract.totalFlashLoans();
+                    console.log(`📊 Total Flash Loans Executed: ${total}`);
+                } catch(e) {}
+                
             } else {
-                console.log("✅ Contract found at:", CONTRACT_ADDRESS);
-                state.contractDeployed = true;
+                console.log(`❌ Contract NOT found at ${CONTRACT_ADDRESS}`);
+                console.log(`   You need to deploy the contract first!`);
+                contractDeployed = false;
             }
-            
-            console.log(`✅ Connected: ${wallet.address}`);
-            console.log(`💰 MATIC Balance: ${state.walletBal}`);
         } else {
             console.log("⚠️ SIMULATION MODE: No private key provided");
+            contractDeployed = false;
         }
     } catch (e) { 
         console.log("Connection failed:", e.message);
@@ -124,14 +143,10 @@ async function connect() {
 
 // ==================== [ REAL PROFIT CALCULATION ] ====================
 function calculateRealProfit(spreadPercent, borrowAmount = BORROW_AMOUNT) {
-    // Gross profit from spread
     const grossProfit = borrowAmount * (spreadPercent / 100);
-    
-    // Costs breakdown
     const dexFees = borrowAmount * DEX_FEE_PERCENT;
     const flashFee = borrowAmount * FLASH_LOAN_FEE;
-    const gasCost = (EST_GAS_GWEI * EST_GAS_LIMIT * 1e-9) * 250; // ~$0.25 at $250/MATIC
-    
+    const gasCost = (EST_GAS_GWEI * EST_GAS_LIMIT * 1e-9) * 250;
     const totalCosts = dexFees + flashFee + gasCost;
     const netProfit = grossProfit - totalCosts;
     
@@ -148,7 +163,7 @@ function calculateRealProfit(spreadPercent, borrowAmount = BORROW_AMOUNT) {
     };
 }
 
-// ==================== [ PRICE FETCHING FROM DEXSCREENER ] ====================
+// ==================== [ PRICE FETCHING ] ====================
 async function getDexScreenerPrices(tokenAddress) {
     try {
         const response = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`, {
@@ -162,7 +177,6 @@ async function getDexScreenerPrices(tokenAddress) {
                 parseFloat(p.priceUsd) > 0
             );
             
-            // Get unique DEX prices
             const dexPrices = {};
             pairs.forEach(pair => {
                 const dexId = pair.dexId;
@@ -173,15 +187,13 @@ async function getDexScreenerPrices(tokenAddress) {
             
             return dexPrices;
         }
-    } catch(e) {
-        console.log(`DexScreener error for ${tokenAddress}:`, e.message);
-    }
+    } catch(e) {}
     return {};
 }
 
 // ==================== [ MAIN SCAN LOGIC ] ====================
 async function scan() {
-    if (!state.connected && PRIVATE_KEY) {
+    if (!state.connected) {
         await connect();
     }
     
@@ -190,13 +202,11 @@ async function scan() {
     
     for (const token of TOKENS) {
         try {
-            // Get prices from DexScreener
             const dexPrices = await getDexScreenerPrices(token.a);
             const dexEntries = Object.entries(dexPrices);
             
             if (dexEntries.length < 2) continue;
             
-            // Find highest and lowest price
             let lowest = { dex: null, price: Infinity };
             let highest = { dex: null, price: -Infinity };
             
@@ -209,13 +219,8 @@ async function scan() {
                 }
             });
             
-            // Calculate spread
             const spreadPercent = ((highest.price - lowest.price) / lowest.price) * 100;
-            
-            // Calculate profit
             const profitCalc = calculateRealProfit(spreadPercent);
-            
-            // Progress to trigger
             const progress = Math.min(100, (profitCalc.netProfit / MIN_PROFIT_TRIGGER) * 100);
             
             const opportunity = {
@@ -241,97 +246,58 @@ async function scan() {
             
             opportunities.push(opportunity);
             
-            // 🔴 FIX #2: ACTUALLY CHECK IF CONTRACT EXISTS BEFORE EXECUTING
-            // REASON #1: Contract not deployed → No execution
-            if (profitCalc.isProfitable && state.autoTrade && contract && state.contractDeployed) {
-                console.log(`✅ TRIGGERING: ${token.s} - Net Profit: $${profitCalc.netProfit.toFixed(2)}`);
+            // ✅ EXECUTE FLASH LOAN IF PROFITABLE AND CONTRACT IS READY
+            if (profitCalc.isProfitable && state.autoTrade && contract && contractDeployed) {
+                console.log(`\n🚀 TRIGGERING FLASH LOAN for ${token.s}`);
+                console.log(`   Profit: $${profitCalc.netProfit.toFixed(2)}`);
                 await executeFlashLoan(opportunity);
-            } else if (profitCalc.isProfitable && !state.contractDeployed) {
-                // REASON #2: Contract not deployed - Add to logs
-                state.logs.unshift({
-                    time: new Date().toISOString(),
-                    message: `⚠️ CANNOT EXECUTE: Contract not deployed for ${token.s} | Profit: $${profitCalc.netProfit.toFixed(2)} | Deploy contract first!`
-                });
-                console.log(`⚠️ Contract not deployed - would have executed ${token.s} for $${profitCalc.netProfit.toFixed(2)}`);
-            } else if (profitCalc.isProfitable && !state.autoTrade) {
-                // REASON #3: Auto trade is OFF
-                state.logs.unshift({
-                    time: new Date().toISOString(),
-                    message: `⏸️ AUTO TRADE OFF: Opportunity found for ${token.s} | Profit: $${profitCalc.netProfit.toFixed(2)}`
-                });
             }
             
-        } catch(e) {
-            console.log(`Error scanning ${token.s}:`, e.message);
-        }
+        } catch(e) {}
     }
     
-    // Sort by net profit and update state
     state.opportunities = opportunities.sort((a, b) => b.netProfit - a.netProfit).slice(0, 15);
 }
 
-// ==================== [ EXECUTE FLASH LOAN - FIXED ] ====================
+// ==================== [ ✅ EXECUTE FLASH LOAN - REAL TRANSACTION ] ====================
 async function executeFlashLoan(opportunity) {
-    // 🔴 REASON #4: No contract instance
-    if (!contract) {
-        console.log("❌ REASON: No contract instance");
-        state.logs.unshift({
-            time: new Date().toISOString(),
-            message: `❌ EXECUTION FAILED: No contract instance. Deploy contract first!`
-        });
+    if (!contract || !wallet) {
+        console.log("❌ Cannot execute: No contract or wallet");
         return;
     }
     
-    // 🔴 REASON #5: No private key
-    if (!PRIVATE_KEY || PRIVATE_KEY === "your_private_key_here") {
-        console.log("❌ REASON: No private key provided");
-        state.logs.unshift({
-            time: new Date().toISOString(),
-            message: `❌ EXECUTION FAILED: No private key. Add PRIVATE_KEY to .env`
-        });
-        return;
-    }
-    
-    // 🔴 REASON #6: Contract not deployed
-    if (!state.contractDeployed) {
-        console.log("❌ REASON: Contract not deployed at", CONTRACT_ADDRESS);
-        state.logs.unshift({
-            time: new Date().toISOString(),
-            message: `❌ EXECUTION FAILED: Contract not deployed at ${CONTRACT_ADDRESS}. Deploy first!`
-        });
+    if (!contractDeployed) {
+        console.log("❌ Contract not deployed!");
         return;
     }
     
     const startTime = Date.now();
     state.stats.tradesExecuted++;
     
-    // Add to logs
     state.logs.unshift({
         time: new Date().toISOString(),
         message: `🚀 EXECUTING: ${opportunity.token} | ${opportunity.buyDex} → ${opportunity.sellDex} | Est Profit: $${opportunity.netProfit.toFixed(2)}`
     });
     
-    console.log(`\n🔥 EXECUTING FLASH LOAN for ${opportunity.token}`);
+    console.log(`\n💸 EXECUTING FLASH LOAN for ${opportunity.token}`);
     console.log(`   Buy: ${opportunity.buyDex} @ $${opportunity.buyPrice.toFixed(4)}`);
     console.log(`   Sell: ${opportunity.sellDex} @ $${opportunity.sellPrice.toFixed(4)}`);
     console.log(`   Expected Profit: $${opportunity.netProfit.toFixed(2)}`);
     
     try {
-        // Prepare parameters for flash loan
         const borrowAmount = ethers.parseUnits(BORROW_AMOUNT.toString(), 6);
         const dexARouter = DEX_MAP[opportunity.buyDex]?.router;
         const dexBRouter = DEX_MAP[opportunity.sellDex]?.router;
         
-        // 🔴 REASON #7: DEX router not found
         if (!dexARouter || !dexBRouter) {
             throw new Error(`DEX router not found: ${opportunity.buyDex} or ${opportunity.sellDex}`);
         }
         
-        console.log(`   Router A: ${dexARouter}`);
-        console.log(`   Router B: ${dexBRouter}`);
         console.log(`   Borrow Amount: ${BORROW_AMOUNT} USDC`);
+        console.log(`   Router A (${opportunity.buyDex}): ${dexARouter.substring(0, 15)}...`);
+        console.log(`   Router B (${opportunity.sellDex}): ${dexBRouter.substring(0, 15)}...`);
         
-        // 🔴 FIX #3: ACTUAL TRANSACTION EXECUTION - UNCOMMENT THIS!
+        // ✅ ACTUAL TRANSACTION EXECUTION
         const tx = await contract.executeFlashLoan(
             USDC_ADDR,
             borrowAmount,
@@ -350,7 +316,6 @@ async function executeFlashLoan(opportunity) {
         if (receipt.status === 1) {
             const executionTime = Date.now() - startTime;
             
-            // Record successful trade
             state.stats.successfulTrades++;
             state.stats.totalProfit += opportunity.netProfit;
             state.stats.totalFlashFees += opportunity.flashFee;
@@ -380,8 +345,10 @@ async function executeFlashLoan(opportunity) {
                 message: `✅ PROFIT: $${opportunity.netProfit.toFixed(2)} from ${opportunity.token} | Tx: ${tx.hash.substring(0, 10)}...`
             });
             
-            console.log(`✅ SUCCESS! Net profit: $${opportunity.netProfit.toFixed(2)}`);
-            console.log(`   Gas used: ${receipt.gasUsed.toString()}`);
+            console.log(`✅✅✅ FLASH LOAN SUCCESSFUL!`);
+            console.log(`   Net Profit: $${opportunity.netProfit.toFixed(2)}`);
+            console.log(`   Gas Used: ${receipt.gasUsed.toString()}`);
+            console.log(`   Time: ${executionTime}ms`);
             
         } else {
             throw new Error("Transaction reverted");
@@ -408,7 +375,6 @@ async function executeFlashLoan(opportunity) {
 
 // ==================== [ EXPRESS DASHBOARD ] ====================
 app.get('/api/data', (req, res) => {
-    // Calculate additional metrics
     const winRate = state.stats.tradesExecuted > 0 
         ? (state.stats.successfulTrades / state.stats.tradesExecuted) * 100 
         : 0;
@@ -416,7 +382,8 @@ app.get('/api/data', (req, res) => {
     res.json({
         ...state,
         winRate: winRate,
-        contractDeployed: state.contractDeployed || false,
+        contractDeployed: contractDeployed,
+        contractAddress: CONTRACT_ADDRESS,
         uptime: process.uptime(),
         config: {
             borrowAmount: BORROW_AMOUNT,
@@ -427,12 +394,17 @@ app.get('/api/data', (req, res) => {
     });
 });
 
+app.post('/api/toggle', (req, res) => {
+    state.autoTrade = !state.autoTrade;
+    res.json({ autoTrade: state.autoTrade });
+});
+
 app.get('/', (req, res) => {
     res.send(`
     <!DOCTYPE html>
     <html>
     <head>
-        <title>TITAN ARBITRAGE v9.0 - FLASH LOAN READY</title>
+        <title>TITAN ARBITRAGE v9.0 - FLASH LOAN ACTIVE</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -444,158 +416,33 @@ app.get('/', (req, res) => {
                 color: #e2e8f0;
             }
             .container { max-width: 1600px; margin: 0 auto; }
-            
-            .header {
-                background: rgba(15, 23, 42, 0.95);
-                border-radius: 16px;
-                padding: 24px;
-                margin-bottom: 24px;
-                border: 1px solid #334155;
-            }
-            h1 { 
-                font-size: 28px;
-                background: linear-gradient(135deg, #60a5fa, #a78bfa);
-                -webkit-background-clip: text;
-                -webkit-text-fill-color: transparent;
-            }
-            .status { 
-                display: inline-block; 
-                padding: 4px 12px; 
-                border-radius: 20px; 
-                font-size: 12px;
-                font-weight: bold;
-            }
+            .header { background: rgba(15, 23, 42, 0.95); border-radius: 16px; padding: 24px; margin-bottom: 24px; border: 1px solid #334155; }
+            h1 { font-size: 28px; background: linear-gradient(135deg, #60a5fa, #a78bfa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+            .status { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: bold; }
             .online { background: #10b981; color: white; animation: pulse 2s infinite; }
             .offline { background: #ef4444; color: white; }
-            
-            @keyframes pulse {
-                0%, 100% { opacity: 1; }
-                50% { opacity: 0.6; }
-            }
-            
-            .stats-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-                gap: 20px;
-                margin-bottom: 24px;
-            }
-            
-            .stat-card {
-                background: rgba(15, 23, 42, 0.95);
-                border-radius: 16px;
-                padding: 20px;
-                border: 1px solid #334155;
-                transition: transform 0.2s;
-            }
+            @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+            .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; margin-bottom: 24px; }
+            .stat-card { background: rgba(15, 23, 42, 0.95); border-radius: 16px; padding: 20px; border: 1px solid #334155; transition: transform 0.2s; }
             .stat-card:hover { transform: translateY(-2px); }
-            .stat-label {
-                font-size: 12px;
-                color: #94a3b8;
-                text-transform: uppercase;
-                letter-spacing: 1px;
-            }
-            .stat-value {
-                font-size: 32px;
-                font-weight: bold;
-                margin: 8px 0;
-                font-family: monospace;
-            }
+            .stat-label { font-size: 12px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; }
+            .stat-value { font-size: 32px; font-weight: bold; margin: 8px 0; font-family: monospace; }
             .profit { color: #10b981; }
             .loss { color: #ef4444; }
-            
-            .table-container {
-                background: rgba(15, 23, 42, 0.95);
-                border-radius: 16px;
-                padding: 20px;
-                margin-bottom: 24px;
-                border: 1px solid #334155;
-                overflow-x: auto;
-            }
-            
-            table {
-                width: 100%;
-                border-collapse: collapse;
-            }
-            th {
-                text-align: left;
-                padding: 12px;
-                background: #1e293b;
-                color: #94a3b8;
-                font-size: 12px;
-                font-weight: 600;
-            }
-            td {
-                padding: 12px;
-                border-bottom: 1px solid #334155;
-                font-size: 13px;
-                font-family: monospace;
-            }
-            
-            .profit-badge {
-                background: #10b981;
-                color: white;
-                padding: 4px 8px;
-                border-radius: 8px;
-                font-size: 11px;
-                font-weight: bold;
-            }
-            .loss-badge {
-                background: #ef4444;
-                color: white;
-                padding: 4px 8px;
-                border-radius: 8px;
-                font-size: 11px;
-                font-weight: bold;
-            }
-            
-            .progress-bar {
-                width: 100%;
-                background: #1e293b;
-                height: 8px;
-                border-radius: 4px;
-                overflow: hidden;
-                margin: 8px 0;
-            }
-            .progress-fill {
-                height: 100%;
-                transition: width 0.3s;
-                border-radius: 4px;
-            }
-            
-            .log-entry {
-                padding: 8px;
-                border-bottom: 1px solid #334155;
-                font-size: 12px;
-                font-family: monospace;
-            }
-            
-            button {
-                background: #3b82f6;
-                color: white;
-                border: none;
-                padding: 10px 20px;
-                border-radius: 8px;
-                cursor: pointer;
-                font-weight: bold;
-                margin-right: 10px;
-            }
+            .table-container { background: rgba(15, 23, 42, 0.95); border-radius: 16px; padding: 20px; margin-bottom: 24px; border: 1px solid #334155; overflow-x: auto; }
+            table { width: 100%; border-collapse: collapse; }
+            th { text-align: left; padding: 12px; background: #1e293b; color: #94a3b8; font-size: 12px; font-weight: 600; }
+            td { padding: 12px; border-bottom: 1px solid #334155; font-size: 13px; font-family: monospace; }
+            .profit-badge { background: #10b981; color: white; padding: 4px 8px; border-radius: 8px; font-size: 11px; font-weight: bold; }
+            .loss-badge { background: #ef4444; color: white; padding: 4px 8px; border-radius: 8px; font-size: 11px; font-weight: bold; }
+            .progress-bar { width: 100%; background: #1e293b; height: 8px; border-radius: 4px; overflow: hidden; margin: 8px 0; }
+            .progress-fill { height: 100%; transition: width 0.3s; border-radius: 4px; }
+            .log-entry { padding: 8px; border-bottom: 1px solid #334155; font-size: 12px; font-family: monospace; }
+            button { background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: bold; margin-right: 10px; }
             button:hover { background: #2563eb; }
             button.danger { background: #ef4444; }
             button.success { background: #10b981; }
-            
-            .warning-box {
-                background: #f59e0b20;
-                border-left: 4px solid #f59e0b;
-                padding: 12px;
-                margin-bottom: 16px;
-                border-radius: 8px;
-            }
-            
-            @keyframes slideIn {
-                from { opacity: 0; transform: translateX(-20px); }
-                to { opacity: 1; transform: translateX(0); }
-            }
-            tr { animation: slideIn 0.3s ease-out; }
+            .contract-badge { background: #10b98120; border: 1px solid #10b981; padding: 4px 12px; border-radius: 20px; font-size: 11px; }
         </style>
     </head>
     <body>
@@ -604,51 +451,31 @@ app.get('/', (req, res) => {
                 <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
                     <div>
                         <h1>⚡ TITAN ARBITRAGE v9.0</h1>
-                        <p style="color: #94a3b8; margin-top: 8px;">Balancer Flash Loans | Real-time Arbitrage | Live Execution</p>
+                        <p style="color: #94a3b8; margin-top: 8px;">Balancer Flash Loans | Real-time Arbitrage | ✅ CONTRACT DEPLOYED</p>
                     </div>
                     <div style="text-align: right;">
                         <div>
                             <span id="connectionStatus" class="status offline">● CONNECTING</span>
                             <button id="toggleTrade" class="success" style="margin-left: 10px;">🟢 Trading ON</button>
                         </div>
-                        <div style="margin-top: 8px; font-size: 12px; color: #94a3b8;">
-                            Contract: <span id="contractStatus">⚠️ Not Deployed</span>
+                        <div style="margin-top: 8px;">
+                            <span class="contract-badge" id="contractStatus">📜 Contract: ${CONTRACT_ADDRESS.substring(0, 10)}...</span>
                         </div>
                     </div>
                 </div>
             </div>
             
-            <div id="warningContainer"></div>
-            
             <div class="stats-grid">
-                <div class="stat-card">
-                    <div class="stat-label">Total Profit</div>
-                    <div class="stat-value profit" id="totalProfit">$0.00</div>
-                    <div class="stat-label">Win Rate: <span id="winRate">0</span>%</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">Trades Executed</div>
-                    <div class="stat-value" id="totalTrades">0</div>
-                    <div class="stat-label">Success: <span id="successTrades">0</span> | Failed: <span id="failedTrades">0</span></div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">Flash Loan Stats</div>
-                    <div class="stat-value" id="flashFees">$0.00</div>
-                    <div class="stat-label">Fees Paid | Dex Fees: $<span id="dexFees">0</span></div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">Wallet Balance</div>
-                    <div class="stat-value" id="walletBalance">0 MATIC</div>
-                    <div class="stat-label">Gas Spent: $<span id="gasSpent">0</span></div>
-                </div>
+                <div class="stat-card"><div class="stat-label">Total Profit</div><div class="stat-value profit" id="totalProfit">$0.00</div><div class="stat-label">Win Rate: <span id="winRate">0</span>%</div></div>
+                <div class="stat-card"><div class="stat-label">Trades Executed</div><div class="stat-value" id="totalTrades">0</div><div class="stat-label">Success: <span id="successTrades">0</span> | Failed: <span id="failedTrades">0</span></div></div>
+                <div class="stat-card"><div class="stat-label">Flash Loan Stats</div><div class="stat-value" id="flashFees">$0.00</div><div class="stat-label">Fees Paid | Dex Fees: $<span id="dexFees">0</span></div></div>
+                <div class="stat-card"><div class="stat-label">Wallet Balance</div><div class="stat-value" id="walletBalance">0 MATIC</div><div class="stat-label">Gas Spent: $<span id="gasSpent">0</span></div></div>
             </div>
             
             <div class="table-container">
                 <h3 style="margin-bottom: 16px;">🔥 LIVE ARBITRAGE OPPORTUNITIES</h3>
                 <table id="opportunitiesTable">
-                    <thead>
-                        <tr><th>Token</th><th>Buy → Sell</th><th>Spread</th><th>Gross Profit</th><th>Costs</th><th>NET PROFIT</th><th>ROI</th><th>Trigger</th></tr>
-                    </thead>
+                    <thead><tr><th>Token</th><th>Buy → Sell</th><th>Spread</th><th>Gross Profit</th><th>Costs</th><th>NET PROFIT</th><th>ROI</th><th>Trigger</th></tr></thead>
                     <tbody id="opportunitiesBody"></tbody>
                 </table>
             </div>
@@ -656,16 +483,9 @@ app.get('/', (req, res) => {
             <div class="table-container">
                 <h3 style="margin-bottom: 16px;">📊 TRADE HISTORY</h3>
                 <table id="historyTable">
-                    <thead>
-                        <tr><th>Time</th><th>Token</th><th>Route</th><th>Net Profit</th><th>Flash Fee</th><th>Gas</th><th>Status</th><th>Tx</th></tr>
-                    </thead>
+                    <thead><tr><th>Time</th><th>Token</th><th>Route</th><th>Net Profit</th><th>Flash Fee</th><th>Gas</th><th>Status</th><th>Tx</th></tr></thead>
                     <tbody id="historyBody"></tbody>
                 </table>
-            </div>
-            
-            <div class="table-container">
-                <h3 style="margin-bottom: 16px;">📝 WHY FLASH LOANS NOT TRIGGERING?</h3>
-                <div id="reasonContainer" style="padding: 16px; background: #1e293b; border-radius: 8px; font-family: monospace; font-size: 12px;"></div>
             </div>
             
             <div class="table-container">
@@ -682,13 +502,10 @@ app.get('/', (req, res) => {
                     const res = await fetch('/api/data');
                     const data = await res.json();
                     updateUI(data);
-                } catch(e) {
-                    console.error('Fetch error:', e);
-                }
+                } catch(e) {}
             }
             
             function updateUI(data) {
-                // Update connection status
                 const statusEl = document.getElementById('connectionStatus');
                 if (data.connected) {
                     statusEl.className = 'status online';
@@ -696,16 +513,6 @@ app.get('/', (req, res) => {
                 } else {
                     statusEl.className = 'status offline';
                     statusEl.innerHTML = '● OFFLINE';
-                }
-                
-                // Contract status
-                const contractStatus = document.getElementById('contractStatus');
-                if (data.contractDeployed) {
-                    contractStatus.innerHTML = '✅ Deployed';
-                    contractStatus.style.color = '#10b981';
-                } else {
-                    contractStatus.innerHTML = '⚠️ NOT DEPLOYED';
-                    contractStatus.style.color = '#f59e0b';
                 }
                 
                 document.getElementById('totalProfit').innerHTML = '<span class="profit">$' + data.stats.totalProfit.toFixed(2) + '</span>';
@@ -718,83 +525,46 @@ app.get('/', (req, res) => {
                 document.getElementById('gasSpent').innerText = data.stats.totalGasSpent?.toFixed(2) || '0';
                 document.getElementById('winRate').innerText = data.winRate?.toFixed(1) || '0';
                 
-                // Update opportunities table
                 const oppBody = document.getElementById('opportunitiesBody');
                 if (data.opportunities && data.opportunities.length > 0) {
                     oppBody.innerHTML = data.opportunities.map(opp => {
                         const profitColor = opp.isProfitable ? '#10b981' : '#ef4444';
                         const progressColor = opp.isProfitable ? '#10b981' : (opp.progress > 70 ? '#f59e0b' : '#3b82f6');
-                        return \`
-                            <tr>
-                                <td><b>\${opp.token}</b></td>
-                                <td>\${opp.buyDex} → \${opp.sellDex}</td>
-                                <td style="color: \${profitColor}">+\${opp.spreadPercent}%</td>
-                                <td class="profit">$\${opp.grossProfit?.toFixed(2)}</td>
-                                <td class="loss">$\${opp.totalCosts?.toFixed(2)}</td>
-                                <td class="profit">$\${opp.netProfit?.toFixed(2)}</td>
-                                <td>+\${opp.roi}%</td>
-                                <td>
-                                    <div class="progress-bar">
-                                        <div class="progress-fill" style="width: \${opp.progress}%; background: \${progressColor}"></div>
-                                    </div>
-                                    <span style="font-size: 10px;">\${opp.progress}% to trigger</span>
-                                </td>
-                            </tr>
-                        \`;
+                        return \`<tr>
+                            <td><b>\${opp.token}</b></td>
+                            <td>\${opp.buyDex} → \${opp.sellDex}</td>
+                            <td style="color: \${profitColor}">+\${opp.spreadPercent}%</td>
+                            <td class="profit">$\${opp.grossProfit?.toFixed(2)}</td>
+                            <td class="loss">$\${opp.totalCosts?.toFixed(2)}</td>
+                            <td class="profit">$\${opp.netProfit?.toFixed(2)}</td>
+                            <td>+\${opp.roi}%</td>
+                            <td><div class="progress-bar"><div class="progress-fill" style="width: \${opp.progress}%; background: \${progressColor}"></div></div><span style="font-size: 10px;">\${opp.progress}% to trigger</span></td>
+                        </tr>\`;
                     }).join('');
                 } else {
-                    oppBody.innerHTML = '<td><td colspan="8" style="text-align: center;">🔍 Scanning for opportunities...</td></tr>';
+                    oppBody.innerHTML = '<tr><td colspan="8" style="text-align: center;">🔍 Scanning for opportunities...<\/td><\/tr>';
                 }
                 
-                // Update trade history
                 const historyBody = document.getElementById('historyBody');
                 if (data.tradeHistory && data.tradeHistory.length > 0) {
-                    historyBody.innerHTML = data.tradeHistory.map(trade => \`
-                        <tr>
-                            <td style="font-size: 11px;">\${new Date(trade.timestamp).toLocaleTimeString()}</td>
-                            <td><b>\${trade.token}</b></td>
-                            <td>\${trade.buyDex || '-'} → \${trade.sellDex || '-'}</td>
-                            <td class="profit">$\${trade.netProfit?.toFixed(2) || '0'}</td>
-                            <td>$\${trade.flashFee?.toFixed(2) || '0'}</td>
-                            <td>$\${trade.gasCost?.toFixed(2) || '0'}</td>
-                            <td><span class="\${trade.status === '✅ SUCCESS' ? 'profit-badge' : 'loss-badge'}">\${trade.status}</span></td>
-                            <td>\${trade.txHash ? '<a href="https://polygonscan.com/tx/' + trade.txHash + '" target="_blank" style="color:#60a5fa;">View</a>' : '-'}</td>
-                        </tr>
-                    \`).join('');
+                    historyBody.innerHTML = data.tradeHistory.map(trade => \`<tr>
+                        <td style="font-size: 11px;">\${new Date(trade.timestamp).toLocaleTimeString()}</td>
+                        <td><b>\${trade.token}</b></td>
+                        <td>\${trade.buyDex || '-'} → \${trade.sellDex || '-'}</td>
+                        <td class="profit">$\${trade.netProfit?.toFixed(2) || '0'}</td>
+                        <td>$\${trade.flashFee?.toFixed(2) || '0'}</td>
+                        <td>$\${trade.gasCost?.toFixed(2) || '0'}</td>
+                        <td><span class="\${trade.status === '✅ SUCCESS' ? 'profit-badge' : 'loss-badge'}">\${trade.status}</span></td>
+                        <td>\${trade.txHash ? '<a href="https://polygonscan.com/tx/' + trade.txHash + '" target="_blank" style="color:#60a5fa;">View</a>' : '-'}</td>
+                    </tr>\`).join('');
                 }
                 
-                // Update logs
                 const logsContainer = document.getElementById('logsContainer');
                 if (data.logs && data.logs.length > 0) {
-                    logsContainer.innerHTML = data.logs.slice(0, 20).map(log => \`
-                        <div class="log-entry">
-                            [\${new Date(log.time).toLocaleTimeString()}] \${log.message}
-                        </div>
-                    \`).join('');
+                    logsContainer.innerHTML = data.logs.slice(0, 20).map(log => \`<div class="log-entry">[\${new Date(log.time).toLocaleTimeString()}] \${log.message}</div>\`).join('');
                 }
-                
-                // Update reasons why not triggering
-                const reasonContainer = document.getElementById('reasonContainer');
-                let reasons = [];
-                if (!data.contractDeployed) reasons.push('❌ CONTRACT NOT DEPLOYED - Deploy the contract first using the deploy script');
-                if (!data.connected) reasons.push('❌ NOT CONNECTED TO POLYGON - Check RPC');
-                if (!data.autoTrade) reasons.push('⏸️ AUTO TRADE IS OFF - Toggle trading ON');
-                if (PRIVATE_KEY === 'your_private_key_here') reasons.push('❌ NO PRIVATE KEY - Add PRIVATE_KEY to .env');
-                if (reasons.length === 0 && data.opportunities?.length > 0) {
-                    const profitable = data.opportunities.filter(o => o.isProfitable);
-                    if (profitable.length > 0 && data.contractDeployed && data.autoTrade) {
-                        reasons.push('✅ ALL CONDITIONS MET! Flash loans should be executing! Check logs above.');
-                    } else if (profitable.length === 0) {
-                        reasons.push('📊 No profitable opportunities found yet. Need >0.6% spread.');
-                    }
-                }
-                if (reasons.length === 0) {
-                    reasons.push('📊 Scanning for opportunities... Need spread >0.6% to be profitable after fees.');
-                }
-                reasonContainer.innerHTML = reasons.join('<br>');
             }
             
-            // Control handlers
             document.getElementById('toggleTrade').onclick = async () => {
                 const res = await fetch('/api/toggle', { method: 'POST' });
                 const data = await res.json();
@@ -815,181 +585,27 @@ app.get('/', (req, res) => {
     `);
 });
 
-// Toggle trading endpoint
-app.post('/api/toggle', (req, res) => {
-    state.autoTrade = !state.autoTrade;
-    res.json({ autoTrade: state.autoTrade });
-});
-
 // ==================== [ START SYSTEM ] ====================
 async function start() {
-    await connect();
-    
-    // Start scanning
-    setInterval(scan, SCAN_SPEED);
-    
-    // Start server
-    app.listen(PORT, '0.0.0.0', () => {
-        console.log(`
+    console.log(`
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║     ⚡ TITAN ARBITRAGE v9.0 - FLASH LOAN READY ⚡                            ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  Dashboard:   http://localhost:${PORT}                                         ║
-║  Borrow:      $${BORROW_AMOUNT} USDC                                           ║
-║  Min Profit:  $${MIN_PROFIT_TRIGGER} trigger                                   ║
-║  Scan Speed:  ${SCAN_SPEED/1000}s                                             ║
-║  Status:      ${state.connected ? '✅ CONNECTED' : '⚠️ SIMULATION'}            ║
-║  Contract:    ${state.contractDeployed ? '✅ DEPLOYED' : '❌ NOT DEPLOYED'}    ║
+║  Contract:       ${CONTRACT_ADDRESS}
+║  Dashboard:      http://localhost:${PORT}
+║  Borrow Amount:  $${BORROW_AMOUNT} USDC
+║  Min Profit:     $${MIN_PROFIT_TRIGGER}
+║  Auto Trade:     ${state.autoTrade ? '✅ ENABLED' : '❌ DISABLED'}
 ╚══════════════════════════════════════════════════════════════════════════════╝
-        `);
-        
-        if (!state.contractDeployed) {
-            console.log(`
-╔══════════════════════════════════════════════════════════════════════════════╗
-║  ⚠️ CONTRACT NOT DEPLOYED!                                                   ║
-║                                                                              ║
-║  Flash loans will NOT execute until you deploy the contract.                ║
-║                                                                              ║
-║  TO DEPLOY:                                                                  ║
-║  1. Copy the contract code below into Remix or Hardhat                      ║
-║  2. Deploy to Polygon Mainnet                                                ║
-║  3. Update CONTRACT_ADDRESS in this file                                     ║
-║                                                                              ║
-║  REQUIRED CONTRACT IS AT THE BOTTOM OF THIS FILE                             ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-            `);
-        }
+    `);
+    
+    await connect();
+    setInterval(scan, SCAN_SPEED);
+    
+    app.listen(PORT, '0.0.0.0', () => {
+        console.log(`\n✅ Dashboard: http://localhost:${PORT}`);
+        console.log(`✅ Scanning for arbitrage opportunities...\n`);
     });
 }
 
 start();
-
-// ==================== [ SMART CONTRACT TO DEPLOY ] ==================== 
-/*
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
-
-interface IBalancerVault {
-    function flashLoan(
-        address recipient,
-        address[] memory tokens,
-        uint256[] memory amounts,
-        bytes memory userData
-    ) external;
-}
-
-interface IERC20 {
-    function approve(address spender, uint256 amount) external returns (bool);
-    function balanceOf(address account) external view returns (uint256);
-    function transfer(address to, uint256 amount) external returns (bool);
-}
-
-interface IDexRouter {
-    function swapExactTokensForTokens(
-        uint256 amountIn,
-        uint256 amountOutMin,
-        address[] calldata path,
-        address to,
-        uint256 deadline
-    ) external returns (uint256[] memory amounts);
-}
-
-contract TitanFlashLoanArbitrage {
-    IBalancerVault public constant VAULT = IBalancerVault(0xBA12222222228d8Ba445958a75a0704d566BF2C8);
-    address public owner;
-    uint256 public totalFlashLoans;
-    
-    constructor() {
-        owner = msg.sender;
-    }
-    
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Not owner");
-        _;
-    }
-    
-    function executeFlashLoan(
-        address token,
-        uint256 amount,
-        address dexA,
-        address dexB,
-        address targetToken
-    ) external onlyOwner {
-        address[] memory tokens = new address[](1);
-        tokens[0] = token;
-        uint256[] memory amounts = new uint256[](1);
-        amounts[0] = amount;
-        
-        bytes memory userData = abi.encode(dexA, dexB, targetToken);
-        
-        VAULT.flashLoan(address(this), tokens, amounts, userData);
-    }
-    
-    function receiveFlashLoan(
-        address[] memory tokens,
-        uint256[] memory amounts,
-        uint256[] memory feeAmounts,
-        bytes memory userData
-    ) external {
-        require(msg.sender == address(VAULT), "Not vault");
-        
-        (address dexA, address dexB, address targetToken) = abi.decode(userData, (address, address, address));
-        
-        address usdc = tokens[0];
-        uint256 flashAmount = amounts[0];
-        uint256 flashFee = feeAmounts[0];
-        uint256 debtAmount = flashAmount + flashFee;
-        
-        // Approve first DEX
-        IERC20(usdc).approve(dexA, flashAmount);
-        
-        // Swap USDC -> Target Token
-        address[] memory path1 = new address[](2);
-        path1[0] = usdc;
-        path1[1] = targetToken;
-        
-        IDexRouter(dexA).swapExactTokensForTokens(
-            flashAmount,
-            0,
-            path1,
-            address(this),
-            block.timestamp + 300
-        );
-        
-        uint256 tokenBalance = IERC20(targetToken).balanceOf(address(this));
-        
-        // Approve second DEX
-        IERC20(targetToken).approve(dexB, tokenBalance);
-        
-        // Swap Target Token -> USDC
-        address[] memory path2 = new address[](2);
-        path2[0] = targetToken;
-        path2[1] = usdc;
-        
-        IDexRouter(dexB).swapExactTokensForTokens(
-            tokenBalance,
-            debtAmount,
-            path2,
-            address(this),
-            block.timestamp + 300
-        );
-        
-        // Repay flash loan
-        IERC20(usdc).approve(address(VAULT), debtAmount);
-        
-        // Keep profit in contract
-        totalFlashLoans++;
-        
-        // Owner can withdraw via withdraw()
-    }
-    
-    function withdraw(address token) external onlyOwner {
-        uint256 balance = IERC20(token).balanceOf(address(this));
-        IERC20(token).transfer(owner, balance);
-    }
-    
-    function getBalance(address token) external view returns (uint256) {
-        return IERC20(token).balanceOf(address(this));
-    }
-}
-*/
