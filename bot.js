@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 3000;
 
 // ==================== [ CONFIGURATION ] ====================
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
-const CONTRACT_ADDRESS = "0xbBc05a40b2c279c04C0c47B3564b8d52d06190C0"; // Deploy this first!
+const CONTRACT_ADDRESS = "0xAe07739C6876Eeb8538e82d58FA0Aa491BF488f8"; // Deploy this first!
 const USDC_ADDR = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
 // Financial parameters
