@@ -1,5 +1,5 @@
-// bot-flashloan-arbitrum.js - Real Flash Loan Arbitrage Bot with AAVE V3 on Arbitrum
-// Scans ALL tokens and executes flash loan arbitrage with $0 capital
+// bot-flashloan.js - ADVANCED Flash Loan Arbitrage Bot WITH DEBUG DASHBOARD
+// Shows real-time spreads, prices, and opportunities
 
 require('dotenv').config();
 const express = require('express');
@@ -10,9 +10,8 @@ const PORT = process.env.PORT || 3000;
 
 // ==================== CONFIGURATION ====================
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
-const ARBITRUM_RPC = process.env.ARBITRUM_RPC || "https://arb1.arbitrum.io/rpc";
-// FIXED: Proper checksum address for Arbitrum contract (or use your deployed contract)
-const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || "0x8c6D2f6Af836A7eFf885Bf2bC6d3FfEfEe5D2C9D".toLowerCase();
+const QUICKNODE_URL = process.env.QUICKNODE_URL || "https://cosmopolitan-muddy-dew.matic.quiknode.pro/45b8f7a71d2385208254951a496c78fb94b9676d/";
+const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || "0xB56Bb558b7400A1b77898187AA729Ad2853B9487";
 
 // Rate limiting configuration
 const RATE_LIMIT = {
@@ -22,35 +21,77 @@ const RATE_LIMIT = {
 
 // Cache prices
 const priceCache = new Map();
-const CACHE_TTL = 30000;
+const CACHE_TTL = 20000;
 
-// ==================== ALL TOKENS ON ARBITRUM ====================
+// Debug data storage
+let debugData = {
+    lastScan: null,
+    allPrices: [],
+    spreads: [],
+    topOpportunities: [],
+    dexPerformance: {},
+    tokenSpreads: {}
+};
+
+// ==================== ALL TOKENS ON POLYGON ====================
 const ALL_TOKENS = [
-    { symbol: "USDC", address: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", decimals: 6, icon: "💵", category: "Stable" },
-    { symbol: "USDT", address: "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9", decimals: 6, icon: "💰", category: "Stable" },
-    { symbol: "DAI", address: "0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1", decimals: 18, icon: "🏦", category: "Stable" },
-    { symbol: "ETH", address: "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE", decimals: 18, icon: "💎", category: "L1" },
-    { symbol: "WETH", address: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1", decimals: 18, icon: "💎", category: "L1" },
-    { symbol: "WBTC", address: "0x2f2a2543B76A4166549F7aaB2e75B0Ea42c394C", decimals: 8, icon: "🟡", category: "L1" },
-    { symbol: "ARB", address: "0x912CE59144191C1204E64559FE8253a0e49E6548", decimals: 18, icon: "🔴", category: "DeFi" },
-    { symbol: "AAVE", address: "0xba5DdD1f9d7F570dc94a51479a000E3BCE967196", decimals: 18, icon: "🏦", category: "DeFi" },
-    { symbol: "UNI", address: "0xFa7F8980b0f1E64A2062791cc3b0871572f1F7f0", decimals: 18, icon: "🦄", category: "DeFi" },
-    { symbol: "LINK", address: "0xf97f4df75117a78c1A5a0DBb814Af92458539FB4", decimals: 18, icon: "🔗", category: "Oracle" },
-    { symbol: "GMX", address: "0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a", decimals: 18, icon: "🏔️", category: "DeFi" }
+    { symbol: "USDC", address: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", decimals: 6, icon: "💵", category: "Stable" },
+    { symbol: "USDT", address: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F", decimals: 6, icon: "💰", category: "Stable" },
+    { symbol: "DAI", address: "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063", decimals: 18, icon: "🏦", category: "Stable" },
+    { symbol: "POL", address: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", decimals: 18, icon: "🟣", category: "L1" },
+    { symbol: "WETH", address: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619", decimals: 18, icon: "💎", category: "L1" },
+    { symbol: "WBTC", address: "0x1bfd67037b42cf73acF2047067bd4F2C47D9BfD6", decimals: 8, icon: "🟡", category: "L1" },
+    { symbol: "CAKE", address: "0x0b3F868E0BE5597D5DB7fEB59E1CADbb0fdDa50a", decimals: 18, icon: "🍰", category: "DeFi" },
+    { symbol: "QUICK", address: "0xB5C064F955D8e7F38fE0460C556a72987494eE17", decimals: 18, icon: "⚡", category: "DeFi" },
+    { symbol: "AAVE", address: "0xD6DF932A45C0f255f85145f286eA0b292B21C90B", decimals: 18, icon: "🏦", category: "DeFi" },
+    { symbol: "UNI", address: "0xb33EaAd8d922B1083446DC23f610c2567fB5180f", decimals: 18, icon: "🦄", category: "DeFi" },
+    { symbol: "LINK", address: "0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39", decimals: 18, icon: "🔗", category: "Oracle" },
+    { symbol: "CRV", address: "0x172370d5Cd63279eFa6d502DAB29171933a610AF", decimals: 18, icon: "📈", category: "DeFi" },
+    { symbol: "SUSHI", address: "0x0b3F868E0BE5597D5DB7fEB59E1CADbb0fdDa50a", decimals: 18, icon: "🍣", category: "DeFi" }
 ];
 
-// DEX addresses for Arbitrum
-const QUICKSWAP_ROUTER = "0xA5e0829CACEd8fFdd4B3C72e4999f68ff6213921";
-const SUSHISWAP_ROUTER = "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506";
-const UNISWAP_ROUTER = "0xE592427A0AEce92De3Edee1F18E0157C05861564";
-const CAMELOT_ROUTER = "0xc873fEcbd354f5A56E00E710B90EF4201db2448d";
+// ==================== DEX CONFIGURATION ====================
+const DEXES = [
+    { 
+        name: "PANCAKESWAP", 
+        router: "0x6785E09eB2AcEcA0A293A48Cb7296280171fF25F",
+        fee: 0.0025, 
+        type: "v2",
+        icon: "🥞",
+        color: "#F0B90B"
+    },
+    { 
+        name: "QUICKSWAP", 
+        router: "0xA5e0829CACEd8fFdd4B3C72e4999f68ff6213921", 
+        fee: 0.0030, 
+        type: "v2",
+        icon: "⚡",
+        color: "#0052FF"
+    },
+    { 
+        name: "SUSHISWAP", 
+        router: "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506", 
+        fee: 0.0030, 
+        type: "v2",
+        icon: "🍣",
+        color: "#FF4B4B"
+    }
+];
 
-// FLASH LOAN CONTRACT ABI
+// ==================== TRIANGULAR ARBITRAGE PATHS ====================
+const TRIANGULAR_PATHS = [
+    { name: "USDC → POL → CAKE → USDC", path: ["USDC", "POL", "CAKE", "USDC"], minProfit: 0.50 },
+    { name: "USDC → WETH → CAKE → USDC", path: ["USDC", "WETH", "CAKE", "USDC"], minProfit: 0.50 },
+    { name: "USDC → POL → WETH → USDC", path: ["USDC", "POL", "WETH", "USDC"], minProfit: 0.50 },
+    { name: "USDC → WETH → WBTC → USDC", path: ["USDC", "WETH", "WBTC", "USDC"], minProfit: 0.75 },
+    { name: "USDC → CAKE → QUICK → USDC", path: ["USDC", "CAKE", "QUICK", "USDC"], minProfit: 0.40 }
+];
+
+// ==================== CONTRACT ABI ====================
 const CONTRACT_ABI = [
     "function executeArbitrage(address tokenIn, address tokenOut, uint256 amountIn, uint256 minProfit) external payable returns (uint256)",
     "function setMinProfitBps(uint256 bps) external",
     "function withdraw(address token, uint256 amount) external",
-    "function owner() view returns (address)",
     "function getBalance(address token) view returns (uint256)",
     "function requestFlashLoan(address asset, uint256 amount, tuple(address[] path, uint8 dex1, uint8 dex2, uint256 amountIn, uint256 minProfit, address profitRecipient) params) external",
     "function totalFlashLoans() view returns (uint256)"
@@ -62,7 +103,7 @@ const ROUTER_ABI = [
 
 // ==================== STATE ====================
 let state = {
-    wallet: { eth: 0, usd: 0 },
+    wallet: { pol: 0, usd: 0 },
     stats: {
         totalProfitUSD: 0,
         totalAttempts: 0,
@@ -70,7 +111,9 @@ let state = {
         failedTrades: 0,
         totalGasPaidUSD: 0,
         successRate: 0,
-        totalFlashLoans: 0
+        totalFlashLoans: 0,
+        opportunitiesFound: 0,
+        triangularOpportunities: 0
     },
     session: {
         startTime: new Date().toISOString(),
@@ -78,7 +121,6 @@ let state = {
         totalScans: 0
     },
     tradeHistory: [],
-    scannedTokens: [],
     logs: [],
     isRunning: true,
     connected: false
@@ -87,7 +129,7 @@ let state = {
 let provider;
 let wallet;
 let flashLoanContract;
-let ethPriceUSD = 1800;
+let polPriceUSD = 0.50;
 let lastCallTime = 0;
 
 function rateLimit() {
@@ -110,45 +152,28 @@ function addLog(message, type) {
 // ==================== BLOCKCHAIN CONNECTION ====================
 async function initializeBlockchain() {
     try {
-        provider = new ethers.JsonRpcProvider(ARBITRUM_RPC);
+        provider = new ethers.JsonRpcProvider(QUICKNODE_URL);
         await rateLimit();
         const blockNumber = await provider.getBlockNumber();
-        addLog(`✅ Connected to Arbitrum (Block: ${blockNumber.toLocaleString()})`, 'success');
+        addLog(`✅ Connected to Polygon (Block: ${blockNumber.toLocaleString()})`, 'success');
         
         if (PRIVATE_KEY && PRIVATE_KEY !== 'your_private_key_here') {
             wallet = new ethers.Wallet(PRIVATE_KEY, provider);
-            
-            // Fix: Convert to checksum address properly
-            let contractAddr = CONTRACT_ADDRESS;
-            if (!ethers.isAddress(contractAddr)) {
-                contractAddr = ethers.getAddress(contractAddr.toLowerCase());
-            }
-            flashLoanContract = new ethers.Contract(contractAddr, CONTRACT_ABI, wallet);
+            flashLoanContract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, wallet);
             
             await rateLimit();
             const balance = await provider.getBalance(wallet.address);
-            state.wallet.eth = parseFloat(ethers.formatEther(balance));
-            state.wallet.usd = state.wallet.eth * ethPriceUSD;
+            state.wallet.pol = parseFloat(ethers.formatEther(balance));
+            state.wallet.usd = state.wallet.pol * polPriceUSD;
             
             await rateLimit();
-            const code = await provider.getCode(contractAddr);
+            const code = await provider.getCode(CONTRACT_ADDRESS);
             if (code !== '0x') {
-                addLog(`✅ Flash Loan Contract: ${contractAddr.substring(0, 20)}...`, 'success');
-                try {
-                    const total = await flashLoanContract.totalFlashLoans();
-                    state.stats.totalFlashLoans = Number(total);
-                    addLog(`📊 Total Flash Loans Executed: ${state.stats.totalFlashLoans}`, 'info');
-                } catch(e) {}
-            } else {
-                addLog(`⚠️ Contract not deployed at ${contractAddr} - Deploy first or use existing contract`, 'warning');
+                addLog(`✅ Flash Loan Contract: ${CONTRACT_ADDRESS.substring(0, 20)}...`, 'success');
             }
             
-            addLog(`📍 Wallet: ${wallet.address.substring(0, 10)}...${wallet.address.substring(38)}`, 'info');
-            addLog(`💰 Balance: ${state.wallet.eth.toFixed(6)} ETH (~$${state.wallet.usd.toFixed(2)})`, 'info');
-            
-            if (state.wallet.eth < 0.03) {
-                addLog(`⚠️ Low ETH! Need ~0.03 ETH for gas on Arbitrum. Send ETH to: ${wallet.address}`, 'warning');
-            }
+            addLog(`📍 Wallet: ${wallet.address.substring(0, 10)}...`, 'info');
+            addLog(`💰 Balance: ${state.wallet.pol.toFixed(4)} POL (~$${state.wallet.usd.toFixed(2)})`, 'info');
         } else {
             addLog(`⚠️ Scan-only mode (no private key)`, 'warning');
         }
@@ -162,8 +187,8 @@ async function initializeBlockchain() {
     }
 }
 
-// ==================== PRICE FETCHING ====================
-async function getTokenPriceOnDex(tokenAddress, decimals, dexRouter) {
+// ==================== PRICE FETCHING WITH DEBUG ====================
+async function getTokenPriceOnDex(tokenAddress, decimals, dexRouter, dexName) {
     const cacheKey = `${tokenAddress}_${dexRouter}`;
     const cached = priceCache.get(cacheKey);
     
@@ -174,79 +199,164 @@ async function getTokenPriceOnDex(tokenAddress, decimals, dexRouter) {
     try {
         await rateLimit();
         const router = new ethers.Contract(dexRouter, ROUTER_ABI, provider);
-        const amountIn = ethers.parseUnits("1", decimals);
-        const path = [tokenAddress, ALL_TOKENS.find(t => t.symbol === "USDC").address];
-        const amounts = await router.getAmountsOut(amountIn, path);
+        const usdcAddress = ALL_TOKENS.find(t => t.symbol === "USDC").address;
+        const path = [tokenAddress, usdcAddress];
+        const amounts = await router.getAmountsOut(ethers.parseUnits("1", decimals), path);
         const price = parseFloat(ethers.formatUnits(amounts[1], 6));
         
-        priceCache.set(cacheKey, { price, timestamp: Date.now() });
+        if (price > 0) {
+            priceCache.set(cacheKey, { price, timestamp: Date.now() });
+        }
         return price;
     } catch (error) {
         return 0;
     }
 }
 
-async function updateETHPrice() {
-    try {
-        const wethToken = ALL_TOKENS.find(t => t.symbol === "WETH");
-        const price = await getTokenPriceOnDex(wethToken.address, wethToken.decimals, UNISWAP_ROUTER);
-        if (price > 0) ethPriceUSD = price;
-    } catch (error) {}
-}
-
-// ==================== SCAN ALL TOKENS ====================
-async function scanAllTokens() {
+// ==================== ENHANCED SCAN WITH DEBUG DATA ====================
+async function scanAllTokensWithDebug() {
     const opportunities = [];
     const tokensToScan = ALL_TOKENS.filter(t => t.symbol !== 'USDC');
+    const allPriceData = [];
+    const spreads = [];
     
-    addLog(`🔍 Scanning ${tokensToScan.length} tokens for arbitrage on Arbitrum...`, 'info');
+    addLog(`🔍 DEBUG SCAN: ${tokensToScan.length} tokens × ${DEXES.length} DEXes = ${tokensToScan.length * DEXES.length} price checks`, 'info');
     
+    // Collect all prices
     for (const token of tokensToScan) {
-        if (token.symbol === 'USDC') continue;
-        
-        try {
-            const priceUni = await getTokenPriceOnDex(token.address, token.decimals, UNISWAP_ROUTER);
-            if (priceUni === 0) continue;
-            
-            await new Promise(r => setTimeout(r, 50));
-            const priceSushi = await getTokenPriceOnDex(token.address, token.decimals, SUSHISWAP_ROUTER);
-            
-            if (priceSushi > 0) {
-                const diffPercent = Math.abs((priceUni - priceSushi) / priceUni * 100);
-                const estimatedProfit = Math.abs(priceUni - priceSushi) * 100;
-                
-                if (diffPercent > 0.15 && estimatedProfit > 0.30) {
-                    opportunities.push({
-                        token: token.symbol,
-                        icon: token.icon,
-                        tokenAddress: token.address,
-                        decimals: token.decimals,
-                        priceUni: priceUni.toFixed(4),
-                        priceSushi: priceSushi.toFixed(4),
-                        diffPercent: diffPercent.toFixed(2),
-                        estimatedProfit: estimatedProfit.toFixed(2),
-                        betterDex: priceUni > priceSushi ? "UNISWAP" : "SUSHISWAP",
-                        worseDex: priceUni > priceSushi ? "SUSHISWAP" : "UNISWAP"
-                    });
-                }
+        for (const dex of DEXES) {
+            const price = await getTokenPriceOnDex(token.address, token.decimals, dex.router, dex.name);
+            if (price > 0) {
+                allPriceData.push({
+                    token: token.symbol,
+                    tokenIcon: token.icon,
+                    dex: dex.name,
+                    dexIcon: dex.icon,
+                    price: price,
+                    fee: dex.fee,
+                    timestamp: Date.now()
+                });
             }
             await new Promise(r => setTimeout(r, 50));
-        } catch (error) {}
+        }
     }
     
-    opportunities.sort((a, b) => parseFloat(b.estimatedProfit) - parseFloat(a.estimatedProfit));
-    
-    if (opportunities.length > 0) {
-        addLog(`📊 Found ${opportunities.length} arbitrage opportunities`, 'opportunity');
-        opportunities.slice(0, 3).forEach(opp => {
-            addLog(`   ${opp.icon} ${opp.token}: ${opp.diffPercent}% diff ($${opp.estimatedProfit} profit)`, 'info');
-        });
+    // Find spreads between DEXes for same token
+    const tokenGroups = {};
+    for (const price of allPriceData) {
+        if (!tokenGroups[price.token]) tokenGroups[price.token] = [];
+        tokenGroups[price.token].push(price);
     }
     
-    return opportunities;
+    for (const [token, prices] of Object.entries(tokenGroups)) {
+        if (prices.length >= 2) {
+            for (let i = 0; i < prices.length; i++) {
+                for (let j = i + 1; j < prices.length; j++) {
+                    const priceDiff = Math.abs(prices[i].price - prices[j].price);
+                    const percentDiff = (priceDiff / Math.min(prices[i].price, prices[j].price)) * 100;
+                    const totalFees = (prices[i].fee + prices[j].fee) * 100;
+                    const netSpread = percentDiff - totalFees;
+                    const profitOn100 = priceDiff * 100;
+                    const profitAfterFees = profitOn100 * (1 - (prices[i].fee + prices[j].fee));
+                    
+                    const spreadData = {
+                        token: token,
+                        tokenIcon: prices[0].tokenIcon,
+                        buyDex: prices[i].price < prices[j].price ? prices[i].dex : prices[j].dex,
+                        sellDex: prices[i].price < prices[j].price ? prices[j].dex : prices[i].dex,
+                        buyDexIcon: prices[i].price < prices[j].price ? prices[i].dexIcon : prices[j].dexIcon,
+                        sellDexIcon: prices[i].price < prices[j].price ? prices[j].dexIcon : prices[i].dexIcon,
+                        buyPrice: Math.min(prices[i].price, prices[j].price),
+                        sellPrice: Math.max(prices[i].price, prices[j].price),
+                        rawSpreadPercent: percentDiff.toFixed(3),
+                        netSpreadPercent: netSpread.toFixed(3),
+                        totalFees: (totalFees).toFixed(2),
+                        profitOn100USD: profitAfterFees.toFixed(2),
+                        isProfitable: netSpread > 0.08 && profitAfterFees > 0.30
+                    };
+                    
+                    spreads.push(spreadData);
+                    
+                    if (spreadData.isProfitable) {
+                        opportunities.push({
+                            type: "SIMPLE",
+                            token: token,
+                            icon: prices[0].tokenIcon,
+                            tokenAddress: ALL_TOKENS.find(t => t.symbol === token).address,
+                            decimals: ALL_TOKENS.find(t => t.symbol === token).decimals,
+                            buyDex: spreadData.buyDex,
+                            sellDex: spreadData.sellDex,
+                            buyPrice: spreadData.buyPrice.toFixed(4),
+                            sellPrice: spreadData.sellPrice.toFixed(4),
+                            diffPercent: spreadData.rawSpreadPercent,
+                            netDiff: spreadData.netSpreadPercent,
+                            estimatedProfit: spreadData.profitOn100USD,
+                            fees: spreadData.totalFees
+                        });
+                    }
+                }
+            }
+        }
+    }
+    
+    // Sort spreads by profit
+    spreads.sort((a, b) => parseFloat(b.profitOn100USD) - parseFloat(a.profitOn100USD));
+    
+    // Update debug data
+    debugData = {
+        lastScan: new Date().toISOString(),
+        allPrices: allPriceData.slice(0, 100),
+        spreads: spreads.slice(0, 20),
+        topOpportunities: opportunities.slice(0, 10),
+        tokenSpreads: spreads.reduce((acc, s) => {
+            if (!acc[s.token]) acc[s.token] = [];
+            acc[s.token].push(s);
+            return acc;
+        }, {}),
+        dexPerformance: calculateDexPerformance(allPriceData)
+    };
+    
+    // Log debug summary
+    if (spreads.length > 0) {
+        addLog(`📊 DEBUG: Found ${spreads.length} spreads, ${opportunities.length} profitable (net >0.08%)`, 'info');
+        const bestSpread = spreads[0];
+        if (bestSpread) {
+            addLog(`   🏆 BEST: ${bestSpread.token} | ${bestSpread.buyDex}($${bestSpread.buyPrice}) → ${bestSpread.sellDex}($${bestSpread.sellPrice}) | ${bestSpread.netSpreadPercent}% net | $${bestSpread.profitOn100USD} profit`, 'opportunity');
+        }
+    } else {
+        addLog(`📊 DEBUG: No spreads found in this scan`, 'info');
+    }
+    
+    return { opportunities, spreads, allPriceData };
 }
 
-// ==================== FLASH LOAN ARBITRAGE EXECUTION ====================
+function calculateDexPerformance(priceData) {
+    const performance = {};
+    for (const dex of DEXES) {
+        performance[dex.name] = {
+            avgPrice: 0,
+            priceCount: 0,
+            icon: dex.icon
+        };
+    }
+    
+    for (const data of priceData) {
+        if (performance[data.dex]) {
+            performance[data.dex].avgPrice += data.price;
+            performance[data.dex].priceCount++;
+        }
+    }
+    
+    for (const dex of DEXES) {
+        if (performance[dex.name].priceCount > 0) {
+            performance[dex.name].avgPrice /= performance[dex.name].priceCount;
+        }
+    }
+    
+    return performance;
+}
+
+// ==================== EXECUTION ====================
 async function executeFlashLoanArbitrage(opportunity) {
     if (!wallet || !flashLoanContract) {
         addLog(`❌ Cannot execute: No wallet/contract`, 'error');
@@ -254,119 +364,66 @@ async function executeFlashLoanArbitrage(opportunity) {
     }
     
     state.stats.totalAttempts++;
-    state.session.lastScan = new Date().toISOString();
     
-    addLog(`💸 EXECUTING FLASH LOAN ARBITRAGE: ${opportunity.icon} ${opportunity.token}`, 'opportunity');
-    addLog(`   Route: ${opportunity.betterDex} → ${opportunity.worseDex}`, 'info');
-    addLog(`   Est. Profit: $${opportunity.estimatedProfit}`, 'info');
-    addLog(`   💰 Capital needed: $0 (AAVE flash loan)`, 'success');
+    addLog(`💸 EXECUTING: ${opportunity.icon} ${opportunity.token}`, 'opportunity');
+    addLog(`   Route: ${opportunity.buyDex} → ${opportunity.sellDex}`, 'info');
+    addLog(`   Est. Profit: $${opportunity.estimatedProfit} (${opportunity.netDiff}% net)`, 'info');
     
     try {
         const asset = ALL_TOKENS.find(t => t.symbol === "USDC").address;
         const amount = ethers.parseUnits("500", 6);
-        
         const path = [asset, opportunity.tokenAddress, asset];
-        const dex1 = opportunity.betterDex === "UNISWAP" ? 0 : 1;
-        const dex2 = opportunity.worseDex === "UNISWAP" ? 0 : 1;
-        
+        const dex1 = DEXES.findIndex(d => d.name === opportunity.buyDex) % DEXES.length;
+        const dex2 = DEXES.findIndex(d => d.name === opportunity.sellDex) % DEXES.length;
         const amountIn = ethers.parseUnits("500", 6);
-        const minProfit = ethers.parseUnits((parseFloat(opportunity.estimatedProfit) * 0.7).toFixed(2), 6);
+        const minProfit = ethers.parseUnits((parseFloat(opportunity.estimatedProfit) * 0.6).toFixed(2), 6);
         const profitRecipient = wallet.address;
         
-        const flashParams = {
-            path: path,
-            dex1: dex1,
-            dex2: dex2,
-            amountIn: amountIn,
-            minProfit: minProfit,
-            profitRecipient: profitRecipient
-        };
+        const flashParams = { path, dex1, dex2, amountIn, minProfit, profitRecipient };
         
-        addLog(`📝 Requesting flash loan of ${ethers.formatUnits(amount, 6)} USDC from AAVE on Arbitrum...`, 'info');
-        addLog(`   Flash loan fee: 0.05% (${ethers.formatUnits(amount * 5n / 10000n, 6)} USDC)`, 'info');
+        addLog(`📝 Requesting flash loan...`, 'info');
+        const tx = await flashLoanContract.requestFlashLoan(asset, amount, flashParams, { gasLimit: 2000000 });
+        addLog(`📤 TX: ${tx.hash}`, 'info');
         
-        await rateLimit();
-        const tx = await flashLoanContract.requestFlashLoan(
-            asset,
-            amount,
-            flashParams,
-            { gasLimit: 2000000 }
-        );
-        
-        addLog(`📤 Flash loan transaction sent: ${tx.hash}`, 'info');
-        addLog(`🔗 https://arbiscan.io/tx/${tx.hash}`, 'info');
-        
-        addLog(`⏳ Waiting for confirmation...`, 'info');
         const receipt = await tx.wait();
         
         if (receipt.status === 1) {
-            const gasUsed = parseFloat(ethers.formatEther(receipt.gasUsed * receipt.gasPrice)) * ethPriceUSD;
+            const gasUsed = parseFloat(ethers.formatEther(receipt.gasUsed * receipt.gasPrice)) * polPriceUSD;
             const profit = parseFloat(opportunity.estimatedProfit) * 0.85;
             
             state.stats.successfulTrades++;
             state.stats.totalProfitUSD += profit;
             state.stats.totalGasPaidUSD += gasUsed;
             state.stats.totalFlashLoans++;
-            state.wallet.usd += profit;
             
-            addLog(`✅ FLASH LOAN ARBITRAGE SUCCESSFUL!`, 'success');
-            addLog(`   Profit: +$${profit.toFixed(2)} (${(profit / ethPriceUSD).toFixed(6)} ETH)`, 'success');
-            addLog(`   Gas: $${gasUsed.toFixed(4)} (paid from profit)`, 'info');
-            addLog(`   💰 Capital used: $0 - All profit is yours!`, 'success');
-            addLog(`   TX: ${tx.hash}`, 'info');
+            addLog(`✅ SUCCESS! Profit: +$${profit.toFixed(2)}`, 'success');
             
             state.tradeHistory.unshift({
                 id: Date.now(),
                 timestamp: new Date().toISOString(),
                 token: opportunity.token,
-                icon: opportunity.icon,
                 profitUSD: profit,
                 gasCostUSD: gasUsed,
                 txHash: tx.hash,
-                explorerUrl: `https://arbiscan.io/tx/${tx.hash}`,
-                success: true,
-                diffPercent: opportunity.diffPercent,
-                type: "FLASH_LOAN",
-                amountBorrowed: "500 USDC"
+                success: true
             });
             
             return true;
         } else {
-            throw new Error("Flash loan transaction reverted");
+            throw new Error("Transaction reverted");
         }
         
     } catch (error) {
         state.stats.failedTrades++;
-        addLog(`❌ FLASH LOAN ARBITRAGE FAILED - ZERO GAS COST!`, 'error');
-        addLog(`   Error: ${error.message.substring(0, 150)}`, 'error');
-        addLog(`   💡 No capital lost - flash loans revert automatically on failure`, 'info');
-        
-        state.tradeHistory.unshift({
-            id: Date.now(),
-            timestamp: new Date().toISOString(),
-            token: opportunity.token,
-            icon: opportunity.icon,
-            profitUSD: 0,
-            gasCostUSD: 0,
-            success: false,
-            error: error.message.substring(0, 100),
-            type: "FLASH_LOAN"
-        });
-        
+        addLog(`❌ FAILED: ${error.message.substring(0, 100)}`, 'error');
         return false;
     }
 }
 
 // ==================== MAIN LOOP ====================
 async function mainLoop() {
-    addLog('🔥 FLASH LOAN ARBITRAGE BOT STARTED - ARBITRUM NETWORK', 'success');
-    addLog(`💰 Scanning ${ALL_TOKENS.length - 1} tokens on Arbitrum`, 'success');
-    addLog('💸 Using AAVE V3 Flash Loans - $0 Capital Needed', 'success');
-    addLog('⚡ Zero gas cost for failed trades', 'success');
-    addLog('🔄 Rate limit: 10 calls/sec with 30s cache', 'info');
-    addLog('📊 Starting arbitrage scanner...', 'info');
-    
-    let consecutiveEmptyScans = 0;
+    addLog('🔥 FLASH LOAN ARBITRAGE BOT WITH DEBUG DASHBOARD STARTED', 'success');
+    addLog(`🔍 Debug mode: Showing real-time spreads across ${DEXES.length} DEXes`, 'info');
     
     while (state.isRunning) {
         if (!state.connected) {
@@ -375,49 +432,62 @@ async function mainLoop() {
             continue;
         }
         
-        await updateETHPrice();
+        const { opportunities, spreads } = await scanAllTokensWithDebug();
         
-        const opportunities = await scanAllTokens();
-        
-        if (opportunities.length > 0) {
-            consecutiveEmptyScans = 0;
+        if (opportunities.length > 0 && wallet) {
             await executeFlashLoanArbitrage(opportunities[0]);
             await new Promise(r => setTimeout(r, 25000));
         } else {
-            consecutiveEmptyScans++;
             state.session.totalScans++;
-            
-            if (consecutiveEmptyScans % 5 === 0) {
-                addLog(`🔍 Scan #${state.session.totalScans} complete. No opportunities.`, 'info');
+            if (state.session.totalScans % 3 === 0) {
+                addLog(`🔍 Scan #${state.session.totalScans} complete. Found ${spreads.length} spreads, ${opportunities.length} profitable.`, 'info');
             }
+            await new Promise(r => setTimeout(r, 10000));
         }
         
-        state.stats.successRate = state.stats.totalAttempts > 0 ? (state.stats.successfulTrades / state.stats.totalAttempts * 100) : 0;
+        state.stats.successRate = state.stats.totalAttempts > 0 ? 
+            (state.stats.successfulTrades / state.stats.totalAttempts * 100) : 0;
         
-        if (wallet && state.session.totalScans % 3 === 0) {
-            try {
-                await rateLimit();
-                const balance = await provider.getBalance(wallet.address);
-                state.wallet.eth = parseFloat(ethers.formatEther(balance));
-                state.wallet.usd = state.wallet.eth * ethPriceUSD;
-            } catch(e) {}
-        }
-        
-        const waitTime = opportunities.length > 0 ? 15000 : 20000;
-        await new Promise(r => setTimeout(r, waitTime));
+        state.stats.opportunitiesFound += opportunities.length;
     }
 }
 
-// ==================== API ====================
+// ==================== DEBUG API ENDPOINTS ====================
+app.get('/api/debug/spreads', (req, res) => {
+    res.json({
+        lastScan: debugData.lastScan,
+        totalSpreads: debugData.spreads.length,
+        profitableSpreads: debugData.spreads.filter(s => s.isProfitable).length,
+        spreads: debugData.spreads,
+        topOpportunities: debugData.topOpportunities
+    });
+});
+
+app.get('/api/debug/prices', (req, res) => {
+    res.json({
+        lastScan: debugData.lastScan,
+        prices: debugData.allPrices,
+        dexPerformance: debugData.dexPerformance
+    });
+});
+
+app.get('/api/debug/token/:symbol', (req, res) => {
+    const symbol = req.params.symbol.toUpperCase();
+    res.json({
+        token: symbol,
+        spreads: debugData.tokenSpreads[symbol] || [],
+        allPrices: debugData.allPrices.filter(p => p.token === symbol)
+    });
+});
+
 app.get('/api/state', (req, res) => {
     const uptime = Math.floor((Date.now() - new Date(state.session.startTime).getTime()) / 1000);
     const hours = Math.floor(uptime / 3600);
     const minutes = Math.floor((uptime % 3600) / 60);
     
     res.json({
-        network: "Arbitrum",
         wallet: {
-            eth: state.wallet.eth.toFixed(6),
+            pol: state.wallet.pol.toFixed(4),
             usd: state.wallet.usd.toFixed(2),
             address: wallet ? wallet.address : null
         },
@@ -426,10 +496,9 @@ app.get('/api/state', (req, res) => {
             totalAttempts: state.stats.totalAttempts,
             successfulTrades: state.stats.successfulTrades,
             failedTrades: state.stats.failedTrades,
-            totalGasPaidUSD: state.stats.totalGasPaidUSD.toFixed(4),
             successRate: state.stats.successRate.toFixed(1),
-            avgProfit: state.stats.successfulTrades > 0 ? (state.stats.totalProfitUSD / state.stats.successfulTrades).toFixed(2) : 0,
-            totalFlashLoans: state.stats.totalFlashLoans
+            totalFlashLoans: state.stats.totalFlashLoans,
+            opportunitiesFound: state.stats.opportunitiesFound
         },
         session: {
             startTime: state.session.startTime,
@@ -437,20 +506,13 @@ app.get('/api/state', (req, res) => {
             totalScans: state.session.totalScans,
             uptime: `${hours}h ${minutes}m`
         },
-        tokens: {
-            total: ALL_TOKENS.length,
-            scanned: state.scannedTokens.length
-        },
         tradeHistory: state.tradeHistory.slice(0, 20),
         logs: state.logs.slice(0, 50),
         connected: state.connected,
-        ethPrice: ethPriceUSD,
-        flashLoanEnabled: true,
-        rateLimit: {
-            callsPerSecond: 10,
-            cacheTTL: "30s"
-        },
-        timestamp: new Date().toISOString()
+        debug: {
+            lastDebugScan: debugData.lastScan,
+            spreadsFound: debugData.spreads.length
+        }
     });
 });
 
@@ -459,155 +521,205 @@ app.post('/api/reset', (req, res) => {
     state.stats.totalAttempts = 0;
     state.stats.successfulTrades = 0;
     state.stats.failedTrades = 0;
-    state.stats.totalGasPaidUSD = 0;
-    state.stats.successRate = 0;
     state.tradeHistory = [];
     addLog('📊 Stats reset', 'info');
     res.json({ status: 'reset' });
 });
 
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', network: 'Arbitrum', connected: state.connected, flashLoanEnabled: true, tokens: ALL_TOKENS.length });
+    res.json({ status: 'ok', connected: state.connected });
 });
 
-// ==================== DASHBOARD ====================
+// ==================== DEBUG DASHBOARD ====================
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Flash Loan Arbitrage Bot | AAVE V3 | Arbitrum Network</title>
+    <title>Flash Loan Arbitrage Bot | Debug Dashboard</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Inter', sans-serif; background: #f8fafc; color: #0f172a; padding: 24px; }
-        .container { max-width: 1400px; margin: 0 auto; }
-        .header { background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); border-radius: 20px; padding: 28px 32px; margin-bottom: 28px; color: white; }
-        .header h1 { font-size: 28px; font-weight: 700; margin-bottom: 8px; }
-        .network-badge { background: #28a0f0; color: white; padding: 4px 12px; border-radius: 20px; font-size: 12px; display: inline-block; margin-left: 12px; vertical-align: middle; }
-        .badge-container { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
-        .badge { padding: 6px 14px; background: rgba(255,255,255,0.15); border-radius: 30px; font-size: 12px; font-weight: 500; }
-        .badge-flash { background: #f59e0b; color: #1a1a2e; }
-        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; margin-bottom: 28px; }
-        .stat-card { background: white; border-radius: 16px; padding: 20px; border: 1px solid #eef2f6; box-shadow: 0 1px 2px rgba(0,0,0,0.02); }
-        .stat-label { font-size: 12px; font-weight: 500; text-transform: uppercase; color: #64748b; margin-bottom: 10px; }
-        .stat-value { font-size: 32px; font-weight: 700; margin-bottom: 4px; }
-        .positive { color: #10b981; }
-        .two-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 28px; }
-        .card { background: white; border-radius: 16px; border: 1px solid #eef2f6; overflow: hidden; }
-        .card-header { padding: 16px 20px; border-bottom: 1px solid #f1f5f9; font-weight: 600; }
-        .trade-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        .trade-table th { text-align: left; padding: 12px 16px; background: #f8fafc; font-weight: 500; color: #475569; }
-        .trade-table td { padding: 12px 16px; border-bottom: 1px solid #f1f5f9; }
-        .tx-link { color: #3b82f6; text-decoration: none; font-family: monospace; font-size: 11px; }
-        .success-text { color: #10b981; font-weight: 500; }
-        .logs-container { max-height: 400px; overflow-y: auto; font-size: 12px; font-family: monospace; }
-        .log-entry { padding: 10px 16px; border-bottom: 1px solid #f1f5f9; }
-        .log-time { color: #94a3b8; margin-right: 12px; }
-        .log-success { color: #10b981; }
-        .log-error { color: #ef4444; }
-        .log-opportunity { color: #f59e0b; }
-        .btn { padding: 10px 20px; border-radius: 10px; font-size: 13px; font-weight: 500; cursor: pointer; border: none; }
-        .btn-primary { background: #0f172a; color: white; }
-        .btn-secondary { background: #f1f5f9; color: #475569; border: 1px solid #e2e8f0; }
-        .button-group { display: flex; gap: 12px; justify-content: flex-end; margin-top: 24px; }
-        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #10b981; display: inline-block; animation: pulse 2s infinite; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+        body { font-family: 'Inter', sans-serif; background: #0f0f1a; color: #e0e0e0; padding: 20px; }
+        .container { max-width: 1600px; margin: 0 auto; }
+        .header { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); border-radius: 16px; padding: 24px; margin-bottom: 24px; }
+        .header h1 { font-size: 28px; margin-bottom: 8px; }
+        .badge { display: inline-block; padding: 4px 12px; background: #00ff8844; border-radius: 20px; font-size: 12px; color: #00ff88; margin-left: 12px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
+        .stat-card { background: #1a1a2e; border-radius: 12px; padding: 16px; border: 1px solid #2a2a3e; }
+        .stat-label { font-size: 11px; color: #888; text-transform: uppercase; margin-bottom: 8px; }
+        .stat-value { font-size: 24px; font-weight: 700; }
+        .positive { color: #00ff88; }
+        .section { background: #1a1a2e; border-radius: 12px; margin-bottom: 24px; overflow: hidden; }
+        .section-header { padding: 16px 20px; background: #0f0f1a; border-bottom: 1px solid #2a2a3e; font-weight: 600; font-size: 16px; }
+        .spread-table, .price-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        .spread-table th, .price-table th { text-align: left; padding: 12px 16px; background: #0f0f1a; color: #888; font-weight: 500; }
+        .spread-table td, .price-table td { padding: 10px 16px; border-bottom: 1px solid #2a2a3e; }
+        .profitable { background: #00ff8810; border-left: 3px solid #00ff88; }
+        .token-icon { font-size: 16px; margin-right: 6px; }
+        .dex-badge { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; background: #2a2a3e; border-radius: 8px; font-size: 11px; }
+        .profit-cell { color: #00ff88; font-weight: 600; }
+        .logs-container { max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 11px; }
+        .log-entry { padding: 8px 16px; border-bottom: 1px solid #2a2a3e; }
+        .log-time { color: #666; margin-right: 12px; }
+        .refresh-btn { padding: 8px 16px; background: #3b82f6; border: none; border-radius: 8px; color: white; cursor: pointer; font-weight: 500; margin-bottom: 16px; }
+        .two-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; }
+        .auto-refresh { font-size: 12px; color: #888; margin-top: 8px; }
     </style>
 </head>
 <body>
 <div class="container">
     <div class="header">
-        <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap;">
-            <div>
-                <h1>💸 Flash Loan Arbitrage Bot <span class="network-badge">ARBITRUM</span></h1>
-                <p>AAVE V3 Flash Loans | $0 Capital | Zero Gas on Failed Trades | 90% Lower Fees</p>
-                <div class="badge-container">
-                    <span class="badge"><span class="status-dot"></span> Live on Arbitrum</span>
-                    <span class="badge badge-flash">🚀 Flash Loan: $0 Capital</span>
-                    <span class="badge">⚡ Zero Gas on Fails</span>
-                    <span class="badge">🔄 Rate Limit Optimized</span>
-                </div>
-            </div>
-        </div>
+        <h1>🔍 Flash Loan Arbitrage Bot <span class="badge">DEBUG MODE</span></h1>
+        <p>Real-time spread detection | Multi-DEX price comparison | PancakeSwap + QuickSwap + SushiSwap</p>
+        <div class="auto-refresh">🔄 Auto-refreshing every 3 seconds</div>
     </div>
 
     <div class="stats-grid">
-        <div class="stat-card"><div class="stat-label">💰 TOTAL PROFIT</div><div class="stat-value positive" id="totalProfit">$0.00</div><div class="stat-sub">From flash loans</div></div>
-        <div class="stat-card"><div class="stat-label">📊 SUCCESS RATE</div><div class="stat-value" id="successRate">0%</div><div class="stat-sub"><span id="successTrades">0</span> wins / <span id="failedTrades">0</span> losses</div></div>
-        <div class="stat-card"><div class="stat-label">⛽ GAS PAID</div><div class="stat-value" id="gasPaid">$0.00</div><div class="stat-sub">Paid from profits</div></div>
-        <div class="stat-card"><div class="stat-label">🎯 ATTEMPTS</div><div class="stat-value" id="attempts">0</div><div class="stat-sub">Avg profit: <span id="avgProfit">$0.00</span></div></div>
+        <div class="stat-card"><div class="stat-label">💰 TOTAL PROFIT</div><div class="stat-value positive" id="totalProfit">$0.00</div></div>
+        <div class="stat-card"><div class="stat-label">📊 SUCCESS RATE</div><div class="stat-value" id="successRate">0%</div></div>
+        <div class="stat-card"><div class="stat-label">🔍 SPREADS FOUND</div><div class="stat-value" id="spreadsFound">0</div></div>
+        <div class="stat-card"><div class="stat-label">💸 FLASH LOANS</div><div class="stat-value" id="flashLoans">0</div></div>
+    </div>
+
+    <div class="section">
+        <div class="section-header">🏆 TOP SPREADS (Most Profitable Arbitrage Opportunities)</div>
+        <table class="spread-table">
+            <thead>
+                <tr><th>Token</th><th>Buy → Sell</th><th>Buy Price</th><th>Sell Price</th><th>Raw Spread</th><th>Net (after fees)</th><th>Profit on $100</th><th>Status</th></tr>
+            </thead>
+            <tbody id="spreadsBody">
+                <tr><td colspan="8" style="text-align:center; padding:40px;">Scanning for spreads...</td></tr>
+            </tbody>
+        </table>
     </div>
 
     <div class="two-columns">
-        <div class="card">
-            <div class="card-header">📋 Flash Loan Trades</div>
-            <div class="card-body">
-                <table class="trade-table">
-                    <thead><tr><th>Time</th><th>Token</th><th>Profit</th><th>Gas</th><th>Proof</th></tr></thead>
-                    <tbody id="tradesBody"><tr><td colspan="5" style="text-align:center; padding:40px;">No flash loan trades yet</td></tr></tbody>
-                </table>
-            </div>
+        <div class="section">
+            <div class="section-header">💰 Current Prices Across DEXes</div>
+            <table class="price-table">
+                <thead><tr><th>Token</th><th>🥞 PancakeSwap</th><th>⚡ QuickSwap</th><th>🍣 SushiSwap</th></tr></thead>
+                <tbody id="pricesBody">
+                    <tr><td colspan="4" style="text-align:center; padding:40px;">Loading prices...</td></tr>
+                </tbody>
+            </table>
         </div>
-        <div class="card">
-            <div class="card-header">📝 Live Activity Logs</div>
-            <div class="card-body"><div class="logs-container" id="logsContainer">Initializing...</div></div>
+        <div class="section">
+            <div class="section-header">📝 Live Activity Logs</div>
+            <div class="logs-container" id="logsContainer">Initializing...</div>
         </div>
     </div>
 
-    <div class="button-group">
-        <button class="btn btn-secondary" onclick="resetStats()">Reset Statistics</button>
-        <button class="btn btn-primary" onclick="location.reload()">Refresh Dashboard</button>
+    <div class="section">
+        <div class="section-header">📋 Recent Trades</div>
+        <table class="spread-table">
+            <thead><tr><th>Time</th><th>Token</th><th>Profit</th><th>Gas</th><th>Status</th><th>Tx</th></tr></thead>
+            <tbody id="tradesBody">
+                <tr><td colspan="6" style="text-align:center; padding:40px;">No trades yet</td></tr>
+            </tbody>
+        </table>
     </div>
 </div>
 
 <script>
     async function fetchData() {
         try {
-            const res = await fetch('/api/state');
-            const data = await res.json();
-            document.getElementById('totalProfit').innerHTML = '$' + (parseFloat(data.stats.totalProfitUSD) || 0).toFixed(2);
-            document.getElementById('successRate').innerHTML = (data.stats.successRate || 0) + '%';
-            document.getElementById('gasPaid').innerHTML = '$' + (parseFloat(data.stats.totalGasPaidUSD) || 0).toFixed(4);
-            document.getElementById('attempts').innerHTML = data.stats.totalAttempts || 0;
-            document.getElementById('successTrades').innerHTML = data.stats.successfulTrades || 0;
-            document.getElementById('failedTrades').innerHTML = data.stats.failedTrades || 0;
-            document.getElementById('avgProfit').innerHTML = '$' + (parseFloat(data.stats.avgProfit) || 0).toFixed(2);
+            // Fetch debug spreads
+            const debugRes = await fetch('/api/debug/spreads');
+            const debugData = await debugRes.json();
             
-            const tradesBody = document.getElementById('tradesBody');
-            if (data.tradeHistory && data.tradeHistory.length > 0) {
+            document.getElementById('spreadsFound').innerHTML = debugData.spreads?.length || 0;
+            
+            const spreadsBody = document.getElementById('spreadsBody');
+            if (debugData.spreads && debugData.spreads.length > 0) {
                 let html = '';
-                for (let t of data.tradeHistory.slice(0, 15)) {
-                    const time = new Date(t.timestamp).toLocaleTimeString();
-                    if (t.success) {
-                        html += '<tr><td>' + time + '</td><td><strong>' + (t.icon || '💸') + ' ' + t.token + '</strong></td><td class="success-text">+$' + t.profitUSD.toFixed(2) + '</td><td>$' + t.gasCostUSD.toFixed(4) + '</td><td><a href="' + t.explorerUrl + '" target="_blank" class="tx-link">View TX →</a></td></tr>';
-                    } else {
-                        html += '<tr><td>' + time + '</td><td><strong>' + (t.icon || '💸') + ' ' + t.token + '</strong></td><td class="failed-text">$0</td><td>$0</td><td><span class="failed-text">No gas cost</span></td></tr>';
-                    }
+                for (let s of debugData.spreads.slice(0, 15)) {
+                    const profitClass = s.isProfitable ? 'profitable' : '';
+                    const statusBadge = s.isProfitable ? '✅ PROFITABLE' : '⚠️ Below threshold';
+                    const statusColor = s.isProfitable ? '#00ff88' : '#888';
+                    html += `<tr class="${profitClass}">
+                        <td><span class="token-icon">${s.tokenIcon || '🪙'}</span> ${s.token}</td>
+                        <td><span class="dex-badge">${s.buyDexIcon} ${s.buyDex}</span> → <span class="dex-badge">${s.sellDexIcon} ${s.sellDex}</span></td>
+                        <td>$${s.buyPrice.toFixed(4)}</td>
+                        <td>$${s.sellPrice.toFixed(4)}</td>
+                        <td>${s.rawSpreadPercent}%</td>
+                        <td style="color: ${parseFloat(s.netSpreadPercent) > 0 ? '#00ff88' : '#ff4444'}">${s.netSpreadPercent}%</td>
+                        <td class="profit-cell">$${s.profitOn100USD}</td>
+                        <td style="color: ${statusColor}">${statusBadge}</td>
+                    </tr>`;
                 }
-                tradesBody.innerHTML = html;
+                spreadsBody.innerHTML = html;
+            } else {
+                spreadsBody.innerHTML = '<tr><td colspan="8" style="text-align:center; padding:40px;">No spreads found. Waiting for next scan...</td></tr>';
             }
             
+            // Fetch prices
+            const pricesRes = await fetch('/api/debug/prices');
+            const pricesData = await pricesRes.json();
+            
+            const pricesByToken = {};
+            if (pricesData.prices) {
+                for (let p of pricesData.prices) {
+                    if (!pricesByToken[p.token]) pricesByToken[p.token] = {};
+                    pricesByToken[p.token][p.dex] = { price: p.price, icon: p.dexIcon };
+                }
+            }
+            
+            const pricesBody = document.getElementById('pricesBody');
+            const tokens = ['POL', 'WETH', 'CAKE', 'WBTC', 'AAVE', 'LINK', 'CRV'];
+            let pricesHtml = '';
+            for (let token of tokens) {
+                const tokenData = pricesByToken[token] || {};
+                pricesHtml += `<tr>
+                    <td><span class="token-icon">${token === 'POL' ? '🟣' : token === 'WETH' ? '💎' : token === 'CAKE' ? '🍰' : token === 'WBTC' ? '🟡' : '🪙'}</span> ${token}</td>
+                    <td>${tokenData['PANCAKESWAP'] ? '$' + tokenData['PANCAKESWAP'].price.toFixed(4) : '—'}</td>
+                    <td>${tokenData['QUICKSWAP'] ? '$' + tokenData['QUICKSWAP'].price.toFixed(4) : '—'}</td>
+                    <td>${tokenData['SUSHISWAP'] ? '$' + tokenData['SUSHISWAP'].price.toFixed(4) : '—'}</td>
+                </tr>`;
+            }
+            pricesBody.innerHTML = pricesHtml;
+            
+            // Fetch state
+            const stateRes = await fetch('/api/state');
+            const stateData = await stateRes.json();
+            
+            document.getElementById('totalProfit').innerHTML = '$' + (parseFloat(stateData.stats.totalProfitUSD) || 0).toFixed(2);
+            document.getElementById('successRate').innerHTML = (stateData.stats.successRate || 0) + '%';
+            document.getElementById('flashLoans').innerHTML = stateData.stats.totalFlashLoans || 0;
+            
+            // Logs
             const logsContainer = document.getElementById('logsContainer');
-            if (data.logs && data.logs.length > 0) {
-                let html = '';
-                for (let log of data.logs.slice(0, 40)) {
-                    let cls = '';
-                    if (log.type === 'success') cls = 'log-success';
-                    else if (log.type === 'error') cls = 'log-error';
-                    else if (log.type === 'opportunity') cls = 'log-opportunity';
+            if (stateData.logs && stateData.logs.length > 0) {
+                let logsHtml = '';
+                for (let log of stateData.logs.slice(0, 20)) {
                     const time = new Date(log.timestamp).toLocaleTimeString();
-                    html += '<div class="log-entry ' + cls + '"><span class="log-time">[' + time + ']</span> ' + log.message + '</div>';
+                    logsHtml += '<div class="log-entry"><span class="log-time">[' + time + ']</span> ' + log.message + '</div>';
                 }
-                logsContainer.innerHTML = html;
+                logsContainer.innerHTML = logsHtml;
             }
+            
+            // Trades
+            const tradesBody = document.getElementById('tradesBody');
+            if (stateData.tradeHistory && stateData.tradeHistory.length > 0) {
+                let tradesHtml = '';
+                for (let t of stateData.tradeHistory.slice(0, 10)) {
+                    const time = new Date(t.timestamp).toLocaleTimeString();
+                    const profitColor = t.success ? '#00ff88' : '#ff4444';
+                    const profitDisplay = t.success ? '+$' + t.profitUSD.toFixed(2) : 'Failed';
+                    tradesHtml += `<tr>
+                        <td>${time}</td>
+                        <td>${t.token || '-'}</td>
+                        <td style="color: ${profitColor}">${profitDisplay}</td>
+                        <td>$${(t.gasCostUSD || 0).toFixed(4)}</td>
+                        <td style="color: ${t.success ? '#00ff88' : '#ff4444'}">${t.success ? '✅ Success' : '❌ Failed'}</td>
+                        <td>${t.txHash ? '<a href="https://polygonscan.com/tx/' + t.txHash + '" target="_blank" style="color:#60a5fa;">View →</a>' : '-'}</td>
+                    </tr>`;
+                }
+                tradesBody.innerHTML = tradesHtml;
+            }
+            
         } catch(e) { console.error(e); }
-    }
-    
-    async function resetStats() {
-        await fetch('/api/reset', { method: 'POST' });
-        setTimeout(fetchData, 500);
     }
     
     fetchData();
@@ -620,19 +732,22 @@ app.get('/', (req, res) => {
 // ==================== START ====================
 async function start() {
     console.log('\n═══════════════════════════════════════════════════════════');
-    console.log(`💸 FLASH LOAN ARBITRAGE BOT - ARBITRUM NETWORK`);
+    console.log(`🔍 FLASH LOAN ARBITRAGE BOT - DEBUG DASHBOARD`);
     console.log('═══════════════════════════════════════════════════════════');
-    console.log(`Contract: ${CONTRACT_ADDRESS}`);
-    console.log(`Network: Arbitrum One`);
-    console.log(`Flash Loans: AAVE V3 - Borrow up to millions with $0 collateral`);
-    console.log(`Gas fees: ~90% cheaper than Ethereum`);
+    console.log(`✓ Debug mode: Showing real-time spreads`);
+    console.log(`✓ ${DEXES.length} DEXes: ${DEXES.map(d => d.name).join(', ')}`);
+    console.log(`✓ ${ALL_TOKENS.length - 1} tokens monitored`);
     console.log(`Dashboard: http://localhost:${PORT}`);
     console.log('═══════════════════════════════════════════════════════════\n');
     
     await initializeBlockchain();
     mainLoop().catch(console.error);
     app.listen(PORT, '0.0.0.0', () => {
-        console.log(`✅ Dashboard: http://localhost:${PORT}`);
+        console.log(`✅ Debug Dashboard: http://localhost:${PORT}`);
+        console.log(`🔍 API endpoints:`);
+        console.log(`   - /api/debug/spreads - View all spreads`);
+        console.log(`   - /api/debug/prices - View all prices`);
+        console.log(`   - /api/debug/token/:symbol - View token-specific data`);
     });
 }
 
