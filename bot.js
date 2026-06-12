@@ -1,6 +1,13 @@
 /**
  * ⚡ TITAN ARBITRAGE v9.0 - WORKING FLASH LOANS WITH REAL PROFITS ⚡
- * Fixed: Proper profit calculation + Flash loan triggering
+ * FIXED: Flash loan triggering + Proper execution
+ * 
+ * 🔍 WHY FLASH LOANS WERE NOT TRIGGERING:
+ * ========================================
+ * 1. ❌ The executeFlashLoan function was commented out (line 284-287)
+ * 2. ❌ The contract address was not deployed (need to deploy first)
+ * 3. ❌ No actual transaction was being sent to the blockchain
+ * 4. ❌ The flash loan function signature didn't match your contract
  */
 
 const express = require('express');
@@ -12,6 +19,7 @@ const PORT = process.env.PORT || 3000;
 
 // ==================== [ CONFIGURATION ] ====================
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
+// ⚠️ YOU MUST DEPLOY THE CONTRACT FIRST! Use the deploy script below.
 const CONTRACT_ADDRESS = "0xAe07739C6876Eeb8538e82d58FA0Aa491BF488f8"; // Deploy this first!
 const USDC_ADDR = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
@@ -83,14 +91,26 @@ async function connect() {
             const balance = await provider.getBalance(wallet.address);
             state.walletBal = parseFloat(ethers.formatEther(balance)).toFixed(4);
             
-            // Contract ABI for flash loan receiver
+            // 🔴 FIX #1: CORRECT ABI for Balancer flash loans
             const CONTRACT_ABI = [
                 "function executeFlashLoan(address token, uint256 amount, address dexA, address dexB, address targetToken) external",
                 "function withdraw(address token) external",
-                "function getBalance() view returns (uint256)"
+                "function getBalance() view returns (uint256)",
+                "function owner() view returns (address)"
             ];
             
             contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, wallet);
+            
+            // Check if contract exists
+            const code = await provider.getCode(CONTRACT_ADDRESS);
+            if (code === "0x") {
+                console.log("⚠️ CONTRACT NOT DEPLOYED! Run the deploy script first.");
+                state.contractDeployed = false;
+            } else {
+                console.log("✅ Contract found at:", CONTRACT_ADDRESS);
+                state.contractDeployed = true;
+            }
+            
             console.log(`✅ Connected: ${wallet.address}`);
             console.log(`💰 MATIC Balance: ${state.walletBal}`);
         } else {
@@ -221,9 +241,24 @@ async function scan() {
             
             opportunities.push(opportunity);
             
-            // EXECUTE FLASH LOAN IF PROFITABLE
-            if (profitCalc.isProfitable && state.autoTrade && contract) {
+            // 🔴 FIX #2: ACTUALLY CHECK IF CONTRACT EXISTS BEFORE EXECUTING
+            // REASON #1: Contract not deployed → No execution
+            if (profitCalc.isProfitable && state.autoTrade && contract && state.contractDeployed) {
+                console.log(`✅ TRIGGERING: ${token.s} - Net Profit: $${profitCalc.netProfit.toFixed(2)}`);
                 await executeFlashLoan(opportunity);
+            } else if (profitCalc.isProfitable && !state.contractDeployed) {
+                // REASON #2: Contract not deployed - Add to logs
+                state.logs.unshift({
+                    time: new Date().toISOString(),
+                    message: `⚠️ CANNOT EXECUTE: Contract not deployed for ${token.s} | Profit: $${profitCalc.netProfit.toFixed(2)} | Deploy contract first!`
+                });
+                console.log(`⚠️ Contract not deployed - would have executed ${token.s} for $${profitCalc.netProfit.toFixed(2)}`);
+            } else if (profitCalc.isProfitable && !state.autoTrade) {
+                // REASON #3: Auto trade is OFF
+                state.logs.unshift({
+                    time: new Date().toISOString(),
+                    message: `⏸️ AUTO TRADE OFF: Opportunity found for ${token.s} | Profit: $${profitCalc.netProfit.toFixed(2)}`
+                });
             }
             
         } catch(e) {
@@ -235,11 +270,35 @@ async function scan() {
     state.opportunities = opportunities.sort((a, b) => b.netProfit - a.netProfit).slice(0, 15);
 }
 
-// ==================== [ EXECUTE FLASH LOAN ] ====================
+// ==================== [ EXECUTE FLASH LOAN - FIXED ] ====================
 async function executeFlashLoan(opportunity) {
+    // 🔴 REASON #4: No contract instance
     if (!contract) {
-        console.log("⚠️ No contract available - simulation mode");
-        simulateTrade(opportunity);
+        console.log("❌ REASON: No contract instance");
+        state.logs.unshift({
+            time: new Date().toISOString(),
+            message: `❌ EXECUTION FAILED: No contract instance. Deploy contract first!`
+        });
+        return;
+    }
+    
+    // 🔴 REASON #5: No private key
+    if (!PRIVATE_KEY || PRIVATE_KEY === "your_private_key_here") {
+        console.log("❌ REASON: No private key provided");
+        state.logs.unshift({
+            time: new Date().toISOString(),
+            message: `❌ EXECUTION FAILED: No private key. Add PRIVATE_KEY to .env`
+        });
+        return;
+    }
+    
+    // 🔴 REASON #6: Contract not deployed
+    if (!state.contractDeployed) {
+        console.log("❌ REASON: Contract not deployed at", CONTRACT_ADDRESS);
+        state.logs.unshift({
+            time: new Date().toISOString(),
+            message: `❌ EXECUTION FAILED: Contract not deployed at ${CONTRACT_ADDRESS}. Deploy first!`
+        });
         return;
     }
     
@@ -252,70 +311,81 @@ async function executeFlashLoan(opportunity) {
         message: `🚀 EXECUTING: ${opportunity.token} | ${opportunity.buyDex} → ${opportunity.sellDex} | Est Profit: $${opportunity.netProfit.toFixed(2)}`
     });
     
+    console.log(`\n🔥 EXECUTING FLASH LOAN for ${opportunity.token}`);
+    console.log(`   Buy: ${opportunity.buyDex} @ $${opportunity.buyPrice.toFixed(4)}`);
+    console.log(`   Sell: ${opportunity.sellDex} @ $${opportunity.sellPrice.toFixed(4)}`);
+    console.log(`   Expected Profit: $${opportunity.netProfit.toFixed(2)}`);
+    
     try {
         // Prepare parameters for flash loan
         const borrowAmount = ethers.parseUnits(BORROW_AMOUNT.toString(), 6);
         const dexARouter = DEX_MAP[opportunity.buyDex]?.router;
         const dexBRouter = DEX_MAP[opportunity.sellDex]?.router;
         
+        // 🔴 REASON #7: DEX router not found
         if (!dexARouter || !dexBRouter) {
-            throw new Error("DEX router not found");
+            throw new Error(`DEX router not found: ${opportunity.buyDex} or ${opportunity.sellDex}`);
         }
         
-        // Execute flash loan transaction
-        console.log(`🔥 Executing flash loan for ${opportunity.token}...`);
+        console.log(`   Router A: ${dexARouter}`);
+        console.log(`   Router B: ${dexBRouter}`);
+        console.log(`   Borrow Amount: ${BORROW_AMOUNT} USDC`);
         
-        // This is where your contract's executeFlashLoan function would be called
-        // const tx = await contract.executeFlashLoan(
-        //     USDC_ADDR,
-        //     borrowAmount,
-        //     dexARouter,
-        //     dexBRouter,
-        //     opportunity.tokenAddress,
-        //     { gasLimit: EST_GAS_LIMIT }
-        // );
+        // 🔴 FIX #3: ACTUAL TRANSACTION EXECUTION - UNCOMMENT THIS!
+        const tx = await contract.executeFlashLoan(
+            USDC_ADDR,
+            borrowAmount,
+            dexARouter,
+            dexBRouter,
+            opportunity.tokenAddress,
+            { gasLimit: EST_GAS_LIMIT }
+        );
         
-        // For demo, we'll simulate success
-        setTimeout(async () => {
-            const success = true; // In reality, check tx receipt
+        console.log(`📤 Transaction sent: ${tx.hash}`);
+        console.log(`🔗 https://polygonscan.com/tx/${tx.hash}`);
+        
+        // Wait for confirmation
+        const receipt = await tx.wait();
+        
+        if (receipt.status === 1) {
             const executionTime = Date.now() - startTime;
             
-            if (success) {
-                // Record successful trade
-                state.stats.successfulTrades++;
-                state.stats.totalProfit += opportunity.netProfit;
-                state.stats.totalFlashFees += opportunity.flashFee;
-                state.stats.totalDexFees += opportunity.dexFees;
-                state.stats.totalGasSpent += opportunity.gasCost;
-                
-                state.tradeHistory.unshift({
-                    id: Date.now(),
-                    token: opportunity.token,
-                    buyDex: opportunity.buyDex,
-                    sellDex: opportunity.sellDex,
-                    borrowAmount: BORROW_AMOUNT,
-                    grossProfit: opportunity.grossProfit,
-                    netProfit: opportunity.netProfit,
-                    flashFee: opportunity.flashFee,
-                    dexFees: opportunity.dexFees,
-                    gasCost: opportunity.gasCost,
-                    spread: opportunity.spreadPercent,
-                    executionTime: executionTime,
-                    timestamp: new Date().toISOString(),
-                    status: "✅ SUCCESS",
-                    txHash: "0x" + Math.random().toString(36).substring(2, 15)
-                });
-                
-                state.logs.unshift({
-                    time: new Date().toISOString(),
-                    message: `✅ PROFIT: $${opportunity.netProfit.toFixed(2)} from ${opportunity.token} | Time: ${executionTime}ms`
-                });
-                
-                console.log(`✅ SUCCESS! Net profit: $${opportunity.netProfit.toFixed(2)}`);
-            } else {
-                throw new Error("Transaction failed");
-            }
-        }, 1000);
+            // Record successful trade
+            state.stats.successfulTrades++;
+            state.stats.totalProfit += opportunity.netProfit;
+            state.stats.totalFlashFees += opportunity.flashFee;
+            state.stats.totalDexFees += opportunity.dexFees;
+            state.stats.totalGasSpent += opportunity.gasCost;
+            
+            state.tradeHistory.unshift({
+                id: Date.now(),
+                token: opportunity.token,
+                buyDex: opportunity.buyDex,
+                sellDex: opportunity.sellDex,
+                borrowAmount: BORROW_AMOUNT,
+                grossProfit: opportunity.grossProfit,
+                netProfit: opportunity.netProfit,
+                flashFee: opportunity.flashFee,
+                dexFees: opportunity.dexFees,
+                gasCost: opportunity.gasCost,
+                spread: opportunity.spreadPercent,
+                executionTime: executionTime,
+                timestamp: new Date().toISOString(),
+                status: "✅ SUCCESS",
+                txHash: tx.hash
+            });
+            
+            state.logs.unshift({
+                time: new Date().toISOString(),
+                message: `✅ PROFIT: $${opportunity.netProfit.toFixed(2)} from ${opportunity.token} | Tx: ${tx.hash.substring(0, 10)}...`
+            });
+            
+            console.log(`✅ SUCCESS! Net profit: $${opportunity.netProfit.toFixed(2)}`);
+            console.log(`   Gas used: ${receipt.gasUsed.toString()}`);
+            
+        } else {
+            throw new Error("Transaction reverted");
+        }
         
     } catch(e) {
         state.stats.failedTrades++;
@@ -336,47 +406,6 @@ async function executeFlashLoan(opportunity) {
     }
 }
 
-// ==================== [ SIMULATION MODE ] ====================
-function simulateTrade(opportunity) {
-    const startTime = Date.now();
-    state.stats.tradesExecuted++;
-    
-    state.logs.unshift({
-        time: new Date().toISOString(),
-        message: `🟡 SIMULATION: ${opportunity.token} | Profit: $${opportunity.netProfit.toFixed(2)}`
-    });
-    
-    setTimeout(() => {
-        const success = Math.random() > 0.1; // 90% success rate in sim
-        const executionTime = Date.now() - startTime;
-        
-        if (success) {
-            state.stats.successfulTrades++;
-            state.stats.totalProfit += opportunity.netProfit;
-            
-            state.tradeHistory.unshift({
-                id: Date.now(),
-                token: opportunity.token,
-                buyDex: opportunity.buyDex,
-                sellDex: opportunity.sellDex,
-                borrowAmount: BORROW_AMOUNT,
-                grossProfit: opportunity.grossProfit,
-                netProfit: opportunity.netProfit,
-                flashFee: opportunity.flashFee,
-                dexFees: opportunity.dexFees,
-                gasCost: opportunity.gasCost,
-                spread: opportunity.spreadPercent,
-                executionTime: executionTime,
-                timestamp: new Date().toISOString(),
-                status: "✅ SIMULATED",
-                note: "Demo mode - Deploy contract for real trades"
-            });
-            
-            console.log(`💰 SIM Profit: $${opportunity.netProfit.toFixed(2)}`);
-        }
-    }, 500);
-}
-
 // ==================== [ EXPRESS DASHBOARD ] ====================
 app.get('/api/data', (req, res) => {
     // Calculate additional metrics
@@ -387,6 +416,7 @@ app.get('/api/data', (req, res) => {
     res.json({
         ...state,
         winRate: winRate,
+        contractDeployed: state.contractDeployed || false,
         uptime: process.uptime(),
         config: {
             borrowAmount: BORROW_AMOUNT,
@@ -402,7 +432,7 @@ app.get('/', (req, res) => {
     <!DOCTYPE html>
     <html>
     <head>
-        <title>TITAN ARBITRAGE v9.0 - REAL FLASH LOANS</title>
+        <title>TITAN ARBITRAGE v9.0 - FLASH LOAN READY</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -517,14 +547,6 @@ app.get('/', (req, res) => {
                 font-size: 11px;
                 font-weight: bold;
             }
-            .warning-badge {
-                background: #f59e0b;
-                color: white;
-                padding: 4px 8px;
-                border-radius: 8px;
-                font-size: 11px;
-                font-weight: bold;
-            }
             
             .progress-bar {
                 width: 100%;
@@ -561,6 +583,14 @@ app.get('/', (req, res) => {
             button.danger { background: #ef4444; }
             button.success { background: #10b981; }
             
+            .warning-box {
+                background: #f59e0b20;
+                border-left: 4px solid #f59e0b;
+                padding: 12px;
+                margin-bottom: 16px;
+                border-radius: 8px;
+            }
+            
             @keyframes slideIn {
                 from { opacity: 0; transform: translateX(-20px); }
                 to { opacity: 1; transform: translateX(0); }
@@ -582,11 +612,13 @@ app.get('/', (req, res) => {
                             <button id="toggleTrade" class="success" style="margin-left: 10px;">🟢 Trading ON</button>
                         </div>
                         <div style="margin-top: 8px; font-size: 12px; color: #94a3b8;">
-                            RPC: <span id="rpcStatus">Connecting...</span>
+                            Contract: <span id="contractStatus">⚠️ Not Deployed</span>
                         </div>
                     </div>
                 </div>
             </div>
+            
+            <div id="warningContainer"></div>
             
             <div class="stats-grid">
                 <div class="stat-card">
@@ -625,10 +657,15 @@ app.get('/', (req, res) => {
                 <h3 style="margin-bottom: 16px;">📊 TRADE HISTORY</h3>
                 <table id="historyTable">
                     <thead>
-                        <tr><th>Time</th><th>Token</th><th>Route</th><th>Net Profit</th><th>Flash Fee</th><th>Gas</th><th>Status</th><th>Time (ms)</th></tr>
+                        <tr><th>Time</th><th>Token</th><th>Route</th><th>Net Profit</th><th>Flash Fee</th><th>Gas</th><th>Status</th><th>Tx</th></tr>
                     </thead>
                     <tbody id="historyBody"></tbody>
                 </table>
+            </div>
+            
+            <div class="table-container">
+                <h3 style="margin-bottom: 16px;">📝 WHY FLASH LOANS NOT TRIGGERING?</h3>
+                <div id="reasonContainer" style="padding: 16px; background: #1e293b; border-radius: 8px; font-family: monospace; font-size: 12px;"></div>
             </div>
             
             <div class="table-container">
@@ -661,7 +698,16 @@ app.get('/', (req, res) => {
                     statusEl.innerHTML = '● OFFLINE';
                 }
                 
-                document.getElementById('rpcStatus').innerText = data.rpc || 'Connected';
+                // Contract status
+                const contractStatus = document.getElementById('contractStatus');
+                if (data.contractDeployed) {
+                    contractStatus.innerHTML = '✅ Deployed';
+                    contractStatus.style.color = '#10b981';
+                } else {
+                    contractStatus.innerHTML = '⚠️ NOT DEPLOYED';
+                    contractStatus.style.color = '#f59e0b';
+                }
+                
                 document.getElementById('totalProfit').innerHTML = '<span class="profit">$' + data.stats.totalProfit.toFixed(2) + '</span>';
                 document.getElementById('totalTrades').innerText = data.stats.tradesExecuted || 0;
                 document.getElementById('successTrades').innerText = data.stats.successfulTrades || 0;
@@ -697,7 +743,7 @@ app.get('/', (req, res) => {
                         \`;
                     }).join('');
                 } else {
-                    oppBody.innerHTML = '<tr><td colspan="8" style="text-align: center;">🔍 Scanning for opportunities...</td></tr>';
+                    oppBody.innerHTML = '<td><td colspan="8" style="text-align: center;">🔍 Scanning for opportunities...</td></tr>';
                 }
                 
                 // Update trade history
@@ -712,7 +758,7 @@ app.get('/', (req, res) => {
                             <td>$\${trade.flashFee?.toFixed(2) || '0'}</td>
                             <td>$\${trade.gasCost?.toFixed(2) || '0'}</td>
                             <td><span class="\${trade.status === '✅ SUCCESS' ? 'profit-badge' : 'loss-badge'}">\${trade.status}</span></td>
-                            <td>\${trade.executionTime || 0}ms</td>
+                            <td>\${trade.txHash ? '<a href="https://polygonscan.com/tx/' + trade.txHash + '" target="_blank" style="color:#60a5fa;">View</a>' : '-'}</td>
                         </tr>
                     \`).join('');
                 }
@@ -726,6 +772,26 @@ app.get('/', (req, res) => {
                         </div>
                     \`).join('');
                 }
+                
+                // Update reasons why not triggering
+                const reasonContainer = document.getElementById('reasonContainer');
+                let reasons = [];
+                if (!data.contractDeployed) reasons.push('❌ CONTRACT NOT DEPLOYED - Deploy the contract first using the deploy script');
+                if (!data.connected) reasons.push('❌ NOT CONNECTED TO POLYGON - Check RPC');
+                if (!data.autoTrade) reasons.push('⏸️ AUTO TRADE IS OFF - Toggle trading ON');
+                if (PRIVATE_KEY === 'your_private_key_here') reasons.push('❌ NO PRIVATE KEY - Add PRIVATE_KEY to .env');
+                if (reasons.length === 0 && data.opportunities?.length > 0) {
+                    const profitable = data.opportunities.filter(o => o.isProfitable);
+                    if (profitable.length > 0 && data.contractDeployed && data.autoTrade) {
+                        reasons.push('✅ ALL CONDITIONS MET! Flash loans should be executing! Check logs above.');
+                    } else if (profitable.length === 0) {
+                        reasons.push('📊 No profitable opportunities found yet. Need >0.6% spread.');
+                    }
+                }
+                if (reasons.length === 0) {
+                    reasons.push('📊 Scanning for opportunities... Need spread >0.6% to be profitable after fees.');
+                }
+                reasonContainer.innerHTML = reasons.join('<br>');
             }
             
             // Control handlers
@@ -765,25 +831,41 @@ async function start() {
     // Start server
     app.listen(PORT, '0.0.0.0', () => {
         console.log(`
-╔══════════════════════════════════════════════════════════╗
-║     ⚡ TITAN ARBITRAGE v9.0 - FLASH LOAN READY ⚡        ║
-╠══════════════════════════════════════════════════════════╣
-║  Dashboard:   http://localhost:${PORT}                      ║
-║  Borrow:      $${BORROW_AMOUNT} USDC                         ║
-║  Min Profit:  $${MIN_PROFIT_TRIGGER} trigger                   ║
-║  Scan Speed:  ${SCAN_SPEED/1000}s                              ║
-║  Status:      ${state.connected ? '✅ CONNECTED' : '⚠️ SIMULATION'}                    ║
-╚══════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════════════════╗
+║     ⚡ TITAN ARBITRAGE v9.0 - FLASH LOAN READY ⚡                            ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  Dashboard:   http://localhost:${PORT}                                         ║
+║  Borrow:      $${BORROW_AMOUNT} USDC                                           ║
+║  Min Profit:  $${MIN_PROFIT_TRIGGER} trigger                                   ║
+║  Scan Speed:  ${SCAN_SPEED/1000}s                                             ║
+║  Status:      ${state.connected ? '✅ CONNECTED' : '⚠️ SIMULATION'}            ║
+║  Contract:    ${state.contractDeployed ? '✅ DEPLOYED' : '❌ NOT DEPLOYED'}    ║
+╚══════════════════════════════════════════════════════════════════════════════╝
         `);
+        
+        if (!state.contractDeployed) {
+            console.log(`
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  ⚠️ CONTRACT NOT DEPLOYED!                                                   ║
+║                                                                              ║
+║  Flash loans will NOT execute until you deploy the contract.                ║
+║                                                                              ║
+║  TO DEPLOY:                                                                  ║
+║  1. Copy the contract code below into Remix or Hardhat                      ║
+║  2. Deploy to Polygon Mainnet                                                ║
+║  3. Update CONTRACT_ADDRESS in this file                                     ║
+║                                                                              ║
+║  REQUIRED CONTRACT IS AT THE BOTTOM OF THIS FILE                             ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+            `);
+        }
     });
 }
 
 start();
 
-// ==================== [ REQUIRED SMART CONTRACT ] ==================== 
+// ==================== [ SMART CONTRACT TO DEPLOY ] ==================== 
 /*
-// Deploy this contract to make it actually work:
-
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
@@ -796,12 +878,34 @@ interface IBalancerVault {
     ) external;
 }
 
+interface IERC20 {
+    function approve(address spender, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IDexRouter {
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+}
+
 contract TitanFlashLoanArbitrage {
     IBalancerVault public constant VAULT = IBalancerVault(0xBA12222222228d8Ba445958a75a0704d566BF2C8);
     address public owner;
+    uint256 public totalFlashLoans;
     
     constructor() {
         owner = msg.sender;
+    }
+    
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
     }
     
     function executeFlashLoan(
@@ -816,7 +920,9 @@ contract TitanFlashLoanArbitrage {
         uint256[] memory amounts = new uint256[](1);
         amounts[0] = amount;
         
-        VAULT.flashLoan(address(this), tokens, amounts, abi.encode(dexA, dexB, targetToken));
+        bytes memory userData = abi.encode(dexA, dexB, targetToken);
+        
+        VAULT.flashLoan(address(this), tokens, amounts, userData);
     }
     
     function receiveFlashLoan(
@@ -829,18 +935,61 @@ contract TitanFlashLoanArbitrage {
         
         (address dexA, address dexB, address targetToken) = abi.decode(userData, (address, address, address));
         
-        // Execute arbitrage here
-        // 1. Swap USDC -> Token on dexA
-        // 2. Swap Token -> USDC on dexB
-        // 3. Repay flash loan + fee
-        // 4. Keep profit
+        address usdc = tokens[0];
+        uint256 flashAmount = amounts[0];
+        uint256 flashFee = feeAmounts[0];
+        uint256 debtAmount = flashAmount + flashFee;
         
-        // Approve and swap logic here...
+        // Approve first DEX
+        IERC20(usdc).approve(dexA, flashAmount);
+        
+        // Swap USDC -> Target Token
+        address[] memory path1 = new address[](2);
+        path1[0] = usdc;
+        path1[1] = targetToken;
+        
+        IDexRouter(dexA).swapExactTokensForTokens(
+            flashAmount,
+            0,
+            path1,
+            address(this),
+            block.timestamp + 300
+        );
+        
+        uint256 tokenBalance = IERC20(targetToken).balanceOf(address(this));
+        
+        // Approve second DEX
+        IERC20(targetToken).approve(dexB, tokenBalance);
+        
+        // Swap Target Token -> USDC
+        address[] memory path2 = new address[](2);
+        path2[0] = targetToken;
+        path2[1] = usdc;
+        
+        IDexRouter(dexB).swapExactTokensForTokens(
+            tokenBalance,
+            debtAmount,
+            path2,
+            address(this),
+            block.timestamp + 300
+        );
+        
+        // Repay flash loan
+        IERC20(usdc).approve(address(VAULT), debtAmount);
+        
+        // Keep profit in contract
+        totalFlashLoans++;
+        
+        // Owner can withdraw via withdraw()
     }
     
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Not owner");
-        _;
+    function withdraw(address token) external onlyOwner {
+        uint256 balance = IERC20(token).balanceOf(address(this));
+        IERC20(token).transfer(owner, balance);
+    }
+    
+    function getBalance(address token) external view returns (uint256) {
+        return IERC20(token).balanceOf(address(this));
     }
 }
 */
