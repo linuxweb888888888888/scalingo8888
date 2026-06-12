@@ -20,7 +20,7 @@ const PORT = process.env.PORT || 3000;
 // ==================== [ CONFIGURATION ] ====================
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 // ⚠️ YOU MUST DEPLOY THE CONTRACT FIRST! Use the deploy script below.
-const CONTRACT_ADDRESS = "0xAe07739C6876Eeb8538e82d58FA0Aa491BF488f8"; // Deploy this first!
+const CONTRACT_ADDRESS = "0x45EA9b7cB6DA33e651Ae7cb71C877cc5C6e42b63"; // Deploy this first!
 const USDC_ADDR = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
 // Financial parameters
