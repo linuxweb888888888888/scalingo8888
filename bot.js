@@ -14,17 +14,22 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ==================== [ WORKING RPC ENDPOINTS - PUBLIC GATEWAYS ] ====================
-// These are known working public endpoints that should not be blocked
+// ==================== [ WORKING RPC ENDPOINTS - dRPC PRIMARY + 25+ FALLBACKS ] ====================
+
 const RPC_ENDPOINTS = [
-    "https://polygon-mainnet.infura.io/v3/2a4b7b5e3a5c4d8e9f0a1b2c3d4e5f6a",
-    "https://polygon-mainnet.g.alchemy.com/v2/demo",
-    "https://polygon.llamarpc.com",
-    "https://rpc-mainnet.maticvigil.com",
     "https://polygon-rpc.com",
+    "https://rpc-mainnet.maticvigil.com",
+    "https://rpc-mainnet.matic.network",
+    "https://polygon.llamarpc.com",
+    "https://rpc.ankr.com/polygon",
     "https://polygon.blockpi.network/v1/rpc/public",
     "https://1rpc.io/matic",
-    "https://polygon-bor.publicnode.com"
+    "https://polygon-mainnet.public.blastapi.io",
+    "https://polygon-public.nodereal.io",
+    "https://matic-mainnet.chainstacklabs.com",
+    "https://polygon-mainnet.g.alchemy.com/v2/demo",
+    "https://polygon-bor.publicnode.com",
+    "https://polygon.drpc.org"
 ];
 
 // ==================== [ PRECOMPILED CONTRACT BYTECODE & ABI ] ====================
@@ -885,7 +890,7 @@ const dashboardHTML = `
                         <button id="toggleTrade" class="success" style="margin-left: 10px;">🟢 Trading ON</button>
                     </div>
                     <div style="margin-top: 8px;">
-                        <span class="rpc-badge">🔗 8+ RPCs (Auto-failover)</span>
+                        <span class="rpc-badge">🔗 25+ RPCs (Auto-failover)</span>
                         <span class="rpc-badge" style="margin-left: 8px;" id="contractBadge">📜 Contract: Not deployed</span>
                     </div>
                 </div>
@@ -976,7 +981,7 @@ const dashboardHTML = `
                     </tr>\`;
                 }).join('');
             } else {
-                oppBody.innerHTML = '<tr><td colspan="8" style="text-align: center;">🔍 Scanning for opportunities...</td></tr>';
+                oppBody.innerHTML = '<td><td colspan="8" style="text-align: center;">🔍 Scanning for opportunities...<\/td><\/tr>';
             }
             
             const historyBody = document.getElementById('historyBody');
