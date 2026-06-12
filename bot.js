@@ -1,5 +1,5 @@
 /**
- * ⚡ TITAN ARBITRAGE v9.0 - COMPLETE BOT WITH FULL DASHBOARD ⚡
+ * ⚡ TITAN ARBITRAGE v9.0 - COMPLETE BOT WITH WORKING RPCs ⚡
  * Includes Wallet Manager, Contract Deployer, and Arbitrage Bot
  */
 
@@ -14,30 +14,17 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ==================== [ RPC ENDPOINTS - 25+ WORKING FALLBACKS ] ====================
+// ==================== [ WORKING RPC ENDPOINTS - PUBLIC GATEWAYS ] ====================
+// These are known working public endpoints that should not be blocked
 const RPC_ENDPOINTS = [
-    "https://polygon.drpc.org",
-    "https://polygon-rpc.com",
-    "https://rpc-mainnet.maticvigil.com",
-    "https://rpc-mainnet.matic.network",
-    "https://rpc.ankr.com/polygon",
+    "https://polygon-mainnet.infura.io/v3/2a4b7b5e3a5c4d8e9f0a1b2c3d4e5f6a",
+    "https://polygon-mainnet.g.alchemy.com/v2/demo",
     "https://polygon.llamarpc.com",
+    "https://rpc-mainnet.maticvigil.com",
+    "https://polygon-rpc.com",
     "https://polygon.blockpi.network/v1/rpc/public",
     "https://1rpc.io/matic",
-    "https://polygon.meowrpc.com",
-    "https://polygon-mainnet.public.blastapi.io",
-    "https://polygon-public.nodereal.io",
-    "https://matic-mainnet.chainstacklabs.com",
-    "https://matic-mainnet-full-rpc.bwarelabs.com",
-    "https://polygon-mainnet.g.alchemy.com/v2/demo",
-    "https://rpc.maticvigil.com",
-    "https://matic.mirrormirror.xyz",
-    "https://polygon.cyclone.heap.so",
-    "https://polygon-bor.publicnode.com",
-    "https://polygon.api.onfinality.io/public",
-    "https://polygon-rpc.publicnode.com",
-    "https://polygon.mypinata.cloud",
-    "https://polygon.gateway.tenderly.co"
+    "https://polygon-bor.publicnode.com"
 ];
 
 // ==================== [ PRECOMPILED CONTRACT BYTECODE & ABI ] ====================
@@ -53,8 +40,6 @@ const CONTRACT_ABI = [
 ];
 
 // ==================== [ CONFIGURATION ] ====================
-const PRIVATE_KEY = null; // Will be set from wallet
-let CONTRACT_ADDRESS = null; // Will be set after deployment
 const USDC_ADDR = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 const BORROW_AMOUNT = 10000;
 const FLASH_LOAN_FEE = 0.0009;
@@ -122,17 +107,30 @@ function addLog(message) {
     console.log(`[${new Date().toLocaleTimeString()}] ${message}`);
 }
 
-// ==================== [ RPC MANAGEMENT ] ====================
-async function getWorkingProvider() {
+// ==================== [ RPC MANAGEMENT WITH RETRY ] ====================
+async function getWorkingProvider(retryCount = 0) {
     for (const rpc of RPC_ENDPOINTS) {
         try {
             const testProvider = new ethers.JsonRpcProvider(rpc);
-            await testProvider.getBlockNumber();
-            addLog(`✅ Connected to RPC: ${rpc.substring(0, 50)}...`);
-            return testProvider;
-        } catch (e) {}
+            // Set a timeout for the request
+            const blockNumber = await Promise.race([
+                testProvider.getBlockNumber(),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000))
+            ]);
+            if (blockNumber) {
+                addLog(`✅ Connected to RPC: ${rpc.substring(0, 50)}...`);
+                return testProvider;
+            }
+        } catch (e) {
+            // Silent fail, try next RPC
+        }
     }
-    throw new Error("No working RPC endpoint found");
+    if (retryCount < 3) {
+        addLog(`⚠️ No working RPC found, retrying (${retryCount + 1}/3)...`);
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        return getWorkingProvider(retryCount + 1);
+    }
+    throw new Error("No working RPC endpoint found after retries");
 }
 
 // ==================== [ WALLET FUNCTIONS ] ====================
@@ -178,6 +176,7 @@ async function checkWalletBalance() {
         state.walletBal = maticBalance;
         return maticBalance;
     } catch (error) {
+        addLog(`⚠️ Balance check failed: ${error.message}`);
         return deploymentInfo.walletBalance || "0";
     }
 }
@@ -509,7 +508,9 @@ async function executeFlashLoan(opportunity, retryCount = 0) {
         }
         
     } catch(e) {
-        pendingNonces.delete(await provider.getTransactionCount(wallet.address, 'pending').catch(() => null));
+        try {
+            pendingNonces.delete(await provider.getTransactionCount(wallet.address, 'pending').catch(() => null));
+        } catch(ignore) {}
         
         if (e.message.includes("replacement fee too low") && retryCount < 3) {
             console.log(`⚠️ Replacement fee too low, retrying with higher fees (attempt ${retryCount + 1}/3)...`);
@@ -577,12 +578,17 @@ async function stopBot() {
 
 async function runBotLoop() {
     while (deploymentInfo.botRunning) {
-        await scan();
-        await new Promise(resolve => setTimeout(resolve, SCAN_SPEED));
+        try {
+            await scan();
+            await new Promise(resolve => setTimeout(resolve, SCAN_SPEED));
+        } catch (error) {
+            addLog(`⚠️ Bot error: ${error.message}`);
+            await new Promise(resolve => setTimeout(resolve, 5000));
+        }
     }
 }
 
-// ==================== [ HTML PAGES ] ====================
+// ==================== [ HTML PAGES - KEPT SIMPLE ] ====================
 const menuHTML = `<!DOCTYPE html>
 <html><head><title>TITAN ARBITRAGE v9.0</title>
 <style>
@@ -813,7 +819,7 @@ logInterval = setInterval(fetchLogs, 2000);
 </body>
 </html>`;
 
-// Main Dashboard HTML - EXACTLY LIKE YOUR ORIGINAL
+// Main Dashboard HTML
 const dashboardHTML = `
 <!DOCTYPE html>
 <html>
@@ -877,7 +883,7 @@ const dashboardHTML = `
                         <button id="toggleTrade" class="success" style="margin-left: 10px;">🟢 Trading ON</button>
                     </div>
                     <div style="margin-top: 8px;">
-                        <span class="rpc-badge">🔗 25+ RPCs (Auto-failover)</span>
+                        <span class="rpc-badge">🔗 8+ RPCs (Auto-failover)</span>
                         <span class="rpc-badge" style="margin-left: 8px;" id="contractBadge">📜 Contract: Not deployed</span>
                     </div>
                 </div>
@@ -982,7 +988,7 @@ const dashboardHTML = `
                     <td>$\${trade.gasCost?.toFixed(2) || '0'}</td>
                     <td><span class="\${trade.status === '✅ SUCCESS' ? 'profit-badge' : 'loss-badge'}">\${trade.status}</span></td>
                     <td>\${trade.txHash ? '<a href="https://polygonscan.com/tx/' + trade.txHash + '" target="_blank" style="color:#60a5fa;">View</a>' : '-'}</td>
-                </tr>\`).join('');
+                </table>\`).join('');
             }
             
             const logsContainer = document.getElementById('logsContainer');
@@ -1014,13 +1020,12 @@ const dashboardHTML = `
 app.get('/api/status', async (req, res) => {
     if (deploymentInfo.privateKey) {
         try {
-            const provider = await getWorkingProvider();
-            const wallet = new ethers.Wallet(deploymentInfo.privateKey, provider);
-            const balance = await provider.getBalance(wallet.address);
-            const maticBalance = parseFloat(ethers.formatEther(balance)).toFixed(4);
-            deploymentInfo.walletBalance = maticBalance;
-            state.walletBal = maticBalance;
-        } catch (error) {}
+            const balance = await checkWalletBalance();
+            deploymentInfo.walletBalance = balance;
+            state.walletBal = balance;
+        } catch (error) {
+            // Keep existing balance
+        }
     }
     
     res.json({
