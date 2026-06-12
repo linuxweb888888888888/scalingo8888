@@ -1,7 +1,7 @@
 /**
- * ⚡ TITAN ARBITRAGE v9.0 - WORKING FLASH LOANS WITH REAL PROFITS ⚡
+ * ⚡ TITAN ARBITRAGE v9.1 - FIXED BALANCER FLASH LOANS ⚡
  * ✅ CONTRACT DEPLOYED: 0x45EA9b7cB6DA33e651Ae7cb71C877cc5C6e42b63
- * ✅ Using dRPC endpoint: https://polygon.drpc.org
+ * ✅ Using Balancer Vault for Flash Loans
  */
 
 const express = require('express');
@@ -17,16 +17,19 @@ const PRIVATE_KEY = "0xe97293d254eb17ce5325c22803d16018a22c649d3d71098672eaa0363
 const CONTRACT_ADDRESS = "0x45EA9b7cB6DA33e651Ae7cb71C877cc5C6e42b63";
 const USDC_ADDR = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
+// ✅ BALANCER VAULT (CORRECT ADDRESS FOR FLASH LOANS)
+const BALANCER_VAULT = "0xBA12222222228d8Ba445958a75a0704d566BF2C8";
+
 // ✅ USING ONLY WORKING dRPC ENDPOINT
 const RPC_URL = "https://polygon.drpc.org";
 
 // Financial parameters
 const BORROW_AMOUNT = 10000;      // $10,000 USDC
-const FLASH_LOAN_FEE = 0.0009;    // 0.09% Balancer fee
+const FLASH_LOAN_FEE = 0.00009;    // 0.009% Balancer fee (FIXED)
 const DEX_FEE_PERCENT = 0.006;    // 0.6% for two swaps (0.3% each)
 const EST_GAS_GWEI = 100;          // 100 Gwei
-const EST_GAS_LIMIT = 500000;      // 500k gas for flash loan
-const MIN_PROFIT_TRIGGER = 50;     // $50 minimum profit to execute
+const EST_GAS_LIMIT = 800000;      // 800k gas for flash loan + swaps
+const MIN_PROFIT_TRIGGER = 20;     // $20 minimum profit to execute (lowered for testing)
 
 const SCAN_SPEED = 8000; // 8 seconds
 
@@ -36,18 +39,27 @@ const TOKENS = [
     { s: "WETH", a: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619", cg: "ethereum", decimals: 18 },
     { s: "WBTC", a: "0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6", cg: "wrapped-bitcoin", decimals: 8 },
     { s: "LINK", a: "0xb0897686c545045aFc77CF20eC7A532E3120E0F1", cg: "chainlink", decimals: 18 },
-    { s: "PEPE", a: "0x25d887Ce7a35172C62FeBFD67a1856F20FaEbB00", cg: "pepe", decimals: 18 },
-    { s: "CRV", a: "0x172370d5Cd63279eFa6d502DAB29171933a610AF", cg: "curve-dao-token", decimals: 18 },
-    { s: "AAVE", a: "0xD6DF932A45C0f255f85145f286eA0b292B21C90B", cg: "aave", decimals: 18 }
+    { s: "USDT", a: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F", cg: "tether", decimals: 6 },
+    { s: "DAI", a: "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063", cg: "dai", decimals: 18 }
 ];
 
-// DEX mapping with real router addresses
+// DEX mapping with correct router addresses for Polygon
 const DEX_MAP = { 
-    "quickswap": { router: "0xa5e0829caced8ffdd4b3c72e4999f68ff6213921", fee: 0.003 },
-    "sushiswap": { router: "0x1b02da8cb0d097eb8d57a175b88c7d8b47997506", fee: 0.003 },
-    "camelot": { router: "0xc873fEcbd354f5A56E00E710B90EF4201db2448d", fee: 0.003 },
-    "pancakeswap": { router: "0x9a489505a00cE272eAa5e07Dba6491314CaE3796", fee: 0.0025 },
-    "uniswap": { router: "0xE592427A0AEce92De3Edee1F18E0157C05861564", fee: 0.003 }
+    "quickswap": { 
+        router: "0xa5e0829caced8ffdd4b3c72e4999f68ff6213923", 
+        factory: "0x5757371414417b8C6CAad45bAeF941aBc7d3Ab32",
+        fee: 0.003 
+    },
+    "sushiswap": { 
+        router: "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506", 
+        factory: "0xc35DADB65012eC5796536bD9864eD8773aBc74C4",
+        fee: 0.003 
+    },
+    "uniswap": { 
+        router: "0xE592427A0AEce92De3Edee1F18E0157C05861564", 
+        factory: "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+        fee: 0.003 
+    }
 };
 
 // ==================== [ STATE MANAGEMENT ] ====================
@@ -74,6 +86,28 @@ let state = {
 let provider, wallet, contract;
 let contractDeployed = false;
 
+// ==================== [ COMPLETE CONTRACT ABI FOR FLASH LOANS ] ====================
+const CONTRACT_ABI = [
+    // Flash Loan Functions
+    "function executeFlashLoan(address token, uint256 amount, address dexA, address dexB, address targetToken) external returns (bool)",
+    "function receiveFlashLoan(address[] memory tokens, uint256[] memory amounts, uint256[] memory feeAmounts, bytes memory userData) external",
+    
+    // Admin Functions
+    "function withdraw(address token, uint256 amount) external",
+    "function withdrawETH() external",
+    "function setApprovals() external",
+    
+    // View Functions
+    "function getBalance(address token) view returns (uint256)",
+    "function owner() view returns (address)",
+    "function totalFlashLoans() view returns (uint256)",
+    "function balancerVault() view returns (address)",
+    
+    // Events
+    "event FlashLoanExecuted(address indexed token, uint256 amount, uint256 profit)",
+    "event ArbitrageExecuted(address indexed token, uint256 buyAmount, uint256 sellAmount, uint256 profit)"
+];
+
 // ==================== [ CONNECTION & CONTRACT ] ====================
 async function connect() {
     try {
@@ -99,14 +133,6 @@ async function connect() {
                 console.log(`✅ Contract found at: ${CONTRACT_ADDRESS}`);
                 contractDeployed = true;
                 
-                const CONTRACT_ABI = [
-                    "function executeFlashLoan(address token, uint256 amount, address dexA, address dexB, address targetToken) external",
-                    "function withdraw(address token) external",
-                    "function getBalance(address token) view returns (uint256)",
-                    "function owner() view returns (address)",
-                    "function totalFlashLoans() view returns (uint256)"
-                ];
-                
                 contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, wallet);
                 
                 try {
@@ -116,7 +142,14 @@ async function connect() {
                         console.log("✅ You are the contract owner!");
                     }
                 } catch(e) {
-                    console.log("⚠️ Could not verify ownership");
+                    console.log("⚠️ Could not verify ownership, but continuing...");
+                }
+                
+                try {
+                    const vault = await contract.balancerVault();
+                    console.log(`✅ Balancer Vault: ${vault}`);
+                } catch(e) {
+                    console.log("⚠️ Could not get vault address, using default");
                 }
                 
                 try {
@@ -126,6 +159,7 @@ async function connect() {
                 
             } else {
                 console.log(`❌ Contract NOT found at ${CONTRACT_ADDRESS}`);
+                console.log(`⚠️ Please deploy the contract first using the Solidity code`);
                 contractDeployed = false;
             }
         } else {
@@ -143,20 +177,20 @@ function calculateRealProfit(spreadPercent, borrowAmount = BORROW_AMOUNT) {
     const grossProfit = borrowAmount * (spreadPercent / 100);
     const dexFees = borrowAmount * DEX_FEE_PERCENT;
     const flashFee = borrowAmount * FLASH_LOAN_FEE;
-    const gasCost = (EST_GAS_GWEI * EST_GAS_LIMIT * 1e-9) * 250;
-    const totalCosts = dexFees + flashFee + gasCost;
+    const gasCostEstimate = (EST_GAS_GWEI * EST_GAS_LIMIT * 1e-9) * 250; // ~$0.25 USD
+    const totalCosts = dexFees + flashFee + gasCostEstimate;
     const netProfit = grossProfit - totalCosts;
     
     return {
         grossProfit: grossProfit,
         dexFees: dexFees,
         flashFee: flashFee,
-        gasCost: gasCost,
+        gasCost: gasCostEstimate,
         totalCosts: totalCosts,
         netProfit: netProfit,
         netProfitPercent: (netProfit / borrowAmount) * 100,
         isProfitable: netProfit > MIN_PROFIT_TRIGGER,
-        roi: (netProfit / totalCosts) * 100
+        roi: totalCosts > 0 ? (netProfit / totalCosts) * 100 : 0
     };
 }
 
@@ -171,20 +205,25 @@ async function getDexScreenerPrices(tokenAddress) {
             const pairs = response.data.pairs.filter(p => 
                 p.chainId === "polygon" && 
                 p.priceUsd && 
-                parseFloat(p.priceUsd) > 0
+                parseFloat(p.priceUsd) > 0 &&
+                (p.baseToken.address.toLowerCase() === tokenAddress.toLowerCase() ||
+                 p.quoteToken.address.toLowerCase() === tokenAddress.toLowerCase())
             );
             
             const dexPrices = {};
             pairs.forEach(pair => {
+                let price = parseFloat(pair.priceUsd);
                 const dexId = pair.dexId;
-                if (!dexPrices[dexId] || parseFloat(pair.priceUsd) > dexPrices[dexId]) {
-                    dexPrices[dexId] = parseFloat(pair.priceUsd);
+                if (!dexPrices[dexId] || price > dexPrices[dexId]) {
+                    dexPrices[dexId] = price;
                 }
             });
             
             return dexPrices;
         }
-    } catch(e) {}
+    } catch(e) {
+        // Silent fail
+    }
     return {};
 }
 
@@ -208,13 +247,15 @@ async function scan() {
             let highest = { dex: null, price: -Infinity };
             
             dexEntries.forEach(([dex, price]) => {
-                if (price < lowest.price) {
+                if (price < lowest.price && DEX_MAP[dex]) {
                     lowest = { dex, price };
                 }
-                if (price > highest.price) {
+                if (price > highest.price && DEX_MAP[dex]) {
                     highest = { dex, price };
                 }
             });
+            
+            if (!lowest.dex || !highest.dex) continue;
             
             const spreadPercent = ((highest.price - lowest.price) / lowest.price) * 100;
             const profitCalc = calculateRealProfit(spreadPercent);
@@ -250,13 +291,19 @@ async function scan() {
                 await executeFlashLoan(opportunity);
             }
             
-        } catch(e) {}
+        } catch(e) {
+            // Silent fail for individual token errors
+        }
     }
     
     state.opportunities = opportunities.sort((a, b) => b.netProfit - a.netProfit).slice(0, 15);
+    
+    if (state.stats.scans % 10 === 0) {
+        console.log(`📊 Scan #${state.stats.scans} - Found ${opportunities.length} opportunities`);
+    }
 }
 
-// ==================== [ EXECUTE FLASH LOAN ] ====================
+// ==================== [ EXECUTE FLASH LOAN - FIXED FOR BALANCER ] ====================
 async function executeFlashLoan(opportunity) {
     if (!contract || !wallet) {
         console.log("❌ Cannot execute: No contract or wallet");
@@ -265,6 +312,7 @@ async function executeFlashLoan(opportunity) {
     
     if (!contractDeployed) {
         console.log("❌ Contract not deployed!");
+        console.log("📝 Please deploy the BalancerFlashLoan contract first");
         return;
     }
     
@@ -282,40 +330,68 @@ async function executeFlashLoan(opportunity) {
     console.log(`   Expected Profit: $${opportunity.netProfit.toFixed(2)}`);
     
     try {
-        const borrowAmount = ethers.parseUnits(BORROW_AMOUNT.toString(), 6);
+        // Get router addresses
         const dexARouter = DEX_MAP[opportunity.buyDex]?.router;
         const dexBRouter = DEX_MAP[opportunity.sellDex]?.router;
         
         if (!dexARouter || !dexBRouter) {
-            throw new Error(`DEX router not found: ${opportunity.buyDex} or ${opportunity.sellDex}`);
+            const errorMsg = `DEX router not found for ${opportunity.buyDex} or ${opportunity.sellDex}`;
+            console.log(`❌ ${errorMsg}`);
+            console.log(`   Available DEXes: ${Object.keys(DEX_MAP).join(', ')}`);
+            throw new Error(errorMsg);
         }
         
+        const borrowAmount = ethers.parseUnits(BORROW_AMOUNT.toString(), 6);
+        
         console.log(`   Borrow Amount: ${BORROW_AMOUNT} USDC`);
+        console.log(`   Balancer Vault: ${BALANCER_VAULT}`);
         console.log(`   Router A (${opportunity.buyDex}): ${dexARouter.substring(0, 15)}...`);
         console.log(`   Router B (${opportunity.sellDex}): ${dexBRouter.substring(0, 15)}...`);
+        console.log(`   Target Token: ${opportunity.tokenAddress.substring(0, 15)}...`);
         
+        // Estimate gas first
+        const gasEstimate = await contract.executeFlashLoan.estimateGas(
+            USDC_ADDR,
+            borrowAmount,
+            dexARouter,
+            dexBRouter,
+            opportunity.tokenAddress
+        ).catch(() => EST_GAS_LIMIT);
+        
+        const gasLimit = Math.min(Math.floor(Number(gasEstimate) * 1.2), 2000000);
+        console.log(`   Gas Estimate: ${gasEstimate}, Using: ${gasLimit}`);
+        
+        // Execute the flash loan transaction
         const tx = await contract.executeFlashLoan(
             USDC_ADDR,
             borrowAmount,
             dexARouter,
             dexBRouter,
             opportunity.tokenAddress,
-            { gasLimit: EST_GAS_LIMIT }
+            { 
+                gasLimit: gasLimit,
+                maxFeePerGas: ethers.parseUnits("150", "gwei"),
+                maxPriorityFeePerGas: ethers.parseUnits("30", "gwei")
+            }
         );
         
         console.log(`📤 Transaction sent: ${tx.hash}`);
         console.log(`🔗 https://polygonscan.com/tx/${tx.hash}`);
         
-        const receipt = await tx.wait();
+        // Wait for confirmation
+        const receipt = await tx.wait(1); // Wait for 1 confirmation
         
         if (receipt.status === 1) {
             const executionTime = Date.now() - startTime;
+            const gasUsedMatic = parseFloat(ethers.formatEther(receipt.gasUsed * receipt.gasPrice));
+            const maticPrice = 0.80; // Approximate, you can fetch this
+            const actualGasCost = gasUsedMatic * maticPrice;
             
             state.stats.successfulTrades++;
             state.stats.totalProfit += opportunity.netProfit;
             state.stats.totalFlashFees += opportunity.flashFee;
             state.stats.totalDexFees += opportunity.dexFees;
-            state.stats.totalGasSpent += opportunity.gasCost;
+            state.stats.totalGasSpent += actualGasCost;
             
             state.tradeHistory.unshift({
                 id: Date.now(),
@@ -327,7 +403,7 @@ async function executeFlashLoan(opportunity) {
                 netProfit: opportunity.netProfit,
                 flashFee: opportunity.flashFee,
                 dexFees: opportunity.dexFees,
-                gasCost: opportunity.gasCost,
+                gasCost: actualGasCost,
                 spread: opportunity.spreadPercent,
                 executionTime: executionTime,
                 timestamp: new Date().toISOString(),
@@ -343,10 +419,11 @@ async function executeFlashLoan(opportunity) {
             console.log(`✅✅✅ FLASH LOAN SUCCESSFUL!`);
             console.log(`   Net Profit: $${opportunity.netProfit.toFixed(2)}`);
             console.log(`   Gas Used: ${receipt.gasUsed.toString()}`);
+            console.log(`   Actual Gas Cost: $${actualGasCost.toFixed(4)}`);
             console.log(`   Time: ${executionTime}ms`);
             
         } else {
-            throw new Error("Transaction reverted");
+            throw new Error("Transaction reverted on-chain");
         }
         
     } catch(e) {
@@ -361,10 +438,11 @@ async function executeFlashLoan(opportunity) {
         
         state.logs.unshift({
             time: new Date().toISOString(),
-            message: `❌ FAILED: ${opportunity.token} - ${e.message}`
+            message: `❌ FAILED: ${opportunity.token} - ${e.message.substring(0, 100)}`
         });
         
         console.log(`❌ Flash loan failed:`, e.message);
+        if (e.error) console.log(`   Details:`, e.error);
     }
 }
 
@@ -379,6 +457,7 @@ app.get('/api/data', (req, res) => {
         winRate: winRate,
         contractDeployed: contractDeployed,
         contractAddress: CONTRACT_ADDRESS,
+        balancerVault: BALANCER_VAULT,
         uptime: process.uptime(),
         config: {
             borrowAmount: BORROW_AMOUNT,
@@ -391,7 +470,22 @@ app.get('/api/data', (req, res) => {
 
 app.post('/api/toggle', (req, res) => {
     state.autoTrade = !state.autoTrade;
+    console.log(`🔄 Auto-trading ${state.autoTrade ? 'ENABLED' : 'DISABLED'}`);
     res.json({ autoTrade: state.autoTrade });
+});
+
+app.post('/api/reset', (req, res) => {
+    state.stats = { 
+        scans: 0, 
+        tradesExecuted: 0,
+        successfulTrades: 0,
+        failedTrades: 0,
+        totalProfit: 0,
+        totalFlashFees: 0,
+        totalGasSpent: 0,
+        totalDexFees: 0
+    };
+    res.json({ message: "Stats reset" });
 });
 
 app.get('/', (req, res) => {
@@ -399,7 +493,7 @@ app.get('/', (req, res) => {
     <!DOCTYPE html>
     <html>
     <head>
-        <title>TITAN ARBITRAGE v9.0 - FLASH LOAN ACTIVE</title>
+        <title>TITAN ARBITRAGE v9.1 - BALANCER FLASH LOANS</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -445,17 +539,19 @@ app.get('/', (req, res) => {
             <div class="header">
                 <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
                     <div>
-                        <h1>⚡ TITAN ARBITRAGE v9.0</h1>
-                        <p style="color: #94a3b8; margin-top: 8px;">Balancer Flash Loans | Real-time Arbitrage | ✅ CONTRACT DEPLOYED</p>
+                        <h1>⚡ TITAN ARBITRAGE v9.1</h1>
+                        <p style="color: #94a3b8; margin-top: 8px;">Balancer Flash Loans | Real-time Arbitrage | ✅ BALANCER INTEGRATED</p>
                     </div>
                     <div style="text-align: right;">
                         <div>
                             <span id="connectionStatus" class="status offline">● CONNECTING</span>
                             <button id="toggleTrade" class="success" style="margin-left: 10px;">🟢 Trading ON</button>
+                            <button id="resetStats" style="background: #6b7280;">🔄 Reset Stats</button>
                         </div>
                         <div style="margin-top: 8px;">
-                            <span class="rpc-badge">🔗 dRPC: polygon.drpc.org (100% uptime)</span>
-                            <span class="rpc-badge" style="margin-left: 8px;">📜 Contract: ${CONTRACT_ADDRESS.substring(0, 10)}...</span>
+                            <span class="rpc-badge">🔗 dRPC: polygon.drpc.org</span>
+                            <span class="rpc-badge" style="margin-left: 8px;">🏦 Balancer Vault</span>
+                            <span class="rpc-badge" style="margin-left: 8px;">📜 ${CONTRACT_ADDRESS.substring(0, 10)}...</span>
                         </div>
                     </div>
                 </div>
@@ -464,7 +560,7 @@ app.get('/', (req, res) => {
             <div class="stats-grid">
                 <div class="stat-card"><div class="stat-label">Total Profit</div><div class="stat-value profit" id="totalProfit">$0.00</div><div class="stat-label">Win Rate: <span id="winRate">0</span>%</div></div>
                 <div class="stat-card"><div class="stat-label">Trades Executed</div><div class="stat-value" id="totalTrades">0</div><div class="stat-label">Success: <span id="successTrades">0</span> | Failed: <span id="failedTrades">0</span></div></div>
-                <div class="stat-card"><div class="stat-label">Flash Loan Stats</div><div class="stat-value" id="flashFees">$0.00</div><div class="stat-label">Fees Paid | Dex Fees: $<span id="dexFees">0</span></div></div>
+                <div class="stat-card"><div class="stat-label">Flash Loan Stats</div><div class="stat-value" id="flashFees">$0.00</div><div class="stat-label">Fees Paid (0.009%)</div></div>
                 <div class="stat-card"><div class="stat-label">Wallet Balance</div><div class="stat-value" id="walletBalance">0 MATIC</div><div class="stat-label">Gas Spent: $<span id="gasSpent">0</span></div></div>
             </div>
             
@@ -516,7 +612,6 @@ app.get('/', (req, res) => {
                 document.getElementById('successTrades').innerText = data.stats.successfulTrades || 0;
                 document.getElementById('failedTrades').innerText = data.stats.failedTrades || 0;
                 document.getElementById('flashFees').innerHTML = '<span class="loss">$' + data.stats.totalFlashFees?.toFixed(2) + '</span>';
-                document.getElementById('dexFees').innerText = data.stats.totalDexFees?.toFixed(2) || '0';
                 document.getElementById('walletBalance').innerText = data.walletBal + ' MATIC';
                 document.getElementById('gasSpent').innerText = data.stats.totalGasSpent?.toFixed(2) || '0';
                 document.getElementById('winRate').innerText = data.winRate?.toFixed(1) || '0';
@@ -538,7 +633,7 @@ app.get('/', (req, res) => {
                         </tr>\`;
                     }).join('');
                 } else {
-                    oppBody.innerHTML = '<tr><td colspan="8" style="text-align: center;">🔍 Scanning for opportunities...<\/td><\/tr>';
+                    oppBody.innerHTML = '<tr><td colspan="8" style="text-align: center;">🔍 Scanning for opportunities...</td></tr>';
                 }
                 
                 const historyBody = document.getElementById('historyBody');
@@ -574,6 +669,11 @@ app.get('/', (req, res) => {
                 }
             };
             
+            document.getElementById('resetStats').onclick = async () => {
+                await fetch('/api/reset', { method: 'POST' });
+                fetchData();
+            };
+            
             fetchData();
         </script>
     </body>
@@ -585,18 +685,35 @@ app.get('/', (req, res) => {
 async function start() {
     console.log(`
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║     ⚡ TITAN ARBITRAGE v9.0 - FLASH LOAN READY ⚡                            ║
+║     ⚡ TITAN ARBITRAGE v9.1 - BALANCER FLASH LOANS ⚡                         ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  RPC:          https://polygon.drpc.org (100% uptime)
+║  Balancer:     ${BALANCER_VAULT}
 ║  Contract:     ${CONTRACT_ADDRESS}
 ║  Dashboard:    http://localhost:${PORT}
 ║  Borrow:       $${BORROW_AMOUNT} USDC
 ║  Min Profit:   $${MIN_PROFIT_TRIGGER}
+║  Flash Fee:    ${FLASH_LOAN_FEE * 100}%
 ║  Auto Trade:   ${state.autoTrade ? '✅ ENABLED' : '❌ DISABLED'}
 ╚══════════════════════════════════════════════════════════════════════════════╝
     `);
     
     await connect();
+    
+    if (!contractDeployed) {
+        console.log(`
+⚠️  CONTRACT NOT DEPLOYED!
+
+Please deploy the BalancerFlashLoan contract first using this address:
+${BALANCER_VAULT} (Balancer V2 Vault on Polygon)
+
+The contract needs to implement:
+- IBalancerFlashLoanReceiver interface
+- swap functions for Quickswap, Sushiswap, Uniswap
+- Approval management for USDC and tokens
+        `);
+    }
+    
     setInterval(scan, SCAN_SPEED);
     
     app.listen(PORT, '0.0.0.0', () => {
