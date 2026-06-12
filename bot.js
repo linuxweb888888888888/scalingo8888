@@ -37,7 +37,6 @@ let hourlyStats = {};
 
 // ==================== FOCUS ON LESS COMPETITIVE TOKENS ====================
 const TARGET_TOKENS = [
-    // Focus on Polygon native tokens first (less competition)
     { symbol: "POL", address: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", decimals: 18, icon: "🟣", priority: "HIGH" },
     { symbol: "QUICK", address: "0xB5C064F955D8e7F38fE0460C556a72987494eE17", decimals: 18, icon: "⚡", priority: "HIGH" },
     { symbol: "WETH", address: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619", decimals: 18, icon: "💎", priority: "MEDIUM" },
@@ -53,10 +52,6 @@ const DEXES = [
     { name: "SUSHISWAP", router: "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506", fee: 0.0030, icon: "🍣" },
     { name: "UNISWAP_V3", router: "0xE592427A0AEce92De3Edee1F18E0157C05861564", fee: 0.0030, icon: "🦄" }
 ];
-
-// ==================== 0x API FOR ORDERBOOK ARBITRAGE ====================
-const ZEROX_API = "https://polygon.api.0x.org/";
-let orderbookOpportunities = [];
 
 // ==================== CONTRACT ABI ====================
 const CONTRACT_ABI = [
@@ -113,23 +108,23 @@ async function initializeBlockchain() {
         provider = new ethers.JsonRpcProvider(QUICKNODE_URL);
         await rateLimit();
         const blockNumber = await provider.getBlockNumber();
-        addLog(`✅ Connected to Polygon (Block: ${blockNumber.toLocaleString()})`, 'success');
+        addLog(`Connected to Polygon (Block: ${blockNumber.toLocaleString()})`, 'success');
         
         if (PRIVATE_KEY && PRIVATE_KEY !== 'your_private_key_here' && !DRY_RUN_MODE) {
             wallet = new ethers.Wallet(PRIVATE_KEY, provider);
             flashLoanContract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, wallet);
             const balance = await provider.getBalance(wallet.address);
             state.wallet.pol = parseFloat(ethers.formatEther(balance));
-            addLog(`📍 Wallet: ${wallet.address.substring(0, 10)}... Balance: ${state.wallet.pol.toFixed(4)} POL`, 'info');
+            addLog(`Wallet: ${wallet.address.substring(0, 10)}... Balance: ${state.wallet.pol.toFixed(4)} POL`, 'info');
         } else if (DRY_RUN_MODE) {
-            addLog(`🔍 DRY RUN MODE - Logging spreads only, no transactions`, 'warning');
-            addLog(`📊 Will collect data for 24 hours before enabling real trades`, 'info');
+            addLog(`DRY RUN MODE - Logging spreads only, no transactions`, 'warning');
+            addLog(`Will collect data for 24 hours before enabling real trades`, 'info');
         }
         
         state.connected = true;
         return true;
     } catch (error) {
-        addLog(`❌ Connection failed: ${error.message}`, 'error');
+        addLog(`Connection failed: ${error.message}`, 'error');
         state.connected = false;
         return false;
     }
@@ -137,7 +132,7 @@ async function initializeBlockchain() {
 
 // ==================== PRICE FETCHING ====================
 async function getTokenPriceOnDex(token, dex) {
-    const cacheKey = `${token.address}_${dex.name}`;
+    const cacheKey = token.address + "_" + dex.name;
     const cached = priceCache.get(cacheKey);
     if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
         return cached.price;
@@ -161,37 +156,13 @@ async function getTokenPriceOnDex(token, dex) {
     }
 }
 
-// ==================== ORDERBOOK ARBITRAGE (0x API) ====================
-async function checkOrderbookArbitrage() {
-    try {
-        const fetch = await import('node-fetch');
-        const usdcAddress = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
-        
-        for (const token of TARGET_TOKENS) {
-            // Check for buy orders below market price
-            const buyUrl = `${ZEROX_API}swap/v1/quote?buyToken=${token.address}&sellToken=${usdcAddress}&sellAmount=500000000`; // $500
-            const sellUrl = `${ZEROX_API}swap/v1/quote?buyToken=${usdcAddress}&sellToken=${token.address}&sellAmount=${ethers.parseUnits("1", token.decimals)}`;
-            
-            try {
-                // This would check limit orders vs market price
-                // Implementation would require actual 0x API calls
-                orderbookOpportunities.push({
-                    token: token.symbol,
-                    type: "ORDERBOOK",
-                    potential: "Checking..."
-                });
-            } catch(e) {}
-        }
-    } catch(e) {}
-}
-
 // ==================== SCAN WITH DETAILED LOGGING ====================
 async function scanAndLogSpreads() {
     const currentHour = new Date().getUTCHours();
     const isOptimalHour = OPTIMAL_HOURS.includes(currentHour);
     const spreads = [];
     
-    addLog(`🔍 SCAN #${state.session.totalScans + 1} - Hour: ${currentHour} UTC ${isOptimalHour ? '(OPTIMAL TRADING TIME ✅)' : '(Low activity)'}`, 'info');
+    addLog(`SCAN #${state.session.totalScans + 1} - Hour: ${currentHour} UTC ${isOptimalHour ? '(OPTIMAL TIME)' : ''}`, 'info');
     
     for (const token of TARGET_TOKENS) {
         const prices = [];
@@ -235,13 +206,12 @@ async function scanAndLogSpreads() {
                     
                     if (spreadData.isProfitable) {
                         state.stats.profitableSpreads++;
-                        addLog(`💰 PROFITABLE: ${token.symbol} | ${spreadData.buyDex}→${spreadData.sellDex} | ${spreadData.netSpread}% net | $${spreadData.profitOn500} profit`, 'opportunity');
+                        addLog(`PROFITABLE: ${token.symbol} | ${spreadData.buyDex}->${spreadData.sellDex} | ${spreadData.netSpread}% net | $${spreadData.profitOn500} profit`, 'opportunity');
                         
                         if (LOG_SPREADS_TO_FILE) {
                             spreadLog.push(spreadData);
                         }
                         
-                        // Update hourly stats
                         if (!hourlyStats[currentHour]) {
                             hourlyStats[currentHour] = { count: 0, totalProfit: 0, avgSpread: 0 };
                         }
@@ -254,33 +224,32 @@ async function scanAndLogSpreads() {
         }
     }
     
-    // Update stats
     state.stats.totalSpreadsFound += spreads.length;
     if (spreads.length > 0) {
-        const avg = spreads.reduce((sum, s) => sum + parseFloat(s.netSpread), 0) / spreads.length;
-        state.stats.averageSpread = avg.toFixed(2);
-        const best = Math.max(...spreads.map(s => parseFloat(s.netSpread)));
+        let sum = 0;
+        for (let s of spreads) sum += parseFloat(s.netSpread);
+        state.stats.averageSpread = (sum / spreads.length).toFixed(2);
+        let best = 0;
+        for (let s of spreads) best = Math.max(best, parseFloat(s.netSpread));
         if (best > state.stats.bestSpread) state.stats.bestSpread = best;
     }
     
     state.stats.totalOpportunities = state.stats.profitableSpreads;
     state.session.totalScans++;
     
-    // Save to file periodically
     if (state.session.totalScans % 10 === 0 && LOG_SPREADS_TO_FILE) {
         fs.writeFileSync('spreads_log.json', JSON.stringify({
             spreads: spreadLog.slice(-1000),
             hourlyStats: hourlyStats,
             summary: state.stats
         }, null, 2));
-        addLog(`💾 Saved spread data to spreads_log.json`, 'info');
+        addLog(`Saved spread data to spreads_log.json`, 'info');
     }
     
-    // Display summary
-    addLog(`📊 SCAN SUMMARY: ${spreads.length} spreads, ${state.stats.profitableSpreads} profitable (min $${MIN_PROFIT_USD})`, 'info');
+    addLog(`SCAN SUMMARY: ${spreads.length} spreads, ${state.stats.profitableSpreads} profitable (min $${MIN_PROFIT_USD})`, 'info');
     
     if (state.stats.profitableSpreads > 0 && !DRY_RUN_MODE && isOptimalHour) {
-        addLog(`🚀 ${state.stats.profitableSpreads} profitable opportunities found! Ready to execute!`, 'success');
+        addLog(`${state.stats.profitableSpreads} profitable opportunities found! Ready to execute!`, 'success');
     }
     
     return spreads.filter(s => s.isProfitable);
@@ -289,23 +258,22 @@ async function scanAndLogSpreads() {
 // ==================== EXECUTE ONLY AFTER 24 HOURS ====================
 async function executeFlashLoanArbitrage(opportunity) {
     if (DRY_RUN_MODE) {
-        addLog(`🔍 DRY RUN: Would execute ${opportunity.token} trade with $${opportunity.profitOn500} profit`, 'info');
+        addLog(`DRY RUN: Would execute ${opportunity.token} trade with $${opportunity.profitOn500} profit`, 'info');
         return false;
     }
     
-    // Only execute during optimal hours
     const currentHour = new Date().getUTCHours();
     if (!OPTIMAL_HOURS.includes(currentHour)) {
-        addLog(`⏰ Skipping execution - not optimal hour (${currentHour} UTC). Best hours: 2-6 AM UTC`, 'info');
+        addLog(`Skipping execution - not optimal hour (${currentHour} UTC). Best hours: 2-6 AM UTC`, 'info');
         return false;
     }
     
     if (!wallet || !flashLoanContract) {
-        addLog(`❌ Cannot execute: No wallet/contract`, 'error');
+        addLog(`Cannot execute: No wallet/contract`, 'error');
         return false;
     }
     
-    addLog(`💸 EXECUTING: ${opportunity.token} | ${opportunity.buyDex}→${opportunity.sellDex} | Est: $${opportunity.profitOn500}`, 'opportunity');
+    addLog(`EXECUTING: ${opportunity.token} | ${opportunity.buyDex}->${opportunity.sellDex} | Est: $${opportunity.profitOn500}`, 'opportunity');
     
     try {
         const usdcAddress = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
@@ -323,7 +291,7 @@ async function executeFlashLoanArbitrage(opportunity) {
         );
         
         const tx = await flashLoanContract.requestFlashLoan(usdcAddress, amount, params, { gasLimit: 2000000 });
-        addLog(`📤 Tx: ${tx.hash.substring(0, 20)}...`, 'info');
+        addLog(`Tx: ${tx.hash.substring(0, 20)}...`, 'info');
         
         const receipt = await tx.wait();
         
@@ -331,7 +299,7 @@ async function executeFlashLoanArbitrage(opportunity) {
             const gasUsed = parseFloat(ethers.formatEther(receipt.gasUsed * receipt.gasPrice)) * polPriceUSD;
             const netProfit = parseFloat(opportunity.profitOn500) - gasUsed;
             
-            addLog(`✅ SUCCESS! Net Profit: $${netProfit.toFixed(2)}`, 'success');
+            addLog(`SUCCESS! Net Profit: $${netProfit.toFixed(2)}`, 'success');
             
             state.tradeHistory.unshift({
                 timestamp: new Date().toISOString(),
@@ -344,26 +312,21 @@ async function executeFlashLoanArbitrage(opportunity) {
             return true;
         }
     } catch (error) {
-        addLog(`❌ Failed: ${error.message.substring(0, 100)}`, 'error');
+        addLog(`Failed: ${error.message.substring(0, 100)}`, 'error');
         return false;
     }
 }
 
-// ==================== MAIN LOOP WITH TIMELINE ====================
+// ==================== MAIN LOOP ====================
 async function mainLoop() {
     const startTime = Date.now();
-    const hoursRunning = 0;
     
-    addLog('🔥 PROFITABLE FLASH LOAN BOT STARTED', 'success');
-    addLog(`📋 Strategy: Focus on POL/QUICK/CRV (less competition)`, 'info');
-    addLog(`⏰ Optimal trading hours: 2-6 AM UTC`, 'info');
-    addLog(`💰 Minimum profit target: $${MIN_PROFIT_USD} (${MIN_SPREAD_PERCENT}% spread)`, 'info');
-    addLog(`🔬 DRY RUN MODE: ${DRY_RUN_MODE ? 'ON - Collecting data for 24 hours' : 'OFF - Executing trades'}`, 'warning');
-    addLog(`📊 Will save data to spreads_log.json`, 'info');
-    addLog(`⏱️ Timeline:`, 'info');
-    addLog(`   - Hours 0-24: Data collection (DRY RUN)`, 'info');
-    addLog(`   - After 24h: Analyze spreads_log.json`, 'info');
-    addLog(`   - Then: Enable real trades with DRY_RUN_MODE = false`, 'info');
+    addLog('PROFITABLE FLASH LOAN BOT STARTED', 'success');
+    addLog(`Strategy: Focus on POL/QUICK/CRV (less competition)`, 'info');
+    addLog(`Optimal trading hours: 2-6 AM UTC`, 'info');
+    addLog(`Minimum profit target: $${MIN_PROFIT_USD} (${MIN_SPREAD_PERCENT}% spread)`, 'info');
+    addLog(`DRY RUN MODE: ${DRY_RUN_MODE ? 'ON - Collecting data for 24 hours' : 'OFF - Executing trades'}`, 'warning');
+    addLog(`Will save data to spreads_log.json`, 'info');
     
     while (state.isRunning) {
         if (!state.connected) {
@@ -374,7 +337,6 @@ async function mainLoop() {
         
         const profitableSpreads = await scanAndLogSpreads();
         
-        // Only execute after 24 hours of data collection
         const hoursElapsed = (Date.now() - startTime) / 3600000;
         
         if (!DRY_RUN_MODE && hoursElapsed > 24 && profitableSpreads.length > 0) {
@@ -383,8 +345,8 @@ async function mainLoop() {
                 await new Promise(r => setTimeout(r, 30000));
             }
         } else if (DRY_RUN_MODE && hoursElapsed > 24) {
-            addLog(`📊 24 HOURS COMPLETE! Check spreads_log.json for analysis`, 'success');
-            addLog(`🔧 Run with DRY_RUN_MODE = false to start real trading`, 'info');
+            addLog(`24 HOURS COMPLETE! Check spreads_log.json for analysis`, 'success');
+            addLog(`Run with DRY_RUN_MODE = false to start real trading`, 'info');
         }
         
         await new Promise(r => setTimeout(r, 15000));
@@ -416,70 +378,80 @@ app.get('/api/analysis', (req, res) => {
 });
 
 app.post('/api/enable', (req, res) => {
-    addLog(`⚠️ To enable trading, set DRY_RUN_MODE = false and restart`, 'warning');
+    addLog(`To enable trading, set DRY_RUN_MODE = false and restart`, 'warning');
     res.json({ message: "Edit bot.js: set DRY_RUN_MODE = false" });
 });
 
 app.get('/', (req, res) => {
-    const html = `<!DOCTYPE html>
-<html>
-<head>
-    <title>Flash Loan Bot - Data Collection Mode</title>
-    <style>
-        body { font-family: monospace; background: #0a0a0a; color: #0f0; padding: 20px; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        .status { background: #1a1a1a; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
-        .profitable { color: #0f0; }
-        .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 20px; }
-        .card { background: #1a1a1a; padding: 15px; border-radius: 8px; }
-        pre { background: #1a1a1a; padding: 10px; overflow-x: auto; }
-    </style>
-</head>
-<body>
-<div class="container">
-    <div class="status">
-        <h1>💰 Flash Loan Arbitrage Bot</h1>
-        <p>Mode: <strong>${DRY_RUN_MODE ? '🔬 DATA COLLECTION (24 hours)' : '🚀 LIVE TRADING'}</strong></p>
-        <p>Minimum Profit: <strong>$${MIN_PROFIT_USD}</strong> | Target Spread: <strong>${MIN_SPREAD_PERCENT}%</strong></p>
-        <p>Optimal Hours: <strong>2-6 AM UTC</strong> | Flash Loan: <strong>$${FLASH_LOAN_AMOUNT}</strong></p>
-    </div>
-    <div class="stats">
-        <div class="card">📊 Total Scans<br><span id="scans">0</span></div>
-        <div class="card">💰 Profitable Spreads<br><span id="profitable">0</span></div>
-        <div class="card">📈 Avg Spread<br><span id="avgSpread">0%</span></div>
-        <div class="card">🏆 Best Spread<br><span id="bestSpread">0%</span></div>
-    </div>
-    <div class="card">
-        <h3>📋 Hourly Performance</h3>
-        <pre id="hourlyData">Loading...</pre>
-    </div>
-    <div class="card">
-        <h3>📝 Live Logs</h3>
-        <pre id="logs" style="height: 300px; overflow-y: auto;"></pre>
-    </div>
-</div>
-<script>
-    async function fetchData() {
-        const res = await fetch('/api/state');
-        const data = await res.json();
-        document.getElementById('scans').innerText = data.stats?.totalSpreadsFound || 0;
-        document.getElementById('profitable').innerText = data.stats?.profitableSpreads || 0;
-        document.getElementById('avgSpread').innerText = (data.stats?.averageSpread || 0) + '%';
-        document.getElementById('bestSpread').innerText = (data.stats?.bestSpread || 0) + '%';
-        
-        const hourlyHtml = Object.entries(data.hourlyStats || {}).map(([hour, stats]) => 
-            `${hour}:00 UTC - ${stats.count} opportunities, avg $${(stats.totalProfit/stats.count).toFixed(2)}`
-        ).join('\\n');
-        document.getElementById('hourlyData').innerText = hourlyHtml || 'No data yet. Keep bot running...';
-        
-        const logsHtml = (data.logs || []).slice(0, 20).map(l => l.message).join('\\n');
-        document.getElementById('logs').innerText = logsHtml;
-    }
-    fetchData();
-    setInterval(fetchData, 5000);
-</script>
-</body>
-</html>`;
+    const html = '<!DOCTYPE html>\n' +
+'<html>\n' +
+'<head>\n' +
+'    <title>Flash Loan Bot - Data Collection Mode</title>\n' +
+'    <style>\n' +
+'        body { font-family: monospace; background: #0a0a0a; color: #0f0; padding: 20px; }\n' +
+'        .container { max-width: 1200px; margin: 0 auto; }\n' +
+'        .status { background: #1a1a1a; padding: 15px; border-radius: 8px; margin-bottom: 20px; }\n' +
+'        .profitable { color: #0f0; }\n' +
+'        .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 20px; }\n' +
+'        .card { background: #1a1a1a; padding: 15px; border-radius: 8px; }\n' +
+'        pre { background: #1a1a1a; padding: 10px; overflow-x: auto; }\n' +
+'    </style>\n' +
+'</head>\n' +
+'<body>\n' +
+'<div class="container">\n' +
+'    <div class="status">\n' +
+'        <h1>Flash Loan Arbitrage Bot</h1>\n' +
+'        <p>Mode: <strong>' + (DRY_RUN_MODE ? 'DATA COLLECTION (24 hours)' : 'LIVE TRADING') + '</strong></p>\n' +
+'        <p>Minimum Profit: <strong>$' + MIN_PROFIT_USD + '</strong> | Target Spread: <strong>' + MIN_SPREAD_PERCENT + '%</strong></p>\n' +
+'        <p>Optimal Hours: <strong>2-6 AM UTC</strong> | Flash Loan: <strong>$' + FLASH_LOAN_AMOUNT + '</strong></p>\n' +
+'    </div>\n' +
+'    <div class="stats">\n' +
+'        <div class="card">Total Scans<br><span id="scans">0</span></div>\n' +
+'        <div class="card">Profitable Spreads<br><span id="profitable">0</span></div>\n' +
+'        <div class="card">Avg Spread<br><span id="avgSpread">0%</span></div>\n' +
+'        <div class="card">Best Spread<br><span id="bestSpread">0%</span></div>\n' +
+'    </div>\n' +
+'    <div class="card">\n' +
+'        <h3>Hourly Performance</h3>\n' +
+'        <pre id="hourlyData">Loading...</pre>\n' +
+'    </div>\n' +
+'    <div class="card">\n' +
+'        <h3>Live Logs</h3>\n' +
+'        <pre id="logs" style="height: 300px; overflow-y: auto;"></pre>\n' +
+'    </div>\n' +
+'</div>\n' +
+'<script>\n' +
+'    async function fetchData() {\n' +
+'        const res = await fetch("/api/state");\n' +
+'        const data = await res.json();\n' +
+'        document.getElementById("scans").innerText = data.stats?.totalSpreadsFound || 0;\n' +
+'        document.getElementById("profitable").innerText = data.stats?.profitableSpreads || 0;\n' +
+'        document.getElementById("avgSpread").innerText = (data.stats?.averageSpread || 0) + "%";\n' +
+'        document.getElementById("bestSpread").innerText = (data.stats?.bestSpread || 0) + "%";\n' +
+'        \n' +
+'        let hourlyText = "";\n' +
+'        if (data.hourlyStats) {\n' +
+'            for (const hour in data.hourlyStats) {\n' +
+'                const stats = data.hourlyStats[hour];\n' +
+'                hourlyText += hour + ":00 UTC - " + stats.count + " opportunities, avg $" + (stats.totalProfit/stats.count).toFixed(2) + "\\n";\n' +
+'            }\n' +
+'        }\n' +
+'        document.getElementById("hourlyData").innerText = hourlyText || "No data yet. Keep bot running...";\n' +
+'        \n' +
+'        let logsText = "";\n' +
+'        if (data.logs) {\n' +
+'            for (let i = 0; i < Math.min(data.logs.length, 20); i++) {\n' +
+'                logsText += data.logs[i].message + "\\n";\n' +
+'            }\n' +
+'        }\n' +
+'        document.getElementById("logs").innerText = logsText;\n' +
+'    }\n' +
+'    fetchData();\n' +
+'    setInterval(fetchData, 5000);\n' +
+'</script>\n' +
+'</body>\n' +
+'</html>';
+    
     res.send(html);
 });
 
@@ -495,7 +467,7 @@ async function start() {
     console.log(`Tokens: ${TARGET_TOKENS.map(t => t.symbol).join(', ')}`);
     console.log('='.repeat(60));
     console.log('');
-    console.log('📋 TIMELINE:');
+    console.log('TIMELINE:');
     console.log('   - First 24 hours: DRY RUN - Collect spread data');
     console.log('   - Check spreads_log.json for analysis');
     console.log('   - Then set DRY_RUN_MODE = false to start trading');
@@ -504,8 +476,8 @@ async function start() {
     await initializeBlockchain();
     mainLoop().catch(console.error);
     app.listen(PORT, '0.0.0.0', () => {
-        console.log(`✅ Dashboard: http://localhost:${PORT}`);
-        console.log(`✅ Data collection started. Let bot run for 24 hours.`);
+        console.log(`Dashboard: http://localhost:${PORT}`);
+        console.log(`Data collection started. Let bot run for 24 hours.`);
     });
 }
 
