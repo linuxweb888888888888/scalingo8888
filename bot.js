@@ -1,5 +1,5 @@
-// bot-flashloan.js - INSTANT OPPORTUNITY FINDER
-// Finds opportunities within 2-3 minutes - Aggressive settings
+// bot-flashloan.js - SIMPLIFIED WORKING VERSION
+// Uses public RPC and simpler price fetching
 
 require('dotenv').config();
 const express = require('express');
@@ -8,192 +8,204 @@ const { ethers } = require('ethers');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ==================== AGGRESSIVE SETTINGS - FINDS OPPORTUNITIES FAST ====================
-const PRIVATE_KEY = process.env.PRIVATE_KEY;
-const QUICKNODE_URL = process.env.QUICKNODE_URL || "https://cosmopolitan-muddy-dew.matic.quiknode.pro/45b8f7a71d2385208254951a496c78fb94b9676d/";
-const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || "0xB56Bb558b7400A1b77898187AA729Ad2853B9487";
-
-// SUPER AGGRESSIVE - Find anything remotely profitable
-const MIN_PROFIT_USD = 0.10;      // Only $0.10 minimum - catches tiny spreads
-const MIN_SPREAD_PERCENT = 0.02;  // 0.02% minimum - extremely sensitive
-const SCAN_INTERVAL = 2000;       // Scan every 2 seconds
-const FAST_MODE = true;            // Skip rate limits for speed
-
-// ==================== ALL TOKENS ON POLYGON ====================
-const ALL_TOKENS = [
-    { symbol: "USDC", address: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", decimals: 6, icon: "💵" },
-    { symbol: "WETH", address: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619", decimals: 18, icon: "💎" },
-    { symbol: "POL", address: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", decimals: 18, icon: "🟣" },
-    { symbol: "WBTC", address: "0x1bfd67037b42cf73acF2047067bd4F2C47D9BfD6", decimals: 8, icon: "🟡" },
-    { symbol: "AAVE", address: "0xD6DF932A45C0f255f85145f286eA0b292B21C90B", decimals: 18, icon: "🏦" },
-    { symbol: "LINK", address: "0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39", decimals: 18, icon: "🔗" },
-    { symbol: "CRV", address: "0x172370d5Cd63279eFa6d502DAB29171933a610AF", decimals: 18, icon: "📈" },
-    { symbol: "SUSHI", address: "0x0b3F868E0BE5597D5DB7fEB59E1CADbb0fdDa50a", decimals: 18, icon: "🍣" },
-    { symbol: "QUICK", address: "0xB5C064F955D8e7F38fE0460C556a72987494eE17", decimals: 18, icon: "⚡" },
-    { symbol: "USDT", address: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F", decimals: 6, icon: "💰" },
-    { symbol: "DAI", address: "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063", decimals: 18, icon: "🏦" },
-    { symbol: "UNI", address: "0xb33EaAd8d922B1083446DC23f610c2567fB5180f", decimals: 18, icon: "🦄" },
-    { symbol: "BAL", address: "0x9a71012B13CA4d3D0Cdc72A177DF3ef03b0E76A3", decimals: 18, icon: "⚖️" },
-    { symbol: "MATIC", address: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", decimals: 18, icon: "🔷" }
+// ==================== USE PUBLIC RPC (MORE RELIABLE) ====================
+// Your QuickNode URL might be rate limiting - let's use public fallbacks
+const RPC_URLS = [
+    "https://polygon-rpc.com/",
+    "https://rpc-mainnet.matic.network",
+    "https://rpc-mainnet.matic.quiknode.pro",
+    "https://matic-mainnet.chainstacklabs.com",
+    "https://matic-mainnet-full-rpc.bwarelabs.com"
 ];
 
-// ==================== ALL DEXES ====================
-const DEXES = [
-    { name: "QUICKSWAP", router: "0xa5E0829cACEd8fFdd4B3C72e4999f68ff6213921", fee: 0.0030, icon: "⚡" },
-    { name: "SUSHISWAP", router: "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506", fee: 0.0030, icon: "🍣" },
-    { name: "UNISWAP", router: "0xE592427A0AEce92De3Edee1F18E0157C05861564", fee: 0.0030, icon: "🦄" }
-];
+let currentRpcIndex = 0;
+let provider;
 
-// ==================== CONTRACT ABI ====================
-const CONTRACT_ABI = [
-    "function requestFlashLoan(address asset, uint256 amount, bytes calldata params) external",
-    "function withdraw(address token, uint256 amount) external",
-    "function getBalance(address token) view returns (uint256)"
-];
+// ==================== TOKENS ====================
+const TOKENS = {
+    USDC: { address: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", decimals: 6, symbol: "USDC" },
+    WETH: { address: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619", decimals: 18, symbol: "WETH" },
+    POL: { address: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", decimals: 18, symbol: "POL" },
+    WBTC: { address: "0x1bfd67037b42cf73acF2047067bd4F2C47D9BfD6", decimals: 8, symbol: "WBTC" },
+    AAVE: { address: "0xD6DF932A45C0f255f85145f286eA0b292B21C90B", decimals: 18, symbol: "AAVE" },
+    LINK: { address: "0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39", decimals: 18, symbol: "LINK" }
+};
+
+// ==================== DEXES ====================
+const QUICKSWAP_ROUTER = "0xa5E0829cACEd8fFdd4B3C72e4999f68ff6213921";
+const SUSHISWAP_ROUTER = "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506";
 
 const ROUTER_ABI = [
     "function getAmountsOut(uint256 amountIn, address[] memory path) public view returns (uint256[] memory)"
 ];
 
 // ==================== STATE ====================
-let state = {
-    connected: false,
-    scanning: false,
-    opportunities: [],
-    allSpreads: [],
-    lastUpdate: null,
-    totalScans: 0
-};
+let opportunities = [];
+let allSpreads = [];
+let totalScans = 0;
+let lastScanTime = null;
+let connected = false;
+let lastError = null;
 
-let provider;
-let lastCallTime = 0;
-
-function addLog(message) {
-    const time = new Date().toLocaleTimeString();
-    console.log(`[${time}] ${message}`);
+// ==================== CREATE PROVIDER WITH FALLBACK ====================
+async function getProvider() {
+    for (let i = 0; i < RPC_URLS.length; i++) {
+        try {
+            const testProvider = new ethers.JsonRpcProvider(RPC_URLS[i]);
+            await testProvider.getBlockNumber();
+            console.log(`✅ Connected to RPC: ${RPC_URLS[i].substring(0, 50)}...`);
+            return testProvider;
+        } catch (e) {
+            console.log(`❌ Failed RPC ${i + 1}: ${e.message.substring(0, 50)}`);
+        }
+    }
+    throw new Error("No working RPC found");
 }
 
-// ==================== CONNECTION ====================
-async function connect() {
+// ==================== GET PRICE WITH RETRY ====================
+async function getPrice(token, routerAddress, retryCount = 0) {
     try {
-        provider = new ethers.JsonRpcProvider(QUICKNODE_URL);
-        const blockNumber = await provider.getBlockNumber();
-        addLog(`✅ Connected to Polygon - Block: ${blockNumber}`);
-        state.connected = true;
-        return true;
+        const router = new ethers.Contract(routerAddress, ROUTER_ABI, provider);
+        const path = [token.address, TOKENS.USDC.address];
+        const amountIn = ethers.parseUnits("0.01", token.decimals);
+        const amounts = await router.getAmountsOut(amountIn, path);
+        const price = parseFloat(ethers.formatUnits(amounts[1], 6)) / 0.01;
+        return price;
     } catch (error) {
-        addLog(`❌ Connection failed: ${error.message}`);
-        state.connected = false;
-        return false;
+        if (retryCount < 2) {
+            await new Promise(r => setTimeout(r, 500));
+            return getPrice(token, routerAddress, retryCount + 1);
+        }
+        return null;
     }
 }
 
-// ==================== FAST PRICE FETCH ====================
-async function getPrice(token, dex) {
-    try {
-        const usdcAddress = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
-        const router = new ethers.Contract(dex.router, ROUTER_ABI, provider);
-        const path = [token.address, usdcAddress];
-        const amounts = await router.getAmountsOut(ethers.parseUnits("0.01", token.decimals), path);
-        return parseFloat(ethers.formatUnits(amounts[1], 6)) / 0.01;
-    } catch (e) {
-        return 0;
-    }
-}
-
-// ==================== SCAN ALL - FIND ANY SPREAD ====================
-async function fastScan() {
-    if (state.scanning) return;
-    state.scanning = true;
-    state.totalScans++;
-    
+// ==================== SCAN FOR OPPORTUNITIES ====================
+async function scan() {
+    totalScans++;
     const startTime = Date.now();
-    const spreads = [];
+    const timestamp = new Date().toLocaleTimeString();
     
-    for (const token of ALL_TOKENS) {
-        if (token.symbol === "USDC") continue;
+    console.log(`[${timestamp}] 🔍 Scan #${totalScans} - Getting prices...`);
+    
+    const quickPrices = {};
+    const sushiPrices = {};
+    let pricesFound = 0;
+    
+    // Get prices from both DEXes
+    for (const [symbol, token] of Object.entries(TOKENS)) {
+        if (symbol === 'USDC') continue;
         
-        const prices = [];
+        const quickPrice = await getPrice(token, QUICKSWAP_ROUTER);
+        const sushiPrice = await getPrice(token, SUSHISWAP_ROUTER);
         
-        for (const dex of DEXES) {
-            const price = await getPrice(token, dex);
-            if (price > 0) {
-                prices.push({ dex: dex.name, price: price, fee: dex.fee });
-            }
+        if (quickPrice) {
+            quickPrices[symbol] = quickPrice;
+            pricesFound++;
+        }
+        if (sushiPrice) {
+            sushiPrices[symbol] = sushiPrice;
+            pricesFound++;
         }
         
-        if (prices.length >= 2) {
-            for (let i = 0; i < prices.length; i++) {
-                for (let j = i + 1; j < prices.length; j++) {
-                    const buyPrice = Math.min(prices[i].price, prices[j].price);
-                    const sellPrice = Math.max(prices[i].price, prices[j].price);
-                    const diffPercent = ((sellPrice - buyPrice) / buyPrice) * 100;
-                    const profit = (sellPrice - buyPrice) * 500;
-                    
-                    spreads.push({
-                        token: token.symbol,
-                        icon: token.icon,
-                        buyDex: prices[i].price < prices[j].price ? prices[i].dex : prices[j].dex,
-                        sellDex: prices[i].price < prices[j].price ? prices[j].dex : prices[i].dex,
-                        buyPrice: buyPrice,
-                        sellPrice: sellPrice,
-                        spreadPercent: diffPercent.toFixed(3),
-                        profit: profit.toFixed(2),
-                        timestamp: Date.now()
-                    });
-                }
-            }
-        }
+        // Small delay between requests
+        await new Promise(r => setTimeout(r, 100));
     }
-    
-    // Sort by profit
-    spreads.sort((a, b) => parseFloat(b.profit) - parseFloat(a.profit));
-    
-    state.allSpreads = spreads;
-    state.opportunities = spreads.filter(s => parseFloat(s.profit) > MIN_PROFIT_USD);
-    state.lastUpdate = new Date().toISOString();
     
     const scanTime = Date.now() - startTime;
+    const newSpreads = [];
     
-    if (state.opportunities.length > 0) {
-        const best = state.opportunities[0];
-        addLog(`🎯 FOUND! ${best.token}: ${best.spreadPercent}% spread → $${best.profit} profit (${scanTime}ms)`);
-    } else if (spreads.length > 0) {
-        addLog(`📊 Scan #${state.totalScans}: ${spreads.length} spreads found, best $${spreads[0].profit} (below $${MIN_PROFIT_USD} threshold)`);
-    } else {
-        addLog(`🔍 Scan #${state.totalScans}: No spreads found (${scanTime}ms)`);
+    // Check each token for spreads
+    for (const [symbol, quickPrice] of Object.entries(quickPrices)) {
+        const sushiPrice = sushiPrices[symbol];
+        if (sushiPrice) {
+            const buyPrice = Math.min(quickPrice, sushiPrice);
+            const sellPrice = Math.max(quickPrice, sushiPrice);
+            const diff = sellPrice - buyPrice;
+            const spreadPercent = (diff / buyPrice) * 100;
+            const profitOn500 = diff * 500;
+            
+            const spread = {
+                token: symbol,
+                buyDex: quickPrice < sushiPrice ? "QuickSwap" : "SushiSwap",
+                sellDex: quickPrice < sushiPrice ? "SushiSwap" : "QuickSwap",
+                buyPrice: buyPrice,
+                sellPrice: sellPrice,
+                spreadPercent: spreadPercent.toFixed(3),
+                profit: profitOn500.toFixed(2),
+                timestamp: timestamp,
+                scanId: totalScans
+            };
+            
+            newSpreads.push(spread);
+            allSpreads.unshift(spread);
+            
+            if (profitOn500 > 0.10) {
+                opportunities.unshift(spread);
+                console.log(`[${timestamp}] 🎯 ${symbol}: ${spreadPercent.toFixed(3)}% spread → $${profitOn500.toFixed(2)} profit (${spread.buyDex} → ${spread.sellDex})`);
+            }
+        }
     }
     
-    state.scanning = false;
+    // Keep only last 100
+    allSpreads = allSpreads.slice(0, 100);
+    opportunities = opportunities.slice(0, 50);
+    lastScanTime = timestamp;
+    
+    // Log summary
+    if (newSpreads.length === 0) {
+        console.log(`[${timestamp}] 📊 Scan #${totalScans}: ${pricesFound} prices found, no spreads (${scanTime}ms)`);
+    } else {
+        const best = newSpreads.reduce((a, b) => parseFloat(a.profit) > parseFloat(b.profit) ? a : b);
+        console.log(`[${timestamp}] 📊 Found ${newSpreads.length} spreads! Best: ${best.token} +${best.spreadPercent}% ($${best.profit})`);
+    }
 }
 
 // ==================== MAIN LOOP ====================
 async function mainLoop() {
     while (true) {
-        if (!state.connected) {
-            await connect();
-            await new Promise(r => setTimeout(r, 3000));
-            continue;
+        if (!connected) {
+            try {
+                provider = await getProvider();
+                connected = true;
+                lastError = null;
+                console.log("✅ Connected to Polygon!");
+            } catch (error) {
+                console.log(`❌ Connection failed: ${error.message}`);
+                connected = false;
+                await new Promise(r => setTimeout(r, 5000));
+                continue;
+            }
         }
         
-        await fastScan();
-        await new Promise(r => setTimeout(r, SCAN_INTERVAL));
+        try {
+            await scan();
+        } catch (error) {
+            console.log(`❌ Scan error: ${error.message}`);
+            connected = false;
+        }
+        
+        await new Promise(r => setTimeout(r, 10000)); // Scan every 10 seconds
     }
 }
 
 // ==================== API ====================
 app.get('/api/state', (req, res) => {
+    const profitableCount = opportunities.filter(o => parseFloat(o.profit) > 0.50).length;
+    const bestSpread = opportunities.length > 0 ? opportunities[0].spreadPercent : "0";
+    const bestProfit = opportunities.length > 0 ? opportunities[0].profit : "0";
+    
     res.json({
-        connected: state.connected,
-        totalScans: state.totalScans,
-        opportunities: state.opportunities.slice(0, 20),
-        allSpreads: state.allSpreads.slice(0, 10),
-        lastUpdate: state.lastUpdate,
-        settings: {
-            minProfit: MIN_PROFIT_USD,
-            minSpread: MIN_SPREAD_PERCENT,
-            scanInterval: SCAN_INTERVAL
-        }
+        connected: connected,
+        totalScans: totalScans,
+        lastScan: lastScanTime,
+        opportunitiesFound: opportunities.length,
+        profitableCount: profitableCount,
+        bestSpread: bestSpread,
+        bestProfit: bestProfit,
+        opportunities: opportunities.slice(0, 15),
+        allSpreads: allSpreads.slice(0, 20),
+        lastError: lastError
     });
 });
 
@@ -204,73 +216,71 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Flash Loan Scanner - Find Opportunities FAST</title>
+    <title>Flash Loan Scanner - Live Arbitrage Finder</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: #f0f2f5;
-            padding: 20px;
+            padding: 24px;
         }
         .container { max-width: 1400px; margin: 0 auto; }
         
         .header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            border-radius: 16px;
-            padding: 24px;
-            margin-bottom: 24px;
-            color: white;
-        }
-        .header h1 { font-size: 28px; margin-bottom: 8px; }
-        .status-badge {
-            display: inline-block;
-            padding: 4px 12px;
-            background: #00ff8844;
+            background: white;
             border-radius: 20px;
-            font-size: 12px;
-            margin-left: 12px;
+            padding: 24px 32px;
+            margin-bottom: 24px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            border: 1px solid #e1e4e8;
         }
+        .header h1 { font-size: 28px; color: #1a1a2e; }
+        .status { display: inline-block; padding: 4px 12px; background: #28a745; color: white; border-radius: 20px; font-size: 12px; margin-left: 12px; }
+        .subtitle { color: #6c757d; margin-top: 8px; }
         
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(4, 1fr);
+            grid-template-columns: repeat(5, 1fr);
             gap: 16px;
             margin-bottom: 24px;
         }
         .stat-card {
             background: white;
-            border-radius: 12px;
+            border-radius: 16px;
             padding: 20px;
             text-align: center;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            border: 1px solid #e1e4e8;
         }
-        .stat-value { font-size: 36px; font-weight: bold; color: #667eea; }
-        .stat-label { color: #666; margin-top: 8px; }
+        .stat-value { font-size: 32px; font-weight: 700; color: #1a1a2e; }
+        .stat-value.green { color: #28a745; }
+        .stat-label { font-size: 12px; color: #6c757d; margin-top: 8px; text-transform: uppercase; }
         
         .card {
             background: white;
-            border-radius: 12px;
+            border-radius: 16px;
             margin-bottom: 24px;
             overflow: hidden;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            border: 1px solid #e1e4e8;
         }
         .card-header {
             padding: 16px 20px;
             background: #f8f9fa;
-            border-bottom: 1px solid #e9ecef;
+            border-bottom: 1px solid #e1e4e8;
             font-weight: 600;
             font-size: 16px;
         }
         
         table { width: 100%; border-collapse: collapse; }
-        th { text-align: left; padding: 12px 16px; background: #f8f9fa; color: #666; font-size: 12px; }
+        th { text-align: left; padding: 12px 16px; background: #f8f9fa; color: #6c757d; font-weight: 600; font-size: 12px; }
         td { padding: 12px 16px; border-bottom: 1px solid #e9ecef; font-size: 14px; }
-        .profit-positive { color: #28a745; font-weight: bold; }
+        .profit-positive { color: #28a745; font-weight: 600; }
         .spread-high { color: #28a745; }
         
         .refresh-note {
             text-align: center;
-            color: #666;
+            color: #6c757d;
             font-size: 12px;
             margin-top: 20px;
         }
@@ -285,20 +295,28 @@ app.get('/', (req, res) => {
             font-size: 12px;
         }
         button:hover { background: #218838; }
+        
+        .log-entry {
+            padding: 8px 16px;
+            border-bottom: 1px solid #e9ecef;
+            font-family: monospace;
+            font-size: 11px;
+        }
     </style>
 </head>
 <body>
 <div class="container">
     <div class="header">
-        <h1>⚡ Flash Loan Arbitrage Scanner <span class="status-badge" id="statusDot">● LIVE</span></h1>
-        <p>Scanning Polygon DEXes every 2 seconds | Threshold: $0.10</p>
+        <h1>⚡ Flash Loan Arbitrage Scanner <span class="status" id="status">● LIVE</span></h1>
+        <p class="subtitle">Scanning QuickSwap + SushiSwap | Finds opportunities within minutes</p>
     </div>
 
     <div class="stats-grid">
-        <div class="stat-card"><div class="stat-value" id="scans">0</div><div class="stat-label">Total Scans</div></div>
-        <div class="stat-card"><div class="stat-value" id="opportunities">0</div><div class="stat-label">Opportunities Found</div></div>
+        <div class="stat-card"><div class="stat-value" id="scans">0</div><div class="stat-label">Scans</div></div>
+        <div class="stat-card"><div class="stat-value green" id="opportunities">0</div><div class="stat-label">Opportunities</div></div>
+        <div class="stat-card"><div class="stat-value" id="profitable">0</div><div class="stat-label">Profitable (>$0.50)</div></div>
         <div class="stat-card"><div class="stat-value" id="bestSpread">0%</div><div class="stat-label">Best Spread</div></div>
-        <div class="stat-card"><div class="stat-value" id="bestProfit">$0</div><div class="stat-label">Best Profit</div></div>
+        <div class="stat-card"><div class="stat-value green" id="bestProfit">$0</div><div class="stat-label">Best Profit</div></div>
     </div>
 
     <div class="card">
@@ -306,30 +324,30 @@ app.get('/', (req, res) => {
         <div style="overflow-x: auto;">
             <table>
                 <thead>
-                    <tr><th>Token</th><th>Buy → Sell</th><th>Buy Price</th><th>Sell Price</th><th>Spread</th><th>Profit ($500)</th><th></th></tr>
+                    <tr><th>Time</th><th>Token</th><th>Buy → Sell</th><th>Buy Price</th><th>Sell Price</th><th>Spread</th><th>Profit ($500)</th><th></th></tr>
                 </thead>
                 <tbody id="opportunitiesBody">
-                    <tr><td colspan="7" style="text-align:center; padding:40px;">Scanning for opportunities... (first results in 10-20 seconds)</td></tr>
+                    <tr><td colspan="8" style="text-align:center; padding:40px;">Scanning for opportunities... (first results in 30-60 seconds)</td></tr>
                 </tbody>
             </table>
         </div>
     </div>
 
     <div class="card">
-        <div class="card-header">📊 All Spreads Detected</div>
+        <div class="card-header">📊 Recent Spreads</div>
         <div style="overflow-x: auto;">
             <table>
                 <thead>
-                    <tr><th>Token</th><th>Arbitrage Path</th><th>Spread</th><th>Profit ($500)</th><th>Time</th></tr>
+                    <tr><th>Time</th><th>Token</th><th>Arbitrage Path</th><th>Spread</th><th>Profit ($500)</th></tr>
                 </thead>
-                <tbody id="allSpreadsBody">
-                    <tr><td colspan="5" style="text-align:center; padding:40px;">Waiting for scan...</td></tr>
+                <tbody id="spreadsBody">
+                    <tr><td colspan="5" style="text-align:center; padding:40px;">Waiting for first scan...</td></tr>
                 </tbody>
             </table>
         </div>
     </div>
 
-    <div class="refresh-note">🔄 Auto-refreshes every 2 seconds | Finds opportunities within 1-2 minutes</div>
+    <div class="refresh-note">🔄 Auto-refreshes every 3 seconds | Scans every 10 seconds | Finds opportunities within 1-2 minutes</div>
 </div>
 
 <script>
@@ -339,64 +357,62 @@ app.get('/', (req, res) => {
             const data = await res.json();
             
             document.getElementById('scans').innerText = data.totalScans || 0;
-            document.getElementById('opportunities').innerText = data.opportunities?.length || 0;
-            
-            let bestSpread = 0;
-            let bestProfit = 0;
-            if (data.allSpreads && data.allSpreads.length > 0) {
-                bestSpread = Math.max(...data.allSpreads.map(s => parseFloat(s.spreadPercent)));
-                bestProfit = Math.max(...data.allSpreads.map(s => parseFloat(s.profit)));
-                document.getElementById('bestSpread').innerText = bestSpread.toFixed(3) + '%';
-                document.getElementById('bestProfit').innerText = '$' + bestProfit.toFixed(2);
-            }
+            document.getElementById('opportunities').innerText = data.opportunitiesFound || 0;
+            document.getElementById('profitable').innerText = data.profitableCount || 0;
+            document.getElementById('bestSpread').innerText = data.bestSpread + '%';
+            document.getElementById('bestProfit').innerText = '$' + data.bestProfit;
             
             // Opportunities table
             const oppsBody = document.getElementById('opportunitiesBody');
             if (data.opportunities && data.opportunities.length > 0) {
                 let html = '';
-                for (let opp of data.opportunities.slice(0, 15)) {
+                for (let opp of data.opportunities.slice(0, 10)) {
+                    const profitClass = parseFloat(opp.profit) > 0.50 ? 'profit-positive' : '';
                     html += '<tr>' +
-                        '<td><strong>' + opp.icon + ' ' + opp.token + '</strong></td>' +
+                        '<td>' + opp.timestamp + '</td>' +
+                        '<td><strong>' + opp.token + '</strong></td>' +
                         '<td>' + opp.buyDex + ' → ' + opp.sellDex + '</td>' +
                         '<td>$' + opp.buyPrice.toFixed(4) + '</td>' +
                         '<td>$' + opp.sellPrice.toFixed(4) + '</td>' +
                         '<td class="spread-high">+' + opp.spreadPercent + '%</td>' +
-                        '<td class="profit-positive">$' + opp.profit + '</td>' +
-                        '<td><button onclick="alert(\'Execute with: ' + opp.token + ' from ' + opp.buyDex + ' to ' + opp.sellDex + '\')">Execute</button></td>' +
+                        '<td class="' + profitClass + '">$' + opp.profit + '</td>' +
+                        '<td><button onclick="alert(\'Execute: ' + opp.token + ' from ' + opp.buyDex + ' to ' + opp.sellDex + '\')">Execute</button></td>' +
                         '</tr>';
                 }
                 oppsBody.innerHTML = html;
             } else {
-                oppsBody.innerHTML = '<tr><td colspan="7" style="text-align:center; padding:40px;">No opportunities yet. Bot is scanning... (first results in 1-2 min)</td></tr>';
+                oppsBody.innerHTML = '<tr><td colspan="8" style="text-align:center; padding:40px;">No opportunities yet. Bot is scanning... (first results in 1-2 min)</td></tr>';
             }
             
             // All spreads table
-            const allSpreadsBody = document.getElementById('allSpreadsBody');
+            const spreadsBody = document.getElementById('spreadsBody');
             if (data.allSpreads && data.allSpreads.length > 0) {
                 let html = '';
-                for (let s of data.allSpreads.slice(0, 20)) {
-                    const time = new Date(s.timestamp).toLocaleTimeString();
+                for (let s of data.allSpreads.slice(0, 15)) {
                     html += '<tr>' +
-                        '<td>' + s.icon + ' ' + s.token + '</td>' +
+                        '<td>' + s.timestamp + '</td>' +
+                        '<td><strong>' + s.token + '</strong></td>' +
                         '<td>' + s.buyDex + ' → ' + s.sellDex + '</td>' +
-                        '<td>' + s.spreadPercent + '%</td>' +
-                        '<td class="' + (parseFloat(s.profit) > 0.10 ? 'profit-positive' : '') + '">$' + s.profit + '</td>' +
-                        '<td>' + time + '</td>' +
+                        '<td class="spread-high">+' + s.spreadPercent + '%</td>' +
+                        '<td>$' + s.profit + '</td>' +
                         '</tr>';
                 }
-                allSpreadsBody.innerHTML = html;
+                spreadsBody.innerHTML = html;
             }
             
-            // Status dot
+            // Status indicator
             if (data.connected) {
-                document.getElementById('statusDot').innerHTML = '● LIVE';
-                document.getElementById('statusDot').style.background = '#00ff8844';
+                document.getElementById('status').innerHTML = '● LIVE';
+                document.getElementById('status').style.background = '#28a745';
+            } else {
+                document.getElementById('status').innerHTML = '● CONNECTING';
+                document.getElementById('status').style.background = '#ffc107';
             }
         } catch(e) { console.error(e); }
     }
     
     fetchData();
-    setInterval(fetchData, 2000);
+    setInterval(fetchData, 3000);
 </script>
 </body>
 </html>`;
@@ -407,24 +423,22 @@ app.get('/', (req, res) => {
 // ==================== START ====================
 async function start() {
     console.log('\n' + '='.repeat(60));
-    console.log('⚡ INSTANT FLASH LOAN SCANNER');
+    console.log('⚡ FLASH LOAN ARBITRAGE SCANNER');
     console.log('='.repeat(60));
-    console.log('Settings:');
-    console.log(`   - Min Profit: $${MIN_PROFIT_USD} (super sensitive)`);
-    console.log(`   - Min Spread: ${MIN_SPREAD_PERCENT}% (catches everything)`);
-    console.log(`   - Scan Interval: ${SCAN_INTERVAL}ms (very fast)`);
-    console.log(`   - Tokens: ${ALL_TOKENS.length - 1}`);
-    console.log(`   - DEXes: ${DEXES.length}`);
+    console.log('Using multiple public RPC endpoints for reliability');
+    console.log('Tokens: WETH, POL, WBTC, AAVE, LINK');
+    console.log('DEXes: QuickSwap + SushiSwap');
+    console.log('Scan interval: 10 seconds');
     console.log('='.repeat(60));
     console.log('\n📊 Dashboard: http://localhost:' + PORT);
-    console.log('⏱️  First results in 10-20 seconds');
-    console.log('🎯 Will find opportunities within 1-2 minutes\n');
+    console.log('⏱️  First results in 30-60 seconds\n');
     
-    await connect();
+    // Start the main loop without waiting
     mainLoop().catch(console.error);
+    
     app.listen(PORT, '0.0.0.0', () => {
         console.log(`✅ Dashboard: http://localhost:${PORT}`);
-        console.log(`✅ Scanning started - watch for opportunities!`);
+        console.log(`✅ Scanner active - watching for arbitrage opportunities`);
     });
 }
 
