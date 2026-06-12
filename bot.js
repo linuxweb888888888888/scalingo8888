@@ -1,7 +1,7 @@
 /**
  * ⚡ TITAN ARBITRAGE v9.0 - WORKING FLASH LOANS WITH REAL PROFITS ⚡
  * ✅ CONTRACT DEPLOYED: 0x45EA9b7cB6DA33e651Ae7cb71C877cc5C6e42b63
- * ✅ Flash loans will EXECUTE automatically when profitable
+ * ✅ Using dRPC endpoint: https://polygon.drpc.org
  */
 
 const express = require('express');
@@ -13,9 +13,12 @@ const PORT = process.env.PORT || 3000;
 
 // ==================== [ CONFIGURATION ] ====================
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
-// ✅ YOUR NEWLY DEPLOYED CONTRACT
+// ✅ YOUR DEPLOYED CONTRACT
 const CONTRACT_ADDRESS = "0x45EA9b7cB6DA33e651Ae7cb71C877cc5C6e42b63";
 const USDC_ADDR = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+
+// ✅ USING ONLY dRPC ENDPOINT
+const RPC_URL = "https://polygon.drpc.org";
 
 // Financial parameters
 const BORROW_AMOUNT = 10000;      // $10,000 USDC
@@ -26,9 +29,6 @@ const EST_GAS_LIMIT = 500000;      // 500k gas for flash loan
 const MIN_PROFIT_TRIGGER = 50;     // $50 minimum profit to execute
 
 const SCAN_SPEED = 8000; // 8 seconds
-
-// RPC endpoints
-const RPC_URLS = ["https://polygon-rpc.com", "https://1rpc.io/matic", "https://polygon.llamarpc.com"];
 
 // Tokens with real pairs on DEXes
 const TOKENS = [
@@ -53,7 +53,7 @@ const DEX_MAP = {
 // ==================== [ STATE MANAGEMENT ] ====================
 let state = { 
     connected: false, 
-    rpc: "Initializing...", 
+    rpc: RPC_URL,
     walletBal: "0.00", 
     autoTrade: true,
     stats: { 
@@ -77,12 +77,13 @@ let contractDeployed = false;
 // ==================== [ CONNECTION & CONTRACT ] ====================
 async function connect() {
     try {
-        provider = new ethers.JsonRpcProvider(RPC_URLS[0]);
+        // ✅ USING ONLY dRPC ENDPOINT
+        provider = new ethers.JsonRpcProvider(RPC_URL);
         const block = await provider.getBlockNumber();
         state.connected = true;
-        state.rpc = RPC_URLS[0];
         
-        console.log(`✅ Connected to Polygon (Block: ${block})`);
+        console.log(`✅ Connected to dRPC Polygon (Block: ${block})`);
+        console.log(`📍 RPC: ${RPC_URL}`);
         
         if (PRIVATE_KEY && PRIVATE_KEY !== "your_private_key_here") {
             wallet = new ethers.Wallet(PRIVATE_KEY, provider);
@@ -98,7 +99,6 @@ async function connect() {
                 console.log(`✅ Contract found at: ${CONTRACT_ADDRESS}`);
                 contractDeployed = true;
                 
-                // Contract ABI for your deployed contract
                 const CONTRACT_ABI = [
                     "function executeFlashLoan(address token, uint256 amount, address dexA, address dexB, address targetToken) external",
                     "function withdraw(address token) external",
@@ -109,7 +109,6 @@ async function connect() {
                 
                 contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, wallet);
                 
-                // Verify ownership
                 try {
                     const owner = await contract.owner();
                     console.log(`✅ Contract owner: ${owner.substring(0, 10)}...`);
@@ -120,7 +119,6 @@ async function connect() {
                     console.log("⚠️ Could not verify ownership");
                 }
                 
-                // Get total flash loans
                 try {
                     const total = await contract.totalFlashLoans();
                     console.log(`📊 Total Flash Loans Executed: ${total}`);
@@ -128,7 +126,6 @@ async function connect() {
                 
             } else {
                 console.log(`❌ Contract NOT found at ${CONTRACT_ADDRESS}`);
-                console.log(`   You need to deploy the contract first!`);
                 contractDeployed = false;
             }
         } else {
@@ -246,7 +243,6 @@ async function scan() {
             
             opportunities.push(opportunity);
             
-            // ✅ EXECUTE FLASH LOAN IF PROFITABLE AND CONTRACT IS READY
             if (profitCalc.isProfitable && state.autoTrade && contract && contractDeployed) {
                 console.log(`\n🚀 TRIGGERING FLASH LOAN for ${token.s}`);
                 console.log(`   Profit: $${profitCalc.netProfit.toFixed(2)}`);
@@ -259,7 +255,7 @@ async function scan() {
     state.opportunities = opportunities.sort((a, b) => b.netProfit - a.netProfit).slice(0, 15);
 }
 
-// ==================== [ ✅ EXECUTE FLASH LOAN - REAL TRANSACTION ] ====================
+// ==================== [ EXECUTE FLASH LOAN ] ====================
 async function executeFlashLoan(opportunity) {
     if (!contract || !wallet) {
         console.log("❌ Cannot execute: No contract or wallet");
@@ -297,7 +293,6 @@ async function executeFlashLoan(opportunity) {
         console.log(`   Router A (${opportunity.buyDex}): ${dexARouter.substring(0, 15)}...`);
         console.log(`   Router B (${opportunity.sellDex}): ${dexBRouter.substring(0, 15)}...`);
         
-        // ✅ ACTUAL TRANSACTION EXECUTION
         const tx = await contract.executeFlashLoan(
             USDC_ADDR,
             borrowAmount,
@@ -310,7 +305,6 @@ async function executeFlashLoan(opportunity) {
         console.log(`📤 Transaction sent: ${tx.hash}`);
         console.log(`🔗 https://polygonscan.com/tx/${tx.hash}`);
         
-        // Wait for confirmation
         const receipt = await tx.wait();
         
         if (receipt.status === 1) {
@@ -442,7 +436,7 @@ app.get('/', (req, res) => {
             button:hover { background: #2563eb; }
             button.danger { background: #ef4444; }
             button.success { background: #10b981; }
-            .contract-badge { background: #10b98120; border: 1px solid #10b981; padding: 4px 12px; border-radius: 20px; font-size: 11px; }
+            .rpc-badge { background: #3b82f620; border: 1px solid #3b82f6; padding: 4px 12px; border-radius: 20px; font-size: 11px; margin-left: 10px; }
         </style>
     </head>
     <body>
@@ -459,7 +453,8 @@ app.get('/', (req, res) => {
                             <button id="toggleTrade" class="success" style="margin-left: 10px;">🟢 Trading ON</button>
                         </div>
                         <div style="margin-top: 8px;">
-                            <span class="contract-badge" id="contractStatus">📜 Contract: ${CONTRACT_ADDRESS.substring(0, 10)}...</span>
+                            <span class="rpc-badge">🔗 dRPC: polygon.drpc.org</span>
+                            <span class="contract-badge" style="margin-left: 8px;">📜 Contract: ${CONTRACT_ADDRESS.substring(0, 10)}...</span>
                         </div>
                     </div>
                 </div>
@@ -591,11 +586,12 @@ async function start() {
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║     ⚡ TITAN ARBITRAGE v9.0 - FLASH LOAN READY ⚡                            ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  Contract:       ${CONTRACT_ADDRESS}
-║  Dashboard:      http://localhost:${PORT}
-║  Borrow Amount:  $${BORROW_AMOUNT} USDC
-║  Min Profit:     $${MIN_PROFIT_TRIGGER}
-║  Auto Trade:     ${state.autoTrade ? '✅ ENABLED' : '❌ DISABLED'}
+║  RPC:          https://polygon.drpc.org
+║  Contract:     ${CONTRACT_ADDRESS}
+║  Dashboard:    http://localhost:${PORT}
+║  Borrow:       $${BORROW_AMOUNT} USDC
+║  Min Profit:   $${MIN_PROFIT_TRIGGER}
+║  Auto Trade:   ${state.autoTrade ? '✅ ENABLED' : '❌ DISABLED'}
 ╚══════════════════════════════════════════════════════════════════════════════╝
     `);
     
@@ -604,6 +600,7 @@ async function start() {
     
     app.listen(PORT, '0.0.0.0', () => {
         console.log(`\n✅ Dashboard: http://localhost:${PORT}`);
+        console.log(`✅ Using dRPC endpoint: ${RPC_URL}`);
         console.log(`✅ Scanning for arbitrage opportunities...\n`);
     });
 }
