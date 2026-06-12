@@ -231,8 +231,11 @@ async function getDexScreenerPrices(tokenAddress) {
             const dexPrices = {};
             pairs.forEach(pair => {
                 const dexId = pair.dexId;
-                if (!dexPrices[dexId] || parseFloat(pair.priceUsd) > dexPrices[dexId]) {
-                    dexPrices[dexId] = parseFloat(pair.priceUsd);
+                // ONLY add DEXes that exist in our DEX_MAP
+                if (DEX_MAP[dexId]) {
+                    if (!dexPrices[dexId] || parseFloat(pair.priceUsd) > dexPrices[dexId]) {
+                        dexPrices[dexId] = parseFloat(pair.priceUsd);
+                    }
                 }
             });
             
@@ -546,7 +549,7 @@ app.get('/', (req, res) => {
             <div class="table-container">
                 <h3 style="margin-bottom: 16px;">🔥 LIVE ARBITRAGE OPPORTUNITIES</h3>
                 <table id="opportunitiesTable">
-                    <thead><tr><th>Token</th><th>Buy → Sell</th><th>Spread</th><th>Gross Profit</th><th>Costs</th><th>NET PROFIT</th><th>ROI</th><th>Trigger</th></tr></thead>
+                    <thead><tr><th>Token</th><th>Buy → Sell</th><th>Spread</th><th>Gross Profit</th><th>Costs</th><th>NET PROFIT</th><th>ROI</th><th>Trigger</th><tr></thead>
                     <tbody id="opportunitiesBody"></tbody>
                 </table>
             </div>
