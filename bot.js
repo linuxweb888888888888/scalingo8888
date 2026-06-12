@@ -99,6 +99,7 @@ let state = {
 
 let provider, wallet, contract;
 let contractDeployed = false;
+let pendingNonces = new Map();
 
 // ==================== [ RPC MANAGEMENT ] ====================
 async function switchRpc() {
@@ -231,7 +232,6 @@ async function getDexScreenerPrices(tokenAddress) {
             const dexPrices = {};
             pairs.forEach(pair => {
                 const dexId = pair.dexId;
-                // ONLY add DEXes that exist in our DEX_MAP
                 if (DEX_MAP[dexId]) {
                     if (!dexPrices[dexId] || parseFloat(pair.priceUsd) > dexPrices[dexId]) {
                         dexPrices[dexId] = parseFloat(pair.priceUsd);
@@ -313,8 +313,8 @@ async function scan() {
     state.opportunities = opportunities.sort((a, b) => b.netProfit - a.netProfit).slice(0, 15);
 }
 
-// ==================== [ EXECUTE FLASH LOAN ] ====================
-async function executeFlashLoan(opportunity) {
+// ==================== [ EXECUTE FLASH LOAN - WITH FEE BUMPING ] ====================
+async function executeFlashLoan(opportunity, retryCount = 0) {
     if (!contract || !wallet) {
         console.log("❌ Cannot execute: No contract or wallet");
         return;
@@ -337,6 +337,7 @@ async function executeFlashLoan(opportunity) {
     console.log(`   Buy: ${opportunity.buyDex} @ $${opportunity.buyPrice.toFixed(4)}`);
     console.log(`   Sell: ${opportunity.sellDex} @ $${opportunity.sellPrice.toFixed(4)}`);
     console.log(`   Expected Profit: $${opportunity.netProfit.toFixed(2)}`);
+    console.log(`   Retry attempt: ${retryCount}`);
     
     try {
         const borrowAmount = ethers.parseUnits(BORROW_AMOUNT.toString(), 6);
@@ -347,15 +348,33 @@ async function executeFlashLoan(opportunity) {
             throw new Error(`DEX router not found: ${opportunity.buyDex} or ${opportunity.sellDex}`);
         }
         
-        console.log(`   Borrow Amount: ${BORROW_AMOUNT} USDC`);
-        console.log(`   Router A (${opportunity.buyDex}): ${dexARouter.substring(0, 15)}...`);
-        console.log(`   Router B (${opportunity.sellDex}): ${dexBRouter.substring(0, 15)}...`);
+        // Get current gas prices
+        const feeData = await provider.getFeeData();
+        const baseMaxFeePerGas = feeData.maxFeePerGas || ethers.parseUnits("100", "gwei");
+        const baseMaxPriorityFeePerGas = feeData.maxPriorityFeePerGas || ethers.parseUnits("30", "gwei");
+        
+        // Bump fees on retry (increase by 50% each retry)
+        const bumpMultiplier = 1 + (retryCount * 0.5);
+        const maxFeePerGas = (baseMaxFeePerGas * BigInt(Math.floor(bumpMultiplier * 100))) / 100n;
+        const maxPriorityFeePerGas = (baseMaxPriorityFeePerGas * BigInt(Math.floor(bumpMultiplier * 100))) / 100n;
+        
+        console.log(`   Max Fee: ${ethers.formatUnits(maxFeePerGas, "gwei")} Gwei`);
+        console.log(`   Priority Fee: ${ethers.formatUnits(maxPriorityFeePerGas, "gwei")} Gwei`);
         
         // Get the current nonce for the transaction
-        const nonce = await provider.getTransactionCount(wallet.address, 'latest');
+        let nonce = await provider.getTransactionCount(wallet.address, 'pending');
+        
+        // Check if we have a pending transaction with this nonce
+        if (pendingNonces.has(nonce)) {
+            console.log(`   Nonce ${nonce} already in use, waiting...`);
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            nonce = await provider.getTransactionCount(wallet.address, 'latest');
+        }
+        
+        pendingNonces.set(nonce, Date.now());
         console.log(`   Nonce: ${nonce}`);
         
-        // Prepare transaction with explicit nonce
+        // Prepare transaction with explicit nonce and bumped fees
         const tx = await contract.executeFlashLoan(
             USDC_ADDR,
             borrowAmount,
@@ -365,8 +384,9 @@ async function executeFlashLoan(opportunity) {
             { 
                 gasLimit: EST_GAS_LIMIT,
                 nonce: nonce,
-                maxFeePerGas: ethers.parseUnits("200", "gwei"),
-                maxPriorityFeePerGas: ethers.parseUnits("30", "gwei")
+                maxFeePerGas: maxFeePerGas,
+                maxPriorityFeePerGas: maxPriorityFeePerGas,
+                type: 2  // EIP-1559 transaction
             }
         );
         
@@ -378,6 +398,8 @@ async function executeFlashLoan(opportunity) {
             tx.wait(),
             new Promise((_, reject) => setTimeout(() => reject(new Error("Transaction timeout")), 60000))
         ]);
+        
+        pendingNonces.delete(nonce);
         
         if (receipt && receipt.status === 1) {
             const executionTime = Date.now() - startTime;
@@ -403,7 +425,8 @@ async function executeFlashLoan(opportunity) {
                 executionTime: executionTime,
                 timestamp: new Date().toISOString(),
                 status: "✅ SUCCESS",
-                txHash: tx.hash
+                txHash: tx.hash,
+                retryCount: retryCount
             });
             
             state.logs.unshift({
@@ -415,19 +438,39 @@ async function executeFlashLoan(opportunity) {
             console.log(`   Net Profit: $${opportunity.netProfit.toFixed(2)}`);
             console.log(`   Gas Used: ${receipt.gasUsed.toString()}`);
             console.log(`   Time: ${executionTime}ms`);
+            console.log(`   Retries: ${retryCount}`);
             
         } else {
             throw new Error("Transaction reverted or timeout");
         }
         
     } catch(e) {
+        pendingNonces.delete(await provider.getTransactionCount(wallet.address, 'pending'));
+        
+        // Handle "replacement fee too low" error by retrying with higher fees
+        if (e.message.includes("replacement fee too low") && retryCount < 3) {
+            console.log(`⚠️ Replacement fee too low, retrying with higher fees (attempt ${retryCount + 1}/3)...`);
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            await executeFlashLoan(opportunity, retryCount + 1);
+            return;
+        }
+        
+        // Handle nonce errors
+        if (e.message.includes("nonce") && retryCount < 3) {
+            console.log(`⚠️ Nonce error, retrying (attempt ${retryCount + 1}/3)...`);
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            await executeFlashLoan(opportunity, retryCount + 1);
+            return;
+        }
+        
         state.stats.failedTrades++;
         state.tradeHistory.unshift({
             id: Date.now(),
             token: opportunity.token,
             error: e.message,
             timestamp: new Date().toISOString(),
-            status: "❌ FAILED"
+            status: "❌ FAILED",
+            retryCount: retryCount
         });
         
         state.logs.unshift({
@@ -549,7 +592,7 @@ app.get('/', (req, res) => {
             <div class="table-container">
                 <h3 style="margin-bottom: 16px;">🔥 LIVE ARBITRAGE OPPORTUNITIES</h3>
                 <table id="opportunitiesTable">
-                    <thead><tr><th>Token</th><th>Buy → Sell</th><th>Spread</th><th>Gross Profit</th><th>Costs</th><th>NET PROFIT</th><th>ROI</th><th>Trigger</th><tr></thead>
+                    <thead><tr><th>Token</th><th>Buy → Sell</th><th>Spread</th><th>Gross Profit</th><th>Costs</th><th>NET PROFIT</th><th>ROI</th><th>Trigger</th></tr></thead>
                     <tbody id="opportunitiesBody"></tbody>
                 </table>
             </div>
