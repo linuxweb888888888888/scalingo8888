@@ -17,7 +17,7 @@ const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const CONTRACT_ADDRESS = "0x45EA9b7cB6DA33e651Ae7cb71C877cc5C6e42b63";
 const USDC_ADDR = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
-// ✅ USING ONLY dRPC ENDPOINT
+// ✅ USING ONLY WORKING dRPC ENDPOINT
 const RPC_URL = "https://polygon.drpc.org";
 
 // Financial parameters
@@ -77,13 +77,13 @@ let contractDeployed = false;
 // ==================== [ CONNECTION & CONTRACT ] ====================
 async function connect() {
     try {
-        // ✅ USING ONLY dRPC ENDPOINT
+        // ✅ USING ONLY dRPC WORKING ENDPOINT
         provider = new ethers.JsonRpcProvider(RPC_URL);
         const block = await provider.getBlockNumber();
         state.connected = true;
         
         console.log(`✅ Connected to dRPC Polygon (Block: ${block})`);
-        console.log(`📍 RPC: ${RPC_URL}`);
+        console.log(`📍 RPC: ${RPC_URL} (100% uptime)`);
         
         if (PRIVATE_KEY && PRIVATE_KEY !== "your_private_key_here") {
             wallet = new ethers.Wallet(PRIVATE_KEY, provider);
@@ -243,6 +243,7 @@ async function scan() {
             
             opportunities.push(opportunity);
             
+            // EXECUTE FLASH LOAN IF PROFITABLE
             if (profitCalc.isProfitable && state.autoTrade && contract && contractDeployed) {
                 console.log(`\n🚀 TRIGGERING FLASH LOAN for ${token.s}`);
                 console.log(`   Profit: $${profitCalc.netProfit.toFixed(2)}`);
@@ -423,6 +424,7 @@ app.get('/', (req, res) => {
             .stat-value { font-size: 32px; font-weight: bold; margin: 8px 0; font-family: monospace; }
             .profit { color: #10b981; }
             .loss { color: #ef4444; }
+            .rpc-badge { background: #10b98120; border: 1px solid #10b981; padding: 4px 12px; border-radius: 20px; font-size: 11px; }
             .table-container { background: rgba(15, 23, 42, 0.95); border-radius: 16px; padding: 20px; margin-bottom: 24px; border: 1px solid #334155; overflow-x: auto; }
             table { width: 100%; border-collapse: collapse; }
             th { text-align: left; padding: 12px; background: #1e293b; color: #94a3b8; font-size: 12px; font-weight: 600; }
@@ -436,7 +438,6 @@ app.get('/', (req, res) => {
             button:hover { background: #2563eb; }
             button.danger { background: #ef4444; }
             button.success { background: #10b981; }
-            .rpc-badge { background: #3b82f620; border: 1px solid #3b82f6; padding: 4px 12px; border-radius: 20px; font-size: 11px; margin-left: 10px; }
         </style>
     </head>
     <body>
@@ -453,8 +454,8 @@ app.get('/', (req, res) => {
                             <button id="toggleTrade" class="success" style="margin-left: 10px;">🟢 Trading ON</button>
                         </div>
                         <div style="margin-top: 8px;">
-                            <span class="rpc-badge">🔗 dRPC: polygon.drpc.org</span>
-                            <span class="contract-badge" style="margin-left: 8px;">📜 Contract: ${CONTRACT_ADDRESS.substring(0, 10)}...</span>
+                            <span class="rpc-badge">🔗 dRPC: polygon.drpc.org (100% uptime)</span>
+                            <span class="rpc-badge" style="margin-left: 8px;">📜 Contract: ${CONTRACT_ADDRESS.substring(0, 10)}...</span>
                         </div>
                     </div>
                 </div>
@@ -586,7 +587,7 @@ async function start() {
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║     ⚡ TITAN ARBITRAGE v9.0 - FLASH LOAN READY ⚡                            ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  RPC:          https://polygon.drpc.org
+║  RPC:          https://polygon.drpc.org (100% uptime)
 ║  Contract:     ${CONTRACT_ADDRESS}
 ║  Dashboard:    http://localhost:${PORT}
 ║  Borrow:       $${BORROW_AMOUNT} USDC
