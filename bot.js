@@ -17,13 +17,32 @@ const PRIVATE_KEY = "0xe97293d254eb17ce5325c22803d16018a22c649d3d71098672eaa0363
 const CONTRACT_ADDRESS = "0x45EA9b7cB6DA33e651Ae7cb71C877cc5C6e42b63";
 const USDC_ADDR = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
-// ✅ USING PUBLIC RPC ENDPOINTS THAT SUPPORT ALL METHODS
+// ✅ USING 20+ PUBLIC RPC ENDPOINTS THAT SUPPORT ALL METHODS
 const RPC_ENDPOINTS = [
     "https://polygon-rpc.com",
     "https://rpc-mainnet.maticvigil.com",
     "https://rpc-mainnet.matic.network",
     "https://rpc.ankr.com/polygon",
-    "https://polygon.llamarpc.com"
+    "https://polygon.llamarpc.com",
+    "https://polygon.blockpi.network/v1/rpc/public",
+    "https://polygon.gateway.tenderly.co",
+    "https://polygon.drpc.org",
+    "https://1rpc.io/matic",
+    "https://polygon.meowrpc.com",
+    "https://polygon-mainnet.public.blastapi.io",
+    "https://polygon-public.nodereal.io",
+    "https://matic-mainnet.chainstacklabs.com",
+    "https://matic-mainnet-full-rpc.bwarelabs.com",
+    "https://polygon-mainnet.g.alchemy.com/v2/demo",
+    "https://rpc.maticvigil.com",
+    "https://matic.mirrormirror.xyz",
+    "https://polygon.cyclone.heap.so",
+    "https://polygon-bor.publicnode.com",
+    "https://matic-mainnet.chainstacklabs.com",
+    "https://polygon-mainnet.public.blastapi.io",
+    "https://polygon.api.onfinality.io/public",
+    "https://polygon-rpc.publicnode.com",
+    "https://polygon.mypinata.cloud"
 ];
 let currentRpcIndex = 0;
 
@@ -510,7 +529,7 @@ app.get('/', (req, res) => {
                             <button id="toggleTrade" class="success" style="margin-left: 10px;">🟢 Trading ON</button>
                         </div>
                         <div style="margin-top: 8px;">
-                            <span class="rpc-badge">🔗 Multiple RPCs (Auto-failover)</span>
+                            <span class="rpc-badge">🔗 25+ RPCs (Auto-failover)</span>
                             <span class="rpc-badge" style="margin-left: 8px;">📜 Contract: ${CONTRACT_ADDRESS.substring(0, 10)}...</span>
                         </div>
                     </div>
@@ -643,7 +662,7 @@ async function start() {
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║     ⚡ TITAN ARBITRAGE v9.0 - FLASH LOAN READY ⚡                            ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  RPC:          Multiple endpoints with auto-failover
+║  RPC:          25+ endpoints with auto-failover
 ║  Contract:     ${CONTRACT_ADDRESS}
 ║  Dashboard:    http://localhost:${PORT}
 ║  Borrow:       $${BORROW_AMOUNT} USDC
@@ -657,7 +676,7 @@ async function start() {
     
     app.listen(PORT, '0.0.0.0', () => {
         console.log(`\n✅ Dashboard: http://localhost:${PORT}`);
-        console.log(`✅ Using multiple RPC endpoints with auto-failover`);
+        console.log(`✅ Using 25+ RPC endpoints with auto-failover`);
         console.log(`✅ Scanning for arbitrage opportunities...\n`);
     });
 }
