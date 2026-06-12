@@ -80,11 +80,11 @@ const DEXES = [
 
 // ==================== TRIANGULAR ARBITRAGE PATHS ====================
 const TRIANGULAR_PATHS = [
-    { name: "USDC → POL → CAKE → USDC", path: ["USDC", "POL", "CAKE", "USDC"], minProfit: 0.50 },
-    { name: "USDC → WETH → CAKE → USDC", path: ["USDC", "WETH", "CAKE", "USDC"], minProfit: 0.50 },
-    { name: "USDC → POL → WETH → USDC", path: ["USDC", "POL", "WETH", "USDC"], minProfit: 0.50 },
-    { name: "USDC → WETH → WBTC → USDC", path: ["USDC", "WETH", "WBTC", "USDC"], minProfit: 0.75 },
-    { name: "USDC → CAKE → QUICK → USDC", path: ["USDC", "CAKE", "QUICK", "USDC"], minProfit: 0.40 }
+    { name: "USDC -> POL -> CAKE -> USDC", path: ["USDC", "POL", "CAKE", "USDC"], minProfit: 0.50 },
+    { name: "USDC -> WETH -> CAKE -> USDC", path: ["USDC", "WETH", "CAKE", "USDC"], minProfit: 0.50 },
+    { name: "USDC -> POL -> WETH -> USDC", path: ["USDC", "POL", "WETH", "USDC"], minProfit: 0.50 },
+    { name: "USDC -> WETH -> WBTC -> USDC", path: ["USDC", "WETH", "WBTC", "USDC"], minProfit: 0.75 },
+    { name: "USDC -> CAKE -> QUICK -> USDC", path: ["USDC", "CAKE", "QUICK", "USDC"], minProfit: 0.40 }
 ];
 
 // ==================== CONTRACT ABI ====================
@@ -155,7 +155,7 @@ async function initializeBlockchain() {
         provider = new ethers.JsonRpcProvider(QUICKNODE_URL);
         await rateLimit();
         const blockNumber = await provider.getBlockNumber();
-        addLog(`✅ Connected to Polygon (Block: ${blockNumber.toLocaleString()})`, 'success');
+        addLog(`Connected to Polygon (Block: ${blockNumber.toLocaleString()})`, 'success');
         
         if (PRIVATE_KEY && PRIVATE_KEY !== 'your_private_key_here') {
             wallet = new ethers.Wallet(PRIVATE_KEY, provider);
@@ -169,19 +169,19 @@ async function initializeBlockchain() {
             await rateLimit();
             const code = await provider.getCode(CONTRACT_ADDRESS);
             if (code !== '0x') {
-                addLog(`✅ Flash Loan Contract: ${CONTRACT_ADDRESS.substring(0, 20)}...`, 'success');
+                addLog(`Flash Loan Contract: ${CONTRACT_ADDRESS.substring(0, 20)}...`, 'success');
             }
             
-            addLog(`📍 Wallet: ${wallet.address.substring(0, 10)}...`, 'info');
-            addLog(`💰 Balance: ${state.wallet.pol.toFixed(4)} POL (~$${state.wallet.usd.toFixed(2)})`, 'info');
+            addLog(`Wallet: ${wallet.address.substring(0, 10)}...`, 'info');
+            addLog(`Balance: ${state.wallet.pol.toFixed(4)} POL (~$${state.wallet.usd.toFixed(2)})`, 'info');
         } else {
-            addLog(`⚠️ Scan-only mode (no private key)`, 'warning');
+            addLog(`Scan-only mode (no private key)`, 'warning');
         }
         
         state.connected = true;
         return true;
     } catch (error) {
-        addLog(`❌ Connection failed: ${error.message}`, 'error');
+        addLog(`Connection failed: ${error.message}`, 'error');
         state.connected = false;
         return false;
     }
@@ -220,7 +220,7 @@ async function scanAllTokensWithDebug() {
     const allPriceData = [];
     const spreads = [];
     
-    addLog(`🔍 DEBUG SCAN: ${tokensToScan.length} tokens × ${DEXES.length} DEXes = ${tokensToScan.length * DEXES.length} price checks`, 'info');
+    addLog(`DEBUG SCAN: ${tokensToScan.length} tokens x ${DEXES.length} DEXes`, 'info');
     
     // Collect all prices
     for (const token of tokensToScan) {
@@ -256,8 +256,7 @@ async function scanAllTokensWithDebug() {
                     const percentDiff = (priceDiff / Math.min(prices[i].price, prices[j].price)) * 100;
                     const totalFees = (prices[i].fee + prices[j].fee) * 100;
                     const netSpread = percentDiff - totalFees;
-                    const profitOn100 = priceDiff * 100;
-                    const profitAfterFees = profitOn100 * (1 - (prices[i].fee + prices[j].fee));
+                    const profitAfterFees = priceDiff * 100 * (1 - (prices[i].fee + prices[j].fee));
                     
                     const spreadData = {
                         token: token,
@@ -270,7 +269,7 @@ async function scanAllTokensWithDebug() {
                         sellPrice: Math.max(prices[i].price, prices[j].price),
                         rawSpreadPercent: percentDiff.toFixed(3),
                         netSpreadPercent: netSpread.toFixed(3),
-                        totalFees: (totalFees).toFixed(2),
+                        totalFees: totalFees.toFixed(2),
                         profitOn100USD: profitAfterFees.toFixed(2),
                         isProfitable: netSpread > 0.08 && profitAfterFees > 0.30
                     };
@@ -318,13 +317,13 @@ async function scanAllTokensWithDebug() {
     
     // Log debug summary
     if (spreads.length > 0) {
-        addLog(`📊 DEBUG: Found ${spreads.length} spreads, ${opportunities.length} profitable (net >0.08%)`, 'info');
+        addLog(`DEBUG: Found ${spreads.length} spreads, ${opportunities.length} profitable`, 'info');
         const bestSpread = spreads[0];
         if (bestSpread) {
-            addLog(`   🏆 BEST: ${bestSpread.token} | ${bestSpread.buyDex}($${bestSpread.buyPrice}) → ${bestSpread.sellDex}($${bestSpread.sellPrice}) | ${bestSpread.netSpreadPercent}% net | $${bestSpread.profitOn100USD} profit`, 'opportunity');
+            addLog(`BEST: ${bestSpread.token} | ${bestSpread.buyDex} -> ${bestSpread.sellDex} | ${bestSpread.netSpreadPercent}% net | $${bestSpread.profitOn100USD} profit`, 'opportunity');
         }
     } else {
-        addLog(`📊 DEBUG: No spreads found in this scan`, 'info');
+        addLog(`DEBUG: No spreads found in this scan`, 'info');
     }
     
     return { opportunities, spreads, allPriceData };
@@ -359,15 +358,15 @@ function calculateDexPerformance(priceData) {
 // ==================== EXECUTION ====================
 async function executeFlashLoanArbitrage(opportunity) {
     if (!wallet || !flashLoanContract) {
-        addLog(`❌ Cannot execute: No wallet/contract`, 'error');
+        addLog(`Cannot execute: No wallet/contract`, 'error');
         return false;
     }
     
     state.stats.totalAttempts++;
     
-    addLog(`💸 EXECUTING: ${opportunity.icon} ${opportunity.token}`, 'opportunity');
-    addLog(`   Route: ${opportunity.buyDex} → ${opportunity.sellDex}`, 'info');
-    addLog(`   Est. Profit: $${opportunity.estimatedProfit} (${opportunity.netDiff}% net)`, 'info');
+    addLog(`EXECUTING: ${opportunity.icon} ${opportunity.token}`, 'opportunity');
+    addLog(`Route: ${opportunity.buyDex} -> ${opportunity.sellDex}`, 'info');
+    addLog(`Est. Profit: $${opportunity.estimatedProfit} (${opportunity.netDiff}% net)`, 'info');
     
     try {
         const asset = ALL_TOKENS.find(t => t.symbol === "USDC").address;
@@ -381,9 +380,9 @@ async function executeFlashLoanArbitrage(opportunity) {
         
         const flashParams = { path, dex1, dex2, amountIn, minProfit, profitRecipient };
         
-        addLog(`📝 Requesting flash loan...`, 'info');
+        addLog(`Requesting flash loan...`, 'info');
         const tx = await flashLoanContract.requestFlashLoan(asset, amount, flashParams, { gasLimit: 2000000 });
-        addLog(`📤 TX: ${tx.hash}`, 'info');
+        addLog(`TX: ${tx.hash}`, 'info');
         
         const receipt = await tx.wait();
         
@@ -396,7 +395,7 @@ async function executeFlashLoanArbitrage(opportunity) {
             state.stats.totalGasPaidUSD += gasUsed;
             state.stats.totalFlashLoans++;
             
-            addLog(`✅ SUCCESS! Profit: +$${profit.toFixed(2)}`, 'success');
+            addLog(`SUCCESS! Profit: +$${profit.toFixed(2)}`, 'success');
             
             state.tradeHistory.unshift({
                 id: Date.now(),
@@ -415,15 +414,15 @@ async function executeFlashLoanArbitrage(opportunity) {
         
     } catch (error) {
         state.stats.failedTrades++;
-        addLog(`❌ FAILED: ${error.message.substring(0, 100)}`, 'error');
+        addLog(`FAILED: ${error.message.substring(0, 100)}`, 'error');
         return false;
     }
 }
 
 // ==================== MAIN LOOP ====================
 async function mainLoop() {
-    addLog('🔥 FLASH LOAN ARBITRAGE BOT WITH DEBUG DASHBOARD STARTED', 'success');
-    addLog(`🔍 Debug mode: Showing real-time spreads across ${DEXES.length} DEXes`, 'info');
+    addLog('FLASH LOAN ARBITRAGE BOT WITH DEBUG DASHBOARD STARTED', 'success');
+    addLog(`Debug mode: Showing real-time spreads across ${DEXES.length} DEXes`, 'info');
     
     while (state.isRunning) {
         if (!state.connected) {
@@ -440,7 +439,7 @@ async function mainLoop() {
         } else {
             state.session.totalScans++;
             if (state.session.totalScans % 3 === 0) {
-                addLog(`🔍 Scan #${state.session.totalScans} complete. Found ${spreads.length} spreads, ${opportunities.length} profitable.`, 'info');
+                addLog(`Scan #${state.session.totalScans} complete. Found ${spreads.length} spreads, ${opportunities.length} profitable.`, 'info');
             }
             await new Promise(r => setTimeout(r, 10000));
         }
@@ -522,7 +521,7 @@ app.post('/api/reset', (req, res) => {
     state.stats.successfulTrades = 0;
     state.stats.failedTrades = 0;
     state.tradeHistory = [];
-    addLog('📊 Stats reset', 'info');
+    addLog('Stats reset', 'info');
     res.json({ status: 'reset' });
 });
 
@@ -530,224 +529,221 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', connected: state.connected });
 });
 
-// ==================== DEBUG DASHBOARD ====================
+// ==================== DEBUG DASHBOARD (FIXED - NO NESTED TEMPLATE ISSUES) ====================
 app.get('/', (req, res) => {
-    res.send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Flash Loan Arbitrage Bot | Debug Dashboard</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Inter', sans-serif; background: #0f0f1a; color: #e0e0e0; padding: 20px; }
-        .container { max-width: 1600px; margin: 0 auto; }
-        .header { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); border-radius: 16px; padding: 24px; margin-bottom: 24px; }
-        .header h1 { font-size: 28px; margin-bottom: 8px; }
-        .badge { display: inline-block; padding: 4px 12px; background: #00ff8844; border-radius: 20px; font-size: 12px; color: #00ff88; margin-left: 12px; }
-        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
-        .stat-card { background: #1a1a2e; border-radius: 12px; padding: 16px; border: 1px solid #2a2a3e; }
-        .stat-label { font-size: 11px; color: #888; text-transform: uppercase; margin-bottom: 8px; }
-        .stat-value { font-size: 24px; font-weight: 700; }
-        .positive { color: #00ff88; }
-        .section { background: #1a1a2e; border-radius: 12px; margin-bottom: 24px; overflow: hidden; }
-        .section-header { padding: 16px 20px; background: #0f0f1a; border-bottom: 1px solid #2a2a3e; font-weight: 600; font-size: 16px; }
-        .spread-table, .price-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        .spread-table th, .price-table th { text-align: left; padding: 12px 16px; background: #0f0f1a; color: #888; font-weight: 500; }
-        .spread-table td, .price-table td { padding: 10px 16px; border-bottom: 1px solid #2a2a3e; }
-        .profitable { background: #00ff8810; border-left: 3px solid #00ff88; }
-        .token-icon { font-size: 16px; margin-right: 6px; }
-        .dex-badge { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; background: #2a2a3e; border-radius: 8px; font-size: 11px; }
-        .profit-cell { color: #00ff88; font-weight: 600; }
-        .logs-container { max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 11px; }
-        .log-entry { padding: 8px 16px; border-bottom: 1px solid #2a2a3e; }
-        .log-time { color: #666; margin-right: 12px; }
-        .refresh-btn { padding: 8px 16px; background: #3b82f6; border: none; border-radius: 8px; color: white; cursor: pointer; font-weight: 500; margin-bottom: 16px; }
-        .two-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; }
-        .auto-refresh { font-size: 12px; color: #888; margin-top: 8px; }
-    </style>
-</head>
-<body>
-<div class="container">
-    <div class="header">
-        <h1>🔍 Flash Loan Arbitrage Bot <span class="badge">DEBUG MODE</span></h1>
-        <p>Real-time spread detection | Multi-DEX price comparison | PancakeSwap + QuickSwap + SushiSwap</p>
-        <div class="auto-refresh">🔄 Auto-refreshing every 3 seconds</div>
-    </div>
-
-    <div class="stats-grid">
-        <div class="stat-card"><div class="stat-label">💰 TOTAL PROFIT</div><div class="stat-value positive" id="totalProfit">$0.00</div></div>
-        <div class="stat-card"><div class="stat-label">📊 SUCCESS RATE</div><div class="stat-value" id="successRate">0%</div></div>
-        <div class="stat-card"><div class="stat-label">🔍 SPREADS FOUND</div><div class="stat-value" id="spreadsFound">0</div></div>
-        <div class="stat-card"><div class="stat-label">💸 FLASH LOANS</div><div class="stat-value" id="flashLoans">0</div></div>
-    </div>
-
-    <div class="section">
-        <div class="section-header">🏆 TOP SPREADS (Most Profitable Arbitrage Opportunities)</div>
-        <table class="spread-table">
-            <thead>
-                <tr><th>Token</th><th>Buy → Sell</th><th>Buy Price</th><th>Sell Price</th><th>Raw Spread</th><th>Net (after fees)</th><th>Profit on $100</th><th>Status</th></tr>
-            </thead>
-            <tbody id="spreadsBody">
-                <tr><td colspan="8" style="text-align:center; padding:40px;">Scanning for spreads...</td></tr>
-            </tbody>
-        </table>
-    </div>
-
-    <div class="two-columns">
-        <div class="section">
-            <div class="section-header">💰 Current Prices Across DEXes</div>
-            <table class="price-table">
-                <thead><tr><th>Token</th><th>🥞 PancakeSwap</th><th>⚡ QuickSwap</th><th>🍣 SushiSwap</th></tr></thead>
-                <tbody id="pricesBody">
-                    <tr><td colspan="4" style="text-align:center; padding:40px;">Loading prices...</td></tr>
-                </tbody>
-            </table>
-        </div>
-        <div class="section">
-            <div class="section-header">📝 Live Activity Logs</div>
-            <div class="logs-container" id="logsContainer">Initializing...</div>
-        </div>
-    </div>
-
-    <div class="section">
-        <div class="section-header">📋 Recent Trades</div>
-        <table class="spread-table">
-            <thead><tr><th>Time</th><th>Token</th><th>Profit</th><th>Gas</th><th>Status</th><th>Tx</th></tr></thead>
-            <tbody id="tradesBody">
-                <tr><td colspan="6" style="text-align:center; padding:40px;">No trades yet</td></tr>
-            </tbody>
-        </table>
-    </div>
-</div>
-
-<script>
-    async function fetchData() {
-        try {
-            // Fetch debug spreads
-            const debugRes = await fetch('/api/debug/spreads');
-            const debugData = await debugRes.json();
-            
-            document.getElementById('spreadsFound').innerHTML = debugData.spreads?.length || 0;
-            
-            const spreadsBody = document.getElementById('spreadsBody');
-            if (debugData.spreads && debugData.spreads.length > 0) {
-                let html = '';
-                for (let s of debugData.spreads.slice(0, 15)) {
-                    const profitClass = s.isProfitable ? 'profitable' : '';
-                    const statusBadge = s.isProfitable ? '✅ PROFITABLE' : '⚠️ Below threshold';
-                    const statusColor = s.isProfitable ? '#00ff88' : '#888';
-                    html += `<tr class="${profitClass}">
-                        <td><span class="token-icon">${s.tokenIcon || '🪙'}</span> ${s.token}</td>
-                        <td><span class="dex-badge">${s.buyDexIcon} ${s.buyDex}</span> → <span class="dex-badge">${s.sellDexIcon} ${s.sellDex}</span></td>
-                        <td>$${s.buyPrice.toFixed(4)}</td>
-                        <td>$${s.sellPrice.toFixed(4)}</td>
-                        <td>${s.rawSpreadPercent}%</td>
-                        <td style="color: ${parseFloat(s.netSpreadPercent) > 0 ? '#00ff88' : '#ff4444'}">${s.netSpreadPercent}%</td>
-                        <td class="profit-cell">$${s.profitOn100USD}</td>
-                        <td style="color: ${statusColor}">${statusBadge}</td>
-                    </tr>`;
-                }
-                spreadsBody.innerHTML = html;
-            } else {
-                spreadsBody.innerHTML = '<tr><td colspan="8" style="text-align:center; padding:40px;">No spreads found. Waiting for next scan...</td></tr>';
-            }
-            
-            // Fetch prices
-            const pricesRes = await fetch('/api/debug/prices');
-            const pricesData = await pricesRes.json();
-            
-            const pricesByToken = {};
-            if (pricesData.prices) {
-                for (let p of pricesData.prices) {
-                    if (!pricesByToken[p.token]) pricesByToken[p.token] = {};
-                    pricesByToken[p.token][p.dex] = { price: p.price, icon: p.dexIcon };
-                }
-            }
-            
-            const pricesBody = document.getElementById('pricesBody');
-            const tokens = ['POL', 'WETH', 'CAKE', 'WBTC', 'AAVE', 'LINK', 'CRV'];
-            let pricesHtml = '';
-            for (let token of tokens) {
-                const tokenData = pricesByToken[token] || {};
-                pricesHtml += `<tr>
-                    <td><span class="token-icon">${token === 'POL' ? '🟣' : token === 'WETH' ? '💎' : token === 'CAKE' ? '🍰' : token === 'WBTC' ? '🟡' : '🪙'}</span> ${token}</td>
-                    <td>${tokenData['PANCAKESWAP'] ? '$' + tokenData['PANCAKESWAP'].price.toFixed(4) : '—'}</td>
-                    <td>${tokenData['QUICKSWAP'] ? '$' + tokenData['QUICKSWAP'].price.toFixed(4) : '—'}</td>
-                    <td>${tokenData['SUSHISWAP'] ? '$' + tokenData['SUSHISWAP'].price.toFixed(4) : '—'}</td>
-                </tr>`;
-            }
-            pricesBody.innerHTML = pricesHtml;
-            
-            // Fetch state
-            const stateRes = await fetch('/api/state');
-            const stateData = await stateRes.json();
-            
-            document.getElementById('totalProfit').innerHTML = '$' + (parseFloat(stateData.stats.totalProfitUSD) || 0).toFixed(2);
-            document.getElementById('successRate').innerHTML = (stateData.stats.successRate || 0) + '%';
-            document.getElementById('flashLoans').innerHTML = stateData.stats.totalFlashLoans || 0;
-            
-            // Logs
-            const logsContainer = document.getElementById('logsContainer');
-            if (stateData.logs && stateData.logs.length > 0) {
-                let logsHtml = '';
-                for (let log of stateData.logs.slice(0, 20)) {
-                    const time = new Date(log.timestamp).toLocaleTimeString();
-                    logsHtml += '<div class="log-entry"><span class="log-time">[' + time + ']</span> ' + log.message + '</div>';
-                }
-                logsContainer.innerHTML = logsHtml;
-            }
-            
-            // Trades
-            const tradesBody = document.getElementById('tradesBody');
-            if (stateData.tradeHistory && stateData.tradeHistory.length > 0) {
-                let tradesHtml = '';
-                for (let t of stateData.tradeHistory.slice(0, 10)) {
-                    const time = new Date(t.timestamp).toLocaleTimeString();
-                    const profitColor = t.success ? '#00ff88' : '#ff4444';
-                    const profitDisplay = t.success ? '+$' + t.profitUSD.toFixed(2) : 'Failed';
-                    tradesHtml += `<tr>
-                        <td>${time}</td>
-                        <td>${t.token || '-'}</td>
-                        <td style="color: ${profitColor}">${profitDisplay}</td>
-                        <td>$${(t.gasCostUSD || 0).toFixed(4)}</td>
-                        <td style="color: ${t.success ? '#00ff88' : '#ff4444'}">${t.success ? '✅ Success' : '❌ Failed'}</td>
-                        <td>${t.txHash ? '<a href="https://polygonscan.com/tx/' + t.txHash + '" target="_blank" style="color:#60a5fa;">View →</a>' : '-'}</td>
-                    </tr>`;
-                }
-                tradesBody.innerHTML = tradesHtml;
-            }
-            
-        } catch(e) { console.error(e); }
-    }
+    const html = '<!DOCTYPE html>\n' +
+'<html lang="en">\n' +
+'<head>\n' +
+'    <meta charset="UTF-8">\n' +
+'    <meta name="viewport" content="width=device-width, initial-scale=1.0">\n' +
+'    <title>Flash Loan Arbitrage Bot | Debug Dashboard</title>\n' +
+'    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">\n' +
+'    <style>\n' +
+'        * { margin: 0; padding: 0; box-sizing: border-box; }\n' +
+'        body { font-family: "Inter", sans-serif; background: #0f0f1a; color: #e0e0e0; padding: 20px; }\n' +
+'        .container { max-width: 1600px; margin: 0 auto; }\n' +
+'        .header { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); border-radius: 16px; padding: 24px; margin-bottom: 24px; }\n' +
+'        .header h1 { font-size: 28px; margin-bottom: 8px; }\n' +
+'        .badge { display: inline-block; padding: 4px 12px; background: #00ff8844; border-radius: 20px; font-size: 12px; color: #00ff88; margin-left: 12px; }\n' +
+'        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }\n' +
+'        .stat-card { background: #1a1a2e; border-radius: 12px; padding: 16px; border: 1px solid #2a2a3e; }\n' +
+'        .stat-label { font-size: 11px; color: #888; text-transform: uppercase; margin-bottom: 8px; }\n' +
+'        .stat-value { font-size: 24px; font-weight: 700; }\n' +
+'        .positive { color: #00ff88; }\n' +
+'        .section { background: #1a1a2e; border-radius: 12px; margin-bottom: 24px; overflow: hidden; }\n' +
+'        .section-header { padding: 16px 20px; background: #0f0f1a; border-bottom: 1px solid #2a2a3e; font-weight: 600; font-size: 16px; }\n' +
+'        .spread-table, .price-table { width: 100%; border-collapse: collapse; font-size: 13px; }\n' +
+'        .spread-table th, .price-table th { text-align: left; padding: 12px 16px; background: #0f0f1a; color: #888; font-weight: 500; }\n' +
+'        .spread-table td, .price-table td { padding: 10px 16px; border-bottom: 1px solid #2a2a3e; }\n' +
+'        .profitable { background: #00ff8810; border-left: 3px solid #00ff88; }\n' +
+'        .token-icon { font-size: 16px; margin-right: 6px; }\n' +
+'        .dex-badge { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; background: #2a2a3e; border-radius: 8px; font-size: 11px; }\n' +
+'        .profit-cell { color: #00ff88; font-weight: 600; }\n' +
+'        .logs-container { max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 11px; }\n' +
+'        .log-entry { padding: 8px 16px; border-bottom: 1px solid #2a2a3e; }\n' +
+'        .log-time { color: #666; margin-right: 12px; }\n' +
+'        .refresh-btn { padding: 8px 16px; background: #3b82f6; border: none; border-radius: 8px; color: white; cursor: pointer; font-weight: 500; margin-bottom: 16px; }\n' +
+'        .two-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; }\n' +
+'        .auto-refresh { font-size: 12px; color: #888; margin-top: 8px; }\n' +
+'    </style>\n' +
+'</head>\n' +
+'<body>\n' +
+'<div class="container">\n' +
+'    <div class="header">\n' +
+'        <h1>Flash Loan Arbitrage Bot <span class="badge">DEBUG MODE</span></h1>\n' +
+'        <p>Real-time spread detection | Multi-DEX price comparison | PancakeSwap + QuickSwap + SushiSwap</p>\n' +
+'        <div class="auto-refresh">Auto-refreshing every 3 seconds</div>\n' +
+'    </div>\n' +
+'\n' +
+'    <div class="stats-grid">\n' +
+'        <div class="stat-card"><div class="stat-label">TOTAL PROFIT</div><div class="stat-value positive" id="totalProfit">$0.00</div></div>\n' +
+'        <div class="stat-card"><div class="stat-label">SUCCESS RATE</div><div class="stat-value" id="successRate">0%</div></div>\n' +
+'        <div class="stat-card"><div class="stat-label">SPREADS FOUND</div><div class="stat-value" id="spreadsFound">0</div></div>\n' +
+'        <div class="stat-card"><div class="stat-label">FLASH LOANS</div><div class="stat-value" id="flashLoans">0</div></div>\n' +
+'    </div>\n' +
+'\n' +
+'    <div class="section">\n' +
+'        <div class="section-header">TOP SPREADS (Most Profitable Arbitrage Opportunities)</div>\n' +
+'        <table class="spread-table">\n' +
+'            <thead>\n' +
+'                <tr><th>Token</th><th>Buy -> Sell</th><th>Buy Price</th><th>Sell Price</th><th>Raw Spread</th><th>Net (after fees)</th><th>Profit on $100</th><th>Status</th></tr>\n' +
+'            </thead>\n' +
+'            <tbody id="spreadsBody">\n' +
+'                <tr><td colspan="8" style="text-align:center; padding:40px;">Scanning for spreads...</td></tr>\n' +
+'            </tbody>\n' +
+'        </table>\n' +
+'    </div>\n' +
+'\n' +
+'    <div class="two-columns">\n' +
+'        <div class="section">\n' +
+'            <div class="section-header">Current Prices Across DEXes</div>\n' +
+'            <table class="price-table">\n' +
+'                <thead><tr><th>Token</th><th>PancakeSwap</th><th>QuickSwap</th><th>SushiSwap</th></tr></thead>\n' +
+'                <tbody id="pricesBody">\n' +
+'                    <tr><td colspan="4" style="text-align:center; padding:40px;">Loading prices...</td></tr>\n' +
+'                </tbody>\n' +
+'            </table>\n' +
+'        </div>\n' +
+'        <div class="section">\n' +
+'            <div class="section-header">Live Activity Logs</div>\n' +
+'            <div class="logs-container" id="logsContainer">Initializing...</div>\n' +
+'        </div>\n' +
+'    </div>\n' +
+'\n' +
+'    <div class="section">\n' +
+'        <div class="section-header">Recent Trades</div>\n' +
+'        <table class="spread-table">\n' +
+'            <thead><tr><th>Time</th><th>Token</th><th>Profit</th><th>Gas</th><th>Status</th><th>Tx</th></tr></thead>\n' +
+'            <tbody id="tradesBody">\n' +
+'                <tr><td colspan="6" style="text-align:center; padding:40px;">No trades yet</td></tr>\n' +
+'            </tbody>\n' +
+'        </table>\n' +
+'    </div>\n' +
+'</div>\n' +
+'\n' +
+'<script>\n' +
+'    async function fetchData() {\n' +
+'        try {\n' +
+'            const debugRes = await fetch("/api/debug/spreads");\n' +
+'            const debugData = await debugRes.json();\n' +
+'            \n' +
+'            document.getElementById("spreadsFound").innerHTML = debugData.spreads?.length || 0;\n' +
+'            \n' +
+'            const spreadsBody = document.getElementById("spreadsBody");\n' +
+'            if (debugData.spreads && debugData.spreads.length > 0) {\n' +
+'                let html = "";\n' +
+'                for (let s of debugData.spreads.slice(0, 15)) {\n' +
+'                    const profitClass = s.isProfitable ? "profitable" : "";\n' +
+'                    const statusBadge = s.isProfitable ? "PROFITABLE" : "Below threshold";\n' +
+'                    const statusColor = s.isProfitable ? "#00ff88" : "#888";\n' +
+'                    html += "<tr class=\\"" + profitClass + "\\">" +\n' +
+'                        "<td><span class=\\"token-icon\\">" + (s.tokenIcon || "") + "</span> " + s.token + "</td>" +\n' +
+'                        "<td><span class=\\"dex-badge\\">" + s.buyDexIcon + " " + s.buyDex + "</span> -> <span class=\\"dex-badge\\">" + s.sellDexIcon + " " + s.sellDex + "</span></td>" +\n' +
+'                        "<td>$" + s.buyPrice.toFixed(4) + "</td>" +\n' +
+'                        "<td>$" + s.sellPrice.toFixed(4) + "</td>" +\n' +
+'                        "<td>" + s.rawSpreadPercent + "%</td>" +\n' +
+'                        "<td style=\\"color: " + (parseFloat(s.netSpreadPercent) > 0 ? "#00ff88" : "#ff4444") + "\\">" + s.netSpreadPercent + "%</td>" +\n' +
+'                        "<td class=\\"profit-cell\\">$" + s.profitOn100USD + "</td>" +\n' +
+'                        "<td style=\\"color: " + statusColor + "\\">" + statusBadge + "</td>" +\n' +
+'                        "</tr>";\n' +
+'                }\n' +
+'                spreadsBody.innerHTML = html;\n' +
+'            } else {\n' +
+'                spreadsBody.innerHTML = "<tr><td colspan=\\"8\\" style=\\"text-align:center; padding:40px;\\">No spreads found. Waiting for next scan...</td></tr>";\n' +
+'            }\n' +
+'            \n' +
+'            const pricesRes = await fetch("/api/debug/prices");\n' +
+'            const pricesData = await pricesRes.json();\n' +
+'            \n' +
+'            const pricesByToken = {};\n' +
+'            if (pricesData.prices) {\n' +
+'                for (let p of pricesData.prices) {\n' +
+'                    if (!pricesByToken[p.token]) pricesByToken[p.token] = {};\n' +
+'                    pricesByToken[p.token][p.dex] = { price: p.price, icon: p.dexIcon };\n' +
+'                }\n' +
+'            }\n' +
+'            \n' +
+'            const pricesBody = document.getElementById("pricesBody");\n' +
+'            const tokens = ["POL", "WETH", "CAKE", "WBTC", "AAVE", "LINK", "CRV"];\n' +
+'            let pricesHtml = "";\n' +
+'            for (let token of tokens) {\n' +
+'                const tokenData = pricesByToken[token] || {};\n' +
+'                const tokenIcon = token === "POL" ? "🟣" : token === "WETH" ? "💎" : token === "CAKE" ? "🍰" : token === "WBTC" ? "🟡" : "🪙";\n' +
+'                pricesHtml += "<tr>" +\n' +
+'                    "<td><span class=\\"token-icon\\">" + tokenIcon + "</span> " + token + "</td>" +\n' +
+'                    "<td>" + (tokenData["PANCAKESWAP"] ? "$" + tokenData["PANCAKESWAP"].price.toFixed(4) : "—") + "</td>" +\n' +
+'                    "<td>" + (tokenData["QUICKSWAP"] ? "$" + tokenData["QUICKSWAP"].price.toFixed(4) : "—") + "</td>" +\n' +
+'                    "<td>" + (tokenData["SUSHISWAP"] ? "$" + tokenData["SUSHISWAP"].price.toFixed(4) : "—") + "</td>" +\n' +
+'                    "</tr>";\n' +
+'            }\n' +
+'            pricesBody.innerHTML = pricesHtml;\n' +
+'            \n' +
+'            const stateRes = await fetch("/api/state");\n' +
+'            const stateData = await stateRes.json();\n' +
+'            \n' +
+'            document.getElementById("totalProfit").innerHTML = "$" + (parseFloat(stateData.stats.totalProfitUSD) || 0).toFixed(2);\n' +
+'            document.getElementById("successRate").innerHTML = (stateData.stats.successRate || 0) + "%";\n' +
+'            document.getElementById("flashLoans").innerHTML = stateData.stats.totalFlashLoans || 0;\n' +
+'            \n' +
+'            const logsContainer = document.getElementById("logsContainer");\n' +
+'            if (stateData.logs && stateData.logs.length > 0) {\n' +
+'                let logsHtml = "";\n' +
+'                for (let log of stateData.logs.slice(0, 20)) {\n' +
+'                    const time = new Date(log.timestamp).toLocaleTimeString();\n' +
+'                    logsHtml += "<div class=\\"log-entry\\"><span class=\\"log-time\\">[" + time + "]</span> " + log.message + "</div>";\n' +
+'                }\n' +
+'                logsContainer.innerHTML = logsHtml;\n' +
+'            }\n' +
+'            \n' +
+'            const tradesBody = document.getElementById("tradesBody");\n' +
+'            if (stateData.tradeHistory && stateData.tradeHistory.length > 0) {\n' +
+'                let tradesHtml = "";\n' +
+'                for (let t of stateData.tradeHistory.slice(0, 10)) {\n' +
+'                    const time = new Date(t.timestamp).toLocaleTimeString();\n' +
+'                    const profitColor = t.success ? "#00ff88" : "#ff4444";\n' +
+'                    const profitDisplay = t.success ? "+$" + t.profitUSD.toFixed(2) : "Failed";\n' +
+'                    tradesHtml += "<tr>" +\n' +
+'                        "<td>" + time + "</td>" +\n' +
+'                        "<td>" + (t.token || "-") + "</td>" +\n' +
+'                        "<td style=\\"color: " + profitColor + "\\">" + profitDisplay + "</td>" +\n' +
+'                        "<td>$" + (t.gasCostUSD || 0).toFixed(4) + "</td>" +\n' +
+'                        "<td style=\\"color: " + (t.success ? "#00ff88" : "#ff4444") + "\\">" + (t.success ? "Success" : "Failed") + "</td>" +\n' +
+'                        "<td>" + (t.txHash ? "<a href=\\"https://polygonscan.com/tx/" + t.txHash + "\\" target=\\"_blank\\" style=\\"color:#60a5fa;\\">View</a>" : "-") + "</td>" +\n' +
+'                        "</tr>";\n' +
+'                }\n' +
+'                tradesBody.innerHTML = tradesHtml;\n' +
+'            }\n' +
+'        } catch(e) { console.error(e); }\n' +
+'    }\n' +
+'    \n' +
+'    fetchData();\n' +
+'    setInterval(fetchData, 3000);\n' +
+'</script>\n' +
+'</body>\n' +
+'</html>';
     
-    fetchData();
-    setInterval(fetchData, 3000);
-</script>
-</body>
-</html>`);
+    res.send(html);
 });
 
 // ==================== START ====================
 async function start() {
-    console.log('\n═══════════════════════════════════════════════════════════');
-    console.log(`🔍 FLASH LOAN ARBITRAGE BOT - DEBUG DASHBOARD`);
-    console.log('═══════════════════════════════════════════════════════════');
-    console.log(`✓ Debug mode: Showing real-time spreads`);
-    console.log(`✓ ${DEXES.length} DEXes: ${DEXES.map(d => d.name).join(', ')}`);
-    console.log(`✓ ${ALL_TOKENS.length - 1} tokens monitored`);
+    console.log('\n===========================================================');
+    console.log('FLASH LOAN ARBITRAGE BOT - DEBUG DASHBOARD');
+    console.log('===========================================================');
+    console.log(`Debug mode: Showing real-time spreads`);
+    console.log(`${DEXES.length} DEXes: ${DEXES.map(d => d.name).join(', ')}`);
+    console.log(`${ALL_TOKENS.length - 1} tokens monitored`);
     console.log(`Dashboard: http://localhost:${PORT}`);
-    console.log('═══════════════════════════════════════════════════════════\n');
+    console.log('===========================================================\n');
     
     await initializeBlockchain();
     mainLoop().catch(console.error);
     app.listen(PORT, '0.0.0.0', () => {
-        console.log(`✅ Debug Dashboard: http://localhost:${PORT}`);
-        console.log(`🔍 API endpoints:`);
-        console.log(`   - /api/debug/spreads - View all spreads`);
-        console.log(`   - /api/debug/prices - View all prices`);
-        console.log(`   - /api/debug/token/:symbol - View token-specific data`);
+        console.log(`Debug Dashboard: http://localhost:${PORT}`);
+        console.log(`API endpoints:`);
+        console.log(`  - /api/debug/spreads - View all spreads`);
+        console.log(`  - /api/debug/prices - View all prices`);
+        console.log(`  - /api/debug/token/:symbol - View token-specific data`);
     });
 }
 
