@@ -155,15 +155,17 @@ async function validateOpportunityOnChain(opportunity, provider) {
         const sellPrice = Number(ethers.formatUnits(amountsOutSell[1], 6));
         const onChainSpread = ((sellPrice - buyPrice) / buyPrice) * 100;
         
-        addLog(`🔍 On-chain validation: ${opportunity.token} | Spread: ${opportunity.spreadPercent}% (DexScreener) vs ${onChainSpread.toFixed(3)}% (On-chain)`);
+        const difference = Math.abs(parseFloat(opportunity.spreadPercent) - onChainSpread);
+        const calcError = ((difference / parseFloat(opportunity.spreadPercent)) * 100).toFixed(1);
+        addLog(`🔍 On-chain validation: ${opportunity.token} | DexScreener: ${opportunity.spreadPercent}% | On-chain: ${onChainSpread.toFixed(3)}% | Difference: ${difference.toFixed(2)}% (${calcError}% error)`);
         
         // Verify spread difference is less than 20% (real opportunity)
-        const difference = Math.abs(parseFloat(opportunity.spreadPercent) - onChainSpread);
         const isValid = difference < 20 && onChainSpread > 0.05;
         
         if (!isValid) {
-            addLog(`⚠️ On-chain validation FAILED for ${opportunity.token}: Spread mismatch >20%`);
-            addToOpportunityLog(opportunity, "🔍 VALIDATED", `On-chain spread ${onChainSpread.toFixed(2)}% vs DexScreener ${opportunity.spreadPercent}%`);
+            const failReason = `On-chain spread ${onChainSpread.toFixed(2)}% vs DexScreener ${opportunity.spreadPercent}% (${difference.toFixed(2)}% diff). WHY: DexScreener shows stale prices OR ${opportunity.buyDex} lacks ${BORROW_AMOUNT} USDC liquidity for ${opportunity.token}. Need <20% difference, got ${difference.toFixed(1)}%`;
+            addLog(`⚠️ On-chain validation FAILED for ${opportunity.token}: ${failReason}`);
+            addToOpportunityLog(opportunity, "🔍 VALIDATED", failReason);
         }
         
         return isValid;
@@ -1149,6 +1151,7 @@ async function scanForOpportunities() {
                 const gasCostUSD = SCANNER_CONFIG.GAS_COST_USD;
                 
                 const netProfit = grossProfit - totalFees - gasCostUSD;
+                const profitShortfall = (SCANNER_CONFIG.MIN_PROFIT_USD - netProfit).toFixed(2);
                 
                 // Lower profit threshold to find more opportunities
                 const minRealProfit = SCANNER_CONFIG.MIN_PROFIT_USD;
@@ -1222,6 +1225,9 @@ async function scanForOpportunities() {
             if (result) {
                 opportunities.push(result);
                 addLog(`💰 GUARANTEED OPPORTUNITY: ${result.token} on ${result.buyDex}→${result.sellDex} | Spread: ${result.spreadPercent}% | Liq: $${(result.buyLiquidity/1000).toFixed(0)}k | Net Profit: $${result.netProfit.toFixed(2)}`);
+                if (result.netProfit < SCANNER_CONFIG.MIN_PROFIT_USD) {
+                    addLog(`⚠️ NOTE: ${result.token} would be REJECTED if net profit falls below $${SCANNER_CONFIG.MIN_PROFIT_USD} (currently $${result.netProfit.toFixed(2)} - short by $${profitShortfall})`);
+                }
             }
         }
     }
@@ -1331,6 +1337,8 @@ async function scan() {
             if (!activeExecutions.has(opp.token) && !state.pendingFlash && opp.isProfitable && opp.netProfit > SCANNER_CONFIG.MIN_PROFIT_USD) {
                 // GAS PROTECTION: Simulate before execution
                 addLog(`🔬 GAS PROTECTION: Simulating transaction for ${opp.token} first...`);
+                addLog(`📊 ${opp.token}: Net $${opp.netProfit.toFixed(2)} needs $${SCANNER_CONFIG.MIN_PROFIT_USD} | Short $${(SCANNER_CONFIG.MIN_PROFIT_USD - opp.netProfit).toFixed(2)} | Spread ${opp.spreadPercent}% | Liq $${(opp.buyLiquidity/1000).toFixed(0)}k`);
+                
                 const simulationResult = await simulateTransaction(wallet, contract, "executeFlashLoan", [
                     USDC_ADDR,
                     ethers.parseUnits(BORROW_AMOUNT.toString(), 6),
@@ -1340,8 +1348,10 @@ async function scan() {
                 ], { gasLimit: 800000 });
                 
                 if (!simulationResult.success) {
-                    addLog(`🛡️ GAS PROTECTION: Skipping ${opp.token} - simulation failed`);
-                    addToOpportunityLog(opp, "⚠️ SKIPPED", "Simulation failed - insufficient profit after slippage");
+                    const shortage = (SCANNER_CONFIG.MIN_PROFIT_USD - opp.netProfit).toFixed(2);
+                    const whyReason = `Profit $${opp.netProfit.toFixed(2)} is $${shortage} below $${SCANNER_CONFIG.MIN_PROFIT_USD} requirement. Calculation: Gross $${opp.grossProfit.toFixed(2)} - Fees $${opp.totalFees.toFixed(2)} - Gas $${SCANNER_CONFIG.GAS_COST_USD} = Net $${opp.netProfit.toFixed(2)}. DexScreener spread ${opp.spreadPercent}% vs on-chain may differ due to liquidity depth.`;
+                    addLog(`🛡️ GAS PROTECTION: Skipping ${opp.token} - ${whyReason}`);
+                    addToOpportunityLog(opp, "⚠️ SKIPPED", whyReason);
                     continue;
                 }
                 
@@ -2079,7 +2089,7 @@ function formatCurrency(num){return '$'+formatNumber(num);}
 function formatLiquidity(num){if(num>=1000000)return '$'+(num/1000000).toFixed(1)+'M';if(num>=1000)return '$'+(num/1000).toFixed(0)+'k';return '$'+num.toFixed(0);}
 function updateUI(data){const statusEl=document.getElementById('connectionStatus');if(data.connected){statusEl.className='status online';statusEl.innerHTML='● ONLINE';}else{statusEl.className='status offline';statusEl.innerHTML='● OFFLINE';}
 const pendingStatus=document.getElementById('pendingStatus');if(data.pendingFlash){pendingStatus.innerHTML='<span class="pending-flash" style="padding:4px 12px;border-radius:20px;font-size:12px">⏳ FLASH PENDING: '+data.pendingFlash+'</span>';}else{pendingStatus.innerHTML='';}
-const minerContainer=document.getElementById('minerPendingContainer');if(data.pendingTransactions&&data.pendingTransactions.length>0){minerContainer.innerHTML='<table style="width:100%"><thead><tr><th>Token</th><th>Tx Hash</th><th>Expected Profit</th><th>Progress</th><th>Gas Price</th></tr></thead><tbody>'+data.pendingTransactions.map(tx=>{const waitSec=Math.floor((Date.now()-new Date(tx.timestamp))/1000);return '<tr><td><b>'+tx.token+'</b></td><td><a href="https://polygonscan.com/tx/'+tx.txHash+'" target="_blank" style="color:#60a5fa">'+tx.txHash.substring(0,10)+'...</a></td><td class="profit">'+formatCurrency(tx.expectedProfit)+'</td><td><div class="progress-bar"><div class="progress-fill" style="width:'+tx.progress+'%"></div></div><span style="font-size:10px">'+tx.progress+'% ('+waitSec+'s)</span></td><td>'+tx.gasPrice+' Gwei</td></tr>';}).join('')+'</tbody> </table>';}else{minerContainer.innerHTML='<p style="color:#94a3b8">No pending transactions waiting for miners</p>';}
+const minerContainer=document.getElementById('minerPendingContainer');if(data.pendingTransactions&&data.pendingTransactions.length>0){minerContainer.innerHTML='<table style="width:100%"><thead><tr><th>Token</th><th>Tx Hash</th><th>Expected Profit</th><th>Progress</th><th>Gas Price</th></tr></thead><tbody>'+data.pendingTransactions.map(tx=>{const waitSec=Math.floor((Date.now()-new Date(tx.timestamp))/1000);return '<tr><td><b>'+tx.token+'</b></td><td><a href="https://polygonscan.com/tx/'+tx.txHash+'" target="_blank" style="color:#60a5fa">'+tx.txHash.substring(0,10)+'...</a></td><td class="profit">'+formatCurrency(tx.expectedProfit)+'</td><td><div class="progress-bar"><div class="progress-fill" style="width:'+tx.progress+'%"></div></div><span style="font-size:10px">'+tx.progress+'% ('+waitSec+'s)</span></td><td>'+tx.gasPrice+' Gwei</td></tr>';}).join('')+'</tbody></table>';}else{minerContainer.innerHTML='<p style="color:#94a3b8">No pending transactions waiting for miners</p>';}
 document.getElementById('totalProfit').innerHTML='<span class="profit">'+formatCurrency(data.stats?.totalProfit||0)+'</span>';
 document.getElementById('totalTrades').innerText=data.stats?.tradesExecuted||0;
 document.getElementById('successTrades').innerText=data.stats?.successfulTrades||0;
