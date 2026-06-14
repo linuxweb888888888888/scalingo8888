@@ -47,9 +47,9 @@ const SCANNER_CONFIG = {
     CACHE_DURATION: 1000,             // Cache prices for 1 second
     
     // Real opportunity filters
-    MIN_LIQUIDITY_USD: 100000,        // $100k minimum liquidity (guaranteed fills)
-    MIN_PROFIT_USD: 3.00,             // $3 minimum profit
-    MIN_SPREAD_PERCENT: 0.15,         // 0.15% minimum spread
+    MIN_LIQUIDITY_USD: 1000,        // $100k minimum liquidity (guaranteed fills)
+    MIN_PROFIT_USD: 0.1,             // $3 minimum profit
+    MIN_SPREAD_PERCENT: 0.05,         // 0.15% minimum spread
     GAS_COST_USD: 0.05,               // $0.05 gas cost
 };
 
