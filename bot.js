@@ -12,7 +12,11 @@ const axios = require('axios');
 const fs = require('fs');
 const solc = require('solc');
 
-const PORT = process.env.PORT || 3000;
+const PORT = parseInt(process.env.PORT) || 3000;
+const app = express();
+
+// Verify PORT is defined
+console.log(`📡 Starting server on port: ${PORT}`);
 
 // ==================== [ FIX: CORRECTED PROVIDER IMPORT FOR ETHERs v6 ] ====================
 // Import JsonRpcProvider correctly from ethers
