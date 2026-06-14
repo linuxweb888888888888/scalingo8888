@@ -63,6 +63,33 @@ let cachedOpportunities = [];
 const RPC_CONNECTION_DELAY = 30000;
 let initialDelayDone = false;
 
+// ==================== [ OPPORTUNITY LOG - NEW ] ====================
+let opportunityLog = [];
+
+function addToOpportunityLog(opportunity, status, reason) {
+    const logEntry = {
+        id: Date.now(),
+        timestamp: new Date().toISOString(),
+        token: opportunity.token,
+        buyDex: opportunity.buyDex,
+        sellDex: opportunity.sellDex,
+        spreadPercent: opportunity.spreadPercent,
+        liquidity: opportunity.buyLiquidity,
+        grossProfit: opportunity.grossProfit,
+        totalFees: opportunity.totalFees,
+        netProfit: opportunity.netProfit,
+        status: status,
+        reason: reason
+    };
+    
+    opportunityLog.unshift(logEntry);
+    if (opportunityLog.length > 50) opportunityLog.pop();
+    
+    state.opportunityLog = opportunityLog;
+    
+    addLog(`📝 OPPORTUNITY LOG: ${opportunity.token} | ${status} | ${reason}`);
+}
+
 // ==================== [ GAS PROTECTION - SIMULATE FIRST, ONLY PAY GAS ON SUCCESS ] ====================
 async function simulateTransaction(wallet, contract, method, args, overrides) {
     try {
@@ -110,6 +137,7 @@ async function validateOpportunityOnChain(opportunity, provider) {
         
         if (!isValid) {
             addLog(`⚠️ On-chain validation FAILED for ${opportunity.token}: Spread mismatch >20%`);
+            addToOpportunityLog(opportunity, "🔍 VALIDATED", `On-chain spread ${onChainSpread.toFixed(2)}% vs DexScreener ${opportunity.spreadPercent}%`);
         }
         
         return isValid;
@@ -587,7 +615,8 @@ let state = {
     tradeHistory: [],
     pendingFlash: null,
     pendingTransactions: [],
-    discoveryStats: null
+    discoveryStats: null,
+    opportunityLog: []  // NEW: Add opportunity log to state
 };
 
 let deploymentInfo = {
@@ -929,6 +958,34 @@ async function scanForOpportunities() {
                         timestamp: now
                     };
                     
+                    // NEW: Check thresholds for opportunity log
+                    let logStatus = "✅ PASSED";
+                    let logReason = "Awaiting execution simulation";
+                    
+                    if (liquidityUsd < 100000) {
+                        logStatus = "❌ REJECTED";
+                        logReason = `Low liquidity: $${(liquidityUsd/1000).toFixed(0)}k (need $100k+)`;
+                        addToOpportunityLog(opportunity, logStatus, logReason);
+                        return null;
+                    }
+                    
+                    if (netProfit < 3.00) {
+                        logStatus = "❌ REJECTED";
+                        logReason = `Net profit $${netProfit.toFixed(2)} below $3.00 threshold`;
+                        addToOpportunityLog(opportunity, logStatus, logReason);
+                        return null;
+                    }
+                    
+                    const breakEvenSpread = ((swapFeesBuy + swapFeesSell + SCANNER_CONFIG.GAS_COST_USD) / BORROW_AMOUNT) * 100;
+                    if (parseFloat(spread.toFixed(3)) < breakEvenSpread) {
+                        logStatus = "❌ REJECTED";
+                        logReason = `Spread ${spread.toFixed(2)}% below breakeven ${breakEvenSpread.toFixed(2)}%`;
+                        addToOpportunityLog(opportunity, logStatus, logReason);
+                        return null;
+                    }
+                    
+                    addToOpportunityLog(opportunity, logStatus, logReason);
+                    
                     // Cache the result
                     priceCache.set(token.a, {
                         opportunity: opportunity,
@@ -1033,6 +1090,7 @@ async function scan() {
                 
                 if (!simulationResult.success) {
                     addLog(`🛡️ GAS PROTECTION: Skipping ${opp.token} - simulation failed`);
+                    addToOpportunityLog(opp, "⚠️ SKIPPED", "Simulation failed - insufficient profit after slippage");
                     continue;
                 }
                 
@@ -1243,6 +1301,15 @@ async function executeFlashLoan(opportunity) {
                             state.stats.totalDexFees += opportunity.swapFeesBuy + opportunity.swapFeesSell;
                             state.stats.totalGasSpent += actualGasCost;
                             
+                            // Update opportunity log with success
+                            const existingLog = state.opportunityLog?.find(log => log.token === opportunity.token && log.status === "✅ PASSED");
+                            if (existingLog) {
+                                existingLog.status = "✅ SUCCESS";
+                                existingLog.reason = `Executed - Profit: $${opportunity.netProfit.toFixed(2)}`;
+                            } else {
+                                addToOpportunityLog(opportunity, "✅ SUCCESS", `Executed - Profit: $${opportunity.netProfit.toFixed(2)}`);
+                            }
+                            
                             state.tradeHistory.unshift({
                                 id: Date.now(),
                                 token: opportunity.token,
@@ -1268,6 +1335,7 @@ async function executeFlashLoan(opportunity) {
                         } else {
                             console.log(`❌ STATUS: REVERTED (Check PolygonScan for reason)`);
                             addLog(`❌ FLASH LOAN REVERTED: ${opportunity.token} | Tx: ${tx.hash}`);
+                            addToOpportunityLog(opportunity, "❌ FAILED", "Transaction reverted on-chain");
                             throw new Error("Transaction reverted");
                         }
                     }
@@ -1378,6 +1446,42 @@ async function runBotLoop() {
         }
     }
 }
+
+// ==================== [ OPPORTUNITY LOG HTML CARD - NEW ] ====================
+const opportunityLogHTML = `
+<div class="table-container">
+    <h3 style="margin-bottom:16px">📋 OPPORTUNITY LOG (Last 50 Opportunities)</h3>
+    <div style="overflow-x:auto; max-height:400px; overflow-y:auto">
+        <table style="width:100%; font-size:12px">
+            <thead>
+                <tr style="position:sticky; top:0; background:#1e293b">
+                    <th>Time</th>
+                    <th>Token</th>
+                    <th>Buy → Sell</th>
+                    <th>Spread</th>
+                    <th>Liquidity</th>
+                    <th>Gross Profit</th>
+                    <th>Fees</th>
+                    <th>NET Profit</th>
+                    <th>Status</th>
+                    <th>Reason</th>
+                </tr>
+            </thead>
+            <tbody id="opportunityLogBody">
+                <tr><td colspan="10" style="text-align:center; color:#94a3b8">Waiting for opportunities...</td></tr>
+            </tbody>
+        </table>
+    </div>
+    <div style="margin-top:12px; padding:8px; background:#0f172a; border-radius:8px; font-size:11px; color:#94a3b8">
+        📊 <strong>Legend:</strong> 
+        <span style="color:#10b981">✅ SUCCESS</span> = Profitable & Executed | 
+        <span style="color:#f59e0b">⚠️ SKIPPED</span> = Simulation Failed | 
+        <span style="color:#ef4444">❌ REJECTED</span> = Below Threshold | 
+        <span style="color:#60a5fa">🔍 VALIDATED</span> = On-chain Check Failed |
+        <span style="color:#8b5cf6">✅ PASSED</span> = Passed Filters, Awaiting Execution
+    </div>
+</div>
+`;
 
 // ==================== [ HTML PAGES ] ====================
 const menuHTML = `<!DOCTYPE html>
@@ -1645,6 +1749,7 @@ async function importContract(){const addr=document.getElementById('contractInpu
 </body>
 </html>`;
 
+// Updated dashboardHTML with Opportunity Log card
 const dashboardHTML = `<!DOCTYPE html>
 <html><head><title>TITAN ARBITRAGE v10.0 - ULTRA FAST OPPORTUNITIES</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1708,6 +1813,9 @@ button.success{background:#10b981}
 
 <div class="table-container"><h3 style="margin-bottom:16px">🔥 GUARANTEED REAL ARBITRAGE OPPORTUNITIES</h3><table id="opportunitiesTable"><thead><tr><th>Token</th><th>Buy → Sell</th><th>Spread</th><th>Liquidity</th><th>Gross Profit</th><th>Fees+Slippage</th><th>NET PROFIT</th><th>Status</th></tr></thead><tbody id="opportunitiesBody"></tbody></table></div>
 
+<!-- OPPORTUNITY LOG CARD - NEW -->
+${opportunityLogHTML}
+
 <div class="table-container"><h3 style="margin-bottom:16px">📊 TRADE HISTORY</h3><table id="historyTable"><thead><tr><th>Time</th><th>Token</th><th>Route</th><th>Net Profit</th><th>Status</th><th>Tx</th></tr></thead><tbody id="historyBody"></tbody></table></div>
 
 <div class="table-container"><h3 style="margin-bottom:16px">📝 LIVE LOGS (Gas Protection & Validator Events)</h3><div id="logsContainer" style="height:200px;overflow-y:auto;font-family:monospace;font-size:12px"></div></div></div>
@@ -1738,7 +1846,36 @@ const oppBody=document.getElementById('opportunitiesBody');
 if(data.opportunities&&data.opportunities.length>0){const realOpps=data.opportunities.filter(o=>o.netProfit>3);if(realOpps.length>0){oppBody.innerHTML=realOpps.map(opp=>'<tr><td><b>'+opp.token+'</b></td><td>'+opp.buyDex+' → '+opp.sellDex+'</td><td class="profit">+'+opp.spreadPercent+'%</td><td>'+formatLiquidity(opp.buyLiquidity||0)+'</td><td class="profit">'+formatCurrency(opp.grossProfit)+'</td><td class="loss">'+formatCurrency(opp.totalFees)+'</td><td class="profit"><b>'+formatCurrency(opp.netProfit)+'</b></td><td><span class="real-badge">💰 GUARANTEED</span></td></tr>').join('');}else{oppBody.innerHTML='<tr><td colspan="8" style="text-align:center">🔍 Scanning for GUARANTEED opportunities (need $3+ profit after fees & slippage)...</td></tr>';}}else{oppBody.innerHTML='<tr><td colspan="8" style="text-align:center">⚡ ULTRA FAST SCAN: Checking 100+ tokens every 2 seconds for guaranteed opportunities...</td></tr>';}
 const historyBody=document.getElementById('historyBody');
 if(data.tradeHistory&&data.tradeHistory.length>0){historyBody.innerHTML=data.tradeHistory.slice(0,20).map(t=>'<tr><td style="font-size:11px">'+new Date(t.timestamp).toLocaleTimeString()+'</td><td><b>'+(t.token||'-')+'</b></td><td>'+(t.buyDex||'-')+'→'+(t.sellDex||'-')+'</td><td class="profit">'+formatCurrency(t.netProfit||0)+'</td><td><span class="'+(t.status==='✅ SUCCESS'?'profit-badge':'loss-badge')+'">'+t.status+'</span></td><td>'+(t.txHash?'<a href="https://polygonscan.com/tx/'+t.txHash+'" target="_blank" style="color:#60a5fa">View</a>':'-')+'</td></tr>').join('');}
-const logsDiv=document.getElementById('logsContainer');if(data.logs&&data.logs.length>0){logsDiv.innerHTML=data.logs.slice(0,20).map(l=>'<div class="log-entry">['+new Date(l.time).toLocaleTimeString()+'] '+l.message+'</div>').join('');}}
+const logsDiv=document.getElementById('logsContainer');if(data.logs&&data.logs.length>0){logsDiv.innerHTML=data.logs.slice(0,20).map(l=>'<div class="log-entry">['+new Date(l.time).toLocaleTimeString()+'] '+l.message+'</div>').join('');}
+
+// NEW: Update Opportunity Log
+const logBody = document.getElementById('opportunityLogBody');
+if (data.opportunityLog && data.opportunityLog.length > 0) {
+    logBody.innerHTML = data.opportunityLog.slice(0, 50).map(log => {
+        let statusColor = '';
+        let statusIcon = '';
+        if (log.status === '✅ SUCCESS') { statusColor = 'color:#10b981'; statusIcon = '✅'; }
+        else if (log.status === '⚠️ SKIPPED') { statusColor = 'color:#f59e0b'; statusIcon = '⚠️'; }
+        else if (log.status === '❌ REJECTED') { statusColor = 'color:#ef4444'; statusIcon = '❌'; }
+        else if (log.status === '🔍 VALIDATED') { statusColor = 'color:#60a5fa'; statusIcon = '🔍'; }
+        else if (log.status === '✅ PASSED') { statusColor = 'color:#8b5cf6'; statusIcon = '⏳'; }
+        return '<tr style="border-bottom:1px solid #334155">' +
+            '<td style="font-size:10px; padding:8px">'+new Date(log.timestamp).toLocaleTimeString()+'</td>' +
+            '<td style="padding:8px"><b>'+log.token+'</b></td>' +
+            '<td style="font-size:11px; padding:8px">'+log.buyDex+' → '+log.sellDex+'</td>' +
+            '<td style="padding:8px">'+log.spreadPercent+'%</td>' +
+            '<td style="font-size:11px; padding:8px">'+formatLiquidity(log.liquidity)+'</td>' +
+            '<td style="padding:8px">'+formatCurrency(log.grossProfit)+'</td>' +
+            '<td style="padding:8px">'+formatCurrency(log.totalFees)+'</td>' +
+            '<td style="padding:8px; font-weight:bold; '+(log.netProfit > 0 ? 'color:#10b981' : 'color:#ef4444')+'">'+formatCurrency(log.netProfit)+'</td>' +
+            '<td style="padding:8px"><span style="'+statusColor+'">'+log.status+'</span></td>' +
+            '<td style="font-size:10px; padding:8px; color:#94a3b8; max-width:200px">'+(log.reason || '-')+'</td>' +
+            '</tr>';
+    }).join('');
+} else {
+    logBody.innerHTML = '<tr><td colspan="10" style="text-align:center; color:#94a3b8; padding:20px">No opportunities scanned yet. Bot is running...</td></tr>';
+}
+}
 document.getElementById('toggleTrade').onclick=async()=>{const res=await fetch('/api/toggle',{method:'POST'});const data=await res.json();const btn=document.getElementById('toggleTrade');if(data.autoTrade){btn.className='success';btn.innerHTML='🟢 Trading ON';}else{btn.className='danger';btn.innerHTML='🔴 Trading OFF';}};
 fetchData();
 </script>
@@ -1785,6 +1922,7 @@ app.get('/api/data', (req, res) => {
         activeTokensCount: TOKENS.length,
         activeDexesCount: Object.keys(DEX_MAP).length,
         discoveryStats: state.discoveryStats,
+        opportunityLog: state.opportunityLog || [],
         config: {
             borrowAmount: BORROW_AMOUNT,
             minProfitTrigger: MIN_PROFIT_USD,
@@ -1877,9 +2015,8 @@ async function start() {
 ║  Deploy Page:  http://localhost:${PORT}/deploy                               ║
 ║  Bot Page:     http://localhost:${PORT}/dashboard                            ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  FIXED: Correct parameter order for executeFlashLoan                        ║
-║  [0] USDC | [1] Amount | [2] BUY DEX | [3] SELL DEX | [4] Target Token      ║
-║  This matches your contract's function signature exactly!                   ║
+║  NEW: Opportunity Log Card - Shows WHY each opportunity passed/failed       ║
+║  Tracks: Liquidity, Profit, Spread, Fees, and Rejection Reasons            ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
     `);
     
@@ -1888,7 +2025,7 @@ async function start() {
         console.log(`\n✅ Create wallet → Send POL → Deploy Balancer Contract → Start Bot`);
         console.log(`\n⚡ ULTRA FAST: Scanning 100+ tokens every 2 seconds`);
         console.log(`💰 GUARANTEED: Only showing opportunities with $3+ profit and $100k+ liquidity\n`);
-        console.log(`🔧 PARAMETER ORDER FIXED: executeFlashLoan(USDC, amount, BUY_DEX, SELL_DEX, targetToken)`);
+        console.log(`📋 NEW FEATURE: Opportunity Log Card shows all scanned opportunities with rejection reasons`);
     });
 }
 
