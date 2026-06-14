@@ -11,7 +11,8 @@
     "express": "^4.18.2",
     "ethers": "^6.13.0",
     "axios": "^1.6.2",
-    "solc": "^0.8.21"
+    "solc": "^0.8.21",
+    "ws": "^8.14.2"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
