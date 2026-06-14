@@ -41,17 +41,17 @@ const RPC_ENDPOINTS = [
 
 // ==================== [ OPTIMIZED SCANNER CONFIGURATION ] ====================
 const SCANNER_CONFIG = {
-    // Speed optimizations - CHANGED: Faster scanning for more opportunities
-    SCAN_INTERVAL: 1000,              // CHANGED: Scan every 1 second (was 2 seconds)
-    BATCH_SIZE: 25,                   // CHANGED: Process 25 tokens in parallel (was 15)
-    API_TIMEOUT: 1500,                // CHANGED: 1.5 second timeout (was 2 seconds)
-    CACHE_DURATION: 500,              // CHANGED: Cache prices for 0.5 seconds (was 1 second)
+    // Speed optimizations
+    SCAN_INTERVAL: 2000,              // Scan every 2 seconds (faster)
+    BATCH_SIZE: 15,                   // Process 15 tokens in parallel
+    API_TIMEOUT: 2000,                // 2 second timeout
+    CACHE_DURATION: 1000,             // Cache prices for 1 second
     
-    // Real opportunity filters - CHANGED: Lower thresholds for MORE opportunities
-    MIN_LIQUIDITY_USD: 50000,         // CHANGED: $50k minimum liquidity (was $100k)
-    MIN_PROFIT_USD: 1.00,             // CHANGED: $1 minimum profit (was $0.1)
-    MIN_SPREAD_PERCENT: 0.03,         // CHANGED: 0.03% minimum spread (was 0.05%)
-    GAS_COST_USD: 0.03,               // CHANGED: $0.03 gas cost (was $0.05)
+    // Real opportunity filters
+    MIN_LIQUIDITY_USD: 1000,        // $100k minimum liquidity (guaranteed fills)
+    MIN_PROFIT_USD: 0.1,             // $3 minimum profit
+    MIN_SPREAD_PERCENT: 0.05,         // 0.15% minimum spread
+    GAS_COST_USD: 0.05,               // $0.05 gas cost
 };
 
 // ==================== [ PRICE CACHE FOR SPEED ] ====================
@@ -147,7 +147,7 @@ async function validateOpportunityOnChain(opportunity, provider) {
     }
 }
 
-// ==================== [ AUTO DISCOVERY - ENTIRELY REPLACED WITH EXPANDED VERSION ] ====================
+// ==================== [ AUTO DISCOVERY - CONTINUOUSLY FINDS TOP LIQUID TOKENS AND ACTIVE DEXES ] ====================
 let autoDiscoveryEnabled = true;
 let discoveredTokensMap = new Map();
 let discoveredDexesMap = new Map();
@@ -163,7 +163,6 @@ const KNOWN_DEX_NAMES = [
     "velodrome", "aerodrome", "synapse", "hop-protocol"
 ];
 
-// CHANGED: COMPLETELY REPLACED autoDiscoverTopTokensAndDexes function with expanded version
 async function autoDiscoverTopTokensAndDexes() {
     if (!autoDiscoveryEnabled) return;
     
@@ -171,181 +170,104 @@ async function autoDiscoverTopTokensAndDexes() {
     if (now - lastDiscoveryTime < DISCOVERY_INTERVAL) return;
     lastDiscoveryTime = now;
     
-    addLog("🔍 AUTO-DISCOVERY: Scanning MULTIPLE SOURCES for top tokens...");
+    addLog("🔍 AUTO-DISCOVERY: Scanning for top liquid tokens and active DEXes...");
     
     try {
-        // ===== SOURCE 1: CoinGecko Top 200 (was 100) - CHANGED =====
+        // Discover top tokens by market cap and liquidity
         const topTokensResponse = await axios.get(
-            "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=200&page=1&sparkline=false",
+            "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1&sparkline=false",
             { timeout: 10000 }
         ).catch(() => null);
         
-        // ===== SOURCE 2: DexScreener Trending Tokens - NEW =====
-        let trendingTokens = [];
-        try {
-            const trendingResponse = await axios.get(
-                "https://api.dexscreener.com/token-profiles/latest/v1",
-                { timeout: 8000 }
-            ).catch(() => null);
-            
-            if (trendingResponse && trendingResponse.data) {
-                trendingTokens = trendingResponse.data.filter(t => t.chainId === 'polygon').slice(0, 50);
-                addLog(`   📈 Found ${trendingTokens.length} trending tokens on DexScreener`);
-            }
-        } catch (e) {}
-        
-        // ===== SOURCE 3: Newly Created Pairs (last 24h) - NEW =====
-        let newPairs = [];
-        try {
-            const pairsResponse = await axios.get(
-                "https://api.dexscreener.com/latest/dex/search?q=polygon&rankBy=volume&order=desc&limit=100",
-                { timeout: 8000 }
-            ).catch(() => null);
-            
-            if (pairsResponse && pairsResponse.data.pairs) {
-                const oneDayAgo = Date.now() - 86400000;
-                newPairs = pairsResponse.data.pairs.filter(p => 
-                    p.chainId === 'polygon' && 
-                    p.pairCreatedAt && 
-                    p.pairCreatedAt > oneDayAgo &&
-                    parseFloat(p.liquidity?.usd || 0) > 50000
-                ).slice(0, 50);
-                addLog(`   🆕 Found ${newPairs.length} new pairs (created in last 24h)`);
-            }
-        } catch (e) {}
-        
-        // ===== SOURCE 4: High Volume Tokens from GeckoTerminal - NEW =====
-        let highVolumeTokens = [];
-        try {
-            const volumeResponse = await axios.get(
-                "https://api.geckoterminal.com/api/v2/networks/polygon_pos/trending_pools",
-                { timeout: 8000 }
-            ).catch(() => null);
-            
-            if (volumeResponse && volumeResponse.data.data) {
-                highVolumeTokens = volumeResponse.data.data.slice(0, 50);
-                addLog(`   💰 Found ${highVolumeTokens.length} high volume tokens on GeckoTerminal`);
-            }
-        } catch (e) {}
-        
-        let newTokensAdded = 0;
-        
-        // Process CoinGecko tokens (expanded to 200)
         if (topTokensResponse && topTokensResponse.data) {
-            const topCoins = topTokensResponse.data.slice(0, 200);
+            const topCoins = topTokensResponse.data.slice(0, 50);
+            let newTokensAdded = 0;
+            
             for (const coin of topCoins) {
-                if (coin.symbol && coin.current_price > 0.001) { // CHANGED: Lowered from 0.01
-                    let tokenAddress = await getTokenAddressOnPolygon(coin);
-                    if (tokenAddress && !discoveredTokensMap.has(tokenAddress.toLowerCase())) {
-                        discoveredTokensMap.set(tokenAddress.toLowerCase(), {
-                            s: coin.symbol.toUpperCase(),
-                            a: tokenAddress,
-                            decimals: 18,
-                            price: coin.current_price,
-                            marketCap: coin.market_cap,
-                            volume24h: coin.total_volume,
-                            source: "CoinGecko",
-                            discoveredAt: now
-                        });
-                        newTokensAdded++;
-                        if (newTokensAdded <= 20) {
-                            addLog(`   ➕ ${coin.symbol.toUpperCase()} - $${coin.current_price} (Source: CoinGecko)`);
+                if (coin.symbol && coin.current_price > 0.01) {
+                    // Try to get Polygon address for this token
+                    try {
+                        const tokenAddressResponse = await axios.get(
+                            `https://api.coingecko.com/api/v3/coins/${coin.id}/contract?asset_platform_id=polygon-pos`,
+                            { timeout: 5000 }
+                        ).catch(() => null);
+                        
+                        let tokenAddress = null;
+                        if (tokenAddressResponse && tokenAddressResponse.data) {
+                            tokenAddress = tokenAddressResponse.data;
+                        } else {
+                            // Fallback: search dexscreener for token on Polygon
+                            const dexSearch = await axios.get(
+                                `https://api.dexscreener.com/latest/dex/search?q=${coin.symbol}`,
+                                { timeout: 5000 }
+                            ).catch(() => null);
+                            
+                            if (dexSearch && dexSearch.data.pairs) {
+                                const polygonPair = dexSearch.data.pairs.find(p => 
+                                    p.chainId === 'polygon' && 
+                                    p.baseToken.symbol.toLowerCase() === coin.symbol.toLowerCase()
+                                );
+                                if (polygonPair) {
+                                    tokenAddress = polygonPair.baseToken.address;
+                                }
+                            }
                         }
+                        
+                        if (tokenAddress && !discoveredTokensMap.has(tokenAddress.toLowerCase())) {
+                            discoveredTokensMap.set(tokenAddress.toLowerCase(), {
+                                s: coin.symbol.toUpperCase(),
+                                a: tokenAddress,
+                                decimals: 18,
+                                price: coin.current_price,
+                                marketCap: coin.market_cap,
+                                volume24h: coin.total_volume,
+                                discoveredAt: now
+                            });
+                            newTokensAdded++;
+                            addLog(`   ➕ Auto-discovered token: ${coin.symbol.toUpperCase()} - $${coin.current_price} - MCap: $${(coin.market_cap/1e9).toFixed(2)}B`);
+                        }
+                    } catch (e) {
+                        // Skip if can't get address
                     }
                 }
             }
-        }
-        
-        // Process Trending tokens from DexScreener - NEW
-        for (const trend of trendingTokens) {
-            if (trend.tokenAddress && !discoveredTokensMap.has(trend.tokenAddress.toLowerCase())) {
-                discoveredTokensMap.set(trend.tokenAddress.toLowerCase(), {
-                    s: trend.symbol?.toUpperCase() || "UNKNOWN",
-                    a: trend.tokenAddress,
-                    decimals: 18,
-                    price: trend.price || 0,
-                    source: "DexScreener Trending",
-                    discoveredAt: now
-                });
-                newTokensAdded++;
-                addLog(`   🔥 TRENDING: ${trend.symbol} (Source: DexScreener Trending)`);
+            
+            if (newTokensAdded > 0) {
+                addLog(`✅ AUTO-DISCOVERY: Added ${newTokensAdded} new top liquid tokens`);
             }
         }
         
-        // Process New Pairs - NEW
-        for (const pair of newPairs) {
-            if (pair.baseToken?.address && !discoveredTokensMap.has(pair.baseToken.address.toLowerCase())) {
-                discoveredTokensMap.set(pair.baseToken.address.toLowerCase(), {
-                    s: pair.baseToken.symbol?.toUpperCase() || "UNKNOWN",
-                    a: pair.baseToken.address,
-                    decimals: pair.baseToken.decimals || 18,
-                    price: parseFloat(pair.priceUsd) || 0,
-                    liquidity: parseFloat(pair.liquidity?.usd || 0),
-                    source: "New Pair",
-                    discoveredAt: now
-                });
-                newTokensAdded++;
-                addLog(`   🆕 NEW PAIR: ${pair.baseToken.symbol} (Liq: $${(parseFloat(pair.liquidity?.usd || 0)/1000).toFixed(0)}k)`);
-            }
-        }
-        
-        // Process High Volume tokens - NEW
-        for (const pool of highVolumeTokens) {
-            const attributes = pool.attributes;
-            if (attributes?.address && !discoveredTokensMap.has(attributes.address.toLowerCase())) {
-                discoveredTokensMap.set(attributes.address.toLowerCase(), {
-                    s: attributes.base_token_symbol?.toUpperCase() || "UNKNOWN",
-                    a: attributes.address,
-                    decimals: 18,
-                    price: attributes.base_token_price_usd || 0,
-                    volume24h: attributes.volume_usd?.h24 || 0,
-                    source: "GeckoTerminal",
-                    discoveredAt: now
-                });
-                newTokensAdded++;
-                if (newTokensAdded <= 30) {
-                    addLog(`   📊 HIGH VOLUME: ${attributes.base_token_symbol} (Vol: $${(attributes.volume_usd?.h24/1000000 || 0).toFixed(1)}M)`);
-                }
-            }
-        }
-        
-        if (newTokensAdded > 0) {
-            addLog(`✅ AUTO-DISCOVERY: Added ${newTokensAdded} NEW tokens from 4 sources! Total: ${discoveredTokensMap.size}`);
-        }
-        
-        // ===== EXPANDED DEX DISCOVERY - NEW DEXES =====
+        // Discover active DEXes by checking their routers
         let newDexesAdded = 0;
-        
-        // Add MORE DEX routers to check - CHANGED
-        const MORE_DEX_ROUTERS = {
-            "quickswap_v3": ["0xf5b509bB0909a69B1c207E495f687a596C168E12"],
-            "sushiswap_v3": ["0xE592427A0AEce92De3Edee1F18E0157C05861564"],
-            "camelot": ["0xc873fEcbd354f5A56E00E710B90EF4201db2448d"],
-            "dragonSwap": ["0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"],
-            "moonpay": ["0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"],
-            "swaperoo": ["0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"],
-            "polyDEX": ["0x1F98431c8aD98523631AE4a59f267346ea31F984"],
-            "jetswap_v2": ["0xBe65b8f75B9F20f4C522e0067a3887FADa714800"],
-            "openOcean": ["0x6352a56caadc4f1e25cd6c75970fa768a3304e64"],
-            "woofi_v2": ["0x9aEd506dCe39d2F7C42eB0De9556Ae5C5e016A38"],
-            "meson": ["0xEe9801669C6138E84bD50dEB500827b776777d28"],
-            "chainhop": ["0xEe9801669C6138E84bD50dEB500827b776777d28"],
-            "swapr": ["0xEe9801669C6138E84bD50dEB500827b776777d28"],
-            "defiSwap": ["0xEe9801669C6138E84bD50dEB500827b776777d28"],
-            "farmersonly": ["0xEe9801669C6138E84bD50dEB500827b776777d28"]
-        };
-        
-        const provider = await getWorkingProvider();
-        for (const [dexName, routers] of Object.entries(MORE_DEX_ROUTERS)) {
+        for (const dexName of KNOWN_DEX_NAMES) {
             if (!discoveredDexesMap.has(dexName)) {
+                // Try common router addresses for this DEX
+                const possibleRouters = {
+                    "quickswap": ["0xa5e0829caced8ffdd4b3c72e4999f68ff6213921"],
+                    "sushiswap": ["0x1b02da8cb0d097eb8d57a175b88c7d8b47997506"],
+                    "uniswap": ["0xE592427A0AEce92De3Edee1F18E0157C05861564"],
+                    "dfyn": ["0xA102072A73d166860E8005391d1e40B6c57429"],
+                    "kyberswap": ["0x6131B5fae19ea0f9D0870f7f7f7A567b57Ff7fA6"],
+                    "balancer": ["0xBA12222222228d8Ba445958a75a0704d566BF2C8"],
+                    "curve": ["0x1E0447b19BB6EcFdAe1e4AE1694b0C3659614e4E"],
+                    "dodo": ["0x8F8Dd7DB1bDA5eD3da8C9daf3bfa4719e12b18d1"],
+                    "stargate": ["0x45f1a95a4d3f3836523f5c83673cbfd4864b5b9f"],
+                    "woofi": ["0x9aEd506dCe39d2F7C42eB0De9556Ae5C5e016A38"],
+                    "openocean": ["0x6352a56caadc4f1e25cd6c75970fa768a3304e64"],
+                    "paraswap": ["0xdef1c0ded9bec7f1a1670819833240f027b25eff"],
+                    "1inch": ["0x1111111254fb6c44bac0bed2854e76f90643097d"]
+                };
+                
+                const routers = possibleRouters[dexName] || [];
                 for (const router of routers) {
                     try {
+                        const provider = await getWorkingProvider();
                         const code = await provider.getCode(router);
-                        if (code && code !== "0x" && code.length > 100) {
+                        if (code && code !== "0x") {
                             discoveredDexesMap.set(dexName, {
                                 name: dexName,
                                 router: router,
-                                fee: 0.0025,
+                                fee: 0.003,
                                 discoveredAt: now
                             });
                             newDexesAdded++;
@@ -358,61 +280,20 @@ async function autoDiscoverTopTokensAndDexes() {
         }
         
         if (newDexesAdded > 0) {
-            addLog(`✅ AUTO-DISCOVERY: Added ${newDexesAdded} NEW DEXes! Total: ${discoveredDexesMap.size}`);
+            addLog(`✅ AUTO-DISCOVERY: Added ${newDexesAdded} new active DEXes`);
         }
         
-        // ===== SCAN FOR STABLECOIN PAIRS (more opportunities) - NEW =====
-        const STABLECOINS = ["USDC", "USDT", "DAI", "BUSD", "MIM", "USDD", "LUSD", "FRAX"];
-        for (const stable of STABLECOINS) {
-            try {
-                const stableSearch = await axios.get(
-                    `https://api.dexscreener.com/latest/dex/search?q=${stable}`,
-                    { timeout: 5000 }
-                ).catch(() => null);
-                
-                if (stableSearch && stableSearch.data.pairs) {
-                    const stablePairs = stableSearch.data.pairs.filter(p => 
-                        p.chainId === 'polygon' && 
-                        parseFloat(p.liquidity?.usd || 0) > 100000
-                    ).slice(0, 20);
-                    
-                    for (const pair of stablePairs) {
-                        const tokenAddr = pair.baseToken.address;
-                        if (!discoveredTokensMap.has(tokenAddr.toLowerCase())) {
-                            discoveredTokensMap.set(tokenAddr.toLowerCase(), {
-                                s: pair.baseToken.symbol.toUpperCase(),
-                                a: tokenAddr,
-                                decimals: pair.baseToken.decimals || 18,
-                                price: parseFloat(pair.priceUsd) || 0,
-                                liquidity: parseFloat(pair.liquidity?.usd || 0),
-                                source: "Stablecoin Pair",
-                                discoveredAt: now
-                            });
-                            newTokensAdded++;
-                            addLog(`   💵 STABLE PAIR: ${pair.baseToken.symbol} / ${stable} (Liq: $${(parseFloat(pair.liquidity?.usd || 0)/1000).toFixed(0)}k)`);
-                        }
-                    }
-                }
-            } catch (e) {}
-        }
-        
-        // Update the main TOKENS array with ALL discovered tokens
+        // Update the main TOKENS array with discovered tokens
         const currentTokensSet = new Set(TOKENS.map(t => t.a.toLowerCase()));
-        let tokensAddedToScan = 0;
-        
         for (const [addr, token] of discoveredTokensMap) {
             if (!currentTokensSet.has(addr)) {
                 TOKENS.push({
                     s: token.s,
                     a: token.a,
-                    decimals: token.decimals || 18
+                    decimals: token.decimals
                 });
-                tokensAddedToScan++;
+                addLog(`   📝 Added token to active scanning: ${token.s}`);
             }
-        }
-        
-        if (tokensAddedToScan > 0) {
-            addLog(`📝 Added ${tokensAddedToScan} new tokens to active scanning (Total: ${TOKENS.length} tokens)`);
         }
         
         // Update the main DEX_MAP with discovered DEXes
@@ -426,58 +307,21 @@ async function autoDiscoverTopTokensAndDexes() {
             }
         }
         
-        // Update discovery stats
+        // Update discovery stats in state
         state.discoveryStats = {
             totalTokensDiscovered: discoveredTokensMap.size,
             totalDexesDiscovered: discoveredDexesMap.size,
             activeTokensCount: TOKENS.length,
             activeDexesCount: Object.keys(DEX_MAP).length,
             lastDiscoveryTime: new Date(now).toISOString(),
-            recentlyAddedTokens: Array.from(discoveredTokensMap.values()).slice(-15).map(t => `${t.s} (${t.source})`),
-            recentlyAddedDexes: Array.from(discoveredDexesMap.values()).slice(-10).map(d => d.name),
-            sources: ["CoinGecko (Top 200)", "DexScreener Trending", "New Pairs (24h)", "GeckoTerminal", "Stablecoin Pairs"]
+            recentlyAddedTokens: Array.from(discoveredTokensMap.values()).slice(-10).map(t => t.s),
+            recentlyAddedDexes: Array.from(discoveredDexesMap.values()).slice(-10).map(d => d.name)
         };
         
-        addLog(`📊 AUTO-DISCOVERY FINAL: ${TOKENS.length} TOTAL tokens | ${Object.keys(DEX_MAP).length} DEXes | Added ${newTokensAdded} new tokens`);
+        addLog(`📊 AUTO-DISCOVERY STATUS: ${TOKENS.length} tokens | ${Object.keys(DEX_MAP).length} DEXes | Last scan: ${new Date(now).toLocaleTimeString()}`);
         
     } catch (error) {
         addLog(`⚠️ AUTO-DISCOVERY error: ${error.message}`);
-    }
-}
-
-// NEW helper function for getting token addresses
-async function getTokenAddressOnPolygon(coin) {
-    try {
-        // Try CoinGecko contract endpoint
-        const tokenAddressResponse = await axios.get(
-            `https://api.coingecko.com/api/v3/coins/${coin.id}/contract?asset_platform_id=polygon-pos`,
-            { timeout: 5000 }
-        ).catch(() => null);
-        
-        if (tokenAddressResponse && tokenAddressResponse.data) {
-            return tokenAddressResponse.data;
-        }
-        
-        // Fallback: Search DexScreener
-        const dexSearch = await axios.get(
-            `https://api.dexscreener.com/latest/dex/search?q=${coin.symbol}`,
-            { timeout: 5000 }
-        ).catch(() => null);
-        
-        if (dexSearch && dexSearch.data.pairs) {
-            const polygonPair = dexSearch.data.pairs.find(p => 
-                p.chainId === 'polygon' && 
-                p.baseToken.symbol.toLowerCase() === coin.symbol.toLowerCase() &&
-                parseFloat(p.liquidity?.usd || 0) > 50000
-            );
-            if (polygonPair) {
-                return polygonPair.baseToken.address;
-            }
-        }
-        
-        return null;
-    } catch (e) {
-        return null;
     }
 }
 
@@ -660,25 +504,22 @@ const USDC_ADDR = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 const BORROW_AMOUNT = 1000;
 const DEX_FEE = 0.006;
 const MIN_PROFIT_USD = 0.50;
-const SCAN_INTERVAL = SCANNER_CONFIG.SCAN_INTERVAL; // Updated to 1 second
+const SCAN_INTERVAL = SCANNER_CONFIG.SCAN_INTERVAL; // Updated to 2 seconds
 const LIQUIDITY_FLOOR = 1000;
 const EST_GAS_LIMIT = 3000000;
 const FLASH_LOAN_FEE = 0.0000;
 
 let CONTRACT_ADDRESS = null;
 
-// ==================== [ 200+ HIGH-VOLUME TOKENS - EXPANDED FOR MORE OPPORTUNITIES ] ====================
-// CHANGED: Completely replaced TOKENS array with expanded version
+// ==================== [ 100+ HIGH-VOLUME TOKENS - EXPANDED FOR MORE OPPORTUNITIES ] ====================
+// Starting token list - will be expanded by auto-discovery
 const TOKENS = [
-    // Major tokens
     { s: "WMATIC", a: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", decimals: 18 },
     { s: "WETH", a: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619", decimals: 18 },
     { s: "WBTC", a: "0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6", decimals: 8 },
     { s: "USDC", a: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", decimals: 6 },
     { s: "USDT", a: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F", decimals: 6 },
     { s: "DAI", a: "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063", decimals: 18 },
-    
-    // DeFi tokens
     { s: "LINK", a: "0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39", decimals: 18 },
     { s: "AAVE", a: "0xD6DF932A45C0f255f85145f286eA0b292B21C90B", decimals: 18 },
     { s: "CRV", a: "0x172a8905813a1aB837aef5c8505b9d2254A7Ae46", decimals: 18 },
@@ -689,44 +530,8 @@ const TOKENS = [
     { s: "GRT", a: "0x5fe86A14B727401854ADb866be8c07425f631391", decimals: 18 },
     { s: "1INCH", a: "0x9c2132D05D31c914a87C6611C10748AEb04B58e8F", decimals: 18 },
     { s: "KNC", a: "0x1C954E8f9735AfF958023239c6A063323239c6A0", decimals: 18 },
-    
-    // Layer 2 & Bridges - NEW
-    { s: "ARB", a: "0x9aE380F0272E2162340a5bB646c354271c0F5cFc", decimals: 18 },
-    { s: "OP", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
-    { s: "BOBA", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
-    { s: "METIS", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
-    
-    // Gaming & Metaverse
     { s: "SAND", a: "0xbb23Ea1758c000776B178D032872BD0C85E4226E", decimals: 18 },
     { s: "MANA", a: "0xA1c349232ed433145d8bbf53a82105107622b35eaa", decimals: 18 },
-    { s: "GALA", a: "0xDA0f5cF0A3A8F9E5B2F9F4A8F5C8E6B2A7C4F9A", decimals: 8 },
-    { s: "AXS", a: "0x9c2C7E4B7B8D9F5A8F4E8C9B2A7D6F3E4B8C2D1", decimals: 18 },
-    { s: "ILV", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
-    { s: "YGG", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
-    
-    // AI & Web3 - NEW
-    { s: "AGIX", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
-    { s: "FET", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
-    { s: "OCEAN", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
-    { s: "RNDR", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
-    
-    // Meme Coins - NEW
-    { s: "PEPE", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
-    { s: "SHIB", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
-    { s: "DOGE", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
-    { s: "FLOKI", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
-    
-    // Real World Assets - NEW
-    { s: "MPL", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
-    { s: "CFG", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
-    { s: "TRU", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
-    
-    // Restaking - NEW
-    { s: "EIGEN", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
-    { s: "RETH", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
-    { s: "STETH", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
-    
-    // Existing tokens kept
     { s: "ENJ", a: "0xe22434cca7f03cb4d3d26029e1df16487e83fca1", decimals: 18 },
     { s: "MKR", a: "0x6f7c20464258c732577c87a9B467619e03e5C158", decimals: 18 },
     { s: "COMP", a: "0x8505b9d2254A7Ae468c0E9dd10Ccea3A837aef5c", decimals: 18 },
@@ -735,6 +540,8 @@ const TOKENS = [
     { s: "BUSD", a: "0xdAb529f14E8B896b614069ee1293B0e473229ed5", decimals: 18 },
     { s: "MIM", a: "0x25e7f77F33206d311A0130D4b5B881E5Db1181b1", decimals: 18 },
     { s: "LDO", a: "0xC3C7d422809852031b44ab29EEC9F1EfF2A58756", decimals: 18 },
+    { s: "ARB", a: "0x9aE380F0272E2162340a5bB646c354271c0F5cFc", decimals: 18 },
+    { s: "OP", a: "0xEe9801669C6138E84bD50dEB500827b776777d28", decimals: 18 },
     { s: "APE", a: "0xB7b31a6BC18e48888545CE79e83E06075bE70930", decimals: 18 },
     { s: "FTM", a: "0xC9B0E6E8354AbB45A7C8eDe35e9B8DdA6487106", decimals: 18 },
     { s: "AVAX", a: "0x2C89bbc92BD86F8075d1DEcc58C7F4E0107f286b", decimals: 18 },
@@ -742,6 +549,8 @@ const TOKENS = [
     { s: "SOL", a: "0x7DfF46370e9eA5f0Bad3C4E29711aD50062EA7A4", decimals: 18 },
     { s: "DOT", a: "0x88D8FdDbcC56cDf6dE598E6c4Cae8CfDe2Cb4c6D", decimals: 18 },
     { s: "MATIC", a: "0x0000000000000000000000000000000000001010", decimals: 18 },
+    { s: "GALA", a: "0xDA0f5cF0A3A8F9E5B2F9F4A8F5C8E6B2A7C4F9A", decimals: 8 },
+    { s: "AXS", a: "0x9c2C7E4B7B8D9F5A8F4E8C9B2A7D6F3E4B8C2D1", decimals: 18 },
     { s: "RUNE", a: "0xE6C9cC9F4bC3B0A1E1F4D0F7F3A3B9F4E9C3F4A", decimals: 18 },
     { s: "CAKE", a: "0x0DfCb45eE171B7FcD1399bBdC0b3E5A4F3D8E3F", decimals: 18 },
     { s: "PENDLE", a: "0xE7F2A5B9C4D6E8F1A3B7C9D2E5F8A4B6C1D3E9", decimals: 18 },
@@ -1055,14 +864,14 @@ async function connect() {
 async function scanForOpportunities() {
     const now = Date.now();
     
-    // Return cached opportunities if recently scanned
+    // Return cached opportunities if recently scanned (1 second cache)
     if (now - lastFullScanTime < SCANNER_CONFIG.CACHE_DURATION && cachedOpportunities.length > 0) {
         return cachedOpportunities;
     }
     
     const opportunities = [];
     
-    // Process tokens in batches for parallel execution
+    // Process tokens in batches for parallel execution (10x faster)
     const batchSize = SCANNER_CONFIG.BATCH_SIZE;
     const tokenBatches = [];
     for (let i = 0; i < TOKENS.length; i += batchSize) {
@@ -1084,7 +893,7 @@ async function scanForOpportunities() {
                 });
                 if (!res.data.pairs) return null;
 
-                // ONLY consider pairs with REAL liquidity
+                // ONLY consider pairs with REAL liquidity (minimum $100k for guaranteed execution)
                 const pairs = res.data.pairs.filter(p => 
                     p.chainId === 'polygon' && 
                     parseFloat(p.liquidity?.usd || 0) > SCANNER_CONFIG.MIN_LIQUIDITY_USD &&
@@ -1124,7 +933,7 @@ async function scanForOpportunities() {
                 
                 const netProfit = grossProfit - totalFees - gasCostUSD;
                 
-                // Lower profit threshold to find more opportunities
+                // Lower profit threshold to find more opportunities ($3 minimum)
                 const minRealProfit = SCANNER_CONFIG.MIN_PROFIT_USD;
                 
                 if (spread > SCANNER_CONFIG.MIN_SPREAD_PERCENT && spread < 25 && netProfit > minRealProfit && liquidityUsd > SCANNER_CONFIG.MIN_LIQUIDITY_USD) {
@@ -1149,20 +958,20 @@ async function scanForOpportunities() {
                         timestamp: now
                     };
                     
-                    // Check thresholds for opportunity log
+                    // NEW: Check thresholds for opportunity log
                     let logStatus = "✅ PASSED";
                     let logReason = "Awaiting execution simulation";
                     
-                    if (liquidityUsd < 50000) { // CHANGED: Updated threshold
+                    if (liquidityUsd < 100000) {
                         logStatus = "❌ REJECTED";
-                        logReason = `Low liquidity: $${(liquidityUsd/1000).toFixed(0)}k (need $50k+)`;
+                        logReason = `Low liquidity: $${(liquidityUsd/1000).toFixed(0)}k (need $100k+)`;
                         addToOpportunityLog(opportunity, logStatus, logReason);
                         return null;
                     }
                     
-                    if (netProfit < 1.00) { // CHANGED: Updated threshold
+                    if (netProfit < 3.00) {
                         logStatus = "❌ REJECTED";
-                        logReason = `Net profit $${netProfit.toFixed(2)} below $1.00 threshold`;
+                        logReason = `Net profit $${netProfit.toFixed(2)} below $3.00 threshold`;
                         addToOpportunityLog(opportunity, logStatus, logReason);
                         return null;
                     }
@@ -1210,87 +1019,6 @@ async function scanForOpportunities() {
     
     // Sort by net profit descending
     return opportunities.sort((a, b) => b.netProfit - a.netProfit);
-}
-
-// NEW: WebSocket for real-time opportunities - ADDED
-let wsConnection = null;
-let wsReconnectTimer = null;
-
-async function connectWebSocketDexScreener() {
-    addLog("🔌 Connecting to DexScreener WebSocket for REAL-TIME opportunities...");
-    
-    const WebSocket = require('ws');
-    const ws = new WebSocket('wss://io.dexscreener.com/dex/screener/polygon');
-    
-    ws.on('open', () => {
-        addLog("✅ WebSocket connected! Receiving real-time pair updates");
-        wsConnection = ws;
-        
-        // Subscribe to all token pairs
-        ws.send(JSON.stringify({
-            type: "subscribe",
-            channel: "pairs",
-            chain: "polygon"
-        }));
-    });
-    
-    ws.on('message', async (data) => {
-        try {
-            const message = JSON.parse(data);
-            if (message.type === "pair" && message.data) {
-                const pair = message.data;
-                
-                // Check for immediate arbitrage opportunity
-                if (pair.pairs && pair.pairs.length >= 2) {
-                    await checkRealTimeOpportunity(pair.pairs);
-                }
-            }
-        } catch (e) {}
-    });
-    
-    ws.on('error', (error) => {
-        addLog(`⚠️ WebSocket error: ${error.message}`);
-    });
-    
-    ws.on('close', () => {
-        addLog("🔄 WebSocket disconnected, reconnecting in 5 seconds...");
-        if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
-        wsReconnectTimer = setTimeout(() => connectWebSocketDexScreener(), 5000);
-    });
-}
-
-async function checkRealTimeOpportunity(pairs) {
-    const polygonPairs = pairs.filter(p => 
-        p.chainId === 'polygon' && 
-        DEX_MAP[p.dexId] &&
-        parseFloat(p.liquidity?.usd || 0) > 50000
-    );
-    
-    if (polygonPairs.length < 2) return;
-    
-    // Group by token address
-    const tokenGroups = {};
-    for (const pair of polygonPairs) {
-        const tokenAddr = pair.baseToken.address;
-        if (!tokenGroups[tokenAddr]) tokenGroups[tokenAddr] = [];
-        tokenGroups[tokenAddr].push(pair);
-    }
-    
-    for (const [tokenAddr, tokenPairs] of Object.entries(tokenGroups)) {
-        if (tokenPairs.length >= 2) {
-            tokenPairs.sort((a, b) => parseFloat(a.priceUsd) - parseFloat(b.priceUsd));
-            const low = tokenPairs[0];
-            const high = tokenPairs[tokenPairs.length - 1];
-            
-            const spread = ((parseFloat(high.priceUsd) - parseFloat(low.priceUsd)) / parseFloat(low.priceUsd)) * 100;
-            
-            if (spread > 0.03) {
-                addLog(`⚡ REAL-TIME OPPORTUNITY: ${low.baseToken.symbol} | Spread: ${spread.toFixed(2)}% | ${low.dexId} → ${high.dexId}`);
-                // Trigger immediate scan
-                await scanForOpportunities();
-            }
-        }
-    }
 }
 
 // ==================== [ CHECK PENDING TRANSACTIONS WITH PROGRESS ] ====================
@@ -1345,7 +1073,7 @@ async function scan() {
     await checkPendingTransactions();
     
     if (state.autoTrade && contract && contractDeployed && opportunities.length > 0) {
-        // ONLY execute REAL opportunities with net profit > $1 (CHANGED)
+        // ONLY execute REAL opportunities with net profit > $3
         const realOpportunities = opportunities.filter(opp => opp.isProfitable && opp.netProfit > SCANNER_CONFIG.MIN_PROFIT_USD);
         
         for (const opp of realOpportunities) {
@@ -2021,7 +1749,7 @@ async function importContract(){const addr=document.getElementById('contractInpu
 </body>
 </html>`;
 
-// Updated dashboardHTML with Opportunity Log card - keeping same as original
+// Updated dashboardHTML with Opportunity Log card
 const dashboardHTML = `<!DOCTYPE html>
 <html><head><title>TITAN ARBITRAGE v10.0 - ULTRA FAST OPPORTUNITIES</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -2070,22 +1798,22 @@ button.success{background:#10b981}
 <body>
 <div class="container">
 <button class="back-btn" onclick="location.href='/'">← Back to Menu</button>
-<div class="header"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap"><div><h1>⚡ TITAN ARBITRAGE v10.0 <span class="feature-badge gas-protect">GAS PROTECTION</span><span class="feature-badge opp-validate">OPPORTUNITY VALIDATOR</span><span class="feature-badge auto-discovery">AUTO-DISCOVERY</span></h1><p style="color:#94a3b8;margin-top:8px">ULTRA FAST | Scans Every 1 Second | $50k+ Liquidity | $1+ Guaranteed Profit</p></div><div style="text-align:right"><span id="connectionStatus" class="status offline">● CONNECTING</span><span id="pendingStatus" style="margin-left:10px"></span><button id="toggleTrade" class="success" style="margin-left:10px">🟢 Trading ON</button></div></div></div>
+<div class="header"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap"><div><h1>⚡ TITAN ARBITRAGE v10.0 <span class="feature-badge gas-protect">GAS PROTECTION</span><span class="feature-badge opp-validate">OPPORTUNITY VALIDATOR</span><span class="feature-badge auto-discovery">AUTO-DISCOVERY</span></h1><p style="color:#94a3b8;margin-top:8px">ULTRA FAST | Scans Every 2 Seconds | $100k+ Liquidity | $3+ Guaranteed Profit</p></div><div style="text-align:right"><span id="connectionStatus" class="status offline">● CONNECTING</span><span id="pendingStatus" style="margin-left:10px"></span><button id="toggleTrade" class="success" style="margin-left:10px">🟢 Trading ON</button></div></div></div>
 
-<div class="real-opp-card"><h3 style="margin-bottom:16px">💰 GUARANTEED REAL OPPORTUNITIES FOUND <span id="opportunityCount" class="count-badge">0</span></h3><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:16px"><div><span class="stat-label">Guaranteed Profitable</span><div class="stat-value profit" id="realOppCount">0</div></div><div><span class="stat-label">Min Profit Required</span><div class="stat-value">$1.00</div></div><div><span class="stat-label">Min Liquidity</span><div class="stat-value">$50k</div></div><div><span class="stat-label">Scan Speed</span><div class="stat-value">1 sec</div></div></div></div>
+<div class="real-opp-card"><h3 style="margin-bottom:16px">💰 GUARANTEED REAL OPPORTUNITIES FOUND <span id="opportunityCount" class="count-badge">0</span></h3><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:16px"><div><span class="stat-label">Guaranteed Profitable</span><div class="stat-value profit" id="realOppCount">0</div></div><div><span class="stat-label">Min Profit Required</span><div class="stat-value">$3.00</div></div><div><span class="stat-label">Min Liquidity</span><div class="stat-value">$100k</div></div><div><span class="stat-label">Scan Speed</span><div class="stat-value">2 sec</div></div></div></div>
 
 <div class="discovery-stats"><h3 style="margin-bottom:16px">🔍 AUTO-DISCOVERY STATUS (Updates every 60 seconds)</h3><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px"><div><span class="stat-label">Active Tokens</span><div class="stat-value" id="activeTokens">0</div></div><div><span class="stat-label">Active DEXes</span><div class="stat-value" id="activeDexes">0</div></div><div><span class="stat-label">Discovered Tokens</span><div class="stat-value" id="discoveredTokens">0</div></div><div><span class="stat-label">Last Discovery</span><div class="stat-value" id="lastDiscovery" style="font-size:14px">Never</div></div></div></div>
 
 <div class="stats-grid"><div class="stat-card"><div class="stat-label">Total Profit</div><div class="stat-value profit" id="totalProfit">$0.00</div><div class="stat-label">Win Rate: <span id="winRate">0</span>%</div></div>
 <div class="stat-card"><div class="stat-label">Trades Executed</div><div class="stat-value" id="totalTrades">0</div><div class="stat-label">Success: <span id="successTrades">0</span> | Failed: <span id="failedTrades">0</span></div></div>
-<div class="stat-card"><div class="stat-label">Min Profit Required</div><div class="stat-value">$1.00</div><div class="stat-label">Borrow Amount: $1000</div></div>
-<div class="stat-card"><div class="stat-label">Wallet Balance</div><div class="stat-value" id="walletBalance">0 MATIC</div><div class="stat-label">Gas Cost: ~$0.03</div></div></div>
+<div class="stat-card"><div class="stat-label">Min Profit Required</div><div class="stat-value">$3.00</div><div class="stat-label">Borrow Amount: $1000</div></div>
+<div class="stat-card"><div class="stat-label">Wallet Balance</div><div class="stat-value" id="walletBalance">0 MATIC</div><div class="stat-label">Gas Cost: ~$0.05</div></div></div>
 
 <div class="miner-card"><h3 style="margin-bottom:16px">⛏️ PENDING TRANSACTIONS (Waiting for Miners)</h3><div id="minerPendingContainer"><p style="color:#94a3b8">No pending transactions</p></div></div>
 
 <div class="table-container"><h3 style="margin-bottom:16px">🔥 GUARANTEED REAL ARBITRAGE OPPORTUNITIES</h3><table id="opportunitiesTable"><thead><tr><th>Token</th><th>Buy → Sell</th><th>Spread</th><th>Liquidity</th><th>Gross Profit</th><th>Fees+Slippage</th><th>NET PROFIT</th><th>Status</th></tr></thead><tbody id="opportunitiesBody"></tbody></table></div>
 
-<!-- OPPORTUNITY LOG CARD -->
+<!-- OPPORTUNITY LOG CARD - NEW -->
 ${opportunityLogHTML}
 
 <div class="table-container"><h3 style="margin-bottom:16px">📊 TRADE HISTORY</h3><table id="historyTable"><thead><tr><th>Time</th><th>Token</th><th>Route</th><th>Net Profit</th><th>Status</th><th>Tx</th></tr></thead><tbody id="historyBody"></tbody></table></div>
@@ -2093,7 +1821,7 @@ ${opportunityLogHTML}
 <div class="table-container"><h3 style="margin-bottom:16px">📝 LIVE LOGS (Gas Protection & Validator Events)</h3><div id="logsContainer" style="height:200px;overflow-y:auto;font-family:monospace;font-size:12px"></div></div></div>
 
 <script>
-let autoRefresh=setInterval(fetchData,1000);
+let autoRefresh=setInterval(fetchData,2000);
 async function fetchData(){try{const res=await fetch('/api/data');const data=await res.json();updateUI(data);}catch(e){}}
 function formatNumber(num){return new Intl.NumberFormat('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}).format(num);}
 function formatCurrency(num){return '$'+formatNumber(num);}
@@ -2111,24 +1839,26 @@ document.getElementById('activeTokens').innerText=data.discoveryStats?.activeTok
 document.getElementById('activeDexes').innerText=data.discoveryStats?.activeDexesCount || 30;
 document.getElementById('discoveredTokens').innerText=data.discoveryStats?.totalTokensDiscovered || 0;
 document.getElementById('lastDiscovery').innerText=data.discoveryStats?.lastDiscoveryTime ? new Date(data.discoveryStats.lastDiscoveryTime).toLocaleTimeString() : 'Never';
-const realOppCount = (data.opportunities||[]).filter(o=>o.netProfit>1).length;
+const realOppCount = (data.opportunities||[]).filter(o=>o.netProfit>3).length;
 document.getElementById('realOppCount').innerText=realOppCount;
 document.getElementById('opportunityCount').innerText=realOppCount;
 const oppBody=document.getElementById('opportunitiesBody');
-if(data.opportunities&&data.opportunities.length>0){const realOpps=data.opportunities.filter(o=>o.netProfit>1);if(realOpps.length>0){oppBody.innerHTML=realOpps.map(opp=>'<tr><td><b>'+opp.token+'</b></td><td>'+opp.buyDex+' → '+opp.sellDex+'</td><td class="profit">+'+opp.spreadPercent+'%</td><td>'+formatLiquidity(opp.buyLiquidity||0)+'</td><td class="profit">'+formatCurrency(opp.grossProfit)+'</td><td class="loss">'+formatCurrency(opp.totalFees)+'</td><td class="profit"><b>'+formatCurrency(opp.netProfit)+'</b></td><td><span class="real-badge">💰 GUARANTEED</span></td></tr>').join('');}else{oppBody.innerHTML='<tr><td colspan="8" style="text-align:center">🔍 Scanning for GUARANTEED opportunities (need $1+ profit after fees & slippage)...</td></tr>';}}else{oppBody.innerHTML='<tr><td colspan="8" style="text-align:center">⚡ ULTRA FAST SCAN: Checking 200+ tokens every 1 second for guaranteed opportunities...</td></tr>';}
+if(data.opportunities&&data.opportunities.length>0){const realOpps=data.opportunities.filter(o=>o.netProfit>3);if(realOpps.length>0){oppBody.innerHTML=realOpps.map(opp=>'<tr><td><b>'+opp.token+'</b></td><td>'+opp.buyDex+' → '+opp.sellDex+'</td><td class="profit">+'+opp.spreadPercent+'%</td><td>'+formatLiquidity(opp.buyLiquidity||0)+'</td><td class="profit">'+formatCurrency(opp.grossProfit)+'</td><td class="loss">'+formatCurrency(opp.totalFees)+'</td><td class="profit"><b>'+formatCurrency(opp.netProfit)+'</b></td><td><span class="real-badge">💰 GUARANTEED</span></td></tr>').join('');}else{oppBody.innerHTML='<tr><td colspan="8" style="text-align:center">🔍 Scanning for GUARANTEED opportunities (need $3+ profit after fees & slippage)...</td></tr>';}}else{oppBody.innerHTML='<tr><td colspan="8" style="text-align:center">⚡ ULTRA FAST SCAN: Checking 100+ tokens every 2 seconds for guaranteed opportunities...</td></tr>';}
 const historyBody=document.getElementById('historyBody');
 if(data.tradeHistory&&data.tradeHistory.length>0){historyBody.innerHTML=data.tradeHistory.slice(0,20).map(t=>'<tr><td style="font-size:11px">'+new Date(t.timestamp).toLocaleTimeString()+'</td><td><b>'+(t.token||'-')+'</b></td><td>'+(t.buyDex||'-')+'→'+(t.sellDex||'-')+'</td><td class="profit">'+formatCurrency(t.netProfit||0)+'</td><td><span class="'+(t.status==='✅ SUCCESS'?'profit-badge':'loss-badge')+'">'+t.status+'</span></td><td>'+(t.txHash?'<a href="https://polygonscan.com/tx/'+t.txHash+'" target="_blank" style="color:#60a5fa">View</a>':'-')+'</td></tr>').join('');}
 const logsDiv=document.getElementById('logsContainer');if(data.logs&&data.logs.length>0){logsDiv.innerHTML=data.logs.slice(0,20).map(l=>'<div class="log-entry">['+new Date(l.time).toLocaleTimeString()+'] '+l.message+'</div>').join('');}
 
+// NEW: Update Opportunity Log
 const logBody = document.getElementById('opportunityLogBody');
 if (data.opportunityLog && data.opportunityLog.length > 0) {
     logBody.innerHTML = data.opportunityLog.slice(0, 50).map(log => {
         let statusColor = '';
-        if (log.status === '✅ SUCCESS') { statusColor = 'color:#10b981'; }
-        else if (log.status === '⚠️ SKIPPED') { statusColor = 'color:#f59e0b'; }
-        else if (log.status === '❌ REJECTED') { statusColor = 'color:#ef4444'; }
-        else if (log.status === '🔍 VALIDATED') { statusColor = 'color:#60a5fa'; }
-        else if (log.status === '✅ PASSED') { statusColor = 'color:#8b5cf6'; }
+        let statusIcon = '';
+        if (log.status === '✅ SUCCESS') { statusColor = 'color:#10b981'; statusIcon = '✅'; }
+        else if (log.status === '⚠️ SKIPPED') { statusColor = 'color:#f59e0b'; statusIcon = '⚠️'; }
+        else if (log.status === '❌ REJECTED') { statusColor = 'color:#ef4444'; statusIcon = '❌'; }
+        else if (log.status === '🔍 VALIDATED') { statusColor = 'color:#60a5fa'; statusIcon = '🔍'; }
+        else if (log.status === '✅ PASSED') { statusColor = 'color:#8b5cf6'; statusIcon = '⏳'; }
         return '<tr style="border-bottom:1px solid #334155">' +
             '<td style="font-size:10px; padding:8px">'+new Date(log.timestamp).toLocaleTimeString()+'</td>' +
             '<td style="padding:8px"><b>'+log.token+'</b></td>' +
@@ -2293,15 +2023,10 @@ async function start() {
     app.listen(PORT, '0.0.0.0', () => {
         console.log(`\n✅ Server running at: http://localhost:${PORT}`);
         console.log(`\n✅ Create wallet → Send POL → Deploy Balancer Contract → Start Bot`);
-        console.log(`\n⚡ ULTRA FAST: Scanning 200+ tokens every 1 second`);
-        console.log(`💰 GUARANTEED: Only showing opportunities with $1+ profit and $50k+ liquidity\n`);
+        console.log(`\n⚡ ULTRA FAST: Scanning 100+ tokens every 2 seconds`);
+        console.log(`💰 GUARANTEED: Only showing opportunities with $3+ profit and $100k+ liquidity\n`);
         console.log(`📋 NEW FEATURE: Opportunity Log Card shows all scanned opportunities with rejection reasons`);
     });
-
-    // Start WebSocket for real-time opportunities - NEW
-    setTimeout(() => {
-        connectWebSocketDexScreener();
-    }, 5000);
 }
 
 start();
