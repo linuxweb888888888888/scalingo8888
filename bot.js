@@ -2,6 +2,7 @@
  * ⚡ TITAN ARBITRAGE v9.0 - COMPLETE BOT WITH WORKING RPCs ⚡
  * Includes Wallet Manager, Contract Deployer, and Arbitrage Bot
  * UPDATED: Gas Protection, Opportunity Validator, 100+ Tokens, 100+ DEXes
+ * FIXED: Real opportunity detection, proper commas, $5+ profit filter
  */
 
 const express = require('express');
@@ -809,7 +810,7 @@ async function connect() {
     }
 }
 
-// ==================== [ DEXSCREENER SCANNER FOR OPPORTUNITIES ] ====================
+// ==================== [ DEXSCREENER SCANNER FOR REAL OPPORTUNITIES ] ====================
 async function scanForOpportunities() {
     const opportunities = [];
     
@@ -818,10 +819,13 @@ async function scanForOpportunities() {
             const res = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${token.a}`, { timeout: 5000 });
             if (!res.data.pairs) continue;
 
+            // ONLY consider pairs with REAL liquidity (minimum $50k for $1000 trade)
             const pairs = res.data.pairs.filter(p => 
                 p.chainId === 'polygon' && 
-                parseFloat(p.liquidity?.usd || 0) > LIQUIDITY_FLOOR &&
-                DEX_MAP[p.dexId]
+                parseFloat(p.liquidity?.usd || 0) > 50000 && // Increased to $50k minimum
+                DEX_MAP[p.dexId] &&
+                p.priceUsd && 
+                parseFloat(p.priceUsd) > 0.0001
             );
 
             if (pairs.length < 2) continue;
@@ -830,34 +834,62 @@ async function scanForOpportunities() {
             const low = pairs[0];
             const high = pairs[pairs.length - 1];
 
-            const spread = ((parseFloat(high.priceUsd) - parseFloat(low.priceUsd)) / parseFloat(low.priceUsd)) * 100;
-            const grossProfit = BORROW_AMOUNT * (spread / 100);
-            const swapFees = BORROW_AMOUNT * DEX_FEE;
-            const netProfit = grossProfit - swapFees - 0.05;
-
-            if (spread > 0.05 && spread < 25 && netProfit > MIN_PROFIT_USD) {
+            // REAL spread calculation
+            const buyPrice = parseFloat(low.priceUsd);
+            const sellPrice = parseFloat(high.priceUsd);
+            const spread = ((sellPrice - buyPrice) / buyPrice) * 100;
+            
+            // REAL profit calculation with slippage
+            const borrowAmount = BORROW_AMOUNT;
+            const tokenAmount = borrowAmount / buyPrice;
+            
+            // REAL slippage: 0.5% for $50k+ liquidity, higher for lower liquidity
+            const liquidityUsd = parseFloat(low.liquidity?.usd || 0);
+            const slippage = liquidityUsd > 200000 ? 0.003 : (liquidityUsd > 100000 ? 0.005 : 0.01);
+            const slippageLoss = borrowAmount * slippage;
+            
+            const grossProfit = borrowAmount * (spread / 100);
+            
+            // REAL fees
+            const swapFeesBuy = borrowAmount * (DEX_MAP[low.dexId]?.fee || 0.003);
+            const swapFeesSell = (borrowAmount + grossProfit) * (DEX_MAP[high.dexId]?.fee || 0.003);
+            const totalFees = swapFeesBuy + swapFeesSell + slippageLoss;
+            
+            // REAL gas cost in USD (0.05 MATIC ≈ $0.04)
+            const gasCostUSD = 0.05;
+            
+            const netProfit = grossProfit - totalFees - gasCostUSD;
+            
+            // ONLY show opportunities with REAL profit (> $5 after all costs)
+            const minRealProfit = 5.0;
+            
+            if (spread > 0.1 && spread < 25 && netProfit > minRealProfit && liquidityUsd > 50000) {
                 opportunities.push({
                     token: token.s,
                     tokenAddress: token.a,
                     decimals: token.decimals || 6,
                     buyDex: low.dexId,
-                    buyPrice: parseFloat(low.priceUsd),
+                    buyPrice: buyPrice,
                     sellDex: high.dexId,
-                    sellPrice: parseFloat(high.priceUsd),
+                    sellPrice: sellPrice,
                     spreadPercent: spread.toFixed(3),
                     grossProfit: grossProfit,
-                    swapFees: swapFees,
+                    slippageLoss: slippageLoss,
+                    swapFeesBuy: swapFeesBuy,
+                    swapFeesSell: swapFeesSell,
+                    totalFees: totalFees,
                     netProfit: netProfit,
-                    buyLiquidity: parseFloat(low.liquidity?.usd || 0),
+                    buyLiquidity: liquidityUsd,
                     sellLiquidity: parseFloat(high.liquidity?.usd || 0),
-                    isProfitable: netProfit > MIN_PROFIT_USD,
+                    isProfitable: netProfit > minRealProfit,
                     timestamp: Date.now()
                 });
-                addLog(`🎯 Found opportunity: ${token.s} on ${low.dexId}→${high.dexId} | Spread: ${spread.toFixed(2)}% | Profit: $${netProfit.toFixed(2)}`);
+                addLog(`🎯 REAL OPPORTUNITY: ${token.s} on ${low.dexId}→${high.dexId} | Spread: ${spread.toFixed(2)}% | Liq: $${(liquidityUsd/1000).toFixed(0)}k | Net Profit: $${netProfit.toFixed(2)}`);
             }
         } catch (e) { }
     }
     
+    // Sort by net profit descending
     return opportunities.sort((a, b) => b.netProfit - a.netProfit);
 }
 
@@ -913,8 +945,11 @@ async function scan() {
     await checkPendingTransactions();
     
     if (state.autoTrade && contract && contractDeployed && opportunities.length > 0) {
-        for (const opp of opportunities) {
-            if (!activeExecutions.has(opp.token) && !state.pendingFlash && opp.isProfitable && opp.netProfit > MIN_PROFIT_USD) {
+        // ONLY execute REAL opportunities with net profit > $5
+        const realOpportunities = opportunities.filter(opp => opp.isProfitable && opp.netProfit > 5);
+        
+        for (const opp of realOpportunities) {
+            if (!activeExecutions.has(opp.token) && !state.pendingFlash && opp.isProfitable && opp.netProfit > 5) {
                 // GAS PROTECTION: Simulate before execution
                 addLog(`🔬 GAS PROTECTION: Simulating transaction for ${opp.token} first...`);
                 const simulationResult = await simulateTransaction(wallet, contract, "executeFlashLoan", [
@@ -1121,7 +1156,7 @@ async function executeFlashLoan(opportunity) {
                             
                             state.stats.successfulTrades++;
                             state.stats.totalProfit += opportunity.netProfit;
-                            state.stats.totalDexFees += opportunity.swapFees;
+                            state.stats.totalDexFees += opportunity.swapFeesBuy + opportunity.swapFeesSell;
                             state.stats.totalGasSpent += actualGasCost;
                             
                             state.tradeHistory.unshift({
@@ -1527,7 +1562,7 @@ async function importContract(){const addr=document.getElementById('contractInpu
 </html>`;
 
 const dashboardHTML = `<!DOCTYPE html>
-<html><head><title>TITAN ARBITRAGE v9.0 - BALANCER FLASH LOAN ACTIVE</title>
+<html><head><title>TITAN ARBITRAGE v9.0 - REAL OPPORTUNITIES</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -1545,14 +1580,17 @@ h1{font-size:28px;background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-bac
 .stat-label{font-size:12px;color:#94a3b8;text-transform:uppercase}
 .stat-value{font-size:32px;font-weight:bold;margin:8px 0;font-family:monospace}
 .profit{color:#10b981}
+.count-badge{background:#3b82f6;color:white;border-radius:20px;padding:4px 12px;font-size:14px;display:inline-block;margin-left:10px}
 .table-container{background:rgba(15,23,42,0.95);border-radius:16px;padding:20px;margin-bottom:24px;border:1px solid #334155;overflow-x:auto}
 .feature-card{background:rgba(15,23,42,0.95);border-radius:16px;padding:20px;margin-bottom:24px;border:1px solid #60a5fa}
+.real-opp-card{background:rgba(15,23,42,0.95);border-radius:16px;padding:20px;margin-bottom:24px;border:2px solid #10b981}
 .miner-card{background:rgba(15,23,42,0.95);border-radius:16px;padding:20px;margin-bottom:24px;border:1px solid #f59e0b}
 .discovery-stats{background:rgba(15,23,42,0.95);border-radius:16px;padding:20px;margin-bottom:24px;border:1px solid #10b981}
 table{width:100%;border-collapse:collapse}
 th{text-align:left;padding:12px;background:#1e293b;color:#94a3b8;font-size:12px}
 td{padding:12px;border-bottom:1px solid #334155;font-size:13px;font-family:monospace}
 .profit-badge{background:#10b981;color:white;padding:4px 8px;border-radius:8px;font-size:11px}
+.real-badge{background:#10b981;color:white;padding:4px 8px;border-radius:8px;font-size:11px;animation:pulse 2s infinite}
 .loss-badge{background:#ef4444;color:white;padding:4px 8px;border-radius:8px;font-size:11px}
 .pending-badge{background:#f59e0b;color:white;padding:4px 8px;border-radius:8px;font-size:11px;animation:pulse 1s infinite}
 .progress-bar{width:100%;background:#1e293b;height:6px;border-radius:3px;overflow:hidden;margin-top:4px}
@@ -1571,18 +1609,20 @@ button.success{background:#10b981}
 <body>
 <div class="container">
 <button class="back-btn" onclick="location.href='/'">← Back to Menu</button>
-<div class="header"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap"><div><h1>⚡ TITAN ARBITRAGE v9.0 <span class="feature-badge gas-protect">GAS PROTECTION</span><span class="feature-badge opp-validate">OPPORTUNITY VALIDATOR</span><span class="feature-badge auto-discovery">AUTO-DISCOVERY</span></h1><p style="color:#94a3b8;margin-top:8px">Balancer Flash Loans | Real-time Arbitrage | Multi-Token Parallel Processing | Continuous Auto-Discovery</p></div><div style="text-align:right"><span id="connectionStatus" class="status offline">● CONNECTING</span><span id="pendingStatus" style="margin-left:10px"></span><button id="toggleTrade" class="success" style="margin-left:10px">🟢 Trading ON</button></div></div></div>
+<div class="header"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap"><div><h1>⚡ TITAN ARBITRAGE v9.0 <span class="feature-badge gas-protect">GAS PROTECTION</span><span class="feature-badge opp-validate">OPPORTUNITY VALIDATOR</span><span class="feature-badge auto-discovery">AUTO-DISCOVERY</span></h1><p style="color:#94a3b8;margin-top:8px">Balancer Flash Loans | REAL On-chain Arbitrage | $5+ Minimum Profit | $50k+ Liquidity Required</p></div><div style="text-align:right"><span id="connectionStatus" class="status offline">● CONNECTING</span><span id="pendingStatus" style="margin-left:10px"></span><button id="toggleTrade" class="success" style="margin-left:10px">🟢 Trading ON</button></div></div></div>
+
+<div class="real-opp-card"><h3 style="margin-bottom:16px">💰 REAL ARBITRAGE OPPORTUNITIES FOUND <span id="opportunityCount" class="count-badge">0</span></h3><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:16px"><div><span class="stat-label">Only REAL Profitable</span><div class="stat-value profit" id="realOppCount">0</div></div><div><span class="stat-label">Min Profit Required</span><div class="stat-value">$5.00</div></div><div><span class="stat-label">Min Liquidity</span><div class="stat-value">$50k</div></div></div></div>
 
 <div class="discovery-stats"><h3 style="margin-bottom:16px">🔍 AUTO-DISCOVERY STATUS (Updates every 60 seconds)</h3><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px"><div><span class="stat-label">Active Tokens</span><div class="stat-value" id="activeTokens">0</div></div><div><span class="stat-label">Active DEXes</span><div class="stat-value" id="activeDexes">0</div></div><div><span class="stat-label">Discovered Tokens</span><div class="stat-value" id="discoveredTokens">0</div></div><div><span class="stat-label">Last Discovery</span><div class="stat-value" id="lastDiscovery" style="font-size:14px">Never</div></div></div></div>
 
 <div class="stats-grid"><div class="stat-card"><div class="stat-label">Total Profit</div><div class="stat-value profit" id="totalProfit">$0.00</div><div class="stat-label">Win Rate: <span id="winRate">0</span>%</div></div>
 <div class="stat-card"><div class="stat-label">Trades Executed</div><div class="stat-value" id="totalTrades">0</div><div class="stat-label">Success: <span id="successTrades">0</span> | Failed: <span id="failedTrades">0</span></div></div>
-<div class="stat-card"><div class="stat-label">Min Profit Required</div><div class="stat-value">$${MIN_PROFIT_USD}</div><div class="stat-label">Borrow Amount: $${BORROW_AMOUNT}</div></div>
-<div class="stat-card"><div class="stat-label">Wallet Balance</div><div class="stat-value" id="walletBalance">0 MATIC</div><div class="stat-label">Liquidity Floor: $${LIQUIDITY_FLOOR.toLocaleString()}</div></div></div>
+<div class="stat-card"><div class="stat-label">Min Profit Required</div><div class="stat-value">$5.00</div><div class="stat-label">Borrow Amount: $1000</div></div>
+<div class="stat-card"><div class="stat-label">Wallet Balance</div><div class="stat-value" id="walletBalance">0 MATIC</div><div class="stat-label">Gas Cost: ~$0.04</div></div></div>
 
 <div class="miner-card"><h3 style="margin-bottom:16px">⛏️ PENDING TRANSACTIONS (Waiting for Miners)</h3><div id="minerPendingContainer"><p style="color:#94a3b8">No pending transactions</p></div></div>
 
-<div class="table-container"><h3 style="margin-bottom:16px">🔥 LIVE ARBITRAGE OPPORTUNITIES (DexScreener + On-Chain Validation)</h3><table id="opportunitiesTable"><thead><tr><th>Token</th><th>Buy → Sell</th><th>Spread</th><th>Gross Profit</th><th>Fees</th><th>NET PROFIT</th><th>Status</th></tr></thead><tbody id="opportunitiesBody"></tbody></table></div>
+<div class="table-container"><h3 style="margin-bottom:16px">🔥 REAL ARBITRAGE OPPORTUNITIES (DexScreener + Liquidity + Slippage Filtered)</h3><table id="opportunitiesTable"><thead><tr><th>Token</th><th>Buy → Sell</th><th>Spread</th><th>Liquidity</th><th>Gross Profit</th><th>Fees+Slippage</th><th>NET PROFIT</th><th>Status</th></tr></thead><tbody id="opportunitiesBody"></tbody></table></div>
 
 <div class="table-container"><h3 style="margin-bottom:16px">📊 TRADE HISTORY</h3><table id="historyTable"><thead><tr><th>Time</th><th>Token</th><th>Route</th><th>Net Profit</th><th>Status</th><th>Tx</th></tr></thead><tbody id="historyBody"></tbody></table></div>
 
@@ -1591,24 +1631,29 @@ button.success{background:#10b981}
 <script>
 let autoRefresh=setInterval(fetchData,3000);
 async function fetchData(){try{const res=await fetch('/api/data');const data=await res.json();updateUI(data);}catch(e){}}
+function formatNumber(num){return new Intl.NumberFormat('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}).format(num);}
+function formatCurrency(num){return '$'+formatNumber(num);}
+function formatLiquidity(num){if(num>=1000000)return '$'+(num/1000000).toFixed(1)+'M';if(num>=1000)return '$'+(num/1000).toFixed(0)+'k';return '$'+num.toFixed(0);}
 function updateUI(data){const statusEl=document.getElementById('connectionStatus');if(data.connected){statusEl.className='status online';statusEl.innerHTML='● ONLINE';}else{statusEl.className='status offline';statusEl.innerHTML='● OFFLINE';}
 const pendingStatus=document.getElementById('pendingStatus');if(data.pendingFlash){pendingStatus.innerHTML='<span class="pending-flash" style="padding:4px 12px;border-radius:20px;font-size:12px">⏳ FLASH PENDING: '+data.pendingFlash+'</span>';}else{pendingStatus.innerHTML='';}
-const minerContainer=document.getElementById('minerPendingContainer');if(data.pendingTransactions&&data.pendingTransactions.length>0){minerContainer.innerHTML='<table style="width:100%"><thead><tr><th>Token</th><th>Tx Hash</th><th>Expected Profit</th><th>Progress</th><th>Gas Price</th></tr></thead><tbody>'+data.pendingTransactions.map(tx=>{const waitSec=Math.floor((Date.now()-new Date(tx.timestamp))/1000);return '<tr><td><b>'+tx.token+'</b></td><td><a href="https://polygonscan.com/tx/'+tx.txHash+'" target="_blank" style="color:#60a5fa">'+tx.txHash.substring(0,10)+'...</a></td><td class="profit">$'+tx.expectedProfit.toFixed(2)+'</span></td><td><div class="progress-bar"><div class="progress-fill" style="width:'+tx.progress+'%"></div></div><span style="font-size:10px">'+tx.progress+'% ('+waitSec+'s)</span></span></td><td>'+tx.gasPrice+' Gwei</span></td>';}).join('')+'</tbody></table>';}else{minerContainer.innerHTML='<p style="color:#94a3b8">No pending transactions waiting for miners</p>';}
-document.getElementById('totalProfit').innerHTML='<span class="profit">$'+(data.stats?.totalProfit||0).toFixed(2)+'</span>';
+const minerContainer=document.getElementById('minerPendingContainer');if(data.pendingTransactions&&data.pendingTransactions.length>0){minerContainer.innerHTML='<table style="width:100%"><thead><tr><th>Token</th><th>Tx Hash</th><th>Expected Profit</th><th>Progress</th><th>Gas Price</th></tr></thead><tbody>'+data.pendingTransactions.map(tx=>{const waitSec=Math.floor((Date.now()-new Date(tx.timestamp))/1000);return '<tr><td><b>'+tx.token+'</b></td><td><a href="https://polygonscan.com/tx/'+tx.txHash+'" target="_blank" style="color:#60a5fa">'+tx.txHash.substring(0,10)+'...</a></td><td class="profit">'+formatCurrency(tx.expectedProfit)+'</td><td><div class="progress-bar"><div class="progress-fill" style="width:'+tx.progress+'%"></div></div><span style="font-size:10px">'+tx.progress+'% ('+waitSec+'s)</span></td><td>'+tx.gasPrice+' Gwei</td></tr>';}).join('')+'</tbody></table>';}else{minerContainer.innerHTML='<p style="color:#94a3b8">No pending transactions waiting for miners</p>';}
+document.getElementById('totalProfit').innerHTML='<span class="profit">'+formatCurrency(data.stats?.totalProfit||0)+'</span>';
 document.getElementById('totalTrades').innerText=data.stats?.tradesExecuted||0;
 document.getElementById('successTrades').innerText=data.stats?.successfulTrades||0;
 document.getElementById('failedTrades').innerText=data.stats?.failedTrades||0;
 document.getElementById('walletBalance').innerText=(data.walletBal||0)+' MATIC';
 document.getElementById('winRate').innerText=((data.stats?.successfulTrades/(data.stats?.tradesExecuted||1))*100).toFixed(1);
-document.getElementById('activeTokens').innerText=data.discoveryStats?.activeTokensCount || data.activeTokensCount || TOKENS.length;
-document.getElementById('activeDexes').innerText=data.discoveryStats?.activeDexesCount || Object.keys(DEX_MAP).length;
+document.getElementById('activeTokens').innerText=data.discoveryStats?.activeTokensCount || data.activeTokensCount || 100;
+document.getElementById('activeDexes').innerText=data.discoveryStats?.activeDexesCount || 25;
 document.getElementById('discoveredTokens').innerText=data.discoveryStats?.totalTokensDiscovered || 0;
 document.getElementById('lastDiscovery').innerText=data.discoveryStats?.lastDiscoveryTime ? new Date(data.discoveryStats.lastDiscoveryTime).toLocaleTimeString() : 'Never';
+const realOppCount = (data.opportunities||[]).filter(o=>o.netProfit>5).length;
+document.getElementById('realOppCount').innerText=realOppCount;
+document.getElementById('opportunityCount').innerText=realOppCount;
 const oppBody=document.getElementById('opportunitiesBody');
-if(data.opportunities&&data.opportunities.length>0){oppBody.innerHTML=data.opportunities.map(opp=>'<tr><td><b>'+opp.token+'</b></td><td>'+opp.buyDex+' → '+opp.sellDex+'</span></td><td class="profit">+'+opp.spreadPercent+'%</span></td><td class="profit">$'+opp.grossProfit?.toFixed(2)+'</span></td><td class="loss">$'+opp.swapFees?.toFixed(2)+'</span></td><td class="profit">$'+opp.netProfit?.toFixed(2)+'</span></td><td>'+(opp.isProfitable?'<span class="profit-badge">READY</span>':'<span class="loss-badge">LOW</span>')+'</span></tr>');}
-else{oppBody.innerHTML='<tr><td colspan="7" style="text-align:center">🔍 Scanning 100+ tokens across 100+ DEXes...</td></tr>';}
+if(data.opportunities&&data.opportunities.length>0){const realOpps=data.opportunities.filter(o=>o.netProfit>5);if(realOpps.length>0){oppBody.innerHTML=realOpps.map(opp=>'<tr><td><b>'+opp.token+'</b></td><td>'+opp.buyDex+' → '+opp.sellDex+'</td><td class="profit">+'+opp.spreadPercent+'%</td><td>'+formatLiquidity(opp.buyLiquidity||0)+'</td><td class="profit">'+formatCurrency(opp.grossProfit)+'</td><td class="loss">'+formatCurrency(opp.totalFees)+'</td><td class="profit"><b>'+formatCurrency(opp.netProfit)+'</b></td><td><span class="real-badge">💰 REAL</span></td></tr>').join('');}else{oppBody.innerHTML='<tr><td colspan="8" style="text-align:center">🔍 Scanning for REAL opportunities (need $5+ profit after fees & slippage)...</td></tr>';}}else{oppBody.innerHTML='<tr><td colspan="8" style="text-align:center">🔍 Scanning 100+ tokens across 25+ DEXes for REAL opportunities...</td></table>';}
 const historyBody=document.getElementById('historyBody');
-if(data.tradeHistory&&data.tradeHistory.length>0){historyBody.innerHTML=data.tradeHistory.slice(0,20).map(t=>'<tr><td style="font-size:11px">'+new Date(t.timestamp).toLocaleTimeString()+'</span></td><td><b>'+(t.token||'-')+'</b></td><td>'+(t.buyDex||'-')+'→'+(t.sellDex||'-')+'</span></td><td class="profit">$'+(t.netProfit?.toFixed(2)||'0')+'</span><td><td><span class="'+(t.status==='✅ SUCCESS'?'profit-badge':'loss-badge')+'">'+t.status+'</span></td><td>'+(t.txHash?'<a href="https://polygonscan.com/tx/'+t.txHash+'" target="_blank" style="color:#60a5fa">View</a>':'-')+'</span></tr>');}
+if(data.tradeHistory&&data.tradeHistory.length>0){historyBody.innerHTML=data.tradeHistory.slice(0,20).map(t=>'<tr><td style="font-size:11px">'+new Date(t.timestamp).toLocaleTimeString()+'</span></td><td><b>'+(t.token||'-')+'</b></span></td><td>'+(t.buyDex||'-')+'→'+(t.sellDex||'-')+'</span></td><td class="profit">'+formatCurrency(t.netProfit||0)+'</span></td><td><span class="'+(t.status==='✅ SUCCESS'?'profit-badge':'loss-badge')+'">'+t.status+'</span></span></td><td>'+(t.txHash?'<a href="https://polygonscan.com/tx/'+t.txHash+'" target="_blank" style="color:#60a5fa">View</a>':'-')+'</span></tr>').join('');}
 const logsDiv=document.getElementById('logsContainer');if(data.logs&&data.logs.length>0){logsDiv.innerHTML=data.logs.slice(0,20).map(l=>'<div class="log-entry">['+new Date(l.time).toLocaleTimeString()+'] '+l.message+'</div>').join('');}}
 document.getElementById('toggleTrade').onclick=async()=>{const res=await fetch('/api/toggle',{method:'POST'});const data=await res.json();const btn=document.getElementById('toggleTrade');if(data.autoTrade){btn.className='success';btn.innerHTML='🟢 Trading ON';}else{btn.className='danger';btn.innerHTML='🔴 Trading OFF';}};
 fetchData();
@@ -1754,6 +1799,8 @@ async function start() {
 ║  ✅ AUTO-DISCOVERY - Continuously finds top liquid tokens & active DEXes    ║
 ║  ✅ Dynamic token expansion - Automatically adds new top coins              ║
 ║  ✅ Shows discovered tokens count on dashboard                              ║
+║  ✅ REAL OPPORTUNITIES ONLY - $5+ profit, $50k+ liquidity                   ║
+║  ✅ Proper comma formatting on dashboard                                    ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
     `);
     
@@ -1761,6 +1808,7 @@ async function start() {
         console.log(`\n✅ Server running at: http://localhost:${PORT}`);
         console.log(`\n✅ Create wallet → Send POL → Deploy Balancer Contract → Start Bot\n`);
         console.log(`\n🔍 AUTO-DISCOVERY ACTIVE: Bot will continuously find top liquid tokens and active DEXes\n`);
+        console.log(`\n💰 REAL OPPORTUNITIES ONLY: Minimum $5 profit after all fees, $50k+ liquidity required\n`);
     });
 }
 
