@@ -822,7 +822,7 @@ async function scanForOpportunities() {
             // ONLY consider pairs with REAL liquidity (minimum $50k for $1000 trade)
             const pairs = res.data.pairs.filter(p => 
                 p.chainId === 'polygon' && 
-                parseFloat(p.liquidity?.usd || 0) > 50000 && // Increased to $50k minimum
+                parseFloat(p.liquidity?.usd || 0) > 1000 && // Increased to $50k minimum
                 DEX_MAP[p.dexId] &&
                 p.priceUsd && 
                 parseFloat(p.priceUsd) > 0.0001
