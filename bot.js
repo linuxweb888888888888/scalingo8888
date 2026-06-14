@@ -48,7 +48,7 @@ const SCANNER_CONFIG = {
     CACHE_DURATION: 500,              // CHANGED: Cache prices for 0.5 seconds (was 1 second)
     
     // Real opportunity filters - CHANGED: Lower thresholds for MORE opportunities
-    MIN_LIQUIDITY_USD: 1000,         // CHANGED: $50k minimum liquidity (was $100k)
+    MIN_LIQUIDITY_USD: 50000,         // CHANGED: $50k minimum liquidity (was $100k)
     MIN_PROFIT_USD: 1.00,             // CHANGED: $1 minimum profit (was $0.1)
     MIN_SPREAD_PERCENT: 0.03,         // CHANGED: 0.03% minimum spread (was 0.05%)
     GAS_COST_USD: 0.03,               // CHANGED: $0.03 gas cost (was $0.05)
