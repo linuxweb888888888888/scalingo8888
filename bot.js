@@ -12,6 +12,8 @@ const axios = require('axios');
 const fs = require('fs');
 const solc = require('solc');
 
+const PORT = process.env.PORT || 3000;
+
 // ==================== [ FIX: CORRECTED PROVIDER IMPORT FOR ETHERs v6 ] ====================
 // Import JsonRpcProvider correctly from ethers
 const { JsonRpcProvider, Network } = require('ethers');
